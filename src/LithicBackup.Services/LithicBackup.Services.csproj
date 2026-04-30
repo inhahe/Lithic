@@ -1,0 +1,15 @@
+<Project Sdk="Microsoft.NET.Sdk">
+
+  <PropertyGroup>
+    <TargetFramework>net8.0-windows</TargetFramework>
+    <RootNamespace>LithicBackup.Services</RootNamespace>
+    <ImplicitUsings>enable</ImplicitUsings>
+    <Nullable>enable</Nullable>
+  </PropertyGroup>
+
+  <ItemGroup>
+    <ProjectReference Include="..\LithicBackup.Core\LithicBackup.Core.csproj" />
+    <ProjectReference Include="..\LithicBackup.Infrastructure\LithicBackup.Infrastructure.csproj" />
+  </ItemGroup>
+
+</Project>

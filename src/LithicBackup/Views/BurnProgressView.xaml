@@ -1,0 +1,123 @@
+<UserControl x:Class="LithicBackup.Views.BurnProgressView"
+             xmlns="http://schemas.microsoft.com/winfx/2006/xaml/presentation"
+             xmlns:x="http://schemas.microsoft.com/winfx/2006/xaml"
+             xmlns:d="http://schemas.microsoft.com/expression/blend/2008"
+             xmlns:mc="http://schemas.openxmlformats.org/markup-compatibility/2006"
+             xmlns:vm="clr-namespace:LithicBackup.ViewModels"
+             mc:Ignorable="d"
+             d:DataContext="{d:DesignInstance Type=vm:BurnProgressViewModel, IsDesignTimeCreatable=False}">
+
+    <StackPanel Margin="8">
+        <!-- Header -->
+        <TextBlock Style="{StaticResource H2}" Text="{Binding StatusText}" Margin="0,0,0,16" />
+
+        <!-- Disc progress (hidden in directory mode) -->
+        <Grid Margin="0,0,0,12"
+              Visibility="{Binding IsDirectoryMode, Converter={StaticResource BoolToVis}, ConverterParameter=Invert}">
+            <Grid.ColumnDefinitions>
+                <ColumnDefinition Width="Auto" />
+                <ColumnDefinition Width="*" />
+            </Grid.ColumnDefinitions>
+
+            <TextBlock Grid.Column="0"
+                       VerticalAlignment="Center"
+                       Margin="0,0,12,0"
+                       Foreground="{StaticResource TextSecondaryBrush}">
+                <TextBlock.Text>
+                    <MultiBinding StringFormat="Disc {0} of {1}">
+                        <Binding Path="CurrentDisc" />
+                        <Binding Path="TotalDiscs" />
+                    </MultiBinding>
+                </TextBlock.Text>
+            </TextBlock>
+
+            <ProgressBar Grid.Column="1"
+                         Minimum="0" Maximum="100"
+                         Value="{Binding DiscPercentage, Mode=OneWay}"
+                         Height="20"
+                         Foreground="{StaticResource PrimaryBrush}" />
+        </Grid>
+
+        <!-- Overall progress -->
+        <TextBlock Style="{StaticResource SubText}" Text="Overall Progress" Margin="0,0,0,4" />
+        <ProgressBar Minimum="0" Maximum="100"
+                     Value="{Binding OverallPercentage, Mode=OneWay}"
+                     Height="20" Margin="0,0,0,12"
+                     Foreground="{StaticResource AccentBrush}" />
+
+        <!-- Stats -->
+        <Grid Margin="0,0,0,12">
+            <Grid.ColumnDefinitions>
+                <ColumnDefinition Width="*" />
+                <ColumnDefinition Width="*" />
+                <ColumnDefinition Width="*" />
+            </Grid.ColumnDefinitions>
+
+            <StackPanel Grid.Column="0">
+                <TextBlock Style="{StaticResource SubText}" Text="Written" />
+                <TextBlock Text="{Binding BytesWrittenText}"
+                           FontSize="14" FontWeight="SemiBold" />
+            </StackPanel>
+
+            <StackPanel Grid.Column="1" HorizontalAlignment="Center">
+                <TextBlock Style="{StaticResource SubText}" Text="Elapsed" />
+                <TextBlock Text="{Binding ElapsedText}"
+                           FontSize="14" FontWeight="SemiBold" />
+            </StackPanel>
+
+            <StackPanel Grid.Column="2" HorizontalAlignment="Right">
+                <TextBlock Style="{StaticResource SubText}" Text="Remaining" />
+                <TextBlock Text="{Binding RemainingText}"
+                           FontSize="14" FontWeight="SemiBold" />
+            </StackPanel>
+        </Grid>
+
+        <!-- Current file -->
+        <TextBlock Style="{StaticResource SubText}" Text="Current:" Margin="0,0,0,2" />
+        <TextBlock Text="{Binding CurrentFile}"
+                   Foreground="{StaticResource TextPrimaryBrush}"
+                   TextTrimming="CharacterEllipsis"
+                   Margin="0,0,0,4" />
+
+        <!-- Per-file progress (visible when a file is actively being copied) -->
+        <Grid Margin="0,0,0,16">
+            <Grid.ColumnDefinitions>
+                <ColumnDefinition Width="*" />
+                <ColumnDefinition Width="Auto" />
+            </Grid.ColumnDefinitions>
+
+            <ProgressBar Grid.Column="0"
+                         Minimum="0" Maximum="100"
+                         Value="{Binding CurrentFilePercentage, Mode=OneWay}"
+                         Height="14"
+                         Foreground="{StaticResource PrimaryBrush}" />
+
+            <TextBlock Grid.Column="1"
+                       Text="{Binding CurrentFileSizeText}"
+                       Foreground="{StaticResource TextSecondaryBrush}"
+                       FontSize="11"
+                       VerticalAlignment="Center"
+                       Margin="8,0,0,0" />
+        </Grid>
+
+        <!-- Result detail (shown after completion) -->
+        <TextBlock Text="{Binding ResultDetail}"
+                   Foreground="{StaticResource TextSecondaryBrush}"
+                   TextWrapping="Wrap"
+                   Visibility="{Binding IsComplete, Converter={StaticResource BoolToVis}}"
+                   Margin="0,0,0,16" />
+
+        <!-- Buttons -->
+        <StackPanel Orientation="Horizontal">
+            <Button Style="{StaticResource PrimaryButton}"
+                    Content="Cancel"
+                    Command="{Binding CancelCommand}"
+                    Visibility="{Binding IsBurning, Converter={StaticResource BoolToVis}}"
+                    Margin="0,0,8,0" />
+            <Button Style="{StaticResource PrimaryButton}"
+                    Content="Done"
+                    Command="{Binding DoneCommand}"
+                    Visibility="{Binding IsComplete, Converter={StaticResource BoolToVis}}" />
+        </StackPanel>
+    </StackPanel>
+</UserControl>
