@@ -1,0 +1,26 @@
+# Build output
+bin/
+obj/
+
+# Visual Studio
+.vs/
+*.user
+*.suo
+*.userosscache
+*.sln.docstates
+
+# NuGet
+packages/
+*.nupkg
+project.lock.json
+
+# Build artifacts
+*.deps.json
+*.runtimeconfig.json
+
+# Logs / temp
+stdout.txt
+stderr.txt
+
+# Tool metadata
+.orchestrator_history
