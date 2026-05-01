@@ -1,3 +1,4 @@
+using System.Globalization;
 using System.Text.Json;
 using Microsoft.Data.Sqlite;
 using LithicBackup.Core.Interfaces;
@@ -189,9 +190,9 @@ public class SqliteCatalogRepository : ICatalogRepository
             DefaultFilesystemType = (FilesystemType)r.GetInt32(r.GetOrdinal("DefaultFilesystemType")),
             CapacityOverrideBytes = r.IsDBNull(r.GetOrdinal("CapacityOverrideBytes"))
                 ? null : r.GetInt64(r.GetOrdinal("CapacityOverrideBytes")),
-            CreatedUtc = DateTime.Parse(r.GetString(r.GetOrdinal("CreatedUtc"))),
+            CreatedUtc = DateTime.Parse(r.GetString(r.GetOrdinal("CreatedUtc")), null, DateTimeStyles.RoundtripKind),
             LastBackupUtc = r.IsDBNull(r.GetOrdinal("LastBackupUtc"))
-                ? null : DateTime.Parse(r.GetString(r.GetOrdinal("LastBackupUtc"))),
+                ? null : DateTime.Parse(r.GetString(r.GetOrdinal("LastBackupUtc")), null, DateTimeStyles.RoundtripKind),
         };
 
         // New columns — may not exist in legacy databases before migration 002.
@@ -349,9 +350,9 @@ public class SqliteCatalogRepository : ICatalogRepository
         IsMultisession = r.GetInt32(r.GetOrdinal("IsMultisession")) != 0,
         IsBad = r.GetInt32(r.GetOrdinal("IsBad")) != 0,
         Status = (BurnSessionStatus)r.GetInt32(r.GetOrdinal("Status")),
-        CreatedUtc = DateTime.Parse(r.GetString(r.GetOrdinal("CreatedUtc"))),
+        CreatedUtc = DateTime.Parse(r.GetString(r.GetOrdinal("CreatedUtc")), null, DateTimeStyles.RoundtripKind),
         LastWrittenUtc = r.IsDBNull(r.GetOrdinal("LastWrittenUtc"))
-            ? null : DateTime.Parse(r.GetString(r.GetOrdinal("LastWrittenUtc"))),
+            ? null : DateTime.Parse(r.GetString(r.GetOrdinal("LastWrittenUtc")), null, DateTimeStyles.RoundtripKind),
     };
 
     // ---------------------------------------------------------------
@@ -497,7 +498,7 @@ public class SqliteCatalogRepository : ICatalogRepository
             dict[path] = new FileVersionInfo(
                 MaxVersion: r.GetInt32(1),
                 SizeBytes: r.GetInt64(2),
-                SourceLastWriteUtc: DateTime.Parse(r.GetString(3)),
+                SourceLastWriteUtc: DateTime.Parse(r.GetString(3), null, DateTimeStyles.RoundtripKind),
                 IsDeduped: r.GetInt32(4) != 0,
                 IsFileRef: r.GetInt32(5) != 0);
         }
@@ -573,8 +574,8 @@ public class SqliteCatalogRepository : ICatalogRepository
         IsFileRef = r.GetInt32(r.GetOrdinal("IsFileRef")) != 0,
         Version = r.GetInt32(r.GetOrdinal("Version")),
         IsDeleted = r.GetInt32(r.GetOrdinal("IsDeleted")) != 0,
-        SourceLastWriteUtc = DateTime.Parse(r.GetString(r.GetOrdinal("SourceLastWriteUtc"))),
-        BackedUpUtc = DateTime.Parse(r.GetString(r.GetOrdinal("BackedUpUtc"))),
+        SourceLastWriteUtc = DateTime.Parse(r.GetString(r.GetOrdinal("SourceLastWriteUtc")), null, DateTimeStyles.RoundtripKind),
+        BackedUpUtc = DateTime.Parse(r.GetString(r.GetOrdinal("BackedUpUtc")), null, DateTimeStyles.RoundtripKind),
     };
 
     // ---------------------------------------------------------------
@@ -830,7 +831,7 @@ public class SqliteCatalogRepository : ICatalogRepository
                 MatchingFileCount = r.GetInt32(2),
                 TotalSizeBytes = r.GetInt64(3),
                 LatestVersion = r.GetInt32(4),
-                LastBackedUpUtc = r.IsDBNull(5) ? null : DateTime.Parse(r.GetString(5)),
+                LastBackedUpUtc = r.IsDBNull(5) ? null : DateTime.Parse(r.GetString(5), null, DateTimeStyles.RoundtripKind),
             });
         }
 

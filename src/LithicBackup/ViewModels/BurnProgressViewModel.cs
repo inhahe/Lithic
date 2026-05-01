@@ -303,7 +303,12 @@ public class BurnProgressViewModel : ViewModelBase
         ElapsedText = FormatTimeSpan(_stopwatch.Elapsed);
         RemainingText = "00:00";
         string verb = IsDirectoryMode ? "Backup" : "Burn";
-        StatusText = success ? $"{verb} completed successfully." : $"{verb} failed: {message}";
+        if (success && (failedFiles is null or { Count: 0 }))
+            StatusText = $"{verb} completed.";
+        else if (failedFiles is { Count: > 0 })
+            StatusText = $"{verb} completed with errors — {failedFiles.Count:N0} file(s) skipped or failed.";
+        else
+            StatusText = string.IsNullOrEmpty(message) ? $"{verb} failed." : $"{verb} failed: {message}";
         ResultDetail = detail;
 
         FailedFiles.Clear();

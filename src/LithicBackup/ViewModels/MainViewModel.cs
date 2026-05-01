@@ -28,7 +28,9 @@ public class MainViewModel : ViewModelBase
     private BurnProgressViewModel? _activeBackupProgress;
     private string _serviceStatusText = "";
     private int? _runningBackupSetId;
+    private CancellationTokenSource? _scanCts;
     private BackupSetEditorWindow? _editorWindow;
+    private Window? _largestFilesWindow;
     private Func<Task>? _pendingSettingsSave;
 
     public MainViewModel(
@@ -53,6 +55,19 @@ public class MainViewModel : ViewModelBase
         NewBackupSetCommand = new RelayCommand(
             _ => StartNewBackupFlow(),
             _ => !IsBurning);
+        CancelScanCommand = new RelayCommand(
+            _ => _scanCts?.Cancel(),
+            _ => _scanCts is not null && !_scanCts.IsCancellationRequested);
+        AbortBackupCommand = new RelayCommand(
+            _ =>
+            {
+                if (_activeBackupProgress?.CancelCommand is ICommand cmd && cmd.CanExecute(null))
+                    cmd.Execute(null);
+                else
+                    _scanCts?.Cancel();
+            },
+            _ => (_scanCts is not null && !_scanCts.IsCancellationRequested) ||
+                 (_activeBackupProgress?.CancelCommand?.CanExecute(null) == true));
         RunIncrementalCommand = new RelayCommand(
             _ => StartIncrementalFlow(),
             _ => !IsBurning && SelectedBackupSet is not null);
@@ -185,6 +200,13 @@ public class MainViewModel : ViewModelBase
     public ICommand ExportBackupSetCommand { get; }
     public ICommand ImportBackupSetCommand { get; }
 
+    /// <summary>Cancels the scan phase of a backup (before burn starts).</summary>
+    public ICommand CancelScanCommand { get; }
+
+    /// <summary>Aborts the current backup — delegates to scan CTS during scanning, or
+    /// to <see cref="BurnProgressViewModel.CancelCommand"/> during the burn phase.</summary>
+    public ICommand AbortBackupCommand { get; }
+
     // Per-set action commands (take BackupSet as CommandParameter)
     public ICommand SetBackupCommand { get; }
     public ICommand SetModifyCommand { get; }
@@ -274,8 +296,11 @@ public class MainViewModel : ViewModelBase
         RestoreSourceSettings(sourceSelection, backupSet.JobOptions);
 
         // Restore saved selections into the treeview.
+        // Must await so the tree is fully populated before the dialog is shown —
+        // otherwise nodes expand/check after the window is visible, causing
+        // visible layout shifts.
         if (backupSet.SourceSelections is { Count: > 0 })
-            _ = sourceSelection.ApplySelectionsAsync(backupSet.SourceSelections);
+            await sourceSelection.ApplySelectionsAsync(backupSet.SourceSelections);
 
         // Enable the Save button immediately — selections exist in a saved set.
         sourceSelection.HasSelection = true;
@@ -314,8 +339,6 @@ public class MainViewModel : ViewModelBase
             _editorWindow = null;
             await LoadBackupSetsAsync();
         };
-
-        Action<ViewModelBase> setView = vm => dialog.SetEditorContent(vm);
 
         // Save button: persist everything and show confirmation.
         sourceSelection.SaveRequested += async () =>
@@ -368,28 +391,71 @@ public class MainViewModel : ViewModelBase
             }
         };
 
+        // Open Largest Files in a separate window so the modify dialog
+        // stays visible.  Only one instance at a time.
         sourceSelection.LargestFilesRequested += async () =>
         {
+            if (_largestFilesWindow is not null)
+            {
+                _largestFilesWindow.Activate();
+                return;
+            }
+
             // Flush any pending debounced save so the scan sees current state.
             saveDebounce?.Cancel();
             SyncSettingsToJobOptions(backupSet, sourceSelection);
             backupSet.SourceSelections = sourceSelection.GetSelections();
             await Task.Run(() => _catalog.UpdateBackupSetAsync(backupSet));
 
-            await ShowLargestFilesAsync(
-                backupSet,
-                () =>
+            int estimatedCount = 0;
+            try { estimatedCount = await _catalog.GetFileCountForBackupSetAsync(backupSet.Id); }
+            catch { }
+
+            var vm = new LargestFilesViewModel(_scanner, _catalog, backupSet, estimatedCount);
+
+            var lfWindow = new BackupSetEditorWindow
+            {
+                Owner = dialog,
+                Title = $"Largest Files \u2014 {backupSet.Name}",
+                SizeToContent = SizeToContent.Manual,
+                Height = 600,
+            };
+
+            _largestFilesWindow = lfWindow;
+
+            vm.DoneRequested += () => lfWindow.Close();
+
+            vm.SaveRequested += async () =>
+            {
+                try
                 {
-                    // Refresh exclusion patterns — LargestFiles may have added
-                    // or removed full-path entries in ExcludedExtensions.
-                    if (backupSet.JobOptions?.ExcludedExtensions is { Count: > 0 } excl)
-                        sourceSelection.ExcludedPatterns =
-                            BackupJobViewModel.FormatExclusionPatterns(excl);
-                    else
-                        sourceSelection.ExcludedPatterns = "";
-                    setView(sourceSelection);
-                },
-                setView);
+                    SyncSettingsToJobOptions(backupSet, sourceSelection);
+                    backupSet.SourceSelections = sourceSelection.GetSelections();
+                    await Task.Run(() => _catalog.UpdateBackupSetAsync(backupSet));
+                    vm.SaveStatusText = "Saved";
+                }
+                catch (Exception ex)
+                {
+                    vm.SaveStatusText = $"Save failed: {ex.Message}";
+                }
+            };
+
+            lfWindow.Closed += (_, _) =>
+            {
+                vm.CancelScan();
+                _largestFilesWindow = null;
+
+                // Refresh exclusion patterns — LargestFiles may have added
+                // or removed full-path entries in ExcludedExtensions.
+                if (backupSet.JobOptions?.ExcludedExtensions is { Count: > 0 } excl)
+                    sourceSelection.ExcludedPatterns =
+                        BackupJobViewModel.FormatExclusionPatterns(excl);
+                else
+                    sourceSelection.ExcludedPatterns = "";
+            };
+
+            lfWindow.SetEditorContent(vm);
+            lfWindow.Show();
         };
 
         // Set content BEFORE showing so layout happens on the real view.
@@ -621,20 +687,32 @@ public class MainViewModel : ViewModelBase
 
         bool isDir = job.TargetDirectory is not null;
 
+        // Mark the set as running immediately so the per-set buttons
+        // switch from Backup/Restore/Modify to Pause/Abort right away.
+        // Clear any stale progress panel from a previous run.
+        ActiveBackupProgress = null;
+        IsBurning = true;
+        RunningBackupSetId = backupSet.Id;
+        _scanCts = new CancellationTokenSource();
+        var scanToken = _scanCts.Token;
         StatusText = $"Scanning \"{backupSet.Name}\"...";
 
         try
         {
-            // Throttled scan progress reporter.
+            // Throttled scan progress reporter.  The `scanning` flag is
+            // cleared after planning so late-arriving Progress callbacks
+            // (queued on the dispatcher) don't overwrite StartBurn's status.
+            bool scanning = true;
             var lastScanUpdate = 0L;
             var scanSw = System.Diagnostics.Stopwatch.StartNew();
             var scanProgress = new Progress<ScanProgress>(sp =>
             {
+                if (!scanning) return;
                 long now = scanSw.ElapsedMilliseconds;
                 if (now - lastScanUpdate >= ProgressUpdateIntervalMs)
                 {
                     lastScanUpdate = now;
-                    StatusText = $"Scanning \"{backupSet.Name}\"... {sp.FilesFound:N0} files found";
+                    StatusText = $"Scanning \"{backupSet.Name}\"... {sp.FilesFound:N0} files scanned ({FormatBytes(sp.TotalBytes)})";
                 }
             });
 
@@ -644,17 +722,23 @@ public class MainViewModel : ViewModelBase
                 if (_directoryBackupService is null)
                 {
                     StatusText = "Directory backup service not available.";
+                    IsBurning = false;
+                    RunningBackupSetId = null;
                     return;
                 }
 
                 var (diff, totalBytes, totalFiles) = await Task.Run(
-                    () => _directoryBackupService.PlanAsync(job, CancellationToken.None, scanProgress));
+                    () => _directoryBackupService.PlanAsync(job, scanToken, scanProgress));
 
                 if (totalFiles == 0)
                 {
                     StatusText = "Nothing to back up — all files are already current.";
+                    IsBurning = false;
+                    RunningBackupSetId = null;
                     return;
                 }
+
+                StatusText = $"{totalFiles:N0} file(s) to back up ({FormatBytes(totalBytes)})";
 
                 plan = new BackupPlan
                 {
@@ -668,22 +752,40 @@ public class MainViewModel : ViewModelBase
             else
             {
                 plan = await Task.Run(
-                    () => _orchestrator.PlanAsync(job, CancellationToken.None, scanProgress));
+                    () => _orchestrator.PlanAsync(job, scanToken, scanProgress));
 
                 int totalFiles = plan.Diff.NewFiles.Count + plan.Diff.ChangedFiles.Count;
                 if (totalFiles == 0)
                 {
                     StatusText = "Nothing to back up — all files are already current.";
+                    IsBurning = false;
+                    RunningBackupSetId = null;
                     return;
                 }
+
+                StatusText = $"{totalFiles:N0} file(s) to back up ({FormatBytes(plan.TotalBytes)})";
             }
 
-            // Go straight to burn.
+            // Stop scan-progress callbacks from overwriting burn status.
+            scanning = false;
             StartBurn(plan);
+        }
+        catch (OperationCanceledException)
+        {
+            StatusText = "Backup cancelled.";
+            IsBurning = false;
+            RunningBackupSetId = null;
         }
         catch (Exception ex)
         {
             StatusText = $"Backup failed: {ex.GetType().Name}: {ex.Message}";
+            IsBurning = false;
+            RunningBackupSetId = null;
+        }
+        finally
+        {
+            _scanCts?.Dispose();
+            _scanCts = null;
         }
     }
 
@@ -1198,6 +1300,9 @@ public class MainViewModel : ViewModelBase
 
                     bool? dialogResult = dialog.ShowDialog();
 
+                    // Re-activate the main window so focus isn't lost to the desktop.
+                    Application.Current.MainWindow?.Activate();
+
                     if (dialogResult == true)
                     {
                         tcs.SetResult(new FailureDecision
@@ -1238,7 +1343,7 @@ public class MainViewModel : ViewModelBase
         catch (Exception ex)
         {
             progressVm.CompleteBurn(false, ex.Message);
-            StatusText = "Backup failed.";
+            StatusText = $"Backup failed: {ex.Message}";
         }
         finally
         {
@@ -1288,6 +1393,9 @@ public class MainViewModel : ViewModelBase
 
                     bool? dialogResult = dialog.ShowDialog();
 
+                    // Re-activate the main window so focus isn't lost to the desktop.
+                    Application.Current.MainWindow?.Activate();
+
                     if (dialogResult == true)
                     {
                         tcs.SetResult(new FailureDecision
@@ -1334,7 +1442,7 @@ public class MainViewModel : ViewModelBase
         catch (Exception ex)
         {
             progressVm.CompleteBurn(false, ex.Message);
-            StatusText = "Directory backup failed.";
+            StatusText = $"Directory backup failed: {ex.Message}";
         }
         finally
         {

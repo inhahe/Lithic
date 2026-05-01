@@ -49,6 +49,14 @@ public class LargestFilesViewModel : ViewModelBase
     /// <summary>Fired when the user clicks "Close".</summary>
     public event Action? DoneRequested;
 
+    /// <summary>Fired when the user clicks "Save".</summary>
+    public event Func<Task>? SaveRequested;
+
+    private string _saveStatusText = "";
+
+    /// <summary>Cancel any running scan (e.g. when the host window closes).</summary>
+    public void CancelScan() => _cts?.Cancel();
+
     public LargestFilesViewModel(
         IFileScanner scanner,
         ICatalogRepository catalog,
@@ -68,6 +76,8 @@ public class LargestFilesViewModel : ViewModelBase
             _cts?.Cancel();
             DoneRequested?.Invoke();
         });
+
+        SaveCommand = new RelayCommand(_ => OnSave());
 
         SortByNameCommand = new RelayCommand(_ => ApplySort("Name"));
         SortByDirectoryCommand = new RelayCommand(_ => ApplySort("Directory"));
@@ -181,14 +191,34 @@ public class LargestFilesViewModel : ViewModelBase
         private set => SetProperty(ref _filesView, value);
     }
 
+    /// <summary>Transient confirmation text shown after a save.</summary>
+    public string SaveStatusText
+    {
+        get => _saveStatusText;
+        set => SetProperty(ref _saveStatusText, value);
+    }
+
     // --- Commands ---
 
     public ICommand CloseCommand { get; }
+    public ICommand SaveCommand { get; }
     public ICommand SortByNameCommand { get; }
     public ICommand SortByDirectoryCommand { get; }
     public ICommand SortBySizeCommand { get; }
     public ICommand ShowFilesCommand { get; }
     public ICommand ShowDirectoriesCommand { get; }
+
+    private async void OnSave()
+    {
+        if (SaveRequested is not null)
+            await SaveRequested.Invoke();
+
+        if (!string.IsNullOrEmpty(SaveStatusText))
+        {
+            await Task.Delay(3000);
+            SaveStatusText = "";
+        }
+    }
 
     // --- Sort ---
 

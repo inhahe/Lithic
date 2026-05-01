@@ -1,3 +1,4 @@
+using System.Runtime.InteropServices;
 using System.Security.Cryptography;
 using System.Text.Json;
 using LithicBackup.Core;
@@ -448,8 +449,24 @@ public class DirectoryBackupService
                     continue;
                 }
 
-                // Ask the user what to do.
-                var decision = await onFailure(file.FullPath, ex.Message);
+                // Ask the user what to do.  Wrap in try/catch so a failure
+                // in the dialog itself doesn't kill the entire backup.
+                FailureDecision decision;
+                try
+                {
+                    decision = await onFailure(file.FullPath, ex.Message);
+                }
+                catch
+                {
+                    // Callback failed (e.g. dialog error) �� treat as Skip.
+                    failedFiles.Add(new FailedFile
+                    {
+                        Path = file.FullPath,
+                        Error = ex.Message,
+                        ActionTaken = BurnFailureAction.Skip,
+                    });
+                    continue;
+                }
 
                 switch (decision.Action)
                 {
@@ -512,6 +529,13 @@ public class DirectoryBackupService
         tx.Complete();
 
         } // try (batch transaction)
+        catch
+        {
+            // Save partial progress: commit whatever file records are in
+            // the current transaction so the next backup doesn't redo them.
+            try { tx.Complete(); } catch { /* best-effort */ }
+            throw;
+        }
         finally
         {
             tx.Dispose();

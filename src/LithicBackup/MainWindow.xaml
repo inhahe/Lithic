@@ -8,7 +8,7 @@
         mc:Ignorable="d"
         d:DataContext="{d:DesignInstance Type=vm:MainViewModel, IsDesignTimeCreatable=False}"
         Style="{StaticResource MainWindowStyle}"
-        Title="Lithic Backup" Height="640" Width="1050"
+        Title="Lithic Backup" Height="820" Width="1050"
         MinHeight="480" MinWidth="700"
         WindowStartupLocation="CenterScreen">
 
@@ -169,7 +169,7 @@
                                                                                                     TargetNullValue='Never backed up'}" />
                                                                                     </TextBlock>
 
-                                                                                    <!-- Running status line (visible only for the running set) -->
+                                                                                    <!-- Running status (visible only for the running set) -->
                                                                                     <StackPanel>
                                                                                         <StackPanel.Visibility>
                                                                                             <MultiBinding Converter="{StaticResource IntEqualsVis}">
@@ -178,23 +178,71 @@
                                                                                                          RelativeSource="{RelativeSource AncestorType=Window}" />
                                                                                             </MultiBinding>
                                                                                         </StackPanel.Visibility>
-                                                                                        <Grid Margin="0,3,0,0" Width="200" HorizontalAlignment="Left">
-                                                                                            <ProgressBar Minimum="0" Maximum="100"
-                                                                                                         Value="{Binding DataContext.ActiveBackupProgress.OverallPercentage,
+
+                                                                                        <!-- Scanning phase (no ActiveBackupProgress yet) -->
+                                                                                        <TextBlock Text="{Binding DataContext.StatusText,
+                                                                                                         RelativeSource={RelativeSource AncestorType=Window}}"
+                                                                                                   FontSize="11"
+                                                                                                   Foreground="{StaticResource TextSecondaryBrush}"
+                                                                                                   Margin="0,2,0,0"
+                                                                                                   Visibility="{Binding DataContext.HasActiveBackupProgress,
+                                                                                                                RelativeSource={RelativeSource AncestorType=Window},
+                                                                                                                Converter={StaticResource BoolToVis},
+                                                                                                                ConverterParameter=Invert}" />
+
+                                                                                        <!-- Burn/copy phase (ActiveBackupProgress available) -->
+                                                                                        <StackPanel Visibility="{Binding DataContext.HasActiveBackupProgress,
                                                                                                                  RelativeSource={RelativeSource AncestorType=Window},
-                                                                                                                 Mode=OneWay}"
-                                                                                                         Height="12"
-                                                                                                         Foreground="{StaticResource AccentBrush}" />
-                                                                                            <TextBlock HorizontalAlignment="Center"
-                                                                                                       VerticalAlignment="Center"
-                                                                                                       FontSize="9">
-                                                                                                <TextBlock.Text>
-                                                                                                    <Binding Path="DataContext.ActiveBackupProgress.OverallPercentage"
-                                                                                                             RelativeSource="{RelativeSource AncestorType=Window}"
-                                                                                                             StringFormat="{}{0:F1}%" />
-                                                                                                </TextBlock.Text>
+                                                                                                                 Converter={StaticResource BoolToVis}}">
+                                                                                            <!-- Status text -->
+                                                                                            <TextBlock Text="{Binding DataContext.ActiveBackupProgress.StatusText,
+                                                                                                             RelativeSource={RelativeSource AncestorType=Window}}"
+                                                                                                       FontSize="11"
+                                                                                                       Foreground="{StaticResource TextSecondaryBrush}"
+                                                                                                       Margin="0,2,0,0" />
+                                                                                            <!-- Progress bar -->
+                                                                                            <Grid Margin="0,3,0,0" HorizontalAlignment="Left" Width="300">
+                                                                                                <ProgressBar Minimum="0" Maximum="100"
+                                                                                                             Value="{Binding DataContext.ActiveBackupProgress.OverallPercentage,
+                                                                                                                     RelativeSource={RelativeSource AncestorType=Window},
+                                                                                                                     Mode=OneWay}"
+                                                                                                             Height="14"
+                                                                                                             Foreground="{StaticResource AccentBrush}" />
+                                                                                                <TextBlock HorizontalAlignment="Center"
+                                                                                                           VerticalAlignment="Center"
+                                                                                                           FontSize="9">
+                                                                                                    <TextBlock.Text>
+                                                                                                        <Binding Path="DataContext.ActiveBackupProgress.OverallPercentage"
+                                                                                                                 RelativeSource="{RelativeSource AncestorType=Window}"
+                                                                                                                 StringFormat="{}{0:F1}%" />
+                                                                                                    </TextBlock.Text>
+                                                                                                </TextBlock>
+                                                                                            </Grid>
+                                                                                            <!-- Current file + stats -->
+                                                                                            <TextBlock Foreground="{StaticResource TextDimBrush}"
+                                                                                                       FontSize="10" Margin="0,2,0,0"
+                                                                                                       TextTrimming="CharacterEllipsis">
+                                                                                                <Run Text="{Binding DataContext.ActiveBackupProgress.CurrentFile,
+                                                                                                            RelativeSource={RelativeSource AncestorType=Window},
+                                                                                                            Mode=OneWay}" />
                                                                                             </TextBlock>
-                                                                                        </Grid>
+                                                                                            <TextBlock Foreground="{StaticResource TextDimBrush}"
+                                                                                                       FontSize="10" Margin="0,1,0,0">
+                                                                                                <Run Text="{Binding DataContext.ActiveBackupProgress.BytesWrittenText,
+                                                                                                            RelativeSource={RelativeSource AncestorType=Window},
+                                                                                                            Mode=OneWay}" />
+                                                                                                <Run Text="  ·  " />
+                                                                                                <Run Text="{Binding DataContext.ActiveBackupProgress.ElapsedText,
+                                                                                                            RelativeSource={RelativeSource AncestorType=Window},
+                                                                                                            Mode=OneWay}" />
+                                                                                                <Run Text=" elapsed" />
+                                                                                                <Run Text="  ·  ~" />
+                                                                                                <Run Text="{Binding DataContext.ActiveBackupProgress.RemainingText,
+                                                                                                            RelativeSource={RelativeSource AncestorType=Window},
+                                                                                                            Mode=OneWay}" />
+                                                                                                <Run Text=" remaining" />
+                                                                                            </TextBlock>
+                                                                                        </StackPanel>
                                                                                     </StackPanel>
                                                                                 </StackPanel>
 
@@ -244,26 +292,23 @@
                                                                                         <Button Style="{StaticResource LinkButton}"
                                                                                                 Command="{Binding DataContext.ActiveBackupProgress.PauseResumeCommand,
                                                                                                           RelativeSource={RelativeSource AncestorType=Window}}"
+                                                                                                Focusable="False"
                                                                                                 Margin="0,0,12,0">
                                                                                             <TextBlock>
                                                                                                 <Run Text="&#x23F8;" FontSize="10" />
                                                                                                 <Run Text="{Binding DataContext.ActiveBackupProgress.PauseResumeLabel,
                                                                                                             RelativeSource={RelativeSource AncestorType=Window},
-                                                                                                            Mode=OneWay}" />
+                                                                                                            Mode=OneWay,
+                                                                                                            FallbackValue=Pause}" />
                                                                                             </TextBlock>
                                                                                         </Button>
                                                                                         <Button Style="{StaticResource LinkButton}"
-                                                                                                Command="{Binding DataContext.ActiveBackupProgress.CancelCommand,
+                                                                                                Command="{Binding DataContext.AbortBackupCommand,
                                                                                                           RelativeSource={RelativeSource AncestorType=Window}}"
+                                                                                                Focusable="False"
                                                                                                 Margin="0,0,12,0"
                                                                                                 Foreground="{StaticResource ErrorBrush}">
                                                                                             <TextBlock><Run Text="&#x2715;" FontSize="10" /> Abort</TextBlock>
-                                                                                        </Button>
-                                                                                        <Button Style="{StaticResource LinkButton}"
-                                                                                                Command="{Binding DataContext.SetModifyCommand,
-                                                                                                          RelativeSource={RelativeSource AncestorType=Window}}"
-                                                                                                CommandParameter="{Binding}">
-                                                                                            <TextBlock><Run Text="&#x270E;" FontSize="10" /> Modify</TextBlock>
                                                                                         </Button>
                                                                                     </WrapPanel>
                                                                                 </StackPanel>
@@ -399,57 +444,58 @@
                                    VerticalAlignment="Center" />
                     </DockPanel>
 
-                    <!-- Disc progress (disc burns only) -->
-                    <DockPanel Margin="0,0,0,4"
-                               Visibility="{Binding IsDirectoryMode, Converter={StaticResource BoolToVis}, ConverterParameter=Invert}">
-                        <TextBlock DockPanel.Dock="Left"
-                                   VerticalAlignment="Center" Margin="0,0,8,0"
-                                   Foreground="{StaticResource TextSecondaryBrush}" FontSize="11">
-                            <TextBlock.Text>
-                                <MultiBinding StringFormat="Disc {0} of {1}">
-                                    <Binding Path="CurrentDisc" />
-                                    <Binding Path="TotalDiscs" />
-                                </MultiBinding>
-                            </TextBlock.Text>
+                    <!-- Live progress (hidden once burn/copy finishes) -->
+                    <StackPanel Visibility="{Binding IsBurning, Converter={StaticResource BoolToVis}}">
+                        <!-- Disc progress (disc burns only) -->
+                        <DockPanel Margin="0,0,0,4"
+                                   Visibility="{Binding IsDirectoryMode, Converter={StaticResource BoolToVis}, ConverterParameter=Invert}">
+                            <TextBlock DockPanel.Dock="Left"
+                                       VerticalAlignment="Center" Margin="0,0,8,0"
+                                       Foreground="{StaticResource TextSecondaryBrush}" FontSize="11">
+                                <TextBlock.Text>
+                                    <MultiBinding StringFormat="Disc {0} of {1}">
+                                        <Binding Path="CurrentDisc" />
+                                        <Binding Path="TotalDiscs" />
+                                    </MultiBinding>
+                                </TextBlock.Text>
+                            </TextBlock>
+                            <ProgressBar Minimum="0" Maximum="100"
+                                         Value="{Binding DiscPercentage, Mode=OneWay}"
+                                         Height="14"
+                                         Foreground="{StaticResource PrimaryBrush}" />
+                        </DockPanel>
+
+                        <!-- Overall progress bar -->
+                        <Grid Margin="0,0,0,6">
+                            <ProgressBar Minimum="0" Maximum="100"
+                                         Value="{Binding OverallPercentage, Mode=OneWay}"
+                                         Height="16"
+                                         Foreground="{StaticResource AccentBrush}" />
+                            <TextBlock HorizontalAlignment="Center" VerticalAlignment="Center"
+                                       FontSize="10">
+                                <TextBlock.Text>
+                                    <Binding Path="OverallPercentage" StringFormat="{}{0:F1}%" />
+                                </TextBlock.Text>
+                            </TextBlock>
+                        </Grid>
+
+                        <!-- Current file -->
+                        <TextBlock Text="{Binding CurrentFile}"
+                                   Foreground="{StaticResource TextSecondaryBrush}"
+                                   FontSize="11" TextTrimming="CharacterEllipsis" />
+
+                        <!-- Stats row -->
+                        <TextBlock Foreground="{StaticResource TextDimBrush}" FontSize="11"
+                                   Margin="0,2,0,0">
+                            <Run Text="{Binding BytesWrittenText, Mode=OneWay}" />
+                            <Run Text="  ·  " />
+                            <Run Text="{Binding ElapsedText, Mode=OneWay}" />
+                            <Run Text=" elapsed" />
+                            <Run Text="  ·  ~" />
+                            <Run Text="{Binding RemainingText, Mode=OneWay}" />
+                            <Run Text=" remaining" />
                         </TextBlock>
-                        <ProgressBar Minimum="0" Maximum="100"
-                                     Value="{Binding DiscPercentage, Mode=OneWay}"
-                                     Height="14"
-                                     Foreground="{StaticResource PrimaryBrush}" />
-                    </DockPanel>
-
-                    <!-- Overall progress bar -->
-                    <Grid Margin="0,0,0,6">
-                        <ProgressBar Minimum="0" Maximum="100"
-                                     Value="{Binding OverallPercentage, Mode=OneWay}"
-                                     Height="16"
-                                     Foreground="{StaticResource AccentBrush}" />
-                        <TextBlock HorizontalAlignment="Center" VerticalAlignment="Center"
-                                   FontSize="10">
-                            <TextBlock.Text>
-                                <Binding Path="OverallPercentage" StringFormat="{}{0:F1}%" />
-                            </TextBlock.Text>
-                        </TextBlock>
-                    </Grid>
-
-                    <!-- Current file (while running) -->
-                    <TextBlock Text="{Binding CurrentFile}"
-                               Foreground="{StaticResource TextSecondaryBrush}"
-                               FontSize="11" TextTrimming="CharacterEllipsis"
-                               Visibility="{Binding IsBurning, Converter={StaticResource BoolToVis}}" />
-
-                    <!-- Stats row (while running) -->
-                    <TextBlock Foreground="{StaticResource TextDimBrush}" FontSize="11"
-                               Margin="0,2,0,0"
-                               Visibility="{Binding IsBurning, Converter={StaticResource BoolToVis}}">
-                        <Run Text="{Binding BytesWrittenText, Mode=OneWay}" />
-                        <Run Text="  ·  " />
-                        <Run Text="{Binding ElapsedText, Mode=OneWay}" />
-                        <Run Text=" elapsed" />
-                        <Run Text="  ·  ~" />
-                        <Run Text="{Binding RemainingText, Mode=OneWay}" />
-                        <Run Text=" remaining" />
-                    </TextBlock>
+                    </StackPanel>
 
                     <!-- Result detail (after completion) -->
                     <TextBlock Text="{Binding ResultDetail}"
