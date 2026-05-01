@@ -30,6 +30,13 @@ public class BackupJobViewModel : ViewModelBase
     private string _subdirectoryName = "";
     private string _excludedExtensions = "";
 
+    private bool _scheduleEnabled;
+    private ScheduleMode _scheduleMode = ScheduleMode.Interval;
+    private string _scheduleIntervalHours = "24";
+    private int _scheduleDailyHour = 2;
+    private int _scheduleDailyMinute;
+    private string _scheduleDebounceSeconds = "60";
+
     private bool _isPlanning;
     private bool _isPlanReady;
     private string _planSummary = "";
@@ -65,6 +72,7 @@ public class BackupJobViewModel : ViewModelBase
 
         // Initialize retention tiers from defaults.
         RetentionTiers = [];
+        TierSets = [];
         foreach (var tier in VersionRetentionService.DefaultTiers)
         {
             var vm = RetentionTierViewModel.FromModel(tier);
@@ -180,8 +188,56 @@ public class BackupJobViewModel : ViewModelBase
         set => SetProperty(ref _deduplicationBlockSizeKb, value);
     }
 
-    /// <summary>Configurable version retention tiers for directory-mode backups.</summary>
+    // --- Schedule options (directory mode) ---
+
+    /// <summary>Whether automated backups are enabled for this set.</summary>
+    public bool ScheduleEnabled
+    {
+        get => _scheduleEnabled;
+        set => SetProperty(ref _scheduleEnabled, value);
+    }
+
+    public ScheduleMode ScheduleMode
+    {
+        get => _scheduleMode;
+        set => SetProperty(ref _scheduleMode, value);
+    }
+
+    public ScheduleMode[] ScheduleModeOptions { get; } = Enum.GetValues<ScheduleMode>();
+
+    /// <summary>Hours between backups (Interval mode) as a text field.</summary>
+    public string ScheduleIntervalHours
+    {
+        get => _scheduleIntervalHours;
+        set => SetProperty(ref _scheduleIntervalHours, value);
+    }
+
+    /// <summary>Hour of day for daily backups (0–23).</summary>
+    public int ScheduleDailyHour
+    {
+        get => _scheduleDailyHour;
+        set => SetProperty(ref _scheduleDailyHour, value);
+    }
+
+    /// <summary>Minute for daily backups (0–59).</summary>
+    public int ScheduleDailyMinute
+    {
+        get => _scheduleDailyMinute;
+        set => SetProperty(ref _scheduleDailyMinute, value);
+    }
+
+    /// <summary>Debounce delay in seconds (Continuous mode) as a text field.</summary>
+    public string ScheduleDebounceSeconds
+    {
+        get => _scheduleDebounceSeconds;
+        set => SetProperty(ref _scheduleDebounceSeconds, value);
+    }
+
+    /// <summary>Configurable version retention tiers for directory-mode backups (legacy/default).</summary>
     public ObservableCollection<RetentionTierViewModel> RetentionTiers { get; }
+
+    /// <summary>Named version tier sets passed through from source selection.</summary>
+    public ObservableCollection<TierSetViewModel> TierSets { get; }
 
     public FilesystemType FilesystemType
     {
@@ -321,6 +377,8 @@ public class BackupJobViewModel : ViewModelBase
                 IncludeCatalogOnDisc = IncludeCatalogOnDisc,
                 AllowFileSplitting = AllowFileSplitting,
                 TargetDirectory = effectiveTargetDir,
+                CreateSubdirectory = CreateSubdirectory,
+                SubdirectoryName = CreateSubdirectory ? SubdirectoryName?.Trim() : null,
                 EnableFileDeduplication = EnableFileDeduplication,
                 EnableDeduplication = EnableDeduplication,
                 ExcludedExtensions = ParseExclusionPatterns(ExcludedExtensions),
@@ -332,6 +390,7 @@ public class BackupJobViewModel : ViewModelBase
 
             // Convert retention tier ViewModels to models.
             job.RetentionTiers = RetentionTiers.Select(t => t.ToModel()).ToList();
+            job.TierSets = TierSets.Select(ts => ts.ToModel()).ToList();
 
             if (IsDirectoryMode)
             {
@@ -443,9 +502,37 @@ public class BackupJobViewModel : ViewModelBase
     }
 
     /// <summary>
-    /// Parse a comma/semicolon/space-separated exclusion pattern string into a
-    /// normalized list. Supports glob patterns (*.log, temp_*, debug*.txt) and
-    /// legacy extension-only entries (.log, log).
+    /// Build a <see cref="BackupSchedule"/> from the current UI state.
+    /// Returns null if scheduling is disabled.
+    /// </summary>
+    internal BackupSchedule? BuildSchedule()
+    {
+        if (!ScheduleEnabled) return null;
+
+        double intervalHours = 24;
+        if (double.TryParse(ScheduleIntervalHours, System.Globalization.NumberStyles.Float,
+                System.Globalization.CultureInfo.InvariantCulture, out double h) && h > 0)
+            intervalHours = h;
+
+        int debounce = 60;
+        if (int.TryParse(ScheduleDebounceSeconds, out int d) && d > 0)
+            debounce = d;
+
+        return new BackupSchedule
+        {
+            Enabled = true,
+            Mode = ScheduleMode,
+            IntervalHours = intervalHours,
+            DailyHour = ScheduleDailyHour,
+            DailyMinute = ScheduleDailyMinute,
+            DebounceSeconds = debounce,
+        };
+    }
+
+    /// <summary>
+    /// Parse an exclusion pattern string into a normalized list. Splits on
+    /// newlines only — commas and semicolons are allowed in patterns since
+    /// they are valid characters in Windows file names.
     /// </summary>
     internal static List<string> ParseExclusionPatterns(string input)
     {
@@ -453,17 +540,17 @@ public class BackupJobViewModel : ViewModelBase
             return [];
 
         return input
-            .Split([',', ';'], StringSplitOptions.RemoveEmptyEntries | StringSplitOptions.TrimEntries)
+            .Split(['\r', '\n'], StringSplitOptions.RemoveEmptyEntries | StringSplitOptions.TrimEntries)
             .Distinct(StringComparer.OrdinalIgnoreCase)
             .ToList();
     }
 
     /// <summary>
-    /// Format an exclusion pattern list back to a comma-separated display string.
+    /// Format an exclusion pattern list back to a display string (one per line).
     /// </summary>
     internal static string FormatExclusionPatterns(List<string> patterns)
     {
-        return string.Join(", ", patterns);
+        return string.Join("\n", patterns);
     }
 
     private static string FormatBytes(long bytes)

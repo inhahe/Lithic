@@ -8,169 +8,316 @@
         mc:Ignorable="d"
         d:DataContext="{d:DesignInstance Type=vm:MainViewModel, IsDesignTimeCreatable=False}"
         Style="{StaticResource MainWindowStyle}"
-        Title="Lithic Backup" Height="600" Width="900"
+        Title="Lithic Backup" SizeToContent="Height" Width="900"
         MinHeight="400" MinWidth="600"
         WindowStartupLocation="CenterScreen">
 
-    <Grid Margin="16">
-        <Grid.RowDefinitions>
-            <RowDefinition Height="Auto" />
-            <RowDefinition Height="*" />
-            <RowDefinition Height="Auto" />
-        </Grid.RowDefinitions>
+    <DockPanel>
+        <!-- Menu bar -->
+        <Menu DockPanel.Dock="Top"
+              Background="{StaticResource BackgroundBrush}"
+              Foreground="{StaticResource TextPrimaryBrush}"
+              Padding="4,2">
+            <MenuItem Header="_File">
+                <MenuItem Header="E_xit" Click="Exit_Click"
+                          InputGestureText="Alt+F4" />
+            </MenuItem>
+            <MenuItem Header="_Help">
+                <MenuItem Header="_About Lithic Backup" Click="About_Click" />
+            </MenuItem>
+        </Menu>
 
-        <!-- Header -->
-        <StackPanel Grid.Row="0" Margin="0,0,0,16">
-            <TextBlock Style="{StaticResource H1}" Text="Lithic Backup" />
-            <TextBlock Style="{StaticResource SubText}"
-                       Text="Incremental disc backup with smart space management" />
-        </StackPanel>
+        <Grid Margin="16">
+            <Grid.RowDefinitions>
+                <RowDefinition Height="Auto" />
+                <RowDefinition Height="*" />
+                <RowDefinition Height="Auto" />
+            </Grid.RowDefinitions>
 
-        <!-- Main content area -->
-        <Grid Grid.Row="1">
-            <Grid.ColumnDefinitions>
-                <ColumnDefinition Width="240" />
-                <ColumnDefinition Width="*" />
-            </Grid.ColumnDefinitions>
+            <!-- Header -->
+            <StackPanel Grid.Row="0" Margin="0,0,0,16">
+                <TextBlock Style="{StaticResource H1}" Text="Lithic Backup" />
+                <TextBlock Style="{StaticResource SubText}"
+                           Text="Incremental disc backup with smart space management" />
+            </StackPanel>
 
-            <!-- Left sidebar: backup sets -->
-            <Border Grid.Column="0" Style="{StaticResource Card}" Margin="0,0,12,0">
-                <DockPanel>
-                    <TextBlock DockPanel.Dock="Top" Style="{StaticResource H2}" Text="Backup Sets" />
+            <!-- Main content area -->
+            <Grid Grid.Row="1">
+                <Grid.ColumnDefinitions>
+                    <ColumnDefinition Width="240" />
+                    <ColumnDefinition Width="*" />
+                </Grid.ColumnDefinitions>
 
-                    <!-- Bottom buttons -->
-                    <StackPanel DockPanel.Dock="Bottom" Margin="0,8,0,0">
-                        <Button Style="{StaticResource PrimaryButton}"
-                                Content="New Backup Set"
-                                HorizontalAlignment="Stretch"
-                                Command="{Binding NewBackupSetCommand}" />
-                        <Button Content="Run Incremental"
-                                HorizontalAlignment="Stretch"
-                                Padding="16,8" Margin="0,6,0,0"
-                                Cursor="Hand"
-                                Command="{Binding RunIncrementalCommand}" />
-                        <Button Content="Restore Files"
-                                HorizontalAlignment="Stretch"
-                                Padding="16,8" Margin="0,6,0,0"
-                                Cursor="Hand"
-                                Command="{Binding RestoreCommand}" />
-                    </StackPanel>
+                <!-- Left sidebar: backup sets -->
+                <Border Grid.Column="0" Style="{StaticResource Card}" Margin="0,0,12,0">
+                    <DockPanel>
+                        <TextBlock DockPanel.Dock="Top" Style="{StaticResource H2}" Text="Backup Sets" />
 
-                    <!-- Backup set list -->
-                    <ListBox ItemsSource="{Binding BackupSets}"
-                             SelectedItem="{Binding SelectedBackupSet}"
-                             BorderThickness="0"
-                             Background="Transparent"
-                             Margin="0,8,0,0">
-                        <ListBox.ItemTemplate>
-                            <DataTemplate>
-                                <StackPanel Margin="2,4">
-                                    <TextBlock Text="{Binding Name}"
-                                               FontWeight="SemiBold" />
-                                    <TextBlock Foreground="{StaticResource TextDimBrush}"
-                                               FontSize="11">
-                                        <TextBlock.Text>
-                                            <Binding Path="SourceRoots.Count"
-                                                     StringFormat="{}{0} source(s)" />
-                                        </TextBlock.Text>
-                                    </TextBlock>
-                                </StackPanel>
+                        <!-- Bottom buttons -->
+                        <StackPanel DockPanel.Dock="Bottom" Margin="0,8,0,0">
+                            <Button Style="{StaticResource PrimaryButton}"
+                                    Content="New Backup Set"
+                                    HorizontalAlignment="Stretch"
+                                    Command="{Binding NewBackupSetCommand}" />
+                            <Button Content="Home"
+                                    HorizontalAlignment="Stretch"
+                                    Padding="16,8" Margin="0,6,0,0"
+                                    Cursor="Hand"
+                                    Command="{Binding HomeCommand}" />
+                        </StackPanel>
+
+                        <!-- Backup set list -->
+                        <ListBox ItemsSource="{Binding BackupSets}"
+                                 SelectedItem="{Binding SelectedBackupSet}"
+                                 BorderThickness="0"
+                                 Background="Transparent"
+                                 Margin="0,8,0,0">
+                            <ListBox.ItemTemplate>
+                                <DataTemplate>
+                                    <StackPanel Margin="2,4">
+                                        <TextBlock Text="{Binding Name}"
+                                                   FontWeight="SemiBold" />
+                                        <TextBlock Foreground="{StaticResource TextDimBrush}"
+                                                   FontSize="11">
+                                            <TextBlock.Text>
+                                                <Binding Path="SourceRoots.Count"
+                                                         StringFormat="{}{0} source(s)" />
+                                            </TextBlock.Text>
+                                        </TextBlock>
+                                    </StackPanel>
+                                </DataTemplate>
+                            </ListBox.ItemTemplate>
+                        </ListBox>
+                    </DockPanel>
+                </Border>
+
+                <!-- Right content area -->
+                <Border Grid.Column="1" Style="{StaticResource Card}">
+                    <ContentControl Content="{Binding CurrentView}">
+                        <ContentControl.Resources>
+                            <!-- Map viewmodel types to views -->
+                            <DataTemplate DataType="{x:Type vm:SourceSelectionViewModel}">
+                                <views:SourceSelectionView />
                             </DataTemplate>
-                        </ListBox.ItemTemplate>
-                    </ListBox>
-                </DockPanel>
-            </Border>
+                            <DataTemplate DataType="{x:Type vm:BackupJobViewModel}">
+                                <views:BackupJobView />
+                            </DataTemplate>
+                            <DataTemplate DataType="{x:Type vm:BurnProgressViewModel}">
+                                <views:BurnProgressView />
+                            </DataTemplate>
+                            <DataTemplate DataType="{x:Type vm:RestoreViewModel}">
+                                <views:RestoreView />
+                            </DataTemplate>
+                            <DataTemplate DataType="{x:Type vm:OrphanedDirectoriesViewModel}">
+                                <views:OrphanedDirectoriesView />
+                            </DataTemplate>
+                            <DataTemplate DataType="{x:Type vm:FindFileViewModel}">
+                                <views:FindFileView />
+                            </DataTemplate>
+                            <DataTemplate DataType="{x:Type vm:BackupCoverageViewModel}">
+                                <views:BackupCoverageView />
+                            </DataTemplate>
+                            <DataTemplate DataType="{x:Type vm:LargestFilesViewModel}">
+                                <views:LargestFilesView />
+                            </DataTemplate>
+                        </ContentControl.Resources>
 
-            <!-- Right content area -->
-            <Border Grid.Column="1" Style="{StaticResource Card}">
-                <ContentControl Content="{Binding CurrentView}">
-                    <ContentControl.Resources>
-                        <!-- Map viewmodel types to views -->
-                        <DataTemplate DataType="{x:Type vm:SourceSelectionViewModel}">
-                            <views:SourceSelectionView />
-                        </DataTemplate>
-                        <DataTemplate DataType="{x:Type vm:BackupJobViewModel}">
-                            <views:BackupJobView />
-                        </DataTemplate>
-                        <DataTemplate DataType="{x:Type vm:BurnProgressViewModel}">
-                            <views:BurnProgressView />
-                        </DataTemplate>
-                        <DataTemplate DataType="{x:Type vm:RestoreViewModel}">
-                            <views:RestoreView />
-                        </DataTemplate>
-                        <DataTemplate DataType="{x:Type vm:OrphanedDirectoriesViewModel}">
-                            <views:OrphanedDirectoriesView />
-                        </DataTemplate>
-                    </ContentControl.Resources>
+                        <!-- Default content when CurrentView is null (home screen) -->
+                        <ContentControl.Style>
+                            <Style TargetType="ContentControl">
+                                <Style.Triggers>
+                                    <DataTrigger Binding="{Binding CurrentView}" Value="{x:Null}">
+                                        <Setter Property="ContentTemplate">
+                                            <Setter.Value>
+                                                <DataTemplate>
+                                                    <ScrollViewer VerticalScrollBarVisibility="Auto"
+                                                                  HorizontalScrollBarVisibility="Disabled">
+                                                        <StackPanel HorizontalAlignment="Center"
+                                                                    Margin="0,24,0,24">
+                                                            <TextBlock Style="{StaticResource H2}"
+                                                                       HorizontalAlignment="Center"
+                                                                       Text="Welcome to Lithic Backup" />
+                                                            <TextBlock Style="{StaticResource SubText}"
+                                                                       HorizontalAlignment="Center"
+                                                                       Margin="0,4,0,0"
+                                                                       TextWrapping="Wrap"
+                                                                       TextAlignment="Center"
+                                                                       MaxWidth="400"
+                                                                       Text="Create a new backup set or select an existing one from the sidebar to run an incremental backup." />
+                                                            <TextBlock Style="{StaticResource SubText}"
+                                                                       HorizontalAlignment="Center"
+                                                                       Margin="0,12,0,0"
+                                                                       Text="Supports CD, DVD, Blu-Ray, and M-Disc media." />
 
-                    <!-- Default content when CurrentView is null (home screen) -->
-                    <ContentControl.Style>
-                        <Style TargetType="ContentControl">
-                            <Style.Triggers>
-                                <DataTrigger Binding="{Binding CurrentView}" Value="{x:Null}">
-                                    <Setter Property="ContentTemplate">
-                                        <Setter.Value>
-                                            <DataTemplate>
-                                                <StackPanel VerticalAlignment="Center"
-                                                            HorizontalAlignment="Center">
-                                                    <TextBlock Style="{StaticResource H2}"
-                                                               HorizontalAlignment="Center"
-                                                               Text="Welcome to Lithic Backup" />
-                                                    <TextBlock Style="{StaticResource SubText}"
-                                                               HorizontalAlignment="Center"
-                                                               Margin="0,4,0,0"
-                                                               TextWrapping="Wrap"
-                                                               TextAlignment="Center"
-                                                               MaxWidth="400"
-                                                               Text="Create a new backup set or select an existing one from the sidebar to run an incremental backup." />
-                                                    <TextBlock Style="{StaticResource SubText}"
-                                                               HorizontalAlignment="Center"
-                                                               Margin="0,12,0,0"
-                                                               Text="Supports CD, DVD, Blu-Ray, and M-Disc media." />
+                                                            <!-- All action buttons in a single vertical list -->
+                                                            <StackPanel MaxWidth="300" Margin="0,20,0,0"
+                                                                        HorizontalAlignment="Center">
 
-                                                    <!-- Backup-set-specific action (only when a set is selected) -->
-                                                    <Button Content="Review Orphaned Directories"
-                                                            HorizontalAlignment="Center"
-                                                            Padding="16,8" Margin="0,24,0,0"
-                                                            Cursor="Hand"
-                                                            Command="{Binding DataContext.OrphanedDirsCommand,
-                                                                      RelativeSource={RelativeSource AncestorType=Window}}">
-                                                        <Button.Style>
-                                                            <Style TargetType="Button">
-                                                                <Setter Property="Visibility" Value="Visible" />
-                                                                <Style.Triggers>
-                                                                    <DataTrigger Binding="{Binding DataContext.SelectedBackupSet,
+                                                                <!-- Always-available actions -->
+                                                                <Button Content="Find File or Directory"
+                                                                        HorizontalAlignment="Stretch"
+                                                                        Padding="16,8"
+                                                                        Cursor="Hand"
+                                                                        Command="{Binding DataContext.FindFileCommand,
+                                                                                  RelativeSource={RelativeSource AncestorType=Window}}" />
+                                                                <Button Content="Import Backup Set"
+                                                                        HorizontalAlignment="Stretch"
+                                                                        Padding="16,8" Margin="0,6,0,0"
+                                                                        Cursor="Hand"
+                                                                        Command="{Binding DataContext.ImportBackupSetCommand,
+                                                                                  RelativeSource={RelativeSource AncestorType=Window}}" />
+
+                                                                <!-- Backup-set-specific actions (only when a set is selected) -->
+                                                                <StackPanel Margin="0,12,0,0">
+                                                                    <StackPanel.Style>
+                                                                        <Style TargetType="StackPanel">
+                                                                            <Setter Property="Visibility" Value="Visible" />
+                                                                            <Style.Triggers>
+                                                                                <DataTrigger Binding="{Binding DataContext.SelectedBackupSet,
+                                                                                                      RelativeSource={RelativeSource AncestorType=Window}}"
+                                                                                             Value="{x:Null}">
+                                                                                    <Setter Property="Visibility" Value="Collapsed" />
+                                                                                </DataTrigger>
+                                                                            </Style.Triggers>
+                                                                        </Style>
+                                                                    </StackPanel.Style>
+
+                                                                    <!-- Visual separator between general and set-specific buttons -->
+                                                                    <Border Height="1"
+                                                                            Background="{StaticResource BorderBrush}"
+                                                                            Margin="0,0,0,12" />
+
+                                                                    <Button Style="{StaticResource PrimaryButton}"
+                                                                            Content="Run Incremental"
+                                                                            HorizontalAlignment="Stretch"
+                                                                            Padding="16,10"
+                                                                            Cursor="Hand"
+                                                                            Command="{Binding DataContext.RunIncrementalCommand,
+                                                                                      RelativeSource={RelativeSource AncestorType=Window}}" />
+
+                                                                    <Button Content="Backup Coverage"
+                                                                            HorizontalAlignment="Stretch"
+                                                                            Padding="16,8" Margin="0,6,0,0"
+                                                                            Cursor="Hand"
+                                                                            Command="{Binding DataContext.BackupCoverageCommand,
+                                                                                      RelativeSource={RelativeSource AncestorType=Window}}" />
+
+                                                                    <Button Content="Restore Files"
+                                                                            HorizontalAlignment="Stretch"
+                                                                            Padding="16,8" Margin="0,6,0,0"
+                                                                            Cursor="Hand"
+                                                                            Command="{Binding DataContext.RestoreCommand,
+                                                                                      RelativeSource={RelativeSource AncestorType=Window}}" />
+
+                                                                    <Button Content="Edit Backup Set"
+                                                                            HorizontalAlignment="Stretch"
+                                                                            Padding="16,8" Margin="0,6,0,0"
+                                                                            Cursor="Hand"
+                                                                            Command="{Binding DataContext.EditBackupSetCommand,
+                                                                                      RelativeSource={RelativeSource AncestorType=Window}}" />
+
+                                                                    <Button Content="Change Destination"
+                                                                            HorizontalAlignment="Stretch"
+                                                                            Padding="16,8" Margin="0,6,0,0"
+                                                                            Cursor="Hand"
+                                                                            Command="{Binding DataContext.ChangeDestinationCommand,
+                                                                                      RelativeSource={RelativeSource AncestorType=Window}}" />
+
+                                                                    <Button Content="Copy Backup Set"
+                                                                            HorizontalAlignment="Stretch"
+                                                                            Padding="16,8" Margin="0,6,0,0"
+                                                                            Cursor="Hand"
+                                                                            Command="{Binding DataContext.CopyBackupSetCommand,
+                                                                                      RelativeSource={RelativeSource AncestorType=Window}}" />
+
+                                                                    <Button Content="Review Orphaned Directories"
+                                                                            HorizontalAlignment="Stretch"
+                                                                            Padding="16,8" Margin="0,6,0,0"
+                                                                            Cursor="Hand"
+                                                                            Command="{Binding DataContext.OrphanedDirsCommand,
+                                                                                      RelativeSource={RelativeSource AncestorType=Window}}" />
+
+                                                                    <Button Content="Export Backup Set"
+                                                                            HorizontalAlignment="Stretch"
+                                                                            Padding="16,8" Margin="0,6,0,0"
+                                                                            Cursor="Hand"
+                                                                            Command="{Binding DataContext.ExportBackupSetCommand,
+                                                                                      RelativeSource={RelativeSource AncestorType=Window}}" />
+                                                                </StackPanel>
+                                                            </StackPanel>
+
+                                                            <!-- Worker Service management -->
+                                                            <Border BorderBrush="{StaticResource BorderBrush}"
+                                                                    BorderThickness="1" CornerRadius="4"
+                                                                    Padding="16,12" Margin="0,24,0,0"
+                                                                    MaxWidth="400">
+                                                                <StackPanel>
+                                                                    <TextBlock Text="{Binding DataContext.ServiceStatusText,
+                                                                                      RelativeSource={RelativeSource AncestorType=Window}}"
+                                                                               FontWeight="SemiBold"
+                                                                               HorizontalAlignment="Center"
+                                                                               Margin="0,0,0,8" />
+
+                                                                    <StackPanel Orientation="Horizontal"
+                                                                                HorizontalAlignment="Center">
+                                                                        <Button Content="Install Service"
+                                                                                Padding="12,6" Margin="0,0,6,0" Cursor="Hand"
+                                                                                Command="{Binding DataContext.InstallServiceCommand,
                                                                                           RelativeSource={RelativeSource AncestorType=Window}}"
-                                                                                 Value="{x:Null}">
-                                                                        <Setter Property="Visibility" Value="Collapsed" />
-                                                                    </DataTrigger>
-                                                                </Style.Triggers>
-                                                            </Style>
-                                                        </Button.Style>
-                                                    </Button>
-                                                </StackPanel>
-                                            </DataTemplate>
-                                        </Setter.Value>
-                                    </Setter>
-                                </DataTrigger>
-                            </Style.Triggers>
-                        </Style>
-                    </ContentControl.Style>
-                </ContentControl>
+                                                                                IsEnabled="{Binding DataContext.CanInstallService,
+                                                                                           RelativeSource={RelativeSource AncestorType=Window}}" />
+                                                                        <Button Content="Start"
+                                                                                Padding="12,6" Margin="0,0,6,0" Cursor="Hand"
+                                                                                Command="{Binding DataContext.StartServiceCommand,
+                                                                                          RelativeSource={RelativeSource AncestorType=Window}}"
+                                                                                IsEnabled="{Binding DataContext.CanStartService,
+                                                                                           RelativeSource={RelativeSource AncestorType=Window}}" />
+                                                                        <Button Content="Stop"
+                                                                                Padding="12,6" Margin="0,0,6,0" Cursor="Hand"
+                                                                                Command="{Binding DataContext.StopServiceCommand,
+                                                                                          RelativeSource={RelativeSource AncestorType=Window}}"
+                                                                                IsEnabled="{Binding DataContext.CanStopService,
+                                                                                           RelativeSource={RelativeSource AncestorType=Window}}" />
+                                                                        <Button Content="Uninstall"
+                                                                                Padding="12,6" Cursor="Hand"
+                                                                                Command="{Binding DataContext.UninstallServiceCommand,
+                                                                                          RelativeSource={RelativeSource AncestorType=Window}}"
+                                                                                IsEnabled="{Binding DataContext.CanUninstallService,
+                                                                                           RelativeSource={RelativeSource AncestorType=Window}}" />
+                                                                    </StackPanel>
+
+                                                                    <TextBlock Foreground="{StaticResource TextSecondaryBrush}"
+                                                                               FontSize="11" TextWrapping="Wrap"
+                                                                               TextAlignment="Center"
+                                                                               Margin="0,8,0,0"
+                                                                               Text="The Worker Service runs automated and continuous backups in the background." />
+                                                                </StackPanel>
+                                                            </Border>
+                                                        </StackPanel>
+                                                    </ScrollViewer>
+                                                </DataTemplate>
+                                            </Setter.Value>
+                                        </Setter>
+                                    </DataTrigger>
+                                </Style.Triggers>
+                            </Style>
+                        </ContentControl.Style>
+                    </ContentControl>
+                </Border>
+            </Grid>
+
+            <!-- Status bar -->
+            <Border Grid.Row="2"
+                    Background="{StaticResource SurfaceBrush}"
+                    BorderBrush="{StaticResource BorderBrush}"
+                    BorderThickness="1"
+                    CornerRadius="4"
+                    Padding="12,8"
+                    Margin="0,12,0,0">
+                <TextBlock Text="{Binding StatusText}"
+                           Foreground="{StaticResource TextSecondaryBrush}"
+                           FontSize="12" />
             </Border>
         </Grid>
-
-        <!-- Status bar -->
-        <Border Grid.Row="2"
-                Background="{StaticResource SurfaceBrush}"
-                BorderBrush="{StaticResource BorderBrush}"
-                BorderThickness="1"
-                CornerRadius="4"
-                Padding="12,8"
-                Margin="0,12,0,0">
-            <TextBlock Text="{Binding StatusText}"
-                       Foreground="{StaticResource TextSecondaryBrush}"
-                       FontSize="12" />
-        </Border>
-    </Grid>
+    </DockPanel>
 </Window>

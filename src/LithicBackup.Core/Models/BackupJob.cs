@@ -56,16 +56,30 @@ public class BackupJob
     /// <summary>
     /// Version retention tiers for directory-mode backups. When empty, the default
     /// tiers from <see cref="Services.VersionRetentionService.DefaultTiers"/> are used.
+    /// This is the global fallback used when no per-node tier set overrides it.
     /// </summary>
     public List<VersionRetentionTier> RetentionTiers { get; set; } = [];
 
+    /// <summary>
+    /// Named version tier sets for per-node retention policies.
+    /// Includes user-defined sets and any modifications to the "Default" set.
+    /// </summary>
+    public List<VersionTierSet> TierSets { get; set; } = [];
+
     /// <summary>When non-null, back up to this directory instead of optical media.</summary>
     public string? TargetDirectory { get; set; }
+
+    /// <summary>Whether to create a subdirectory under the target directory.</summary>
+    public bool CreateSubdirectory { get; set; }
+
+    /// <summary>Name of the subdirectory to create under the target directory.</summary>
+    public string? SubdirectoryName { get; set; }
 
     /// <summary>
     /// Glob patterns to exclude from the backup (e.g. "*.log", "temp_*", "debug*.txt").
     /// Also accepts legacy extension forms (".log", "log") which are treated as "*.log".
     /// Matched case-insensitively against the file name via <see cref="GlobMatcher"/>.
+    /// Path patterns containing / or \ match against the full path (e.g. "*/.vs/*").
     /// </summary>
     public List<string> ExcludedExtensions { get; set; } = [];
 

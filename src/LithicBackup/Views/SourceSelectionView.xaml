@@ -10,19 +10,404 @@
     <DockPanel>
         <!-- Header -->
         <StackPanel DockPanel.Dock="Top" Margin="0,0,0,12">
-            <TextBlock Style="{StaticResource H2}" Text="Select Source Files" />
-            <TextBlock Style="{StaticResource SubText}"
-                       Text="Check the files and directories you want to include in this backup." />
+            <Grid>
+                <Grid.ColumnDefinitions>
+                    <ColumnDefinition Width="*" />
+                    <ColumnDefinition Width="Auto" />
+                </Grid.ColumnDefinitions>
+                <StackPanel Grid.Column="0">
+                    <TextBlock Style="{StaticResource H2}" Text="Select Source Files" />
+                    <TextBlock Style="{StaticResource SubText}"
+                               Text="Check the files and directories you want to include in this backup." />
+                </StackPanel>
+                <StackPanel Grid.Column="1" Orientation="Horizontal" VerticalAlignment="Top">
+                    <CheckBox Content="Show sizes" IsChecked="{Binding ShowSizes}"
+                              VerticalAlignment="Center" Margin="0,0,8,0"
+                              ToolTip="Display file and directory sizes (computed in background)." />
+                    <CheckBox Content="Selected only" IsChecked="{Binding ShowSelectedSizesOnly}"
+                              IsEnabled="{Binding ShowSizes}"
+                              VerticalAlignment="Center"
+                              ToolTip="Only show sizes for selected (checked) items." />
+                </StackPanel>
+            </Grid>
+            <StackPanel Orientation="Horizontal" Margin="0,6,0,0">
+                <Button Content="+ Add Path"
+                        Command="{Binding AddPathCommand}"
+                        Padding="10,6" Margin="0,0,8,0" Cursor="Hand"
+                        ToolTip="Add a network share or custom directory as a backup source." />
+                <Button Content="Largest Files &amp; Directories"
+                        Command="{Binding LargestFilesCommand}"
+                        Padding="10,6" Cursor="Hand"
+                        Visibility="{Binding ShowLargestFiles, Converter={StaticResource BoolToVis}}"
+                        ToolTip="View the largest files and directories in this backup set's sources." />
+            </StackPanel>
         </StackPanel>
 
-        <!-- Bottom buttons -->
-        <StackPanel DockPanel.Dock="Bottom" Orientation="Horizontal"
-                    HorizontalAlignment="Right" Margin="0,12,0,0">
-            <Button Content="Cancel" Command="{Binding CancelCommand}"
-                    Padding="16,8" Margin="0,0,8,0" Cursor="Hand" />
-            <Button Style="{StaticResource PrimaryButton}"
-                    Content="Next" Command="{Binding NextCommand}" />
-        </StackPanel>
+        <!-- Bottom: summary + buttons -->
+        <Grid DockPanel.Dock="Bottom" Margin="0,12,0,0">
+            <Grid.ColumnDefinitions>
+                <ColumnDefinition Width="*" />
+                <ColumnDefinition Width="Auto" />
+            </Grid.ColumnDefinitions>
+
+            <!-- Selected size summary -->
+            <TextBlock Grid.Column="0"
+                       Text="{Binding SelectedSizeText}"
+                       Foreground="{StaticResource TextSecondaryBrush}"
+                       FontSize="12"
+                       VerticalAlignment="Center" />
+
+            <StackPanel Grid.Column="1" Orientation="Horizontal">
+                <Button Content="Cancel" Command="{Binding CancelCommand}"
+                        Padding="16,8" Margin="0,0,8,0" Cursor="Hand" />
+                <Button Style="{StaticResource PrimaryButton}"
+                        Content="Next" Command="{Binding NextCommand}" />
+            </StackPanel>
+        </Grid>
+
+        <!-- Backup set settings -->
+        <Border DockPanel.Dock="Bottom" Style="{StaticResource Card}"
+                Padding="12" Margin="0,10,0,0">
+            <StackPanel>
+                <TextBlock Text="Backup Settings" FontWeight="SemiBold" Margin="0,0,0,8" />
+
+                <!-- Name -->
+                <Grid Margin="0,0,0,8">
+                    <Grid.ColumnDefinitions>
+                        <ColumnDefinition Width="Auto" />
+                        <ColumnDefinition Width="*" />
+                    </Grid.ColumnDefinitions>
+                    <TextBlock Grid.Column="0" Text="Name:"
+                               VerticalAlignment="Center" Margin="0,0,6,0" />
+                    <TextBox Grid.Column="1"
+                             Text="{Binding SetName, UpdateSourceTrigger=PropertyChanged}"
+                             Padding="6,4"
+                             BorderBrush="{StaticResource BorderBrush}" />
+                </Grid>
+
+
+
+                <!-- Target mode -->
+                <StackPanel Orientation="Horizontal" Margin="0,0,0,8">
+                    <RadioButton Content="Backup to Disc"
+                                 IsChecked="True"
+                                 GroupName="TargetMode"
+                                 Margin="0,0,16,0"
+                                 VerticalContentAlignment="Center"
+                                 x:Name="DiscModeRadio" />
+                    <RadioButton Content="Backup to Directory"
+                                 IsChecked="{Binding IsDirectoryMode, Mode=TwoWay}"
+                                 GroupName="TargetMode"
+                                 VerticalContentAlignment="Center" />
+                </StackPanel>
+
+                <!-- Directory target path (directory mode) -->
+                <Grid Margin="0,0,0,8"
+                      Visibility="{Binding IsDirectoryMode, Converter={StaticResource BoolToVis}}">
+                    <Grid.ColumnDefinitions>
+                        <ColumnDefinition Width="Auto" />
+                        <ColumnDefinition Width="*" />
+                        <ColumnDefinition Width="Auto" />
+                    </Grid.ColumnDefinitions>
+                    <TextBlock Grid.Column="0" Text="Destination:"
+                               VerticalAlignment="Center" Margin="0,0,6,0" />
+                    <TextBox Grid.Column="1"
+                             Text="{Binding TargetDirectory, UpdateSourceTrigger=PropertyChanged}"
+                             Padding="6,4"
+                             BorderBrush="{StaticResource BorderBrush}"
+                             ToolTip="Path to the backup target directory" />
+                    <Button Grid.Column="2" Content="..."
+                            Command="{Binding BrowseDirectoryCommand}"
+                            Padding="8,4" Margin="4,0,0,0" Cursor="Hand" />
+                </Grid>
+
+                <!-- Subdirectory option (directory mode) -->
+                <StackPanel Orientation="Horizontal" Margin="0,0,0,8"
+                            Visibility="{Binding IsDirectoryMode, Converter={StaticResource BoolToVis}}">
+                    <CheckBox Content="Create subdirectory:"
+                              IsChecked="{Binding CreateSubdirectory, Mode=TwoWay}"
+                              VerticalContentAlignment="Center"
+                              Margin="0,0,8,0" />
+                    <TextBox Text="{Binding SubdirectoryName, UpdateSourceTrigger=PropertyChanged}"
+                             Padding="6,4" Width="250"
+                             BorderBrush="{StaticResource BorderBrush}"
+                             IsEnabled="{Binding CreateSubdirectory}" />
+                </StackPanel>
+
+                <!-- ====== Disc-mode options ====== -->
+                <StackPanel Visibility="{Binding IsDirectoryMode, Converter={StaticResource BoolToVis}, ConverterParameter=Invert}">
+                    <Grid Margin="0,0,0,6">
+                        <Grid.ColumnDefinitions>
+                            <ColumnDefinition Width="Auto" />
+                            <ColumnDefinition Width="Auto" />
+                            <ColumnDefinition Width="20" />
+                            <ColumnDefinition Width="Auto" />
+                            <ColumnDefinition Width="Auto" />
+                            <ColumnDefinition Width="20" />
+                            <ColumnDefinition Width="Auto" />
+                            <ColumnDefinition Width="100" />
+                        </Grid.ColumnDefinitions>
+                        <TextBlock Grid.Column="0" Text="Zip mode:"
+                                   VerticalAlignment="Center" Margin="0,0,6,0" />
+                        <ComboBox Grid.Column="1"
+                                  ItemsSource="{Binding ZipModeOptions}"
+                                  SelectedItem="{Binding ZipMode}"
+                                  Padding="4,3" />
+                        <TextBlock Grid.Column="3" Text="Filesystem:"
+                                   VerticalAlignment="Center" Margin="0,0,6,0" />
+                        <ComboBox Grid.Column="4"
+                                  ItemsSource="{Binding FilesystemTypeOptions}"
+                                  SelectedItem="{Binding FilesystemType}"
+                                  Padding="4,3" />
+                        <TextBlock Grid.Column="6" Text="Capacity (GB):"
+                                   VerticalAlignment="Center" Margin="0,0,6,0" />
+                        <TextBox Grid.Column="7"
+                                 Text="{Binding CapacityOverrideGb, UpdateSourceTrigger=PropertyChanged}"
+                                 Padding="4,3"
+                                 BorderBrush="{StaticResource BorderBrush}"
+                                 ToolTip="Override disc capacity in GB (leave blank for auto-detect)" />
+                    </Grid>
+                    <StackPanel Orientation="Horizontal" Margin="0,0,0,4">
+                        <CheckBox Content="Verify after burn"
+                                  IsChecked="{Binding VerifyAfterBurn}"
+                                  Margin="0,0,16,0" />
+                        <CheckBox Content="Include catalog on disc"
+                                  IsChecked="{Binding IncludeCatalogOnDisc}"
+                                  Margin="0,0,16,0" />
+                        <CheckBox Content="Allow file splitting"
+                                  IsChecked="{Binding AllowFileSplitting}" />
+                    </StackPanel>
+                </StackPanel>
+
+                <!-- ====== Directory-mode options ====== -->
+                <StackPanel Visibility="{Binding IsDirectoryMode, Converter={StaticResource BoolToVis}}">
+
+                    <!-- Deduplication -->
+                    <StackPanel Orientation="Horizontal" Margin="0,0,0,6">
+                        <CheckBox Content="File-level dedup"
+                                  IsChecked="{Binding EnableFileDeduplication}"
+                                  VerticalContentAlignment="Center"
+                                  Margin="0,0,16,0" />
+                        <CheckBox Content="Block-level dedup"
+                                  IsChecked="{Binding EnableBlockDeduplication}"
+                                  VerticalContentAlignment="Center"
+                                  Margin="0,0,8,0" />
+                        <TextBlock Text="Block size:"
+                                   VerticalAlignment="Center" Margin="0,0,4,0" />
+                        <TextBox Text="{Binding BlockSizeKb, UpdateSourceTrigger=PropertyChanged}"
+                                 Padding="4,3" Width="60"
+                                 BorderBrush="{StaticResource BorderBrush}"
+                                 IsEnabled="{Binding EnableBlockDeduplication}" />
+                        <TextBlock Text="KB" VerticalAlignment="Center" Margin="4,0,0,0" />
+                    </StackPanel>
+
+                    <!-- Version retention tier sets -->
+                    <TextBlock Text="Version Retention Tier Sets" FontWeight="SemiBold"
+                               Margin="0,0,0,4" FontSize="12" />
+
+                    <!-- Tier set selector -->
+                    <StackPanel Orientation="Horizontal" Margin="0,0,0,6">
+                        <ComboBox ItemsSource="{Binding TierSets}"
+                                  SelectedItem="{Binding SelectedTierSet}"
+                                  DisplayMemberPath="Name"
+                                  Padding="4,3" MinWidth="120" />
+                        <Button Content="+ New" Command="{Binding AddTierSetCommand}"
+                                Padding="8,4" Margin="6,0,0,0" Cursor="Hand" FontSize="11"
+                                ToolTip="Create a new custom tier set" />
+                        <Button Content="&#x2715; Remove" Command="{Binding RemoveTierSetCommand}"
+                                Padding="8,4" Margin="4,0,0,0" Cursor="Hand" FontSize="11"
+                                ToolTip="Remove the selected tier set" />
+                    </StackPanel>
+
+                    <!-- Tier set name editor (custom sets only) -->
+                    <Grid Margin="20,0,0,4">
+                        <Grid.Style>
+                            <Style TargetType="Grid">
+                                <Setter Property="Visibility" Value="Collapsed" />
+                                <Style.Triggers>
+                                    <DataTrigger Binding="{Binding SelectedTierSet.IsBuiltIn}" Value="False">
+                                        <Setter Property="Visibility" Value="Visible" />
+                                    </DataTrigger>
+                                </Style.Triggers>
+                            </Style>
+                        </Grid.Style>
+                        <Grid.ColumnDefinitions>
+                            <ColumnDefinition Width="Auto" />
+                            <ColumnDefinition Width="200" />
+                        </Grid.ColumnDefinitions>
+                        <TextBlock Grid.Column="0" Text="Name:"
+                                   VerticalAlignment="Center" Margin="0,0,6,0" FontSize="11" />
+                        <TextBox Grid.Column="1"
+                                 Text="{Binding SelectedTierSet.Name, UpdateSourceTrigger=PropertyChanged}"
+                                 Padding="4,3" FontSize="11"
+                                 BorderBrush="{StaticResource BorderBrush}" />
+                    </Grid>
+
+                    <!-- "None" description -->
+                    <TextBlock Margin="20,0,0,4" FontSize="11" FontStyle="Italic"
+                               Foreground="{StaticResource TextDimBrush}"
+                               Text="No version history — files are overwritten in place.">
+                        <TextBlock.Style>
+                            <Style TargetType="TextBlock">
+                                <Setter Property="Visibility" Value="Collapsed" />
+                                <Style.Triggers>
+                                    <DataTrigger Binding="{Binding SelectedTierSet.Name}" Value="None">
+                                        <Setter Property="Visibility" Value="Visible" />
+                                    </DataTrigger>
+                                </Style.Triggers>
+                            </Style>
+                        </TextBlock.Style>
+                    </TextBlock>
+
+                    <!-- Retention tiers of the selected set -->
+                    <StackPanel Margin="20,0,0,0">
+                        <StackPanel.Style>
+                            <Style TargetType="StackPanel">
+                                <Style.Triggers>
+                                    <DataTrigger Binding="{Binding CanEditSelectedTierSet}" Value="False">
+                                        <Setter Property="Visibility" Value="Collapsed" />
+                                    </DataTrigger>
+                                </Style.Triggers>
+                            </Style>
+                        </StackPanel.Style>
+                        <ItemsControl ItemsSource="{Binding SelectedTierSet.Tiers}">
+                            <ItemsControl.ItemTemplate>
+                                <DataTemplate>
+                                    <StackPanel Orientation="Horizontal" Margin="0,0,0,4">
+                                        <TextBlock Text="Under" VerticalAlignment="Center"
+                                                   Margin="0,0,4,0" />
+                                        <Grid Width="60">
+                                            <TextBox Text="{Binding MaxAgeDays, UpdateSourceTrigger=PropertyChanged}"
+                                                     Padding="4,3" x:Name="AgeDaysBox"
+                                                     BorderBrush="{StaticResource BorderBrush}"
+                                                     ToolTip="Days (leave empty for catch-all)" />
+                                            <TextBlock Text="any" IsHitTestVisible="False"
+                                                       Foreground="{StaticResource TextDimBrush}"
+                                                       VerticalAlignment="Center" Margin="6,0,0,0">
+                                                <TextBlock.Style>
+                                                    <Style TargetType="TextBlock">
+                                                        <Setter Property="Visibility" Value="Collapsed" />
+                                                        <Style.Triggers>
+                                                            <DataTrigger Binding="{Binding Text, ElementName=AgeDaysBox}"
+                                                                         Value="">
+                                                                <Setter Property="Visibility" Value="Visible" />
+                                                            </DataTrigger>
+                                                        </Style.Triggers>
+                                                    </Style>
+                                                </TextBlock.Style>
+                                            </TextBlock>
+                                        </Grid>
+                                        <TextBlock Text="days, keep" VerticalAlignment="Center"
+                                                   Margin="4,0,4,0" />
+                                        <Grid Width="50">
+                                            <TextBox Text="{Binding MaxVersions, UpdateSourceTrigger=PropertyChanged}"
+                                                     Padding="4,3" x:Name="MaxVersionsBox"
+                                                     BorderBrush="{StaticResource BorderBrush}"
+                                                     ToolTip="Max versions (leave empty for all)" />
+                                            <TextBlock Text="all" IsHitTestVisible="False"
+                                                       Foreground="{StaticResource TextDimBrush}"
+                                                       VerticalAlignment="Center" Margin="6,0,0,0">
+                                                <TextBlock.Style>
+                                                    <Style TargetType="TextBlock">
+                                                        <Setter Property="Visibility" Value="Collapsed" />
+                                                        <Style.Triggers>
+                                                            <DataTrigger Binding="{Binding Text, ElementName=MaxVersionsBox}"
+                                                                         Value="">
+                                                                <Setter Property="Visibility" Value="Visible" />
+                                                            </DataTrigger>
+                                                        </Style.Triggers>
+                                                    </Style>
+                                                </TextBlock.Style>
+                                            </TextBlock>
+                                        </Grid>
+                                        <TextBlock Text="versions" VerticalAlignment="Center"
+                                                   Margin="4,0,8,0" />
+                                        <Button Content="&#x2715;" Command="{Binding RemoveCommand}"
+                                                Padding="4,2" Cursor="Hand" FontSize="11" />
+                                    </StackPanel>
+                                </DataTemplate>
+                            </ItemsControl.ItemTemplate>
+                        </ItemsControl>
+                        <Button Content="+ Add Tier" Command="{Binding AddRetentionTierCommand}"
+                                HorizontalAlignment="Left"
+                                Padding="8,4" Margin="0,2,0,6" Cursor="Hand" FontSize="11" />
+                    </StackPanel>
+
+                    <!-- Schedule -->
+                    <CheckBox Content="Enable automated backups"
+                              IsChecked="{Binding ScheduleEnabled, Mode=TwoWay}"
+                              FontWeight="SemiBold" FontSize="12" Margin="0,0,0,6" />
+                    <StackPanel IsEnabled="{Binding ScheduleEnabled}" Margin="0,0,0,2">
+                        <StackPanel Orientation="Horizontal" Margin="0,0,0,4">
+                            <TextBlock Text="Mode:" VerticalAlignment="Center" Margin="0,0,6,0" />
+                            <ComboBox ItemsSource="{Binding ScheduleModeOptions}"
+                                      SelectedItem="{Binding ScheduleMode}"
+                                      Padding="4,3" Width="120" />
+                        </StackPanel>
+                        <!-- Interval -->
+                        <StackPanel Orientation="Horizontal" Margin="0,0,0,4">
+                            <StackPanel.Style>
+                                <Style TargetType="StackPanel">
+                                    <Setter Property="Visibility" Value="Collapsed" />
+                                    <Style.Triggers>
+                                        <DataTrigger Binding="{Binding ScheduleMode}" Value="Interval">
+                                            <Setter Property="Visibility" Value="Visible" />
+                                        </DataTrigger>
+                                    </Style.Triggers>
+                                </Style>
+                            </StackPanel.Style>
+                            <TextBlock Text="Every" VerticalAlignment="Center" Margin="0,0,6,0" />
+                            <TextBox Text="{Binding ScheduleIntervalHours, UpdateSourceTrigger=PropertyChanged}"
+                                     Padding="4,3" Width="60"
+                                     BorderBrush="{StaticResource BorderBrush}" />
+                            <TextBlock Text="hours" VerticalAlignment="Center" Margin="6,0,0,0" />
+                        </StackPanel>
+                        <!-- Daily -->
+                        <StackPanel Orientation="Horizontal" Margin="0,0,0,4">
+                            <StackPanel.Style>
+                                <Style TargetType="StackPanel">
+                                    <Setter Property="Visibility" Value="Collapsed" />
+                                    <Style.Triggers>
+                                        <DataTrigger Binding="{Binding ScheduleMode}" Value="Daily">
+                                            <Setter Property="Visibility" Value="Visible" />
+                                        </DataTrigger>
+                                    </Style.Triggers>
+                                </Style>
+                            </StackPanel.Style>
+                            <TextBlock Text="Run at" VerticalAlignment="Center" Margin="0,0,6,0" />
+                            <TextBox Text="{Binding ScheduleDailyHour, UpdateSourceTrigger=PropertyChanged}"
+                                     Padding="4,3" Width="40"
+                                     BorderBrush="{StaticResource BorderBrush}"
+                                     ToolTip="Hour (0-23)" />
+                            <TextBlock Text=":" VerticalAlignment="Center" Margin="2,0,2,0" />
+                            <TextBox Text="{Binding ScheduleDailyMinute, UpdateSourceTrigger=PropertyChanged, StringFormat='{}{0:D2}'}"
+                                     Padding="4,3" Width="40"
+                                     BorderBrush="{StaticResource BorderBrush}"
+                                     ToolTip="Minute (0-59)" />
+                        </StackPanel>
+                        <!-- Continuous -->
+                        <StackPanel Orientation="Horizontal" Margin="0,0,0,4">
+                            <StackPanel.Style>
+                                <Style TargetType="StackPanel">
+                                    <Setter Property="Visibility" Value="Collapsed" />
+                                    <Style.Triggers>
+                                        <DataTrigger Binding="{Binding ScheduleMode}" Value="Continuous">
+                                            <Setter Property="Visibility" Value="Visible" />
+                                        </DataTrigger>
+                                    </Style.Triggers>
+                                </Style>
+                            </StackPanel.Style>
+                            <TextBlock Text="Wait" VerticalAlignment="Center" Margin="0,0,6,0" />
+                            <TextBox Text="{Binding ScheduleDebounceSeconds, UpdateSourceTrigger=PropertyChanged}"
+                                     Padding="4,3" Width="60"
+                                     BorderBrush="{StaticResource BorderBrush}" />
+                            <TextBlock Text="seconds after last change"
+                                       VerticalAlignment="Center" Margin="6,0,0,0" />
+                        </StackPanel>
+                    </StackPanel>
+                </StackPanel>
+            </StackPanel>
+        </Border>
 
         <!-- TreeView with integrated column headers -->
         <TreeView ItemsSource="{Binding Roots}">
@@ -35,15 +420,40 @@
                             BorderBrush="{StaticResource BorderBrush}"
                             Background="{StaticResource SurfaceBrush}">
                         <DockPanel>
-                            <!-- Column header row -->
+                            <!-- Column header row.
+                                 Right margin compensates for the scrollbar width so
+                                 header columns stay aligned with the item rows inside
+                                 the ScrollViewer. -->
                             <Grid DockPanel.Dock="Top">
+                                <Grid.Style>
+                                    <Style TargetType="Grid">
+                                        <Style.Triggers>
+                                            <DataTrigger Binding="{Binding ComputedVerticalScrollBarVisibility, ElementName=TreeScroll}" Value="Visible">
+                                                <Setter Property="Margin" Value="0,0,17,0" />
+                                            </DataTrigger>
+                                        </Style.Triggers>
+                                    </Style>
+                                </Grid.Style>
                                 <Grid.ColumnDefinitions>
+                                    <ColumnDefinition Width="Auto" SharedSizeGroup="RetentionCol" />
                                     <ColumnDefinition Width="Auto" SharedSizeGroup="AutoIncludeCol" />
-                                    <ColumnDefinition Width="Auto" SharedSizeGroup="VersionsCol" />
                                     <ColumnDefinition Width="Auto" SharedSizeGroup="IncludeCol" />
+                                    <ColumnDefinition Width="Auto" SharedSizeGroup="FilterCol" />
                                     <ColumnDefinition Width="*" />
+                                    <ColumnDefinition Width="Auto" SharedSizeGroup="FilesCol" />
+                                    <ColumnDefinition Width="Auto" SharedSizeGroup="SizeCol" />
                                 </Grid.ColumnDefinitions>
                                 <Border Grid.Column="0"
+                                        BorderBrush="{StaticResource BorderBrush}"
+                                        BorderThickness="0,0,1,1"
+                                        Padding="4,6">
+                                    <TextBlock Text="Retention"
+                                               FontSize="11"
+                                               Foreground="{StaticResource TextSecondaryBrush}"
+                                               VerticalAlignment="Center"
+                                               ToolTip="Version retention policy (right-click to inherit from parent)" />
+                                </Border>
+                                <Border Grid.Column="1"
                                         BorderBrush="{StaticResource BorderBrush}"
                                         BorderThickness="0,0,1,1"
                                         Padding="4,6">
@@ -55,21 +465,9 @@
                                               VerticalContentAlignment="Center"
                                               ToolTip="Check/uncheck all auto-include" />
                                 </Border>
-                                <Border Grid.Column="1"
-                                        BorderBrush="{StaticResource BorderBrush}"
-                                        BorderThickness="0,0,1,1"
-                                        Padding="4,6">
-                                    <CheckBox IsChecked="{Binding IsAllKeepVersionHistory, Mode=TwoWay}"
-                                              IsThreeState="False"
-                                              Content="Keep versions"
-                                              FontSize="11"
-                                              Foreground="{StaticResource TextSecondaryBrush}"
-                                              VerticalContentAlignment="Center"
-                                              ToolTip="Keep previous versions when files change" />
-                                </Border>
                                 <Border Grid.Column="2"
                                         BorderBrush="{StaticResource BorderBrush}"
-                                        BorderThickness="0,0,0,1"
+                                        BorderThickness="0,0,1,1"
                                         Padding="4,6">
                                     <CheckBox IsChecked="{Binding IsAllSelected, Mode=TwoWay}"
                                               IsThreeState="False"
@@ -79,11 +477,72 @@
                                 </Border>
                                 <Border Grid.Column="3"
                                         BorderBrush="{StaticResource BorderBrush}"
-                                        BorderThickness="0,0,0,1" />
+                                        BorderThickness="0,0,1,1"
+                                        Padding="4,6" />
+                                <Border Grid.Column="4"
+                                        BorderBrush="{StaticResource BorderBrush}"
+                                        BorderThickness="0,0,1,1"
+                                        Padding="4,6"
+                                        Cursor="Hand"
+                                        Background="Transparent">
+                                    <Border.InputBindings>
+                                        <MouseBinding MouseAction="LeftClick"
+                                                      Command="{Binding SortByNameCommand}" />
+                                    </Border.InputBindings>
+                                    <TextBlock FontSize="11"
+                                               Foreground="{StaticResource TextSecondaryBrush}">
+                                        <Run Text="Name" /><Run Text="{Binding NameSortIndicator, Mode=OneWay}" />
+                                    </TextBlock>
+                                </Border>
+                                <Border Grid.Column="5"
+                                        BorderBrush="{StaticResource BorderBrush}"
+                                        BorderThickness="0,0,1,1"
+                                        Padding="8,6"
+                                        Background="Transparent">
+                                    <Border.Style>
+                                        <Style TargetType="Border">
+                                            <Style.Triggers>
+                                                <DataTrigger Binding="{Binding ShowSizes}" Value="False">
+                                                    <Setter Property="Visibility" Value="Collapsed" />
+                                                </DataTrigger>
+                                            </Style.Triggers>
+                                        </Style>
+                                    </Border.Style>
+                                    <TextBlock FontSize="11"
+                                               Foreground="{StaticResource TextSecondaryBrush}"
+                                               HorizontalAlignment="Right"
+                                               Text="Files" />
+                                </Border>
+                                <Border Grid.Column="6"
+                                        BorderBrush="{StaticResource BorderBrush}"
+                                        BorderThickness="0,0,0,1"
+                                        Padding="8,6"
+                                        Cursor="Hand"
+                                        Background="Transparent">
+                                    <Border.Style>
+                                        <Style TargetType="Border">
+                                            <Style.Triggers>
+                                                <DataTrigger Binding="{Binding ShowSizes}" Value="False">
+                                                    <Setter Property="Visibility" Value="Collapsed" />
+                                                </DataTrigger>
+                                            </Style.Triggers>
+                                        </Style>
+                                    </Border.Style>
+                                    <Border.InputBindings>
+                                        <MouseBinding MouseAction="LeftClick"
+                                                      Command="{Binding SortBySizeCommand}" />
+                                    </Border.InputBindings>
+                                    <TextBlock FontSize="11"
+                                               Foreground="{StaticResource TextSecondaryBrush}"
+                                               HorizontalAlignment="Right">
+                                        <Run Text="Size" /><Run Text="{Binding SizeSortIndicator, Mode=OneWay}" />
+                                    </TextBlock>
+                                </Border>
                             </Grid>
 
                             <!-- Scrollable tree items -->
-                            <ScrollViewer Focusable="False"
+                            <ScrollViewer x:Name="TreeScroll"
+                                          Focusable="False"
                                           CanContentScroll="False"
                                           HorizontalScrollBarVisibility="Disabled"
                                           VerticalScrollBarVisibility="Auto"
@@ -109,43 +568,114 @@
                                     <!-- This node's row -->
                                     <Grid MinHeight="24">
                                         <Grid.ColumnDefinitions>
+                                            <ColumnDefinition Width="Auto" SharedSizeGroup="RetentionCol" />
                                             <ColumnDefinition Width="Auto" SharedSizeGroup="AutoIncludeCol" />
-                                            <ColumnDefinition Width="Auto" SharedSizeGroup="VersionsCol" />
                                             <ColumnDefinition Width="Auto" SharedSizeGroup="IncludeCol" />
+                                            <ColumnDefinition Width="Auto" SharedSizeGroup="FilterCol" />
                                             <ColumnDefinition Width="*" />
+                                            <ColumnDefinition Width="Auto" SharedSizeGroup="FilesCol" />
+                                            <ColumnDefinition Width="Auto" SharedSizeGroup="SizeCol" />
                                         </Grid.ColumnDefinitions>
 
-                                        <!-- Col 0: Auto-include new (fixed position, not indented) -->
+                                        <!-- Col 0: Retention policy (tier set) -->
                                         <Border Grid.Column="0"
+                                                BorderBrush="{StaticResource BorderBrush}"
+                                                BorderThickness="0,0,1,0"
+                                                Padding="2,0">
+                                            <ComboBox SelectedItem="{Binding DisplayTierSetName, Mode=TwoWay}"
+                                                      ItemsSource="{Binding DataContext.AvailableTierSetNames,
+                                                                    RelativeSource={RelativeSource AncestorType=TreeView}}"
+                                                      FontSize="10"
+                                                      Padding="2,1"
+                                                      MinWidth="70"
+                                                      VerticalAlignment="Center"
+                                                      BorderThickness="0">
+                                                <ComboBox.ContextMenu>
+                                                    <ContextMenu>
+                                                        <MenuItem Header="Inherit from parent"
+                                                                  Command="{Binding ResetTierToInheritCommand}"
+                                                                  ToolTip="Remove explicit assignment; inherit retention policy from parent directory" />
+                                                    </ContextMenu>
+                                                </ComboBox.ContextMenu>
+                                                <ComboBox.Style>
+                                                    <Style TargetType="ComboBox">
+                                                        <Setter Property="Foreground" Value="{StaticResource TextPrimaryBrush}" />
+                                                        <Style.Triggers>
+                                                            <DataTrigger Binding="{Binding IsSelected}" Value="False">
+                                                                <Setter Property="IsEnabled" Value="False" />
+                                                            </DataTrigger>
+                                                            <DataTrigger Binding="{Binding IsInheritedTier}" Value="True">
+                                                                <Setter Property="Foreground" Value="{StaticResource TextDimBrush}" />
+                                                            </DataTrigger>
+                                                        </Style.Triggers>
+                                                    </Style>
+                                                </ComboBox.Style>
+                                            </ComboBox>
+                                        </Border>
+
+                                        <!-- Col 1: Auto-include new (fixed position, not indented) -->
+                                        <Border Grid.Column="1"
                                                 BorderBrush="{StaticResource BorderBrush}"
                                                 BorderThickness="0,0,1,0">
                                             <CheckBox IsChecked="{Binding AutoIncludeNew, Mode=TwoWay}"
                                                       VerticalAlignment="Center"
                                                       HorizontalAlignment="Center"
                                                       ToolTip="Auto-include new subdirectories"
-                                                      Visibility="{Binding IsDirectory, Converter={StaticResource BoolToVis}}" />
-                                        </Border>
-
-                                        <!-- Col 1: Keep versions -->
-                                        <Border Grid.Column="1"
-                                                BorderBrush="{StaticResource BorderBrush}"
-                                                BorderThickness="0,0,1,0">
-                                            <CheckBox IsChecked="{Binding KeepVersionHistory, Mode=TwoWay}"
-                                                      VerticalAlignment="Center"
-                                                      HorizontalAlignment="Center"
-                                                      ToolTip="Keep previous versions when this file/directory changes" />
+                                                      Visibility="{Binding IsDirectory, Converter={StaticResource BoolToVis}}">
+                                                <CheckBox.Style>
+                                                    <Style TargetType="CheckBox">
+                                                        <Style.Triggers>
+                                                            <DataTrigger Binding="{Binding IsSelected}" Value="False">
+                                                                <Setter Property="IsEnabled" Value="False" />
+                                                            </DataTrigger>
+                                                        </Style.Triggers>
+                                                    </Style>
+                                                </CheckBox.Style>
+                                            </CheckBox>
                                         </Border>
 
                                         <!-- Col 2: Include -->
-                                        <CheckBox Grid.Column="2"
-                                                  IsChecked="{Binding IsSelected, Mode=TwoWay}"
-                                                  IsThreeState="False"
-                                                  VerticalAlignment="Center"
-                                                  HorizontalAlignment="Center" />
+                                        <Border Grid.Column="2"
+                                                BorderBrush="{StaticResource BorderBrush}"
+                                                BorderThickness="0,0,1,0">
+                                            <CheckBox IsChecked="{Binding IsSelected, Mode=TwoWay}"
+                                                      IsThreeState="False"
+                                                      VerticalAlignment="Center"
+                                                      HorizontalAlignment="Center" />
+                                        </Border>
 
-                                        <!-- Col 3: Clickable name area (single-click expands directories) -->
-                                        <Border x:Name="NameArea" Grid.Column="3"
-                                                Background="Transparent">
+                                        <!-- Col 3: Filter button (directories only) -->
+                                        <Border Grid.Column="3"
+                                                BorderBrush="{StaticResource BorderBrush}"
+                                                BorderThickness="0,0,1,0">
+                                            <Button x:Name="ExclusionBtn"
+                                                    Command="{Binding EditExclusionsCommand}"
+                                                    Padding="3,1" Margin="2"
+                                                    VerticalAlignment="Center" HorizontalAlignment="Center"
+                                                    Cursor="Hand"
+                                                    Background="Transparent"
+                                                    BorderBrush="{StaticResource BorderBrush}"
+                                                    BorderThickness="1"
+                                                    ToolTip="Edit exclusion/inclusion rules for this directory"
+                                                    Visibility="Collapsed">
+                                                <TextBlock x:Name="ExclusionBtnText"
+                                                           Text="Filter"
+                                                           FontSize="10"
+                                                           Foreground="{StaticResource TextDimBrush}" />
+                                            </Button>
+                                        </Border>
+
+                                        <!-- Col 4: Clickable name area (single-click expands directories) -->
+                                        <Border x:Name="NameArea" Grid.Column="4"
+                                                Background="Transparent"
+                                                BorderBrush="{StaticResource BorderBrush}"
+                                                BorderThickness="0,0,1,0">
+                                            <Border.ContextMenu>
+                                                <ContextMenu>
+                                                    <MenuItem Header="Edit Exclusion Rules..."
+                                                              Command="{Binding EditExclusionsCommand}" />
+                                                </ContextMenu>
+                                            </Border.ContextMenu>
                                             <Border.InputBindings>
                                                 <MouseBinding MouseAction="LeftClick"
                                                               Command="{Binding ToggleExpandCommand}" />
@@ -171,7 +701,64 @@
                                                 <ContentPresenter x:Name="PART_Header"
                                                                   ContentSource="Header"
                                                                   VerticalAlignment="Center" />
+                                                <!-- Backup status dot (wrapped for reliable tooltip hit-testing) -->
+                                                <Border x:Name="StatusDotArea"
+                                                        Background="Transparent"
+                                                        Padding="3"
+                                                        Margin="2,0,0,0"
+                                                        VerticalAlignment="Center"
+                                                        ToolTipService.InitialShowDelay="0"
+                                                        Visibility="Collapsed">
+                                                    <Ellipse x:Name="StatusDot"
+                                                             Width="7" Height="7" />
+                                                </Border>
                                             </StackPanel>
+                                        </Border>
+
+                                        <!-- Col 5: File count (visible only when ShowSizes is on) -->
+                                        <Border Grid.Column="5"
+                                                BorderBrush="{StaticResource BorderBrush}"
+                                                BorderThickness="0,0,1,0">
+                                            <Border.Style>
+                                                <Style TargetType="Border">
+                                                    <Style.Triggers>
+                                                        <DataTrigger Binding="{Binding DataContext.ShowSizes,
+                                                                     RelativeSource={RelativeSource AncestorType=TreeView}}"
+                                                                     Value="False">
+                                                            <Setter Property="Visibility" Value="Collapsed" />
+                                                        </DataTrigger>
+                                                    </Style.Triggers>
+                                                </Style>
+                                            </Border.Style>
+                                            <TextBlock Text="{Binding FormattedFileCount}"
+                                                       VerticalAlignment="Center"
+                                                       HorizontalAlignment="Right"
+                                                       FontSize="11"
+                                                       Foreground="{StaticResource TextSecondaryBrush}"
+                                                       Padding="8,0,8,0"
+                                                       MinWidth="40" />
+                                        </Border>
+
+                                        <!-- Col 6: Size (visible only when ShowSizes is on) -->
+                                        <Border Grid.Column="6">
+                                            <Border.Style>
+                                                <Style TargetType="Border">
+                                                    <Style.Triggers>
+                                                        <DataTrigger Binding="{Binding DataContext.ShowSizes,
+                                                                     RelativeSource={RelativeSource AncestorType=TreeView}}"
+                                                                     Value="False">
+                                                            <Setter Property="Visibility" Value="Collapsed" />
+                                                        </DataTrigger>
+                                                    </Style.Triggers>
+                                                </Style>
+                                            </Border.Style>
+                                            <TextBlock Text="{Binding FormattedSize}"
+                                                       VerticalAlignment="Center"
+                                                       HorizontalAlignment="Right"
+                                                       FontSize="11"
+                                                       Foreground="{StaticResource TextSecondaryBrush}"
+                                                       Padding="8,0,8,0"
+                                                       MinWidth="60" />
                                         </Border>
                                     </Grid>
 
@@ -193,6 +780,34 @@
                                     </Trigger>
                                     <DataTrigger Binding="{Binding IsDirectory}" Value="True">
                                         <Setter TargetName="NameArea" Property="Cursor" Value="Hand" />
+                                        <Setter TargetName="ExclusionBtn" Property="Visibility" Value="Visible" />
+                                    </DataTrigger>
+                                    <DataTrigger Binding="{Binding HasExclusionRules}" Value="True">
+                                        <Setter TargetName="ExclusionBtnText" Property="Foreground" Value="#1976D2" />
+                                        <Setter TargetName="ExclusionBtn" Property="BorderBrush" Value="#1976D2" />
+                                        <Setter TargetName="ExclusionBtnText" Property="FontWeight" Value="SemiBold" />
+                                    </DataTrigger>
+
+                                    <!-- Backup status dot colors -->
+                                    <DataTrigger Binding="{Binding BackupStatus}" Value="{x:Static vm:BackupStatus.BackedUp}">
+                                        <Setter TargetName="StatusDotArea" Property="Visibility" Value="Visible" />
+                                        <Setter TargetName="StatusDot" Property="Fill" Value="#2E7D32" />
+                                        <Setter TargetName="StatusDotArea" Property="ToolTip" Value="Backed up" />
+                                    </DataTrigger>
+                                    <DataTrigger Binding="{Binding BackupStatus}" Value="{x:Static vm:BackupStatus.Changed}">
+                                        <Setter TargetName="StatusDotArea" Property="Visibility" Value="Visible" />
+                                        <Setter TargetName="StatusDot" Property="Fill" Value="#EF6C00" />
+                                        <Setter TargetName="StatusDotArea" Property="ToolTip" Value="Changed since last backup" />
+                                    </DataTrigger>
+                                    <DataTrigger Binding="{Binding BackupStatus}" Value="{x:Static vm:BackupStatus.NotBackedUp}">
+                                        <Setter TargetName="StatusDotArea" Property="Visibility" Value="Visible" />
+                                        <Setter TargetName="StatusDot" Property="Fill" Value="#C62828" />
+                                        <Setter TargetName="StatusDotArea" Property="ToolTip" Value="Not backed up" />
+                                    </DataTrigger>
+                                    <DataTrigger Binding="{Binding BackupStatus}" Value="{x:Static vm:BackupStatus.Partial}">
+                                        <Setter TargetName="StatusDotArea" Property="Visibility" Value="Visible" />
+                                        <Setter TargetName="StatusDot" Property="Fill" Value="#F9A825" />
+                                        <Setter TargetName="StatusDotArea" Property="ToolTip" Value="Partially backed up" />
                                     </DataTrigger>
                                 </ControlTemplate.Triggers>
                             </ControlTemplate>

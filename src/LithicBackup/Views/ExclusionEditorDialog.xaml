@@ -1,0 +1,180 @@
+<Window x:Class="LithicBackup.Views.ExclusionEditorDialog"
+        xmlns="http://schemas.microsoft.com/winfx/2006/xaml/presentation"
+        xmlns:x="http://schemas.microsoft.com/winfx/2006/xaml"
+        Title="Edit Exclusion Rules"
+        Width="520" SizeToContent="Height"
+        WindowStartupLocation="CenterOwner"
+        ResizeMode="NoResize"
+        ShowInTaskbar="False"
+        Style="{StaticResource MainWindowStyle}">
+
+    <StackPanel Margin="16">
+        <!-- Header -->
+        <TextBlock FontWeight="SemiBold" FontSize="14"
+                   Foreground="{StaticResource TextPrimaryBrush}"
+                   Text="{Binding DirectoryName}" />
+        <TextBlock Foreground="{StaticResource TextSecondaryBrush}"
+                   FontSize="11" Margin="0,2,0,12"
+                   TextTrimming="CharacterEllipsis"
+                   Text="{Binding DirectoryPath}" />
+
+        <!-- Inherited exclusions (read-only) -->
+        <TextBlock Text="Inherited exclusions from parent directories:"
+                   Foreground="{StaticResource TextSecondaryBrush}"
+                   FontSize="11" Margin="0,0,0,4"
+                   Visibility="{Binding HasInheritedExclusions, Converter={StaticResource BoolToVis}}" />
+        <TextBox Text="{Binding InheritedExclusionsText, Mode=OneWay}"
+                 IsReadOnly="True"
+                 FontSize="11"
+                 Padding="6,4" MaxHeight="60"
+                 VerticalScrollBarVisibility="Auto"
+                 TextWrapping="NoWrap"
+                 Opacity="0.6"
+                 BorderBrush="{StaticResource BorderBrush}"
+                 Visibility="{Binding HasInheritedExclusions, Converter={StaticResource BoolToVis}}"
+                 Margin="0,0,0,12" />
+
+        <!-- Mode toggle -->
+        <StackPanel Orientation="Horizontal" Margin="0,0,0,10">
+            <RadioButton Content="Exclude matching files"
+                         IsChecked="{Binding IsExcludeMode}"
+                         GroupName="FilterMode"
+                         VerticalContentAlignment="Center"
+                         Margin="0,0,16,0" />
+            <RadioButton Content="Include only matching files"
+                         IsChecked="{Binding IsIncludeOnlyMode}"
+                         GroupName="FilterMode"
+                         VerticalContentAlignment="Center" />
+        </StackPanel>
+
+        <!-- Exclude mode: exclusion patterns + re-include list -->
+        <StackPanel Visibility="{Binding IsExcludeMode, Converter={StaticResource BoolToVis}}">
+            <TextBlock Text="Exclude patterns (one per line):"
+                       Foreground="{StaticResource TextSecondaryBrush}"
+                       FontSize="11" Margin="0,0,0,4" />
+            <TextBox x:Name="ExcludeBox"
+                     Text="{Binding ExcludedPatterns, UpdateSourceTrigger=PropertyChanged}"
+                     Padding="6,4" Height="80"
+                     AcceptsReturn="True"
+                     VerticalScrollBarVisibility="Auto"
+                     TextWrapping="NoWrap"
+                     BorderBrush="{StaticResource BorderBrush}"
+                     ToolTip="Examples:  *.log  *.tmp  *.bak  */.vs/*  */bin/*  */obj/*&#x0a;&#x0a;Patterns apply to this directory and all subdirectories.&#x0a;Use * to match any characters. Use */ for path patterns." />
+
+            <TextBlock Text="Re-include patterns (override parent exclusions):"
+                       Foreground="{StaticResource TextSecondaryBrush}"
+                       FontSize="11" Margin="0,10,0,4" />
+
+            <!-- Re-include pattern list -->
+            <Border BorderBrush="{StaticResource BorderBrush}" BorderThickness="1"
+                    CornerRadius="3" Padding="4" MaxHeight="140">
+                <ScrollViewer VerticalScrollBarVisibility="Auto"
+                              HorizontalScrollBarVisibility="Disabled">
+                    <StackPanel>
+                        <ItemsControl ItemsSource="{Binding IncludePatternItems}">
+                            <ItemsControl.ItemTemplate>
+                                <DataTemplate>
+                                    <Grid Margin="0,1">
+                                        <Grid.ColumnDefinitions>
+                                            <ColumnDefinition Width="*" />
+                                            <ColumnDefinition Width="Auto" />
+                                            <ColumnDefinition Width="Auto" />
+                                        </Grid.ColumnDefinitions>
+                                        <TextBox Text="{Binding Pattern, UpdateSourceTrigger=PropertyChanged}"
+                                                 FontSize="12" Padding="4,2"
+                                                 BorderBrush="{StaticResource BorderBrush}" />
+                                        <CheckBox Grid.Column="1" Content="Keep versions"
+                                                  IsChecked="{Binding KeepVersions}"
+                                                  VerticalAlignment="Center"
+                                                  FontSize="11" Margin="8,0,0,0" />
+                                        <Button Grid.Column="2" Content="&#x2715;" Padding="4,1" Margin="4,0,0,0"
+                                                FontSize="10" Cursor="Hand"
+                                                Background="Transparent" BorderThickness="0"
+                                                Foreground="{StaticResource TextDimBrush}"
+                                                Command="{Binding DataContext.RemovePatternCommand,
+                                                          RelativeSource={RelativeSource AncestorType=Window}}"
+                                                CommandParameter="{Binding}"
+                                                ToolTip="Remove this pattern" />
+                                    </Grid>
+                                </DataTemplate>
+                            </ItemsControl.ItemTemplate>
+                        </ItemsControl>
+                        <Button Content="+ Add pattern" FontSize="11" Padding="6,3"
+                                Margin="0,4,0,0" HorizontalAlignment="Left"
+                                Cursor="Hand" Background="Transparent"
+                                BorderBrush="{StaticResource BorderBrush}"
+                                Foreground="{StaticResource TextSecondaryBrush}"
+                                Command="{Binding AddPatternCommand}" />
+                    </StackPanel>
+                </ScrollViewer>
+            </Border>
+        </StackPanel>
+
+        <!-- Include-only mode: inclusion pattern list -->
+        <StackPanel Visibility="{Binding IsIncludeOnlyMode, Converter={StaticResource BoolToVis}}">
+            <TextBlock Text="Only include files matching these patterns:"
+                       Foreground="{StaticResource TextSecondaryBrush}"
+                       FontSize="11" Margin="0,0,0,4" />
+
+            <Border BorderBrush="{StaticResource BorderBrush}" BorderThickness="1"
+                    CornerRadius="3" Padding="4" MaxHeight="200">
+                <ScrollViewer VerticalScrollBarVisibility="Auto"
+                              HorizontalScrollBarVisibility="Disabled">
+                    <StackPanel>
+                        <ItemsControl ItemsSource="{Binding IncludePatternItems}">
+                            <ItemsControl.ItemTemplate>
+                                <DataTemplate>
+                                    <Grid Margin="0,1">
+                                        <Grid.ColumnDefinitions>
+                                            <ColumnDefinition Width="*" />
+                                            <ColumnDefinition Width="Auto" />
+                                            <ColumnDefinition Width="Auto" />
+                                        </Grid.ColumnDefinitions>
+                                        <TextBox Text="{Binding Pattern, UpdateSourceTrigger=PropertyChanged}"
+                                                 FontSize="12" Padding="4,2"
+                                                 BorderBrush="{StaticResource BorderBrush}" />
+                                        <CheckBox Grid.Column="1" Content="Keep versions"
+                                                  IsChecked="{Binding KeepVersions}"
+                                                  VerticalAlignment="Center"
+                                                  FontSize="11" Margin="8,0,0,0" />
+                                        <Button Grid.Column="2" Content="&#x2715;" Padding="4,1" Margin="4,0,0,0"
+                                                FontSize="10" Cursor="Hand"
+                                                Background="Transparent" BorderThickness="0"
+                                                Foreground="{StaticResource TextDimBrush}"
+                                                Command="{Binding DataContext.RemovePatternCommand,
+                                                          RelativeSource={RelativeSource AncestorType=Window}}"
+                                                CommandParameter="{Binding}"
+                                                ToolTip="Remove this pattern" />
+                                    </Grid>
+                                </DataTemplate>
+                            </ItemsControl.ItemTemplate>
+                        </ItemsControl>
+                        <Button Content="+ Add pattern" FontSize="11" Padding="6,3"
+                                Margin="0,4,0,0" HorizontalAlignment="Left"
+                                Cursor="Hand" Background="Transparent"
+                                BorderBrush="{StaticResource BorderBrush}"
+                                Foreground="{StaticResource TextSecondaryBrush}"
+                                Command="{Binding AddPatternCommand}" />
+                    </StackPanel>
+                </ScrollViewer>
+            </Border>
+
+            <TextBlock Text="All other files will be excluded from backup."
+                       Foreground="{StaticResource TextDimBrush}"
+                       FontSize="11" FontStyle="Italic"
+                       Margin="0,4,0,0" />
+        </StackPanel>
+
+        <!-- Buttons -->
+        <StackPanel Orientation="Horizontal" HorizontalAlignment="Right"
+                    Margin="0,16,0,0">
+            <Button Content="Cancel" Padding="16,8" Margin="0,0,8,0"
+                    Cursor="Hand" IsCancel="True"
+                    Click="Cancel_Click" />
+            <Button Style="{StaticResource PrimaryButton}"
+                    Content="OK" Padding="16,8"
+                    Cursor="Hand" IsDefault="True"
+                    Click="OK_Click" />
+        </StackPanel>
+    </StackPanel>
+</Window>

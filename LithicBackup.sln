@@ -1,4 +1,4 @@
-
+﻿
 Microsoft Visual Studio Solution File, Format Version 12.00
 # Visual Studio Version 17
 VisualStudioVersion = 17.0.31903.59
@@ -12,6 +12,8 @@ EndProject
 Project("{FAE04EC0-301F-11D3-BF4B-00C04F79EFBC}") = "LithicBackup.Services", "src\LithicBackup.Services\LithicBackup.Services.csproj", "{60FD21FF-4DE4-42A2-A24B-55A75A8B9BD5}"
 EndProject
 Project("{FAE04EC0-301F-11D3-BF4B-00C04F79EFBC}") = "LithicBackup", "src\LithicBackup\LithicBackup.csproj", "{2914FADB-C00D-4678-B11F-6E93C02FE790}"
+EndProject
+Project("{FAE04EC0-301F-11D3-BF4B-00C04F79EFBC}") = "LithicBackup.Worker", "src\LithicBackup.Worker\LithicBackup.Worker.csproj", "{464F50E7-DCB7-444A-96DF-0860425063CF}"
 EndProject
 Global
 	GlobalSection(SolutionConfigurationPlatforms) = preSolution
@@ -71,6 +73,18 @@ Global
 		{2914FADB-C00D-4678-B11F-6E93C02FE790}.Release|x64.Build.0 = Release|Any CPU
 		{2914FADB-C00D-4678-B11F-6E93C02FE790}.Release|x86.ActiveCfg = Release|Any CPU
 		{2914FADB-C00D-4678-B11F-6E93C02FE790}.Release|x86.Build.0 = Release|Any CPU
+		{464F50E7-DCB7-444A-96DF-0860425063CF}.Debug|Any CPU.ActiveCfg = Debug|Any CPU
+		{464F50E7-DCB7-444A-96DF-0860425063CF}.Debug|Any CPU.Build.0 = Debug|Any CPU
+		{464F50E7-DCB7-444A-96DF-0860425063CF}.Debug|x64.ActiveCfg = Debug|Any CPU
+		{464F50E7-DCB7-444A-96DF-0860425063CF}.Debug|x64.Build.0 = Debug|Any CPU
+		{464F50E7-DCB7-444A-96DF-0860425063CF}.Debug|x86.ActiveCfg = Debug|Any CPU
+		{464F50E7-DCB7-444A-96DF-0860425063CF}.Debug|x86.Build.0 = Debug|Any CPU
+		{464F50E7-DCB7-444A-96DF-0860425063CF}.Release|Any CPU.ActiveCfg = Release|Any CPU
+		{464F50E7-DCB7-444A-96DF-0860425063CF}.Release|Any CPU.Build.0 = Release|Any CPU
+		{464F50E7-DCB7-444A-96DF-0860425063CF}.Release|x64.ActiveCfg = Release|Any CPU
+		{464F50E7-DCB7-444A-96DF-0860425063CF}.Release|x64.Build.0 = Release|Any CPU
+		{464F50E7-DCB7-444A-96DF-0860425063CF}.Release|x86.ActiveCfg = Release|Any CPU
+		{464F50E7-DCB7-444A-96DF-0860425063CF}.Release|x86.Build.0 = Release|Any CPU
 	EndGlobalSection
 	GlobalSection(SolutionProperties) = preSolution
 		HideSolutionNode = FALSE
@@ -80,5 +94,6 @@ Global
 		{CF24AE51-2269-4278-A702-1C1A1E515A8E} = {827E0CD3-B72D-47B6-A68D-7590B98EB39B}
 		{60FD21FF-4DE4-42A2-A24B-55A75A8B9BD5} = {827E0CD3-B72D-47B6-A68D-7590B98EB39B}
 		{2914FADB-C00D-4678-B11F-6E93C02FE790} = {827E0CD3-B72D-47B6-A68D-7590B98EB39B}
+		{464F50E7-DCB7-444A-96DF-0860425063CF} = {827E0CD3-B72D-47B6-A68D-7590B98EB39B}
 	EndGlobalSection
 EndGlobal

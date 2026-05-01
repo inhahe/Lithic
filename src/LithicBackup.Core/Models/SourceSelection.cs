@@ -24,11 +24,48 @@ public class SourceSelection
     public bool AutoIncludeNewSubdirectories { get; set; } = true;
 
     /// <summary>
-    /// Whether to keep previous versions of files when they change.
-    /// When false, changed files are overwritten in place without preserving history.
-    /// Useful for logs and other files where old versions aren't needed.
+    /// Name of the version tier set assigned to this node, or null to inherit
+    /// from the parent node. The tier set name references a
+    /// <see cref="VersionTierSet"/> defined in <see cref="JobOptions.TierSets"/>.
     /// </summary>
-    public bool KeepVersionHistory { get; set; } = true;
+    /// <remarks>
+    /// "None" is a reserved name meaning no version history is kept.
+    /// "Default" is the built-in tier set with standard retention rules.
+    /// Null means inherit from the nearest ancestor with an explicit assignment.
+    /// </remarks>
+    public string? VersionTierSetName { get; set; }
+
+    /// <summary>
+    /// Backward-compatibility shim for old serialised data that stored a boolean
+    /// <c>KeepVersionHistory</c> flag. During JSON deserialization the setter
+    /// converts <c>false</c> → <c>VersionTierSetName = "None"</c>.
+    /// New code should use <see cref="VersionTierSetName"/> instead.
+    /// </summary>
+    [Obsolete("Use VersionTierSetName instead. Retained for JSON backward compat.")]
+    public bool KeepVersionHistory
+    {
+        get => VersionTierSetName != "None";
+        set
+        {
+            // Only act when deserializing old data (VersionTierSetName not yet set).
+            if (!value && VersionTierSetName is null)
+                VersionTierSetName = "None";
+        }
+    }
+
+    /// <summary>
+    /// Glob patterns to exclude within this directory's subtree.
+    /// Uses the same syntax as <see cref="GlobMatcher"/>: filename patterns
+    /// (e.g. <c>*.log</c>) or path patterns (e.g. <c>*/bin/*</c>).
+    /// Patterns are inherited by child directories.
+    /// </summary>
+    public List<string> ExcludedPatterns { get; set; } = [];
+
+    /// <summary>
+    /// Glob patterns to re-include within this directory's subtree,
+    /// overriding exclusions inherited from parent directories.
+    /// </summary>
+    public List<string> IncludedPatterns { get; set; } = [];
 
     /// <summary>Child nodes (subdirectories and files).</summary>
     public List<SourceSelection> Children { get; set; } = [];
@@ -37,26 +74,49 @@ public class SourceSelection
     /// Collect all paths (files and directories) where version history is disabled.
     /// Used by the backup service to skip the move-to-prev step.
     /// </summary>
-    public static (HashSet<string> Files, List<string> DirectoryPrefixes) CollectNoVersionPaths(
+    /// <returns>
+    /// <list type="bullet">
+    ///   <item><c>Files</c> — explicit file paths with versioning disabled.</item>
+    ///   <item><c>DirectoryPrefixes</c> — directory path prefixes (ending in \) where
+    ///         all contained files skip versioning.</item>
+    ///   <item><c>NoVersionGlobs</c> — glob patterns from include/re-include rules
+    ///         marked with <c>~nv:</c> (no version history for matching files).</item>
+    /// </list>
+    /// </returns>
+    public static (HashSet<string> Files, List<string> DirectoryPrefixes, List<string> NoVersionGlobs) CollectNoVersionPaths(
         IEnumerable<SourceSelection> roots)
     {
         var files = new HashSet<string>(StringComparer.OrdinalIgnoreCase);
         var dirPrefixes = new List<string>();
-        CollectNoVersionPathsRecursive(roots, files, dirPrefixes);
-        return (files, dirPrefixes);
+        var noVersionGlobs = new List<string>();
+        CollectNoVersionPathsRecursive(roots, files, dirPrefixes, noVersionGlobs, parentTierSetName: "Default");
+        return (files, dirPrefixes, noVersionGlobs);
     }
 
     private static void CollectNoVersionPathsRecursive(
         IEnumerable<SourceSelection> nodes,
         HashSet<string> files,
-        List<string> dirPrefixes)
+        List<string> dirPrefixes,
+        List<string> noVersionGlobs,
+        string parentTierSetName)
     {
         foreach (var node in nodes)
         {
             if (node.IsSelected == false)
                 continue;
 
-            if (!node.KeepVersionHistory)
+            // Resolve this node's effective tier set name.
+            string effectiveTier = node.VersionTierSetName ?? parentTierSetName;
+            bool keepsVersions = !string.Equals(effectiveTier, "None", StringComparison.OrdinalIgnoreCase);
+
+            // Collect include/re-include patterns marked with ~nv: prefix.
+            foreach (var pattern in node.IncludedPatterns)
+            {
+                if (pattern.StartsWith("~nv:"))
+                    noVersionGlobs.Add(pattern[4..]);
+            }
+
+            if (!keepsVersions)
             {
                 if (node.IsDirectory)
                 {
@@ -73,7 +133,7 @@ public class SourceSelection
             {
                 // Only recurse into children if this directory keeps versions —
                 // children under a no-version directory are already covered.
-                CollectNoVersionPathsRecursive(node.Children, files, dirPrefixes);
+                CollectNoVersionPathsRecursive(node.Children, files, dirPrefixes, noVersionGlobs, effectiveTier);
             }
         }
     }
