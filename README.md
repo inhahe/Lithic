@@ -34,9 +34,14 @@ LithicBackup provides two independent deduplication strategies. Both can be enab
 
 ### Version Retention
 
-LithicBackup keeps previous versions of files as they change over time. A tiered retention policy controls how many old versions are kept and for how long.
+LithicBackup keeps previous versions of files as they change over time. Retention is managed through **named tier sets** — each tier set defines a policy with any number of tiers, and each tier specifies an age threshold and a maximum version count.
 
-You can configure **any number of tiers**, each with an age threshold and a maximum version count:
+Two built-in tier sets are always available:
+
+- **Default** — age-based tiered retention (configurable tiers, see below)
+- **None** — no version history; files are overwritten in place
+
+You can create additional custom tier sets for different types of data. Each tier set contains any number of tiers:
 
 | Tier | Age | Versions Kept |
 |------|-----|---------------|
@@ -46,7 +51,7 @@ You can configure **any number of tiers**, each with an age threshold and a maxi
 
 This is the default configuration, but every aspect is customizable. You can add, remove, or modify tiers freely — keep 50 versions for the first week, then 10 for a month, then 2 for a year, then 1 forever. The newest version of every file is always preserved regardless of tier rules.
 
-Version history can also be disabled per-file or per-directory for content where history isn't useful (logs, caches, build output).
+Tier sets are assigned per-file or per-directory in the source selection tree. Nodes inherit their parent's tier set by default — assign a tier set to a top-level directory and everything underneath follows, with the option to override at any level. For example, you could use "Default" for most files but assign "None" to build output directories.
 
 ### Scheduled and Continuous Backups
 
@@ -65,7 +70,7 @@ Only directory-mode backup sets can be scheduled (disc burns require physical me
 - Treeview file browser with tristate checkboxes — select entire drives, individual directories, or specific files
 - New subdirectories are automatically included under fully-selected parents
 - Exclusion patterns (glob syntax): `*.log`, `temp_*`, `*/.vs/*`, etc.
-- Per-file and per-directory version history control
+- Per-node retention tier set assignment with inheritance from parent directories
 
 ### Restore
 
