@@ -70,8 +70,9 @@ Only directory-mode backup sets can be scheduled (disc burns require physical me
 
 - Treeview file browser with tristate checkboxes — select entire drives, individual directories, or specific files
 - New subdirectories are automatically included under fully-selected parents
-- Exclusion patterns (glob syntax): `*.log`, `temp_*`, `*/.vs/*`, etc.
-- Per-node retention tier set assignment with inheritance from parent directories
+- **Per-directory exclusion patterns** (glob syntax): attach patterns like `*.log`, `temp_*`, `*/bin/*` to any directory node. Patterns are inherited by all child directories automatically.
+- **Per-directory re-include patterns**: override inherited exclusions at any level. For example, exclude `*.dll` at the project root but re-include it under a `lib/` subdirectory.
+- Per-node retention tier set assignment with inheritance from parent directories — assign any custom tier set to any file or directory, and children inherit unless overridden
 
 ### Restore
 
