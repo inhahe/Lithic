@@ -436,6 +436,8 @@ public class DirectoryBackupService
             catch (OperationCanceledException) { throw; }
             catch (Exception ex)
             {
+                string errorDetail = DescribeFileError(ex, file.FullPath);
+
                 // If the user previously chose "Skip All", skip without
                 // prompting again.
                 if (permanentSkipAll || onFailure is null)
@@ -443,7 +445,7 @@ public class DirectoryBackupService
                     failedFiles.Add(new FailedFile
                     {
                         Path = file.FullPath,
-                        Error = ex.Message,
+                        Error = errorDetail,
                         ActionTaken = BurnFailureAction.Skip,
                     });
                     continue;
@@ -454,15 +456,15 @@ public class DirectoryBackupService
                 FailureDecision decision;
                 try
                 {
-                    decision = await onFailure(file.FullPath, ex.Message);
+                    decision = await onFailure(file.FullPath, errorDetail);
                 }
                 catch
                 {
-                    // Callback failed (e.g. dialog error) �� treat as Skip.
+                    // Callback failed (e.g. dialog error) -- treat as Skip.
                     failedFiles.Add(new FailedFile
                     {
                         Path = file.FullPath,
-                        Error = ex.Message,
+                        Error = errorDetail,
                         ActionTaken = BurnFailureAction.Skip,
                     });
                     continue;
@@ -479,7 +481,7 @@ public class DirectoryBackupService
                         failedFiles.Add(new FailedFile
                         {
                             Path = file.FullPath,
-                            Error = ex.Message,
+                            Error = errorDetail,
                             ActionTaken = BurnFailureAction.Abort,
                         });
                         throw new OperationCanceledException(
@@ -494,7 +496,7 @@ public class DirectoryBackupService
                         failedFiles.Add(new FailedFile
                         {
                             Path = file.FullPath,
-                            Error = ex.Message,
+                            Error = errorDetail,
                             ActionTaken = decision.Action,
                         });
                         break;
@@ -925,6 +927,139 @@ public class DirectoryBackupService
 
         var hash = await SHA256.HashDataAsync(stream, ct);
         return Convert.ToHexString(hash).ToLowerInvariant();
+    }
+
+    /// <summary>
+    /// Produce a more descriptive error message for file I/O failures by
+    /// decoding the Windows error code and, for sharing violations, trying
+    /// to identify the locking process via the Restart Manager API.
+    /// </summary>
+    private static string DescribeFileError(Exception ex, string filePath)
+    {
+        // Decode common Win32 error codes embedded in HResult.
+        if (ex is IOException)
+        {
+            int win32 = ex.HResult & 0xFFFF;
+            string? reason = win32 switch
+            {
+                0x0020 => FormatSharingViolation(filePath),  // ERROR_SHARING_VIOLATION
+                0x0021 => "File region is locked",           // ERROR_LOCK_VIOLATION
+                0x0050 => "File already exists at target",   // ERROR_FILE_EXISTS
+                0x0070 => "Disk is full",                    // ERROR_DISK_FULL
+                0x00CE => "Path is too long",                // ERROR_FILENAME_EXCED_RANGE
+                _ => null,
+            };
+
+            if (reason is not null)
+                return reason;
+        }
+
+        return ex switch
+        {
+            UnauthorizedAccessException => $"Permission denied: {ex.Message}",
+            PathTooLongException => $"Path is too long ({filePath.Length} chars)",
+            FileNotFoundException => "File no longer exists (deleted after scan?)",
+            DirectoryNotFoundException => "Directory no longer exists",
+            _ => ex.Message,
+        };
+    }
+
+    /// <summary>
+    /// For ERROR_SHARING_VIOLATION, use the Restart Manager API to find
+    /// which process holds the file open.
+    /// </summary>
+    private static string FormatSharingViolation(string filePath)
+    {
+        try
+        {
+            var lockers = GetLockingProcesses(filePath);
+            if (lockers.Count > 0)
+            {
+                var names = string.Join(", ", lockers.Select(
+                    p => $"{p.ProcessName} (PID {p.Id})"));
+                return $"File is locked by: {names}";
+            }
+        }
+        catch { /* Restart Manager not available or failed */ }
+
+        return "File is locked by another process";
+    }
+
+    // --- Restart Manager P/Invoke for locking-process detection ---
+
+    private static List<System.Diagnostics.Process> GetLockingProcesses(string path)
+    {
+        int res = RmStartSession(out uint sessionHandle, 0, Guid.NewGuid().ToString());
+        if (res != 0) return [];
+
+        try
+        {
+            string[] resources = [path];
+            res = RmRegisterResources(sessionHandle, (uint)resources.Length, resources,
+                0, null!, 0, null!);
+            if (res != 0) return [];
+
+            uint needed = 0, count = 0;
+            var reason = 0u;
+            res = RmGetList(sessionHandle, out needed, ref count, null!, ref reason);
+            if (res != 234 /* ERROR_MORE_DATA */ || needed == 0) return [];
+
+            var processInfo = new RM_PROCESS_INFO[needed];
+            count = needed;
+            res = RmGetList(sessionHandle, out _, ref count, processInfo, ref reason);
+            if (res != 0) return [];
+
+            var result = new List<System.Diagnostics.Process>();
+            foreach (var pi in processInfo.Take((int)count))
+            {
+                try { result.Add(System.Diagnostics.Process.GetProcessById(pi.Process.dwProcessId)); }
+                catch { /* process exited */ }
+            }
+            return result;
+        }
+        finally
+        {
+            RmEndSession(sessionHandle);
+        }
+    }
+
+    [DllImport("rstrtmgr.dll", CharSet = CharSet.Unicode)]
+    private static extern int RmStartSession(out uint pSessionHandle, int dwSessionFlags, string strSessionKey);
+
+    [DllImport("rstrtmgr.dll")]
+    private static extern int RmEndSession(uint pSessionHandle);
+
+    [DllImport("rstrtmgr.dll", CharSet = CharSet.Unicode)]
+    private static extern int RmRegisterResources(uint pSessionHandle,
+        uint nFiles, string[] rgsFileNames,
+        uint nApplications, RM_UNIQUE_PROCESS[] rgApplications,
+        uint nServices, string[] rgsServiceNames);
+
+    [DllImport("rstrtmgr.dll")]
+    private static extern int RmGetList(uint pSessionHandle,
+        out uint pnProcInfoNeeded, ref uint pnProcInfo,
+        [In, Out] RM_PROCESS_INFO[]? rgAffectedApps, ref uint lpdwRebootReasons);
+
+    [StructLayout(LayoutKind.Sequential)]
+    private struct RM_UNIQUE_PROCESS
+    {
+        public int dwProcessId;
+        public System.Runtime.InteropServices.ComTypes.FILETIME ProcessStartTime;
+    }
+
+    [StructLayout(LayoutKind.Sequential, CharSet = CharSet.Unicode)]
+    private struct RM_PROCESS_INFO
+    {
+        public RM_UNIQUE_PROCESS Process;
+        [MarshalAs(UnmanagedType.ByValTStr, SizeConst = 256)]
+        public string strAppName;
+        [MarshalAs(UnmanagedType.ByValTStr, SizeConst = 64)]
+        public string strServiceShortName;
+        public int ApplicationType;
+        public uint AppStatus;
+        public uint TSSessionId;
+        [MarshalAs(UnmanagedType.Bool)]
+        public bool bRestartable;
     }
 
     private static readonly JsonSerializerOptions _jsonOptions = new()
