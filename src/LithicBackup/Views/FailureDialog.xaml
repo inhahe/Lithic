@@ -20,7 +20,6 @@
             <RowDefinition Height="Auto" />
             <RowDefinition Height="*" />
             <RowDefinition Height="Auto" />
-            <RowDefinition Height="Auto" />
         </Grid.RowDefinitions>
 
         <!-- File path -->
@@ -44,25 +43,8 @@
         <!-- Spacer -->
         <Border Grid.Row="2" />
 
-        <!-- Apply to all checkbox -->
-        <CheckBox Grid.Row="3"
-                  IsChecked="{Binding ApplyToAll, Mode=TwoWay}"
-                  Margin="0,0,0,12"
-                  Foreground="{StaticResource TextPrimaryBrush}">
-            <CheckBox.Style>
-                <Style TargetType="CheckBox">
-                    <Setter Property="Content" Value="Apply to all remaining failures on this disc" />
-                    <Style.Triggers>
-                        <DataTrigger Binding="{Binding IsDirectoryMode}" Value="True">
-                            <Setter Property="Content" Value="Apply to all remaining failures" />
-                        </DataTrigger>
-                    </Style.Triggers>
-                </Style>
-            </CheckBox.Style>
-        </CheckBox>
-
         <!-- Buttons -->
-        <WrapPanel Grid.Row="4" HorizontalAlignment="Right">
+        <WrapPanel Grid.Row="3" HorizontalAlignment="Right">
             <Button Content="Skip" Click="OnSkip"
                     Padding="14,6" Margin="0,0,6,0" Cursor="Hand" />
             <Button Content="Retry" Click="OnRetry"

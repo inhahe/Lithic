@@ -52,11 +52,16 @@ public class SourceSelectionViewModel : ViewModelBase
     private Dictionary<string, FileVersionInfo>? _catalogInfo;
     private bool _showLargestFiles;
     private bool _isApplyingSelections;
+    private bool _isEditMode;
+    private string _saveStatusText = "";
 
     /// <summary>Fired when the user clicks "Next" with a valid selection.</summary>
     public event Action<List<SourceSelection>>? NextRequested;
 
-    /// <summary>Fired when the user clicks "Cancel".</summary>
+    /// <summary>Fired when the user clicks "Save" in edit mode.</summary>
+    public event Func<Task>? SaveRequested;
+
+    /// <summary>Fired when the user clicks "Cancel" / "Close".</summary>
     public event Action? CancelRequested;
 
     /// <summary>Fired when the user clicks "Largest Files &amp; Directories".</summary>
@@ -73,7 +78,8 @@ public class SourceSelectionViewModel : ViewModelBase
         RetentionTiers = [];
         TierSets = [];
         AvailableTierSetNames = ["Default", "None"];
-        NextCommand = new RelayCommand(_ => OnNext(), _ => HasSelection);
+        NextCommand = new RelayCommand(_ => OnNext(), _ => HasSelection && !IsEditMode);
+        SaveCommand = new RelayCommand(_ => OnSave(), _ => HasSelection && IsEditMode);
         CancelCommand = new RelayCommand(_ => CancelRequested?.Invoke());
         LargestFilesCommand = new RelayCommand(
             _ => LargestFilesRequested?.Invoke(),
@@ -476,9 +482,30 @@ public class SourceSelectionViewModel : ViewModelBase
     /// </summary>
     public bool IsApplyingSelections => _isApplyingSelections;
 
+    /// <summary>
+    /// When true the view is in "edit existing set" mode: shows Save/Close
+    /// buttons instead of Next/Cancel, and hides the wizard-step flow.
+    /// </summary>
+    public bool IsEditMode
+    {
+        get => _isEditMode;
+        set => SetProperty(ref _isEditMode, value);
+    }
+
+    /// <summary>
+    /// Brief status text shown after a save ("Saved", "Save failed", etc.).
+    /// Cleared automatically when the user makes further changes.
+    /// </summary>
+    public string SaveStatusText
+    {
+        get => _saveStatusText;
+        set => SetProperty(ref _saveStatusText, value);
+    }
+
     // --- Commands ---
 
     public ICommand NextCommand { get; }
+    public ICommand SaveCommand { get; }
     public ICommand CancelCommand { get; }
     public ICommand LargestFilesCommand { get; }
     public ICommand SortByNameCommand { get; }
@@ -806,6 +833,19 @@ public class SourceSelectionViewModel : ViewModelBase
         var selections = GetSelections();
         if (selections.Count > 0)
             NextRequested?.Invoke(selections);
+    }
+
+    private async void OnSave()
+    {
+        if (SaveRequested is not null)
+            await SaveRequested.Invoke();
+
+        // Auto-clear the status after a few seconds so it doesn't persist forever.
+        if (!string.IsNullOrEmpty(SaveStatusText))
+        {
+            await Task.Delay(3000);
+            SaveStatusText = "";
+        }
     }
 
     private List<SourceSelectionNodeViewModel> GetAllDirectoryNodes()

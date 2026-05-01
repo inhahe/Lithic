@@ -155,6 +155,10 @@
             <Border Style="{StaticResource Card}" Padding="12"
                     Visibility="{Binding IsDirectoryMode, Converter={StaticResource BoolToVis}}">
                 <StackPanel>
+                    <CheckBox Content="Verify backup after completion"
+                              IsChecked="{Binding VerifyAfterBackup}"
+                              Margin="0,0,0,10" />
+
                     <TextBlock Text="Deduplication" FontWeight="SemiBold" Margin="0,0,0,8" />
 
                     <CheckBox Content="File-level deduplication (identical files stored once)"

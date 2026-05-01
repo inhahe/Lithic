@@ -10,6 +10,7 @@ public class JobOptions
     public FilesystemType FilesystemType { get; set; } = FilesystemType.UDF;
     public long? CapacityOverrideBytes { get; set; }
     public bool VerifyAfterBurn { get; set; } = true;
+    public bool VerifyAfterBackup { get; set; }
     public bool IncludeCatalogOnDisc { get; set; } = true;
     public bool AllowFileSplitting { get; set; } = true;
     public bool EnableFileDeduplication { get; set; }

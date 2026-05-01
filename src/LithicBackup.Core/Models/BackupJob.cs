@@ -53,6 +53,9 @@ public class BackupJob
     /// <summary>Whether to verify data after burning.</summary>
     public bool VerifyAfterBurn { get; set; } = true;
 
+    /// <summary>Whether to verify files after a directory backup completes.</summary>
+    public bool VerifyAfterBackup { get; set; }
+
     /// <summary>
     /// Version retention tiers for directory-mode backups. When empty, the default
     /// tiers from <see cref="Services.VersionRetentionService.DefaultTiers"/> are used.

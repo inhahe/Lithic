@@ -47,11 +47,12 @@ public class BackupOrchestrator : IBackupOrchestrator
     // PlanAsync
     // -------------------------------------------------------------------
 
-    public async Task<BackupPlan> PlanAsync(BackupJob job, CancellationToken ct = default)
+    public async Task<BackupPlan> PlanAsync(BackupJob job, CancellationToken ct = default,
+        IProgress<ScanProgress>? scanProgress = null)
     {
         // 1. Scan source directories (global + per-directory exclusions).
         var isExcluded = GlobMatcher.CreateCombinedFilter(job.ExcludedExtensions, job.Sources);
-        var scanned = await _scanner.ScanAsync(job.Sources, progress: null, ct, isExcluded);
+        var scanned = await _scanner.ScanAsync(job.Sources, progress: scanProgress, ct, isExcluded);
 
         // 2. Compute diff against existing catalog (if this is an existing set).
         BackupDiff diff;
@@ -459,12 +460,6 @@ public class BackupOrchestrator : IBackupOrchestrator
                             {
                                 var decision = await onFailure(file.FullPath, ex.Message);
                                 action = decision.Action;
-
-                                // Remember "apply to all" decisions.
-                                if (decision.ApplyToAllOnDisc)
-                                {
-                                    discSkip = action;
-                                }
                             }
                             else
                             {
@@ -547,8 +542,6 @@ public class BackupOrchestrator : IBackupOrchestrator
                                                     throw new OperationCanceledException(
                                                         "Backup aborted by user due to file failure.");
                                                 default:
-                                                    if (zipDecision.ApplyToAllOnDisc)
-                                                        discSkip = BurnFailureAction.SkipAllForDisc;
                                                     failedFiles.Add(new FailedFile
                                                     {
                                                         Path = file.FullPath,

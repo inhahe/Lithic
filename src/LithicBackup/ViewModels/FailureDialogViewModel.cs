@@ -10,7 +10,6 @@ public class FailureDialogViewModel : ViewModelBase
     private string _filePath = string.Empty;
     private string _errorMessage = string.Empty;
     private BurnFailureAction _chosenAction = BurnFailureAction.Skip;
-    private bool _applyToAll;
     private bool _isDirectoryMode;
 
     /// <summary>The path of the file that failed.</summary>
@@ -32,13 +31,6 @@ public class FailureDialogViewModel : ViewModelBase
     {
         get => _chosenAction;
         set => SetProperty(ref _chosenAction, value);
-    }
-
-    /// <summary>Whether to apply the chosen action to all remaining failures.</summary>
-    public bool ApplyToAll
-    {
-        get => _applyToAll;
-        set => SetProperty(ref _applyToAll, value);
     }
 
     /// <summary>

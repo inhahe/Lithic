@@ -20,6 +20,7 @@ public class BackupJobViewModel : ViewModelBase
     private bool _includeCatalogOnDisc = true;
     private bool _allowFileSplitting = true;
 
+    private bool _verifyAfterBackup;
     private bool _enableFileDeduplication;
     private bool _enableDeduplication;
     private string _deduplicationBlockSizeKb = "64";
@@ -107,6 +108,13 @@ public class BackupJobViewModel : ViewModelBase
     {
         get => _verifyAfterBurn;
         set => SetProperty(ref _verifyAfterBurn, value);
+    }
+
+    /// <summary>Whether to verify files after a directory backup completes.</summary>
+    public bool VerifyAfterBackup
+    {
+        get => _verifyAfterBackup;
+        set => SetProperty(ref _verifyAfterBackup, value);
     }
 
     public bool IncludeCatalogOnDisc
@@ -374,6 +382,7 @@ public class BackupJobViewModel : ViewModelBase
                 FilesystemType = FilesystemType,
                 CapacityOverrideBytes = GetCapacityOverrideBytes(),
                 VerifyAfterBurn = VerifyAfterBurn,
+                VerifyAfterBackup = VerifyAfterBackup,
                 IncludeCatalogOnDisc = IncludeCatalogOnDisc,
                 AllowFileSplitting = AllowFileSplitting,
                 TargetDirectory = effectiveTargetDir,
@@ -392,6 +401,19 @@ public class BackupJobViewModel : ViewModelBase
             job.RetentionTiers = RetentionTiers.Select(t => t.ToModel()).ToList();
             job.TierSets = TierSets.Select(ts => ts.ToModel()).ToList();
 
+            // Throttled scan progress reporter.
+            var lastScanUpdate = 0L;
+            var scanSw = System.Diagnostics.Stopwatch.StartNew();
+            var scanProgress = new Progress<ScanProgress>(sp =>
+            {
+                long now = scanSw.ElapsedMilliseconds;
+                if (now - lastScanUpdate >= ProgressUpdateIntervalMs)
+                {
+                    lastScanUpdate = now;
+                    PlanSummary = $"Scanning... {sp.FilesFound:N0} files found";
+                }
+            });
+
             if (IsDirectoryMode)
             {
                 if (string.IsNullOrWhiteSpace(TargetDirectoryPath))
@@ -409,7 +431,7 @@ public class BackupJobViewModel : ViewModelBase
                 // Run the heavy scan/diff work on a background thread so the
                 // UI stays responsive and the spinner is visible.
                 var (diff, totalBytes, totalFiles) = await Task.Run(
-                    () => DirectoryBackup.PlanAsync(job, CancellationToken.None));
+                    () => DirectoryBackup.PlanAsync(job, CancellationToken.None, scanProgress));
 
                 int newCount = diff.NewFiles.Count;
                 int changedCount = diff.ChangedFiles.Count;
@@ -442,7 +464,7 @@ public class BackupJobViewModel : ViewModelBase
             else
             {
                 // Run the heavy scan/diff work on a background thread.
-                _plan = await Task.Run(() => Orchestrator.PlanAsync(job));
+                _plan = await Task.Run(() => Orchestrator.PlanAsync(job, CancellationToken.None, scanProgress));
 
                 int newCount = _plan.Diff.NewFiles.Count;
                 int changedCount = _plan.Diff.ChangedFiles.Count;

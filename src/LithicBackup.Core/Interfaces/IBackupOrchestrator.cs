@@ -9,7 +9,6 @@ public delegate Task<FailureDecision> FailureCallback(string filePath, string er
 public class FailureDecision
 {
     public BurnFailureAction Action { get; init; }
-    public bool ApplyToAllOnDisc { get; init; }
 }
 
 /// <summary>
@@ -20,7 +19,8 @@ public interface IBackupOrchestrator
     /// <summary>
     /// Scan sources, compute diff against catalog, allocate files to discs.
     /// </summary>
-    Task<BackupPlan> PlanAsync(BackupJob job, CancellationToken ct = default);
+    Task<BackupPlan> PlanAsync(BackupJob job, CancellationToken ct = default,
+        IProgress<ScanProgress>? scanProgress = null);
 
     /// <summary>
     /// Execute the backup plan: stage files, burn discs, update catalog.

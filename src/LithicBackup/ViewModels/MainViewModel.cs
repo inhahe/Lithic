@@ -25,7 +25,11 @@ public class MainViewModel : ViewModelBase
     private ViewModelBase? _currentView;
     private BackupSet? _selectedBackupSet;
     private bool _isBurning;
+    private BurnProgressViewModel? _activeBackupProgress;
     private string _serviceStatusText = "";
+    private int? _runningBackupSetId;
+    private BackupSetEditorWindow? _editorWindow;
+    private Func<Task>? _pendingSettingsSave;
 
     public MainViewModel(
         ICatalogRepository catalog,
@@ -68,12 +72,11 @@ public class MainViewModel : ViewModelBase
             _ => StartOrphanedDirsFlow(),
             _ => !IsBurning && SelectedBackupSet is not null);
         FindFileCommand = new RelayCommand(
-            _ => StartFindFileFlow(),
-            _ => !IsBurning);
+            _ => StartFindFileFlow());
         HomeCommand = new RelayCommand(_ => GoHome());
         BackupCoverageCommand = new RelayCommand(
             _ => StartBackupCoverageFlow(),
-            _ => !IsBurning && SelectedBackupSet is not null);
+            _ => SelectedBackupSet is not null);
         LargestFilesCommand = new RelayCommand(
             _ => StartLargestFilesFlow(),
             _ => !IsBurning && SelectedBackupSet is not null);
@@ -83,6 +86,16 @@ public class MainViewModel : ViewModelBase
         ImportBackupSetCommand = new RelayCommand(
             _ => _ = ImportBackupSetAsync());
 
+        // Per-set action commands (take BackupSet via CommandParameter).
+        SetBackupCommand = new RelayCommand(
+            o => { if (o is BackupSet s) { SelectedBackupSet = s; StartIncrementalFlow(); } },
+            o => !IsBurning);
+        SetModifyCommand = new RelayCommand(
+            o => { if (o is BackupSet s) { SelectedBackupSet = s; StartEditFlow(); } },
+            o => !IsBurning);
+        SetRestoreCommand = new RelayCommand(
+            o => { if (o is BackupSet s) { SelectedBackupSet = s; StartRestoreFlow(); } },
+            o => !IsBurning);
         InstallServiceCommand = new RelayCommand(_ => InstallService());
         UninstallServiceCommand = new RelayCommand(_ => UninstallService());
         StartServiceCommand = new RelayCommand(_ => StartService());
@@ -142,6 +155,20 @@ public class MainViewModel : ViewModelBase
         private set => SetProperty(ref _isBurning, value);
     }
 
+    /// <summary>The in-progress or just-completed backup, shown in the inline progress panel.</summary>
+    public BurnProgressViewModel? ActiveBackupProgress
+    {
+        get => _activeBackupProgress;
+        private set
+        {
+            if (SetProperty(ref _activeBackupProgress, value))
+                OnPropertyChanged(nameof(HasActiveBackupProgress));
+        }
+    }
+
+    /// <summary>True when there's an active backup progress panel to display.</summary>
+    public bool HasActiveBackupProgress => _activeBackupProgress is not null;
+
     // --- Commands ---
 
     public ICommand NewBackupSetCommand { get; }
@@ -157,6 +184,17 @@ public class MainViewModel : ViewModelBase
     public ICommand LargestFilesCommand { get; }
     public ICommand ExportBackupSetCommand { get; }
     public ICommand ImportBackupSetCommand { get; }
+
+    // Per-set action commands (take BackupSet as CommandParameter)
+    public ICommand SetBackupCommand { get; }
+    public ICommand SetModifyCommand { get; }
+    public ICommand SetRestoreCommand { get; }
+    /// <summary>ID of the backup set currently being backed up, or null.</summary>
+    public int? RunningBackupSetId
+    {
+        get => _runningBackupSetId;
+        private set => SetProperty(ref _runningBackupSetId, value);
+    }
 
     // --- Worker Service management ---
 
@@ -205,8 +243,7 @@ public class MainViewModel : ViewModelBase
     }
 
     // -------------------------------------------------------------------
-    // Flow 1b: Edit Backup Set
-    //   Source Selection (pre-loaded) → Job Config (pre-loaded) → Done
+    // Flow 1b: Edit Backup Set (modify-only — no wizard, no Plan/Start)
     // -------------------------------------------------------------------
 
     private async void StartEditFlow()
@@ -215,7 +252,13 @@ public class MainViewModel : ViewModelBase
 
         var backupSet = SelectedBackupSet;
 
-        // Load catalog data so the source tree can show backup status indicators.
+        // Show a wait cursor while loading — the dialog won't appear until ready.
+        Mouse.OverrideCursor = Cursors.Wait;
+
+        // ---------------------------------------------------------------
+        // Phase 1: async data loading (dialog not yet visible)
+        // ---------------------------------------------------------------
+
         Dictionary<string, Core.Models.FileVersionInfo>? catalogInfo = null;
         try
         {
@@ -224,6 +267,7 @@ public class MainViewModel : ViewModelBase
         catch { }
 
         var sourceSelection = new SourceSelectionViewModel(catalogInfo);
+        sourceSelection.IsEditMode = true;
 
         // Restore backup set settings from saved state.
         sourceSelection.SetName = backupSet.Name;
@@ -233,13 +277,65 @@ public class MainViewModel : ViewModelBase
         if (backupSet.SourceSelections is { Count: > 0 })
             _ = sourceSelection.ApplySelectionsAsync(backupSet.SourceSelections);
 
-        // Enable the Next button immediately — selections exist in a saved set.
+        // Enable the Save button immediately — selections exist in a saved set.
         sourceSelection.HasSelection = true;
-
         sourceSelection.ShowLargestFiles = true;
-        sourceSelection.NextRequested += sources =>
-            ShowJobConfig(sources, backupSet.Id, sourceSelection);
-        sourceSelection.CancelRequested += GoHome;
+
+        // Helper: sync all VM settings into the BackupSet and write to DB.
+        async Task SaveAllAsync()
+        {
+            SyncSettingsToJobOptions(backupSet, sourceSelection);
+            backupSet.SourceSelections = sourceSelection.GetSelections();
+            await Task.Run(() => _catalog.UpdateBackupSetAsync(backupSet));
+        }
+
+        // Register a pending save so settings are persisted on dialog close.
+        _pendingSettingsSave = SaveAllAsync;
+
+        // ---------------------------------------------------------------
+        // Phase 2: create dialog, set content, then show (invisible → reveal)
+        // ---------------------------------------------------------------
+
+        var dialog = new BackupSetEditorWindow
+        {
+            Owner = Application.Current.MainWindow,
+            Title = $"Modify \u2014 {backupSet.Name}",
+        };
+        _editorWindow = dialog;
+        dialog.Closed += async (_, _) =>
+        {
+            // Save all settings when the dialog closes (Close / X button).
+            // Await the write so LoadBackupSetsAsync sees current data.
+            if (_pendingSettingsSave is not null)
+            {
+                await _pendingSettingsSave();
+                _pendingSettingsSave = null;
+            }
+            _editorWindow = null;
+            await LoadBackupSetsAsync();
+        };
+
+        Action<ViewModelBase> setView = vm => dialog.SetEditorContent(vm);
+
+        // Save button: persist everything and show confirmation.
+        sourceSelection.SaveRequested += async () =>
+        {
+            try
+            {
+                await SaveAllAsync();
+                StatusText = $"Backup set \"{sourceSelection.SetName}\" saved. {DateTime.Now:HH:mm:ss}";
+                sourceSelection.SaveStatusText = "Saved";
+                await LoadBackupSetsAsync();
+                dialog.Title = $"Modify \u2014 {sourceSelection.SetName}";
+            }
+            catch (Exception ex)
+            {
+                StatusText = $"Failed to save: {ex.Message}";
+                sourceSelection.SaveStatusText = "Save failed";
+            }
+        };
+
+        sourceSelection.CancelRequested += () => dialog.Close();
 
         // Auto-save source selections to the database whenever the user
         // toggles a checkbox.  Debounced because cascading parent→child
@@ -262,6 +358,9 @@ public class MainViewModel : ViewModelBase
                 try
                 {
                     await Task.Delay(300, token);
+                    // Sync ALL settings (including JobOptions) so the
+                    // full BackupSet write never overwrites with stale data.
+                    SyncSettingsToJobOptions(backupSet, sourceSelection);
                     backupSet.SourceSelections = sourceSelection.GetSelections();
                     await Task.Run(() => _catalog.UpdateBackupSetAsync(backupSet));
                 }
@@ -269,39 +368,37 @@ public class MainViewModel : ViewModelBase
             }
         };
 
-        // Cache the LargestFilesViewModel so reopening doesn't re-scan.
-        // Invalidated whenever selections change so the scan always
-        // reflects the current treeview state.
-        LargestFilesViewModel? cachedLargestFiles = null;
-        List<SourceSelection>? cachedSelections = null;
         sourceSelection.LargestFilesRequested += async () =>
         {
-            // Flush any pending debounced save immediately.
+            // Flush any pending debounced save so the scan sees current state.
             saveDebounce?.Cancel();
+            SyncSettingsToJobOptions(backupSet, sourceSelection);
             backupSet.SourceSelections = sourceSelection.GetSelections();
-            _ = Task.Run(() => _catalog.UpdateBackupSetAsync(backupSet));
+            await Task.Run(() => _catalog.UpdateBackupSetAsync(backupSet));
 
-            // Invalidate cache if selections changed.
-            var currentSelections = backupSet.SourceSelections;
-            if (cachedLargestFiles is not null
-                && !SelectionsMatch(cachedSelections, currentSelections))
-            {
-                cachedLargestFiles = null;
-            }
-
-            if (cachedLargestFiles is not null)
-            {
-                CurrentView = cachedLargestFiles;
-                StatusText = $"Largest files for \"{backupSet.Name}\".";
-                return;
-            }
-
-            cachedSelections = currentSelections;
-            cachedLargestFiles = await ShowLargestFilesAsync(
-                backupSet, () => CurrentView = sourceSelection);
+            await ShowLargestFilesAsync(
+                backupSet,
+                () =>
+                {
+                    // Refresh exclusion patterns — LargestFiles may have added
+                    // or removed full-path entries in ExcludedExtensions.
+                    if (backupSet.JobOptions?.ExcludedExtensions is { Count: > 0 } excl)
+                        sourceSelection.ExcludedPatterns =
+                            BackupJobViewModel.FormatExclusionPatterns(excl);
+                    else
+                        sourceSelection.ExcludedPatterns = "";
+                    setView(sourceSelection);
+                },
+                setView);
         };
 
-        CurrentView = sourceSelection;
+        // Set content BEFORE showing so layout happens on the real view.
+        // Show() is needed for WPF to have a handle/PresentationSource.
+        // The window starts at Opacity 0 and reveals itself after layout
+        // completes inside SetEditorContent (which also clears the wait cursor).
+        dialog.SetEditorContent(sourceSelection);
+        dialog.Show();
+
         StatusText = $"Editing backup set \"{backupSet.Name}\".";
     }
 
@@ -395,6 +492,7 @@ public class MainViewModel : ViewModelBase
                     FilesystemType = src.JobOptions.FilesystemType,
                     CapacityOverrideBytes = src.JobOptions.CapacityOverrideBytes,
                     VerifyAfterBurn = src.JobOptions.VerifyAfterBurn,
+                    VerifyAfterBackup = src.JobOptions.VerifyAfterBackup,
                     IncludeCatalogOnDisc = src.JobOptions.IncludeCatalogOnDisc,
                     AllowFileSplitting = src.JobOptions.AllowFileSplitting,
                     EnableFileDeduplication = src.JobOptions.EnableFileDeduplication,
@@ -459,22 +557,27 @@ public class MainViewModel : ViewModelBase
 
     // -------------------------------------------------------------------
     // Flow 2: Incremental Backup (existing backup set)
+    //   Builds a BackupJob from saved options, plans, and starts
+    //   immediately — no configuration page.
     // -------------------------------------------------------------------
 
-    private void StartIncrementalFlow()
+    private async void StartIncrementalFlow()
     {
         if (SelectedBackupSet is null)
             return;
 
+        var backupSet = SelectedBackupSet;
+        var opts = backupSet.JobOptions ?? new JobOptions();
+
         // Prefer the full saved selection tree; fall back to root-only reconstruction.
         List<SourceSelection> sources;
-        if (SelectedBackupSet.SourceSelections is { Count: > 0 })
+        if (backupSet.SourceSelections is { Count: > 0 })
         {
-            sources = SelectedBackupSet.SourceSelections;
+            sources = backupSet.SourceSelections;
         }
         else
         {
-            sources = SelectedBackupSet.SourceRoots
+            sources = backupSet.SourceRoots
                 .Select(root => new SourceSelection
                 {
                     Path = root,
@@ -485,7 +588,103 @@ public class MainViewModel : ViewModelBase
                 .ToList();
         }
 
-        ShowJobConfig(sources, SelectedBackupSet.Id);
+        // Build the BackupJob directly from saved JobOptions.
+        string? effectiveTargetDir = opts.TargetDirectory;
+        if (effectiveTargetDir is not null && opts.CreateSubdirectory
+            && !string.IsNullOrWhiteSpace(opts.SubdirectoryName))
+        {
+            effectiveTargetDir = Path.Combine(effectiveTargetDir, opts.SubdirectoryName.Trim());
+        }
+
+        var job = new BackupJob
+        {
+            BackupSetId = backupSet.Id,
+            Sources = sources,
+            ZipMode = opts.ZipMode,
+            FilesystemType = opts.FilesystemType,
+            CapacityOverrideBytes = opts.CapacityOverrideBytes,
+            VerifyAfterBurn = opts.VerifyAfterBurn,
+            VerifyAfterBackup = opts.VerifyAfterBackup,
+            IncludeCatalogOnDisc = opts.IncludeCatalogOnDisc,
+            AllowFileSplitting = opts.AllowFileSplitting,
+            TargetDirectory = effectiveTargetDir,
+            CreateSubdirectory = opts.CreateSubdirectory,
+            SubdirectoryName = opts.CreateSubdirectory ? opts.SubdirectoryName?.Trim() : null,
+            EnableFileDeduplication = opts.EnableFileDeduplication,
+            EnableDeduplication = opts.EnableDeduplication,
+            DeduplicationBlockSize = opts.DeduplicationBlockSize > 0
+                ? opts.DeduplicationBlockSize : 64 * 1024,
+            ExcludedExtensions = opts.ExcludedExtensions,
+            RetentionTiers = opts.RetentionTiers,
+            TierSets = opts.TierSets,
+        };
+
+        bool isDir = job.TargetDirectory is not null;
+
+        StatusText = $"Scanning \"{backupSet.Name}\"...";
+
+        try
+        {
+            // Throttled scan progress reporter.
+            var lastScanUpdate = 0L;
+            var scanSw = System.Diagnostics.Stopwatch.StartNew();
+            var scanProgress = new Progress<ScanProgress>(sp =>
+            {
+                long now = scanSw.ElapsedMilliseconds;
+                if (now - lastScanUpdate >= ProgressUpdateIntervalMs)
+                {
+                    lastScanUpdate = now;
+                    StatusText = $"Scanning \"{backupSet.Name}\"... {sp.FilesFound:N0} files found";
+                }
+            });
+
+            BackupPlan plan;
+            if (isDir)
+            {
+                if (_directoryBackupService is null)
+                {
+                    StatusText = "Directory backup service not available.";
+                    return;
+                }
+
+                var (diff, totalBytes, totalFiles) = await Task.Run(
+                    () => _directoryBackupService.PlanAsync(job, CancellationToken.None, scanProgress));
+
+                if (totalFiles == 0)
+                {
+                    StatusText = "Nothing to back up — all files are already current.";
+                    return;
+                }
+
+                plan = new BackupPlan
+                {
+                    Job = job,
+                    Diff = diff,
+                    DiscAllocations = [],
+                    TotalDiscsRequired = 0,
+                    TotalBytes = totalBytes,
+                };
+            }
+            else
+            {
+                plan = await Task.Run(
+                    () => _orchestrator.PlanAsync(job, CancellationToken.None, scanProgress));
+
+                int totalFiles = plan.Diff.NewFiles.Count + plan.Diff.ChangedFiles.Count;
+                if (totalFiles == 0)
+                {
+                    StatusText = "Nothing to back up — all files are already current.";
+                    return;
+                }
+            }
+
+            // Go straight to burn.
+            StartBurn(plan);
+        }
+        catch (Exception ex)
+        {
+            StatusText = $"Backup failed: {ex.GetType().Name}: {ex.Message}";
+        }
     }
 
     // -------------------------------------------------------------------
@@ -493,7 +692,8 @@ public class MainViewModel : ViewModelBase
     // -------------------------------------------------------------------
 
     private void ShowJobConfig(List<SourceSelection> sources, int? backupSetId,
-        SourceSelectionViewModel? sourceSettings = null)
+        SourceSelectionViewModel? sourceSettings = null,
+        BackupSetEditorWindow? dialog = null)
     {
         var jobConfig = new BackupJobViewModel(sources, _orchestrator, _burner, _directoryBackupService);
 
@@ -507,8 +707,6 @@ public class MainViewModel : ViewModelBase
         // saved options, so apply them after RestoreJobOptions.
         if (sourceSettings is not null)
             ApplySourceSettings(jobConfig, sourceSettings);
-
-        jobConfig.BackRequested += backupSetId.HasValue ? StartEditFlow : StartNewBackupFlow;
 
         // Save the backup set when planning completes.
         jobConfig.PlanCompleted += async job =>
@@ -526,14 +724,33 @@ public class MainViewModel : ViewModelBase
             }
         };
 
-        jobConfig.StartRequested += plan =>
+        if (dialog is not null)
         {
-            // Patch the backup set ID onto the plan's job.
-            plan.Job.BackupSetId = backupSetId;
-            StartBurn(plan);
-        };
+            // Editing in dialog — navigation stays within the dialog window.
+            dialog.SetEditorContent(jobConfig);
+            jobConfig.BackRequested += StartEditFlow;
+            jobConfig.StartRequested += plan =>
+            {
+                _pendingSettingsSave = null; // PlanCompleted already saved — don't overwrite
+                dialog.Close();
+                plan.Job.BackupSetId = backupSetId;
+                StartBurn(plan);
+            };
+        }
+        else
+        {
+            // Inline in main window (new backup set or incremental backup).
+            CurrentView = jobConfig;
+            jobConfig.BackRequested += backupSetId.HasValue
+                ? () => StartEditFlow()
+                : StartNewBackupFlow;
+            jobConfig.StartRequested += plan =>
+            {
+                plan.Job.BackupSetId = backupSetId;
+                StartBurn(plan);
+            };
+        }
 
-        CurrentView = jobConfig;
         StatusText = "Configure your backup options, then click Plan Backup.";
     }
 
@@ -548,6 +765,7 @@ public class MainViewModel : ViewModelBase
         vm.ZipMode = opts.ZipMode;
         vm.FilesystemType = opts.FilesystemType;
         vm.VerifyAfterBurn = opts.VerifyAfterBurn;
+        vm.VerifyAfterBackup = opts.VerifyAfterBackup;
         vm.IncludeCatalogOnDisc = opts.IncludeCatalogOnDisc;
         vm.AllowFileSplitting = opts.AllowFileSplitting;
         vm.EnableFileDeduplication = opts.EnableFileDeduplication;
@@ -634,25 +852,6 @@ public class MainViewModel : ViewModelBase
     }
 
     /// <summary>
-    /// Quick check whether two selection lists have the same paths and
-    /// selection states.  Used to decide if the cached LargestFilesViewModel
-    /// is still valid after the user may have toggled checkboxes.
-    /// </summary>
-    private static bool SelectionsMatch(
-        List<SourceSelection>? a, List<SourceSelection>? b)
-    {
-        if (ReferenceEquals(a, b)) return true;
-        if (a is null || b is null || a.Count != b.Count) return false;
-        for (int i = 0; i < a.Count; i++)
-        {
-            if (!string.Equals(a[i].Path, b[i].Path, StringComparison.OrdinalIgnoreCase)
-                || a[i].IsSelected != b[i].IsSelected)
-                return false;
-        }
-        return true;
-    }
-
-    /// <summary>
     /// Restore saved job options into the source selection view's settings section.
     /// </summary>
     private static void RestoreSourceSettings(SourceSelectionViewModel vm, JobOptions? opts)
@@ -719,6 +918,80 @@ public class MainViewModel : ViewModelBase
             vm.ScheduleDailyMinute = sched.DailyMinute;
             vm.ScheduleDebounceSeconds = sched.DebounceSeconds.ToString();
         }
+    }
+
+    /// <summary>
+    /// Write the current source selection settings back into the backup set's
+    /// <see cref="JobOptions"/> so they survive a dialog close without Plan.
+    /// This is the inverse of <see cref="RestoreSourceSettings"/>.
+    /// </summary>
+    private static void SyncSettingsToJobOptions(BackupSet backupSet, SourceSelectionViewModel vm)
+    {
+        var opts = backupSet.JobOptions ?? new JobOptions();
+
+        // Name.
+        backupSet.Name = vm.SetName;
+
+        // Exclusions.
+        opts.ExcludedExtensions = !string.IsNullOrWhiteSpace(vm.ExcludedPatterns)
+            ? BackupJobViewModel.ParseExclusionPatterns(vm.ExcludedPatterns)
+            : [];
+
+        // Target mode + directory.
+        if (vm.IsDirectoryMode)
+            opts.TargetDirectory = vm.TargetDirectory;
+        opts.CreateSubdirectory = vm.CreateSubdirectory;
+        opts.SubdirectoryName = vm.SubdirectoryName;
+
+        // Disc options.
+        opts.ZipMode = vm.ZipMode;
+        opts.FilesystemType = vm.FilesystemType;
+        opts.VerifyAfterBurn = vm.VerifyAfterBurn;
+        opts.IncludeCatalogOnDisc = vm.IncludeCatalogOnDisc;
+        opts.AllowFileSplitting = vm.AllowFileSplitting;
+        if (double.TryParse(vm.CapacityOverrideGb,
+                System.Globalization.NumberStyles.Float,
+                System.Globalization.CultureInfo.InvariantCulture,
+                out double gb) && gb > 0)
+            opts.CapacityOverrideBytes = (long)(gb * 1024 * 1024 * 1024);
+        else
+            opts.CapacityOverrideBytes = null;
+
+        // Directory options.
+        opts.EnableFileDeduplication = vm.EnableFileDeduplication;
+        opts.EnableDeduplication = vm.EnableBlockDeduplication;
+        if (int.TryParse(vm.BlockSizeKb, out int blockKb) && blockKb > 0)
+            opts.DeduplicationBlockSize = blockKb * 1024;
+
+        // Tier sets.
+        opts.TierSets = vm.TierSets.Select(ts => ts.ToModel()).ToList();
+        var defaultTs = vm.TierSets.FirstOrDefault(t => t.Name == "Default");
+        opts.RetentionTiers = defaultTs is not null
+            ? defaultTs.Tiers.Select(t => t.ToModel()).ToList()
+            : [];
+
+        // Schedule.
+        if (vm.ScheduleEnabled)
+        {
+            opts.Schedule = new BackupSchedule
+            {
+                Enabled = true,
+                Mode = vm.ScheduleMode,
+                IntervalHours = double.TryParse(vm.ScheduleIntervalHours,
+                    System.Globalization.NumberStyles.Float,
+                    System.Globalization.CultureInfo.InvariantCulture,
+                    out var h) ? h : 24,
+                DailyHour = vm.ScheduleDailyHour,
+                DailyMinute = vm.ScheduleDailyMinute,
+                DebounceSeconds = int.TryParse(vm.ScheduleDebounceSeconds, out var s) ? s : 60,
+            };
+        }
+        else if (opts.Schedule is not null)
+        {
+            opts.Schedule.Enabled = false;
+        }
+
+        backupSet.JobOptions = opts;
     }
 
     /// <summary>
@@ -808,6 +1081,7 @@ public class MainViewModel : ViewModelBase
             FilesystemType = job.FilesystemType,
             CapacityOverrideBytes = job.CapacityOverrideBytes,
             VerifyAfterBurn = job.VerifyAfterBurn,
+            VerifyAfterBackup = job.VerifyAfterBackup,
             IncludeCatalogOnDisc = job.IncludeCatalogOnDisc,
             AllowFileSplitting = job.AllowFileSplitting,
             EnableFileDeduplication = job.EnableFileDeduplication,
@@ -864,23 +1138,26 @@ public class MainViewModel : ViewModelBase
     {
         bool isDir = plan.Job.TargetDirectory is not null;
         var progressVm = new BurnProgressViewModel { IsDirectoryMode = isDir };
-        CurrentView = progressVm;
+        CurrentView = null;                     // return to home screen
+        ActiveBackupProgress = progressVm;      // show inline progress panel
         IsBurning = true;
+        RunningBackupSetId = plan.Job.BackupSetId;
 
         progressVm.DoneRequested += () =>
         {
-            GoHome();
+            ActiveBackupProgress = null;        // dismiss the progress panel
+            RunningBackupSetId = null;
             _ = LoadBackupSetsAsync();
         };
 
         if (isDir)
         {
-            StatusText = "Copying files...";
+            StatusText = "";
             _ = ExecuteDirectoryBackupAsync(plan, progressVm);
         }
         else
         {
-            StatusText = "Burning...";
+            StatusText = "";
             _ = ExecuteBurnAsync(plan, progressVm);
         }
     }
@@ -926,16 +1203,14 @@ public class MainViewModel : ViewModelBase
                         tcs.SetResult(new FailureDecision
                         {
                             Action = vm.ChosenAction,
-                            ApplyToAllOnDisc = vm.ApplyToAll,
                         });
                     }
                     else
                     {
-                        // Dialog closed without choosing -- default to Skip.
+                        // Dialog closed without choosing — default to Skip.
                         tcs.SetResult(new FailureDecision
                         {
                             Action = BurnFailureAction.Skip,
-                            ApplyToAllOnDisc = false,
                         });
                     }
                 });
@@ -968,6 +1243,7 @@ public class MainViewModel : ViewModelBase
         finally
         {
             IsBurning = false;
+            RunningBackupSetId = null;
         }
     }
 
@@ -987,7 +1263,7 @@ public class MainViewModel : ViewModelBase
             var progress = new Progress<BackupProgress>(p =>
             {
                 progressVm.OnBackupProgress(p);
-                StatusText = $"Copying files — {p.OverallPercentage:F0}%";
+                StatusText = $"{p.OverallPercentage:F0}% complete";
             });
 
             FailureCallback onFailure = async (filePath, error) =>
@@ -1017,7 +1293,6 @@ public class MainViewModel : ViewModelBase
                         tcs.SetResult(new FailureDecision
                         {
                             Action = vm.ChosenAction,
-                            ApplyToAllOnDisc = vm.ApplyToAll,
                         });
                     }
                     else
@@ -1026,7 +1301,6 @@ public class MainViewModel : ViewModelBase
                         tcs.SetResult(new FailureDecision
                         {
                             Action = BurnFailureAction.Skip,
-                            ApplyToAllOnDisc = false,
                         });
                     }
                 });
@@ -1065,6 +1339,7 @@ public class MainViewModel : ViewModelBase
         finally
         {
             IsBurning = false;
+            RunningBackupSetId = null;
         }
     }
 
@@ -1154,8 +1429,12 @@ public class MainViewModel : ViewModelBase
         await ShowLargestFilesAsync(SelectedBackupSet, GoHome);
     }
 
-    private async Task<LargestFilesViewModel> ShowLargestFilesAsync(BackupSet backupSet, Action onDone)
+    private async Task<LargestFilesViewModel> ShowLargestFilesAsync(
+        BackupSet backupSet, Action onDone,
+        Action<ViewModelBase>? setView = null)
     {
+        setView ??= vm => CurrentView = vm;
+
         // Fast scalar count from the catalog for the progress bar.
         int estimatedCount = 0;
         try { estimatedCount = await _catalog.GetFileCountForBackupSetAsync(backupSet.Id); }
@@ -1164,7 +1443,7 @@ public class MainViewModel : ViewModelBase
         var vm = new LargestFilesViewModel(_scanner, _catalog, backupSet, estimatedCount);
         vm.DoneRequested += onDone;
 
-        CurrentView = vm;
+        setView(vm);
         StatusText = $"Scanning source files for \"{backupSet.Name}\".";
         return vm;
     }

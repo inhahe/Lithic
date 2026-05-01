@@ -8,8 +8,8 @@
         mc:Ignorable="d"
         d:DataContext="{d:DesignInstance Type=vm:MainViewModel, IsDesignTimeCreatable=False}"
         Style="{StaticResource MainWindowStyle}"
-        Title="Lithic Backup" SizeToContent="Height" Width="900"
-        MinHeight="400" MinWidth="600"
+        Title="Lithic Backup" Height="640" Width="1050"
+        MinHeight="480" MinWidth="700"
         WindowStartupLocation="CenterScreen">
 
     <DockPanel>
@@ -32,327 +32,273 @@
                 <RowDefinition Height="Auto" />
                 <RowDefinition Height="*" />
                 <RowDefinition Height="Auto" />
+                <RowDefinition Height="Auto" />
             </Grid.RowDefinitions>
 
             <!-- Header -->
-            <StackPanel Grid.Row="0" Margin="0,0,0,16">
-                <TextBlock Style="{StaticResource H1}" Text="Lithic Backup" />
+            <StackPanel Grid.Row="0" Margin="0,0,0,12">
+                <TextBlock Style="{StaticResource H1}" Text="Lithic Backup" Margin="0,0,0,2" />
                 <TextBlock Style="{StaticResource SubText}"
-                           Text="Incremental disc backup with smart space management" />
+                           Text="Incremental disc and directory backup with smart space management" />
             </StackPanel>
 
-            <!-- Main content area -->
-            <Grid Grid.Row="1">
-                <Grid.ColumnDefinitions>
-                    <ColumnDefinition Width="240" />
-                    <ColumnDefinition Width="*" />
-                </Grid.ColumnDefinitions>
+            <!-- Main content area (full width) -->
+            <Border Grid.Row="1" Style="{StaticResource Card}">
+                <ContentControl Content="{Binding CurrentView}">
+                    <ContentControl.Resources>
+                        <!-- Map viewmodel types to views -->
+                        <DataTemplate DataType="{x:Type vm:SourceSelectionViewModel}">
+                            <views:SourceSelectionView />
+                        </DataTemplate>
+                        <DataTemplate DataType="{x:Type vm:BackupJobViewModel}">
+                            <views:BackupJobView />
+                        </DataTemplate>
+                        <DataTemplate DataType="{x:Type vm:RestoreViewModel}">
+                            <views:RestoreView />
+                        </DataTemplate>
+                        <DataTemplate DataType="{x:Type vm:OrphanedDirectoriesViewModel}">
+                            <views:OrphanedDirectoriesView />
+                        </DataTemplate>
+                        <DataTemplate DataType="{x:Type vm:FindFileViewModel}">
+                            <views:FindFileView />
+                        </DataTemplate>
+                        <DataTemplate DataType="{x:Type vm:BackupCoverageViewModel}">
+                            <views:BackupCoverageView />
+                        </DataTemplate>
+                        <DataTemplate DataType="{x:Type vm:LargestFilesViewModel}">
+                            <views:LargestFilesView />
+                        </DataTemplate>
+                    </ContentControl.Resources>
 
-                <!-- Left sidebar: backup sets -->
-                <Border Grid.Column="0" Style="{StaticResource Card}" Margin="0,0,12,0">
-                    <DockPanel>
-                        <TextBlock DockPanel.Dock="Top" Style="{StaticResource H2}" Text="Backup Sets" />
+                    <!-- Default content when CurrentView is null (home screen = set list) -->
+                    <ContentControl.Style>
+                        <Style TargetType="ContentControl">
+                            <Style.Triggers>
+                                <DataTrigger Binding="{Binding CurrentView}" Value="{x:Null}">
+                                    <Setter Property="ContentTemplate">
+                                        <Setter.Value>
+                                            <DataTemplate>
+                                                <DockPanel>
+                                                    <!-- Toolbar row -->
+                                                    <StackPanel DockPanel.Dock="Top"
+                                                                Orientation="Horizontal"
+                                                                Margin="0,0,0,12">
+                                                        <Button Command="{Binding DataContext.NewBackupSetCommand,
+                                                                          RelativeSource={RelativeSource AncestorType=Window}}"
+                                                                Padding="12,6" Margin="0,0,8,0"
+                                                                ToolTipService.ShowOnDisabled="True"
+                                                                ToolTipService.InitialShowDelay="0">
+                                                            <StackPanel Orientation="Horizontal">
+                                                                <TextBlock Text="+" FontWeight="Bold" Margin="0,0,4,0" />
+                                                                <TextBlock Text="New Backup Set" />
+                                                            </StackPanel>
+                                                            <Button.Style>
+                                                                <Style TargetType="Button" BasedOn="{StaticResource PrimaryButton}">
+                                                                    <Style.Triggers>
+                                                                        <Trigger Property="IsEnabled" Value="False">
+                                                                            <Setter Property="ToolTip"
+                                                                                    Value="A backup is currently in progress." />
+                                                                        </Trigger>
+                                                                    </Style.Triggers>
+                                                                </Style>
+                                                            </Button.Style>
+                                                        </Button>
+                                                        <Button Command="{Binding DataContext.FindFileCommand,
+                                                                          RelativeSource={RelativeSource AncestorType=Window}}"
+                                                                Padding="12,6" Margin="0,0,8,0" Cursor="Hand">
+                                                            <StackPanel Orientation="Horizontal">
+                                                                <TextBlock Text="&#x1F50D;" Margin="0,0,4,0" />
+                                                                <TextBlock Text="Find File/Directory" />
+                                                            </StackPanel>
+                                                        </Button>
+                                                        <Button Command="{Binding DataContext.ImportBackupSetCommand,
+                                                                          RelativeSource={RelativeSource AncestorType=Window}}"
+                                                                Padding="12,6" Cursor="Hand">
+                                                            <StackPanel Orientation="Horizontal">
+                                                                <TextBlock Text="Import" />
+                                                            </StackPanel>
+                                                        </Button>
+                                                    </StackPanel>
 
-                        <!-- Bottom buttons -->
-                        <StackPanel DockPanel.Dock="Bottom" Margin="0,8,0,0">
-                            <Button Content="New Backup Set"
-                                    HorizontalAlignment="Stretch"
-                                    Command="{Binding NewBackupSetCommand}"
-                                    ToolTipService.ShowOnDisabled="True"
-                                    ToolTipService.InitialShowDelay="0">
-                                <Button.Style>
-                                    <Style TargetType="Button" BasedOn="{StaticResource PrimaryButton}">
-                                        <Style.Triggers>
-                                            <Trigger Property="IsEnabled" Value="False">
-                                                <Setter Property="ToolTip"
-                                                        Value="A backup is currently in progress." />
-                                            </Trigger>
-                                        </Style.Triggers>
-                                    </Style>
-                                </Button.Style>
-                            </Button>
-                            <Button Content="Home"
-                                    HorizontalAlignment="Stretch"
-                                    Padding="16,8" Margin="0,6,0,0"
-                                    Cursor="Hand"
-                                    Command="{Binding HomeCommand}" />
-                        </StackPanel>
-
-                        <!-- Backup set list -->
-                        <ListBox ItemsSource="{Binding BackupSets}"
-                                 SelectedItem="{Binding SelectedBackupSet}"
-                                 BorderThickness="0"
-                                 Background="Transparent"
-                                 Margin="0,8,0,0">
-                            <ListBox.ItemTemplate>
-                                <DataTemplate>
-                                    <StackPanel Margin="2,4">
-                                        <TextBlock Text="{Binding Name}"
-                                                   FontWeight="SemiBold" />
-                                        <TextBlock Foreground="{StaticResource TextDimBrush}"
-                                                   FontSize="11">
-                                            <TextBlock.Text>
-                                                <Binding Path="SourceRoots.Count"
-                                                         StringFormat="{}{0} source(s)" />
-                                            </TextBlock.Text>
-                                        </TextBlock>
-                                    </StackPanel>
-                                </DataTemplate>
-                            </ListBox.ItemTemplate>
-                        </ListBox>
-                    </DockPanel>
-                </Border>
-
-                <!-- Right content area -->
-                <Border Grid.Column="1" Style="{StaticResource Card}">
-                    <ContentControl Content="{Binding CurrentView}">
-                        <ContentControl.Resources>
-                            <!-- Map viewmodel types to views -->
-                            <DataTemplate DataType="{x:Type vm:SourceSelectionViewModel}">
-                                <views:SourceSelectionView />
-                            </DataTemplate>
-                            <DataTemplate DataType="{x:Type vm:BackupJobViewModel}">
-                                <views:BackupJobView />
-                            </DataTemplate>
-                            <DataTemplate DataType="{x:Type vm:BurnProgressViewModel}">
-                                <views:BurnProgressView />
-                            </DataTemplate>
-                            <DataTemplate DataType="{x:Type vm:RestoreViewModel}">
-                                <views:RestoreView />
-                            </DataTemplate>
-                            <DataTemplate DataType="{x:Type vm:OrphanedDirectoriesViewModel}">
-                                <views:OrphanedDirectoriesView />
-                            </DataTemplate>
-                            <DataTemplate DataType="{x:Type vm:FindFileViewModel}">
-                                <views:FindFileView />
-                            </DataTemplate>
-                            <DataTemplate DataType="{x:Type vm:BackupCoverageViewModel}">
-                                <views:BackupCoverageView />
-                            </DataTemplate>
-                            <DataTemplate DataType="{x:Type vm:LargestFilesViewModel}">
-                                <views:LargestFilesView />
-                            </DataTemplate>
-                        </ContentControl.Resources>
-
-                        <!-- Default content when CurrentView is null (home screen) -->
-                        <ContentControl.Style>
-                            <Style TargetType="ContentControl">
-                                <Style.Triggers>
-                                    <DataTrigger Binding="{Binding CurrentView}" Value="{x:Null}">
-                                        <Setter Property="ContentTemplate">
-                                            <Setter.Value>
-                                                <DataTemplate>
+                                                    <!-- Backup sets list -->
                                                     <ScrollViewer VerticalScrollBarVisibility="Auto"
                                                                   HorizontalScrollBarVisibility="Disabled">
-                                                        <StackPanel HorizontalAlignment="Center"
-                                                                    Margin="0,24,0,24">
-                                                            <TextBlock Style="{StaticResource H2}"
-                                                                       HorizontalAlignment="Center"
-                                                                       Text="Welcome to Lithic Backup" />
-                                                            <TextBlock Style="{StaticResource SubText}"
-                                                                       HorizontalAlignment="Center"
-                                                                       Margin="0,4,0,0"
-                                                                       TextWrapping="Wrap"
-                                                                       TextAlignment="Center"
-                                                                       MaxWidth="400"
-                                                                       Text="Create a new backup set or select an existing one from the sidebar to run an incremental backup." />
-                                                            <TextBlock Style="{StaticResource SubText}"
-                                                                       HorizontalAlignment="Center"
-                                                                       Margin="0,12,0,0"
-                                                                       Text="Supports CD, DVD, Blu-Ray, and M-Disc media." />
+                                                        <StackPanel>
+                                                            <ItemsControl ItemsSource="{Binding DataContext.BackupSets,
+                                                                                        RelativeSource={RelativeSource AncestorType=Window}}">
+                                                                <ItemsControl.ItemTemplate>
+                                                                    <DataTemplate>
+                                                                        <Border BorderBrush="{StaticResource BorderBrush}"
+                                                                                BorderThickness="0,0,0,1"
+                                                                                Padding="8,10"
+                                                                                Background="Transparent"
+                                                                                Cursor="Hand">
+                                                                            <Border.InputBindings>
+                                                                                <MouseBinding MouseAction="LeftDoubleClick"
+                                                                                              Command="{Binding DataContext.SetModifyCommand,
+                                                                                                        RelativeSource={RelativeSource AncestorType=Window}}"
+                                                                                              CommandParameter="{Binding}" />
+                                                                            </Border.InputBindings>
 
-                                                            <!-- All action buttons in a single vertical list -->
-                                                            <StackPanel MaxWidth="300" Margin="0,20,0,0"
-                                                                        HorizontalAlignment="Center">
+                                                                            <Grid>
+                                                                                <Grid.ColumnDefinitions>
+                                                                                    <ColumnDefinition Width="*" />
+                                                                                    <ColumnDefinition Width="Auto" />
+                                                                                </Grid.ColumnDefinitions>
 
-                                                                <!-- Always-available actions -->
-                                                                <Button Content="Find File or Directory"
-                                                                        HorizontalAlignment="Stretch"
-                                                                        Padding="16,8"
-                                                                        Cursor="Hand"
-                                                                        Command="{Binding DataContext.FindFileCommand,
-                                                                                  RelativeSource={RelativeSource AncestorType=Window}}" />
-                                                                <Button Content="Import Backup Set"
-                                                                        HorizontalAlignment="Stretch"
-                                                                        Padding="16,8" Margin="0,6,0,0"
-                                                                        Cursor="Hand"
-                                                                        Command="{Binding DataContext.ImportBackupSetCommand,
-                                                                                  RelativeSource={RelativeSource AncestorType=Window}}" />
+                                                                                <!-- Left: Name and status -->
+                                                                                <StackPanel Grid.Column="0" VerticalAlignment="Center">
+                                                                                    <TextBlock Text="{Binding Name}"
+                                                                                               FontWeight="SemiBold" FontSize="14" />
 
-                                                                <!-- Backup-set-specific actions (only when a set is selected) -->
-                                                                <StackPanel Margin="0,12,0,0">
-                                                                    <StackPanel.Style>
-                                                                        <Style TargetType="StackPanel">
-                                                                            <Setter Property="Visibility" Value="Visible" />
-                                                                            <Style.Triggers>
-                                                                                <DataTrigger Binding="{Binding DataContext.SelectedBackupSet,
-                                                                                                      RelativeSource={RelativeSource AncestorType=Window}}"
-                                                                                             Value="{x:Null}">
-                                                                                    <Setter Property="Visibility" Value="Collapsed" />
-                                                                                </DataTrigger>
-                                                                            </Style.Triggers>
-                                                                        </Style>
-                                                                    </StackPanel.Style>
+                                                                                    <!-- Idle status line (hidden when this set is running) -->
+                                                                                    <TextBlock FontSize="11"
+                                                                                               Foreground="{StaticResource TextDimBrush}">
+                                                                                        <TextBlock.Visibility>
+                                                                                            <MultiBinding Converter="{StaticResource IntEqualsVis}"
+                                                                                                          ConverterParameter="Invert">
+                                                                                                <Binding Path="Id" />
+                                                                                                <Binding Path="DataContext.RunningBackupSetId"
+                                                                                                         RelativeSource="{RelativeSource AncestorType=Window}" />
+                                                                                            </MultiBinding>
+                                                                                        </TextBlock.Visibility>
+                                                                                        <Run Text="{Binding SourceRoots.Count, Mode=OneWay, StringFormat='{}{0} source(s)'}" />
+                                                                                        <Run Text="  ·  " />
+                                                                                        <Run Text="{Binding LastBackupUtc, Mode=OneWay,
+                                                                                                    StringFormat='Last: {0:MMM d, yyyy}',
+                                                                                                    TargetNullValue='Never backed up'}" />
+                                                                                    </TextBlock>
 
-                                                                    <!-- Visual separator between general and set-specific buttons -->
-                                                                    <Border Height="1"
-                                                                            Background="{StaticResource BorderBrush}"
-                                                                            Margin="0,0,0,12" />
+                                                                                    <!-- Running status line (visible only for the running set) -->
+                                                                                    <StackPanel>
+                                                                                        <StackPanel.Visibility>
+                                                                                            <MultiBinding Converter="{StaticResource IntEqualsVis}">
+                                                                                                <Binding Path="Id" />
+                                                                                                <Binding Path="DataContext.RunningBackupSetId"
+                                                                                                         RelativeSource="{RelativeSource AncestorType=Window}" />
+                                                                                            </MultiBinding>
+                                                                                        </StackPanel.Visibility>
+                                                                                        <Grid Margin="0,3,0,0" Width="200" HorizontalAlignment="Left">
+                                                                                            <ProgressBar Minimum="0" Maximum="100"
+                                                                                                         Value="{Binding DataContext.ActiveBackupProgress.OverallPercentage,
+                                                                                                                 RelativeSource={RelativeSource AncestorType=Window},
+                                                                                                                 Mode=OneWay}"
+                                                                                                         Height="12"
+                                                                                                         Foreground="{StaticResource AccentBrush}" />
+                                                                                            <TextBlock HorizontalAlignment="Center"
+                                                                                                       VerticalAlignment="Center"
+                                                                                                       FontSize="9">
+                                                                                                <TextBlock.Text>
+                                                                                                    <Binding Path="DataContext.ActiveBackupProgress.OverallPercentage"
+                                                                                                             RelativeSource="{RelativeSource AncestorType=Window}"
+                                                                                                             StringFormat="{}{0:F1}%" />
+                                                                                                </TextBlock.Text>
+                                                                                            </TextBlock>
+                                                                                        </Grid>
+                                                                                    </StackPanel>
+                                                                                </StackPanel>
 
-                                                                    <Button Content="Run Incremental"
-                                                                            HorizontalAlignment="Stretch"
-                                                                            Padding="16,10"
-                                                                            Cursor="Hand"
-                                                                            Command="{Binding DataContext.RunIncrementalCommand,
-                                                                                      RelativeSource={RelativeSource AncestorType=Window}}"
-                                                                            ToolTipService.ShowOnDisabled="True"
-                                                                            ToolTipService.InitialShowDelay="0">
-                                                                        <Button.Style>
-                                                                            <Style TargetType="Button" BasedOn="{StaticResource PrimaryButton}">
-                                                                                <Style.Triggers>
-                                                                                    <Trigger Property="IsEnabled" Value="False">
-                                                                                        <Setter Property="ToolTip"
-                                                                                                Value="A backup is currently in progress." />
-                                                                                    </Trigger>
-                                                                                </Style.Triggers>
-                                                                            </Style>
-                                                                        </Button.Style>
-                                                                    </Button>
+                                                                                <!-- Right: Action links -->
+                                                                                <StackPanel Grid.Column="1" VerticalAlignment="Center">
+                                                                                    <!-- Idle actions (hidden when this set is running) -->
+                                                                                    <WrapPanel>
+                                                                                        <WrapPanel.Visibility>
+                                                                                            <MultiBinding Converter="{StaticResource IntEqualsVis}"
+                                                                                                          ConverterParameter="Invert">
+                                                                                                <Binding Path="Id" />
+                                                                                                <Binding Path="DataContext.RunningBackupSetId"
+                                                                                                         RelativeSource="{RelativeSource AncestorType=Window}" />
+                                                                                            </MultiBinding>
+                                                                                        </WrapPanel.Visibility>
+                                                                                        <Button Style="{StaticResource LinkButton}"
+                                                                                                Command="{Binding DataContext.SetBackupCommand,
+                                                                                                          RelativeSource={RelativeSource AncestorType=Window}}"
+                                                                                                CommandParameter="{Binding}"
+                                                                                                Margin="0,0,12,0">
+                                                                                            <TextBlock><Run Text="&#x25B6;" FontSize="10" /> Backup</TextBlock>
+                                                                                        </Button>
+                                                                                        <Button Style="{StaticResource LinkButton}"
+                                                                                                Command="{Binding DataContext.SetRestoreCommand,
+                                                                                                          RelativeSource={RelativeSource AncestorType=Window}}"
+                                                                                                CommandParameter="{Binding}"
+                                                                                                Margin="0,0,12,0">
+                                                                                            <TextBlock><Run Text="&#x21A9;" FontSize="10" /> Restore</TextBlock>
+                                                                                        </Button>
+                                                                                        <Button Style="{StaticResource LinkButton}"
+                                                                                                Command="{Binding DataContext.SetModifyCommand,
+                                                                                                          RelativeSource={RelativeSource AncestorType=Window}}"
+                                                                                                CommandParameter="{Binding}">
+                                                                                            <TextBlock><Run Text="&#x270E;" FontSize="10" /> Modify</TextBlock>
+                                                                                        </Button>
+                                                                                    </WrapPanel>
 
-                                                                    <Button Content="Backup Coverage"
-                                                                            HorizontalAlignment="Stretch"
-                                                                            Padding="16,8" Margin="0,6,0,0"
-                                                                            Cursor="Hand"
-                                                                            Command="{Binding DataContext.BackupCoverageCommand,
-                                                                                      RelativeSource={RelativeSource AncestorType=Window}}"
-                                                                            ToolTipService.ShowOnDisabled="True"
-                                                                            ToolTipService.InitialShowDelay="0">
-                                                                        <Button.Style>
-                                                                            <Style TargetType="Button">
-                                                                                <Style.Triggers>
-                                                                                    <Trigger Property="IsEnabled" Value="False">
-                                                                                        <Setter Property="ToolTip"
-                                                                                                Value="A backup is currently in progress." />
-                                                                                    </Trigger>
-                                                                                </Style.Triggers>
-                                                                            </Style>
-                                                                        </Button.Style>
-                                                                    </Button>
+                                                                                    <!-- Running actions -->
+                                                                                    <WrapPanel>
+                                                                                        <WrapPanel.Visibility>
+                                                                                            <MultiBinding Converter="{StaticResource IntEqualsVis}">
+                                                                                                <Binding Path="Id" />
+                                                                                                <Binding Path="DataContext.RunningBackupSetId"
+                                                                                                         RelativeSource="{RelativeSource AncestorType=Window}" />
+                                                                                            </MultiBinding>
+                                                                                        </WrapPanel.Visibility>
+                                                                                        <Button Style="{StaticResource LinkButton}"
+                                                                                                Command="{Binding DataContext.ActiveBackupProgress.PauseResumeCommand,
+                                                                                                          RelativeSource={RelativeSource AncestorType=Window}}"
+                                                                                                Margin="0,0,12,0">
+                                                                                            <TextBlock>
+                                                                                                <Run Text="&#x23F8;" FontSize="10" />
+                                                                                                <Run Text="{Binding DataContext.ActiveBackupProgress.PauseResumeLabel,
+                                                                                                            RelativeSource={RelativeSource AncestorType=Window},
+                                                                                                            Mode=OneWay}" />
+                                                                                            </TextBlock>
+                                                                                        </Button>
+                                                                                        <Button Style="{StaticResource LinkButton}"
+                                                                                                Command="{Binding DataContext.ActiveBackupProgress.CancelCommand,
+                                                                                                          RelativeSource={RelativeSource AncestorType=Window}}"
+                                                                                                Margin="0,0,12,0"
+                                                                                                Foreground="{StaticResource ErrorBrush}">
+                                                                                            <TextBlock><Run Text="&#x2715;" FontSize="10" /> Abort</TextBlock>
+                                                                                        </Button>
+                                                                                        <Button Style="{StaticResource LinkButton}"
+                                                                                                Command="{Binding DataContext.SetModifyCommand,
+                                                                                                          RelativeSource={RelativeSource AncestorType=Window}}"
+                                                                                                CommandParameter="{Binding}">
+                                                                                            <TextBlock><Run Text="&#x270E;" FontSize="10" /> Modify</TextBlock>
+                                                                                        </Button>
+                                                                                    </WrapPanel>
+                                                                                </StackPanel>
+                                                                            </Grid>
+                                                                        </Border>
+                                                                    </DataTemplate>
+                                                                </ItemsControl.ItemTemplate>
+                                                            </ItemsControl>
 
-                                                                    <Button Content="Restore Files"
-                                                                            HorizontalAlignment="Stretch"
-                                                                            Padding="16,8" Margin="0,6,0,0"
-                                                                            Cursor="Hand"
-                                                                            Command="{Binding DataContext.RestoreCommand,
-                                                                                      RelativeSource={RelativeSource AncestorType=Window}}"
-                                                                            ToolTipService.ShowOnDisabled="True"
-                                                                            ToolTipService.InitialShowDelay="0">
-                                                                        <Button.Style>
-                                                                            <Style TargetType="Button">
-                                                                                <Style.Triggers>
-                                                                                    <Trigger Property="IsEnabled" Value="False">
-                                                                                        <Setter Property="ToolTip"
-                                                                                                Value="A backup is currently in progress." />
-                                                                                    </Trigger>
-                                                                                </Style.Triggers>
-                                                                            </Style>
-                                                                        </Button.Style>
-                                                                    </Button>
-
-                                                                    <Button Content="Edit Backup Set"
-                                                                            HorizontalAlignment="Stretch"
-                                                                            Padding="16,8" Margin="0,6,0,0"
-                                                                            Cursor="Hand"
-                                                                            Command="{Binding DataContext.EditBackupSetCommand,
-                                                                                      RelativeSource={RelativeSource AncestorType=Window}}"
-                                                                            ToolTipService.ShowOnDisabled="True"
-                                                                            ToolTipService.InitialShowDelay="0">
-                                                                        <Button.Style>
-                                                                            <Style TargetType="Button">
-                                                                                <Style.Triggers>
-                                                                                    <Trigger Property="IsEnabled" Value="False">
-                                                                                        <Setter Property="ToolTip"
-                                                                                                Value="A backup is currently in progress." />
-                                                                                    </Trigger>
-                                                                                </Style.Triggers>
-                                                                            </Style>
-                                                                        </Button.Style>
-                                                                    </Button>
-
-                                                                    <Button Content="Change Destination"
-                                                                            HorizontalAlignment="Stretch"
-                                                                            Padding="16,8" Margin="0,6,0,0"
-                                                                            Cursor="Hand"
-                                                                            Command="{Binding DataContext.ChangeDestinationCommand,
-                                                                                      RelativeSource={RelativeSource AncestorType=Window}}"
-                                                                            ToolTipService.ShowOnDisabled="True"
-                                                                            ToolTipService.InitialShowDelay="0">
-                                                                        <Button.Style>
-                                                                            <Style TargetType="Button">
-                                                                                <Style.Triggers>
-                                                                                    <Trigger Property="IsEnabled" Value="False">
-                                                                                        <Setter Property="ToolTip"
-                                                                                                Value="Only available for directory-mode backup sets." />
-                                                                                    </Trigger>
-                                                                                </Style.Triggers>
-                                                                            </Style>
-                                                                        </Button.Style>
-                                                                    </Button>
-
-                                                                    <Button Content="Copy Backup Set"
-                                                                            HorizontalAlignment="Stretch"
-                                                                            Padding="16,8" Margin="0,6,0,0"
-                                                                            Cursor="Hand"
-                                                                            Command="{Binding DataContext.CopyBackupSetCommand,
-                                                                                      RelativeSource={RelativeSource AncestorType=Window}}"
-                                                                            ToolTipService.ShowOnDisabled="True"
-                                                                            ToolTipService.InitialShowDelay="0">
-                                                                        <Button.Style>
-                                                                            <Style TargetType="Button">
-                                                                                <Style.Triggers>
-                                                                                    <Trigger Property="IsEnabled" Value="False">
-                                                                                        <Setter Property="ToolTip"
-                                                                                                Value="A backup is currently in progress." />
-                                                                                    </Trigger>
-                                                                                </Style.Triggers>
-                                                                            </Style>
-                                                                        </Button.Style>
-                                                                    </Button>
-
-                                                                    <Button Content="Review Orphaned Directories"
-                                                                            HorizontalAlignment="Stretch"
-                                                                            Padding="16,8" Margin="0,6,0,0"
-                                                                            Cursor="Hand"
-                                                                            Command="{Binding DataContext.OrphanedDirsCommand,
-                                                                                      RelativeSource={RelativeSource AncestorType=Window}}"
-                                                                            ToolTipService.ShowOnDisabled="True"
-                                                                            ToolTipService.InitialShowDelay="0">
-                                                                        <Button.Style>
-                                                                            <Style TargetType="Button">
-                                                                                <Style.Triggers>
-                                                                                    <Trigger Property="IsEnabled" Value="False">
-                                                                                        <Setter Property="ToolTip"
-                                                                                                Value="A backup is currently in progress." />
-                                                                                    </Trigger>
-                                                                                </Style.Triggers>
-                                                                            </Style>
-                                                                        </Button.Style>
-                                                                    </Button>
-
-                                                                    <Button Content="Export Backup Set"
-                                                                            HorizontalAlignment="Stretch"
-                                                                            Padding="16,8" Margin="0,6,0,0"
-                                                                            Cursor="Hand"
-                                                                            Command="{Binding DataContext.ExportBackupSetCommand,
-                                                                                      RelativeSource={RelativeSource AncestorType=Window}}" />
-                                                                </StackPanel>
-                                                            </StackPanel>
+                                                            <!-- Empty state -->
+                                                            <TextBlock HorizontalAlignment="Center"
+                                                                       Margin="0,32,0,0"
+                                                                       Foreground="{StaticResource TextDimBrush}"
+                                                                       FontSize="13">
+                                                                <TextBlock.Style>
+                                                                    <Style TargetType="TextBlock">
+                                                                        <Setter Property="Visibility" Value="Collapsed" />
+                                                                        <Style.Triggers>
+                                                                            <DataTrigger Binding="{Binding DataContext.BackupSets.Count,
+                                                                                                  RelativeSource={RelativeSource AncestorType=Window}}"
+                                                                                         Value="0">
+                                                                                <Setter Property="Visibility" Value="Visible" />
+                                                                            </DataTrigger>
+                                                                        </Style.Triggers>
+                                                                    </Style>
+                                                                </TextBlock.Style>
+                                                                No backup sets yet. Click "New Backup Set" to get started.
+                                                            </TextBlock>
 
                                                             <!-- Worker Service management -->
                                                             <Border BorderBrush="{StaticResource BorderBrush}"
                                                                     BorderThickness="1" CornerRadius="4"
                                                                     Padding="16,12" Margin="0,24,0,0"
-                                                                    MaxWidth="400">
+                                                                    MaxWidth="500"
+                                                                    HorizontalAlignment="Center">
                                                                 <StackPanel>
                                                                     <TextBlock Text="{Binding DataContext.ServiceStatusText,
                                                                                       RelativeSource={RelativeSource AncestorType=Window}}"
@@ -392,24 +338,174 @@
                                                                                FontSize="11" TextWrapping="Wrap"
                                                                                TextAlignment="Center"
                                                                                Margin="0,8,0,0"
-                                                                               Text="The Worker Service runs automated and continuous backups in the background." />
+                                                                               Text="The Worker Service runs automated backups in the background." />
                                                                 </StackPanel>
                                                             </Border>
                                                         </StackPanel>
                                                     </ScrollViewer>
-                                                </DataTemplate>
-                                            </Setter.Value>
-                                        </Setter>
-                                    </DataTrigger>
-                                </Style.Triggers>
-                            </Style>
-                        </ContentControl.Style>
-                    </ContentControl>
-                </Border>
-            </Grid>
+                                                </DockPanel>
+                                            </DataTemplate>
+                                        </Setter.Value>
+                                    </Setter>
+                                </DataTrigger>
+                            </Style.Triggers>
+                        </Style>
+                    </ContentControl.Style>
+                </ContentControl>
+            </Border>
+
+            <!-- Inline backup progress panel -->
+            <Border Grid.Row="2"
+                    Style="{StaticResource Card}" Padding="12"
+                    Margin="0,8,0,0"
+                    Visibility="{Binding HasActiveBackupProgress, Converter={StaticResource BoolToVis}}">
+                <StackPanel DataContext="{Binding ActiveBackupProgress}">
+                    <!-- Status text + action buttons -->
+                    <DockPanel Margin="0,0,0,6">
+                        <StackPanel DockPanel.Dock="Right" Orientation="Horizontal"
+                                    VerticalAlignment="Center">
+                            <!-- Pause/Resume (directory backups only, while running) -->
+                            <Button Content="{Binding PauseResumeLabel}"
+                                    Command="{Binding PauseResumeCommand}"
+                                    Padding="10,4" Margin="0,0,6,0" Cursor="Hand">
+                                <Button.Style>
+                                    <Style TargetType="Button">
+                                        <Setter Property="Visibility" Value="Visible" />
+                                        <Style.Triggers>
+                                            <DataTrigger Binding="{Binding IsBurning}" Value="False">
+                                                <Setter Property="Visibility" Value="Collapsed" />
+                                            </DataTrigger>
+                                            <DataTrigger Binding="{Binding IsDirectoryMode}" Value="False">
+                                                <Setter Property="Visibility" Value="Collapsed" />
+                                            </DataTrigger>
+                                        </Style.Triggers>
+                                    </Style>
+                                </Button.Style>
+                            </Button>
+                            <!-- Cancel (while running) -->
+                            <Button Content="Cancel"
+                                    Command="{Binding CancelCommand}"
+                                    Visibility="{Binding IsBurning, Converter={StaticResource BoolToVis}}"
+                                    Padding="10,4" Margin="0,0,6,0" Cursor="Hand" />
+                            <!-- Dismiss (after completion) -->
+                            <Button Style="{StaticResource PrimaryButton}"
+                                    Content="Dismiss"
+                                    Command="{Binding DoneCommand}"
+                                    Visibility="{Binding IsComplete, Converter={StaticResource BoolToVis}}"
+                                    Padding="10,4" Cursor="Hand" />
+                        </StackPanel>
+                        <TextBlock Text="{Binding StatusText}"
+                                   FontWeight="SemiBold" FontSize="13"
+                                   VerticalAlignment="Center" />
+                    </DockPanel>
+
+                    <!-- Disc progress (disc burns only) -->
+                    <DockPanel Margin="0,0,0,4"
+                               Visibility="{Binding IsDirectoryMode, Converter={StaticResource BoolToVis}, ConverterParameter=Invert}">
+                        <TextBlock DockPanel.Dock="Left"
+                                   VerticalAlignment="Center" Margin="0,0,8,0"
+                                   Foreground="{StaticResource TextSecondaryBrush}" FontSize="11">
+                            <TextBlock.Text>
+                                <MultiBinding StringFormat="Disc {0} of {1}">
+                                    <Binding Path="CurrentDisc" />
+                                    <Binding Path="TotalDiscs" />
+                                </MultiBinding>
+                            </TextBlock.Text>
+                        </TextBlock>
+                        <ProgressBar Minimum="0" Maximum="100"
+                                     Value="{Binding DiscPercentage, Mode=OneWay}"
+                                     Height="14"
+                                     Foreground="{StaticResource PrimaryBrush}" />
+                    </DockPanel>
+
+                    <!-- Overall progress bar -->
+                    <Grid Margin="0,0,0,6">
+                        <ProgressBar Minimum="0" Maximum="100"
+                                     Value="{Binding OverallPercentage, Mode=OneWay}"
+                                     Height="16"
+                                     Foreground="{StaticResource AccentBrush}" />
+                        <TextBlock HorizontalAlignment="Center" VerticalAlignment="Center"
+                                   FontSize="10">
+                            <TextBlock.Text>
+                                <Binding Path="OverallPercentage" StringFormat="{}{0:F1}%" />
+                            </TextBlock.Text>
+                        </TextBlock>
+                    </Grid>
+
+                    <!-- Current file (while running) -->
+                    <TextBlock Text="{Binding CurrentFile}"
+                               Foreground="{StaticResource TextSecondaryBrush}"
+                               FontSize="11" TextTrimming="CharacterEllipsis"
+                               Visibility="{Binding IsBurning, Converter={StaticResource BoolToVis}}" />
+
+                    <!-- Stats row (while running) -->
+                    <TextBlock Foreground="{StaticResource TextDimBrush}" FontSize="11"
+                               Margin="0,2,0,0"
+                               Visibility="{Binding IsBurning, Converter={StaticResource BoolToVis}}">
+                        <Run Text="{Binding BytesWrittenText, Mode=OneWay}" />
+                        <Run Text="  ·  " />
+                        <Run Text="{Binding ElapsedText, Mode=OneWay}" />
+                        <Run Text=" elapsed" />
+                        <Run Text="  ·  ~" />
+                        <Run Text="{Binding RemainingText, Mode=OneWay}" />
+                        <Run Text=" remaining" />
+                    </TextBlock>
+
+                    <!-- Result detail (after completion) -->
+                    <TextBlock Text="{Binding ResultDetail}"
+                               Foreground="{StaticResource TextSecondaryBrush}"
+                               TextWrapping="Wrap"
+                               Visibility="{Binding IsComplete, Converter={StaticResource BoolToVis}}"
+                               Margin="0,4,0,0" />
+
+                    <!-- Failed files (after completion, if any) -->
+                    <Border Visibility="{Binding HasFailedFiles, Converter={StaticResource BoolToVis}}"
+                            BorderBrush="{StaticResource BorderBrush}"
+                            BorderThickness="1" CornerRadius="4"
+                            Margin="0,6,0,0" MaxHeight="120">
+                        <DockPanel>
+                            <DockPanel DockPanel.Dock="Top" Margin="8,4,8,2">
+                                <TextBlock FontWeight="SemiBold" FontSize="11"
+                                           Foreground="{StaticResource TextPrimaryBrush}">
+                                    <Run Text="Failed/skipped: " />
+                                    <Run Text="{Binding FailedFiles.Count, Mode=OneWay}" />
+                                </TextBlock>
+                                <StackPanel Orientation="Horizontal" HorizontalAlignment="Right">
+                                    <Button Content="Copy" Command="{Binding CopyFailedFilesCommand}"
+                                            Padding="6,2" Margin="0,0,4,0" Cursor="Hand" FontSize="10" />
+                                    <Button Content="Export..." Command="{Binding ExportFailedFilesCommand}"
+                                            Padding="6,2" Cursor="Hand" FontSize="10" />
+                                </StackPanel>
+                            </DockPanel>
+                            <ScrollViewer VerticalScrollBarVisibility="Auto"
+                                          HorizontalScrollBarVisibility="Disabled">
+                                <ItemsControl ItemsSource="{Binding FailedFiles}">
+                                    <ItemsControl.ItemTemplate>
+                                        <DataTemplate>
+                                            <Border BorderBrush="{StaticResource BorderBrush}"
+                                                    BorderThickness="0,1,0,0" Padding="8,2">
+                                                <DockPanel>
+                                                    <TextBlock DockPanel.Dock="Right"
+                                                               Text="{Binding Error}"
+                                                               Foreground="#FFCC4444"
+                                                               FontSize="10" Margin="8,0,0,0" />
+                                                    <TextBlock Text="{Binding Path}"
+                                                               FontSize="10"
+                                                               TextTrimming="CharacterEllipsis"
+                                                               ToolTip="{Binding Path}" />
+                                                </DockPanel>
+                                            </Border>
+                                        </DataTemplate>
+                                    </ItemsControl.ItemTemplate>
+                                </ItemsControl>
+                            </ScrollViewer>
+                        </DockPanel>
+                    </Border>
+                </StackPanel>
+            </Border>
 
             <!-- Status bar -->
-            <Border Grid.Row="2"
+            <Border Grid.Row="3"
                     Background="{StaticResource SurfaceBrush}"
                     BorderBrush="{StaticResource BorderBrush}"
                     BorderThickness="1"
@@ -417,7 +513,6 @@
                     Padding="12,8"
                     Margin="0,12,0,0">
                 <TextBlock Text="{Binding StatusText}"
-                           Foreground="{StaticResource TextSecondaryBrush}"
                            FontSize="12" />
             </Border>
         </Grid>

@@ -31,10 +31,10 @@
                 </StackPanel>
             </Grid>
             <StackPanel Orientation="Horizontal" Margin="0,6,0,0">
-                <Button Content="+ Add Path"
+                <Button Content="+ Add Network/Custom Folder"
                         Command="{Binding AddPathCommand}"
                         Padding="10,6" Margin="0,0,8,0" Cursor="Hand"
-                        ToolTip="Add a network share or custom directory as a backup source." />
+                        ToolTip="Add a network share or unmapped drive as a backup source." />
                 <Button Content="Largest Files &amp; Directories"
                         Command="{Binding LargestFilesCommand}"
                         Padding="10,6" Cursor="Hand"
@@ -57,10 +57,40 @@
                        FontSize="12"
                        VerticalAlignment="Center" />
 
-            <StackPanel Grid.Column="1" Orientation="Horizontal">
+            <StackPanel Grid.Column="1" Orientation="Horizontal" VerticalAlignment="Center">
+                <!-- Save status indicator (edit mode) -->
+                <TextBlock Text="{Binding SaveStatusText}"
+                           Foreground="{StaticResource AccentBrush}"
+                           FontWeight="SemiBold" FontSize="12"
+                           VerticalAlignment="Center" Margin="0,0,12,0"
+                           Visibility="{Binding IsEditMode, Converter={StaticResource BoolToVis}}" />
+
+                <!-- Edit mode: Save + Close -->
+                <Button Content="Save" Command="{Binding SaveCommand}"
+                        Visibility="{Binding IsEditMode, Converter={StaticResource BoolToVis}}"
+                        ToolTipService.ShowOnDisabled="True"
+                        ToolTipService.InitialShowDelay="0">
+                    <Button.Style>
+                        <Style TargetType="Button" BasedOn="{StaticResource PrimaryButton}">
+                            <Style.Triggers>
+                                <Trigger Property="IsEnabled" Value="False">
+                                    <Setter Property="ToolTip"
+                                            Value="Select at least one file or directory to back up." />
+                                </Trigger>
+                            </Style.Triggers>
+                        </Style>
+                    </Button.Style>
+                </Button>
+                <Button Content="Close" Command="{Binding CancelCommand}"
+                        Padding="16,8" Margin="8,0,0,0" Cursor="Hand"
+                        Visibility="{Binding IsEditMode, Converter={StaticResource BoolToVis}}" />
+
+                <!-- New-set mode: Cancel + Next -->
                 <Button Content="Cancel" Command="{Binding CancelCommand}"
-                        Padding="16,8" Margin="0,0,8,0" Cursor="Hand" />
+                        Padding="16,8" Margin="0,0,8,0" Cursor="Hand"
+                        Visibility="{Binding IsEditMode, Converter={StaticResource BoolToVis}, ConverterParameter=Invert}" />
                 <Button Content="Next" Command="{Binding NextCommand}"
+                        Visibility="{Binding IsEditMode, Converter={StaticResource BoolToVis}, ConverterParameter=Invert}"
                         ToolTipService.ShowOnDisabled="True"
                         ToolTipService.InitialShowDelay="0">
                     <Button.Style>

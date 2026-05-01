@@ -33,6 +33,7 @@ public class BurnProgressViewModel : ViewModelBase
     private string _currentFileSizeText = "";
     private bool _isPaused;
     private string _statusBeforePause = "";
+    private long _lastUiUpdateMs;
 
     /// <summary>
     /// Signaling primitive shared with the backup service. When reset (paused),
@@ -206,9 +207,25 @@ public class BurnProgressViewModel : ViewModelBase
 
     /// <summary>
     /// Update the view from a <see cref="BackupProgress"/> event.
+    /// Throttled to avoid excessive UI redraw (see <see cref="ProgressUpdateIntervalMs"/>).
+    /// Status-message-only reports (planning phases) are never throttled.
     /// </summary>
     public void OnBackupProgress(BackupProgress progress)
     {
+        // Status-message-only reports (e.g. "Verifying backup...") always go through.
+        if (!string.IsNullOrEmpty(progress.StatusMessage))
+        {
+            StatusText = progress.StatusMessage;
+            CurrentFile = progress.CurrentFile;
+            return;
+        }
+
+        // Throttle data-progress updates.
+        long nowMs = _stopwatch.ElapsedMilliseconds;
+        if (nowMs - _lastUiUpdateMs < ProgressUpdateIntervalMs)
+            return;
+        _lastUiUpdateMs = nowMs;
+
         CurrentDisc = progress.CurrentDisc;
         TotalDiscs = progress.TotalDiscs;
         OverallPercentage = progress.OverallPercentage;
@@ -257,6 +274,8 @@ public class BurnProgressViewModel : ViewModelBase
         {
             DiscPercentage = progress.DiscBurnProgress.Percentage;
         }
+
+        StatusText = "Copying files...";
     }
 
     /// <summary>Creates and returns a CancellationTokenSource for this operation.</summary>
