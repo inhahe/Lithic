@@ -46,7 +46,13 @@ public partial class App : Application
 
         var catalogPath = Path.Combine(appDataDir, "catalog.db");
         _catalog = new SqliteCatalogRepository(catalogPath);
-        var burner = new Imapi2DiscBurner();
+
+        // --simulate-burner: use a mock disc burner for testing without hardware.
+        var args = Environment.GetCommandLineArgs();
+        bool simulateBurner = args.Any(a => a.Equals("--simulate-burner", StringComparison.OrdinalIgnoreCase));
+        IDiscBurner burner = simulateBurner
+            ? new SimulatedDiscBurner()
+            : new Imapi2DiscBurner();
         var scanner = new FileScanner(_catalog);
         var packer = new BinPacker();
         var zipHandler = new ZipHandler();

@@ -495,6 +495,39 @@
                             <Run Text="{Binding RemainingText, Mode=OneWay}" />
                             <Run Text=" remaining" />
                         </TextBlock>
+
+                        <!-- Simulated burner failure injection (simulate-burner flag only) -->
+                        <Border Visibility="{Binding DataContext.IsSimulatedBurner,
+                                             RelativeSource={RelativeSource AncestorType=Window},
+                                             Converter={StaticResource BoolToVis}}"
+                                BorderBrush="#FF886622" BorderThickness="1"
+                                CornerRadius="4" Padding="8,5"
+                                Margin="0,8,0,0"
+                                Background="#18886622">
+                            <StackPanel Orientation="Horizontal"
+                                        VerticalAlignment="Center">
+                                <TextBlock Text="&#x26A0; Inject failure:"
+                                           FontWeight="SemiBold" FontSize="11"
+                                           Foreground="#FFCC8833"
+                                           VerticalAlignment="Center"
+                                           Margin="0,0,10,0" />
+                                <Button Content="File Write Error"
+                                        Command="{Binding DataContext.SimFileFailureCommand,
+                                                  RelativeSource={RelativeSource AncestorType=Window}}"
+                                        Padding="8,3" Margin="0,0,6,0" FontSize="11"
+                                        Cursor="Hand" Focusable="False" />
+                                <Button Content="Catastrophic Disc Failure"
+                                        Command="{Binding DataContext.SimCatastrophicFailureCommand,
+                                                  RelativeSource={RelativeSource AncestorType=Window}}"
+                                        Padding="8,3" Margin="0,0,6,0" FontSize="11"
+                                        Cursor="Hand" Focusable="False" />
+                                <Button Content="Arm Erase Failure"
+                                        Command="{Binding DataContext.SimEraseFailureCommand,
+                                                  RelativeSource={RelativeSource AncestorType=Window}}"
+                                        Padding="8,3" FontSize="11"
+                                        Cursor="Hand" Focusable="False" />
+                            </StackPanel>
+                        </Border>
                     </StackPanel>
 
                     <!-- Result detail (after completion) -->

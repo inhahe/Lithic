@@ -79,6 +79,20 @@ Only directory-mode backup sets can be scheduled (disc burns require physical me
 - Multi-disc restore with guided disc insertion prompts
 - Preserves original directory structure
 
+### Testing Without Hardware
+
+Pass `--simulate-burner` on the command line to replace the real IMAPI2 disc burner with a simulated drive. The simulated burner copies files to a local "disc shelf" directory (`%LOCALAPPDATA%/LithicBackup/simulated-discs/`) instead of writing to physical media, so scan, burn, verify, and restore workflows can all be tested without an optical drive.
+
+Each simulated burn creates a `disc-N/` directory containing the actual file content and a `_manifest.json` with per-file metadata (path, size, SHA-256 hash). Burns simulate realistic timing based on a configurable speed multiplier.
+
+While a simulated burn is in progress, the UI displays failure injection buttons:
+
+- **File Write Error** -- causes the next file write to fail with an I/O error
+- **Catastrophic Disc Failure** -- triggers an immediate unrecoverable disc error (simulates laser failure or disc ejection)
+- **Arm Erase Failure** -- causes the next erase operation to fail
+
+These buttons only appear in `--simulate-burner` mode and reset automatically when a new burn starts.
+
 ### Other Features
 
 - **Orphaned directory cleanup** — detect directories that were removed from source selections, deleted from disk, or match exclusion patterns, and purge them from the catalog

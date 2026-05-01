@@ -5,6 +5,7 @@ using System.Windows;
 using System.Windows.Input;
 using LithicBackup.Core.Interfaces;
 using LithicBackup.Core.Models;
+using LithicBackup.Infrastructure.Burning;
 using LithicBackup.Services;
 using LithicBackup.Views;
 
@@ -19,6 +20,7 @@ public class MainViewModel : ViewModelBase
     private readonly IRestoreService _restoreService;
     private readonly DirectoryBackupService _directoryBackupService;
     private readonly Services.TrayService? _trayService;
+    private readonly SimulatedDiscBurner? _simulatedBurner;
 
     private string _statusText = "Ready";
     private int _recorderCount;
@@ -49,6 +51,7 @@ public class MainViewModel : ViewModelBase
         _restoreService = restoreService;
         _directoryBackupService = directoryBackupService;
         _trayService = trayService;
+        _simulatedBurner = burner as SimulatedDiscBurner;
 
         BackupSets = [];
 
@@ -115,6 +118,17 @@ public class MainViewModel : ViewModelBase
         UninstallServiceCommand = new RelayCommand(_ => UninstallService());
         StartServiceCommand = new RelayCommand(_ => StartService());
         StopServiceCommand = new RelayCommand(_ => StopService());
+
+        // Simulated burner failure injection (--simulate-burner only).
+        SimFileFailureCommand = new RelayCommand(
+            _ => { if (_simulatedBurner is not null) _simulatedBurner.FileFailureProbability = 1.0; },
+            _ => _simulatedBurner is not null && IsBurning);
+        SimCatastrophicFailureCommand = new RelayCommand(
+            _ => { if (_simulatedBurner is not null) _simulatedBurner.CatastrophicFailureAtPercent = 0; },
+            _ => _simulatedBurner is not null && IsBurning);
+        SimEraseFailureCommand = new RelayCommand(
+            _ => { if (_simulatedBurner is not null) _simulatedBurner.SimulateEraseFail = true; },
+            _ => _simulatedBurner is not null && IsBurning);
 
         RefreshServiceStatus();
 
@@ -224,6 +238,12 @@ public class MainViewModel : ViewModelBase
     public ICommand UninstallServiceCommand { get; }
     public ICommand StartServiceCommand { get; }
     public ICommand StopServiceCommand { get; }
+
+    // Simulated burner failure injection (--simulate-burner only).
+    public bool IsSimulatedBurner => _simulatedBurner is not null;
+    public ICommand SimFileFailureCommand { get; }
+    public ICommand SimCatastrophicFailureCommand { get; }
+    public ICommand SimEraseFailureCommand { get; }
 
     /// <summary>Current service state for UI binding.</summary>
     public ServiceState ServiceStatus { get; private set; }
@@ -1238,6 +1258,14 @@ public class MainViewModel : ViewModelBase
 
     private void StartBurn(BackupPlan plan)
     {
+        // Reset simulated failure modes so each burn starts clean.
+        if (_simulatedBurner is not null)
+        {
+            _simulatedBurner.FileFailureProbability = 0;
+            _simulatedBurner.CatastrophicFailureAtPercent = null;
+            _simulatedBurner.SimulateEraseFail = false;
+        }
+
         bool isDir = plan.Job.TargetDirectory is not null;
         var progressVm = new BurnProgressViewModel { IsDirectoryMode = isDir };
         CurrentView = null;                     // return to home screen
