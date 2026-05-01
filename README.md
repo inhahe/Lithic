@@ -22,6 +22,7 @@ Backing up to optical media comes with challenges that LithicBackup handles auto
 - **Catalog on disc**: the SQLite backup catalog is written to the last disc in each set, so you can always identify and locate your files even without the original system
 - **Post-burn verification**: data integrity is verified against the disc after each burn
 - **Capacity overrides**: override the reported disc capacity for media that over-reports (common with M-Disc)
+- **Automatic zipping for incompatible paths**: files whose names or paths are too long or contain characters that the target disc filesystem doesn't support can be automatically zipped before burning. Three modes are available: zip all files, zip only incompatible files, or never zip. Zipping is also offered as a fallback when a file fails to stage normally.
 - **Filesystem options**: ISO 9660, Joliet, and UDF — UDF is the default and is required for Blu-Ray
 
 ### Deduplication
