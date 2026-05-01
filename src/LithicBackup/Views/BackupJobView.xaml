@@ -80,12 +80,17 @@
             <TextBlock Text="Options" FontWeight="SemiBold" Margin="0,0,0,8" />
 
             <!-- Excluded file patterns (both modes) -->
-            <StackPanel Orientation="Horizontal" Margin="0,0,0,12">
-                <TextBlock Text="Exclude files:" VerticalAlignment="Center" Margin="0,0,8,0" />
+            <StackPanel Margin="0,0,0,12">
+                <TextBlock Text="Exclude file paths matching these patterns (one per line):"
+                           Foreground="{StaticResource TextSecondaryBrush}"
+                           FontSize="11" Margin="0,0,0,4" />
                 <TextBox Text="{Binding ExcludedExtensions, UpdateSourceTrigger=PropertyChanged}"
-                         Padding="6,4" Width="350"
+                         Padding="6,4" Height="52"
+                         AcceptsReturn="True"
+                         VerticalScrollBarVisibility="Auto"
+                         TextWrapping="NoWrap"
                          BorderBrush="{StaticResource BorderBrush}"
-                         ToolTip="Comma-separated patterns to exclude (e.g. *.log, *.tmp, temp_*, debug*.txt)" />
+                         ToolTip="Examples:  *.log  *.tmp  *.bak  */.vs/*  */bin/*  */obj/*&#x0a;&#x0a;Use * to match any characters in a file name.&#x0a;Use */ to match directory paths." />
             </StackPanel>
 
             <!-- Disc-specific options (hidden in directory mode) -->
@@ -150,6 +155,10 @@
             <Border Style="{StaticResource Card}" Padding="12"
                     Visibility="{Binding IsDirectoryMode, Converter={StaticResource BoolToVis}}">
                 <StackPanel>
+                    <CheckBox Content="Verify backup after completion"
+                              IsChecked="{Binding VerifyAfterBackup}"
+                              Margin="0,0,0,10" />
+
                     <TextBlock Text="Deduplication" FontWeight="SemiBold" Margin="0,0,0,8" />
 
                     <CheckBox Content="File-level deduplication (identical files stored once)"
@@ -168,70 +177,22 @@
                                  BorderBrush="{StaticResource BorderBrush}" />
                     </StackPanel>
 
-                    <TextBlock Text="Version Retention" FontWeight="SemiBold" Margin="0,8,0,4" />
+                    <TextBlock Text="Version Retention Tier Sets" FontWeight="SemiBold" Margin="0,8,0,4" />
                     <TextBlock Foreground="{StaticResource TextSecondaryBrush}" FontSize="11" Margin="0,0,0,8"
-                               Text="Configure how many old file versions to keep based on age." />
+                               Text="Version retention policies defined in the source selection. Edit them there." />
 
-                    <!-- Retention tier list -->
-                    <ItemsControl ItemsSource="{Binding RetentionTiers}">
+                    <ItemsControl ItemsSource="{Binding TierSets}">
                         <ItemsControl.ItemTemplate>
                             <DataTemplate>
-                                <StackPanel Orientation="Horizontal" Margin="0,0,0,4">
-                                    <TextBlock Text="Under" VerticalAlignment="Center" Margin="0,0,4,0" />
-                                    <Grid Width="60">
-                                        <TextBox Text="{Binding MaxAgeDays, UpdateSourceTrigger=PropertyChanged}"
-                                                 Padding="4,3" x:Name="AgeDaysBox"
-                                                 BorderBrush="{StaticResource BorderBrush}"
-                                                 ToolTip="Days (leave empty for catch-all)" />
-                                        <TextBlock Text="any" IsHitTestVisible="False"
-                                                   Foreground="{StaticResource TextDimBrush}"
-                                                   VerticalAlignment="Center" Margin="6,0,0,0">
-                                            <TextBlock.Style>
-                                                <Style TargetType="TextBlock">
-                                                    <Setter Property="Visibility" Value="Collapsed" />
-                                                    <Style.Triggers>
-                                                        <DataTrigger Binding="{Binding Text, ElementName=AgeDaysBox}" Value="">
-                                                            <Setter Property="Visibility" Value="Visible" />
-                                                        </DataTrigger>
-                                                    </Style.Triggers>
-                                                </Style>
-                                            </TextBlock.Style>
-                                        </TextBlock>
-                                    </Grid>
-                                    <TextBlock Text="days, keep" VerticalAlignment="Center" Margin="4,0,4,0" />
-                                    <Grid Width="50">
-                                        <TextBox Text="{Binding MaxVersions, UpdateSourceTrigger=PropertyChanged}"
-                                                 Padding="4,3" x:Name="MaxVersionsBox"
-                                                 BorderBrush="{StaticResource BorderBrush}"
-                                                 ToolTip="Max versions (leave empty for all)" />
-                                        <TextBlock Text="all" IsHitTestVisible="False"
-                                                   Foreground="{StaticResource TextDimBrush}"
-                                                   VerticalAlignment="Center" Margin="6,0,0,0">
-                                            <TextBlock.Style>
-                                                <Style TargetType="TextBlock">
-                                                    <Setter Property="Visibility" Value="Collapsed" />
-                                                    <Style.Triggers>
-                                                        <DataTrigger Binding="{Binding Text, ElementName=MaxVersionsBox}" Value="">
-                                                            <Setter Property="Visibility" Value="Visible" />
-                                                        </DataTrigger>
-                                                    </Style.Triggers>
-                                                </Style>
-                                            </TextBlock.Style>
-                                        </TextBlock>
-                                    </Grid>
-                                    <TextBlock Text="versions" VerticalAlignment="Center" Margin="4,0,8,0" />
-                                    <Button Content="&#x2715;" Command="{Binding RemoveCommand}"
-                                            Padding="4,2" Cursor="Hand"
-                                            FontSize="11" />
-                                </StackPanel>
+                                <TextBlock Margin="0,0,0,2" FontSize="11">
+                                    <Run Text="{Binding Name, Mode=OneWay}" FontWeight="SemiBold" />
+                                    <Run Text=" — " Foreground="{StaticResource TextDimBrush}" />
+                                    <Run Text="{Binding Tiers.Count, Mode=OneWay, StringFormat='{}{0} tier(s)'}"
+                                         Foreground="{StaticResource TextSecondaryBrush}" />
+                                </TextBlock>
                             </DataTemplate>
                         </ItemsControl.ItemTemplate>
                     </ItemsControl>
-
-                    <Button Content="+ Add Tier" Command="{Binding AddTierCommand}"
-                            HorizontalAlignment="Left"
-                            Padding="8,4" Margin="0,4,0,0" Cursor="Hand"
-                            FontSize="11" />
                 </StackPanel>
             </Border>
 
@@ -259,11 +220,35 @@
                         HorizontalAlignment="Right" Margin="0,16,0,0">
                 <Button Content="Back" Command="{Binding BackCommand}"
                         Padding="16,8" Margin="0,0,8,0" Cursor="Hand" />
-                <Button Style="{StaticResource PrimaryButton}"
-                        Content="Plan Backup" Command="{Binding PlanCommand}"
-                        Margin="0,0,8,0" />
-                <Button Style="{StaticResource PrimaryButton}"
-                        Content="Start Backup" Command="{Binding StartCommand}" />
+                <Button Content="Plan Backup" Command="{Binding PlanCommand}"
+                        Margin="0,0,8,0"
+                        ToolTipService.ShowOnDisabled="True"
+                        ToolTipService.InitialShowDelay="0">
+                    <Button.Style>
+                        <Style TargetType="Button" BasedOn="{StaticResource PrimaryButton}">
+                            <Style.Triggers>
+                                <Trigger Property="IsEnabled" Value="False">
+                                    <Setter Property="ToolTip"
+                                            Value="Planning is already in progress." />
+                                </Trigger>
+                            </Style.Triggers>
+                        </Style>
+                    </Button.Style>
+                </Button>
+                <Button Content="Start Backup" Command="{Binding StartCommand}"
+                        ToolTipService.ShowOnDisabled="True"
+                        ToolTipService.InitialShowDelay="0">
+                    <Button.Style>
+                        <Style TargetType="Button" BasedOn="{StaticResource PrimaryButton}">
+                            <Style.Triggers>
+                                <Trigger Property="IsEnabled" Value="False">
+                                    <Setter Property="ToolTip"
+                                            Value="Click &quot;Plan Backup&quot; first to generate a backup plan." />
+                                </Trigger>
+                            </Style.Triggers>
+                        </Style>
+                    </Button.Style>
+                </Button>
             </StackPanel>
             </StackPanel>
         </ScrollViewer>

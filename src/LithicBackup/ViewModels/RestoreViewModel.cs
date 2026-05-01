@@ -33,11 +33,11 @@ public class RestoreViewModel : ViewModelBase
     public RestoreViewModel(
         ICatalogRepository catalog,
         IRestoreService restoreService,
-        ObservableCollection<BackupSet> backupSets)
+        BackupSet backupSet)
     {
         _catalog = catalog;
         _restoreService = restoreService;
-        BackupSets = backupSets;
+        _selectedBackupSet = backupSet;
         RestorableFiles = [];
         SelectedFiles = [];
 
@@ -45,21 +45,14 @@ public class RestoreViewModel : ViewModelBase
         RestoreCommand = new RelayCommand(_ => _ = RestoreAsync(), _ => CanRestore());
         CancelCommand = new RelayCommand(_ => _cts?.Cancel(), _ => IsRestoring);
         DoneCommand = new RelayCommand(_ => DoneRequested?.Invoke());
+
+        // Load files immediately for the given backup set.
+        _ = LoadRestorableFilesAsync(backupSet.Id);
     }
 
     // --- Properties ---
 
-    public ObservableCollection<BackupSet> BackupSets { get; }
-
-    public BackupSet? SelectedBackupSet
-    {
-        get => _selectedBackupSet;
-        set
-        {
-            if (SetProperty(ref _selectedBackupSet, value) && value is not null)
-                _ = LoadRestorableFilesAsync(value.Id);
-        }
-    }
+    public BackupSet SelectedBackupSet => _selectedBackupSet!;
 
     public ObservableCollection<RestorableFileViewModel> RestorableFiles { get; }
 

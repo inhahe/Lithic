@@ -39,34 +39,47 @@ public class DirectoryBackupService
     }
 
     /// <summary>
-    /// Execute a directory backup: scan sources, compute diff, copy files
-    /// with versioned history, update catalog, and apply retention.
+    /// Execute a directory backup: copy files with versioned history,
+    /// update catalog, and apply retention.
+    /// When <paramref name="precomputedDiff"/> is supplied the scan/diff
+    /// steps are skipped (they were already done during planning).
     /// </summary>
     public async Task<BackupResult> ExecuteAsync(
         BackupJob job,
         string targetDirectory,
         IReadOnlyList<VersionRetentionTier>? retentionTiers,
         IProgress<BackupProgress>? progress,
-        CancellationToken ct)
+        CancellationToken ct,
+        ManualResetEventSlim? pauseEvent = null,
+        FailureCallback? onFailure = null,
+        BackupDiff? precomputedDiff = null)
     {
-        // 1. Scan sources.
-        var isExcluded = GlobMatcher.CreateFilter(job.ExcludedExtensions);
-        var scanned = await _scanner.ScanAsync(job.Sources, progress: null, ct, isExcluded);
-
-        // 2. Compute diff.
         BackupDiff diff;
-        if (job.BackupSetId.HasValue)
+        if (precomputedDiff is not null)
         {
-            diff = await _scanner.ComputeDiffAsync(scanned, job.BackupSetId.Value, ct);
+            diff = precomputedDiff;
         }
         else
         {
-            diff = new BackupDiff
+            // No pre-computed diff — scan and compute from scratch.
+            progress?.Report(new BackupProgress { StatusMessage = "Scanning source files..." });
+            var isExcluded = GlobMatcher.CreateCombinedFilter(job.ExcludedExtensions, job.Sources);
+            var scanned = await _scanner.ScanAsync(job.Sources, progress: null, ct, isExcluded);
+
+            progress?.Report(new BackupProgress { StatusMessage = "Computing changes..." });
+            if (job.BackupSetId.HasValue)
             {
-                NewFiles = scanned,
-                ChangedFiles = [],
-                DeletedFiles = [],
-            };
+                diff = await _scanner.ComputeDiffAsync(scanned, job.BackupSetId.Value, ct);
+            }
+            else
+            {
+                diff = new BackupDiff
+                {
+                    NewFiles = scanned,
+                    ChangedFiles = [],
+                    DeletedFiles = [],
+                };
+            }
         }
 
         var filesToBackup = diff.NewFiles.Concat(diff.ChangedFiles).ToList();
@@ -112,8 +125,11 @@ public class DirectoryBackupService
             StringComparer.OrdinalIgnoreCase);
 
         // Build a lookup of paths where version history is disabled.
-        var (noVersionFiles, noVersionDirPrefixes) =
+        var (noVersionFiles, noVersionDirPrefixes, noVersionGlobs) =
             SourceSelection.CollectNoVersionPaths(job.Sources);
+        var noVersionGlobFilter = noVersionGlobs.Count > 0
+            ? GlobMatcher.CreateFilter(noVersionGlobs)
+            : null;
 
         // 5. Create a single "virtual" DiscRecord for this backup run.
         Directory.CreateDirectory(targetDirectory);
@@ -127,7 +143,33 @@ public class DirectoryBackupService
         if (job.EnableFileDeduplication)
             Directory.CreateDirectory(fileStoreDir);
 
-        using var tx = await _catalog.BeginTransactionAsync(ct);
+        // 6. Copy files.
+        var failedFiles = new List<FailedFile>();
+        long totalBytes = filesToBackup.Sum(f => f.SizeBytes);
+        long bytesWritten = 0;
+        bool permanentSkipAll = false;
+
+        // Track hashes + formats of successfully backed-up files for verification.
+        var backedUp = job.VerifyAfterBackup
+            ? new Dictionary<string, (string Hash, bool IsDeduped, bool IsFileRef)>(
+                StringComparer.OrdinalIgnoreCase)
+            : null;
+
+        // Commit catalog records periodically so that cancellation preserves
+        // progress for files already copied.  Commits happen:
+        //   - every CommitBatchSize small files,
+        //   - immediately after any large file (>= 10 MB),
+        //   - before starting a large file (to flush pending small files),
+        //   - at least every CommitIntervalSeconds regardless of file size.
+        const int CommitBatchSize = 50;
+        const long CommitLargeFileThreshold = 10 * 1024 * 1024; // 10 MB
+        const double CommitIntervalSeconds = 30;
+        int batchCount = 0;
+        var commitTimer = System.Diagnostics.Stopwatch.StartNew();
+        var tx = await _catalog.BeginTransactionAsync(ct);
+
+        try
+        {
 
         var discRecord = await _catalog.CreateDiscAsync(new DiscRecord
         {
@@ -144,11 +186,6 @@ public class DirectoryBackupService
             LastWrittenUtc = DateTime.UtcNow,
         }, ct);
 
-        // 6. Copy files.
-        var failedFiles = new List<FailedFile>();
-        long totalBytes = filesToBackup.Sum(f => f.SizeBytes);
-        long bytesWritten = 0;
-
         // Per-file progress: only report intermediate progress for files >= 1 MB,
         // and throttle reports to every ~1 MB to avoid flooding the UI thread.
         const long PerFileProgressThreshold = 1024 * 1024;      // 1 MB
@@ -156,6 +193,7 @@ public class DirectoryBackupService
 
         for (int i = 0; i < filesToBackup.Count; i++)
         {
+            pauseEvent?.Wait(ct);
             ct.ThrowIfCancellationRequested();
 
             var file = filesToBackup[i];
@@ -175,16 +213,35 @@ public class DirectoryBackupService
                 CurrentFileTotalBytes = file.SizeBytes,
             });
 
+            // Before starting a large file, flush pending records so small
+            // files already copied are safe if the large copy is cancelled.
+            if (file.SizeBytes >= CommitLargeFileThreshold && batchCount > 0)
+            {
+                discRecord.BytesUsed = bytesWritten;
+                discRecord.LastWrittenUtc = DateTime.UtcNow;
+                await _catalog.UpdateDiscAsync(discRecord, ct);
+                tx.Complete();
+                tx.Dispose();
+                tx = await _catalog.BeginTransactionAsync(ct);
+                batchCount = 0;
+                commitTimer.Restart();
+            }
+
+            // Determine version number from the lightweight lookup
+            // BEFORE entering the retry loop so retries don't increment
+            // the version number.
+            int version = 1;
+            bool hasExistingInfo = versionInfo.TryGetValue(file.FullPath, out var existingInfo);
+            if (hasExistingInfo)
+                version = existingInfo.MaxVersion + 1;
+
+            bool fileRetrying = true;
+            while (fileRetrying)
+            {
+                fileRetrying = false;
+
             try
             {
-                // Determine version number from the lightweight lookup.
-                int version = 1;
-                if (versionInfo.TryGetValue(file.FullPath, out var existingInfo))
-                    version = existingInfo.MaxVersion + 1;
-                // Update for subsequent files in the same run.
-                versionInfo[file.FullPath] = new FileVersionInfo(
-                    version, file.SizeBytes, file.LastWriteUtc, false, false);
-
                 // Compute hash up front — needed for file-level dedup checks
                 // and the catalog record regardless.
                 string hash = await ComputeFileHashAsync(file.FullPath, ct);
@@ -236,7 +293,7 @@ public class DirectoryBackupService
                     if (!File.Exists(fileStorePath))
                     {
                         // First occurrence of this content — copy to the store.
-                        await CopyFileAsync(file.FullPath, fileStorePath, ct, fileProgress);
+                        await CopyFileAsync(file.FullPath, fileStorePath, ct, fileProgress, pauseEvent);
                     }
                     isFileRef = true;
                 }
@@ -262,11 +319,12 @@ public class DirectoryBackupService
                 // Check if this file should keep version history.
                 bool keepVersions = !noVersionFiles.Contains(file.FullPath)
                     && !noVersionDirPrefixes.Any(p =>
-                        file.FullPath.StartsWith(p, StringComparison.OrdinalIgnoreCase));
+                        file.FullPath.StartsWith(p, StringComparison.OrdinalIgnoreCase))
+                    && !(noVersionGlobFilter?.Invoke(file.FullPath) ?? false);
 
                 // Move existing current file to _prev if this is a changed file
                 // and version history is enabled.
-                if (isChanged && keepVersions)
+                if (isChanged && keepVersions && hasExistingInfo)
                 {
                     bool oldDeduped = existingInfo.IsDeduped;
                     bool oldFileRef = existingInfo.IsFileRef;
@@ -344,7 +402,7 @@ public class DirectoryBackupService
                 else
                 {
                     // Plain copy.
-                    await CopyFileAsync(file.FullPath, currentPath, ct, fileProgress);
+                    await CopyFileAsync(file.FullPath, currentPath, ct, fileProgress, pauseEvent);
                 }
 
                 // Update version info so a later file in this same run
@@ -369,26 +427,95 @@ public class DirectoryBackupService
                     BackedUpUtc = DateTime.UtcNow,
                 }, ct);
 
+                backedUp?.TryAdd(file.FullPath, (hash, isDeduped, isFileRef));
+
                 bytesWritten += file.SizeBytes;
+                batchCount++;
             }
+            catch (OperationCanceledException) { throw; }
             catch (Exception ex)
             {
-                failedFiles.Add(new FailedFile
+                // If the user previously chose "Skip All", skip without
+                // prompting again.
+                if (permanentSkipAll || onFailure is null)
                 {
-                    Path = file.FullPath,
-                    Error = ex.Message,
-                    ActionTaken = BurnFailureAction.Skip,
-                });
+                    failedFiles.Add(new FailedFile
+                    {
+                        Path = file.FullPath,
+                        Error = ex.Message,
+                        ActionTaken = BurnFailureAction.Skip,
+                    });
+                    continue;
+                }
+
+                // Ask the user what to do.
+                var decision = await onFailure(file.FullPath, ex.Message);
+
+                switch (decision.Action)
+                {
+                    case BurnFailureAction.Retry:
+                        fileRetrying = true;
+                        break;
+
+                    case BurnFailureAction.Abort:
+                        // Record this file and stop.
+                        failedFiles.Add(new FailedFile
+                        {
+                            Path = file.FullPath,
+                            Error = ex.Message,
+                            ActionTaken = BurnFailureAction.Abort,
+                        });
+                        throw new OperationCanceledException(
+                            "Backup aborted by user due to file failure.");
+
+                    case BurnFailureAction.SkipAllPermanently:
+                        permanentSkipAll = true;
+                        goto case BurnFailureAction.Skip;
+
+                    case BurnFailureAction.Skip:
+                    default:
+                        failedFiles.Add(new FailedFile
+                        {
+                            Path = file.FullPath,
+                            Error = ex.Message,
+                            ActionTaken = decision.Action,
+                        });
+                        break;
+                }
+
+            }
+            } // while (fileRetrying)
+
+            // Commit when: batch is full, a large file just finished, or
+            // enough wall-clock time has elapsed since the last commit.
+            if (batchCount >= CommitBatchSize
+                || file.SizeBytes >= CommitLargeFileThreshold
+                || commitTimer.Elapsed.TotalSeconds >= CommitIntervalSeconds)
+            {
+                discRecord.BytesUsed = bytesWritten;
+                discRecord.LastWrittenUtc = DateTime.UtcNow;
+                await _catalog.UpdateDiscAsync(discRecord, ct);
+                tx.Complete();
+                tx.Dispose();
+                tx = await _catalog.BeginTransactionAsync(ct);
+                batchCount = 0;
+                commitTimer.Restart();
             }
         }
 
-        // Update disc record with final stats.
+        // Final batch: update disc record and commit remaining records.
         discRecord.BytesUsed = bytesWritten;
         discRecord.Status = BurnSessionStatus.Completed;
         discRecord.LastWrittenUtc = DateTime.UtcNow;
         await _catalog.UpdateDiscAsync(discRecord, ct);
 
-        ((IDisposable)tx).Dispose();
+        tx.Complete();
+
+        } // try (batch transaction)
+        finally
+        {
+            tx.Dispose();
+        }
 
         // Update the backup set's last backup timestamp.
         var backupSet = await _catalog.GetBackupSetAsync(backupSetId, ct);
@@ -398,7 +525,124 @@ public class DirectoryBackupService
             await _catalog.UpdateBackupSetAsync(backupSet, ct);
         }
 
-        // 7. Apply retention: physically delete old version files.
+        // 7. Verify backed-up files by reading them back and comparing hashes.
+        if (backedUp is not null && backedUp.Count > 0)
+        {
+            progress?.Report(new BackupProgress
+            {
+                StatusMessage = "Verifying backup...",
+                BytesWrittenTotal = bytesWritten,
+                BytesTotalAll = totalBytes,
+                OverallPercentage = 100,
+            });
+
+            var verifiedBlocks = new HashSet<string>(StringComparer.OrdinalIgnoreCase);
+            int verifiedCount = 0;
+
+            foreach (var (sourcePath, info) in backedUp)
+            {
+                if (ct.IsCancellationRequested) break;
+                pauseEvent?.Wait(ct);
+
+                verifiedCount++;
+                progress?.Report(new BackupProgress
+                {
+                    StatusMessage = $"Verifying backup ({verifiedCount:N0} / {backedUp.Count:N0})...",
+                    CurrentFile = sourcePath,
+                    BytesWrittenTotal = bytesWritten,
+                    BytesTotalAll = totalBytes,
+                    OverallPercentage = 100,
+                });
+
+                try
+                {
+                    if (info.IsFileRef)
+                    {
+                        // Verify the canonical copy in _filestore/{hash}.dat.
+                        string fileStorePath = Path.Combine(fileStoreDir, info.Hash + ".dat");
+                        if (!verifiedBlocks.Contains(info.Hash))
+                        {
+                            string destHash = await ComputeFileHashAsync(fileStorePath, ct);
+                            if (destHash != info.Hash)
+                            {
+                                failedFiles.Add(new FailedFile
+                                {
+                                    Path = sourcePath,
+                                    Error = "Verification failed: filestore hash mismatch",
+                                    ActionTaken = BurnFailureAction.Skip,
+                                });
+                            }
+                            verifiedBlocks.Add(info.Hash);
+                        }
+                    }
+                    else if (info.IsDeduped)
+                    {
+                        // Read the .dedup manifest and verify each block.
+                        string destPath = GetCurrentPath(
+                            targetDirectory, sourcePath, isDeduped: true, isFileRef: false);
+                        string json = await File.ReadAllTextAsync(destPath, ct);
+                        var manifest = JsonSerializer.Deserialize<DedupManifest>(json, _jsonOptions);
+                        if (manifest is null)
+                        {
+                            failedFiles.Add(new FailedFile
+                            {
+                                Path = sourcePath,
+                                Error = "Verification failed: corrupt dedup manifest",
+                                ActionTaken = BurnFailureAction.Skip,
+                            });
+                            continue;
+                        }
+
+                        foreach (string blockHash in manifest.BlockHashes)
+                        {
+                            if (verifiedBlocks.Contains(blockHash))
+                                continue;
+
+                            string blockPath = Path.Combine(blockStoreDir, blockHash + ".blk");
+                            string actualHash = await ComputeFileHashAsync(blockPath, ct);
+                            if (actualHash != blockHash)
+                            {
+                                failedFiles.Add(new FailedFile
+                                {
+                                    Path = sourcePath,
+                                    Error = $"Verification failed: block hash mismatch ({blockHash})",
+                                    ActionTaken = BurnFailureAction.Skip,
+                                });
+                                break;
+                            }
+                            verifiedBlocks.Add(blockHash);
+                        }
+                    }
+                    else
+                    {
+                        // Plain copy — hash the destination file.
+                        string destPath = GetCurrentPath(
+                            targetDirectory, sourcePath, isDeduped: false, isFileRef: false);
+                        string destHash = await ComputeFileHashAsync(destPath, ct);
+                        if (destHash != info.Hash)
+                        {
+                            failedFiles.Add(new FailedFile
+                            {
+                                Path = sourcePath,
+                                Error = "Verification failed: hash mismatch",
+                                ActionTaken = BurnFailureAction.Skip,
+                            });
+                        }
+                    }
+                }
+                catch (Exception ex) when (ex is not OperationCanceledException)
+                {
+                    failedFiles.Add(new FailedFile
+                    {
+                        Path = sourcePath,
+                        Error = $"Verification failed: {ex.Message}",
+                        ActionTaken = BurnFailureAction.Skip,
+                    });
+                }
+            }
+        }
+
+        // 8. Apply retention: physically delete old version files.
         if (retentionTiers is not null && retentionTiers.Count > 0)
         {
             try
@@ -449,10 +693,11 @@ public class DirectoryBackupService
     /// Scan sources and compute diff for planning purposes (no writes).
     /// </summary>
     public async Task<(BackupDiff Diff, long TotalBytes, int TotalFiles)> PlanAsync(
-        BackupJob job, CancellationToken ct)
+        BackupJob job, CancellationToken ct,
+        IProgress<ScanProgress>? scanProgress = null)
     {
-        var isExcluded = GlobMatcher.CreateFilter(job.ExcludedExtensions);
-        var scanned = await _scanner.ScanAsync(job.Sources, progress: null, ct, isExcluded);
+        var isExcluded = GlobMatcher.CreateCombinedFilter(job.ExcludedExtensions, job.Sources);
+        var scanned = await _scanner.ScanAsync(job.Sources, progress: scanProgress, ct, isExcluded);
 
         BackupDiff diff;
         if (job.BackupSetId.HasValue)
@@ -486,7 +731,8 @@ public class DirectoryBackupService
     /// </param>
     private static async Task CopyFileAsync(
         string sourcePath, string destPath, CancellationToken ct,
-        Action<long>? onProgress = null)
+        Action<long>? onProgress = null,
+        ManualResetEventSlim? pauseEvent = null)
     {
         string? destDir = Path.GetDirectoryName(destPath);
         if (destDir is not null)
@@ -499,21 +745,22 @@ public class DirectoryBackupService
             destPath, FileMode.Create, FileAccess.Write,
             FileShare.None, bufferSize: 81920, useAsync: true);
 
-        if (onProgress is null)
+        if (onProgress is null && pauseEvent is null)
         {
             await srcStream.CopyToAsync(dstStream, ct);
             return;
         }
 
-        // Chunked copy with progress callback.
+        // Chunked copy with progress callback and pause support.
         var buffer = new byte[81920];
         long totalCopied = 0;
         int read;
         while ((read = await srcStream.ReadAsync(buffer, ct)) > 0)
         {
+            pauseEvent?.Wait(ct);
             await dstStream.WriteAsync(buffer.AsMemory(0, read), ct);
             totalCopied += read;
-            onProgress(totalCopied);
+            onProgress?.Invoke(totalCopied);
         }
     }
 

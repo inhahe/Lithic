@@ -47,6 +47,12 @@ public interface ICatalogRepository : IDisposable
     Task<Dictionary<string, FileVersionInfo>> GetLatestVersionInfoAsync(int backupSetId, CancellationToken ct = default);
 
     /// <summary>
+    /// Fast scalar count of distinct source paths in a backup set (non-deleted).
+    /// Use for progress bar estimates instead of loading full file metadata.
+    /// </summary>
+    Task<int> GetFileCountForBackupSetAsync(int backupSetId, CancellationToken ct = default);
+
+    /// <summary>
     /// Get a single file record by backup set, source path, and version number.
     /// Used for on-demand lookup when updating a specific record's DiscPath.
     /// </summary>
@@ -74,6 +80,23 @@ public interface ICatalogRepository : IDisposable
     /// </summary>
     Task<int> MarkFilesDeletedByDirectoryAsync(int backupSetId, string directoryPrefix, CancellationToken ct = default);
 
+    /// <summary>
+    /// Mark files as deleted by their exact source paths.  Used to clean up
+    /// catalog records for files that are no longer in the source selection
+    /// or are now excluded by glob patterns.
+    /// </summary>
+    Task<int> MarkFilesDeletedBySourcePathsAsync(int backupSetId, IEnumerable<string> sourcePaths, CancellationToken ct = default);
+
+    // --- Cross-set search ---
+
+    /// <summary>
+    /// Search for files across all backup sets whose source path contains the
+    /// given substring (case-insensitive). Returns one summary row per backup
+    /// set that contains matches.
+    /// </summary>
+    Task<IReadOnlyList<FileSearchResult>> SearchFilesAcrossSetsAsync(
+        string pathSubstring, CancellationToken ct = default);
+
     // --- Database export ---
 
     /// <summary>
@@ -82,5 +105,5 @@ public interface ICatalogRepository : IDisposable
     Task ExportDatabaseAsync(string destinationPath, CancellationToken ct = default);
 
     // --- Transactions ---
-    Task<IDisposable> BeginTransactionAsync(CancellationToken ct = default);
+    Task<ICatalogTransaction> BeginTransactionAsync(CancellationToken ct = default);
 }

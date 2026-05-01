@@ -1,4 +1,8 @@
+using System.Collections.ObjectModel;
 using System.Diagnostics;
+using System.Text;
+using System.Threading;
+using System.Windows;
 using System.Windows.Input;
 using LithicBackup.Core.Interfaces;
 
@@ -27,6 +31,15 @@ public class BurnProgressViewModel : ViewModelBase
     private bool _isDirectoryMode;
     private double _currentFilePercentage;
     private string _currentFileSizeText = "";
+    private bool _isPaused;
+    private string _statusBeforePause = "";
+    private long _lastUiUpdateMs;
+
+    /// <summary>
+    /// Signaling primitive shared with the backup service. When reset (paused),
+    /// the file-copy loop blocks until set (resumed) or the cancellation token fires.
+    /// </summary>
+    public ManualResetEventSlim PauseEvent { get; } = new(true);
 
     /// <summary>Fired when the user clicks "Done" after burn completes.</summary>
     public event Action? DoneRequested;
@@ -103,6 +116,12 @@ public class BurnProgressViewModel : ViewModelBase
         set => SetProperty(ref _resultDetail, value);
     }
 
+    /// <summary>Files that failed during the backup, displayed in a scrollable list.</summary>
+    public ObservableCollection<FailedFile> FailedFiles { get; } = [];
+
+    /// <summary>True when there are any failed files to display.</summary>
+    public bool HasFailedFiles => FailedFiles.Count > 0;
+
     /// <summary>When true, this is a directory backup (not a disc burn).</summary>
     public bool IsDirectoryMode
     {
@@ -124,13 +143,51 @@ public class BurnProgressViewModel : ViewModelBase
         set => SetProperty(ref _currentFileSizeText, value);
     }
 
+    /// <summary>Whether the backup is currently paused.</summary>
+    public bool IsPaused
+    {
+        get => _isPaused;
+        set
+        {
+            if (SetProperty(ref _isPaused, value))
+                OnPropertyChanged(nameof(PauseResumeLabel));
+        }
+    }
+
+    /// <summary>Label for the pause/resume toggle button.</summary>
+    public string PauseResumeLabel => IsPaused ? "Resume" : "Pause";
+
     public ICommand CancelCommand => new RelayCommand(_ => Cancel(), _ => IsBurning);
     public ICommand DoneCommand => new RelayCommand(_ => DoneRequested?.Invoke(), _ => IsComplete);
+    public ICommand PauseResumeCommand => new RelayCommand(
+        _ => { if (IsPaused) Resume(); else Pause(); },
+        _ => IsBurning && IsDirectoryMode);
+    public ICommand CopyFailedFilesCommand => new RelayCommand(
+        _ => CopyFailedFilesToClipboard(), _ => HasFailedFiles);
+    public ICommand ExportFailedFilesCommand => new RelayCommand(
+        _ => ExportFailedFilesToFile(), _ => HasFailedFiles);
 
     private void Cancel()
     {
         _cts?.Cancel();
         StatusText = "Cancelling...";
+    }
+
+    private void Pause()
+    {
+        PauseEvent.Reset();
+        _statusBeforePause = StatusText;
+        StatusText = "Paused";
+        _stopwatch.Stop();
+        IsPaused = true;
+    }
+
+    private void Resume()
+    {
+        PauseEvent.Set();
+        StatusText = _statusBeforePause;
+        _stopwatch.Start();
+        IsPaused = false;
     }
 
     /// <summary>
@@ -150,9 +207,25 @@ public class BurnProgressViewModel : ViewModelBase
 
     /// <summary>
     /// Update the view from a <see cref="BackupProgress"/> event.
+    /// Throttled to avoid excessive UI redraw (see <see cref="ProgressUpdateIntervalMs"/>).
+    /// Status-message-only reports (planning phases) are never throttled.
     /// </summary>
     public void OnBackupProgress(BackupProgress progress)
     {
+        // Status-message-only reports (e.g. "Verifying backup...") always go through.
+        if (!string.IsNullOrEmpty(progress.StatusMessage))
+        {
+            StatusText = progress.StatusMessage;
+            CurrentFile = progress.CurrentFile;
+            return;
+        }
+
+        // Throttle data-progress updates.
+        long nowMs = _stopwatch.ElapsedMilliseconds;
+        if (nowMs - _lastUiUpdateMs < ProgressUpdateIntervalMs)
+            return;
+        _lastUiUpdateMs = nowMs;
+
         CurrentDisc = progress.CurrentDisc;
         TotalDiscs = progress.TotalDiscs;
         OverallPercentage = progress.OverallPercentage;
@@ -201,12 +274,16 @@ public class BurnProgressViewModel : ViewModelBase
         {
             DiscPercentage = progress.DiscBurnProgress.Percentage;
         }
+
+        StatusText = "Copying files...";
     }
 
     /// <summary>Creates and returns a CancellationTokenSource for this operation.</summary>
     public CancellationTokenSource StartBurn()
     {
         _cts = new CancellationTokenSource();
+        PauseEvent.Set();
+        IsPaused = false;
         IsBurning = true;
         IsComplete = false;
         StatusText = IsDirectoryMode ? "Copying files..." : "Burning...";
@@ -214,8 +291,12 @@ public class BurnProgressViewModel : ViewModelBase
         return _cts;
     }
 
-    public void CompleteBurn(bool success, string message, string detail = "")
+    public void CompleteBurn(
+        bool success, string message, string detail = "",
+        IReadOnlyList<FailedFile>? failedFiles = null)
     {
+        PauseEvent.Set();
+        IsPaused = false;
         _stopwatch.Stop();
         IsBurning = false;
         IsComplete = true;
@@ -224,8 +305,49 @@ public class BurnProgressViewModel : ViewModelBase
         string verb = IsDirectoryMode ? "Backup" : "Burn";
         StatusText = success ? $"{verb} completed successfully." : $"{verb} failed: {message}";
         ResultDetail = detail;
+
+        FailedFiles.Clear();
+        if (failedFiles is not null)
+        {
+            foreach (var f in failedFiles)
+                FailedFiles.Add(f);
+        }
+        OnPropertyChanged(nameof(HasFailedFiles));
+
         _cts?.Dispose();
         _cts = null;
+    }
+
+    private string FormatFailedFilesList()
+    {
+        var sb = new StringBuilder();
+        sb.AppendLine($"Failed/skipped files: {FailedFiles.Count}");
+        sb.AppendLine();
+        sb.AppendLine("Path\tError\tAction");
+        foreach (var f in FailedFiles)
+            sb.AppendLine($"{f.Path}\t{f.Error}\t{f.ActionTaken}");
+        return sb.ToString();
+    }
+
+    private void CopyFailedFilesToClipboard()
+    {
+        Clipboard.SetText(FormatFailedFilesList());
+    }
+
+    private void ExportFailedFilesToFile()
+    {
+        var dialog = new Microsoft.Win32.SaveFileDialog
+        {
+            Title = "Export failed/skipped files",
+            Filter = "Text files (*.txt)|*.txt|CSV files (*.csv)|*.csv|All files (*.*)|*.*",
+            DefaultExt = ".txt",
+            FileName = $"failed-files-{DateTime.Now:yyyy-MM-dd-HHmmss}",
+        };
+
+        if (dialog.ShowDialog() == true)
+        {
+            System.IO.File.WriteAllText(dialog.FileName, FormatFailedFilesList());
+        }
     }
 
     private static string FormatBytes(long bytes)

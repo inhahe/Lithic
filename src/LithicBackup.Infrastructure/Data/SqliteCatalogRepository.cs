@@ -36,10 +36,15 @@ public class SqliteCatalogRepository : ICatalogRepository
         int currentVersion = 0;
         using (var cmd = _connection.CreateCommand())
         {
-            cmd.CommandText = "SELECT Version FROM SchemaVersion LIMIT 1";
+            cmd.CommandText = "SELECT COALESCE(MAX(Version), 0) FROM SchemaVersion";
             try { currentVersion = Convert.ToInt32(cmd.ExecuteScalar()); }
             catch { /* Table may not exist on first run before 001 applies. */ }
         }
+
+        // Clean up stale version rows left by a previous bug where the
+        // 001 INSERT could re-add Version=1 after 002 had updated it to 2.
+        try { Execute("DELETE FROM SchemaVersion WHERE Version < (SELECT MAX(Version) FROM SchemaVersion)"); }
+        catch { /* Harmless if table is empty or has a single row. */ }
 
         // Apply numbered migrations in order.
         var migrations = new (int Version, string ResourceName)[]
@@ -500,6 +505,22 @@ public class SqliteCatalogRepository : ICatalogRepository
         return Task.FromResult(dict);
     }
 
+    public Task<int> GetFileCountForBackupSetAsync(int backupSetId, CancellationToken ct = default)
+    {
+        ct.ThrowIfCancellationRequested();
+
+        using var cmd = _connection.CreateCommand();
+        cmd.CommandText = """
+            SELECT COUNT(DISTINCT f.SourcePath)
+            FROM Files f
+            INNER JOIN Discs d ON f.DiscId = d.Id
+            WHERE d.BackupSetId = $setId AND f.IsDeleted = 0
+            """;
+        cmd.Parameters.AddWithValue("$setId", backupSetId);
+        var result = cmd.ExecuteScalar();
+        return Task.FromResult(result is long v ? (int)v : 0);
+    }
+
     public Task<FileRecord?> GetFileRecordByPathAndVersionAsync(int backupSetId, string sourcePath, int version, CancellationToken ct = default)
     {
         ct.ThrowIfCancellationRequested();
@@ -727,6 +748,95 @@ public class SqliteCatalogRepository : ICatalogRepository
         return Task.FromResult(rows);
     }
 
+    public async Task<int> MarkFilesDeletedBySourcePathsAsync(
+        int backupSetId, IEnumerable<string> sourcePaths, CancellationToken ct = default)
+    {
+        ct.ThrowIfCancellationRequested();
+
+        int totalRows = 0;
+        var tx = await BeginTransactionAsync(ct);
+        try
+        {
+            using var cmd = _connection.CreateCommand();
+            cmd.CommandText = """
+                UPDATE Files SET IsDeleted = 1
+                WHERE IsDeleted = 0
+                  AND DiscId IN (SELECT Id FROM Discs WHERE BackupSetId = $setId)
+                  AND SourcePath = $path
+                """;
+            cmd.Parameters.AddWithValue("$setId", backupSetId);
+            var pathParam = cmd.Parameters.AddWithValue("$path", "");
+
+            foreach (var path in sourcePaths)
+            {
+                ct.ThrowIfCancellationRequested();
+                pathParam.Value = path;
+                totalRows += cmd.ExecuteNonQuery();
+            }
+
+            tx.Complete();
+        }
+        finally
+        {
+            tx.Dispose();
+        }
+
+        return totalRows;
+    }
+
+    // ---------------------------------------------------------------
+    // Cross-set Search
+    // ---------------------------------------------------------------
+
+    public Task<IReadOnlyList<FileSearchResult>> SearchFilesAcrossSetsAsync(
+        string pathSubstring, CancellationToken ct = default)
+    {
+        ct.ThrowIfCancellationRequested();
+
+        using var cmd = _connection.CreateCommand();
+        cmd.CommandText = """
+            SELECT
+                bs.Id          AS BackupSetId,
+                bs.Name        AS BackupSetName,
+                COUNT(*)       AS MatchingFileCount,
+                SUM(f.SizeBytes) AS TotalSizeBytes,
+                MAX(f.Version) AS LatestVersion,
+                MAX(f.BackedUpUtc) AS LastBackedUpUtc
+            FROM Files f
+            INNER JOIN Discs d      ON f.DiscId = d.Id
+            INNER JOIN BackupSets bs ON d.BackupSetId = bs.Id
+            WHERE f.SourcePath LIKE $pattern ESCAPE '\'
+              AND f.IsDeleted = 0
+            GROUP BY bs.Id, bs.Name
+            ORDER BY bs.Name
+            """;
+
+        // Escape LIKE wildcards in the user input, then wrap with %.
+        var escaped = pathSubstring
+            .Replace("\\", "\\\\")
+            .Replace("[", "\\[")
+            .Replace("%", "\\%")
+            .Replace("_", "\\_");
+        cmd.Parameters.AddWithValue("$pattern", "%" + escaped + "%");
+
+        var list = new List<FileSearchResult>();
+        using var r = cmd.ExecuteReader();
+        while (r.Read())
+        {
+            list.Add(new FileSearchResult
+            {
+                BackupSetId = r.GetInt32(0),
+                BackupSetName = r.GetString(1),
+                MatchingFileCount = r.GetInt32(2),
+                TotalSizeBytes = r.GetInt64(3),
+                LatestVersion = r.GetInt32(4),
+                LastBackedUpUtc = r.IsDBNull(5) ? null : DateTime.Parse(r.GetString(5)),
+            });
+        }
+
+        return Task.FromResult<IReadOnlyList<FileSearchResult>>(list);
+    }
+
     // ---------------------------------------------------------------
     // Database Export
     // ---------------------------------------------------------------
@@ -748,18 +858,18 @@ public class SqliteCatalogRepository : ICatalogRepository
     // Transactions
     // ---------------------------------------------------------------
 
-    public Task<IDisposable> BeginTransactionAsync(CancellationToken ct = default)
+    public Task<ICatalogTransaction> BeginTransactionAsync(CancellationToken ct = default)
     {
         ct.ThrowIfCancellationRequested();
         var tx = _connection.BeginTransaction();
-        return Task.FromResult<IDisposable>(new TransactionScope(tx));
+        return Task.FromResult<ICatalogTransaction>(new TransactionScope(tx));
     }
 
     /// <summary>
     /// Wrapper that commits on Dispose unless an exception has occurred,
     /// in which case it rolls back.
     /// </summary>
-    private sealed class TransactionScope : IDisposable
+    private sealed class TransactionScope : ICatalogTransaction
     {
         private SqliteTransaction? _transaction;
         private bool _completed;

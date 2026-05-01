@@ -20,7 +20,6 @@
             <RowDefinition Height="Auto" />
             <RowDefinition Height="*" />
             <RowDefinition Height="Auto" />
-            <RowDefinition Height="Auto" />
         </Grid.RowDefinitions>
 
         <!-- File path -->
@@ -44,28 +43,63 @@
         <!-- Spacer -->
         <Border Grid.Row="2" />
 
-        <!-- Apply to all checkbox -->
-        <CheckBox Grid.Row="3"
-                  Content="Apply to all remaining failures on this disc"
-                  IsChecked="{Binding ApplyToAll, Mode=TwoWay}"
-                  Margin="0,0,0,12"
-                  Foreground="{StaticResource TextPrimaryBrush}" />
-
         <!-- Buttons -->
-        <WrapPanel Grid.Row="4" HorizontalAlignment="Right">
+        <WrapPanel Grid.Row="3" HorizontalAlignment="Right">
             <Button Content="Skip" Click="OnSkip"
                     Padding="14,6" Margin="0,0,6,0" Cursor="Hand" />
             <Button Content="Retry" Click="OnRetry"
                     Padding="14,6" Margin="0,0,6,0" Cursor="Hand" />
+
+            <!-- Disc-burn only: Zip and Skip All (Disc) -->
             <Button Content="Zip" Click="OnZip"
                     Padding="14,6" Margin="0,0,6,0" Cursor="Hand"
-                    ToolTip="Zip the file and retry (may resolve path incompatibilities)" />
+                    ToolTip="Zip the file and retry (may resolve path incompatibilities)">
+                <Button.Style>
+                    <Style TargetType="Button">
+                        <Style.Triggers>
+                            <DataTrigger Binding="{Binding IsDirectoryMode}" Value="True">
+                                <Setter Property="Visibility" Value="Collapsed" />
+                            </DataTrigger>
+                        </Style.Triggers>
+                    </Style>
+                </Button.Style>
+            </Button>
+            <Button Content="Zip All (Disc)" Click="OnZipAllForDisc"
+                    Padding="14,6" Margin="0,0,6,0" Cursor="Hand"
+                    ToolTip="Zip all remaining failures on this disc">
+                <Button.Style>
+                    <Style TargetType="Button">
+                        <Style.Triggers>
+                            <DataTrigger Binding="{Binding IsDirectoryMode}" Value="True">
+                                <Setter Property="Visibility" Value="Collapsed" />
+                            </DataTrigger>
+                        </Style.Triggers>
+                    </Style>
+                </Button.Style>
+            </Button>
             <Button Content="Skip All (Disc)" Click="OnSkipAllForDisc"
                     Padding="14,6" Margin="0,0,6,0" Cursor="Hand"
-                    ToolTip="Skip all remaining failures on this disc" />
-            <Button Content="Skip All (Permanent)" Click="OnSkipAllPermanently"
+                    ToolTip="Skip all remaining failures on this disc">
+                <Button.Style>
+                    <Style TargetType="Button">
+                        <Style.Triggers>
+                            <DataTrigger Binding="{Binding IsDirectoryMode}" Value="True">
+                                <Setter Property="Visibility" Value="Collapsed" />
+                            </DataTrigger>
+                        </Style.Triggers>
+                    </Style>
+                </Button.Style>
+            </Button>
+
+            <Button Content="Skip All" Click="OnSkipAllPermanently"
+                    Padding="14,6" Margin="0,0,6,0" Cursor="Hand"
+                    ToolTip="Skip all remaining failures" />
+
+            <!-- Abort the entire backup -->
+            <Button Content="Abort" Click="OnAbort"
                     Padding="14,6" Cursor="Hand"
-                    ToolTip="Skip all remaining failures permanently" />
+                    ToolTip="Abort the entire backup"
+                    Foreground="#FFCC4444" />
         </WrapPanel>
     </Grid>
 </Window>

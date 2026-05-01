@@ -47,11 +47,12 @@ public class BackupOrchestrator : IBackupOrchestrator
     // PlanAsync
     // -------------------------------------------------------------------
 
-    public async Task<BackupPlan> PlanAsync(BackupJob job, CancellationToken ct = default)
+    public async Task<BackupPlan> PlanAsync(BackupJob job, CancellationToken ct = default,
+        IProgress<ScanProgress>? scanProgress = null)
     {
-        // 1. Scan source directories.
-        var isExcluded = GlobMatcher.CreateFilter(job.ExcludedExtensions);
-        var scanned = await _scanner.ScanAsync(job.Sources, progress: null, ct, isExcluded);
+        // 1. Scan source directories (global + per-directory exclusions).
+        var isExcluded = GlobMatcher.CreateCombinedFilter(job.ExcludedExtensions, job.Sources);
+        var scanned = await _scanner.ScanAsync(job.Sources, progress: scanProgress, ct, isExcluded);
 
         // 2. Compute diff against existing catalog (if this is an existing set).
         BackupDiff diff;
@@ -449,30 +450,32 @@ public class BackupOrchestrator : IBackupOrchestrator
 
                             if (permanentSkip.HasValue)
                             {
-                                action = BurnFailureAction.SkipAllPermanently;
+                                action = permanentSkip.Value;
                             }
                             else if (discSkip.HasValue)
                             {
-                                action = BurnFailureAction.SkipAllForDisc;
+                                action = discSkip.Value;
                             }
                             else if (onFailure is not null)
                             {
                                 var decision = await onFailure(file.FullPath, ex.Message);
                                 action = decision.Action;
-
-                                // Remember "apply to all" decisions.
-                                if (decision.ApplyToAllOnDisc || action == BurnFailureAction.SkipAllForDisc)
-                                {
-                                    discSkip = action;
-                                }
-                                if (action == BurnFailureAction.SkipAllPermanently)
-                                {
-                                    permanentSkip = action;
-                                }
                             }
                             else
                             {
                                 action = BurnFailureAction.Skip;
+                            }
+
+                            // Certain actions implicitly set the disc/permanent flags.
+                            switch (action)
+                            {
+                                case BurnFailureAction.SkipAllForDisc:
+                                case BurnFailureAction.ZipAllForDisc:
+                                    discSkip = action;
+                                    break;
+                                case BurnFailureAction.SkipAllPermanently:
+                                    permanentSkip = action;
+                                    break;
                             }
 
                             switch (action)
@@ -481,7 +484,18 @@ public class BackupOrchestrator : IBackupOrchestrator
                                     retrying = true;
                                     break;
 
+                                case BurnFailureAction.Abort:
+                                    failedFiles.Add(new FailedFile
+                                    {
+                                        Path = file.FullPath,
+                                        Error = ex.Message,
+                                        ActionTaken = BurnFailureAction.Abort,
+                                    });
+                                    throw new OperationCanceledException(
+                                        "Backup aborted by user due to file failure.");
+
                                 case BurnFailureAction.Zip:
+                                case BurnFailureAction.ZipAllForDisc:
                                     try
                                     {
                                         string zipPath = await _zipHandler.ZipFileAsync(
@@ -499,12 +513,53 @@ public class BackupOrchestrator : IBackupOrchestrator
                                     }
                                     catch (Exception zipEx)
                                     {
-                                        failedFiles.Add(new FailedFile
+                                        // Zip also failed — ask user what to do.
+                                        // Only offer Skip / Skip All / Abort (zip
+                                        // already failed so Zip/Retry won't help).
+                                        if (onFailure is not null
+                                            && !permanentSkip.HasValue
+                                            && discSkip is not BurnFailureAction.SkipAllForDisc)
                                         {
-                                            Path = file.FullPath,
-                                            Error = $"Zip also failed: {zipEx.Message}",
-                                            ActionTaken = BurnFailureAction.Zip,
-                                        });
+                                            var zipDecision = await onFailure(
+                                                file.FullPath,
+                                                $"Zip also failed: {zipEx.Message}");
+
+                                            switch (zipDecision.Action)
+                                            {
+                                                case BurnFailureAction.SkipAllForDisc:
+                                                    discSkip = BurnFailureAction.SkipAllForDisc;
+                                                    goto default;
+                                                case BurnFailureAction.SkipAllPermanently:
+                                                    permanentSkip = BurnFailureAction.SkipAllPermanently;
+                                                    goto default;
+                                                case BurnFailureAction.Abort:
+                                                    failedFiles.Add(new FailedFile
+                                                    {
+                                                        Path = file.FullPath,
+                                                        Error = $"Zip also failed: {zipEx.Message}",
+                                                        ActionTaken = BurnFailureAction.Abort,
+                                                    });
+                                                    throw new OperationCanceledException(
+                                                        "Backup aborted by user due to file failure.");
+                                                default:
+                                                    failedFiles.Add(new FailedFile
+                                                    {
+                                                        Path = file.FullPath,
+                                                        Error = $"Zip also failed: {zipEx.Message}",
+                                                        ActionTaken = zipDecision.Action,
+                                                    });
+                                                    break;
+                                            }
+                                        }
+                                        else
+                                        {
+                                            failedFiles.Add(new FailedFile
+                                            {
+                                                Path = file.FullPath,
+                                                Error = $"Zip also failed: {zipEx.Message}",
+                                                ActionTaken = BurnFailureAction.Zip,
+                                            });
+                                        }
                                     }
                                     break;
 
@@ -693,7 +748,8 @@ public class BackupOrchestrator : IBackupOrchestrator
                 }
 
                 // Commit the catalog updates.
-                ((IDisposable)tx).Dispose();
+                tx.Complete();
+                tx.Dispose();
 
                 discsWritten++;
                 totalBytesWritten += allocation.TotalBytes;
@@ -892,7 +948,8 @@ public class BackupOrchestrator : IBackupOrchestrator
                     }, ct);
                 }
 
-                ((IDisposable)tx).Dispose();
+                tx.Complete();
+                tx.Dispose();
 
                 totalBytesWritten += allocation.TotalBytes;
             }
@@ -1010,7 +1067,8 @@ public class BackupOrchestrator : IBackupOrchestrator
                 }, ct);
             }
 
-            ((IDisposable)tx).Dispose();
+            tx.Complete();
+            tx.Dispose();
         }
         finally
         {

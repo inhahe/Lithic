@@ -16,10 +16,26 @@ public partial class App : Application
     private SqliteCatalogRepository? _catalog;
     private TrayService? _trayService;
     private WinForms.NotifyIcon? _notifyIcon;
+    private UserSettings _settings = new();
 
-    protected override void OnStartup(StartupEventArgs e)
+    /// <summary>
+    /// Set when the user chooses Exit from the tray menu.
+    /// Allows <see cref="MainWindow.OnClosing"/> to distinguish
+    /// a real shutdown from the X button (which minimizes to tray).
+    /// </summary>
+    internal bool IsExiting { get; private set; }
+
+    protected override async void OnStartup(StartupEventArgs e)
     {
         base.OnStartup(e);
+
+        // Show splash screen immediately while services initialize.
+        var splash = new SplashWindow();
+        splash.Show();
+
+        // Yield so the splash window renders before heavy initialization begins.
+        await System.Windows.Threading.Dispatcher.Yield(
+            System.Windows.Threading.DispatcherPriority.Background);
 
         // --- Composition root: wire up services ---
 
@@ -71,23 +87,34 @@ public partial class App : Application
             _catalog, burner, scanner, orchestrator, restoreService, directoryBackupService, _trayService);
         var mainWindow = new MainWindow { DataContext = mainViewModel };
 
-        // --- System tray icon ---
+        // --- User settings & system tray icon ---
+        _settings = UserSettings.Load();
         SetupNotifyIcon(mainWindow);
 
         // Wire up tray service to show balloon tips when changes accumulate.
         _trayService.BackupSuggested += reason =>
         {
+            if (_settings.SuppressBackupSuggestions)
+                return;
+
             Current.Dispatcher.Invoke(() =>
             {
                 _notifyIcon?.ShowBalloonTip(
                     5000,
                     "LithicBackup \u2014 Backup Suggested",
-                    reason,
+                    reason + "\n\nClick to stop future reminders. You can re-enable them from the tray icon\u2019s right-click menu.",
                     WinForms.ToolTipIcon.Info);
             });
         };
 
+        // Swap splash for main window.
+        // Explicitly set MainWindow so MinimizeToTray and other
+        // callers of Application.MainWindow reference the real window
+        // (WPF auto-assigns it to the first Window instantiated, which
+        // was the splash).
+        MainWindow = mainWindow;
         mainWindow.Show();
+        splash.Close();
 
         // Start background monitoring if there are existing backup sets.
         _ = StartBackgroundMonitoringAsync();
@@ -104,33 +131,58 @@ public partial class App : Application
 
         var contextMenu = new WinForms.ContextMenuStrip();
         contextMenu.Items.Add("Open LithicBackup", null, (_, _) => ShowMainWindow());
+
+        var remindersItem = new WinForms.ToolStripMenuItem("Backup reminders")
+        {
+            Checked = !_settings.SuppressBackupSuggestions,
+            CheckOnClick = true,
+        };
+        remindersItem.CheckedChanged += (_, _) =>
+        {
+            _settings.SuppressBackupSuggestions = !remindersItem.Checked;
+            _settings.Save();
+        };
+        contextMenu.Items.Add(remindersItem);
+
         contextMenu.Items.Add(new WinForms.ToolStripSeparator());
-        contextMenu.Items.Add("Exit", null, (_, _) => Shutdown());
+        contextMenu.Items.Add("Exit", null, (_, _) => ExitApplication());
         _notifyIcon.ContextMenuStrip = contextMenu;
 
         // Double-click tray icon to restore the window.
         _notifyIcon.DoubleClick += (_, _) => ShowMainWindow();
 
-        // Minimize to tray instead of taskbar — but only when idle on the
-        // home screen.  If the user is mid-flow (creating a backup set,
-        // burning, restoring, etc.) just minimize normally so they don't
-        // lose sight of the window.
-        mainWindow.StateChanged += (_, _) =>
+        // Clicking the balloon tip suppresses future reminders immediately.
+        _notifyIcon.BalloonTipClicked += (_, _) =>
         {
-            if (mainWindow.WindowState == WindowState.Minimized
-                && (mainWindow.DataContext as MainViewModel)?.CurrentView is null)
-            {
-                mainWindow.Hide();
-                _notifyIcon.ShowBalloonTip(
-                    1500,
-                    "LithicBackup",
-                    "Minimized to tray. Background monitoring continues.",
-                    WinForms.ToolTipIcon.Info);
-            }
+            _settings.SuppressBackupSuggestions = true;
+            _settings.Save();
+            remindersItem.Checked = false;
         };
+    }
 
-        // Clicking the balloon tip also restores the window.
-        _notifyIcon.BalloonTipClicked += (_, _) => ShowMainWindow();
+    /// <summary>
+    /// Perform a real application shutdown (File &gt; Exit or tray Exit).
+    /// Sets <see cref="IsExiting"/> so <see cref="MainWindow.OnClosing"/>
+    /// allows the window to close instead of minimizing to tray.
+    /// </summary>
+    internal void ExitApplication()
+    {
+        IsExiting = true;
+        Shutdown();
+    }
+
+    /// <summary>
+    /// Hide the main window to the system tray and show a notification.
+    /// Called by the title bar's tray button.
+    /// </summary>
+    internal void MinimizeToTray()
+    {
+        MainWindow?.Hide();
+        _notifyIcon?.ShowBalloonTip(
+            1500,
+            "LithicBackup",
+            "Minimized to tray. Background monitoring continues.",
+            WinForms.ToolTipIcon.Info);
     }
 
     private void ShowMainWindow()

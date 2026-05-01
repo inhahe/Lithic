@@ -8,6 +8,11 @@ namespace LithicBackup.ViewModels;
 /// </summary>
 public abstract class ViewModelBase : INotifyPropertyChanged
 {
+    /// <summary>
+    /// Minimum interval in milliseconds between UI progress updates.
+    /// All throttled progress reporters should use this value.
+    /// </summary>
+    protected const int ProgressUpdateIntervalMs = 500;
     public event PropertyChangedEventHandler? PropertyChanged;
 
     protected void OnPropertyChanged([CallerMemberName] string? propertyName = null)

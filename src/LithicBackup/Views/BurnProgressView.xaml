@@ -105,10 +105,90 @@
                    Foreground="{StaticResource TextSecondaryBrush}"
                    TextWrapping="Wrap"
                    Visibility="{Binding IsComplete, Converter={StaticResource BoolToVis}}"
-                   Margin="0,0,0,16" />
+                   Margin="0,0,0,8" />
+
+        <!-- Failed/skipped files list (scrollable, shown after completion when there are failures) -->
+        <Border Visibility="{Binding HasFailedFiles, Converter={StaticResource BoolToVis}}"
+                BorderBrush="{StaticResource BorderBrush}"
+                BorderThickness="1" CornerRadius="4"
+                Margin="0,0,0,16"
+                MaxHeight="200">
+            <DockPanel>
+                <DockPanel DockPanel.Dock="Top" Margin="8,6,8,4">
+                    <TextBlock FontWeight="SemiBold"
+                               Foreground="{StaticResource TextPrimaryBrush}">
+                        <Run Text="Failed/skipped files: " />
+                        <Run Text="{Binding FailedFiles.Count, Mode=OneWay}" />
+                    </TextBlock>
+                    <StackPanel Orientation="Horizontal" HorizontalAlignment="Right">
+                        <Button Content="Copy to Clipboard"
+                                Command="{Binding CopyFailedFilesCommand}"
+                                Padding="8,2" Margin="0,0,6,0" Cursor="Hand"
+                                FontSize="11" />
+                        <Button Content="Export..."
+                                Command="{Binding ExportFailedFilesCommand}"
+                                Padding="8,2" Cursor="Hand"
+                                FontSize="11" />
+                    </StackPanel>
+                </DockPanel>
+
+                <ScrollViewer VerticalScrollBarVisibility="Auto"
+                              HorizontalScrollBarVisibility="Disabled">
+                    <ItemsControl ItemsSource="{Binding FailedFiles}">
+                        <ItemsControl.ItemTemplate>
+                            <DataTemplate>
+                                <Border BorderBrush="{StaticResource BorderBrush}"
+                                        BorderThickness="0,1,0,0"
+                                        Padding="8,4">
+                                    <DockPanel>
+                                        <TextBlock DockPanel.Dock="Right"
+                                                   Text="{Binding ActionTaken}"
+                                                   Foreground="{StaticResource TextDimBrush}"
+                                                   FontSize="10"
+                                                   VerticalAlignment="Top"
+                                                   Margin="8,0,0,0" />
+                                        <StackPanel>
+                                            <TextBlock Text="{Binding Path}"
+                                                       Foreground="{StaticResource TextPrimaryBrush}"
+                                                       FontSize="11"
+                                                       TextTrimming="CharacterEllipsis"
+                                                       ToolTip="{Binding Path}" />
+                                            <TextBlock Text="{Binding Error}"
+                                                       Foreground="#FFCC4444"
+                                                       FontSize="11"
+                                                       TextWrapping="Wrap" />
+                                        </StackPanel>
+                                    </DockPanel>
+                                </Border>
+                            </DataTemplate>
+                        </ItemsControl.ItemTemplate>
+                    </ItemsControl>
+                </ScrollViewer>
+            </DockPanel>
+        </Border>
 
         <!-- Buttons -->
         <StackPanel Orientation="Horizontal">
+            <!-- Pause/Resume (directory backups only) -->
+            <Button Content="{Binding PauseResumeLabel}"
+                    Command="{Binding PauseResumeCommand}"
+                    Padding="16,8" Cursor="Hand"
+                    Margin="0,0,8,0">
+                <Button.Style>
+                    <Style TargetType="Button">
+                        <Setter Property="Visibility" Value="Visible" />
+                        <Style.Triggers>
+                            <DataTrigger Binding="{Binding IsBurning}" Value="False">
+                                <Setter Property="Visibility" Value="Collapsed" />
+                            </DataTrigger>
+                            <DataTrigger Binding="{Binding IsDirectoryMode}" Value="False">
+                                <Setter Property="Visibility" Value="Collapsed" />
+                            </DataTrigger>
+                        </Style.Triggers>
+                    </Style>
+                </Button.Style>
+            </Button>
+
             <Button Style="{StaticResource PrimaryButton}"
                     Content="Cancel"
                     Command="{Binding CancelCommand}"

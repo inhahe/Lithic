@@ -3,7 +3,7 @@
 CREATE TABLE IF NOT EXISTS SchemaVersion (
     Version     INTEGER NOT NULL PRIMARY KEY
 );
-INSERT OR IGNORE INTO SchemaVersion (Version) VALUES (1);
+INSERT INTO SchemaVersion (Version) SELECT 1 WHERE NOT EXISTS (SELECT 1 FROM SchemaVersion);
 
 CREATE TABLE IF NOT EXISTS BackupSets (
     Id                      INTEGER PRIMARY KEY AUTOINCREMENT,

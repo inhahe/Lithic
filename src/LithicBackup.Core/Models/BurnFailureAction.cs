@@ -14,9 +14,15 @@ public enum BurnFailureAction
     /// <summary>Zip this file (may resolve path/name incompatibilities) and retry.</summary>
     Zip,
 
-    /// <summary>Skip all remaining failures on this disc and try them on the next disc.</summary>
+    /// <summary>Skip all remaining failures on this disc.</summary>
     SkipAllForDisc,
+
+    /// <summary>Zip all remaining failures on this disc (resolves filesystem incompatibilities).</summary>
+    ZipAllForDisc,
 
     /// <summary>Skip all remaining failures permanently.</summary>
     SkipAllPermanently,
+
+    /// <summary>Abort the entire backup operation.</summary>
+    Abort,
 }

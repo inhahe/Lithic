@@ -28,7 +28,7 @@ public class FileScanner : IFileScanner
 
         foreach (var source in sources)
         {
-            ct.ThrowIfCancellationRequested();
+            if (ct.IsCancellationRequested) break;
             ScanNode(source, results, ref filesFound, ref totalBytes, progress, ct, isExcluded);
         }
 
@@ -45,10 +45,8 @@ public class FileScanner : IFileScanner
         Func<string, bool>? isExcluded = null)
     {
         // Fully excluded — skip this entire subtree.
-        if (node.IsSelected == false)
+        if (node.IsSelected == false || ct.IsCancellationRequested)
             return;
-
-        ct.ThrowIfCancellationRequested();
 
         if (node.IsDirectory)
         {
@@ -108,7 +106,7 @@ public class FileScanner : IFileScanner
         CancellationToken ct,
         Func<string, bool>? isExcluded = null)
     {
-        ct.ThrowIfCancellationRequested();
+        if (ct.IsCancellationRequested) return;
 
         progress?.Report(new ScanProgress
         {
@@ -121,8 +119,19 @@ public class FileScanner : IFileScanner
         {
             foreach (var filePath in Directory.EnumerateFiles(directoryPath))
             {
-                ct.ThrowIfCancellationRequested();
+                if (ct.IsCancellationRequested) return;
                 AddFile(filePath, results, ref filesFound, ref totalBytes, isExcluded);
+
+                // Report periodically so large directories don't stall progress.
+                if (filesFound % 500 == 0)
+                {
+                    progress?.Report(new ScanProgress
+                    {
+                        CurrentDirectory = directoryPath,
+                        FilesFound = filesFound,
+                        TotalBytes = totalBytes,
+                    });
+                }
             }
 
             foreach (var subDir in Directory.EnumerateDirectories(directoryPath))
@@ -159,14 +168,14 @@ public class FileScanner : IFileScanner
         {
             foreach (var filePath in Directory.EnumerateFiles(directoryPath))
             {
-                ct.ThrowIfCancellationRequested();
+                if (ct.IsCancellationRequested) return;
                 if (!knownChildren.Contains(filePath))
                     AddFile(filePath, results, ref filesFound, ref totalBytes, isExcluded);
             }
 
             foreach (var subDir in Directory.EnumerateDirectories(directoryPath))
             {
-                ct.ThrowIfCancellationRequested();
+                if (ct.IsCancellationRequested) return;
                 if (!knownChildren.Contains(subDir))
                 {
                     ScanDirectoryRecursive(subDir, results,
@@ -230,7 +239,7 @@ public class FileScanner : IFileScanner
         var currentPaths = new HashSet<string>(StringComparer.OrdinalIgnoreCase);
         foreach (var scanned in scannedFiles)
         {
-            ct.ThrowIfCancellationRequested();
+            if (ct.IsCancellationRequested) break;
             currentPaths.Add(scanned.FullPath);
 
             if (!backedUp.TryGetValue(scanned.FullPath, out var lastBackup))
