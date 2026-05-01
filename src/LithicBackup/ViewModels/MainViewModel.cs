@@ -241,17 +241,62 @@ public class MainViewModel : ViewModelBase
             ShowJobConfig(sources, backupSet.Id, sourceSelection);
         sourceSelection.CancelRequested += GoHome;
 
-        // Cache the LargestFilesViewModel for the duration of this edit session
-        // so reopening doesn't re-scan the filesystem.
+        // Auto-save source selections to the database whenever the user
+        // toggles a checkbox.  Debounced because cascading parent→child
+        // changes fire the callback many times for a single click.
+        CancellationTokenSource? saveDebounce = null;
+        sourceSelection.SelectionChanged += () =>
+        {
+            // Don't auto-save while restoring saved selections — the tree
+            // is in a partially-restored state and GetSelections() would
+            // produce incomplete data, overwriting the real saved state.
+            if (sourceSelection.IsApplyingSelections) return;
+
+            saveDebounce?.Cancel();
+            saveDebounce = new CancellationTokenSource();
+            var ct = saveDebounce.Token;
+            _ = DebouncedSaveAsync(ct);
+
+            async Task DebouncedSaveAsync(CancellationToken token)
+            {
+                try
+                {
+                    await Task.Delay(300, token);
+                    backupSet.SourceSelections = sourceSelection.GetSelections();
+                    await Task.Run(() => _catalog.UpdateBackupSetAsync(backupSet));
+                }
+                catch (OperationCanceledException) { }
+            }
+        };
+
+        // Cache the LargestFilesViewModel so reopening doesn't re-scan.
+        // Invalidated whenever selections change so the scan always
+        // reflects the current treeview state.
         LargestFilesViewModel? cachedLargestFiles = null;
+        List<SourceSelection>? cachedSelections = null;
         sourceSelection.LargestFilesRequested += async () =>
         {
+            // Flush any pending debounced save immediately.
+            saveDebounce?.Cancel();
+            backupSet.SourceSelections = sourceSelection.GetSelections();
+            _ = Task.Run(() => _catalog.UpdateBackupSetAsync(backupSet));
+
+            // Invalidate cache if selections changed.
+            var currentSelections = backupSet.SourceSelections;
+            if (cachedLargestFiles is not null
+                && !SelectionsMatch(cachedSelections, currentSelections))
+            {
+                cachedLargestFiles = null;
+            }
+
             if (cachedLargestFiles is not null)
             {
                 CurrentView = cachedLargestFiles;
                 StatusText = $"Largest files for \"{backupSet.Name}\".";
                 return;
             }
+
+            cachedSelections = currentSelections;
             cachedLargestFiles = await ShowLargestFilesAsync(
                 backupSet, () => CurrentView = sourceSelection);
         };
@@ -586,6 +631,25 @@ public class MainViewModel : ViewModelBase
             vm.ScheduleDailyMinute = sched.DailyMinute;
             vm.ScheduleDebounceSeconds = sched.DebounceSeconds.ToString();
         }
+    }
+
+    /// <summary>
+    /// Quick check whether two selection lists have the same paths and
+    /// selection states.  Used to decide if the cached LargestFilesViewModel
+    /// is still valid after the user may have toggled checkboxes.
+    /// </summary>
+    private static bool SelectionsMatch(
+        List<SourceSelection>? a, List<SourceSelection>? b)
+    {
+        if (ReferenceEquals(a, b)) return true;
+        if (a is null || b is null || a.Count != b.Count) return false;
+        for (int i = 0; i < a.Count; i++)
+        {
+            if (!string.Equals(a[i].Path, b[i].Path, StringComparison.OrdinalIgnoreCase)
+                || a[i].IsSelected != b[i].IsSelected)
+                return false;
+        }
+        return true;
     }
 
     /// <summary>
@@ -980,7 +1044,8 @@ public class MainViewModel : ViewModelBase
                 progress,
                 cts.Token,
                 progressVm.PauseEvent,
-                onFailure));
+                onFailure,
+                plan.Diff));
 
             string detail = $"Data written: {FormatBytes(result.BytesWritten)}";
 

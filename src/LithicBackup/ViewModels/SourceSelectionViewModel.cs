@@ -51,6 +51,7 @@ public class SourceSelectionViewModel : ViewModelBase
     private readonly SizeComputeScheduler _scheduler = new();
     private Dictionary<string, FileVersionInfo>? _catalogInfo;
     private bool _showLargestFiles;
+    private bool _isApplyingSelections;
 
     /// <summary>Fired when the user clicks "Next" with a valid selection.</summary>
     public event Action<List<SourceSelection>>? NextRequested;
@@ -60,6 +61,9 @@ public class SourceSelectionViewModel : ViewModelBase
 
     /// <summary>Fired when the user clicks "Largest Files &amp; Directories".</summary>
     public event Action? LargestFilesRequested;
+
+    /// <summary>Fired whenever a checkbox selection changes in the tree.</summary>
+    public event Action? SelectionChanged;
 
     public SourceSelectionViewModel(
         Dictionary<string, FileVersionInfo>? catalogInfo = null)
@@ -465,6 +469,13 @@ public class SourceSelectionViewModel : ViewModelBase
         set => SetProperty(ref _showLargestFiles, value);
     }
 
+    /// <summary>
+    /// True while <see cref="ApplySelectionsAsync"/> is restoring saved state.
+    /// External listeners (e.g. auto-save) should ignore <see cref="SelectionChanged"/>
+    /// events while this is set, to avoid overwriting saved data with partially-restored state.
+    /// </summary>
+    public bool IsApplyingSelections => _isApplyingSelections;
+
     // --- Commands ---
 
     public ICommand NextCommand { get; }
@@ -554,7 +565,7 @@ public class SourceSelectionViewModel : ViewModelBase
         var root = new SourceSelectionNodeViewModel(
             "", true, null,
             () => ShowSizes, () => (_sortColumn, _sortAscending), _scheduler,
-            () => { RefreshHasSelection(); RefreshSelectedSize(); },
+            () => { RefreshHasSelection(); RefreshSelectedSize(); SelectionChanged?.Invoke(); },
             () => ShowSelectedSizesOnly,
             _catalogInfo);
         RootNode = root;
@@ -692,6 +703,30 @@ public class SourceSelectionViewModel : ViewModelBase
         foreach (var root in Roots)
         {
             var model = root.ToModel();
+
+            // Unwrap the virtual "All Drives" root — downstream consumers
+            // (scanner, database) can't handle Path="".
+            if (root.Path == "")
+            {
+                if (model is not null && model.Children.Count > 0)
+                {
+                    // Normal case: root is selected/partial, children are in ToModel().
+                    result.AddRange(model.Children);
+                }
+                else
+                {
+                    // Safety: root's IsSelected may be stale (false) even though
+                    // children have selections.  Walk children directly.
+                    foreach (var child in root.Children)
+                    {
+                        var childModel = child.ToModel();
+                        if (childModel is not null)
+                            result.Add(childModel);
+                    }
+                }
+                continue;
+            }
+
             if (model is not null)
                 result.Add(model);
         }
@@ -707,6 +742,10 @@ public class SourceSelectionViewModel : ViewModelBase
     public async Task ApplySelectionsAsync(List<SourceSelection> selections)
     {
         if (RootNode is null) return;
+
+        _isApplyingSelections = true;
+        try
+        {
 
         // New format: single root with empty path wrapping drive children.
         var virtualRoot = selections.FirstOrDefault(s => s.Path == "");
@@ -736,12 +775,30 @@ public class SourceSelectionViewModel : ViewModelBase
                     string.Equals(c.Path, selection.Path, StringComparison.OrdinalIgnoreCase));
                 if (driveNode is not null)
                     await driveNode.ApplySelectionAsync(selection);
+
+                // Create nodes for custom paths (network shares, etc.)
+                // that aren't pre-populated as drive roots.
+                if (driveNode is null && Directory.Exists(selection.Path))
+                {
+                    var node = AddPathNode(selection.Path, isSelected: false);
+                    await node.ApplySelectionAsync(selection);
+                }
             }
+
+            // ApplySelectionAsync bypasses the IsSelected setter, so the
+            // virtual root's tristate was never recomputed from its children.
+            RootNode.UpdateFromChildren();
         }
 
         RefreshHasSelection();
         OnPropertyChanged(nameof(IsAllSelected));
         OnPropertyChanged(nameof(IsAllAutoIncludeNew));
+
+        }
+        finally
+        {
+            _isApplyingSelections = false;
+        }
     }
 
     private void OnNext()

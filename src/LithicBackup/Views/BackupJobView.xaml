@@ -192,93 +192,6 @@
                 </StackPanel>
             </Border>
 
-            <!-- Backup schedule (directory mode only) -->
-            <Border Style="{StaticResource Card}" Padding="12"
-                    Visibility="{Binding IsDirectoryMode, Converter={StaticResource BoolToVis}}">
-                <StackPanel>
-                    <CheckBox Content="Enable automated backups (requires LithicBackup Worker Service)"
-                              IsChecked="{Binding ScheduleEnabled, Mode=TwoWay}"
-                              FontWeight="SemiBold" Margin="0,0,0,8" />
-
-                    <StackPanel IsEnabled="{Binding ScheduleEnabled}">
-                        <!-- Schedule mode -->
-                        <StackPanel Orientation="Horizontal" Margin="0,0,0,8">
-                            <TextBlock Text="Mode:" VerticalAlignment="Center" Margin="0,0,8,0" />
-                            <ComboBox ItemsSource="{Binding ScheduleModeOptions}"
-                                      SelectedItem="{Binding ScheduleMode}"
-                                      Padding="6,4" Width="140" />
-                        </StackPanel>
-
-                        <!-- Interval hours (visible when Interval) -->
-                        <StackPanel Orientation="Horizontal" Margin="0,0,0,6">
-                            <StackPanel.Style>
-                                <Style TargetType="StackPanel">
-                                    <Setter Property="Visibility" Value="Collapsed" />
-                                    <Style.Triggers>
-                                        <DataTrigger Binding="{Binding ScheduleMode}" Value="Interval">
-                                            <Setter Property="Visibility" Value="Visible" />
-                                        </DataTrigger>
-                                    </Style.Triggers>
-                                </Style>
-                            </StackPanel.Style>
-                            <TextBlock Text="Every" VerticalAlignment="Center" Margin="0,0,6,0" />
-                            <TextBox Text="{Binding ScheduleIntervalHours, UpdateSourceTrigger=PropertyChanged}"
-                                     Padding="4,3" Width="60"
-                                     BorderBrush="{StaticResource BorderBrush}" />
-                            <TextBlock Text="hours" VerticalAlignment="Center" Margin="6,0,0,0" />
-                        </StackPanel>
-
-                        <!-- Daily time (visible when Daily) -->
-                        <StackPanel Orientation="Horizontal" Margin="0,0,0,6">
-                            <StackPanel.Style>
-                                <Style TargetType="StackPanel">
-                                    <Setter Property="Visibility" Value="Collapsed" />
-                                    <Style.Triggers>
-                                        <DataTrigger Binding="{Binding ScheduleMode}" Value="Daily">
-                                            <Setter Property="Visibility" Value="Visible" />
-                                        </DataTrigger>
-                                    </Style.Triggers>
-                                </Style>
-                            </StackPanel.Style>
-                            <TextBlock Text="Run at" VerticalAlignment="Center" Margin="0,0,6,0" />
-                            <TextBox Text="{Binding ScheduleDailyHour, UpdateSourceTrigger=PropertyChanged}"
-                                     Padding="4,3" Width="40"
-                                     BorderBrush="{StaticResource BorderBrush}"
-                                     ToolTip="Hour (0-23)" />
-                            <TextBlock Text=":" VerticalAlignment="Center" Margin="2,0,2,0" />
-                            <TextBox Text="{Binding ScheduleDailyMinute, UpdateSourceTrigger=PropertyChanged, StringFormat='{}{0:D2}'}"
-                                     Padding="4,3" Width="40"
-                                     BorderBrush="{StaticResource BorderBrush}"
-                                     ToolTip="Minute (0-59)" />
-                        </StackPanel>
-
-                        <!-- Debounce (visible when Continuous) -->
-                        <StackPanel Orientation="Horizontal" Margin="0,0,0,6">
-                            <StackPanel.Style>
-                                <Style TargetType="StackPanel">
-                                    <Setter Property="Visibility" Value="Collapsed" />
-                                    <Style.Triggers>
-                                        <DataTrigger Binding="{Binding ScheduleMode}" Value="Continuous">
-                                            <Setter Property="Visibility" Value="Visible" />
-                                        </DataTrigger>
-                                    </Style.Triggers>
-                                </Style>
-                            </StackPanel.Style>
-                            <TextBlock Text="Wait" VerticalAlignment="Center" Margin="0,0,6,0" />
-                            <TextBox Text="{Binding ScheduleDebounceSeconds, UpdateSourceTrigger=PropertyChanged}"
-                                     Padding="4,3" Width="60"
-                                     BorderBrush="{StaticResource BorderBrush}" />
-                            <TextBlock Text="seconds after last change before backing up"
-                                       VerticalAlignment="Center" Margin="6,0,0,0" />
-                        </StackPanel>
-
-                        <TextBlock Foreground="{StaticResource TextSecondaryBrush}" FontSize="11"
-                                   TextWrapping="Wrap" Margin="0,4,0,0"
-                                   Text="The LithicBackup Worker Service must be installed and running for automated backups. You can install it from the home screen." />
-                    </StackPanel>
-                </StackPanel>
-            </Border>
-
             <!-- Plan summary -->
             <Border Style="{StaticResource Card}" Padding="12">
                 <StackPanel>
@@ -303,11 +216,35 @@
                         HorizontalAlignment="Right" Margin="0,16,0,0">
                 <Button Content="Back" Command="{Binding BackCommand}"
                         Padding="16,8" Margin="0,0,8,0" Cursor="Hand" />
-                <Button Style="{StaticResource PrimaryButton}"
-                        Content="Plan Backup" Command="{Binding PlanCommand}"
-                        Margin="0,0,8,0" />
-                <Button Style="{StaticResource PrimaryButton}"
-                        Content="Start Backup" Command="{Binding StartCommand}" />
+                <Button Content="Plan Backup" Command="{Binding PlanCommand}"
+                        Margin="0,0,8,0"
+                        ToolTipService.ShowOnDisabled="True"
+                        ToolTipService.InitialShowDelay="0">
+                    <Button.Style>
+                        <Style TargetType="Button" BasedOn="{StaticResource PrimaryButton}">
+                            <Style.Triggers>
+                                <Trigger Property="IsEnabled" Value="False">
+                                    <Setter Property="ToolTip"
+                                            Value="Planning is already in progress." />
+                                </Trigger>
+                            </Style.Triggers>
+                        </Style>
+                    </Button.Style>
+                </Button>
+                <Button Content="Start Backup" Command="{Binding StartCommand}"
+                        ToolTipService.ShowOnDisabled="True"
+                        ToolTipService.InitialShowDelay="0">
+                    <Button.Style>
+                        <Style TargetType="Button" BasedOn="{StaticResource PrimaryButton}">
+                            <Style.Triggers>
+                                <Trigger Property="IsEnabled" Value="False">
+                                    <Setter Property="ToolTip"
+                                            Value="Click &quot;Plan Backup&quot; first to generate a backup plan." />
+                                </Trigger>
+                            </Style.Triggers>
+                        </Style>
+                    </Button.Style>
+                </Button>
             </StackPanel>
             </StackPanel>
         </ScrollViewer>

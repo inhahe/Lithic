@@ -149,169 +149,159 @@ public class BackupCoverageViewModel : ViewModelBase
     {
         try
         {
-            // Build source selections (same pattern as StartIncrementalFlow).
-            List<SourceSelection> sources;
-            if (_backupSet.SourceSelections is { Count: > 0 })
+            // Build source selections and exclusion filter on a background
+            // thread so deep selection trees don't stall the UI.
+            var (sources, isExcluded) = await Task.Run(() =>
             {
-                sources = _backupSet.SourceSelections;
-            }
-            else
-            {
-                sources = _backupSet.SourceRoots
-                    .Select(root => new SourceSelection
-                    {
-                        Path = root,
-                        IsDirectory = true,
-                        IsSelected = true,
-                        AutoIncludeNewSubdirectories = true,
-                    })
-                    .ToList();
-            }
+                List<SourceSelection> src;
+                if (_backupSet.SourceSelections is { Count: > 0 })
+                    src = _backupSet.SourceSelections;
+                else
+                    src = _backupSet.SourceRoots
+                        .Select(root => new SourceSelection
+                        {
+                            Path = root,
+                            IsDirectory = true,
+                            IsSelected = true,
+                            AutoIncludeNewSubdirectories = true,
+                        })
+                        .ToList();
 
-            // Build exclusion filter.
-            Func<string, bool>? isExcluded = null;
-            if (_backupSet.JobOptions?.ExcludedExtensions is { Count: > 0 } patterns)
-                isExcluded = GlobMatcher.CreateFilter(patterns);
+                Func<string, bool>? filter = null;
+                if (_backupSet.JobOptions?.ExcludedExtensions is { Count: > 0 } patterns)
+                    filter = GlobMatcher.CreateFilter(patterns);
+                return (src, filter);
+            });
 
-            // Fast scalar count for the progress bar estimate, then load
-            // full catalog data (needed later for diff classification).
+            // Load catalog data on a background thread (can be slow for
+            // large catalogs since the SQLite call is synchronous).
             ScanProgressText = "Loading catalog data...";
-            int estimatedTotal = 0;
-            try { estimatedTotal = await _catalog.GetFileCountForBackupSetAsync(_backupSet.Id, ct); }
-            catch { }
-            var catalogInfo = await _catalog.GetLatestVersionInfoAsync(_backupSet.Id, ct);
-
-            ct.ThrowIfCancellationRequested();
-
-            // If no catalog estimate (new backup set), do a fast file count
-            // so the progress bar is determinate instead of a looping animation.
-            if (estimatedTotal == 0)
+            var (estimatedTotal, catalogInfo) = await Task.Run(() =>
             {
-                int[] counter = [0];
+                int count = 0;
+                try { count = _catalog.GetFileCountForBackupSetAsync(_backupSet.Id, ct).GetAwaiter().GetResult(); }
+                catch { }
+                var info = _catalog.GetLatestVersionInfoAsync(_backupSet.Id, ct).GetAwaiter().GetResult();
+                return (count, info);
+            });
 
-                var countTask = Task.Run(() =>
-                {
-                    foreach (var source in sources)
-                    {
-                        if (source.IsSelected == false || !source.IsDirectory)
-                            continue;
-                        if (!System.IO.Directory.Exists(source.Path))
-                            continue;
-                        CountFilesRecursive(
-                            new System.IO.DirectoryInfo(source.Path), counter, ct);
-                    }
-                    return counter[0];
-                }, ct);
+            if (ct.IsCancellationRequested) return;
 
-                while (!countTask.IsCompleted)
-                {
-                    ScanProgressText = $"Counting files... {counter[0]:N0} found";
-                    await Task.WhenAny(countTask, Task.Delay(1000, ct));
-                }
-
-                estimatedTotal = await countTask;
-            }
-
+            // When we have a catalog estimate, switch to a determinate bar.
             if (estimatedTotal > 0)
                 IsProgressIndeterminate = false;
 
             // Scan source files on a background thread.
-            var progress = new Progress<ScanProgress>(p =>
-            {
-                ScanProgressText = $"Scanning... {p.FilesFound:N0} files found ({FormatBytes(p.TotalBytes)})";
-                if (estimatedTotal > 0)
-                    ScanPercent = Math.Min(99, (double)p.FilesFound / estimatedTotal * 100);
-            });
+            var scanProgress = new LatestProgress<ScanProgress>();
 
             ScanProgressText = "Scanning source directories...";
-            var scannedFiles = await Task.Run(
-                () => _scanner.ScanAsync(sources, progress, ct, isExcluded),
-                ct);
+            var scanTask = Task.Run(
+                () => _scanner.ScanAsync(sources, scanProgress, ct, isExcluded));
 
-            ct.ThrowIfCancellationRequested();
+            while (!scanTask.IsCompleted && !ct.IsCancellationRequested)
+            {
+                var p = scanProgress.Latest;
+                if (p is not null)
+                {
+                    ScanProgressText = $"Scanning... {p.FilesFound:N0} files found ({FormatBytes(p.TotalBytes)})";
+                    if (estimatedTotal > 0)
+                        ScanPercent = Math.Min(99, (double)p.FilesFound / estimatedTotal * 100);
+                }
+                await Task.WhenAny(scanTask, Task.Delay(1000));
+            }
 
-            // Compare.
+            var scannedFiles = await scanTask;
+
+            if (ct.IsCancellationRequested) return;
+
+            // Compare on a background thread so large file sets don't
+            // hang the UI.
             ScanPercent = 100;
             ScanProgressText = "Comparing...";
-            long totalBytes = 0, backedUpBytes = 0, notBackedUpBytes = 0, changedBytes = 0;
-            int backedUpCount = 0, notBackedUpCount = 0, changedCount = 0;
-            var notBackedUp = new List<CoverageFileItem>();
-            var changed = new List<CoverageFileItem>();
 
-            foreach (var file in scannedFiles)
+            var cmp = await Task.Run(() =>
             {
-                totalBytes += file.SizeBytes;
+                long totalB = 0, backedUpB = 0, notBackedUpB = 0, changedB = 0;
+                int backedUpC = 0, notBackedUpC = 0, changedC = 0;
+                var nbList = new List<CoverageFileItem>();
+                var chList = new List<CoverageFileItem>();
 
-                if (catalogInfo.TryGetValue(file.FullPath, out var info))
+                foreach (var file in scannedFiles)
                 {
-                    // File is in the catalog — check if it's changed since last backup.
-                    if (file.SizeBytes != info.SizeBytes ||
-                        file.LastWriteUtc > info.SourceLastWriteUtc)
+                    totalB += file.SizeBytes;
+
+                    if (catalogInfo.TryGetValue(file.FullPath, out var info))
                     {
-                        changedCount++;
-                        changedBytes += file.SizeBytes;
-                        changed.Add(new CoverageFileItem
+                        if (file.SizeBytes != info.SizeBytes ||
+                            file.LastWriteUtc > info.SourceLastWriteUtc)
+                        {
+                            changedC++;
+                            changedB += file.SizeBytes;
+                            chList.Add(new CoverageFileItem
+                            {
+                                FilePath = file.FullPath,
+                                SizeBytes = file.SizeBytes,
+                            });
+                        }
+                        else
+                        {
+                            backedUpC++;
+                            backedUpB += file.SizeBytes;
+                        }
+                    }
+                    else
+                    {
+                        notBackedUpC++;
+                        notBackedUpB += file.SizeBytes;
+                        nbList.Add(new CoverageFileItem
                         {
                             FilePath = file.FullPath,
                             SizeBytes = file.SizeBytes,
                         });
                     }
-                    else
-                    {
-                        backedUpCount++;
-                        backedUpBytes += file.SizeBytes;
-                    }
                 }
-                else
-                {
-                    // File not in catalog — not backed up.
-                    notBackedUpCount++;
-                    notBackedUpBytes += file.SizeBytes;
-                    notBackedUp.Add(new CoverageFileItem
-                    {
-                        FilePath = file.FullPath,
-                        SizeBytes = file.SizeBytes,
-                    });
-                }
-            }
+
+                return (totalB, backedUpB, backedUpC, notBackedUpB, notBackedUpC,
+                        changedB, changedC, nbList, chList);
+            });
 
             // Update properties (triggers UI refresh).
             TotalSourceFiles = scannedFiles.Count;
-            _totalSourceBytes = totalBytes;
+            _totalSourceBytes = cmp.totalB;
             OnPropertyChanged(nameof(TotalSourceSizeText));
 
-            BackedUpCount = backedUpCount;
-            _backedUpBytes = backedUpBytes;
+            BackedUpCount = cmp.backedUpC;
+            _backedUpBytes = cmp.backedUpB;
             OnPropertyChanged(nameof(BackedUpSizeText));
 
-            NotBackedUpCount = notBackedUpCount;
-            _notBackedUpBytes = notBackedUpBytes;
+            NotBackedUpCount = cmp.notBackedUpC;
+            _notBackedUpBytes = cmp.notBackedUpB;
             OnPropertyChanged(nameof(NotBackedUpSizeText));
 
-            ChangedCount = changedCount;
-            _changedBytes = changedBytes;
+            ChangedCount = cmp.changedC;
+            _changedBytes = cmp.changedB;
             OnPropertyChanged(nameof(ChangedSizeText));
 
             CoveragePercent = scannedFiles.Count > 0
-                ? (double)backedUpCount / scannedFiles.Count * 100
+                ? (double)cmp.backedUpC / scannedFiles.Count * 100
                 : 0;
 
             // Populate lists (cap at 2000 to avoid UI overload).
             const int maxDisplay = 2000;
-            foreach (var item in notBackedUp.OrderByDescending(i => i.SizeBytes).Take(maxDisplay))
+            foreach (var item in cmp.nbList.OrderByDescending(i => i.SizeBytes).Take(maxDisplay))
                 NotBackedUpFiles.Add(item);
-            foreach (var item in changed.OrderByDescending(i => i.SizeBytes).Take(maxDisplay))
+            foreach (var item in cmp.chList.OrderByDescending(i => i.SizeBytes).Take(maxDisplay))
                 ChangedFiles.Add(item);
 
             OnPropertyChanged(nameof(HasNotBackedUp));
             OnPropertyChanged(nameof(HasChanged));
 
-            SummaryText = notBackedUpCount == 0 && changedCount == 0
+            SummaryText = cmp.notBackedUpC == 0 && cmp.changedC == 0
                 ? "All source files are backed up and current."
-                : $"{backedUpCount:N0} backed up, {notBackedUpCount:N0} not backed up, {changedCount:N0} changed since last backup.";
+                : $"{cmp.backedUpC:N0} backed up, {cmp.notBackedUpC:N0} not backed up, {cmp.changedC:N0} changed since last backup.";
 
-            if (notBackedUp.Count > maxDisplay)
-                SummaryText += $" (showing largest {maxDisplay:N0} of {notBackedUp.Count:N0} not-backed-up files)";
+            if (cmp.nbList.Count > maxDisplay)
+                SummaryText += $" (showing largest {maxDisplay:N0} of {cmp.nbList.Count:N0} not-backed-up files)";
         }
         catch (OperationCanceledException)
         {
@@ -327,38 +317,6 @@ public class BackupCoverageViewModel : ViewModelBase
             _cts?.Dispose();
             _cts = null;
         }
-    }
-
-    /// <summary>
-    /// Recursively count files, writing to a shared counter that the UI
-    /// thread polls on a timer.  Per-directory error handling so broken
-    /// symlinks or inaccessible directories don't abort the entire count.
-    /// </summary>
-    private static void CountFilesRecursive(
-        System.IO.DirectoryInfo dir, int[] counter, CancellationToken ct)
-    {
-        try
-        {
-            foreach (var _ in dir.EnumerateFiles())
-            {
-                counter[0]++;
-                ct.ThrowIfCancellationRequested();
-            }
-        }
-        catch (Exception) when (!ct.IsCancellationRequested)
-        {
-            return;
-        }
-
-        try
-        {
-            foreach (var sub in dir.EnumerateDirectories())
-            {
-                ct.ThrowIfCancellationRequested();
-                CountFilesRecursive(sub, counter, ct);
-            }
-        }
-        catch (Exception) when (!ct.IsCancellationRequested) { }
     }
 
     private static string FormatBytes(long bytes)

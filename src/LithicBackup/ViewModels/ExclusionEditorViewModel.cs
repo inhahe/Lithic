@@ -1,28 +1,4 @@
-using System.Collections.ObjectModel;
-using System.Windows.Input;
-
 namespace LithicBackup.ViewModels;
-
-/// <summary>
-/// A single include/re-include pattern with a per-pattern version-history toggle.
-/// </summary>
-public class PatternItem : ViewModelBase
-{
-    private string _pattern = "";
-    private bool _keepVersions = true;
-
-    public string Pattern
-    {
-        get => _pattern;
-        set => SetProperty(ref _pattern, value);
-    }
-
-    public bool KeepVersions
-    {
-        get => _keepVersions;
-        set => SetProperty(ref _keepVersions, value);
-    }
-}
 
 /// <summary>
 /// ViewModel for the per-directory exclusion editor dialog.
@@ -31,10 +7,6 @@ public class PatternItem : ViewModelBase
 ///   - Exclude mode (default): user specifies exclude patterns, optionally with re-include overrides.
 ///   - Include-only mode: user specifies which files to keep; behind the scenes this sets
 ///     exclude = "*" and uses IncludedPatterns as the whitelist.
-///
-/// Include/re-include patterns each carry a "Keep versions" flag. Patterns whose
-/// flag is unchecked are stored with a <c>~nv:</c> prefix in the serialised pattern
-/// list so the backup engine can disable version history for matching files.
 /// </summary>
 public class ExclusionEditorViewModel : ViewModelBase
 {
@@ -66,14 +38,7 @@ public class ExclusionEditorViewModel : ViewModelBase
             : "";
         HasInheritedExclusions = inherited.Count > 0;
 
-        ParseIncludePatterns(node.IncludedPatterns);
-
-        AddPatternCommand = new RelayCommand(_ => IncludePatternItems.Add(new PatternItem()));
-        RemovePatternCommand = new RelayCommand(p =>
-        {
-            if (p is PatternItem item)
-                IncludePatternItems.Remove(item);
-        });
+        IncludedPatterns = node.IncludedPatterns;
 
         DetectMode();
     }
@@ -93,16 +58,9 @@ public class ExclusionEditorViewModel : ViewModelBase
         InheritedExclusionsText = inheritedExclusionsText;
         HasInheritedExclusions = !string.IsNullOrEmpty(inheritedExclusionsText);
 
-        ParseIncludePatterns(includedPatterns.Count > 0
+        IncludedPatterns = includedPatterns.Count > 0
             ? string.Join("\n", includedPatterns)
-            : "");
-
-        AddPatternCommand = new RelayCommand(_ => IncludePatternItems.Add(new PatternItem()));
-        RemovePatternCommand = new RelayCommand(p =>
-        {
-            if (p is PatternItem item)
-                IncludePatternItems.Remove(item);
-        });
+            : "";
 
         DetectMode();
     }
@@ -135,26 +93,16 @@ public class ExclusionEditorViewModel : ViewModelBase
         set => SetProperty(ref _excludedPatterns, value);
     }
 
-    /// <summary>
-    /// Include/re-include patterns as structured items with per-pattern
-    /// "Keep versions" toggle. The UI binds to this collection.
-    /// </summary>
-    public ObservableCollection<PatternItem> IncludePatternItems { get; } = [];
+    private string _includedPatterns = "";
 
     /// <summary>
-    /// Serialised form of <see cref="IncludePatternItems"/>.
-    /// Patterns with <c>KeepVersions == false</c> are prefixed with <c>~nv:</c>.
-    /// Read by callers after the dialog closes.
+    /// Re-include / include-only patterns as a newline-separated string.
+    /// Edited directly in a multiline TextBox.
     /// </summary>
     public string IncludedPatterns
     {
-        get
-        {
-            var lines = IncludePatternItems
-                .Where(p => !string.IsNullOrWhiteSpace(p.Pattern))
-                .Select(p => p.KeepVersions ? p.Pattern.Trim() : $"~nv:{p.Pattern.Trim()}");
-            return string.Join("\n", lines);
-        }
+        get => _includedPatterns;
+        set => SetProperty(ref _includedPatterns, value);
     }
 
     // ---------------------------------------------------------------
@@ -196,34 +144,4 @@ public class ExclusionEditorViewModel : ViewModelBase
         }
     }
 
-    // ---------------------------------------------------------------
-    // Commands
-    // ---------------------------------------------------------------
-
-    public ICommand AddPatternCommand { get; }
-    public ICommand RemovePatternCommand { get; }
-
-    // ---------------------------------------------------------------
-    // Helpers
-    // ---------------------------------------------------------------
-
-    /// <summary>
-    /// Parse a newline-separated pattern string into <see cref="IncludePatternItems"/>.
-    /// Lines prefixed with <c>~nv:</c> have <c>KeepVersions = false</c>.
-    /// </summary>
-    private void ParseIncludePatterns(string text)
-    {
-        IncludePatternItems.Clear();
-        if (string.IsNullOrWhiteSpace(text))
-            return;
-
-        foreach (var line in text.Split(['\r', '\n'],
-            StringSplitOptions.RemoveEmptyEntries | StringSplitOptions.TrimEntries))
-        {
-            if (line.StartsWith("~nv:"))
-                IncludePatternItems.Add(new PatternItem { Pattern = line[4..], KeepVersions = false });
-            else
-                IncludePatternItems.Add(new PatternItem { Pattern = line, KeepVersions = true });
-        }
-    }
 }

@@ -60,8 +60,20 @@
             <StackPanel Grid.Column="1" Orientation="Horizontal">
                 <Button Content="Cancel" Command="{Binding CancelCommand}"
                         Padding="16,8" Margin="0,0,8,0" Cursor="Hand" />
-                <Button Style="{StaticResource PrimaryButton}"
-                        Content="Next" Command="{Binding NextCommand}" />
+                <Button Content="Next" Command="{Binding NextCommand}"
+                        ToolTipService.ShowOnDisabled="True"
+                        ToolTipService.InitialShowDelay="0">
+                    <Button.Style>
+                        <Style TargetType="Button" BasedOn="{StaticResource PrimaryButton}">
+                            <Style.Triggers>
+                                <Trigger Property="IsEnabled" Value="False">
+                                    <Setter Property="ToolTip"
+                                            Value="Select at least one file or directory to back up." />
+                                </Trigger>
+                            </Style.Triggers>
+                        </Style>
+                    </Button.Style>
+                </Button>
             </StackPanel>
         </Grid>
 
@@ -585,6 +597,7 @@
                                             <ComboBox SelectedItem="{Binding DisplayTierSetName, Mode=TwoWay}"
                                                       ItemsSource="{Binding DataContext.AvailableTierSetNames,
                                                                     RelativeSource={RelativeSource AncestorType=TreeView}}"
+                                                      IsEnabled="{Binding IsNodeEnabled}"
                                                       FontSize="10"
                                                       Padding="2,1"
                                                       MinWidth="70"
@@ -601,9 +614,6 @@
                                                     <Style TargetType="ComboBox">
                                                         <Setter Property="Foreground" Value="{StaticResource TextPrimaryBrush}" />
                                                         <Style.Triggers>
-                                                            <DataTrigger Binding="{Binding IsSelected}" Value="False">
-                                                                <Setter Property="IsEnabled" Value="False" />
-                                                            </DataTrigger>
                                                             <DataTrigger Binding="{Binding IsInheritedTier}" Value="True">
                                                                 <Setter Property="Foreground" Value="{StaticResource TextDimBrush}" />
                                                             </DataTrigger>
@@ -618,20 +628,11 @@
                                                 BorderBrush="{StaticResource BorderBrush}"
                                                 BorderThickness="0,0,1,0">
                                             <CheckBox IsChecked="{Binding AutoIncludeNew, Mode=TwoWay}"
+                                                      IsEnabled="{Binding IsNodeEnabled}"
                                                       VerticalAlignment="Center"
                                                       HorizontalAlignment="Center"
                                                       ToolTip="Auto-include new subdirectories"
-                                                      Visibility="{Binding IsDirectory, Converter={StaticResource BoolToVis}}">
-                                                <CheckBox.Style>
-                                                    <Style TargetType="CheckBox">
-                                                        <Style.Triggers>
-                                                            <DataTrigger Binding="{Binding IsSelected}" Value="False">
-                                                                <Setter Property="IsEnabled" Value="False" />
-                                                            </DataTrigger>
-                                                        </Style.Triggers>
-                                                    </Style>
-                                                </CheckBox.Style>
-                                            </CheckBox>
+                                                      Visibility="{Binding IsDirectory, Converter={StaticResource BoolToVis}}" />
                                         </Border>
 
                                         <!-- Col 2: Include -->

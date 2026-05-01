@@ -39,8 +39,10 @@ public class DirectoryBackupService
     }
 
     /// <summary>
-    /// Execute a directory backup: scan sources, compute diff, copy files
-    /// with versioned history, update catalog, and apply retention.
+    /// Execute a directory backup: copy files with versioned history,
+    /// update catalog, and apply retention.
+    /// When <paramref name="precomputedDiff"/> is supplied the scan/diff
+    /// steps are skipped (they were already done during planning).
     /// </summary>
     public async Task<BackupResult> ExecuteAsync(
         BackupJob job,
@@ -49,26 +51,35 @@ public class DirectoryBackupService
         IProgress<BackupProgress>? progress,
         CancellationToken ct,
         ManualResetEventSlim? pauseEvent = null,
-        FailureCallback? onFailure = null)
+        FailureCallback? onFailure = null,
+        BackupDiff? precomputedDiff = null)
     {
-        // 1. Scan sources (global + per-directory exclusions).
-        var isExcluded = GlobMatcher.CreateCombinedFilter(job.ExcludedExtensions, job.Sources);
-        var scanned = await _scanner.ScanAsync(job.Sources, progress: null, ct, isExcluded);
-
-        // 2. Compute diff.
         BackupDiff diff;
-        if (job.BackupSetId.HasValue)
+        if (precomputedDiff is not null)
         {
-            diff = await _scanner.ComputeDiffAsync(scanned, job.BackupSetId.Value, ct);
+            diff = precomputedDiff;
         }
         else
         {
-            diff = new BackupDiff
+            // No pre-computed diff — scan and compute from scratch.
+            progress?.Report(new BackupProgress { StatusMessage = "Scanning source files..." });
+            var isExcluded = GlobMatcher.CreateCombinedFilter(job.ExcludedExtensions, job.Sources);
+            var scanned = await _scanner.ScanAsync(job.Sources, progress: null, ct, isExcluded);
+
+            progress?.Report(new BackupProgress { StatusMessage = "Computing changes..." });
+            if (job.BackupSetId.HasValue)
             {
-                NewFiles = scanned,
-                ChangedFiles = [],
-                DeletedFiles = [],
-            };
+                diff = await _scanner.ComputeDiffAsync(scanned, job.BackupSetId.Value, ct);
+            }
+            else
+            {
+                diff = new BackupDiff
+                {
+                    NewFiles = scanned,
+                    ChangedFiles = [],
+                    DeletedFiles = [],
+                };
+            }
         }
 
         var filesToBackup = diff.NewFiles.Concat(diff.ChangedFiles).ToList();

@@ -55,10 +55,22 @@
 
                         <!-- Bottom buttons -->
                         <StackPanel DockPanel.Dock="Bottom" Margin="0,8,0,0">
-                            <Button Style="{StaticResource PrimaryButton}"
-                                    Content="New Backup Set"
+                            <Button Content="New Backup Set"
                                     HorizontalAlignment="Stretch"
-                                    Command="{Binding NewBackupSetCommand}" />
+                                    Command="{Binding NewBackupSetCommand}"
+                                    ToolTipService.ShowOnDisabled="True"
+                                    ToolTipService.InitialShowDelay="0">
+                                <Button.Style>
+                                    <Style TargetType="Button" BasedOn="{StaticResource PrimaryButton}">
+                                        <Style.Triggers>
+                                            <Trigger Property="IsEnabled" Value="False">
+                                                <Setter Property="ToolTip"
+                                                        Value="A backup is currently in progress." />
+                                            </Trigger>
+                                        </Style.Triggers>
+                                    </Style>
+                                </Button.Style>
+                            </Button>
                             <Button Content="Home"
                                     HorizontalAlignment="Stretch"
                                     Padding="16,8" Margin="0,6,0,0"
@@ -187,55 +199,145 @@
                                                                             Background="{StaticResource BorderBrush}"
                                                                             Margin="0,0,0,12" />
 
-                                                                    <Button Style="{StaticResource PrimaryButton}"
-                                                                            Content="Run Incremental"
+                                                                    <Button Content="Run Incremental"
                                                                             HorizontalAlignment="Stretch"
                                                                             Padding="16,10"
                                                                             Cursor="Hand"
                                                                             Command="{Binding DataContext.RunIncrementalCommand,
-                                                                                      RelativeSource={RelativeSource AncestorType=Window}}" />
+                                                                                      RelativeSource={RelativeSource AncestorType=Window}}"
+                                                                            ToolTipService.ShowOnDisabled="True"
+                                                                            ToolTipService.InitialShowDelay="0">
+                                                                        <Button.Style>
+                                                                            <Style TargetType="Button" BasedOn="{StaticResource PrimaryButton}">
+                                                                                <Style.Triggers>
+                                                                                    <Trigger Property="IsEnabled" Value="False">
+                                                                                        <Setter Property="ToolTip"
+                                                                                                Value="A backup is currently in progress." />
+                                                                                    </Trigger>
+                                                                                </Style.Triggers>
+                                                                            </Style>
+                                                                        </Button.Style>
+                                                                    </Button>
 
                                                                     <Button Content="Backup Coverage"
                                                                             HorizontalAlignment="Stretch"
                                                                             Padding="16,8" Margin="0,6,0,0"
                                                                             Cursor="Hand"
                                                                             Command="{Binding DataContext.BackupCoverageCommand,
-                                                                                      RelativeSource={RelativeSource AncestorType=Window}}" />
+                                                                                      RelativeSource={RelativeSource AncestorType=Window}}"
+                                                                            ToolTipService.ShowOnDisabled="True"
+                                                                            ToolTipService.InitialShowDelay="0">
+                                                                        <Button.Style>
+                                                                            <Style TargetType="Button">
+                                                                                <Style.Triggers>
+                                                                                    <Trigger Property="IsEnabled" Value="False">
+                                                                                        <Setter Property="ToolTip"
+                                                                                                Value="A backup is currently in progress." />
+                                                                                    </Trigger>
+                                                                                </Style.Triggers>
+                                                                            </Style>
+                                                                        </Button.Style>
+                                                                    </Button>
 
                                                                     <Button Content="Restore Files"
                                                                             HorizontalAlignment="Stretch"
                                                                             Padding="16,8" Margin="0,6,0,0"
                                                                             Cursor="Hand"
                                                                             Command="{Binding DataContext.RestoreCommand,
-                                                                                      RelativeSource={RelativeSource AncestorType=Window}}" />
+                                                                                      RelativeSource={RelativeSource AncestorType=Window}}"
+                                                                            ToolTipService.ShowOnDisabled="True"
+                                                                            ToolTipService.InitialShowDelay="0">
+                                                                        <Button.Style>
+                                                                            <Style TargetType="Button">
+                                                                                <Style.Triggers>
+                                                                                    <Trigger Property="IsEnabled" Value="False">
+                                                                                        <Setter Property="ToolTip"
+                                                                                                Value="A backup is currently in progress." />
+                                                                                    </Trigger>
+                                                                                </Style.Triggers>
+                                                                            </Style>
+                                                                        </Button.Style>
+                                                                    </Button>
 
                                                                     <Button Content="Edit Backup Set"
                                                                             HorizontalAlignment="Stretch"
                                                                             Padding="16,8" Margin="0,6,0,0"
                                                                             Cursor="Hand"
                                                                             Command="{Binding DataContext.EditBackupSetCommand,
-                                                                                      RelativeSource={RelativeSource AncestorType=Window}}" />
+                                                                                      RelativeSource={RelativeSource AncestorType=Window}}"
+                                                                            ToolTipService.ShowOnDisabled="True"
+                                                                            ToolTipService.InitialShowDelay="0">
+                                                                        <Button.Style>
+                                                                            <Style TargetType="Button">
+                                                                                <Style.Triggers>
+                                                                                    <Trigger Property="IsEnabled" Value="False">
+                                                                                        <Setter Property="ToolTip"
+                                                                                                Value="A backup is currently in progress." />
+                                                                                    </Trigger>
+                                                                                </Style.Triggers>
+                                                                            </Style>
+                                                                        </Button.Style>
+                                                                    </Button>
 
                                                                     <Button Content="Change Destination"
                                                                             HorizontalAlignment="Stretch"
                                                                             Padding="16,8" Margin="0,6,0,0"
                                                                             Cursor="Hand"
                                                                             Command="{Binding DataContext.ChangeDestinationCommand,
-                                                                                      RelativeSource={RelativeSource AncestorType=Window}}" />
+                                                                                      RelativeSource={RelativeSource AncestorType=Window}}"
+                                                                            ToolTipService.ShowOnDisabled="True"
+                                                                            ToolTipService.InitialShowDelay="0">
+                                                                        <Button.Style>
+                                                                            <Style TargetType="Button">
+                                                                                <Style.Triggers>
+                                                                                    <Trigger Property="IsEnabled" Value="False">
+                                                                                        <Setter Property="ToolTip"
+                                                                                                Value="Only available for directory-mode backup sets." />
+                                                                                    </Trigger>
+                                                                                </Style.Triggers>
+                                                                            </Style>
+                                                                        </Button.Style>
+                                                                    </Button>
 
                                                                     <Button Content="Copy Backup Set"
                                                                             HorizontalAlignment="Stretch"
                                                                             Padding="16,8" Margin="0,6,0,0"
                                                                             Cursor="Hand"
                                                                             Command="{Binding DataContext.CopyBackupSetCommand,
-                                                                                      RelativeSource={RelativeSource AncestorType=Window}}" />
+                                                                                      RelativeSource={RelativeSource AncestorType=Window}}"
+                                                                            ToolTipService.ShowOnDisabled="True"
+                                                                            ToolTipService.InitialShowDelay="0">
+                                                                        <Button.Style>
+                                                                            <Style TargetType="Button">
+                                                                                <Style.Triggers>
+                                                                                    <Trigger Property="IsEnabled" Value="False">
+                                                                                        <Setter Property="ToolTip"
+                                                                                                Value="A backup is currently in progress." />
+                                                                                    </Trigger>
+                                                                                </Style.Triggers>
+                                                                            </Style>
+                                                                        </Button.Style>
+                                                                    </Button>
 
                                                                     <Button Content="Review Orphaned Directories"
                                                                             HorizontalAlignment="Stretch"
                                                                             Padding="16,8" Margin="0,6,0,0"
                                                                             Cursor="Hand"
                                                                             Command="{Binding DataContext.OrphanedDirsCommand,
-                                                                                      RelativeSource={RelativeSource AncestorType=Window}}" />
+                                                                                      RelativeSource={RelativeSource AncestorType=Window}}"
+                                                                            ToolTipService.ShowOnDisabled="True"
+                                                                            ToolTipService.InitialShowDelay="0">
+                                                                        <Button.Style>
+                                                                            <Style TargetType="Button">
+                                                                                <Style.Triggers>
+                                                                                    <Trigger Property="IsEnabled" Value="False">
+                                                                                        <Setter Property="ToolTip"
+                                                                                                Value="A backup is currently in progress." />
+                                                                                    </Trigger>
+                                                                                </Style.Triggers>
+                                                                            </Style>
+                                                                        </Button.Style>
+                                                                    </Button>
 
                                                                     <Button Content="Export Backup Set"
                                                                             HorizontalAlignment="Stretch"

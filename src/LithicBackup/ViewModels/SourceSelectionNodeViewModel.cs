@@ -225,6 +225,12 @@ public class SourceSelectionNodeViewModel : ViewModelBase
     }
 
     /// <summary>
+    /// True when this node is at least partially selected (i.e. not deselected).
+    /// Used to enable/disable per-node controls (tier set, auto-include).
+    /// </summary>
+    public bool IsNodeEnabled => _isSelected != false;
+
+    /// <summary>
     /// Tristate: true = included, false = excluded, null = partially included.
     /// </summary>
     public bool? IsSelected
@@ -237,6 +243,15 @@ public class SourceSelectionNodeViewModel : ViewModelBase
 
             _isSelected = value;
             OnPropertyChanged();
+            OnPropertyChanged(nameof(IsNodeEnabled));
+
+            // Clear backup status for deselected files — they're not part
+            // of the backup, so showing a status dot would be misleading.
+            if (value == false && _backupStatus != BackupStatus.Unknown)
+            {
+                _backupStatus = BackupStatus.Unknown;
+                OnPropertyChanged(nameof(BackupStatus));
+            }
 
             if (_suppressPropagation)
                 return;
@@ -393,6 +408,7 @@ public class SourceSelectionNodeViewModel : ViewModelBase
         _suppressPropagation = true;
         _isSelected = model.IsSelected;
         OnPropertyChanged(nameof(IsSelected));
+        OnPropertyChanged(nameof(IsNodeEnabled));
         _suppressPropagation = false;
 
         _autoIncludeNew = model.AutoIncludeNewSubdirectories;
@@ -548,7 +564,9 @@ public class SourceSelectionNodeViewModel : ViewModelBase
                 };
 
                 // Determine backup status for files from the catalog.
-                if (!isDir && _catalogInfo is not null)
+                // Only for selected files — unselected files aren't part of the
+                // backup, so showing "not backed up" would be misleading.
+                if (!isDir && _catalogInfo is not null && child._isSelected != false)
                 {
                     if (_catalogInfo.TryGetValue(fullName, out var info))
                     {
@@ -815,7 +833,7 @@ public class SourceSelectionNodeViewModel : ViewModelBase
     /// <summary>
     /// Recalculate this node's tristate based on its children's states.
     /// </summary>
-    private void UpdateFromChildren()
+    internal void UpdateFromChildren()
     {
         if (Children.Count == 0)
             return;

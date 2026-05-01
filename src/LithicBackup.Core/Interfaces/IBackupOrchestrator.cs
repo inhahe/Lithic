@@ -99,4 +99,11 @@ public class BackupProgress
 
     /// <summary>Total size of the current file in bytes (0 if not tracked).</summary>
     public long CurrentFileTotalBytes { get; init; }
+
+    /// <summary>
+    /// Optional status message describing the current phase
+    /// (e.g. "Scanning source files...", "Computing changes...").
+    /// When null or empty, the UI shows default copy-progress text.
+    /// </summary>
+    public string? StatusMessage { get; init; }
 }

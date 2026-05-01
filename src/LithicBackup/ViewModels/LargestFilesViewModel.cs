@@ -443,122 +443,85 @@ public class LargestFilesViewModel : ViewModelBase
     {
         try
         {
-            // Build source selections.
-            List<SourceSelection> sources;
-            if (_backupSet.SourceSelections is { Count: > 0 })
+            // Build source selections and exclusion filter on a background
+            // thread so deep selection trees don't stall the UI.
+            var (sources, isExcluded) = await Task.Run(() =>
             {
-                sources = _backupSet.SourceSelections;
-            }
-            else
-            {
-                sources = _backupSet.SourceRoots
-                    .Select(root => new SourceSelection
-                    {
-                        Path = root,
-                        IsDirectory = true,
-                        IsSelected = true,
-                        AutoIncludeNewSubdirectories = true,
-                    })
-                    .ToList();
-            }
+                List<SourceSelection> src;
+                if (_backupSet.SourceSelections is { Count: > 0 })
+                    src = _backupSet.SourceSelections;
+                else
+                    src = _backupSet.SourceRoots
+                        .Select(root => new SourceSelection
+                        {
+                            Path = root,
+                            IsDirectory = true,
+                            IsSelected = true,
+                            AutoIncludeNewSubdirectories = true,
+                        })
+                        .ToList();
 
-            // Build exclusion filter (global + per-directory patterns).
-            var isExcluded = GlobMatcher.CreateCombinedFilter(
-                _backupSet.JobOptions?.ExcludedExtensions ?? [],
-                sources);
+                var filter = GlobMatcher.CreateCombinedFilter(
+                    _backupSet.JobOptions?.ExcludedExtensions ?? [],
+                    src);
+                return (src, filter);
+            });
 
-            // If no catalog estimate is available (new backup set), do a fast
-            // file count so the progress bar is determinate instead of a
-            // looping animation.  Uses IgnoreInaccessible to skip access-denied
-            // directories without throwing.  The count ignores exclusion
-            // patterns so it may overestimate, but that's fine — the bar will
-            // simply reach near-100% a bit early.
-            if (_estimatedTotal == 0)
-            {
-                // Shared counter — background thread writes, UI polls.
-                int[] counter = [0];
-
-                var countTask = Task.Run(() =>
-                {
-                    foreach (var source in sources)
-                    {
-                        if (source.IsSelected == false || !source.IsDirectory)
-                            continue;
-                        if (!Directory.Exists(source.Path))
-                            continue;
-                        CountFilesRecursive(
-                            new DirectoryInfo(source.Path), counter, ct);
-                    }
-                    return counter[0];
-                }, ct);
-
-                // Poll the counter every second — no dependency on
-                // SynchronizationContext.Post or throttled progress.
-                while (!countTask.IsCompleted)
-                {
-                    ScanProgressText = $"Counting files... {counter[0]:N0} found";
-                    await Task.WhenAny(countTask, Task.Delay(1000, ct));
-                }
-
-                _estimatedTotal = await countTask;
-                if (_estimatedTotal > 0)
-                    IsProgressIndeterminate = false;
-            }
+            // When we have a catalog estimate, switch to a determinate bar.
+            if (_estimatedTotal > 0)
+                IsProgressIndeterminate = false;
 
             // Scan source files on background thread.
-            // Wrap in ThrottledProgress to avoid flooding the UI dispatcher —
-            // the scanner reports per-directory, which can be thousands of posts/sec.
-            var uiProgress = new Progress<ScanProgress>(p =>
-            {
-                // Show current directory (truncated) so the user can see progress is alive.
-                var dir = p.CurrentDirectory ?? "";
-                if (dir.Length > 60)
-                    dir = "..." + dir[^57..];
-                ScanProgressText = $"Scanning... {p.FilesFound:N0} files ({FormatBytes(p.TotalBytes)})\n{dir}";
-                if (_estimatedTotal > 0)
-                    ScanPercent = Math.Min(99, (double)p.FilesFound / _estimatedTotal * 100);
-            });
-            var progress = new ThrottledProgress<ScanProgress>(uiProgress, TimeSpan.FromMilliseconds(50));
+            // Scanner writes to a lightweight holder; UI polls every second.
+            var scanProgress = new LatestProgress<ScanProgress>();
 
             ScanProgressText = "Scanning source directories...";
-            var scannedFiles = await Task.Run(
-                () => _scanner.ScanAsync(sources, progress, ct, isExcluded),
-                ct);
+            var scanTask = Task.Run(
+                () => _scanner.ScanAsync(sources, scanProgress, ct, isExcluded));
 
-            ct.ThrowIfCancellationRequested();
+            while (!scanTask.IsCompleted && !ct.IsCancellationRequested)
+            {
+                var p = scanProgress.Latest;
+                if (p is not null)
+                {
+                    ScanProgressText = $"Scanning... {p.FilesFound:N0} files ({FormatBytes(p.TotalBytes)})\n{p.CurrentDirectory}";
+                    if (_estimatedTotal > 0)
+                        ScanPercent = Math.Min(99, (double)p.FilesFound / _estimatedTotal * 100);
+                }
+                await Task.WhenAny(scanTask, Task.Delay(1000));
+            }
+
+            var scannedFiles = await scanTask;
+
+            if (ct.IsCancellationRequested) return;
 
             ScanPercent = 100;
             ScanProgressText = $"Checking backup status for {scannedFiles.Count:N0} files...";
 
-            // Compute diff to determine backup status per file.
-            // Run on a background thread so the classification loop
-            // doesn't block the UI when the file list is large.
-            HashSet<string> newPaths, changedPaths;
-            try
-            {
-                var diff = await Task.Run(
-                    () => _scanner.ComputeDiffAsync(scannedFiles, _backupSet.Id, ct), ct);
-                newPaths = new HashSet<string>(
-                    diff.NewFiles.Select(f => f.FullPath), StringComparer.OrdinalIgnoreCase);
-                changedPaths = new HashSet<string>(
-                    diff.ChangedFiles.Select(f => f.FullPath), StringComparer.OrdinalIgnoreCase);
-            }
-            catch
-            {
-                // Diff unavailable (new backup set, catalog error) — leave status Unknown.
-                newPaths = [];
-                changedPaths = [];
-            }
-
-            ct.ThrowIfCancellationRequested();
-
-            ScanProgressText = "Building file list...";
-
-            // All heavy computation on background thread: total size, sorting,
-            // item creation, status assignment, and directory tree building.
+            // All heavy computation on a single background thread: diff,
+            // hash sets, sorting, item creation, and directory tree.
+            // Keeps the UI thread free (avoids multi-second hangs).
             const int maxDisplay = 10_000;
-            var result = await Task.Run(() =>
+            var result = await Task.Run(async () =>
             {
+                HashSet<string> newPaths, changedPaths;
+                try
+                {
+                    var diff = await _scanner.ComputeDiffAsync(scannedFiles, _backupSet.Id, ct);
+                    newPaths = new HashSet<string>(
+                        diff.NewFiles.Select(f => f.FullPath), StringComparer.OrdinalIgnoreCase);
+                    changedPaths = new HashSet<string>(
+                        diff.ChangedFiles.Select(f => f.FullPath), StringComparer.OrdinalIgnoreCase);
+                }
+                catch
+                {
+                    newPaths = [];
+                    changedPaths = [];
+                }
+
+                if (ct.IsCancellationRequested)
+                    return (totalBytes: 0L, fileItems: new List<LargestFileItem>(), dirTree: new List<DirectoryItem>());
+
                 long totalBytes = 0;
                 foreach (var f in scannedFiles)
                     totalBytes += f.SizeBytes;
@@ -590,9 +553,9 @@ public class LargestFilesViewModel : ViewModelBase
                 var dirTree = BuildDirectoryTree(scannedFiles, newPaths, changedPaths);
 
                 return (totalBytes, fileItems, dirTree);
-            }, ct);
+            });
 
-            ct.ThrowIfCancellationRequested();
+            if (ct.IsCancellationRequested) return;
 
             TotalFiles = scannedFiles.Count;
             TotalSizeText = FormatBytes(result.totalBytes);
@@ -834,38 +797,6 @@ public class LargestFilesViewModel : ViewModelBase
         ];
     }
 
-    /// <summary>
-    /// Recursively count files, writing to a shared counter that the UI
-    /// thread polls on a timer.  Per-directory error handling so broken
-    /// symlinks or inaccessible directories don't abort the entire count.
-    /// </summary>
-    private static void CountFilesRecursive(
-        DirectoryInfo dir, int[] counter, CancellationToken ct)
-    {
-        try
-        {
-            foreach (var _ in dir.EnumerateFiles())
-            {
-                counter[0]++;
-                ct.ThrowIfCancellationRequested();
-            }
-        }
-        catch (Exception) when (!ct.IsCancellationRequested)
-        {
-            return;
-        }
-
-        try
-        {
-            foreach (var sub in dir.EnumerateDirectories())
-            {
-                ct.ThrowIfCancellationRequested();
-                CountFilesRecursive(sub, counter, ct);
-            }
-        }
-        catch (Exception) when (!ct.IsCancellationRequested) { }
-    }
-
     internal static string FormatBytes(long bytes)
     {
         if (bytes <= 0) return "0 B";
@@ -923,6 +854,18 @@ internal sealed class ThrottledProgress<T>(IProgress<T> inner, TimeSpan interval
             inner.Report(value);
         }
     }
+}
+
+/// <summary>
+/// Lightweight <see cref="IProgress{T}"/> that just stores the latest value.
+/// Called on a background thread; the UI thread polls <see cref="Latest"/>
+/// on a timer. No <see cref="SynchronizationContext"/> posting — avoids
+/// dispatcher flooding and stalls.
+/// </summary>
+internal sealed class LatestProgress<T> : IProgress<T> where T : class
+{
+    public volatile T? Latest;
+    public void Report(T value) => Latest = value;
 }
 
 /// <summary>A directory entry for the directory tree view.</summary>
