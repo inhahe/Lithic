@@ -10,6 +10,8 @@ namespace LithicBackup.ViewModels;
 public class TierSetViewModel : ViewModelBase
 {
     private string _name;
+    private string _filePatternsText = "";
+    private string _fileExemptPatternsText = "";
 
     /// <summary>
     /// Raised when the name changes so the parent can update references.
@@ -52,6 +54,26 @@ public class TierSetViewModel : ViewModelBase
     /// </summary>
     public ObservableCollection<RetentionTierViewModel> Tiers { get; }
 
+    /// <summary>
+    /// Newline-separated glob patterns for file paths that should use this
+    /// tier set.  Not meaningful for the "Default" tier set (fallback).
+    /// </summary>
+    public string FilePatternsText
+    {
+        get => _filePatternsText;
+        set => SetProperty(ref _filePatternsText, value);
+    }
+
+    /// <summary>
+    /// Newline-separated glob patterns for file paths exempt from this tier
+    /// set, overriding <see cref="FilePatternsText"/>.
+    /// </summary>
+    public string FileExemptPatternsText
+    {
+        get => _fileExemptPatternsText;
+        set => SetProperty(ref _fileExemptPatternsText, value);
+    }
+
     /// <summary>Convert to a persistence model.</summary>
     public VersionTierSet ToModel()
     {
@@ -59,8 +81,42 @@ public class TierSetViewModel : ViewModelBase
         {
             Name = Name,
             Tiers = Tiers.Select(t => t.ToModel()).ToList(),
+            FilePatterns = ParsePatterns(_filePatternsText),
+            FileExemptPatterns = ParsePatterns(_fileExemptPatternsText),
         };
     }
+
+    /// <summary>Populate this viewmodel from a persistence model.</summary>
+    public static TierSetViewModel FromModel(VersionTierSet model, bool isBuiltIn)
+    {
+        var vm = new TierSetViewModel(model.Name, isBuiltIn)
+        {
+            _filePatternsText = FormatPatterns(model.FilePatterns),
+            _fileExemptPatternsText = FormatPatterns(model.FileExemptPatterns),
+        };
+        foreach (var tier in model.Tiers)
+        {
+            var tierVm = RetentionTierViewModel.FromModel(tier);
+            tierVm.RemoveRequested += t => vm.Tiers.Remove(t);
+            vm.Tiers.Add(tierVm);
+        }
+        return vm;
+    }
+
+    /// <summary>Parse a newline/comma/semicolon-separated pattern string into a list.</summary>
+    private static List<string> ParsePatterns(string input)
+    {
+        if (string.IsNullOrWhiteSpace(input))
+            return [];
+        return input
+            .Split(['\r', '\n', ',', ';'], StringSplitOptions.RemoveEmptyEntries | StringSplitOptions.TrimEntries)
+            .Distinct(StringComparer.OrdinalIgnoreCase)
+            .ToList();
+    }
+
+    /// <summary>Format a pattern list to a newline-separated display string.</summary>
+    private static string FormatPatterns(List<string> patterns)
+        => patterns.Count > 0 ? string.Join("\n", patterns) : "";
 
     public override string ToString() => Name;
 }

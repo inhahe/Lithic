@@ -64,7 +64,7 @@ public class DirectoryBackupService
         {
             // No pre-computed diff — scan and compute from scratch.
             progress?.Report(new BackupProgress { StatusMessage = "Scanning source files..." });
-            var isExcluded = GlobMatcher.CreateCombinedFilter(job.ExcludedExtensions, job.Sources);
+            var isExcluded = BuildExclusionFilter(job);
             var scanned = await _scanner.ScanAsync(job.Sources, progress: null, ct, isExcluded);
 
             progress?.Report(new BackupProgress { StatusMessage = "Computing changes..." });
@@ -125,11 +125,12 @@ public class DirectoryBackupService
             diff.ChangedFiles.Select(f => f.FullPath),
             StringComparer.OrdinalIgnoreCase);
 
-        // Build a lookup of paths where version history is disabled.
-        var (noVersionFiles, noVersionDirPrefixes, noVersionGlobs) =
-            SourceSelection.CollectNoVersionPaths(job.Sources);
-        var noVersionGlobFilter = noVersionGlobs.Count > 0
-            ? GlobMatcher.CreateFilter(noVersionGlobs)
+        // Pattern-based tier resolver: matches file paths against tier set
+        // FilePatterns to determine each file's retention policy.
+        // Tier sets with 0 tiers also serve as exclusion rules (handled at
+        // scan time), but we still need the resolver here for versioning.
+        var tierResolver = job.TierSets.Count > 0
+            ? VersionTierSet.BuildTierResolver(job.TierSets)
             : null;
 
         // 5. Create a single "virtual" DiscRecord for this backup run.
@@ -192,6 +193,12 @@ public class DirectoryBackupService
         const long PerFileProgressThreshold = 1024 * 1024;      // 1 MB
         const long PerFileReportInterval    = 1024 * 1024;      // 1 MB
 
+        // Free-space monitoring: check every FreeSpaceCheckInterval files
+        // and warn once when space drops below the remaining data to copy.
+        const int FreeSpaceCheckInterval = 100;
+        bool lowSpaceWarned = false;
+        string? targetRoot = Path.GetPathRoot(targetDirectory);
+
         for (int i = 0; i < filesToBackup.Count; i++)
         {
             pauseEvent?.Wait(ct);
@@ -199,6 +206,36 @@ public class DirectoryBackupService
 
             var file = filesToBackup[i];
             bool isChanged = changedPaths.Contains(file.FullPath);
+
+            // Periodic free-space check.
+            if (!lowSpaceWarned && targetRoot is not null
+                && i % FreeSpaceCheckInterval == 0 && i > 0)
+            {
+                try
+                {
+                    var driveInfo = new DriveInfo(targetRoot);
+                    if (driveInfo.IsReady)
+                    {
+                        long freeSpace = driveInfo.AvailableFreeSpace;
+                        long bytesRemaining = totalBytes - bytesWritten;
+                        if (freeSpace < bytesRemaining)
+                        {
+                            lowSpaceWarned = true;
+                            progress?.Report(new BackupProgress
+                            {
+                                StatusMessage = $"\u26A0 Low disk space: {FormatBytes(freeSpace)} free, " +
+                                    $"{FormatBytes(bytesRemaining)} remaining to copy",
+                                CurrentFile = file.FullPath,
+                                BytesWrittenTotal = bytesWritten,
+                                BytesTotalAll = totalBytes,
+                                OverallPercentage = totalBytes > 0
+                                    ? (double)bytesWritten / totalBytes * 100 : 0,
+                            });
+                        }
+                    }
+                }
+                catch { /* ignore drive-info errors */ }
+            }
 
             progress?.Report(new BackupProgress
             {
@@ -318,10 +355,18 @@ public class DirectoryBackupService
                 }
 
                 // Check if this file should keep version history.
-                bool keepVersions = !noVersionFiles.Contains(file.FullPath)
-                    && !noVersionDirPrefixes.Any(p =>
-                        file.FullPath.StartsWith(p, StringComparison.OrdinalIgnoreCase))
-                    && !(noVersionGlobFilter?.Invoke(file.FullPath) ?? false);
+                // The tier resolver determines versioning: tier sets with
+                // tiers > 0 keep versions, tier sets with 0 tiers do not.
+                bool keepVersions;
+                if (tierResolver is not null)
+                {
+                    var fileTierSet = tierResolver(file.FullPath);
+                    keepVersions = fileTierSet.Tiers.Count > 0;
+                }
+                else
+                {
+                    keepVersions = true;
+                }
 
                 // Move existing current file to _prev if this is a changed file
                 // and version history is enabled.
@@ -522,6 +567,18 @@ public class DirectoryBackupService
             }
         }
 
+        // Report completion of file copying so the UI shows 100%
+        // even when many small files all processed within one throttle
+        // window.
+        progress?.Report(new BackupProgress
+        {
+            StatusMessage = "Finalizing...",
+            CurrentFile = "",
+            BytesWrittenTotal = bytesWritten,
+            BytesTotalAll = totalBytes,
+            OverallPercentage = 100,
+        });
+
         // Final batch: update disc record and commit remaining records.
         discRecord.BytesUsed = bytesWritten;
         discRecord.Status = BurnSessionStatus.Completed;
@@ -669,11 +726,33 @@ public class DirectoryBackupService
         }
 
         // 8. Apply retention: physically delete old version files.
-        if (retentionTiers is not null && retentionTiers.Count > 0)
+        // Use per-file tier resolution when a tier resolver is available,
+        // otherwise fall back to the single retentionTiers list.
+        bool hasRetention = tierResolver is not null || (retentionTiers is not null && retentionTiers.Count > 0);
+        if (hasRetention)
+        {
+            progress?.Report(new BackupProgress
+            {
+                StatusMessage = "Applying retention rules...",
+                BytesWrittenTotal = bytesWritten,
+                BytesTotalAll = totalBytes,
+                OverallPercentage = 100,
+            });
+        }
+        if (hasRetention)
         {
             try
             {
-                var toDelete = await _retention.ComputeRetentionAsync(backupSetId, retentionTiers, ct);
+                IReadOnlyList<FileRecord> toDelete;
+                if (tierResolver is not null)
+                {
+                    toDelete = await _retention.ComputeRetentionAsync(backupSetId,
+                        path => tierResolver(path).Tiers, ct);
+                }
+                else
+                {
+                    toDelete = await _retention.ComputeRetentionAsync(backupSetId, retentionTiers!, ct);
+                }
 
                 foreach (var fileRecord in toDelete)
                 {
@@ -722,7 +801,7 @@ public class DirectoryBackupService
         BackupJob job, CancellationToken ct,
         IProgress<ScanProgress>? scanProgress = null)
     {
-        var isExcluded = GlobMatcher.CreateCombinedFilter(job.ExcludedExtensions, job.Sources);
+        var isExcluded = BuildExclusionFilter(job);
         var scanned = await _scanner.ScanAsync(job.Sources, progress: scanProgress, ct, isExcluded);
 
         BackupDiff diff;
@@ -744,6 +823,48 @@ public class DirectoryBackupService
         long totalBytes = files.Sum(f => f.SizeBytes);
 
         return (diff, totalBytes, files.Count);
+    }
+
+    // -------------------------------------------------------------------
+    // Exclusion filter
+    // -------------------------------------------------------------------
+
+    /// <summary>
+    /// Build the combined file exclusion filter from global extension patterns
+    /// and tier-based exclusion (tier sets with 0 tiers = excluded from backup).
+    /// </summary>
+    internal static Func<string, bool>? BuildExclusionFilter(BackupJob job)
+    {
+        var globalFilter = job.ExcludedExtensions.Count > 0
+            ? GlobMatcher.CreateFilter(job.ExcludedExtensions) : null;
+
+        // Tier sets with 0 tiers act as exclusion rules: matched files are
+        // not backed up at all.  Build a resolver and check at scan time.
+        Func<string, VersionTierSet>? tierResolver = null;
+        if (job.TierSets.Count > 0)
+        {
+            var resolver = VersionTierSet.BuildTierResolver(job.TierSets);
+            // Only pay the per-file cost if at least one non-default tier set
+            // has 0 tiers (i.e. acts as an exclusion set).
+            bool hasExclusionTierSet = job.TierSets.Any(ts =>
+                ts.Tiers.Count == 0
+                && ts.FilePatterns.Count > 0
+                && !string.Equals(ts.Name, "Default", StringComparison.OrdinalIgnoreCase));
+            if (hasExclusionTierSet)
+                tierResolver = resolver;
+        }
+
+        if (globalFilter is null && tierResolver is null)
+            return null;
+
+        return path =>
+        {
+            if (globalFilter?.Invoke(path) ?? false)
+                return true;
+            if (tierResolver is not null && tierResolver(path).Tiers.Count == 0)
+                return true;
+            return false;
+        };
     }
 
     // -------------------------------------------------------------------
@@ -1060,6 +1181,15 @@ public class DirectoryBackupService
         public uint TSSessionId;
         [MarshalAs(UnmanagedType.Bool)]
         public bool bRestartable;
+    }
+
+    private static string FormatBytes(long bytes)
+    {
+        string[] units = ["B", "KB", "MB", "GB", "TB"];
+        int i = 0;
+        double size = bytes;
+        while (size >= 1024 && i < units.Length - 1) { size /= 1024; i++; }
+        return i == 0 ? $"{size:N0} {units[i]}" : $"{size:N1} {units[i]}";
     }
 
     private static readonly JsonSerializerOptions _jsonOptions = new()

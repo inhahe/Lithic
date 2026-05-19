@@ -1,9 +1,6 @@
 using System.IO;
-using System.Windows;
 using System.Windows.Input;
-using LithicBackup.Core;
 using LithicBackup.Core.Models;
-using LithicBackup.Views;
 
 namespace LithicBackup.ViewModels;
 
@@ -29,12 +26,8 @@ public enum BackupStatus
 /// </summary>
 public class SourceSelectionNodeViewModel : ViewModelBase
 {
-    /// <summary>Sentinel value representing "inherit tier from parent."</summary>
-    internal const string InheritTierName = "(Inherit)";
-
     private bool? _isSelected = false;
     private bool _autoIncludeNew = true;
-    private string _versionTierSetName = InheritTierName;
     private bool _isExpanded;
     private bool _isLoaded;
     private bool _suppressPropagation;
@@ -50,10 +43,6 @@ public class SourceSelectionNodeViewModel : ViewModelBase
     private int _fileCount = -1;
     private bool _isComputing;
     private BackupStatus _backupStatus = BackupStatus.Unknown;
-    private string _excludedPatterns = "";
-    private string _includedPatterns = "";
-    private string _versionExcludedPatterns = "";
-    private string _versionIncludedPatterns = "";
     private readonly Func<bool>? _getShowSizes;
     private readonly Func<(SortColumn Column, bool Ascending)>? _getSortMode;
     private readonly SizeComputeScheduler? _scheduler;
@@ -88,11 +77,6 @@ public class SourceSelectionNodeViewModel : ViewModelBase
             if (IsDirectory)
                 IsExpanded = !IsExpanded;
         });
-        EditExclusionsCommand = new RelayCommand(_ => EditExclusions(), _ => IsDirectory);
-        ResetTierToInheritCommand = new RelayCommand(
-            _ => VersionTierSetName = InheritTierName,
-            _ => !IsInheritedTier);
-
         // Directories get a dummy child so the expander arrow shows.
         if (isDirectory && !_isLoaded)
             Children.Add(new SourceSelectionNodeViewModel("Loading...", false, this) { _isSelected = false });
@@ -106,9 +90,6 @@ public class SourceSelectionNodeViewModel : ViewModelBase
 
     /// <summary>Single-click on the name area toggles expand/collapse for directories.</summary>
     public ICommand ToggleExpandCommand { get; }
-
-    /// <summary>Opens the exclusion/inclusion pattern editor dialog for this directory.</summary>
-    public ICommand EditExclusionsCommand { get; }
 
     /// <summary>Nesting depth (0 for root nodes). Used for indentation in the custom TreeViewItem template.</summary>
     public int Depth { get; }
@@ -190,70 +171,6 @@ public class SourceSelectionNodeViewModel : ViewModelBase
             return _fileCount.ToString("N0");
         }
     }
-
-    /// <summary>
-    /// Newline-separated glob patterns to exclude within this directory's subtree.
-    /// Inherited by child directories. Only meaningful for directories.
-    /// </summary>
-    public string ExcludedPatterns
-    {
-        get => _excludedPatterns;
-        set
-        {
-            if (SetProperty(ref _excludedPatterns, value))
-                OnPropertyChanged(nameof(HasExclusionRules));
-        }
-    }
-
-    /// <summary>
-    /// Newline-separated glob patterns to re-include within this directory's subtree,
-    /// overriding exclusions inherited from parent directories.
-    /// </summary>
-    public string IncludedPatterns
-    {
-        get => _includedPatterns;
-        set
-        {
-            if (SetProperty(ref _includedPatterns, value))
-                OnPropertyChanged(nameof(HasExclusionRules));
-        }
-    }
-
-    /// <summary>
-    /// Newline-separated glob patterns for files whose past versions should
-    /// not be retained. Inherited by child directories.
-    /// </summary>
-    public string VersionExcludedPatterns
-    {
-        get => _versionExcludedPatterns;
-        set
-        {
-            if (SetProperty(ref _versionExcludedPatterns, value))
-                OnPropertyChanged(nameof(HasExclusionRules));
-        }
-    }
-
-    /// <summary>
-    /// Newline-separated glob patterns to override version exclusions inherited
-    /// from parent directories, re-enabling version retention for matching files.
-    /// </summary>
-    public string VersionIncludedPatterns
-    {
-        get => _versionIncludedPatterns;
-        set
-        {
-            if (SetProperty(ref _versionIncludedPatterns, value))
-                OnPropertyChanged(nameof(HasExclusionRules));
-        }
-    }
-
-    /// <summary>
-    /// True if this node has its own exclusion or inclusion patterns
-    /// (backup or version). Used as a visual indicator in the tree.
-    /// </summary>
-    public bool HasExclusionRules =>
-        !string.IsNullOrWhiteSpace(_excludedPatterns) || !string.IsNullOrWhiteSpace(_includedPatterns)
-        || !string.IsNullOrWhiteSpace(_versionExcludedPatterns) || !string.IsNullOrWhiteSpace(_versionIncludedPatterns);
 
     /// <summary>Backup status relative to the catalog.</summary>
     public BackupStatus BackupStatus
@@ -337,80 +254,6 @@ public class SourceSelectionNodeViewModel : ViewModelBase
         }
     }
 
-    /// <summary>
-    /// Name of the version tier set assigned to this node.
-    /// <see cref="InheritTierName"/> means "inherit from parent."
-    /// Any other value (e.g. "Default", "None", or a custom name) is an
-    /// explicit assignment.
-    /// </summary>
-    public string VersionTierSetName
-    {
-        get => _versionTierSetName;
-        set
-        {
-            if (!SetProperty(ref _versionTierSetName, value))
-                return;
-
-            OnPropertyChanged(nameof(EffectiveTierSetName));
-            OnPropertyChanged(nameof(DisplayTierSetName));
-            OnPropertyChanged(nameof(IsInheritedTier));
-
-            // When a parent's effective tier changes, all inheriting
-            // descendants need their display refreshed.
-            if (IsDirectory && _isLoaded)
-                RefreshChildTierDisplay();
-        }
-    }
-
-    /// <summary>
-    /// The resolved tier set name for this node. Walks up the parent chain
-    /// until a node with an explicit assignment is found, defaulting to "Default".
-    /// </summary>
-    public string EffectiveTierSetName =>
-        _versionTierSetName != InheritTierName
-            ? _versionTierSetName
-            : (Parent?.EffectiveTierSetName ?? "Default");
-
-    /// <summary>
-    /// Display/edit property for the ComboBox. Returns the effective tier name
-    /// (so the column always shows a real name like "Default" or "None", never
-    /// "(Inherit)"). Setting this makes the assignment explicit on this node.
-    /// </summary>
-    public string DisplayTierSetName
-    {
-        get => EffectiveTierSetName;
-        set
-        {
-            // Setting via the ComboBox always makes it explicit.
-            VersionTierSetName = value;
-        }
-    }
-
-    /// <summary>
-    /// True when this node inherits its tier set from an ancestor
-    /// rather than having an explicit assignment.
-    /// </summary>
-    public bool IsInheritedTier => _versionTierSetName == InheritTierName;
-
-    /// <summary>Command to reset this node's tier set back to inheriting from its parent.</summary>
-    public ICommand ResetTierToInheritCommand { get; }
-
-    /// <summary>
-    /// Notify all loaded descendants that the effective tier set name may
-    /// have changed (because an ancestor's assignment changed).
-    /// </summary>
-    private void RefreshChildTierDisplay()
-    {
-        foreach (var child in Children)
-        {
-            child.OnPropertyChanged(nameof(EffectiveTierSetName));
-            child.OnPropertyChanged(nameof(DisplayTierSetName));
-            child.OnPropertyChanged(nameof(IsInheritedTier));
-            if (child.IsDirectory && child._isLoaded)
-                child.RefreshChildTierDisplay();
-        }
-    }
-
     public bool IsExpanded
     {
         get => _isExpanded;
@@ -451,23 +294,6 @@ public class SourceSelectionNodeViewModel : ViewModelBase
 
         _autoIncludeNew = model.AutoIncludeNewSubdirectories;
         OnPropertyChanged(nameof(AutoIncludeNew));
-        _versionTierSetName = model.VersionTierSetName is not null
-            ? model.VersionTierSetName
-            : InheritTierName;
-        OnPropertyChanged(nameof(VersionTierSetName));
-        OnPropertyChanged(nameof(EffectiveTierSetName));
-        OnPropertyChanged(nameof(IsInheritedTier));
-
-        // Restore per-directory exclusion/inclusion patterns.
-        _excludedPatterns = FormatPatternLines(model.ExcludedPatterns);
-        OnPropertyChanged(nameof(ExcludedPatterns));
-        _includedPatterns = FormatPatternLines(model.IncludedPatterns);
-        OnPropertyChanged(nameof(IncludedPatterns));
-        _versionExcludedPatterns = FormatPatternLines(model.VersionExcludedPatterns);
-        OnPropertyChanged(nameof(VersionExcludedPatterns));
-        _versionIncludedPatterns = FormatPatternLines(model.VersionIncludedPatterns);
-        OnPropertyChanged(nameof(VersionIncludedPatterns));
-        OnPropertyChanged(nameof(HasExclusionRules));
 
         // If this directory has child selections to restore, expand and apply.
         // Suppress size computation during this expansion — we're restoring
@@ -566,9 +392,6 @@ public class SourceSelectionNodeViewModel : ViewModelBase
             // scan the entire drive during expansion.
             bool precomputeSizes = showSizes && _scheduler is not null
                 && _size >= 0 && _fileCount >= 0;
-            Func<string, bool>? excludeFilter = precomputeSizes
-                ? BuildEffectiveExcludeFilter()
-                : null;
 
             // Phase 1: enumerate entries. When precomputeSizes is true,
             // directory sizes are computed inline using the shared cache.
@@ -592,7 +415,7 @@ public class SourceSelectionNodeViewModel : ViewModelBase
                             {
                                 try
                                 {
-                                    var (sz, fc) = _scheduler!.ComputeInline(subDir, excludeFilter);
+                                    var (sz, fc) = _scheduler!.ComputeInline(subDir, excludeFilter: null);
                                     dirSize = sz;
                                     dirFileCount = fc;
                                 }
@@ -645,8 +468,6 @@ public class SourceSelectionNodeViewModel : ViewModelBase
                 {
                     _isSelected = _isSelected ?? false,
                     _autoIncludeNew = isDir ? _autoIncludeNew : true,
-                    // Children inherit tier set from parent by default.
-                    _versionTierSetName = InheritTierName,
                     _size = size,
                     _fileCount = fileCount,
                 };
@@ -734,41 +555,6 @@ public class SourceSelectionNodeViewModel : ViewModelBase
             if (child.IsDirectory && child._isLoaded)
                 await child.ComputeUnknownSizesAsync();
         }
-    }
-
-    /// <summary>
-    /// Build a combined exclusion predicate for this node by collecting all
-    /// <see cref="ExcludedPatterns"/> and <see cref="IncludedPatterns"/> from
-    /// this node up through every ancestor.  Returns <c>null</c> when no
-    /// ancestor has any patterns (the common fast-path).
-    /// </summary>
-    internal Func<string, bool>? BuildEffectiveExcludeFilter()
-    {
-        var excludePatterns = new List<string>();
-        var includePatterns = new List<string>();
-
-        for (var n = this; n is not null; n = n.Parent)
-        {
-            if (!string.IsNullOrWhiteSpace(n._excludedPatterns))
-                excludePatterns.AddRange(ParsePatternLines(n._excludedPatterns));
-            if (!string.IsNullOrWhiteSpace(n._includedPatterns))
-                includePatterns.AddRange(ParsePatternLines(n._includedPatterns));
-        }
-
-        if (excludePatterns.Count == 0)
-            return null;
-
-        var excludeFilter = GlobMatcher.CreateFilter(excludePatterns);
-        if (excludeFilter is null)
-            return null;
-
-        var includeFilter = includePatterns.Count > 0
-            ? GlobMatcher.CreateFilter(includePatterns)
-            : null;
-
-        return includeFilter is null
-            ? excludeFilter
-            : path => excludeFilter(path) && !includeFilter(path);
     }
 
     /// <summary>
@@ -922,42 +708,6 @@ public class SourceSelectionNodeViewModel : ViewModelBase
         return (total, count);
     }
 
-    /// <summary>
-    /// Open the exclusion/inclusion editor dialog for this directory node.
-    /// </summary>
-    private void EditExclusions()
-    {
-        var editorVm = new ExclusionEditorViewModel(this);
-        var dialog = new ExclusionEditorDialog
-        {
-            DataContext = editorVm,
-            Owner = Application.Current.MainWindow,
-        };
-
-        if (dialog.ShowDialog() == true)
-        {
-            ExcludedPatterns = editorVm.ExcludedPatterns;
-            IncludedPatterns = editorVm.IncludedPatterns;
-            VersionExcludedPatterns = editorVm.VersionExcludedPatterns;
-            VersionIncludedPatterns = editorVm.VersionIncludedPatterns;
-        }
-    }
-
-    /// <summary>Parse a newline-separated pattern string into a list.</summary>
-    private static List<string> ParsePatternLines(string input)
-    {
-        if (string.IsNullOrWhiteSpace(input))
-            return [];
-        return input
-            .Split(['\r', '\n'], StringSplitOptions.RemoveEmptyEntries | StringSplitOptions.TrimEntries)
-            .Distinct(StringComparer.OrdinalIgnoreCase)
-            .ToList();
-    }
-
-    /// <summary>Format a pattern list back to a newline-separated display string.</summary>
-    private static string FormatPatternLines(List<string> patterns)
-        => patterns.Count > 0 ? string.Join("\n", patterns) : "";
-
     /// <summary>Format a byte count as a human-readable string.</summary>
     internal static string FormatBytes(long bytes)
     {
@@ -1066,13 +816,6 @@ public class SourceSelectionNodeViewModel : ViewModelBase
             IsDirectory = IsDirectory,
             IsSelected = IsSelected,
             AutoIncludeNewSubdirectories = AutoIncludeNew,
-            VersionTierSetName = _versionTierSetName != InheritTierName
-                ? _versionTierSetName
-                : null,
-            ExcludedPatterns = ParsePatternLines(_excludedPatterns),
-            IncludedPatterns = ParsePatternLines(_includedPatterns),
-            VersionExcludedPatterns = ParsePatternLines(_versionExcludedPatterns),
-            VersionIncludedPatterns = ParsePatternLines(_versionIncludedPatterns),
         };
 
         if (IsDirectory && _isLoaded)

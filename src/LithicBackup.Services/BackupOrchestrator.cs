@@ -50,8 +50,8 @@ public class BackupOrchestrator : IBackupOrchestrator
     public async Task<BackupPlan> PlanAsync(BackupJob job, CancellationToken ct = default,
         IProgress<ScanProgress>? scanProgress = null)
     {
-        // 1. Scan source directories (global + per-directory exclusions).
-        var isExcluded = GlobMatcher.CreateCombinedFilter(job.ExcludedExtensions, job.Sources);
+        // 1. Scan source directories (global + tier-set exclusions).
+        var isExcluded = DirectoryBackupService.BuildExclusionFilter(job);
         var scanned = await _scanner.ScanAsync(job.Sources, progress: scanProgress, ct, isExcluded);
 
         // 2. Compute diff against existing catalog (if this is an existing set).

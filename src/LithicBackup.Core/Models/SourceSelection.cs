@@ -24,15 +24,13 @@ public class SourceSelection
     public bool AutoIncludeNewSubdirectories { get; set; } = true;
 
     /// <summary>
-    /// Name of the version tier set assigned to this node, or null to inherit
-    /// from the parent node. The tier set name references a
-    /// <see cref="VersionTierSet"/> defined in <see cref="JobOptions.TierSets"/>.
+    /// Legacy: name of the version tier set assigned to this node, or null.
+    /// Retained for backward compatibility with old serialized data.
+    /// New code uses the global pattern-based tier resolver defined on
+    /// <see cref="VersionTierSet"/> instead of per-node assignments.
     /// </summary>
-    /// <remarks>
-    /// "None" is a reserved name meaning no version history is kept.
-    /// "Default" is the built-in tier set with standard retention rules.
-    /// Null means inherit from the nearest ancestor with an explicit assignment.
-    /// </remarks>
+    [Obsolete("Tier set assignment is now determined by VersionTierSet.FilePatterns. " +
+              "Retained for JSON backward compat.")]
     public string? VersionTierSetName { get; set; }
 
     /// <summary>

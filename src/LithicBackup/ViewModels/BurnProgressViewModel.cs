@@ -212,11 +212,22 @@ public class BurnProgressViewModel : ViewModelBase
     /// </summary>
     public void OnBackupProgress(BackupProgress progress)
     {
-        // Status-message-only reports (e.g. "Verifying backup...") always go through.
+        // Status-message reports (e.g. "Verifying backup...") always go through
+        // without throttling.  Also update numeric fields when provided so
+        // progress bars reflect the actual state (e.g. 100% after copying).
         if (!string.IsNullOrEmpty(progress.StatusMessage))
         {
             StatusText = progress.StatusMessage;
             CurrentFile = progress.CurrentFile;
+
+            if (progress.BytesTotalAll > 0)
+            {
+                OverallPercentage = progress.OverallPercentage;
+                BytesWrittenText = $"{FormatBytes(progress.BytesWrittenTotal)} / {FormatBytes(progress.BytesTotalAll)}";
+                ElapsedText = FormatTimeSpan(_stopwatch.Elapsed);
+            }
+            CurrentFilePercentage = 0;
+            CurrentFileSizeText = "";
             return;
         }
 
@@ -287,6 +298,7 @@ public class BurnProgressViewModel : ViewModelBase
         IsBurning = true;
         IsComplete = false;
         StatusText = IsDirectoryMode ? "Copying files..." : "Burning...";
+        _lastUiUpdateMs = -ProgressUpdateIntervalMs; // ensure first report gets through
         _stopwatch.Restart();
         return _cts;
     }

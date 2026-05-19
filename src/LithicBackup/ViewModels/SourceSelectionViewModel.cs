@@ -1,4 +1,5 @@
 using System.Collections.ObjectModel;
+using System.ComponentModel;
 using System.IO;
 using System.Windows;
 using System.Windows.Input;
@@ -27,7 +28,6 @@ public class SourceSelectionViewModel : ViewModelBase
     private bool _sortAscending = true;
     private bool _showSelectedSizesOnly;
     private string _selectedSizeText = "";
-    private string _excludedPatterns = "";
     private string _setName = "";
     private string _targetDirectory = "";
     private bool _isDirectoryMode;
@@ -118,7 +118,6 @@ public class SourceSelectionViewModel : ViewModelBase
         Roots = [];
         RetentionTiers = [];
         TierSets = [];
-        AvailableTierSetNames = ["Default", "None"];
         NextCommand = new RelayCommand(_ => OnNext(), _ => HasSelection && !IsEditMode);
         SaveCommand = new RelayCommand(_ => OnSave(), _ => _needsSave && IsEditMode);
         CancelCommand = new RelayCommand(_ => CancelRequested?.Invoke());
@@ -274,12 +273,6 @@ public class SourceSelectionViewModel : ViewModelBase
     }
 
     /// <summary>
-    /// Names of all available tier sets, including the "(Inherit)" sentinel.
-    /// Bound by the per-node ComboBox in the tree view column.
-    /// </summary>
-    public ObservableCollection<string> AvailableTierSetNames { get; }
-
-    /// <summary>
     /// Named tier set definitions. The "Default" and "None" sets are built-in;
     /// users can add custom sets. Each set contains an editable list of
     /// retention tiers. The currently selected set's tiers are shown in the
@@ -296,9 +289,24 @@ public class SourceSelectionViewModel : ViewModelBase
         get => _selectedTierSet;
         set
         {
+            if (_selectedTierSet is not null)
+                _selectedTierSet.PropertyChanged -= OnTierSetPropertyChanged;
             if (!SetProperty(ref _selectedTierSet, value))
                 return;
+            if (_selectedTierSet is not null)
+                _selectedTierSet.PropertyChanged += OnTierSetPropertyChanged;
             OnPropertyChanged(nameof(CanEditSelectedTierSet));
+        }
+    }
+
+    private void OnTierSetPropertyChanged(object? sender, PropertyChangedEventArgs e)
+    {
+        if (!string.IsNullOrEmpty(_saveStatusText))
+            SaveStatusText = "";
+        if (!_needsSave)
+        {
+            _needsSave = true;
+            CommandManager.InvalidateRequerySuggested();
         }
     }
 
@@ -388,24 +396,6 @@ public class SourceSelectionViewModel : ViewModelBase
     {
         get => _selectedSizeText;
         private set => SetProperty(ref _selectedSizeText, value);
-    }
-
-    /// <summary>
-    /// Global exclusion patterns (delegated to the root node).
-    /// Used by MainViewModel to read/write the "global" exclusion list
-    /// for backward compatibility with JobOptions.ExcludedExtensions.
-    /// </summary>
-    public string ExcludedPatterns
-    {
-        get => RootNode?.ExcludedPatterns ?? _excludedPatterns;
-        set
-        {
-            if (RootNode is not null)
-                RootNode.ExcludedPatterns = value;
-            else
-                _excludedPatterns = value;
-            OnPropertyChanged();
-        }
     }
 
     // --- Backup set settings ---
@@ -730,17 +720,21 @@ public class SourceSelectionViewModel : ViewModelBase
                 if (node.Size >= 0) total += node.Size;
                 fileCount++;
             }
-            else if (node.IsSelected == true && !node.IsLoaded)
+            else if (node.IsSelected == true)
             {
-                // Fully selected directory that hasn't been expanded yet.
-                // Use its total filesystem size as best estimate.
+                // Fully selected directory — use its computed totals.
+                // FileCount is the recursive count of all contained files,
+                // which gives us an accurate number for catalog comparison
+                // regardless of whether the node has been expanded.
                 if (node.Size >= 0) total += node.Size;
+                if (node.FileCount >= 0)
+                    fileCount += node.FileCount;
                 dirCount++;
             }
-            else
+            else if (node.IsLoaded)
             {
-                // Partially or fully selected directory that's been loaded.
-                // Recurse to count only selected children.
+                // Partially selected directory — recurse to count only
+                // selected children.
                 dirCount++;
                 ComputeSelectedSize(node.Children, ref total, ref fileCount, ref dirCount);
             }
@@ -1141,7 +1135,7 @@ public class SourceSelectionViewModel : ViewModelBase
 
             toWriteSize = Math.Max(0, totalSize - catalogSize);
             int toWriteEstimate = Math.Max(0, fileCount - catalogFiles);
-            if (toWriteEstimate > 0)
+            if (toWriteEstimate > 0 || toWriteSize > 0)
                 lines.Add($"New/changed (est.): ~{toWriteEstimate:N0} files, ~{SourceSelectionNodeViewModel.FormatBytes(toWriteSize)}");
             else if (catalogFiles > 0)
                 lines.Add("All selected files are already backed up.");
@@ -1347,7 +1341,7 @@ public class SourceSelectionViewModel : ViewModelBase
         }
 
         var noneSet = new TierSetViewModel("None", isBuiltIn: true);
-        // "None" has no tiers — files are overwritten without version history.
+        // "None" has no tiers — matching files are excluded from backup.
 
         TierSets.Add(defaultSet);
         TierSets.Add(noneSet);
@@ -1365,40 +1359,8 @@ public class SourceSelectionViewModel : ViewModelBase
         } while (TierSets.Any(t => t.Name == name));
 
         var newSet = new TierSetViewModel(name, isBuiltIn: false);
-        WireTierSetNameChanged(newSet);
         TierSets.Add(newSet);
-        AvailableTierSetNames.Add(name);
         SelectedTierSet = newSet;
-    }
-
-    /// <summary>
-    /// Subscribe to a tier set's name change so references in the tree and
-    /// the available-names list stay in sync.
-    /// </summary>
-    private void WireTierSetNameChanged(TierSetViewModel ts)
-    {
-        ts.NameChanged += (oldName, newName) =>
-        {
-            // Update the available names list.
-            int idx = AvailableTierSetNames.IndexOf(oldName);
-            if (idx >= 0)
-                AvailableTierSetNames[idx] = newName;
-
-            // Rename references in the source tree.
-            RenameTierSetReferences(Roots, oldName, newName);
-        };
-    }
-
-    private static void RenameTierSetReferences(
-        IEnumerable<SourceSelectionNodeViewModel> nodes, string oldName, string newName)
-    {
-        foreach (var node in nodes)
-        {
-            if (node.VersionTierSetName == oldName)
-                node.VersionTierSetName = newName;
-            if (node.IsDirectory && node.IsLoaded)
-                RenameTierSetReferences(node.Children, oldName, newName);
-        }
     }
 
     private void RemoveSelectedTierSet()
@@ -1406,37 +1368,8 @@ public class SourceSelectionViewModel : ViewModelBase
         if (_selectedTierSet is null || _selectedTierSet.IsBuiltIn)
             return;
 
-        string removedName = _selectedTierSet.Name;
-
-        // Reset any nodes using this tier set back to "(Inherit)".
-        ResetTierSetReferences(Roots, removedName);
-
         TierSets.Remove(_selectedTierSet);
-        AvailableTierSetNames.Remove(removedName);
         SelectedTierSet = TierSets.FirstOrDefault();
-    }
-
-    private static void ResetTierSetReferences(
-        IEnumerable<SourceSelectionNodeViewModel> nodes, string tierSetName)
-    {
-        foreach (var node in nodes)
-        {
-            if (node.VersionTierSetName == tierSetName)
-                node.VersionTierSetName = SourceSelectionNodeViewModel.InheritTierName;
-            if (node.IsDirectory && node.IsLoaded)
-                ResetTierSetReferences(node.Children, tierSetName);
-        }
-    }
-
-    /// <summary>
-    /// Rebuild the <see cref="AvailableTierSetNames"/> list from the current
-    /// <see cref="TierSets"/> collection. Call after loading/restoring tier sets.
-    /// </summary>
-    internal void RebuildAvailableTierSetNames()
-    {
-        AvailableTierSetNames.Clear();
-        foreach (var ts in TierSets)
-            AvailableTierSetNames.Add(ts.Name);
     }
 
     /// <summary>
@@ -1464,15 +1397,7 @@ public class SourceSelectionViewModel : ViewModelBase
         foreach (var model in tierSets)
         {
             bool isBuiltIn = model.Name is "Default" or "None";
-            var vm = new TierSetViewModel(model.Name, isBuiltIn);
-            if (!isBuiltIn)
-                WireTierSetNameChanged(vm);
-            foreach (var tier in model.Tiers)
-            {
-                var tierVm = RetentionTierViewModel.FromModel(tier);
-                tierVm.RemoveRequested += t => vm.Tiers.Remove(t);
-                vm.Tiers.Add(tierVm);
-            }
+            var vm = TierSetViewModel.FromModel(model, isBuiltIn);
             TierSets.Add(vm);
         }
 
@@ -1493,7 +1418,6 @@ public class SourceSelectionViewModel : ViewModelBase
             TierSets.Insert(1, new TierSetViewModel("None", isBuiltIn: true));
         }
 
-        RebuildAvailableTierSetNames();
         SelectedTierSet = TierSets.FirstOrDefault();
     }
 

@@ -638,13 +638,9 @@ public class MainViewModel : ViewModelBase
                 vm.CancelScan();
                 _largestFilesWindow = null;
 
-                // Refresh exclusion patterns — LargestFiles may have added
-                // or removed full-path entries in ExcludedExtensions.
-                if (backupSet.JobOptions?.ExcludedExtensions is { Count: > 0 } excl)
-                    sourceSelection.ExcludedPatterns =
-                        BackupJobViewModel.FormatExclusionPatterns(excl);
-                else
-                    sourceSelection.ExcludedPatterns = "";
+                // LargestFiles may have modified ExcludedExtensions on the
+                // backup set; those changes are persisted directly on the
+                // BackupSet.JobOptions and don't need syncing back here.
             };
 
             lfWindow.SetEditorContent(vm);
@@ -770,6 +766,8 @@ public class MainViewModel : ViewModelBase
                             MaxAge = t.MaxAge,
                             MaxVersions = t.MaxVersions,
                         }).ToList(),
+                        FilePatterns = [.. ts.FilePatterns],
+                        FileExemptPatterns = [.. ts.FileExemptPatterns],
                     }).ToList(),
                     TargetDirectory = src.JobOptions.TargetDirectory,
                     CreateSubdirectory = src.JobOptions.CreateSubdirectory,
@@ -975,6 +973,14 @@ public class MainViewModel : ViewModelBase
                     TotalDiscsRequired = 0,
                     TotalBytes = totalBytes,
                 };
+
+                // Check free space before starting.
+                if (!CheckFreeSpaceBeforeBackup(job.TargetDirectory!, totalBytes))
+                {
+                    IsBurning = false;
+                    RunningBackupSetId = null;
+                    return;
+                }
             }
             else
             {
@@ -1128,13 +1134,7 @@ public class MainViewModel : ViewModelBase
             vm.TierSets.Clear();
             foreach (var ts in opts.TierSets)
             {
-                var tsVm = new TierSetViewModel(ts.Name, ts.Name is "Default" or "None");
-                foreach (var tier in ts.Tiers)
-                {
-                    var tierVm = RetentionTierViewModel.FromModel(tier);
-                    tierVm.RemoveRequested += t => tsVm.Tiers.Remove(t);
-                    tsVm.Tiers.Add(tierVm);
-                }
+                var tsVm = TierSetViewModel.FromModel(ts, ts.Name is "Default" or "None");
                 vm.TierSets.Add(tsVm);
             }
         }
@@ -1142,15 +1142,9 @@ public class MainViewModel : ViewModelBase
         {
             // Backward compat: convert flat RetentionTiers to "Default" tier set.
             vm.TierSets.Clear();
-            var defaultTs = new TierSetViewModel("Default", isBuiltIn: true);
-            foreach (var tier in opts.RetentionTiers)
-            {
-                var tierVm = RetentionTierViewModel.FromModel(tier);
-                tierVm.RemoveRequested += t => defaultTs.Tiers.Remove(t);
-                defaultTs.Tiers.Add(tierVm);
-            }
-            vm.TierSets.Add(defaultTs);
-            vm.TierSets.Add(new TierSetViewModel("None", isBuiltIn: true));
+            var defaultModel = new VersionTierSet { Name = "Default", Tiers = [.. opts.RetentionTiers] };
+            vm.TierSets.Add(TierSetViewModel.FromModel(defaultModel, isBuiltIn: true));
+            vm.TierSets.Add(TierSetViewModel.FromModel(new VersionTierSet { Name = "None" }, isBuiltIn: true));
         }
 
         // Restore legacy RetentionTiers from the "Default" tier set.
@@ -1245,10 +1239,6 @@ public class MainViewModel : ViewModelBase
     {
         if (opts is null) return;
 
-        // Exclusions.
-        if (opts.ExcludedExtensions.Count > 0)
-            vm.ExcludedPatterns = BackupJobViewModel.FormatExclusionPatterns(opts.ExcludedExtensions);
-
         // Target mode + directory.
         if (opts.TargetDirectory is not null)
         {
@@ -1325,11 +1315,6 @@ public class MainViewModel : ViewModelBase
         var selections = vm.GetSelections();
         backupSet.SourceRoots = selections.Select(s => s.Path).ToList();
 
-        // Exclusions.
-        opts.ExcludedExtensions = !string.IsNullOrWhiteSpace(vm.ExcludedPatterns)
-            ? BackupJobViewModel.ParseExclusionPatterns(vm.ExcludedPatterns)
-            : [];
-
         // Target mode + directory.
         if (vm.IsDirectoryMode)
             opts.TargetDirectory = vm.TargetDirectory;
@@ -1397,9 +1382,6 @@ public class MainViewModel : ViewModelBase
         if (!string.IsNullOrEmpty(src.SetName))
             job.SetName = src.SetName;
 
-        // Exclusions.
-        job.ExcludedExtensions = src.ExcludedPatterns;
-
         // Target mode + directory.
         job.IsDirectoryMode = src.IsDirectoryMode;
         if (src.IsDirectoryMode)
@@ -1426,14 +1408,7 @@ public class MainViewModel : ViewModelBase
         job.TierSets.Clear();
         foreach (var srcTs in src.TierSets)
         {
-            var tsVm = new TierSetViewModel(srcTs.Name, srcTs.IsBuiltIn);
-            foreach (var srcTier in srcTs.Tiers)
-            {
-                var model = srcTier.ToModel();
-                var tierVm = RetentionTierViewModel.FromModel(model);
-                tierVm.RemoveRequested += t => tsVm.Tiers.Remove(t);
-                tsVm.Tiers.Add(tierVm);
-            }
+            var tsVm = TierSetViewModel.FromModel(srcTs.ToModel(), srcTs.IsBuiltIn);
             job.TierSets.Add(tsVm);
         }
 
@@ -1489,6 +1464,8 @@ public class MainViewModel : ViewModelBase
                     MaxAge = t.MaxAge,
                     MaxVersions = t.MaxVersions,
                 }).ToList(),
+                FilePatterns = [.. ts.FilePatterns],
+                FileExemptPatterns = [.. ts.FileExemptPatterns],
             }).ToList(),
             TargetDirectory = job.TargetDirectory,
             CreateSubdirectory = job.CreateSubdirectory,
@@ -1525,6 +1502,45 @@ public class MainViewModel : ViewModelBase
             CreatedUtc = DateTime.UtcNow,
         });
         return newSet.Id;
+    }
+
+    /// <summary>
+    /// Check whether the target drive has enough free space for the planned
+    /// backup.  Returns <c>true</c> to proceed, <c>false</c> to abort.
+    /// When space is insufficient a confirmation dialog lets the user
+    /// continue anyway (partial backup) or cancel.
+    /// </summary>
+    private bool CheckFreeSpaceBeforeBackup(string targetDirectory, long requiredBytes)
+    {
+        try
+        {
+            string pathRoot = System.IO.Path.GetPathRoot(targetDirectory) ?? targetDirectory;
+            var driveInfo = new System.IO.DriveInfo(pathRoot);
+            if (!driveInfo.IsReady)
+                return true; // can't check — let it proceed
+
+            long freeSpace = driveInfo.AvailableFreeSpace;
+            if (freeSpace >= requiredBytes)
+                return true; // plenty of space
+
+            string driveLetter = pathRoot.TrimEnd('\\');
+            var result = MessageBox.Show(
+                $"The target drive ({driveLetter}) only has {FormatBytes(freeSpace)} free, " +
+                $"but the backup needs {FormatBytes(requiredBytes)}.\n\n" +
+                $"The backup will run out of space and may be incomplete.\n\n" +
+                $"Start anyway?",
+                "Insufficient Disk Space",
+                MessageBoxButton.YesNo,
+                MessageBoxImage.Warning);
+
+            if (result != MessageBoxResult.Yes)
+            {
+                StatusText = "Backup cancelled — not enough free space.";
+                return false;
+            }
+        }
+        catch { /* can't check — let it proceed */ }
+        return true;
     }
 
     private void StartBurn(BackupPlan plan)

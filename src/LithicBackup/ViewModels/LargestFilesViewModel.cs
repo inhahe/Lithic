@@ -305,168 +305,6 @@ public class LargestFilesViewModel : ViewModelBase
         }
     }
 
-    // --- Per-directory exclusion editing ---
-
-    private void OnDirectoryExclusionEditRequested(DirectoryItem item)
-    {
-        var selections = _backupSet.SourceSelections ?? [];
-        var node = FindSelectionNode(selections, item.FullPath);
-
-        // Collect current patterns (empty if no node exists yet).
-        var excluded = node?.ExcludedPatterns ?? [];
-        var included = node?.IncludedPatterns ?? [];
-
-        // Build inherited exclusions text by walking ancestor directories.
-        var inherited = BuildInheritedText(selections, item.FullPath);
-
-        var editorVm = new ExclusionEditorViewModel(
-            item.Name, item.FullPath, excluded, included, inherited);
-
-        var dialog = new ExclusionEditorDialog
-        {
-            DataContext = editorVm,
-            Owner = Application.Current.MainWindow,
-        };
-
-        if (dialog.ShowDialog() != true) return;
-
-        // Parse results.
-        var newExcluded = ParseLines(editorVm.ExcludedPatterns);
-        var newIncluded = ParseLines(editorVm.IncludedPatterns);
-
-        // Find or create the node in the selection tree.
-        node = FindOrCreateSelectionNode(selections, item.FullPath);
-        node.ExcludedPatterns = newExcluded;
-        node.IncludedPatterns = newIncluded;
-
-        _backupSet.SourceSelections = selections;
-        _ = SaveBackupSetAsync();
-    }
-
-    private async Task SaveBackupSetAsync()
-    {
-        try { await _catalog.UpdateBackupSetAsync(_backupSet); } catch { }
-    }
-
-    private static SourceSelection? FindSelectionNode(
-        IReadOnlyList<SourceSelection> nodes, string path)
-    {
-        foreach (var node in nodes)
-        {
-            if (string.Equals(node.Path, path, StringComparison.OrdinalIgnoreCase))
-                return node;
-            var found = FindSelectionNode(node.Children, path);
-            if (found is not null) return found;
-        }
-        return null;
-    }
-
-    /// <summary>
-    /// Find or create a SourceSelection node for the given path, building
-    /// intermediate parent nodes as needed.
-    /// </summary>
-    private static SourceSelection FindOrCreateSelectionNode(
-        List<SourceSelection> roots, string targetPath)
-    {
-        // Try to find an existing node first.
-        var existing = FindSelectionNode(roots, targetPath);
-        if (existing is not null) return existing;
-
-        // Walk up from targetPath to find the deepest existing ancestor.
-        var ancestors = new List<string>();
-        string? current = targetPath;
-        while (current is not null)
-        {
-            ancestors.Add(current);
-            string? parent = Path.GetDirectoryName(current);
-            if (parent == current) break;
-            current = parent;
-        }
-
-        // Walk from shallowest to deepest, creating nodes as needed.
-        List<SourceSelection> container = roots;
-        SourceSelection? parentNode = null;
-
-        // Also check the virtual root (empty path).
-        var virtualRoot = roots.FirstOrDefault(r => r.Path == "");
-        if (virtualRoot is not null)
-        {
-            parentNode = virtualRoot;
-            container = virtualRoot.Children;
-        }
-
-        for (int i = ancestors.Count - 1; i >= 0; i--)
-        {
-            var path = ancestors[i];
-            var node = container.FirstOrDefault(n =>
-                string.Equals(n.Path, path, StringComparison.OrdinalIgnoreCase));
-            if (node is null)
-            {
-                node = new SourceSelection
-                {
-                    Path = path,
-                    IsDirectory = true,
-                    IsSelected = true,
-                    AutoIncludeNewSubdirectories = true,
-                };
-                container.Add(node);
-            }
-            parentNode = node;
-            container = node.Children;
-        }
-
-        return parentNode!;
-    }
-
-    private static string BuildInheritedText(
-        IReadOnlyList<SourceSelection> roots, string targetPath)
-    {
-        var lines = new List<string>();
-
-        // Collect the ancestor chain.
-        var ancestors = new List<string>();
-        string? current = Path.GetDirectoryName(targetPath);
-        while (current is not null)
-        {
-            ancestors.Add(current);
-            string? parent = Path.GetDirectoryName(current);
-            if (parent == current) break;
-            current = parent;
-        }
-
-        // Check virtual root.
-        var virtualRoot = roots.FirstOrDefault(r => r.Path == "");
-        if (virtualRoot?.ExcludedPatterns is { Count: > 0 } rootPatterns)
-        {
-            foreach (var p in rootPatterns)
-                lines.Add($"{p}  (All Drives)");
-        }
-
-        // Walk shallowest-first.
-        for (int i = ancestors.Count - 1; i >= 0; i--)
-        {
-            var node = FindSelectionNode(roots, ancestors[i]);
-            if (node?.ExcludedPatterns is { Count: > 0 } patterns)
-            {
-                string label = Path.GetFileName(node.Path);
-                if (string.IsNullOrEmpty(label)) label = node.Path;
-                foreach (var p in patterns)
-                    lines.Add($"{p}  ({label})");
-            }
-        }
-
-        return lines.Count > 0 ? string.Join("\n", lines) : "";
-    }
-
-    private static List<string> ParseLines(string input)
-    {
-        if (string.IsNullOrWhiteSpace(input)) return [];
-        return input
-            .Split(['\r', '\n'], StringSplitOptions.RemoveEmptyEntries | StringSplitOptions.TrimEntries)
-            .Distinct(StringComparer.OrdinalIgnoreCase)
-            .ToList();
-    }
-
     // --- Logic ---
 
     private async Task LoadAsync(CancellationToken ct)
@@ -491,9 +329,9 @@ public class LargestFilesViewModel : ViewModelBase
                         })
                         .ToList();
 
-                var filter = GlobMatcher.CreateCombinedFilter(
-                    _backupSet.JobOptions?.ExcludedExtensions ?? [],
-                    src);
+                var filter = (_backupSet.JobOptions?.ExcludedExtensions is { Count: > 0 } excl)
+                    ? GlobMatcher.CreateFilter(excl)
+                    : null;
                 return (src, filter);
             });
 
@@ -629,7 +467,6 @@ public class LargestFilesViewModel : ViewModelBase
         foreach (var item in items)
         {
             item.InclusionToggled = OnDirectoryInclusionToggled;
-            item.ExclusionEditRequested = OnDirectoryExclusionEditRequested;
             WireDirectoryCallbacks(item.Children);
         }
     }
@@ -916,13 +753,6 @@ public class DirectoryItem : ViewModelBase
 
     /// <summary>Callback invoked when <see cref="IsIncluded"/> is toggled.</summary>
     internal Action<DirectoryItem>? InclusionToggled;
-
-    /// <summary>Callback invoked when the user wants to edit exclusion rules.</summary>
-    internal Action<DirectoryItem>? ExclusionEditRequested;
-
-    /// <summary>Opens the exclusion editor for this directory.</summary>
-    public ICommand EditExclusionsCommand => new RelayCommand(
-        _ => ExclusionEditRequested?.Invoke(this));
 
     public bool IsExpanded
     {

@@ -35,6 +35,22 @@ public class VersionRetentionService : IVersionRetentionService
         IReadOnlyList<VersionRetentionTier> tiers,
         CancellationToken ct = default)
     {
+        return await ComputeRetentionAsync(
+            backupSetId,
+            _ => tiers,
+            ct);
+    }
+
+    /// <summary>
+    /// Apply retention tiers to all files in a backup set, using per-file
+    /// tier resolution.  The <paramref name="tierSelector"/> receives a source
+    /// path and returns the retention tiers to apply to that file's versions.
+    /// </summary>
+    public async Task<IReadOnlyList<FileRecord>> ComputeRetentionAsync(
+        int backupSetId,
+        Func<string, IReadOnlyList<VersionRetentionTier>> tierSelector,
+        CancellationToken ct = default)
+    {
         var allFiles = await _catalog.GetAllFilesForBackupSetAsync(backupSetId, ct);
         var now = DateTime.UtcNow;
 
@@ -56,6 +72,11 @@ public class VersionRetentionService : IVersionRetentionService
 
             if (versions.Count <= 1)
                 continue; // Only one version, nothing to trim.
+
+            // Resolve this file's retention tiers.
+            var tiers = tierSelector(group.Key);
+            if (tiers.Count == 0)
+                continue; // "None" tier set — no retention rules to apply.
 
             // Never delete the most recent version of any file.
             long newestId = versions[0].Id;

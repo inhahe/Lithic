@@ -376,7 +376,6 @@
                                             </Grid.Style>
                                             <Grid.ColumnDefinitions>
                                                 <ColumnDefinition Width="Auto" SharedSizeGroup="DirCheckCol" />
-                                                <ColumnDefinition Width="Auto" SharedSizeGroup="DirFilterCol" />
                                                 <ColumnDefinition Width="*" />
                                                 <ColumnDefinition Width="Auto" SharedSizeGroup="DirFilesCol" />
                                                 <ColumnDefinition Width="Auto" SharedSizeGroup="DirSizeCol" />
@@ -388,17 +387,13 @@
 
                                             <Border Grid.Column="1"
                                                     BorderBrush="{StaticResource BorderBrush}"
-                                                    BorderThickness="0,0,1,1" />
-
-                                            <Border Grid.Column="2"
-                                                    BorderBrush="{StaticResource BorderBrush}"
                                                     BorderThickness="0,0,1,1"
                                                     Padding="8,6">
                                                 <TextBlock Text="Directory" FontSize="11" FontWeight="SemiBold"
                                                            Foreground="{StaticResource TextSecondaryBrush}" />
                                             </Border>
 
-                                            <Border Grid.Column="3"
+                                            <Border Grid.Column="2"
                                                     BorderBrush="{StaticResource BorderBrush}"
                                                     BorderThickness="0,0,1,1"
                                                     Padding="8,6">
@@ -407,7 +402,7 @@
                                                            HorizontalAlignment="Right" />
                                             </Border>
 
-                                            <Border Grid.Column="4"
+                                            <Border Grid.Column="3"
                                                     BorderBrush="{StaticResource BorderBrush}"
                                                     BorderThickness="0,0,0,1"
                                                     Padding="8,6">
@@ -446,7 +441,6 @@
                                                 <Grid MinHeight="24">
                                                     <Grid.ColumnDefinitions>
                                                         <ColumnDefinition Width="Auto" SharedSizeGroup="DirCheckCol" />
-                                                        <ColumnDefinition Width="Auto" SharedSizeGroup="DirFilterCol" />
                                                         <ColumnDefinition Width="*" />
                                                         <ColumnDefinition Width="Auto" SharedSizeGroup="DirFilesCol" />
                                                         <ColumnDefinition Width="Auto" SharedSizeGroup="DirSizeCol" />
@@ -473,25 +467,8 @@
                                                         </StackPanel>
                                                     </Border>
 
-                                                    <!-- Col 1: Filter button -->
+                                                    <!-- Col 1: Name area with tree indentation -->
                                                     <Border Grid.Column="1"
-                                                            BorderBrush="{StaticResource BorderBrush}"
-                                                            BorderThickness="0,0,1,0">
-                                                        <Button Command="{Binding EditExclusionsCommand}"
-                                                                Padding="3,1" Margin="2"
-                                                                VerticalAlignment="Center" HorizontalAlignment="Center"
-                                                                Cursor="Hand"
-                                                                Background="Transparent"
-                                                                BorderBrush="{StaticResource BorderBrush}"
-                                                                BorderThickness="1"
-                                                                ToolTip="Edit exclusion/inclusion rules for this directory">
-                                                            <TextBlock Text="Filter" FontSize="10"
-                                                                       Foreground="{StaticResource TextDimBrush}" />
-                                                        </Button>
-                                                    </Border>
-
-                                                    <!-- Col 2: Name area with tree indentation -->
-                                                    <Border Grid.Column="2"
                                                             BorderBrush="{StaticResource BorderBrush}"
                                                             BorderThickness="0,0,1,0"
                                                             Background="Transparent">
@@ -519,8 +496,8 @@
                                                         </StackPanel>
                                                     </Border>
 
-                                                    <!-- Col 3: File count -->
-                                                    <Border Grid.Column="3"
+                                                    <!-- Col 2: File count -->
+                                                    <Border Grid.Column="2"
                                                             BorderBrush="{StaticResource BorderBrush}"
                                                             BorderThickness="0,0,1,0">
                                                         <TextBlock Text="{Binding FileCountText}"
@@ -532,8 +509,8 @@
                                                                    MinWidth="50" />
                                                     </Border>
 
-                                                    <!-- Col 4: Size -->
-                                                    <Border Grid.Column="4">
+                                                    <!-- Col 3: Size -->
+                                                    <Border Grid.Column="3">
                                                         <TextBlock Text="{Binding SizeText}"
                                                                    Foreground="{StaticResource TextSecondaryBrush}"
                                                                    FontSize="12"

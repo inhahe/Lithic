@@ -69,15 +69,11 @@ public sealed class SizeComputeScheduler
             var queue = isPriority ? _priorityQueue : _backgroundQueue;
             foreach (var node in pending)
             {
-                // Build the filter once on the calling thread (UI) where
-                // reading node properties is safe.  The compiled predicate
-                // is then used on the worker thread.
-                var filter = node.BuildEffectiveExcludeFilter();
                 queue.AddLast(new WorkItem(node, () =>
                 {
                     if (Interlocked.Decrement(ref remaining) == 0)
                         tcs.TrySetResult();
-                }, filter, progress));
+                }, ExcludeFilter: null, progress));
             }
         }
 
