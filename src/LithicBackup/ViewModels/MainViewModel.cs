@@ -1594,55 +1594,11 @@ public class MainViewModel : ViewModelBase
                 StatusText = $"Burning disc {p.CurrentDisc}/{p.TotalDiscs} — {p.OverallPercentage:F0}%";
             });
 
-            FailureCallback onFailure = async (filePath, error) =>
-            {
-                var tcs = new TaskCompletionSource<FailureDecision>();
-
-                // Must show the dialog on the UI thread.
-                await Application.Current.Dispatcher.InvokeAsync(() =>
-                {
-                    var vm = new FailureDialogViewModel
-                    {
-                        FilePath = filePath,
-                        ErrorMessage = error,
-                    };
-
-                    var dialog = new FailureDialog
-                    {
-                        DataContext = vm,
-                        Owner = Application.Current.MainWindow,
-                    };
-
-                    bool? dialogResult = dialog.ShowDialog();
-
-                    // Re-activate the main window so focus isn't lost to the desktop.
-                    Application.Current.MainWindow?.Activate();
-
-                    if (dialogResult == true)
-                    {
-                        tcs.SetResult(new FailureDecision
-                        {
-                            Action = vm.ChosenAction,
-                        });
-                    }
-                    else
-                    {
-                        // Dialog closed without choosing — default to Skip.
-                        tcs.SetResult(new FailureDecision
-                        {
-                            Action = BurnFailureAction.Skip,
-                        });
-                    }
-                });
-
-                return await tcs.Task;
-            };
-
-            // Run the backup on a background thread so the UI stays responsive.
-            // The Progress<T> callback marshals back to the UI thread automatically,
-            // and the onFailure callback uses Dispatcher.InvokeAsync for dialogs.
+            // Files that fail to copy are automatically skipped so the
+            // backup can run unattended.  Failures are collected and shown
+            // in the completion view.
             var result = await Task.Run(
-                () => _orchestrator.ExecuteAsync(plan, progress, onFailure, cts.Token));
+                () => _orchestrator.ExecuteAsync(plan, progress, onFailure: null, cts.Token));
 
             string detail = $"Discs written: {result.DiscsWritten}\n" +
                             $"Data written: {FormatBytes(result.BytesWritten)}";
@@ -1686,54 +1642,9 @@ public class MainViewModel : ViewModelBase
                 StatusText = $"{p.OverallPercentage:F0}% complete";
             });
 
-            FailureCallback onFailure = async (filePath, error) =>
-            {
-                var tcs = new TaskCompletionSource<FailureDecision>();
-
-                // Must show the dialog on the UI thread.
-                await Application.Current.Dispatcher.InvokeAsync(() =>
-                {
-                    var vm = new FailureDialogViewModel
-                    {
-                        FilePath = filePath,
-                        ErrorMessage = error,
-                        IsDirectoryMode = true,
-                    };
-
-                    var dialog = new FailureDialog
-                    {
-                        DataContext = vm,
-                        Owner = Application.Current.MainWindow,
-                    };
-
-                    bool? dialogResult = dialog.ShowDialog();
-
-                    // Re-activate the main window so focus isn't lost to the desktop.
-                    Application.Current.MainWindow?.Activate();
-
-                    if (dialogResult == true)
-                    {
-                        tcs.SetResult(new FailureDecision
-                        {
-                            Action = vm.ChosenAction,
-                        });
-                    }
-                    else
-                    {
-                        // Dialog closed without choosing — default to Skip.
-                        tcs.SetResult(new FailureDecision
-                        {
-                            Action = BurnFailureAction.Skip,
-                        });
-                    }
-                });
-
-                return await tcs.Task;
-            };
-
-            // Run the backup on a background thread so the UI stays responsive.
-            // The Progress<T> callback marshals back to the UI thread automatically,
-            // and the onFailure callback uses Dispatcher.InvokeAsync for dialogs.
+            // Files that fail to copy are automatically skipped so the
+            // backup can run unattended.  Failures are collected and shown
+            // in the completion view.
             var result = await Task.Run(() => _directoryBackupService.ExecuteAsync(
                 plan.Job,
                 plan.Job.TargetDirectory!,
@@ -1741,7 +1652,7 @@ public class MainViewModel : ViewModelBase
                 progress,
                 cts.Token,
                 progressVm.PauseEvent,
-                onFailure,
+                onFailure: null,
                 plan.Diff));
 
             string detail = $"Data written: {FormatBytes(result.BytesWritten)}";
