@@ -297,6 +297,13 @@
                                                                                             </MultiBinding>
                                                                                         </WrapPanel.Visibility>
                                                                                         <Button Style="{StaticResource LinkButton}"
+                                                                                                Command="{Binding DataContext.SetCheckCommand,
+                                                                                                          RelativeSource={RelativeSource AncestorType=Window}}"
+                                                                                                CommandParameter="{Binding}"
+                                                                                                Margin="0,0,12,0">
+                                                                                            <TextBlock><Run Text="&#x2139;" FontSize="10" /> Check Size</TextBlock>
+                                                                                        </Button>
+                                                                                        <Button Style="{StaticResource LinkButton}"
                                                                                                 Command="{Binding DataContext.SetBackupCommand,
                                                                                                           RelativeSource={RelativeSource AncestorType=Window}}"
                                                                                                 CommandParameter="{Binding}"

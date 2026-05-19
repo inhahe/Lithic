@@ -44,16 +44,8 @@
                         Padding="10,6" Margin="0,0,8,0" Cursor="Hand"
                         Visibility="{Binding ShowLargestFiles, Converter={StaticResource BoolToVis}}"
                         ToolTip="View the largest files and directories in this backup set's sources." />
-                <Button Command="{Binding CalculateSizeCommand}"
-                        Padding="10,6" Margin="0,0,8,0" Cursor="Hand"
-                        ToolTip="Compute sizes for any selected directories that haven't been calculated yet.">
-                    <StackPanel Orientation="Horizontal">
-                        <TextBlock Text="Calculate Selected Size" />
-                        <TextBlock Text=" ..." Visibility="{Binding IsCalculatingSize, Converter={StaticResource BoolToVis}}" />
-                    </StackPanel>
-                </Button>
             </StackPanel>
-            <!-- Size calculation result (below buttons) -->
+            <!-- Size report (auto-populated when background sizes are ready) -->
             <TextBlock Text="{Binding SizeCalculationResult}"
                        Foreground="{StaticResource TextSecondaryBrush}"
                        FontSize="11" Margin="0,4,0,0">
@@ -748,7 +740,17 @@
                                                       VerticalAlignment="Center"
                                                       HorizontalAlignment="Center"
                                                       ToolTip="Auto-include new subdirectories"
-                                                      Visibility="{Binding IsDirectory, Converter={StaticResource BoolToVis}}" />
+                                                      Visibility="{Binding IsDirectory, Converter={StaticResource BoolToVis}}">
+                                                <CheckBox.Style>
+                                                    <Style TargetType="CheckBox">
+                                                        <Style.Triggers>
+                                                            <DataTrigger Binding="{Binding IsNodeEnabled}" Value="False">
+                                                                <Setter Property="Opacity" Value="0.35" />
+                                                            </DataTrigger>
+                                                        </Style.Triggers>
+                                                    </Style>
+                                                </CheckBox.Style>
+                                            </CheckBox>
                                         </Border>
 
                                         <!-- Col 1: Include -->

@@ -106,6 +106,9 @@ public class MainViewModel : ViewModelBase
             _ => _ = ImportBackupSetAsync());
 
         // Per-set action commands (take BackupSet via CommandParameter).
+        SetCheckCommand = new RelayCommand(
+            o => { if (o is BackupSet s) { SelectedBackupSet = s; _ = CheckSizeAsync(); } },
+            o => !IsBurning);
         SetBackupCommand = new RelayCommand(
             o => { if (o is BackupSet s) { SelectedBackupSet = s; StartIncrementalFlow(); } },
             o => !IsBurning);
@@ -244,6 +247,7 @@ public class MainViewModel : ViewModelBase
     public ICommand AbortBackupCommand { get; }
 
     // Per-set action commands (take BackupSet as CommandParameter)
+    public ICommand SetCheckCommand { get; }
     public ICommand SetBackupCommand { get; }
     public ICommand SetModifyCommand { get; }
     public ICommand SetRestoreCommand { get; }
@@ -370,7 +374,20 @@ public class MainViewModel : ViewModelBase
         // the scheduler at high priority (which would peg the CPU for minutes).
         // Now queue a lazy background scan so sizes fill in after the dialog
         // opens without blocking the UI or grinding the system.
-        _ = sourceSelection.ComputeAllUnknownSizesAsync();
+        // After sizes are ready, run PlanAsync for accurate new/changed counts.
+        // Re-runs automatically (debounced) when the user changes selections.
+        CancellationTokenSource? autoCheckCts = null;
+        bool planCheckReady = false;
+
+        _ = InitialSizeScanAsync();
+
+        async Task InitialSizeScanAsync()
+        {
+            await sourceSelection.ComputeAllUnknownSizesAsync();
+            planCheckReady = true;
+            autoCheckCts = new CancellationTokenSource();
+            await RunPlanCheckInEditorAsync(sourceSelection, backupSet, autoCheckCts.Token);
+        }
 
         // Enable Save if selections already exist; for new empty sets, the user
         // must check at least one box first.
@@ -452,6 +469,9 @@ public class MainViewModel : ViewModelBase
 
         dialog.Closed += async (_, _) =>
         {
+            // Stop any background PlanAsync scan.
+            autoCheckCts?.Cancel();
+
             if (_unsavedNewSetId is int unsavedId)
             {
                 // User closed without saving a new set — discard the
@@ -553,6 +573,30 @@ public class MainViewModel : ViewModelBase
             }
         };
 
+        // Shared helper: cancel any in-progress PlanAsync and re-run after
+        // a debounce.  Used by both selection changes and exclusion changes.
+        void TriggerPlanReCheck()
+        {
+            autoCheckCts?.Cancel();
+            if (!planCheckReady) return;
+            autoCheckCts = new CancellationTokenSource();
+            var ct = autoCheckCts.Token;
+            _ = DebouncedPlanCheckAsync(ct);
+        }
+
+        async Task DebouncedPlanCheckAsync(CancellationToken token)
+        {
+            try
+            {
+                // Longer debounce — PlanAsync is expensive, wait for the
+                // user to finish toggling checkboxes or typing patterns.
+                await Task.Delay(1000, token);
+                sourceSelection.BuildSizeReport();
+                await RunPlanCheckInEditorAsync(sourceSelection, backupSet, token);
+            }
+            catch (OperationCanceledException) { }
+        }
+
         // Auto-save source selections to the database whenever the user
         // toggles a checkbox.  Debounced because cascading parent→child
         // changes fire the callback many times for a single click.
@@ -582,7 +626,14 @@ public class MainViewModel : ViewModelBase
                 }
                 catch (OperationCanceledException) { }
             }
+
+            // Re-run PlanAsync so the size report reflects the new selection.
+            TriggerPlanReCheck();
         };
+
+        // Re-run PlanAsync when the user edits tier set file patterns
+        // (exclusion/inclusion lists) so the "To back up" line updates.
+        sourceSelection.ExclusionSettingsChanged += TriggerPlanReCheck;
 
         // Open Largest Files in a separate window so the modify dialog
         // stays visible.  Only one instance at a time.
@@ -843,6 +894,268 @@ public class MainViewModel : ViewModelBase
         catch (Exception ex)
         {
             StatusText = $"Failed to delete backup set: {ex.Message}";
+        }
+    }
+
+    // -------------------------------------------------------------------
+    // Check Size (run PlanAsync without starting backup)
+    // -------------------------------------------------------------------
+
+    private async Task CheckSizeAsync()
+    {
+        if (SelectedBackupSet is null) return;
+
+        var backupSet = SelectedBackupSet;
+        var sources = backupSet.SourceSelections;
+        if (sources is null or { Count: 0 })
+        {
+            StatusText = "No sources configured — open Modify to set up this backup set.";
+            return;
+        }
+
+        var opts = backupSet.JobOptions;
+        if (opts is null)
+        {
+            StatusText = "No job options saved — open Modify to configure this backup set.";
+            return;
+        }
+
+        string? effectiveTargetDir = opts.TargetDirectory;
+        if (effectiveTargetDir is not null && opts.CreateSubdirectory
+            && !string.IsNullOrWhiteSpace(opts.SubdirectoryName))
+        {
+            effectiveTargetDir = Path.Combine(effectiveTargetDir, opts.SubdirectoryName.Trim());
+        }
+
+        var job = new BackupJob
+        {
+            BackupSetId = backupSet.Id,
+            Sources = sources,
+            ZipMode = opts.ZipMode,
+            FilesystemType = opts.FilesystemType,
+            CapacityOverrideBytes = opts.CapacityOverrideBytes,
+            VerifyAfterBurn = opts.VerifyAfterBurn,
+            VerifyAfterBackup = opts.VerifyAfterBackup,
+            IncludeCatalogOnDisc = opts.IncludeCatalogOnDisc,
+            AllowFileSplitting = opts.AllowFileSplitting,
+            TargetDirectory = effectiveTargetDir,
+            CreateSubdirectory = opts.CreateSubdirectory,
+            SubdirectoryName = opts.CreateSubdirectory ? opts.SubdirectoryName?.Trim() : null,
+            EnableFileDeduplication = opts.EnableFileDeduplication,
+            EnableDeduplication = opts.EnableDeduplication,
+            DeduplicationBlockSize = opts.DeduplicationBlockSize > 0
+                ? opts.DeduplicationBlockSize : 64 * 1024,
+            ExcludedExtensions = opts.ExcludedExtensions,
+            RetentionTiers = opts.RetentionTiers,
+            TierSets = opts.TierSets,
+        };
+
+        bool isDir = job.TargetDirectory is not null;
+
+        StatusText = $"Checking \"{backupSet.Name}\"...";
+
+        try
+        {
+            var scanSw = System.Diagnostics.Stopwatch.StartNew();
+            long lastScanUpdate = 0;
+            var scanProgress = new Progress<ScanProgress>(sp =>
+            {
+                long now = scanSw.ElapsedMilliseconds;
+                if (now - lastScanUpdate >= ProgressUpdateIntervalMs)
+                {
+                    lastScanUpdate = now;
+                    StatusText = $"Checking \"{backupSet.Name}\"... {sp.FilesFound:N0} files scanned";
+                }
+            });
+
+            int totalFiles;
+            long totalBytes;
+
+            if (isDir && _directoryBackupService is not null)
+            {
+                var (diff, bytes, files) = await Task.Run(
+                    () => _directoryBackupService.PlanAsync(job, CancellationToken.None, scanProgress));
+                totalFiles = files;
+                totalBytes = bytes;
+
+                int newCount = diff.NewFiles.Count;
+                int changedCount = diff.ChangedFiles.Count;
+                int deletedCount = diff.DeletedFiles.Count;
+
+                string msg = totalFiles == 0
+                    ? $"\"{backupSet.Name}\": nothing to back up — all files are current."
+                    : $"\"{backupSet.Name}\": {totalFiles:N0} file(s) to back up ({FormatBytes(totalBytes)}) " +
+                      $"— {newCount:N0} new, {changedCount:N0} changed, {deletedCount:N0} deleted";
+
+                // Check free space.
+                if (totalFiles > 0 && effectiveTargetDir is not null)
+                {
+                    try
+                    {
+                        string pathRoot = Path.GetPathRoot(effectiveTargetDir) ?? effectiveTargetDir;
+                        var driveInfo = new DriveInfo(pathRoot);
+                        if (driveInfo.IsReady)
+                        {
+                            long free = driveInfo.AvailableFreeSpace;
+                            if (totalBytes > free)
+                                msg += $" — \u26A0 only {FormatBytes(free)} free!";
+                        }
+                    }
+                    catch { }
+                }
+
+                StatusText = msg;
+            }
+            else if (!isDir)
+            {
+                var plan = await Task.Run(
+                    () => _orchestrator.PlanAsync(job, CancellationToken.None, scanProgress));
+                totalFiles = plan.Diff.NewFiles.Count + plan.Diff.ChangedFiles.Count;
+                totalBytes = plan.TotalBytes;
+
+                StatusText = totalFiles == 0
+                    ? $"\"{backupSet.Name}\": nothing to back up — all files are current."
+                    : $"\"{backupSet.Name}\": {totalFiles:N0} file(s) to back up ({FormatBytes(totalBytes)}), " +
+                      $"{plan.TotalDiscsRequired} disc(s) required";
+            }
+            else
+            {
+                StatusText = "Directory backup service not available.";
+            }
+        }
+        catch (Exception ex)
+        {
+            StatusText = $"Check failed: {ex.Message}";
+        }
+    }
+
+    /// <summary>
+    /// Run PlanAsync against the current editor state and show accurate
+    /// new/changed/deleted counts in <see cref="SourceSelectionViewModel.SizeCalculationResult"/>.
+    /// Cancellable — pass a token that is cancelled on selection change or dialog close.
+    /// </summary>
+    private async Task RunPlanCheckInEditorAsync(
+        SourceSelectionViewModel sourceVm, BackupSet backupSet, CancellationToken ct)
+    {
+        // Sync current UI state so the job reflects the latest settings.
+        SyncSettingsToJobOptions(backupSet, sourceVm);
+        backupSet.SourceSelections = sourceVm.GetSelections();
+
+        var opts = backupSet.JobOptions;
+        var sources = backupSet.SourceSelections;
+        if (opts is null || sources is null or { Count: 0 })
+            return;
+
+        string? effectiveTargetDir = opts.TargetDirectory;
+        if (effectiveTargetDir is not null && opts.CreateSubdirectory
+            && !string.IsNullOrWhiteSpace(opts.SubdirectoryName))
+            effectiveTargetDir = Path.Combine(effectiveTargetDir, opts.SubdirectoryName.Trim());
+
+        var job = new BackupJob
+        {
+            BackupSetId = backupSet.Id,
+            Sources = sources,
+            ZipMode = opts.ZipMode,
+            FilesystemType = opts.FilesystemType,
+            CapacityOverrideBytes = opts.CapacityOverrideBytes,
+            VerifyAfterBurn = opts.VerifyAfterBurn,
+            VerifyAfterBackup = opts.VerifyAfterBackup,
+            IncludeCatalogOnDisc = opts.IncludeCatalogOnDisc,
+            AllowFileSplitting = opts.AllowFileSplitting,
+            TargetDirectory = effectiveTargetDir,
+            CreateSubdirectory = opts.CreateSubdirectory,
+            SubdirectoryName = opts.CreateSubdirectory ? opts.SubdirectoryName?.Trim() : null,
+            EnableFileDeduplication = opts.EnableFileDeduplication,
+            EnableDeduplication = opts.EnableDeduplication,
+            DeduplicationBlockSize = opts.DeduplicationBlockSize > 0
+                ? opts.DeduplicationBlockSize : 64 * 1024,
+            ExcludedExtensions = opts.ExcludedExtensions,
+            RetentionTiers = opts.RetentionTiers,
+            TierSets = opts.TierSets,
+        };
+
+        bool isDir = job.TargetDirectory is not null;
+
+        // Capture the quick report as the base text; scanning progress appends to it.
+        string baseReport = sourceVm.SizeCalculationResult;
+        string scanningLine = "Scanning for changes...";
+        sourceVm.SizeCalculationResult = string.IsNullOrEmpty(baseReport)
+            ? scanningLine
+            : baseReport + "\n" + scanningLine;
+
+        try
+        {
+            ct.ThrowIfCancellationRequested();
+
+            var scanSw = System.Diagnostics.Stopwatch.StartNew();
+            long lastUpdate = 0;
+            var scanProgress = new Progress<ScanProgress>(sp =>
+            {
+                long now = scanSw.ElapsedMilliseconds;
+                if (now - lastUpdate >= ProgressUpdateIntervalMs)
+                {
+                    lastUpdate = now;
+                    string line = $"Scanning for changes... {sp.FilesFound:N0} files checked";
+                    sourceVm.SizeCalculationResult = string.IsNullOrEmpty(baseReport)
+                        ? line : baseReport + "\n" + line;
+                }
+            });
+
+            string resultLine;
+
+            if (isDir && _directoryBackupService is not null)
+            {
+                var (diff, totalBytes, totalFiles) = await Task.Run(
+                    () => _directoryBackupService.PlanAsync(job, ct, scanProgress));
+
+                if (totalFiles == 0)
+                {
+                    resultLine = "All selected files are backed up and up to date.";
+                }
+                else
+                {
+                    resultLine = $"To back up: {totalFiles:N0} file(s) ({FormatBytes(totalBytes)}) \u2014 " +
+                        $"{diff.NewFiles.Count:N0} new, {diff.ChangedFiles.Count:N0} changed, {diff.DeletedFiles.Count:N0} deleted";
+
+                    // Free space warning.
+                    if (effectiveTargetDir is not null)
+                    {
+                        try
+                        {
+                            string pathRoot = Path.GetPathRoot(effectiveTargetDir) ?? effectiveTargetDir;
+                            var driveInfo = new DriveInfo(pathRoot);
+                            if (driveInfo.IsReady && driveInfo.AvailableFreeSpace < totalBytes)
+                                resultLine += $"\n\u26A0 Only {FormatBytes(driveInfo.AvailableFreeSpace)} free \u2014 need {FormatBytes(totalBytes)}";
+                        }
+                        catch { }
+                    }
+                }
+            }
+            else if (!isDir)
+            {
+                var plan = await Task.Run(
+                    () => _orchestrator.PlanAsync(job, ct, scanProgress));
+                int totalFiles = plan.Diff.NewFiles.Count + plan.Diff.ChangedFiles.Count;
+
+                if (totalFiles == 0)
+                    resultLine = "All selected files are backed up and up to date.";
+                else
+                    resultLine = $"To back up: {totalFiles:N0} file(s) ({FormatBytes(plan.TotalBytes)}), " +
+                        $"{plan.TotalDiscsRequired} disc(s) required";
+            }
+            else
+            {
+                return;
+            }
+
+            // Replace scanning indicator with accurate result.
+            sourceVm.SizeCalculationResult = string.IsNullOrEmpty(baseReport)
+                ? resultLine : baseReport + "\n" + resultLine;
+        }
+        catch (Exception)
+        {
+            // Cancelled or failed — restore base report without scanning indicator.
+            sourceVm.SizeCalculationResult = baseReport;
         }
     }
 

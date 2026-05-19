@@ -12,7 +12,7 @@
         Opacity="0">
 
     <Border Style="{StaticResource Card}" Margin="12">
-        <ContentControl x:Name="ContentArea">
+        <ContentControl x:Name="ContentArea" Focusable="False">
             <ContentControl.Resources>
                 <DataTemplate DataType="{x:Type vm:SourceSelectionViewModel}">
                     <views:SourceSelectionView />

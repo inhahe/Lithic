@@ -144,7 +144,9 @@ public class SourceSelectionNodeViewModel : ViewModelBase
     }
 
     /// <summary>Human-readable size string (e.g. "1.2 GB"). Empty when
-    /// "selected only" mode is active and this node is not selected.</summary>
+    /// "selected only" mode is active and this node is not selected.
+    /// In "selected only" mode, partially-selected directories show the
+    /// sum of their selected children rather than the full filesystem size.</summary>
     public string FormattedSize
     {
         get
@@ -153,12 +155,16 @@ public class SourceSelectionNodeViewModel : ViewModelBase
                 return _isComputing ? "Working..." : "";
             bool selectedOnly = _getShowSelectedOnly?.Invoke() ?? false;
             if (selectedOnly && IsSelected == false) return "";
+            if (selectedOnly && IsDirectory && IsSelected == null && _isLoaded)
+                return FormatBytes(ComputeSelectedChildrenSize());
             return FormatBytes(_size);
         }
     }
 
     /// <summary>Formatted file count string (e.g. "1,234"). Empty for
-    /// individual files or when the count is not yet computed.</summary>
+    /// individual files or when the count is not yet computed.
+    /// In "selected only" mode, partially-selected directories show the
+    /// count of selected children only.</summary>
     public string FormattedFileCount
     {
         get
@@ -168,8 +174,45 @@ public class SourceSelectionNodeViewModel : ViewModelBase
                 return _isComputing ? "Working..." : "";
             bool selectedOnly = _getShowSelectedOnly?.Invoke() ?? false;
             if (selectedOnly && IsSelected == false) return "";
+            if (selectedOnly && IsSelected == null && _isLoaded)
+                return ComputeSelectedChildrenFileCount().ToString("N0");
             return _fileCount.ToString("N0");
         }
+    }
+
+    /// <summary>Recursively sum the sizes of selected children.</summary>
+    private long ComputeSelectedChildrenSize()
+    {
+        long total = 0;
+        foreach (var child in Children)
+        {
+            if (child.IsSelected == false) continue;
+            if (child._size < 0) continue;
+
+            if (!child.IsDirectory || child.IsSelected == true)
+                total += child._size;
+            else if (child._isLoaded)
+                total += child.ComputeSelectedChildrenSize();
+        }
+        return total;
+    }
+
+    /// <summary>Recursively count files in selected children.</summary>
+    private int ComputeSelectedChildrenFileCount()
+    {
+        int total = 0;
+        foreach (var child in Children)
+        {
+            if (child.IsSelected == false) continue;
+
+            if (!child.IsDirectory)
+                total += 1;
+            else if (child.IsSelected == true && child._fileCount >= 0)
+                total += child._fileCount;
+            else if (child._isLoaded)
+                total += child.ComputeSelectedChildrenFileCount();
+        }
+        return total;
     }
 
     /// <summary>Backup status relative to the catalog.</summary>

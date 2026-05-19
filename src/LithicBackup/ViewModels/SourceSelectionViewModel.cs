@@ -79,6 +79,9 @@ public class SourceSelectionViewModel : ViewModelBase
     /// <summary>Fired whenever a checkbox selection changes in the tree.</summary>
     public event Action? SelectionChanged;
 
+    /// <summary>Fired when tier set file patterns or exempt patterns change.</summary>
+    public event Action? ExclusionSettingsChanged;
+
     /// <summary>Fired when the user clicks "Seed from Existing Backup".</summary>
     public event Func<Task>? SeedFromExistingRequested;
 
@@ -308,6 +311,12 @@ public class SourceSelectionViewModel : ViewModelBase
             _needsSave = true;
             CommandManager.InvalidateRequerySuggested();
         }
+
+        // Notify listeners when exclusion-affecting patterns change so
+        // the size report can be recalculated with the new filters.
+        if (e.PropertyName is nameof(TierSetViewModel.FilePatternsText)
+                           or nameof(TierSetViewModel.FileExemptPatternsText))
+            ExclusionSettingsChanged?.Invoke();
     }
 
     /// <summary>
@@ -860,6 +869,10 @@ public class SourceSelectionViewModel : ViewModelBase
     {
         foreach (var root in Roots.ToList())
             await root.ComputeUnknownSizesAsync();
+
+        // Auto-show size report once background sizes are ready.
+        RefreshSelectedSize();
+        BuildSizeReport();
     }
 
     private void ToggleSort(SortColumn column)
@@ -1075,7 +1088,7 @@ public class SourceSelectionViewModel : ViewModelBase
     /// Build a detailed multi-line size report showing total selected,
     /// already-backed-up, new/changed to write, and destination space.
     /// </summary>
-    private void BuildSizeReport()
+    internal void BuildSizeReport()
     {
         long totalSize = 0;
         int fileCount = 0;
@@ -1097,7 +1110,6 @@ public class SourceSelectionViewModel : ViewModelBase
         // Compute catalog coverage by scanning _catalogInfo against the
         // selected paths.  This works regardless of whether tree nodes
         // are expanded — the catalog has the full picture.
-        long toWriteSize = totalSize;
         if (_catalogInfo is { Count: > 0 })
         {
             // Build the set of selected directory prefixes (with trailing \)
@@ -1133,16 +1145,10 @@ public class SourceSelectionViewModel : ViewModelBase
 
             if (catalogFiles > 0)
                 lines.Add($"Already backed up: {catalogFiles:N0} files, {SourceSelectionNodeViewModel.FormatBytes(catalogSize)}");
-
-            toWriteSize = Math.Max(0, totalSize - catalogSize);
-            int toWriteEstimate = Math.Max(0, fileCount - catalogFiles);
-            if (toWriteEstimate > 0 || toWriteSize > 0)
-                lines.Add($"New/changed (est.): ~{toWriteEstimate:N0} files, ~{SourceSelectionNodeViewModel.FormatBytes(toWriteSize)}");
-            else if (catalogFiles > 0)
-                lines.Add("All selected files are already backed up.");
         }
 
-        // Check destination space (directory-mode only).
+        // Show destination free space (directory-mode only).
+        // Accurate "insufficient" warnings come from PlanAsync, not here.
         if (_isDirectoryMode && !string.IsNullOrWhiteSpace(_targetDirectory))
         {
             try
@@ -1153,10 +1159,7 @@ public class SourceSelectionViewModel : ViewModelBase
                 {
                     long free = driveInfo.AvailableFreeSpace;
                     string driveLetter = pathRoot.TrimEnd('\\');
-                    if (toWriteSize > 0 && free < toWriteSize)
-                        lines.Add($"Destination ({driveLetter}): {SourceSelectionNodeViewModel.FormatBytes(free)} free \u2014 \u26A0 insufficient, need {SourceSelectionNodeViewModel.FormatBytes(toWriteSize)}");
-                    else
-                        lines.Add($"Destination ({driveLetter}): {SourceSelectionNodeViewModel.FormatBytes(free)} free");
+                    lines.Add($"Destination ({driveLetter}): {SourceSelectionNodeViewModel.FormatBytes(free)} free");
                 }
             }
             catch { }
@@ -1212,13 +1215,17 @@ public class SourceSelectionViewModel : ViewModelBase
     {
         foreach (var node in nodes)
         {
-            if (node.IsSelected == false)
+            if (node.IsSelected == false || !node.IsDirectory)
                 continue;
-            if (node.IsDirectory && node.Size < 0)
+
+            if (node.Size < 0)
                 result.Add(node);
-            // Recurse into loaded children regardless — a partial-selected
-            // parent might have uncalculated children deeper in the tree.
-            if (node.IsDirectory && node.IsLoaded)
+
+            // Only recurse into partially selected directories.
+            // ComputeSelectedSize uses the aggregate Size/FileCount for
+            // fully-selected directories, so their children don't need
+            // individual sizes computed.
+            if (node.IsSelected != true && node.IsLoaded)
                 CollectUncalculatedSelectedDirs(node.Children, result);
         }
     }
