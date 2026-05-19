@@ -132,13 +132,51 @@
                                                                                 BorderThickness="0,0,0,1"
                                                                                 Padding="8,10"
                                                                                 Background="Transparent"
-                                                                                Cursor="Hand">
+                                                                                Cursor="Hand"
+                                                                                Tag="{Binding DataContext, RelativeSource={RelativeSource AncestorType=Window}}">
                                                                             <Border.InputBindings>
                                                                                 <MouseBinding MouseAction="LeftDoubleClick"
                                                                                               Command="{Binding DataContext.SetModifyCommand,
                                                                                                         RelativeSource={RelativeSource AncestorType=Window}}"
                                                                                               CommandParameter="{Binding}" />
                                                                             </Border.InputBindings>
+                                                                            <Border.ContextMenu>
+                                                                                <ContextMenu DataContext="{Binding PlacementTarget.DataContext, RelativeSource={RelativeSource Self}}">
+                                                                                    <MenuItem Header="Backup"
+                                                                                              Command="{Binding PlacementTarget.Tag.SetBackupCommand, RelativeSource={RelativeSource AncestorType=ContextMenu}}"
+                                                                                              CommandParameter="{Binding}" />
+                                                                                    <MenuItem Header="Restore"
+                                                                                              Command="{Binding PlacementTarget.Tag.SetRestoreCommand, RelativeSource={RelativeSource AncestorType=ContextMenu}}"
+                                                                                              CommandParameter="{Binding}" />
+                                                                                    <MenuItem Header="Modify"
+                                                                                              Command="{Binding PlacementTarget.Tag.SetModifyCommand, RelativeSource={RelativeSource AncestorType=ContextMenu}}"
+                                                                                              CommandParameter="{Binding}" />
+                                                                                    <Separator />
+                                                                                    <MenuItem Header="Review Orphaned Directories"
+                                                                                              Command="{Binding PlacementTarget.Tag.SetOrphanedDirsCommand, RelativeSource={RelativeSource AncestorType=ContextMenu}}"
+                                                                                              CommandParameter="{Binding}" />
+                                                                                    <MenuItem Header="Backup Coverage"
+                                                                                              Command="{Binding PlacementTarget.Tag.SetCoverageCommand, RelativeSource={RelativeSource AncestorType=ContextMenu}}"
+                                                                                              CommandParameter="{Binding}" />
+                                                                                    <MenuItem Header="Largest Files"
+                                                                                              Command="{Binding PlacementTarget.Tag.SetLargestFilesCommand, RelativeSource={RelativeSource AncestorType=ContextMenu}}"
+                                                                                              CommandParameter="{Binding}" />
+                                                                                    <Separator />
+                                                                                    <MenuItem Header="Copy Backup Set"
+                                                                                              Command="{Binding PlacementTarget.Tag.SetCopyCommand, RelativeSource={RelativeSource AncestorType=ContextMenu}}"
+                                                                                              CommandParameter="{Binding}" />
+                                                                                    <MenuItem Header="Change Destination..."
+                                                                                              Command="{Binding PlacementTarget.Tag.SetChangeDestCommand, RelativeSource={RelativeSource AncestorType=ContextMenu}}"
+                                                                                              CommandParameter="{Binding}" />
+                                                                                    <MenuItem Header="Export..."
+                                                                                              Command="{Binding PlacementTarget.Tag.SetExportCommand, RelativeSource={RelativeSource AncestorType=ContextMenu}}"
+                                                                                              CommandParameter="{Binding}" />
+                                                                                    <Separator />
+                                                                                    <MenuItem Header="Delete"
+                                                                                              Command="{Binding PlacementTarget.Tag.SetDeleteCommand, RelativeSource={RelativeSource AncestorType=ContextMenu}}"
+                                                                                              CommandParameter="{Binding}" />
+                                                                                </ContextMenu>
+                                                                            </Border.ContextMenu>
 
                                                                             <Grid>
                                                                                 <Grid.ColumnDefinitions>
@@ -275,8 +313,15 @@
                                                                                         <Button Style="{StaticResource LinkButton}"
                                                                                                 Command="{Binding DataContext.SetModifyCommand,
                                                                                                           RelativeSource={RelativeSource AncestorType=Window}}"
-                                                                                                CommandParameter="{Binding}">
+                                                                                                CommandParameter="{Binding}"
+                                                                                                Margin="0,0,12,0">
                                                                                             <TextBlock><Run Text="&#x270E;" FontSize="10" /> Modify</TextBlock>
+                                                                                        </Button>
+                                                                                        <Button Style="{StaticResource LinkButton}"
+                                                                                                Command="{Binding DataContext.SetOrphanedDirsCommand,
+                                                                                                          RelativeSource={RelativeSource AncestorType=Window}}"
+                                                                                                CommandParameter="{Binding}">
+                                                                                            <TextBlock><Run Text="&#x267B;" FontSize="10" /> Cleanup</TextBlock>
                                                                                         </Button>
                                                                                     </WrapPanel>
 

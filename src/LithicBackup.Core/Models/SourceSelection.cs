@@ -67,6 +67,20 @@ public class SourceSelection
     /// </summary>
     public List<string> IncludedPatterns { get; set; } = [];
 
+    /// <summary>
+    /// Glob patterns for files whose past versions should NOT be retained.
+    /// Matched files are still backed up but old versions are deleted during
+    /// retention cleanup rather than kept. Patterns are inherited by child
+    /// directories.
+    /// </summary>
+    public List<string> VersionExcludedPatterns { get; set; } = [];
+
+    /// <summary>
+    /// Glob patterns to override <see cref="VersionExcludedPatterns"/> inherited
+    /// from parent directories, re-enabling version retention for matching files.
+    /// </summary>
+    public List<string> VersionIncludedPatterns { get; set; } = [];
+
     /// <summary>Child nodes (subdirectories and files).</summary>
     public List<SourceSelection> Children { get; set; } = [];
 
@@ -109,11 +123,18 @@ public class SourceSelection
             string effectiveTier = node.VersionTierSetName ?? parentTierSetName;
             bool keepsVersions = !string.Equals(effectiveTier, "None", StringComparison.OrdinalIgnoreCase);
 
-            // Collect include/re-include patterns marked with ~nv: prefix.
+            // Collect include/re-include patterns marked with ~nv: prefix (legacy).
             foreach (var pattern in node.IncludedPatterns)
             {
                 if (pattern.StartsWith("~nv:"))
                     noVersionGlobs.Add(pattern[4..]);
+            }
+
+            // Collect per-directory version exclusion patterns.
+            foreach (var pattern in node.VersionExcludedPatterns)
+            {
+                if (!string.IsNullOrWhiteSpace(pattern))
+                    noVersionGlobs.Add(pattern);
             }
 
             if (!keepsVersions)

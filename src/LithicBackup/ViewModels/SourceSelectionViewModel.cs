@@ -21,7 +21,7 @@ public class SourceSelectionViewModel : ViewModelBase
     private bool _hasSelection;
     private bool _updatingAllAutoInclude;
     private bool _updatingAllSelected;
-    private bool _showSizes;
+    private bool _showSizes = true;
     private TierSetViewModel? _selectedTierSet;
     private SortColumn _sortColumn = SortColumn.Name;
     private bool _sortAscending = true;
@@ -50,10 +50,19 @@ public class SourceSelectionViewModel : ViewModelBase
     private string _scheduleDebounceSeconds = "60";
     private readonly SizeComputeScheduler _scheduler = new();
     private Dictionary<string, FileVersionInfo>? _catalogInfo;
+    private readonly List<DriveData>? _preloadedDrives;
     private bool _showLargestFiles;
     private bool _isApplyingSelections;
     private bool _isEditMode;
     private string _saveStatusText = "";
+    private bool _isCalculatingSize;
+    private string _sizeCalculationResult = "";
+    private bool _isSeeding;
+    private string _seedResult = "";
+    private bool _seedSkipHashing = true;
+    private CancellationTokenSource? _seedCts;
+    private bool _needsSave = true;
+    private string _destinationSpaceText = "";
 
     /// <summary>Fired when the user clicks "Next" with a valid selection.</summary>
     public event Action<List<SourceSelection>>? NextRequested;
@@ -70,16 +79,48 @@ public class SourceSelectionViewModel : ViewModelBase
     /// <summary>Fired whenever a checkbox selection changes in the tree.</summary>
     public event Action? SelectionChanged;
 
+    /// <summary>Fired when the user clicks "Seed from Existing Backup".</summary>
+    public event Func<Task>? SeedFromExistingRequested;
+
+    /// <summary>
+    /// Pre-computed drive data from a background thread.
+    /// Avoids blocking the UI thread on <see cref="DriveInfo.GetDrives"/>
+    /// and <see cref="DriveInfo.TotalSize"/> calls which can be slow when
+    /// network or removable drives are present.
+    /// </summary>
+    public record DriveData(string RootPath, long UsedSize);
+
+    /// <summary>
+    /// Enumerate available drives on a background thread.
+    /// Call this from <c>Task.Run</c> and pass the result to the constructor.
+    /// </summary>
+    public static List<DriveData> EnumerateDrives()
+    {
+        var result = new List<DriveData>();
+        foreach (var drive in DriveInfo.GetDrives())
+        {
+            if (!drive.IsReady) continue;
+            if (drive.DriveType == DriveType.CDRom) continue;
+            long usedSize = -1;
+            try { usedSize = drive.TotalSize - drive.AvailableFreeSpace; }
+            catch { }
+            result.Add(new DriveData(drive.RootDirectory.FullName, usedSize));
+        }
+        return result;
+    }
+
     public SourceSelectionViewModel(
-        Dictionary<string, FileVersionInfo>? catalogInfo = null)
+        Dictionary<string, FileVersionInfo>? catalogInfo = null,
+        List<DriveData>? preloadedDrives = null)
     {
         _catalogInfo = catalogInfo;
+        _preloadedDrives = preloadedDrives;
         Roots = [];
         RetentionTiers = [];
         TierSets = [];
         AvailableTierSetNames = ["Default", "None"];
         NextCommand = new RelayCommand(_ => OnNext(), _ => HasSelection && !IsEditMode);
-        SaveCommand = new RelayCommand(_ => OnSave(), _ => HasSelection && IsEditMode);
+        SaveCommand = new RelayCommand(_ => OnSave(), _ => _needsSave && IsEditMode);
         CancelCommand = new RelayCommand(_ => CancelRequested?.Invoke());
         LargestFilesCommand = new RelayCommand(
             _ => LargestFilesRequested?.Invoke(),
@@ -92,6 +133,53 @@ public class SourceSelectionViewModel : ViewModelBase
         RemoveTierSetCommand = new RelayCommand(_ => RemoveSelectedTierSet(),
             _ => _selectedTierSet is not null && !_selectedTierSet.IsBuiltIn);
         AddPathCommand = new RelayCommand(_ => AddCustomPath());
+        AutoIncludeCheckedCommand = new RelayCommand(_ => SetAutoIncludeOnChecked());
+        CalculateSizeCommand = new RelayCommand(
+            _ => _ = OnCalculateSize(),
+            _ => !IsCalculatingSize);
+        SeedFromExistingCommand = new RelayCommand(
+            _ => _ = OnSeedFromExisting(),
+            _ => !IsSeeding && IsEditMode && IsDirectoryMode && !string.IsNullOrWhiteSpace(TargetDirectory));
+        CancelSeedCommand = new RelayCommand(
+            _ => _seedCts?.Cancel(),
+            _ => IsSeeding && _seedCts is not null && !_seedCts.IsCancellationRequested);
+
+        // Clear the "Saved" indicator and mark dirty whenever the user changes anything.
+        PropertyChanged += (_, e) =>
+        {
+            if (e.PropertyName is not (nameof(SaveStatusText)
+                    or nameof(HasSelection)
+                    or nameof(ShowSizes) or nameof(ShowSelectedSizesOnly)
+                    or nameof(SelectedSizeText) or nameof(NameSortIndicator)
+                    or nameof(SizeSortIndicator) or nameof(CurrentSortColumn)
+                    or nameof(SortAscending) or nameof(IsApplyingSelections)
+                    or nameof(ShowLargestFiles) or nameof(IsEditMode)
+                    or nameof(IsAllAutoIncludeNew) or nameof(IsAllSelected)
+                    or nameof(CanEditSelectedTierSet)
+                    or nameof(IsCalculatingSize) or nameof(SizeCalculationResult)
+                    or nameof(IsSeeding) or nameof(SeedResult)
+                    or nameof(DestinationSpaceText)))
+            {
+                if (!string.IsNullOrEmpty(_saveStatusText))
+                    SaveStatusText = "";
+                if (!_needsSave)
+                {
+                    _needsSave = true;
+                    CommandManager.InvalidateRequerySuggested();
+                }
+            }
+        };
+        SelectionChanged += () =>
+        {
+            if (!string.IsNullOrEmpty(_saveStatusText))
+                SaveStatusText = "";
+            if (!_needsSave)
+            {
+                _needsSave = true;
+                CommandManager.InvalidateRequerySuggested();
+            }
+        };
+
         LoadDriveRoots();
 
         // Initialise retention tiers from defaults.
@@ -340,7 +428,21 @@ public class SourceSelectionViewModel : ViewModelBase
     public string TargetDirectory
     {
         get => _targetDirectory;
-        set => SetProperty(ref _targetDirectory, value);
+        set
+        {
+            if (!SetProperty(ref _targetDirectory, value)) return;
+            RefreshDestinationSpace();
+        }
+    }
+
+    /// <summary>
+    /// Info line showing destination drive total capacity and free space.
+    /// Refreshed automatically when <see cref="TargetDirectory"/> changes.
+    /// </summary>
+    public string DestinationSpaceText
+    {
+        get => _destinationSpaceText;
+        private set => SetProperty(ref _destinationSpaceText, value);
     }
 
     /// <summary>Whether to create a subdirectory under the target.</summary>
@@ -502,12 +604,76 @@ public class SourceSelectionViewModel : ViewModelBase
         set => SetProperty(ref _saveStatusText, value);
     }
 
+    /// <summary>True while a backup size calculation is in progress.</summary>
+    public bool IsCalculatingSize
+    {
+        get => _isCalculatingSize;
+        set => SetProperty(ref _isCalculatingSize, value);
+    }
+
+    /// <summary>
+    /// Result of the most recent size calculation (multi-line text summary).
+    /// Empty when no calculation has been run or the result was cleared.
+    /// </summary>
+    public string SizeCalculationResult
+    {
+        get => _sizeCalculationResult;
+        set => SetProperty(ref _sizeCalculationResult, value);
+    }
+
+    /// <summary>True while a seed-from-existing operation is in progress.</summary>
+    public bool IsSeeding
+    {
+        get => _isSeeding;
+        set => SetProperty(ref _isSeeding, value);
+    }
+
+    /// <summary>Result of the most recent seed operation.</summary>
+    public string SeedResult
+    {
+        get => _seedResult;
+        set => SetProperty(ref _seedResult, value);
+    }
+
+    /// <summary>
+    /// When true, the seed operation skips SHA-256 hashing and records only
+    /// file size + last-write-time.  Much faster — hashing is not needed for
+    /// incremental detection (which uses size + timestamp).
+    /// </summary>
+    public bool SeedSkipHashing
+    {
+        get => _seedSkipHashing;
+        set => SetProperty(ref _seedSkipHashing, value);
+    }
+
+    /// <summary>Token for the in-progress seed operation (read by the handler).</summary>
+    public CancellationToken SeedCancellationToken => _seedCts?.Token ?? CancellationToken.None;
+
+    /// <summary>
+    /// True when there are unsaved changes. Used by the dialog to decide
+    /// whether to prompt before closing, and by the Save button CanExecute.
+    /// </summary>
+    public bool HasUnsavedChanges => _needsSave;
+
+    /// <summary>
+    /// Mark the current state as clean (just saved or freshly loaded).
+    /// Disables the Save button until the user makes further changes.
+    /// </summary>
+    public void MarkClean()
+    {
+        _needsSave = false;
+        CommandManager.InvalidateRequerySuggested();
+    }
+
     // --- Commands ---
 
     public ICommand NextCommand { get; }
     public ICommand SaveCommand { get; }
     public ICommand CancelCommand { get; }
     public ICommand LargestFilesCommand { get; }
+    public ICommand CalculateSizeCommand { get; }
+    public ICommand SeedFromExistingCommand { get; }
+    public ICommand CancelSeedCommand { get; }
     public ICommand SortByNameCommand { get; }
     public ICommand SortBySizeCommand { get; }
     public ICommand BrowseDirectoryCommand { get; }
@@ -515,6 +681,7 @@ public class SourceSelectionViewModel : ViewModelBase
     public ICommand AddTierSetCommand { get; }
     public ICommand RemoveTierSetCommand { get; }
     public ICommand AddPathCommand { get; }
+    public ICommand AutoIncludeCheckedCommand { get; }
 
     /// <summary>
     /// Called by the view (or a timer) to recheck whether any files are selected.
@@ -592,7 +759,7 @@ public class SourceSelectionViewModel : ViewModelBase
         var root = new SourceSelectionNodeViewModel(
             "", true, null,
             () => ShowSizes, () => (_sortColumn, _sortAscending), _scheduler,
-            () => { RefreshHasSelection(); RefreshSelectedSize(); SelectionChanged?.Invoke(); },
+            () => { RefreshHasSelection(); RefreshSelectedSize(); SizeCalculationResult = ""; SelectionChanged?.Invoke(); },
             () => ShowSelectedSizesOnly,
             _catalogInfo);
         RootNode = root;
@@ -601,20 +768,32 @@ public class SourceSelectionViewModel : ViewModelBase
         // IsExpanded setter triggers LoadChildrenAsync on the empty path.
         root.IsLoaded = true;
         root.Children.Clear(); // Remove the "Loading..." dummy child.
-        foreach (var drive in DriveInfo.GetDrives())
+
+        if (_preloadedDrives is not null)
         {
-            if (!drive.IsReady)
-                continue;
-
-            if (drive.DriveType == DriveType.CDRom)
-                continue;
-
-            var node = new SourceSelectionNodeViewModel(
-                drive.RootDirectory.FullName, true, root,
-                catalogInfo: _catalogInfo);
-            try { node.Size = drive.TotalSize - drive.AvailableFreeSpace; }
-            catch { }
-            root.Children.Add(node);
+            // Use pre-computed drive data (enumerated on a background thread).
+            foreach (var dd in _preloadedDrives)
+            {
+                var node = new SourceSelectionNodeViewModel(
+                    dd.RootPath, true, root, catalogInfo: _catalogInfo);
+                if (dd.UsedSize >= 0) node.Size = dd.UsedSize;
+                root.Children.Add(node);
+            }
+        }
+        else
+        {
+            // Fallback: enumerate on the calling thread (legacy callers).
+            foreach (var drive in DriveInfo.GetDrives())
+            {
+                if (!drive.IsReady) continue;
+                if (drive.DriveType == DriveType.CDRom) continue;
+                var node = new SourceSelectionNodeViewModel(
+                    drive.RootDirectory.FullName, true, root,
+                    catalogInfo: _catalogInfo);
+                try { node.Size = drive.TotalSize - drive.AvailableFreeSpace; }
+                catch { }
+                root.Children.Add(node);
+            }
         }
 
         root.IsExpanded = true;
@@ -683,7 +862,7 @@ public class SourceSelectionViewModel : ViewModelBase
         return node;
     }
 
-    private async Task ComputeAllUnknownSizesAsync()
+    internal async Task ComputeAllUnknownSizesAsync()
     {
         foreach (var root in Roots.ToList())
             await root.ComputeUnknownSizesAsync();
@@ -796,16 +975,27 @@ public class SourceSelectionViewModel : ViewModelBase
         {
             // Old format: drive roots at top level — match against the
             // root's children (the drive nodes).
+            // Process pre-existing drive nodes in parallel (independent subtrees).
+            var driveTasks = new List<Task>();
+            var customSelections = new List<SourceSelection>();
+
             foreach (var selection in selections)
             {
                 var driveNode = RootNode.Children.FirstOrDefault(c =>
                     string.Equals(c.Path, selection.Path, StringComparison.OrdinalIgnoreCase));
                 if (driveNode is not null)
-                    await driveNode.ApplySelectionAsync(selection);
+                    driveTasks.Add(driveNode.ApplySelectionAsync(selection));
+                else
+                    customSelections.Add(selection);
+            }
+            await Task.WhenAll(driveTasks);
 
-                // Create nodes for custom paths (network shares, etc.)
-                // that aren't pre-populated as drive roots.
-                if (driveNode is null && Directory.Exists(selection.Path))
+            // Create nodes for custom paths (network shares, etc.)
+            // that aren't pre-populated as drive roots.  Sequential because
+            // AddPathNode modifies the Children collection.
+            foreach (var selection in customSelections)
+            {
+                if (Directory.Exists(selection.Path))
                 {
                     var node = AddPathNode(selection.Path, isSelected: false);
                     await node.ApplySelectionAsync(selection);
@@ -840,11 +1030,239 @@ public class SourceSelectionViewModel : ViewModelBase
         if (SaveRequested is not null)
             await SaveRequested.Invoke();
 
+        // Mark clean after a successful save so the button disables.
+        if (SaveStatusText == "Saved")
+        {
+            _needsSave = false;
+            CommandManager.InvalidateRequerySuggested();
+        }
+
         // Auto-clear the status after a few seconds so it doesn't persist forever.
         if (!string.IsNullOrEmpty(SaveStatusText))
         {
             await Task.Delay(3000);
             SaveStatusText = "";
+        }
+    }
+
+    private async Task OnCalculateSize()
+    {
+        IsCalculatingSize = true;
+
+        // Find all selected directories that don't have computed sizes yet.
+        var uncalculated = new List<SourceSelectionNodeViewModel>();
+        CollectUncalculatedSelectedDirs(Roots, uncalculated);
+
+        if (uncalculated.Count > 0)
+        {
+            int total = uncalculated.Count;
+            int done = 0;
+            SizeCalculationResult = $"Scanning 0/{total:N0}...";
+
+            // Progress<T> marshals callbacks to the UI thread via
+            // SynchronizationContext, so property sets are safe here.
+            var progress = new Progress<string>(path =>
+            {
+                done++;
+                var dirName = System.IO.Path.GetFileName(path.TrimEnd('\\'));
+                SizeCalculationResult = $"Scanning {done:N0}/{total:N0}: {dirName}";
+            });
+
+            await _scheduler.EnqueueAsync(uncalculated, isPriority: true, progress);
+        }
+
+        RefreshSelectedSize();
+        BuildSizeReport();
+        IsCalculatingSize = false;
+    }
+
+    /// <summary>
+    /// Build a detailed multi-line size report showing total selected,
+    /// already-backed-up, new/changed to write, and destination space.
+    /// </summary>
+    private void BuildSizeReport()
+    {
+        long totalSize = 0;
+        int fileCount = 0;
+        int dirCount = 0;
+        ComputeSelectedSize(Roots, ref totalSize, ref fileCount, ref dirCount);
+
+        if (fileCount == 0 && dirCount == 0)
+        {
+            SizeCalculationResult = "No selected files or directories found.";
+            return;
+        }
+
+        var lines = new List<string>();
+        var parts = new List<string>();
+        if (dirCount > 0) parts.Add($"{dirCount:N0} {(dirCount == 1 ? "directory" : "directories")}");
+        if (fileCount > 0) parts.Add($"{fileCount:N0} {(fileCount == 1 ? "file" : "files")}");
+        lines.Add($"Selected: {string.Join(", ", parts)}, {SourceSelectionNodeViewModel.FormatBytes(totalSize)}");
+
+        // Compute catalog coverage by scanning _catalogInfo against the
+        // selected paths.  This works regardless of whether tree nodes
+        // are expanded — the catalog has the full picture.
+        long toWriteSize = totalSize;
+        if (_catalogInfo is { Count: > 0 })
+        {
+            // Build the set of selected directory prefixes (with trailing \)
+            // and individual file paths from the tree.
+            var dirPrefixes = new List<string>();
+            var filePaths = new HashSet<string>(StringComparer.OrdinalIgnoreCase);
+            CollectSelectedPaths(Roots, dirPrefixes, filePaths);
+
+            // Single pass over the catalog: sum entries that fall under
+            // any selected prefix or match a selected file.
+            long catalogSize = 0;
+            int catalogFiles = 0;
+            foreach (var (path, info) in _catalogInfo)
+            {
+                bool covered = filePaths.Contains(path);
+                if (!covered)
+                {
+                    for (int i = 0; i < dirPrefixes.Count; i++)
+                    {
+                        if (path.StartsWith(dirPrefixes[i], StringComparison.OrdinalIgnoreCase))
+                        {
+                            covered = true;
+                            break;
+                        }
+                    }
+                }
+                if (covered)
+                {
+                    catalogSize += info.SizeBytes;
+                    catalogFiles++;
+                }
+            }
+
+            if (catalogFiles > 0)
+                lines.Add($"Already backed up: {catalogFiles:N0} files, {SourceSelectionNodeViewModel.FormatBytes(catalogSize)}");
+
+            toWriteSize = Math.Max(0, totalSize - catalogSize);
+            int toWriteEstimate = Math.Max(0, fileCount - catalogFiles);
+            if (toWriteEstimate > 0)
+                lines.Add($"New/changed (est.): ~{toWriteEstimate:N0} files, ~{SourceSelectionNodeViewModel.FormatBytes(toWriteSize)}");
+            else if (catalogFiles > 0)
+                lines.Add("All selected files are already backed up.");
+        }
+
+        // Check destination space (directory-mode only).
+        if (_isDirectoryMode && !string.IsNullOrWhiteSpace(_targetDirectory))
+        {
+            try
+            {
+                string pathRoot = Path.GetPathRoot(_targetDirectory) ?? _targetDirectory;
+                var driveInfo = new DriveInfo(pathRoot);
+                if (driveInfo.IsReady)
+                {
+                    long free = driveInfo.AvailableFreeSpace;
+                    string driveLetter = pathRoot.TrimEnd('\\');
+                    if (toWriteSize > 0 && free < toWriteSize)
+                        lines.Add($"Destination ({driveLetter}): {SourceSelectionNodeViewModel.FormatBytes(free)} free \u2014 \u26A0 insufficient, need {SourceSelectionNodeViewModel.FormatBytes(toWriteSize)}");
+                    else
+                        lines.Add($"Destination ({driveLetter}): {SourceSelectionNodeViewModel.FormatBytes(free)} free");
+                }
+            }
+            catch { }
+        }
+
+        SizeCalculationResult = string.Join("\n", lines);
+    }
+
+    /// <summary>
+    /// Collect selected directory prefixes (ending with \) and individual
+    /// selected file paths from the tree.  Used for matching against the
+    /// catalog to compute coverage without requiring all nodes to be loaded.
+    /// </summary>
+    private static void CollectSelectedPaths(
+        IEnumerable<SourceSelectionNodeViewModel> nodes,
+        List<string> dirPrefixes, HashSet<string> filePaths)
+    {
+        foreach (var node in nodes)
+        {
+            if (node.IsSelected == false)
+                continue;
+
+            if (!node.IsDirectory)
+            {
+                // Individual selected file.
+                filePaths.Add(node.Path);
+            }
+            else if (node.IsSelected == true && !node.IsLoaded)
+            {
+                // Fully selected unexpanded directory — everything under
+                // this path is selected.  Use as a prefix for catalog matching.
+                string prefix = node.Path.EndsWith('\\') ? node.Path : node.Path + "\\";
+                dirPrefixes.Add(prefix);
+            }
+            else if (node.IsSelected == true && node.IsLoaded)
+            {
+                // Fully selected expanded directory — also a prefix match
+                // (covers any files deeper than the loaded children).
+                string prefix = node.Path.EndsWith('\\') ? node.Path : node.Path + "\\";
+                dirPrefixes.Add(prefix);
+            }
+            else if (node.IsLoaded)
+            {
+                // Partially selected — recurse to find specific children.
+                CollectSelectedPaths(node.Children, dirPrefixes, filePaths);
+            }
+        }
+    }
+
+    private static void CollectUncalculatedSelectedDirs(
+        IEnumerable<SourceSelectionNodeViewModel> nodes,
+        List<SourceSelectionNodeViewModel> result)
+    {
+        foreach (var node in nodes)
+        {
+            if (node.IsSelected == false)
+                continue;
+            if (node.IsDirectory && node.Size < 0)
+                result.Add(node);
+            // Recurse into loaded children regardless — a partial-selected
+            // parent might have uncalculated children deeper in the tree.
+            if (node.IsDirectory && node.IsLoaded)
+                CollectUncalculatedSelectedDirs(node.Children, result);
+        }
+    }
+
+    private void SetAutoIncludeOnChecked()
+    {
+        var dirs = GetAllDirectoryNodes();
+        foreach (var node in dirs)
+        {
+            if (node.IsSelected != false && !node.AutoIncludeNew)
+                node.AutoIncludeNew = true;
+        }
+        OnPropertyChanged(nameof(IsAllAutoIncludeNew));
+    }
+
+    private async Task OnSeedFromExisting()
+    {
+        if (SeedFromExistingRequested is null) return;
+
+        _seedCts = new CancellationTokenSource();
+        IsSeeding = true;
+        SeedResult = "Importing files from existing backup...";
+        try
+        {
+            await SeedFromExistingRequested.Invoke();
+        }
+        catch (OperationCanceledException)
+        {
+            SeedResult = "Import cancelled.";
+        }
+        catch (Exception ex)
+        {
+            SeedResult = $"Error: {ex.Message}";
+        }
+        finally
+        {
+            IsSeeding = false;
+            _seedCts?.Dispose();
+            _seedCts = null;
         }
     }
 
@@ -1077,5 +1495,40 @@ public class SourceSelectionViewModel : ViewModelBase
 
         RebuildAvailableTierSetNames();
         SelectedTierSet = TierSets.FirstOrDefault();
+    }
+
+    /// <summary>
+    /// Query the destination drive's total capacity and free space and update
+    /// <see cref="DestinationSpaceText"/>.  Called automatically when
+    /// <see cref="TargetDirectory"/> changes.
+    /// </summary>
+    public void RefreshDestinationSpace()
+    {
+        if (string.IsNullOrWhiteSpace(_targetDirectory))
+        {
+            DestinationSpaceText = "";
+            return;
+        }
+
+        try
+        {
+            string pathRoot = Path.GetPathRoot(_targetDirectory) ?? _targetDirectory;
+            var driveInfo = new DriveInfo(pathRoot);
+            if (!driveInfo.IsReady)
+            {
+                DestinationSpaceText = "";
+                return;
+            }
+
+            long total = driveInfo.TotalSize;
+            long free = driveInfo.AvailableFreeSpace;
+            DestinationSpaceText = $"{pathRoot.TrimEnd('\\')}  —  " +
+                $"{SourceSelectionNodeViewModel.FormatBytes(total)} total, " +
+                $"{SourceSelectionNodeViewModel.FormatBytes(free)} free";
+        }
+        catch
+        {
+            DestinationSpaceText = "";
+        }
     }
 }

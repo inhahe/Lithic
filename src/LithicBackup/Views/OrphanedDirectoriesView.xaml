@@ -21,27 +21,41 @@
                                Margin="0,0,0,4" />
                     <TextBlock Foreground="{StaticResource TextSecondaryBrush}" FontSize="11"
                                TextWrapping="Wrap" Margin="0,0,0,8"
-                               Text="Enter exclusion patterns to find catalogued files that should be purged (e.g. *.log, */.vs/*, */bin/*)." />
-                    <StackPanel Orientation="Horizontal">
+                               Text="Enter exclusion patterns to find catalogued files that should be purged (one per line, e.g. *.log, */.vs/*, */bin/*)." />
+                    <DockPanel>
+                        <Button DockPanel.Dock="Right" Content="Scan"
+                                Command="{Binding ScanExcludedCommand}"
+                                Padding="12,6" Margin="8,0,0,0" Cursor="Hand"
+                                VerticalAlignment="Top" />
                         <TextBox Text="{Binding ExclusionPatterns, UpdateSourceTrigger=PropertyChanged}"
-                                 Padding="6,4" Width="400"
+                                 Padding="6,4" Height="80"
+                                 AcceptsReturn="True"
+                                 VerticalScrollBarVisibility="Auto"
+                                 TextWrapping="NoWrap"
                                  BorderBrush="{StaticResource BorderBrush}"
-                                 ToolTip="Comma-separated patterns (e.g. *.log, temp_*, */.vs/*, */bin/*)" />
-                        <Button Content="Scan" Command="{Binding ScanExcludedCommand}"
-                                Padding="12,6" Margin="8,0,0,0" Cursor="Hand" />
-                    </StackPanel>
+                                 ToolTip="One pattern per line.&#x0a;Examples: *.log  *.tmp  *.bak  */.vs/*  */bin/*  */obj/*" />
+                    </DockPanel>
                 </StackPanel>
             </Border>
         </StackPanel>
 
         <!-- Bottom buttons -->
-        <StackPanel DockPanel.Dock="Bottom" Orientation="Horizontal"
-                    HorizontalAlignment="Right" Margin="0,12,0,0">
-            <Button Content="Close" Command="{Binding CloseCommand}"
-                    Padding="16,8" Margin="0,0,8,0" Cursor="Hand" />
-            <Button Style="{StaticResource PrimaryButton}"
-                    Content="Purge Selected" Command="{Binding PurgeSelectedCommand}" />
-        </StackPanel>
+        <DockPanel DockPanel.Dock="Bottom" Margin="0,12,0,0">
+            <!-- Purge status (left-aligned, visible during purge) -->
+            <TextBlock Text="{Binding PurgeStatusText}"
+                       Foreground="{StaticResource TextSecondaryBrush}"
+                       FontSize="11" VerticalAlignment="Center"
+                       TextTrimming="CharacterEllipsis"
+                       Margin="0,0,12,0" />
+
+            <!-- Buttons (right-aligned) -->
+            <StackPanel Orientation="Horizontal" HorizontalAlignment="Right">
+                <Button Content="Close" Command="{Binding CloseCommand}"
+                        Padding="16,8" Margin="0,0,8,0" Cursor="Hand" />
+                <Button Style="{StaticResource PrimaryButton}"
+                        Content="Purge Selected" Command="{Binding PurgeSelectedCommand}" />
+            </StackPanel>
+        </DockPanel>
 
         <!-- Directory list -->
         <Border BorderThickness="1"

@@ -18,6 +18,7 @@
   <ItemGroup>
     <EmbeddedResource Include="Data\Migrations\001_InitialSchema.sql" />
     <EmbeddedResource Include="Data\Migrations\002_BackupSetConfig.sql" />
+    <EmbeddedResource Include="Data\Migrations\003_CatalogQueryIndex.sql" />
   </ItemGroup>
 
 </Project>

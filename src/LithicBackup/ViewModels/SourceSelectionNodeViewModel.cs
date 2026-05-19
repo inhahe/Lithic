@@ -1,7 +1,7 @@
-using System.Collections.ObjectModel;
 using System.IO;
 using System.Windows;
 using System.Windows.Input;
+using LithicBackup.Core;
 using LithicBackup.Core.Models;
 using LithicBackup.Views;
 
@@ -38,6 +38,13 @@ public class SourceSelectionNodeViewModel : ViewModelBase
     private bool _isExpanded;
     private bool _isLoaded;
     private bool _suppressPropagation;
+    /// <summary>
+    /// When true, <see cref="LoadChildrenAsync"/> skips Phase 2 (submitting
+    /// child directories to the size scheduler).  Set during
+    /// <see cref="ApplySelectionAsync"/> to avoid flooding the scheduler
+    /// with hundreds of directories while restoring saved state.
+    /// </summary>
+    internal bool _suppressSizeComputation;
     private Task? _loadTask;
     private long _size = -1;
     private int _fileCount = -1;
@@ -45,6 +52,8 @@ public class SourceSelectionNodeViewModel : ViewModelBase
     private BackupStatus _backupStatus = BackupStatus.Unknown;
     private string _excludedPatterns = "";
     private string _includedPatterns = "";
+    private string _versionExcludedPatterns = "";
+    private string _versionIncludedPatterns = "";
     private readonly Func<bool>? _getShowSizes;
     private readonly Func<(SortColumn Column, bool Ascending)>? _getSortMode;
     private readonly SizeComputeScheduler? _scheduler;
@@ -93,7 +102,7 @@ public class SourceSelectionNodeViewModel : ViewModelBase
     public string Name { get; }
     public bool IsDirectory { get; }
     public SourceSelectionNodeViewModel? Parent { get; }
-    public ObservableCollection<SourceSelectionNodeViewModel> Children { get; }
+    public BulkObservableCollection<SourceSelectionNodeViewModel> Children { get; }
 
     /// <summary>Single-click on the name area toggles expand/collapse for directories.</summary>
     public ICommand ToggleExpandCommand { get; }
@@ -211,11 +220,40 @@ public class SourceSelectionNodeViewModel : ViewModelBase
     }
 
     /// <summary>
-    /// True if this node has its own exclusion or inclusion patterns.
-    /// Used as a visual indicator in the tree.
+    /// Newline-separated glob patterns for files whose past versions should
+    /// not be retained. Inherited by child directories.
+    /// </summary>
+    public string VersionExcludedPatterns
+    {
+        get => _versionExcludedPatterns;
+        set
+        {
+            if (SetProperty(ref _versionExcludedPatterns, value))
+                OnPropertyChanged(nameof(HasExclusionRules));
+        }
+    }
+
+    /// <summary>
+    /// Newline-separated glob patterns to override version exclusions inherited
+    /// from parent directories, re-enabling version retention for matching files.
+    /// </summary>
+    public string VersionIncludedPatterns
+    {
+        get => _versionIncludedPatterns;
+        set
+        {
+            if (SetProperty(ref _versionIncludedPatterns, value))
+                OnPropertyChanged(nameof(HasExclusionRules));
+        }
+    }
+
+    /// <summary>
+    /// True if this node has its own exclusion or inclusion patterns
+    /// (backup or version). Used as a visual indicator in the tree.
     /// </summary>
     public bool HasExclusionRules =>
-        !string.IsNullOrWhiteSpace(_excludedPatterns) || !string.IsNullOrWhiteSpace(_includedPatterns);
+        !string.IsNullOrWhiteSpace(_excludedPatterns) || !string.IsNullOrWhiteSpace(_includedPatterns)
+        || !string.IsNullOrWhiteSpace(_versionExcludedPatterns) || !string.IsNullOrWhiteSpace(_versionIncludedPatterns);
 
     /// <summary>Backup status relative to the catalog.</summary>
     public BackupStatus BackupStatus
@@ -425,20 +463,34 @@ public class SourceSelectionNodeViewModel : ViewModelBase
         OnPropertyChanged(nameof(ExcludedPatterns));
         _includedPatterns = FormatPatternLines(model.IncludedPatterns);
         OnPropertyChanged(nameof(IncludedPatterns));
+        _versionExcludedPatterns = FormatPatternLines(model.VersionExcludedPatterns);
+        OnPropertyChanged(nameof(VersionExcludedPatterns));
+        _versionIncludedPatterns = FormatPatternLines(model.VersionIncludedPatterns);
+        OnPropertyChanged(nameof(VersionIncludedPatterns));
         OnPropertyChanged(nameof(HasExclusionRules));
 
         // If this directory has child selections to restore, expand and apply.
+        // Suppress size computation during this expansion — we're restoring
+        // saved state, not responding to a user click.  Sizes are computed
+        // lazily after the dialog opens.
         if (IsDirectory && model.Children.Count > 0)
         {
+            _suppressSizeComputation = true;
             await EnsureChildrenLoadedAsync();
+            _suppressSizeComputation = false;
 
+            // Apply sibling subtrees concurrently — each child's
+            // filesystem enumeration runs on the thread pool, so
+            // siblings overlap instead of serialising.
+            var tasks = new List<Task>(model.Children.Count);
             foreach (var childModel in model.Children)
             {
                 var childNode = Children.FirstOrDefault(c =>
                     string.Equals(c.Path, childModel.Path, StringComparison.OrdinalIgnoreCase));
                 if (childNode is not null)
-                    await childNode.ApplySelectionAsync(childModel);
+                    tasks.Add(childNode.ApplySelectionAsync(childModel));
             }
+            await Task.WhenAll(tasks);
         }
     }
 
@@ -469,10 +521,7 @@ public class SourceSelectionNodeViewModel : ViewModelBase
                           .ThenByDescending(c => c.Name, StringComparer.OrdinalIgnoreCase);
         }
 
-        var list = sorted.ToList();
-        Children.Clear();
-        foreach (var child in list)
-            Children.Add(child);
+        Children.ReplaceAll(sorted.ToList());
 
         // Recurse into loaded subdirectories.
         foreach (var child in Children)
@@ -494,16 +543,38 @@ public class SourceSelectionNodeViewModel : ViewModelBase
         // Yield at a priority below Render so the WPF layout/render pass
         // completes first — this ensures the "Loading..." placeholder is
         // painted before the filesystem enumeration begins.
-        await System.Windows.Threading.Dispatcher.Yield(
-            System.Windows.Threading.DispatcherPriority.Background);
+        // Skip the yield during selection restore (_suppressSizeComputation)
+        // because the dialog isn't visible yet — the yield would add ~16ms
+        // of dead time per directory for no visual benefit.
+        if (!_suppressSizeComputation)
+            await System.Windows.Threading.Dispatcher.Yield(
+                System.Windows.Threading.DispatcherPriority.Background);
 
         try
         {
-            // Phase 1: fast enumeration — file sizes are trivial, directory
-            // sizes are left as -1 (computed progressively in Phase 2).
+            // Pre-compute sizes on the background thread when the parent's
+            // size is already known — the cache has the data from the parent's
+            // computation so each child lookup is fast (no file enumeration).
+            // For fresh directories (parent not yet computed), sizes stay at -1
+            // and Phase 2 uses the scheduler for progressive fill-in.
+            bool showSizes = _getShowSizes?.Invoke() ?? false;
+            // Only pre-compute when both _size and _fileCount are set, which
+            // means the scheduler computed this node's size (populating the
+            // cache for all its subdirectories).  Drive nodes have _size set
+            // from DriveInfo but _fileCount == -1, so they correctly skip
+            // precomputation — otherwise ComputeInline would recursively
+            // scan the entire drive during expansion.
+            bool precomputeSizes = showSizes && _scheduler is not null
+                && _size >= 0 && _fileCount >= 0;
+            Func<string, bool>? excludeFilter = precomputeSizes
+                ? BuildEffectiveExcludeFilter()
+                : null;
+
+            // Phase 1: enumerate entries. When precomputeSizes is true,
+            // directory sizes are computed inline using the shared cache.
             var entries = await Task.Run(() =>
             {
-                var result = new List<(string FullName, bool IsDirectory, long Size)>();
+                var result = new List<(string FullName, bool IsDirectory, long Size, int FileCount)>();
                 var dirInfo = new DirectoryInfo(Path);
 
                 try
@@ -514,7 +585,21 @@ public class SourceSelectionNodeViewModel : ViewModelBase
                         {
                             if ((subDir.Attributes & (FileAttributes.System | FileAttributes.Hidden)) != 0)
                                 continue;
-                            result.Add((subDir.FullName, true, -1));
+
+                            long dirSize = -1;
+                            int dirFileCount = -1;
+                            if (precomputeSizes)
+                            {
+                                try
+                                {
+                                    var (sz, fc) = _scheduler!.ComputeInline(subDir, excludeFilter);
+                                    dirSize = sz;
+                                    dirFileCount = fc;
+                                }
+                                catch { }
+                            }
+
+                            result.Add((subDir.FullName, true, dirSize, dirFileCount));
                         }
                         catch (UnauthorizedAccessException) { }
                     }
@@ -531,7 +616,7 @@ public class SourceSelectionNodeViewModel : ViewModelBase
                             long size = 0;
                             try { size = file.Length; }
                             catch { }
-                            result.Add((file.FullName, false, size));
+                            result.Add((file.FullName, false, size, 1));
                         }
                         catch (UnauthorizedAccessException) { }
                     }
@@ -549,10 +634,12 @@ public class SourceSelectionNodeViewModel : ViewModelBase
                 return result;
             });
 
-            // Back on the UI thread — swap the placeholder for real children.
-            Children.Clear();
-
-            foreach (var (fullName, isDir, size) in entries)
+            // Build the full list of child nodes before touching the
+            // ObservableCollection.  ReplaceAll fires a single Reset
+            // notification instead of N individual Add events, avoiding
+            // per-item layout storms in the TreeView.
+            var childNodes = new List<SourceSelectionNodeViewModel>(entries.Count);
+            foreach (var (fullName, isDir, size, fileCount) in entries)
             {
                 var child = new SourceSelectionNodeViewModel(fullName, isDir, this)
                 {
@@ -561,6 +648,7 @@ public class SourceSelectionNodeViewModel : ViewModelBase
                     // Children inherit tier set from parent by default.
                     _versionTierSetName = InheritTierName,
                     _size = size,
+                    _fileCount = fileCount,
                 };
 
                 // Determine backup status for files from the catalog.
@@ -581,18 +669,21 @@ public class SourceSelectionNodeViewModel : ViewModelBase
                     }
                 }
 
-                Children.Add(child);
+                childNodes.Add(child);
             }
+
+            // Swap in one shot: replace all items with a single Reset
+            // notification instead of N individual Add events.
+            Children.ReplaceAll(childNodes);
 
             // Compute aggregate backup status for this directory.
             if (_catalogInfo is not null)
                 UpdateDirectoryBackupStatus();
 
-            // Phase 2: if "Show sizes" is on, submit directory children to the
-            // centralised scheduler at high priority so they are computed before
-            // any background-scan items.
-            bool showSizes = _getShowSizes?.Invoke() ?? false;
-            if (showSizes && _scheduler is not null)
+            // Phase 2: if "Show sizes" is on and sizes weren't already
+            // pre-computed above, submit directory children to the scheduler
+            // at high priority for progressive fill-in.
+            if (showSizes && _scheduler is not null && !precomputeSizes && !_suppressSizeComputation)
             {
                 var dirNodes = Children.Where(c => c.IsDirectory).ToList();
                 if (dirNodes.Count > 0)
@@ -643,6 +734,108 @@ public class SourceSelectionNodeViewModel : ViewModelBase
             if (child.IsDirectory && child._isLoaded)
                 await child.ComputeUnknownSizesAsync();
         }
+    }
+
+    /// <summary>
+    /// Build a combined exclusion predicate for this node by collecting all
+    /// <see cref="ExcludedPatterns"/> and <see cref="IncludedPatterns"/> from
+    /// this node up through every ancestor.  Returns <c>null</c> when no
+    /// ancestor has any patterns (the common fast-path).
+    /// </summary>
+    internal Func<string, bool>? BuildEffectiveExcludeFilter()
+    {
+        var excludePatterns = new List<string>();
+        var includePatterns = new List<string>();
+
+        for (var n = this; n is not null; n = n.Parent)
+        {
+            if (!string.IsNullOrWhiteSpace(n._excludedPatterns))
+                excludePatterns.AddRange(ParsePatternLines(n._excludedPatterns));
+            if (!string.IsNullOrWhiteSpace(n._includedPatterns))
+                includePatterns.AddRange(ParsePatternLines(n._includedPatterns));
+        }
+
+        if (excludePatterns.Count == 0)
+            return null;
+
+        var excludeFilter = GlobMatcher.CreateFilter(excludePatterns);
+        if (excludeFilter is null)
+            return null;
+
+        var includeFilter = includePatterns.Count > 0
+            ? GlobMatcher.CreateFilter(includePatterns)
+            : null;
+
+        return includeFilter is null
+            ? excludeFilter
+            : path => excludeFilter(path) && !includeFilter(path);
+    }
+
+    /// <summary>
+    /// Compute the total size and file count for a directory, dispatching to
+    /// the filtered or cached path depending on whether a filter is present.
+    /// </summary>
+    internal static (long Size, int FileCount) ComputeDirectorySize(
+        DirectoryInfo dir, DirectorySizeCache cache, Func<string, bool>? excludeFilter)
+    {
+        return excludeFilter is null
+            ? ComputeDirectorySizeCached(dir, cache)
+            : ComputeDirectorySizeFiltered(dir, excludeFilter);
+    }
+
+    /// <summary>
+    /// Recursively compute the total size and file count of a directory while
+    /// applying an exclusion filter. Skips the persistent cache because
+    /// filtered sizes depend on patterns that can change independently of
+    /// the directory's last-write timestamp.
+    /// </summary>
+    internal static (long Size, int FileCount) ComputeDirectorySizeFiltered(
+        DirectoryInfo dir, Func<string, bool> isExcluded)
+    {
+        long totalSize = 0;
+        int totalCount = 0;
+
+        try
+        {
+            foreach (var file in dir.EnumerateFiles())
+            {
+                try
+                {
+                    if (!isExcluded(file.FullName))
+                    {
+                        totalSize += file.Length;
+                        totalCount++;
+                    }
+                }
+                catch { }
+            }
+        }
+        catch { }
+
+        try
+        {
+            foreach (var subDir in dir.EnumerateDirectories())
+            {
+                try
+                {
+                    if ((subDir.Attributes & (FileAttributes.System | FileAttributes.Hidden)) != 0)
+                        continue;
+                }
+                catch { continue; }
+
+                // Check if the directory itself is excluded (e.g. */node_modules/*)
+                // by testing a synthetic child path.
+                if (isExcluded(System.IO.Path.Combine(subDir.FullName, "_")))
+                    continue;
+
+                var (subSize, subCount) = ComputeDirectorySizeFiltered(subDir, isExcluded);
+                totalSize += subSize;
+                totalCount += subCount;
+            }
+        }
+        catch { }
+
+        return (totalSize, totalCount);
     }
 
     /// <summary>
@@ -745,6 +938,8 @@ public class SourceSelectionNodeViewModel : ViewModelBase
         {
             ExcludedPatterns = editorVm.ExcludedPatterns;
             IncludedPatterns = editorVm.IncludedPatterns;
+            VersionExcludedPatterns = editorVm.VersionExcludedPatterns;
+            VersionIncludedPatterns = editorVm.VersionIncludedPatterns;
         }
     }
 
@@ -876,6 +1071,8 @@ public class SourceSelectionNodeViewModel : ViewModelBase
                 : null,
             ExcludedPatterns = ParsePatternLines(_excludedPatterns),
             IncludedPatterns = ParsePatternLines(_includedPatterns),
+            VersionExcludedPatterns = ParsePatternLines(_versionExcludedPatterns),
+            VersionIncludedPatterns = ParsePatternLines(_versionIncludedPatterns),
         };
 
         if (IsDirectory && _isLoaded)

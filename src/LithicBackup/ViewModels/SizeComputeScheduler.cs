@@ -23,6 +23,18 @@ public sealed class SizeComputeScheduler
     private readonly DirectorySizeCache _cache = new();
 
     /// <summary>
+    /// Compute a directory's size synchronously using the shared cache.
+    /// Intended for callers that already run on a background thread and
+    /// want to avoid the per-node scheduler overhead (e.g. pre-populating
+    /// child sizes during directory expansion).
+    /// </summary>
+    internal (long Size, int FileCount) ComputeInline(
+        DirectoryInfo dir, Func<string, bool>? excludeFilter)
+    {
+        return SourceSelectionNodeViewModel.ComputeDirectorySize(dir, _cache, excludeFilter);
+    }
+
+    /// <summary>
     /// Enqueue directory nodes for size computation.
     /// </summary>
     /// <param name="nodes">Directory nodes whose <see cref="SourceSelectionNodeViewModel.Size"/> should be set.</param>
@@ -30,8 +42,14 @@ public sealed class SizeComputeScheduler
     /// <c>true</c> for directories the user has just expanded (computed first);
     /// <c>false</c> for background-scan items.
     /// </param>
+    /// <param name="progress">
+    /// Optional progress reporter. When provided, the scheduler reports
+    /// the path of each directory as it starts computing its size (rate-
+    /// limited to avoid flooding the UI).
+    /// </param>
     /// <returns>A task that completes when every node in this batch has been processed.</returns>
-    internal Task EnqueueAsync(IReadOnlyList<SourceSelectionNodeViewModel> nodes, bool isPriority)
+    internal Task EnqueueAsync(IReadOnlyList<SourceSelectionNodeViewModel> nodes,
+        bool isPriority, IProgress<string>? progress = null)
     {
         var pending = new List<SourceSelectionNodeViewModel>();
         foreach (var n in nodes)
@@ -51,11 +69,15 @@ public sealed class SizeComputeScheduler
             var queue = isPriority ? _priorityQueue : _backgroundQueue;
             foreach (var node in pending)
             {
+                // Build the filter once on the calling thread (UI) where
+                // reading node properties is safe.  The compiled predicate
+                // is then used on the worker thread.
+                var filter = node.BuildEffectiveExcludeFilter();
                 queue.AddLast(new WorkItem(node, () =>
                 {
                     if (Interlocked.Decrement(ref remaining) == 0)
                         tcs.TrySetResult();
-                }));
+                }, filter, progress));
             }
         }
 
@@ -77,10 +99,20 @@ public sealed class SizeComputeScheduler
             _ = Task.Run(ProcessQueueAsync);
     }
 
+    /// <summary>Maximum results to accumulate before flushing to the UI.</summary>
+    private const int FlushBatchSize = 50;
+
+    /// <summary>Minimum interval between progress reports (ms).</summary>
+    private const long ProgressIntervalMs = 150;
+
     private async Task ProcessQueueAsync()
     {
         try
         {
+            var batch = new List<(SourceSelectionNodeViewModel Node, long Size,
+                                  int FileCount, Action OnComplete)>();
+            long lastProgressTick = 0;
+
             while (true)
             {
                 WorkItem item;
@@ -110,36 +142,46 @@ public sealed class SizeComputeScheduler
                     continue;
                 }
 
-                // Mark this single node as actively computing so the UI
-                // shows "working..." only for the directory in progress.
-                await System.Windows.Application.Current.Dispatcher.InvokeAsync(() =>
-                    item.Node.IsComputing = true);
+                // Rate-limited progress report so the UI shows what's
+                // being scanned without flooding the dispatcher.
+                if (item.Progress is not null)
+                {
+                    long now = Environment.TickCount64;
+                    if (now - lastProgressTick >= ProgressIntervalMs)
+                    {
+                        item.Progress.Report(item.Node.Path);
+                        lastProgressTick = now;
+                    }
+                }
 
+                long size = -1;
+                int fileCount = -1;
                 try
                 {
                     var dirInfo = new DirectoryInfo(item.Node.Path);
-                    var (size, fileCount) = SourceSelectionNodeViewModel.ComputeDirectorySizeCached(dirInfo, _cache);
-
-                    // Marshal to the UI thread so the bound property fires
-                    // PropertyChanged on the correct dispatcher.
-                    await System.Windows.Application.Current.Dispatcher.InvokeAsync(() =>
-                    {
-                        item.Node.Size = size;
-                        item.Node.FileCount = fileCount;
-                        item.Node.IsComputing = false;
-                    });
+                    (size, fileCount) = SourceSelectionNodeViewModel.ComputeDirectorySize(
+                        dirInfo, _cache, item.ExcludeFilter);
                 }
-                catch
+                catch { }
+
+                batch.Add((item.Node, size, fileCount, item.OnComplete));
+
+                // Flush when the batch is full or when priority items
+                // arrived (so they aren't delayed by the current batch).
+                bool shouldFlush;
+                lock (_lock)
                 {
-                    // Size computation failed (access denied, I/O error, etc.).
-                    // Leave at -1; clear the computing flag so UI shows blank
-                    // rather than a perpetual "working..." indicator.
-                    await System.Windows.Application.Current.Dispatcher.InvokeAsync(() =>
-                        item.Node.IsComputing = false);
+                    shouldFlush = batch.Count >= FlushBatchSize
+                        || _priorityQueue.Count > 0;
                 }
 
-                item.OnComplete();
+                if (shouldFlush)
+                    await FlushBatchAsync(batch);
             }
+
+            // Flush any remaining results.
+            if (batch.Count > 0)
+                await FlushBatchAsync(batch);
         }
         finally
         {
@@ -161,5 +203,43 @@ public sealed class SizeComputeScheduler
         }
     }
 
-    private sealed record WorkItem(SourceSelectionNodeViewModel Node, Action OnComplete);
+    /// <summary>
+    /// Dispatch a batch of computed sizes to the UI thread in a single call,
+    /// then fire all completion callbacks. This avoids per-node UI dispatches
+    /// that cause layout storms with SharedSizeGroup columns.
+    /// </summary>
+    private static async Task FlushBatchAsync(
+        List<(SourceSelectionNodeViewModel Node, long Size,
+              int FileCount, Action OnComplete)> batch)
+    {
+        if (batch.Count == 0) return;
+
+        // Snapshot and clear before the await so the caller can start
+        // filling the next batch immediately.
+        var results = batch.ToList();
+        batch.Clear();
+
+        // Single UI dispatch for the entire batch — one layout pass
+        // instead of 2N passes (IsComputing + Size per node).
+        await System.Windows.Application.Current.Dispatcher.InvokeAsync(() =>
+        {
+            foreach (var (node, size, fileCount, _) in results)
+            {
+                if (size >= 0)
+                {
+                    node.Size = size;
+                    node.FileCount = fileCount;
+                }
+            }
+        });
+
+        foreach (var (_, _, _, onComplete) in results)
+            onComplete();
+    }
+
+    private sealed record WorkItem(
+        SourceSelectionNodeViewModel Node,
+        Action OnComplete,
+        Func<string, bool>? ExcludeFilter,
+        IProgress<string>? Progress);
 }

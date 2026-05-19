@@ -1066,4 +1066,157 @@ public class DirectoryBackupService
     {
         WriteIndented = true,
     };
+
+    // ------------------------------------------------------------------
+    // Seed from existing mirror directory
+    // ------------------------------------------------------------------
+
+    /// <summary>
+    /// Import files from an existing mirror-format backup directory (e.g. a
+    /// backup4all mirror or a plain robocopy mirror) into the LithicBackup
+    /// catalog. Each file under the mirror's drive-letter subdirectories
+    /// (e.g. <c>C/Users/foo/file.txt</c>) is recorded as "already backed up"
+    /// so that future incremental backups only copy new or changed files.
+    /// </summary>
+    /// <returns>Number of files imported.</returns>
+    public async Task<int> SeedFromExistingDirectoryAsync(
+        int backupSetId,
+        string targetDir,
+        IProgress<ScanProgress>? progress = null,
+        CancellationToken ct = default,
+        bool skipHashing = false)
+    {
+        // Create a disc record for this import.
+        var discRecord = await _catalog.CreateDiscAsync(new DiscRecord
+        {
+            BackupSetId = backupSetId,
+            Label = targetDir,
+            SequenceNumber = 1,
+            MediaType = MediaType.Directory,
+            FilesystemType = FilesystemType.UDF,
+            Capacity = 0,
+            BytesUsed = 0,
+            Status = BurnSessionStatus.Completed,
+            CreatedUtc = DateTime.UtcNow,
+        }, ct);
+
+        int importedCount = 0;
+        long totalBytes = 0;
+        var progressSw = System.Diagnostics.Stopwatch.StartNew();
+        long lastProgressMs = 0;
+        const int ProgressIntervalMs = 500;
+
+        // Enumerate all single-letter (or short) subdirectories that look like
+        // drive prefixes: C, D, E, etc.
+        var rootDir = new DirectoryInfo(targetDir);
+        if (!rootDir.Exists)
+            throw new DirectoryNotFoundException($"Target directory not found: {targetDir}");
+
+        foreach (var driveDir in rootDir.EnumerateDirectories())
+        {
+            // Accept single-letter or two-letter names as potential drive prefixes.
+            // Skip _prev, _blocks, _filestore directories.
+            string dirName = driveDir.Name;
+            if (dirName.StartsWith('_') || dirName.Length > 2)
+                continue;
+
+            // Reconstruct the drive root: "C" → "C:\"
+            string driveRoot = dirName + @":\";
+
+            foreach (var file in driveDir.EnumerateFiles("*", SearchOption.AllDirectories))
+            {
+                ct.ThrowIfCancellationRequested();
+
+                // Skip .dedup and .fileref manifests — those are LithicBackup internal files.
+                if (file.Name.EndsWith(".dedup", StringComparison.OrdinalIgnoreCase) ||
+                    file.Name.EndsWith(".fileref", StringComparison.OrdinalIgnoreCase))
+                    continue;
+
+                // Skip files in _prev directories (versioned history).
+                string relativeToDrive = System.IO.Path.GetRelativePath(driveDir.FullName, file.FullName);
+                string fullSourcePath = System.IO.Path.Combine(driveRoot, relativeToDrive);
+                string discPath = System.IO.Path.Combine(dirName, relativeToDrive);
+
+                string hash;
+                if (skipHashing)
+                {
+                    // Use empty hash — incremental detection relies on
+                    // size + last-write-time, not content hash.
+                    hash = "";
+                }
+                else
+                {
+                    // Report before hashing so the UI shows which file is
+                    // being processed — large files take a long time to hash.
+                    long nowPre = progressSw.ElapsedMilliseconds;
+                    if (nowPre - lastProgressMs >= ProgressIntervalMs)
+                    {
+                        lastProgressMs = nowPre;
+                        progress?.Report(new ScanProgress
+                        {
+                            CurrentDirectory = fullSourcePath,
+                            FilesFound = importedCount,
+                            TotalBytes = totalBytes,
+                        });
+                    }
+
+                    try
+                    {
+                        hash = await ComputeFileHashAsync(file.FullName, ct);
+                    }
+                    catch
+                    {
+                        // If we can't read the file (locked, etc.), skip it.
+                        continue;
+                    }
+                }
+
+                await _catalog.CreateFileRecordAsync(new FileRecord
+                {
+                    DiscId = discRecord.Id,
+                    SourcePath = fullSourcePath,
+                    DiscPath = discPath,
+                    SizeBytes = file.Length,
+                    Hash = hash,
+                    IsZipped = false,
+                    IsSplit = false,
+                    IsDeduped = false,
+                    IsFileRef = false,
+                    Version = 1,
+                    SourceLastWriteUtc = file.LastWriteTimeUtc,
+                    BackedUpUtc = DateTime.UtcNow,
+                }, ct);
+
+                importedCount++;
+                totalBytes += file.Length;
+
+                // Throttle progress reports to avoid flooding the UI thread.
+                long nowPost = progressSw.ElapsedMilliseconds;
+                if (nowPost - lastProgressMs >= ProgressIntervalMs)
+                {
+                    lastProgressMs = nowPost;
+                    progress?.Report(new ScanProgress
+                    {
+                        CurrentDirectory = fullSourcePath,
+                        FilesFound = importedCount,
+                        TotalBytes = totalBytes,
+                    });
+                }
+            }
+        }
+
+        // Always report final state so the UI shows the true total.
+        progress?.Report(new ScanProgress
+        {
+            CurrentDirectory = "",
+            FilesFound = importedCount,
+            TotalBytes = totalBytes,
+        });
+
+        // Update disc used bytes.
+        discRecord.BytesUsed = totalBytes;
+        await _catalog.UpdateDiscAsync(discRecord, ct);
+
+        return importedCount;
+    }
 }

@@ -5,7 +5,7 @@
         xmlns:views="clr-namespace:LithicBackup.Views"
         Style="{StaticResource MainWindowStyle}"
         Title="Modify Backup Set"
-        SizeToContent="Height" Width="950"
+        Height="950" Width="950"
         MinHeight="500" MinWidth="700"
         WindowStartupLocation="CenterOwner"
         ShowInTaskbar="False"

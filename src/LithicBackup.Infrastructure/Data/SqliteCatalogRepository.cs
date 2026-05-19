@@ -51,6 +51,7 @@ public class SqliteCatalogRepository : ICatalogRepository
         var migrations = new (int Version, string ResourceName)[]
         {
             (2, "LithicBackup.Infrastructure.Data.Migrations.002_BackupSetConfig.sql"),
+            (3, "LithicBackup.Infrastructure.Data.Migrations.003_CatalogQueryIndex.sql"),
         };
 
         foreach (var (version, resourceName) in migrations)
@@ -853,6 +854,51 @@ public class SqliteCatalogRepository : ICatalogRepository
         cmd.ExecuteNonQuery();
 
         return Task.CompletedTask;
+    }
+
+    // ---------------------------------------------------------------
+    // Delete Backup Set
+    // ---------------------------------------------------------------
+
+    public async Task DeleteBackupSetAsync(int backupSetId, CancellationToken ct = default)
+    {
+        ct.ThrowIfCancellationRequested();
+
+        var tx = await BeginTransactionAsync(ct);
+        try
+        {
+            // Delete in dependency order: chunks → files → discs → backup set.
+            using var cmd = _connection.CreateCommand();
+
+            cmd.CommandText = """
+                DELETE FROM FileChunks
+                WHERE FileRecordId IN (
+                    SELECT f.Id FROM Files f
+                    INNER JOIN Discs d ON f.DiscId = d.Id
+                    WHERE d.BackupSetId = $setId
+                )
+                """;
+            cmd.Parameters.AddWithValue("$setId", backupSetId);
+            cmd.ExecuteNonQuery();
+
+            cmd.CommandText = """
+                DELETE FROM Files
+                WHERE DiscId IN (SELECT Id FROM Discs WHERE BackupSetId = $setId)
+                """;
+            cmd.ExecuteNonQuery();
+
+            cmd.CommandText = "DELETE FROM Discs WHERE BackupSetId = $setId";
+            cmd.ExecuteNonQuery();
+
+            cmd.CommandText = "DELETE FROM BackupSets WHERE Id = $setId";
+            cmd.ExecuteNonQuery();
+
+            tx.Complete();
+        }
+        finally
+        {
+            tx.Dispose();
+        }
     }
 
     // ---------------------------------------------------------------

@@ -26,6 +26,11 @@ public class OrphanedDirectoriesViewModel : ViewModelBase
     /// <summary>Cached active files from the catalog, loaded once during init.</summary>
     private List<FileRecord>? _activeFiles;
 
+    private string _purgeStatusText = "";
+
+    /// <summary>Task that completes when initial data loading finishes.</summary>
+    private readonly Task _loadTask;
+
     public event Action? DoneRequested;
 
     public OrphanedDirectoriesViewModel(ICatalogRepository catalog, BackupSet backupSet)
@@ -38,8 +43,14 @@ public class OrphanedDirectoriesViewModel : ViewModelBase
         ScanExcludedCommand = new RelayCommand(_ => _ = ScanForExcludedAsync(), _ => !IsLoading && !IsPurging);
         CloseCommand = new RelayCommand(_ => DoneRequested?.Invoke());
 
-        _ = LoadAsync();
+        _loadTask = LoadAsync();
     }
+
+    /// <summary>
+    /// Await initial data loading. Used by callers that want to show a wait
+    /// cursor until the view is ready (e.g. <see cref="MainViewModel"/>).
+    /// </summary>
+    internal Task WaitForLoadAsync() => _loadTask;
 
     public ObservableCollection<OrphanedDirectoryItem> Items { get; }
 
@@ -92,6 +103,15 @@ public class OrphanedDirectoriesViewModel : ViewModelBase
                 item.IsSelected = target;
             OnPropertyChanged();
         }
+    }
+
+    /// <summary>
+    /// Live progress text shown during purge (e.g. "Purging 3/12: D:\Photos\Old").
+    /// </summary>
+    public string PurgeStatusText
+    {
+        get => _purgeStatusText;
+        set => SetProperty(ref _purgeStatusText, value);
     }
 
     public ICommand PurgeSelectedCommand { get; }
@@ -291,62 +311,87 @@ public class OrphanedDirectoriesViewModel : ViewModelBase
 
         IsPurging = true;
         SummaryText = "Purging...";
+        PurgeStatusText = "";
 
         try
         {
-            var tx = await _catalog.BeginTransactionAsync();
-            int totalPurged = 0;
-
-            try
+            // Snapshot data needed by the background thread before leaving
+            // the UI thread.  MatchingSourcePaths and DirectoryPath are
+            // plain properties, safe to capture.
+            var workItems = selected.Select(item => new
             {
-                foreach (var item in selected)
+                item.DirectoryPath,
+                item.Reason,
+                item.MatchingSourcePaths,
+            }).ToList();
+
+            int backupSetId = _backupSet.Id;
+            var progress = new Progress<string>(status => PurgeStatusText = status);
+
+            // Run all DB work on a background thread — the catalog methods
+            // are synchronous (ExecuteNonQuery / Task.FromResult) and would
+            // otherwise freeze the UI for the entire purge.
+            int totalPurged = await Task.Run(() =>
+            {
+                var tx = _catalog.BeginTransactionAsync().GetAwaiter().GetResult();
+                int purged = 0;
+
+                try
                 {
-                    if (item.Reason == OrphanedReason.MatchesExclusionPattern
-                        && item.MatchingSourcePaths is not null)
+                    for (int i = 0; i < workItems.Count; i++)
                     {
-                        // Excluded-pattern items: delete specific files by path.
-                        totalPurged += await _catalog.MarkFilesDeletedBySourcePathsAsync(
-                            _backupSet.Id, item.MatchingSourcePaths);
+                        var wi = workItems[i];
+
+                        var dirName = Path.GetFileName(wi.DirectoryPath.TrimEnd('\\'));
+                        ((IProgress<string>)progress).Report(
+                            $"Purging {i + 1:N0}/{workItems.Count:N0}: {dirName}");
+
+                        if (wi.Reason == OrphanedReason.MatchesExclusionPattern
+                            && wi.MatchingSourcePaths is not null)
+                        {
+                            purged += _catalog.MarkFilesDeletedBySourcePathsAsync(
+                                backupSetId, wi.MatchingSourcePaths).GetAwaiter().GetResult();
+                        }
+                        else
+                        {
+                            purged += _catalog.MarkFilesDeletedByDirectoryAsync(
+                                backupSetId, wi.DirectoryPath).GetAwaiter().GetResult();
+                        }
                     }
-                    else
-                    {
-                        // Orphaned directory items: delete all files under the directory.
-                        int count = await _catalog.MarkFilesDeletedByDirectoryAsync(
-                            _backupSet.Id, item.DirectoryPath);
-                        totalPurged += count;
-                    }
+
+                    tx.Complete();
+                }
+                finally
+                {
+                    tx.Dispose();
                 }
 
-                tx.Complete();
-            }
-            finally
-            {
-                tx.Dispose();
-            }
+                // Clean the cached active-file list on the same thread
+                // (no UI objects touched).
+                if (_activeFiles is not null)
+                {
+                    var purgedPaths = new HashSet<string>(
+                        workItems.Where(w => w.MatchingSourcePaths is not null)
+                                 .SelectMany(w => w.MatchingSourcePaths!),
+                        StringComparer.OrdinalIgnoreCase);
+                    var purgedDirs = workItems
+                        .Where(w => w.Reason != OrphanedReason.MatchesExclusionPattern)
+                        .Select(w => w.DirectoryPath + "\\")
+                        .ToList();
 
-            // Remove purged items from the list.
+                    _activeFiles.RemoveAll(f =>
+                        purgedPaths.Contains(f.SourcePath)
+                        || purgedDirs.Any(d => f.SourcePath.StartsWith(d, StringComparison.OrdinalIgnoreCase)));
+                }
+
+                return purged;
+            });
+
+            // Back on the UI thread — update the observable collection.
             foreach (var item in selected)
                 Items.Remove(item);
 
-            // Also remove them from the cached active files so a re-scan
-            // won't show them again.
-            if (_activeFiles is not null)
-            {
-                var purgedPaths = new HashSet<string>(
-                    selected.Where(s => s.MatchingSourcePaths is not null)
-                            .SelectMany(s => s.MatchingSourcePaths!),
-                    StringComparer.OrdinalIgnoreCase);
-                var purgedDirs = selected
-                    .Where(s => s.Reason != OrphanedReason.MatchesExclusionPattern)
-                    .Select(s => s.DirectoryPath + "\\")
-                    .ToList();
-
-                _activeFiles.RemoveAll(f =>
-                    purgedPaths.Contains(f.SourcePath)
-                    || purgedDirs.Any(d => f.SourcePath.StartsWith(d, StringComparison.OrdinalIgnoreCase)));
-            }
-
-            SummaryText = $"Purged {totalPurged} file record(s). {Items.Count} item{(Items.Count == 1 ? "" : "s")} remaining.";
+            SummaryText = $"Purged {totalPurged:N0} file record(s). {Items.Count} item{(Items.Count == 1 ? "" : "s")} remaining.";
         }
         catch (Exception ex)
         {
@@ -354,6 +399,7 @@ public class OrphanedDirectoriesViewModel : ViewModelBase
         }
         finally
         {
+            PurgeStatusText = "";
             IsPurging = false;
         }
     }
@@ -389,7 +435,7 @@ public class OrphanedDirectoriesViewModel : ViewModelBase
             return [];
 
         return input
-            .Split([',', ';'], StringSplitOptions.RemoveEmptyEntries | StringSplitOptions.TrimEntries)
+            .Split([',', ';', '\r', '\n'], StringSplitOptions.RemoveEmptyEntries | StringSplitOptions.TrimEntries)
             .Where(s => s.Length > 0)
             .Distinct(StringComparer.OrdinalIgnoreCase)
             .ToList();

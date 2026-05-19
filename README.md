@@ -72,7 +72,9 @@ Only directory-mode backup sets can be scheduled (disc burns require physical me
 - New subdirectories are automatically included under fully-selected parents
 - **Per-directory exclusion patterns** (glob syntax): attach patterns like `*.log`, `temp_*`, `*/bin/*` to any directory node. Patterns are inherited by all child directories automatically.
 - **Per-directory re-include patterns**: override inherited exclusions at any level. For example, exclude `*.dll` at the project root but re-include it under a `lib/` subdirectory.
+- **Per-directory version retention filters**: a second set of exclusion/inclusion patterns that control which files keep past versions. Files matching version exclusion patterns are still backed up, but old versions are deleted during retention cleanup instead of being kept. Useful for large binaries (`.iso`, `.zip`, `.exe`) where only the current copy matters. Patterns are inherited and overridable per-directory, just like backup exclusions.
 - Per-node retention tier set assignment with inheritance from parent directories — assign any custom tier set to any file or directory, and children inherit unless overridden
+- **Pre-backup size calculator**: calculate how much data will be written before actually running the backup. Shows new files, changed files, per-source-root breakdown, destination free space, and whether the data will fit.
 
 ### Restore
 
@@ -101,6 +103,8 @@ These buttons only appear in `--simulate-burner` mode and reset automatically wh
 - **Copy backup sets** — duplicate a backup set's configuration (sources, options, schedule, retention tiers) as a starting point for a new set
 - **Edit backup sets** — modify sources, options, name, and schedule of existing sets
 - **Change destination** — relocate a backup set's target directory (e.g., when an external drive changes drive letters) without re-running the backup
+- **Seed from existing backup** — import files from an existing mirror-format backup directory (e.g. a backup4all mirror or robocopy mirror) into the catalog so future backups are incremental rather than re-copying everything. The seed operation scans the destination directory, hashes each file, and creates catalog entries.
+- **Right-click context menu** on backup sets — quick access to all operations (Backup, Restore, Modify, Orphaned Directories, Backup Coverage, Largest Files, Copy, Change Destination, Export)
 
 ## Architecture
 

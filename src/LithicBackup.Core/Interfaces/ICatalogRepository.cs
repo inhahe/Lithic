@@ -12,6 +12,7 @@ public interface ICatalogRepository : IDisposable
     Task<BackupSet?> GetBackupSetAsync(int id, CancellationToken ct = default);
     Task<IReadOnlyList<BackupSet>> GetAllBackupSetsAsync(CancellationToken ct = default);
     Task UpdateBackupSetAsync(BackupSet set, CancellationToken ct = default);
+    Task DeleteBackupSetAsync(int backupSetId, CancellationToken ct = default);
 
     // --- Discs ---
     Task<DiscRecord> CreateDiscAsync(DiscRecord disc, CancellationToken ct = default);

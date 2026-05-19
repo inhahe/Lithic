@@ -59,8 +59,9 @@ public partial class BackupSetEditorWindow : Window
     }
 
     /// <summary>
-    /// Clamp MaxHeight to the screen working area so the window never
-    /// pushes past the screen edge.
+    /// Size the window to fill the screen working area so the source tree
+    /// gets maximum vertical space and the settings section never needs to
+    /// scroll.  MaxHeight prevents overshooting the screen edge.
     /// </summary>
     private void ApplyScreenMaxHeight()
     {
@@ -71,7 +72,9 @@ public partial class BackupSetEditorWindow : Window
             new System.Windows.Interop.WindowInteropHelper(this).Handle);
         var workArea = screen.WorkingArea;
 
-        MaxHeight = workArea.Height / dpiScale;
+        double maxH = workArea.Height / dpiScale;
+        MaxHeight = maxH;
+        Height = maxH - 20; // small margin so the window doesn't touch screen edges
     }
 
     /// <summary>

@@ -34,6 +34,7 @@ public class MainViewModel : ViewModelBase
     private BackupSetEditorWindow? _editorWindow;
     private Window? _largestFilesWindow;
     private Func<Task>? _pendingSettingsSave;
+    private int? _unsavedNewSetId;
 
     public MainViewModel(
         ICatalogRepository catalog,
@@ -114,6 +115,27 @@ public class MainViewModel : ViewModelBase
         SetRestoreCommand = new RelayCommand(
             o => { if (o is BackupSet s) { SelectedBackupSet = s; StartRestoreFlow(); } },
             o => !IsBurning);
+        SetOrphanedDirsCommand = new RelayCommand(
+            o => { if (o is BackupSet s) { SelectedBackupSet = s; StartOrphanedDirsFlow(); } },
+            o => !IsBurning);
+        SetCoverageCommand = new RelayCommand(
+            o => { if (o is BackupSet s) { SelectedBackupSet = s; StartBackupCoverageFlow(); } },
+            o => o is BackupSet);
+        SetLargestFilesCommand = new RelayCommand(
+            o => { if (o is BackupSet s) { SelectedBackupSet = s; StartLargestFilesFlow(); } },
+            o => !IsBurning);
+        SetCopyCommand = new RelayCommand(
+            o => { if (o is BackupSet s) { SelectedBackupSet = s; _ = CopyBackupSetAsync(); } },
+            o => !IsBurning);
+        SetChangeDestCommand = new RelayCommand(
+            o => { if (o is BackupSet s) { SelectedBackupSet = s; _ = ChangeDestinationAsync(); } },
+            o => !IsBurning && o is BackupSet bs && bs.JobOptions?.TargetDirectory is not null);
+        SetExportCommand = new RelayCommand(
+            o => { if (o is BackupSet s) { SelectedBackupSet = s; _ = ExportBackupSetAsync(); } },
+            o => o is BackupSet);
+        SetDeleteCommand = new RelayCommand(
+            o => { if (o is BackupSet s) _ = DeleteBackupSetAsync(s); },
+            o => !IsBurning && o is BackupSet);
         InstallServiceCommand = new RelayCommand(_ => InstallService());
         UninstallServiceCommand = new RelayCommand(_ => UninstallService());
         StartServiceCommand = new RelayCommand(_ => StartService());
@@ -225,6 +247,13 @@ public class MainViewModel : ViewModelBase
     public ICommand SetBackupCommand { get; }
     public ICommand SetModifyCommand { get; }
     public ICommand SetRestoreCommand { get; }
+    public ICommand SetOrphanedDirsCommand { get; }
+    public ICommand SetCoverageCommand { get; }
+    public ICommand SetLargestFilesCommand { get; }
+    public ICommand SetCopyCommand { get; }
+    public ICommand SetChangeDestCommand { get; }
+    public ICommand SetExportCommand { get; }
+    public ICommand SetDeleteCommand { get; }
     /// <summary>ID of the backup set currently being backed up, or null.</summary>
     public int? RunningBackupSetId
     {
@@ -267,21 +296,28 @@ public class MainViewModel : ViewModelBase
     //   Source Selection → Backup Job Config → Burn Progress → Done
     // -------------------------------------------------------------------
 
-    private void StartNewBackupFlow()
+    private async void StartNewBackupFlow()
     {
-        var sourceSelection = new SourceSelectionViewModel();
-        sourceSelection.SetName = $"Backup {DateTime.Now:yyyy-MM-dd}";
+        try
+        {
+            var newSet = await _catalog.CreateBackupSetAsync(new BackupSet
+            {
+                Name = $"Backup {DateTime.Now:yyyy-MM-dd}",
+                SourceRoots = [],
+                CreatedUtc = DateTime.UtcNow,
+            });
 
-        sourceSelection.NextRequested += sources =>
-            ShowJobConfig(sources, backupSetId: null, sourceSelection);
-        sourceSelection.CancelRequested += GoHome;
-
-        // Default to "has selection" so Next is available immediately
-        // (the user will check boxes before clicking).
-        sourceSelection.HasSelection = true;
-
-        CurrentView = sourceSelection;
-        StatusText = "Select the files and directories to back up.";
+            // Don't reload the list — the new set stays invisible until the
+            // user explicitly clicks Save.  If they close without saving,
+            // the close handler deletes the temporary DB record.
+            _unsavedNewSetId = newSet.Id;
+            SelectedBackupSet = newSet;
+            StartEditFlow();
+        }
+        catch (Exception ex)
+        {
+            StatusText = $"Failed to create backup set: {ex.Message}";
+        }
     }
 
     // -------------------------------------------------------------------
@@ -301,14 +337,22 @@ public class MainViewModel : ViewModelBase
         // Phase 1: async data loading (dialog not yet visible)
         // ---------------------------------------------------------------
 
-        Dictionary<string, Core.Models.FileVersionInfo>? catalogInfo = null;
-        try
+        // Kick off the two slow I/O operations in parallel on the thread pool:
+        // 1. Catalog query (synchronous SQL under the hood)
+        // 2. Drive enumeration (DriveInfo.GetDrives + TotalSize — slow for network drives)
+        var catalogTask = Task.Run(() =>
         {
-            catalogInfo = await _catalog.GetLatestVersionInfoAsync(backupSet.Id);
-        }
-        catch { }
+            try { return _catalog.GetLatestVersionInfoAsync(backupSet.Id).GetAwaiter().GetResult(); }
+            catch { return null as Dictionary<string, Core.Models.FileVersionInfo>; }
+        });
+        var drivesTask = Task.Run(() => SourceSelectionViewModel.EnumerateDrives());
 
-        var sourceSelection = new SourceSelectionViewModel(catalogInfo);
+        await Task.WhenAll(catalogTask, drivesTask);
+
+        var catalogInfo = catalogTask.Result;
+        var drives = drivesTask.Result;
+
+        var sourceSelection = new SourceSelectionViewModel(catalogInfo, drives);
         sourceSelection.IsEditMode = true;
 
         // Restore backup set settings from saved state.
@@ -322,9 +366,34 @@ public class MainViewModel : ViewModelBase
         if (backupSet.SourceSelections is { Count: > 0 })
             await sourceSelection.ApplySelectionsAsync(backupSet.SourceSelections);
 
-        // Enable the Save button immediately — selections exist in a saved set.
-        sourceSelection.HasSelection = true;
+        // Sizes were suppressed during ApplySelectionsAsync to avoid flooding
+        // the scheduler at high priority (which would peg the CPU for minutes).
+        // Now queue a lazy background scan so sizes fill in after the dialog
+        // opens without blocking the UI or grinding the system.
+        _ = sourceSelection.ComputeAllUnknownSizesAsync();
+
+        // Enable Save if selections already exist; for new empty sets, the user
+        // must check at least one box first.
+        if (backupSet.SourceSelections is { Count: > 0 } || backupSet.SourceRoots.Count > 0)
+            sourceSelection.HasSelection = true;
         sourceSelection.ShowLargestFiles = true;
+
+        // Show catalog summary so the user knows files are already tracked
+        // (e.g. from a previous seed or backup).
+        if (catalogInfo is { Count: > 0 })
+        {
+            long totalBytes = 0;
+            foreach (var fvi in catalogInfo.Values)
+                totalBytes += fvi.SizeBytes;
+            sourceSelection.SeedResult =
+                $"{catalogInfo.Count:N0} files ({FormatBytes(totalBytes)}) in catalog.";
+        }
+
+        // For existing sets, start clean — Save enables only when the user
+        // changes something.  New sets (_unsavedNewSetId) keep _needsSave=true
+        // so Save is immediately available.
+        if (_unsavedNewSetId is null)
+            sourceSelection.MarkClean();
 
         // Helper: sync all VM settings into the BackupSet and write to DB.
         async Task SaveAllAsync()
@@ -347,12 +416,54 @@ public class MainViewModel : ViewModelBase
             Title = $"Modify \u2014 {backupSet.Name}",
         };
         _editorWindow = dialog;
+
+        // Prompt before closing if there are unsaved changes.
+        // For new sets: "Discard?"  For existing sets: "Save before closing?"
+        dialog.Closing += (_, e) =>
+        {
+            if (!sourceSelection.HasUnsavedChanges)
+                return;
+
+            if (_unsavedNewSetId is not null)
+            {
+                var result = MessageBox.Show(
+                    "This backup set hasn't been saved yet.\n\nDiscard it?",
+                    "Unsaved Backup Set",
+                    MessageBoxButton.YesNo,
+                    MessageBoxImage.Question);
+
+                if (result != MessageBoxResult.Yes)
+                    e.Cancel = true;
+            }
+            else
+            {
+                var result = MessageBox.Show(
+                    "You have unsaved changes.\n\nSave before closing?",
+                    "Unsaved Changes",
+                    MessageBoxButton.YesNoCancel,
+                    MessageBoxImage.Question);
+
+                if (result == MessageBoxResult.Cancel)
+                    e.Cancel = true;
+                else if (result == MessageBoxResult.No)
+                    _pendingSettingsSave = null; // skip auto-save
+            }
+        };
+
         dialog.Closed += async (_, _) =>
         {
-            // Save all settings when the dialog closes (Close / X button).
-            // Await the write so LoadBackupSetsAsync sees current data.
-            if (_pendingSettingsSave is not null)
+            if (_unsavedNewSetId is int unsavedId)
             {
+                // User closed without saving a new set — discard the
+                // temporary DB record so no orphan appears in the catalog.
+                _unsavedNewSetId = null;
+                _pendingSettingsSave = null;
+                try { await _catalog.DeleteBackupSetAsync(unsavedId); }
+                catch { /* best effort */ }
+            }
+            else if (_pendingSettingsSave is not null)
+            {
+                // Existing set — save all settings on close.
                 await _pendingSettingsSave();
                 _pendingSettingsSave = null;
             }
@@ -366,9 +477,11 @@ public class MainViewModel : ViewModelBase
             try
             {
                 await SaveAllAsync();
+                _unsavedNewSetId = null; // committed — don't delete on close
                 StatusText = $"Backup set \"{sourceSelection.SetName}\" saved. {DateTime.Now:HH:mm:ss}";
                 sourceSelection.SaveStatusText = "Saved";
                 await LoadBackupSetsAsync();
+                SelectedBackupSet = BackupSets.FirstOrDefault(s => s.Id == backupSet.Id);
                 dialog.Title = $"Modify \u2014 {sourceSelection.SetName}";
             }
             catch (Exception ex)
@@ -379,6 +492,66 @@ public class MainViewModel : ViewModelBase
         };
 
         sourceSelection.CancelRequested += () => dialog.Close();
+
+        // "Seed from Existing Backup" button: imports files from an existing
+        // mirror-format backup directory (e.g. backup4all mirror) into the
+        // catalog so future incremental backups only copy new/changed files.
+        sourceSelection.SeedFromExistingRequested += async () =>
+        {
+            // Sync and save current settings first.
+            SyncSettingsToJobOptions(backupSet, sourceSelection);
+            backupSet.SourceSelections = sourceSelection.GetSelections();
+            await Task.Run(() => _catalog.UpdateBackupSetAsync(backupSet));
+
+            string? dir = sourceSelection.TargetDirectory;
+            if (sourceSelection.CreateSubdirectory
+                && !string.IsNullOrWhiteSpace(sourceSelection.SubdirectoryName))
+                dir = Path.Combine(dir!, sourceSelection.SubdirectoryName.Trim());
+
+            if (string.IsNullOrWhiteSpace(dir) || !Directory.Exists(dir))
+            {
+                sourceSelection.SeedResult = "Destination directory does not exist.";
+                return;
+            }
+
+            long lastSeedUpdate = 0;
+            var seedSw = System.Diagnostics.Stopwatch.StartNew();
+            var scanProgress = new Progress<ScanProgress>(sp =>
+            {
+                long now = seedSw.ElapsedMilliseconds;
+                if (now - lastSeedUpdate < ProgressUpdateIntervalMs)
+                    return;
+                lastSeedUpdate = now;
+
+                string current = string.IsNullOrEmpty(sp.CurrentDirectory) ? ""
+                    : $"\n{sp.CurrentDirectory}";
+                sourceSelection.SeedResult =
+                    $"Importing... {sp.FilesFound:N0} files ({FormatBytes(sp.TotalBytes)}){current}";
+            });
+
+            bool skipHash = sourceSelection.SeedSkipHashing;
+            var seedCt = sourceSelection.SeedCancellationToken;
+            int count = await Task.Run(() =>
+                _directoryBackupService.SeedFromExistingDirectoryAsync(
+                    backupSet.Id, dir, scanProgress, seedCt,
+                    skipHashing: skipHash));
+
+            if (count > 0)
+            {
+                sourceSelection.SeedResult =
+                    $"Imported {count:N0} files. Future backups will be incremental.";
+
+                // Check source tree nodes matching the seeded directory structure
+                // so the user sees which drives/directories are covered.
+                await ApplySeedSelectionsAsync(sourceSelection, dir!);
+
+                sourceSelection.HasSelection = true;
+            }
+            else
+            {
+                sourceSelection.SeedResult = "No files found to import.";
+            }
+        };
 
         // Auto-save source selections to the database whenever the user
         // toggles a checkbox.  Debounced because cascading parent→child
@@ -638,6 +811,40 @@ public class MainViewModel : ViewModelBase
         catch (Exception ex)
         {
             StatusText = $"Failed to copy backup set: {ex.Message}";
+        }
+    }
+
+    // -------------------------------------------------------------------
+    // Delete Backup Set
+    // -------------------------------------------------------------------
+
+    private async Task DeleteBackupSetAsync(BackupSet backupSet)
+    {
+        var result = MessageBox.Show(
+            $"Permanently delete \"{backupSet.Name}\"?\n\n" +
+            "This removes the backup set and all its catalog records " +
+            "(disc entries, file records, etc.) from the database.\n\n" +
+            "Files already written to disc or directory are not affected.",
+            "Delete Backup Set",
+            MessageBoxButton.YesNo,
+            MessageBoxImage.Warning);
+
+        if (result != MessageBoxResult.Yes)
+            return;
+
+        try
+        {
+            await _catalog.DeleteBackupSetAsync(backupSet.Id);
+            await LoadBackupSetsAsync();
+
+            if (SelectedBackupSet?.Id == backupSet.Id)
+                SelectedBackupSet = null;
+
+            StatusText = $"Deleted \"{backupSet.Name}\".";
+        }
+        catch (Exception ex)
+        {
+            StatusText = $"Failed to delete backup set: {ex.Message}";
         }
     }
 
@@ -974,6 +1181,64 @@ public class MainViewModel : ViewModelBase
     }
 
     /// <summary>
+    /// After seeding, check the source tree nodes that correspond to the
+    /// directories found in the mirror.  For each drive-prefix subdirectory
+    /// in the mirror (C, D, …), expand the matching drive node and check
+    /// the top-level subdirectories that exist in the mirror so the user
+    /// sees exactly which directories are covered.
+    /// </summary>
+    private static async Task ApplySeedSelectionsAsync(
+        SourceSelectionViewModel sourceSelection, string mirrorDir)
+    {
+        if (sourceSelection.RootNode is null) return;
+
+        var rootDir = new DirectoryInfo(mirrorDir);
+        if (!rootDir.Exists) return;
+
+        foreach (var driveDir in rootDir.EnumerateDirectories())
+        {
+            // Same filter as SeedFromExistingDirectoryAsync: accept single/
+            // double-letter names, skip _prev/_blocks/etc.
+            if (driveDir.Name.StartsWith('_') || driveDir.Name.Length > 2)
+                continue;
+
+            string driveRoot = driveDir.Name + @":\";
+            var driveNode = sourceSelection.RootNode.Children.FirstOrDefault(c =>
+                string.Equals(c.Path, driveRoot, StringComparison.OrdinalIgnoreCase));
+            if (driveNode is null)
+                continue;
+
+            // Expand the drive so its children are loaded.
+            await driveNode.EnsureChildrenLoadedAsync();
+
+            // Check subdirectories that have files in the mirror.
+            bool anyChecked = false;
+            foreach (var subDir in driveDir.EnumerateDirectories())
+            {
+                if (subDir.Name.StartsWith('_'))
+                    continue;
+
+                string subPath = Path.Combine(driveRoot, subDir.Name);
+                var childNode = driveNode.Children.FirstOrDefault(c =>
+                    string.Equals(c.Path.TrimEnd('\\'), subPath.TrimEnd('\\'),
+                                  StringComparison.OrdinalIgnoreCase));
+                if (childNode is not null)
+                {
+                    childNode.IsSelected = true;
+                    anyChecked = true;
+                }
+            }
+
+            // If the mirror only contains loose files directly under the drive
+            // prefix (no subdirectories), check the drive itself.
+            if (!anyChecked && driveDir.EnumerateFiles().Any())
+                driveNode.IsSelected = true;
+        }
+
+        sourceSelection.RefreshHasSelection();
+    }
+
+    /// <summary>
     /// Restore saved job options into the source selection view's settings section.
     /// </summary>
     private static void RestoreSourceSettings(SourceSelectionViewModel vm, JobOptions? opts)
@@ -1053,6 +1318,12 @@ public class MainViewModel : ViewModelBase
 
         // Name.
         backupSet.Name = vm.SetName;
+
+        // Source roots — derive from the current tree selections so orphaned-
+        // directory detection and other consumers always have an up-to-date
+        // flat list of covered root paths.
+        var selections = vm.GetSelections();
+        backupSet.SourceRoots = selections.Select(s => s.Path).ToList();
 
         // Exclusions.
         opts.ExcludedExtensions = !string.IsNullOrWhiteSpace(vm.ExcludedPatterns)
@@ -1500,16 +1771,28 @@ public class MainViewModel : ViewModelBase
     // Flow 4: Orphaned Directories
     // -------------------------------------------------------------------
 
-    private void StartOrphanedDirsFlow()
+    private async void StartOrphanedDirsFlow()
     {
         if (SelectedBackupSet is null)
             return;
 
-        var vm = new OrphanedDirectoriesViewModel(_catalog, SelectedBackupSet);
-        vm.DoneRequested += GoHome;
+        Mouse.OverrideCursor = Cursors.Wait;
+        try
+        {
+            var vm = new OrphanedDirectoriesViewModel(_catalog, SelectedBackupSet);
+            vm.DoneRequested += GoHome;
 
-        CurrentView = vm;
-        StatusText = "Review directories no longer in the backup sources.";
+            // Wait for the initial data load so the view appears fully populated
+            // instead of flashing a "Loading..." placeholder.
+            await vm.WaitForLoadAsync();
+
+            CurrentView = vm;
+            StatusText = "Review directories no longer in the backup sources.";
+        }
+        finally
+        {
+            Mouse.OverrideCursor = null;
+        }
     }
 
     // -------------------------------------------------------------------
