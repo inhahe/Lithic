@@ -1051,7 +1051,8 @@ public class SourceSelectionViewModel : ViewModelBase
         {
             int total = uncalculated.Count;
             int done = 0;
-            SizeCalculationResult = $"Scanning 0/{total:N0}...";
+            var firstName = System.IO.Path.GetFileName(uncalculated[0].Path.TrimEnd('\\'));
+            SizeCalculationResult = $"Scanning 1/{total:N0}: {firstName}";
 
             // Progress<T> marshals callbacks to the UI thread via
             // SynchronizationContext, so property sets are safe here.
@@ -1059,7 +1060,7 @@ public class SourceSelectionViewModel : ViewModelBase
             {
                 done++;
                 var dirName = System.IO.Path.GetFileName(path.TrimEnd('\\'));
-                SizeCalculationResult = $"Scanning {done:N0}/{total:N0}: {dirName}";
+                SizeCalculationResult = $"Scanning {Math.Min(done + 1, total):N0}/{total:N0}: {dirName}";
             });
 
             await _scheduler.EnqueueAsync(uncalculated, isPriority: true, progress);
