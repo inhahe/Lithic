@@ -85,12 +85,17 @@ public partial class App : Application
         // Version retention service (available for use in consolidation workflows).
         var retentionService = new VersionRetentionService(_catalog);
 
+        // Shared file-hash cache — dedup analysis pre-computes hashes that
+        // the backup service reuses to avoid redundant I/O.
+        var fileHashCache = new FileHashCache();
+
         // Directory backup service.
         var directoryBackupService = new DirectoryBackupService(
-            _catalog, scanner, retentionService, deduplicationEngine);
+            _catalog, scanner, retentionService, deduplicationEngine, fileHashCache);
 
         var mainViewModel = new MainViewModel(
-            _catalog, burner, scanner, orchestrator, restoreService, directoryBackupService, _trayService);
+            _catalog, burner, scanner, orchestrator, restoreService, directoryBackupService, _trayService,
+            fileHashCache);
         var mainWindow = new MainWindow { DataContext = mainViewModel };
 
         // --- User settings & system tray icon ---

@@ -177,6 +177,11 @@ public class LargestFilesViewModel : ViewModelBase
     public string SizeSortIndicator => _sortColumn == "Size"
         ? (_sortAscending ? " \u25B2" : " \u25BC") : "";
 
+    /// <summary>Sort indicator for the directory tree "Directory" header.
+    /// Shows when sort is by Name or Directory (both map to directory name in tree).</summary>
+    public string DirTreeNameSortIndicator => _sortColumn is "Name" or "Directory"
+        ? (_sortAscending ? " \u25B2" : " \u25BC") : "";
+
     private ObservableCollection<LargestFileItem> _filesCollection = [];
     public ObservableCollection<LargestFileItem> Files
     {
@@ -243,7 +248,9 @@ public class LargestFilesViewModel : ViewModelBase
         OnPropertyChanged(nameof(NameSortIndicator));
         OnPropertyChanged(nameof(DirectorySortIndicator));
         OnPropertyChanged(nameof(SizeSortIndicator));
+        OnPropertyChanged(nameof(DirTreeNameSortIndicator));
 
+        // Sort flat file list.
         FilesView.SortDescriptions.Clear();
         var direction = ascending
             ? ListSortDirection.Ascending
@@ -256,6 +263,49 @@ public class LargestFilesViewModel : ViewModelBase
             _ => "SizeBytes",
         };
         FilesView.SortDescriptions.Add(new SortDescription(prop, direction));
+
+        // Sort directory tree recursively.
+        SortDirectoryTree();
+    }
+
+    /// <summary>
+    /// Recursively sort the directory tree according to the current sort column
+    /// and direction.  Preserves expansion state (IsExpanded lives on the
+    /// DirectoryItem data objects, not on the UI containers).
+    /// </summary>
+    private void SortDirectoryTree()
+    {
+        if (_directories is null) return;
+
+        Comparison<DirectoryItem> comparison = _sortColumn switch
+        {
+            "Name" or "Directory" => _sortAscending
+                ? (a, b) => string.Compare(a.Name, b.Name, StringComparison.OrdinalIgnoreCase)
+                : (a, b) => string.Compare(b.Name, a.Name, StringComparison.OrdinalIgnoreCase),
+            _ => _sortAscending
+                ? (a, b) => a.SizeBytes.CompareTo(b.SizeBytes)
+                : (a, b) => b.SizeBytes.CompareTo(a.SizeBytes),
+        };
+
+        foreach (var root in _directories)
+            SortDirectoryChildrenRecursive(root.Children, comparison);
+
+        // Force the TreeView to re-bind.  IsExpanded is preserved because it
+        // lives on the DirectoryItem objects, not on the WPF containers.
+        var dirs = _directories;
+        Directories = null;
+        Directories = dirs;
+    }
+
+    private static void SortDirectoryChildrenRecursive(
+        List<DirectoryItem> items, Comparison<DirectoryItem> comparison)
+    {
+        items.Sort(comparison);
+        foreach (var item in items)
+        {
+            if (item.Children.Count > 0)
+                SortDirectoryChildrenRecursive(item.Children, comparison);
+        }
     }
 
     // --- Inclusion toggle ---
@@ -664,15 +714,7 @@ public class LargestFilesViewModel : ViewModelBase
         ];
     }
 
-    internal static string FormatBytes(long bytes)
-    {
-        if (bytes <= 0) return "0 B";
-        string[] units = ["B", "KB", "MB", "GB", "TB"];
-        int i = 0;
-        double size = bytes;
-        while (size >= 1024 && i < units.Length - 1) { size /= 1024; i++; }
-        return i == 0 ? $"{size:N0} {units[i]}" : $"{size:N1} {units[i]}";
-    }
+    internal static string FormatBytes(long bytes) => $"{bytes:N0}";
 }
 
 /// <summary>A single file entry for the largest files view.</summary>

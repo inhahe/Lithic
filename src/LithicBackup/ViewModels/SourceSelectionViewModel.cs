@@ -1,8 +1,11 @@
 using System.Collections.ObjectModel;
 using System.ComponentModel;
 using System.IO;
+using System.Security.Cryptography;
 using System.Windows;
 using System.Windows.Input;
+using LithicBackup.Core;
+using LithicBackup.Core.Interfaces;
 using LithicBackup.Core.Models;
 using LithicBackup.Services;
 
@@ -53,6 +56,8 @@ public class SourceSelectionViewModel : ViewModelBase
     private readonly List<DriveData>? _preloadedDrives;
     private bool _showLargestFiles;
     private bool _isApplyingSelections;
+    private Func<string, bool>? _cachedExcludeFilter;
+    private bool _excludeFilterDirty = true;
     private bool _isEditMode;
     private string _saveStatusText = "";
     private bool _isCalculatingSize;
@@ -63,6 +68,11 @@ public class SourceSelectionViewModel : ViewModelBase
     private CancellationTokenSource? _seedCts;
     private bool _needsSave = true;
     private string _destinationSpaceText = "";
+    private readonly FileHashCache? _fileHashCache;
+    private readonly IFileScanner? _scanner;
+    private bool _isAnalyzingDedup;
+    private string _dedupAnalysisResult = "";
+    private CancellationTokenSource? _dedupCts;
 
     /// <summary>Fired when the user clicks "Next" with a valid selection.</summary>
     public event Action<List<SourceSelection>>? NextRequested;
@@ -114,10 +124,14 @@ public class SourceSelectionViewModel : ViewModelBase
 
     public SourceSelectionViewModel(
         Dictionary<string, FileVersionInfo>? catalogInfo = null,
-        List<DriveData>? preloadedDrives = null)
+        List<DriveData>? preloadedDrives = null,
+        FileHashCache? fileHashCache = null,
+        IFileScanner? scanner = null)
     {
         _catalogInfo = catalogInfo;
         _preloadedDrives = preloadedDrives;
+        _fileHashCache = fileHashCache;
+        _scanner = scanner;
         Roots = [];
         RetentionTiers = [];
         TierSets = [];
@@ -145,6 +159,12 @@ public class SourceSelectionViewModel : ViewModelBase
         CancelSeedCommand = new RelayCommand(
             _ => _seedCts?.Cancel(),
             _ => IsSeeding && _seedCts is not null && !_seedCts.IsCancellationRequested);
+        AnalyzeDedupCommand = new RelayCommand(
+            _ => _ = OnAnalyzeDedupAsync(),
+            _ => !_isAnalyzingDedup);
+        CancelDedupCommand = new RelayCommand(
+            _ => _dedupCts?.Cancel(),
+            _ => _isAnalyzingDedup && _dedupCts is not null && !_dedupCts.IsCancellationRequested);
 
         // Clear the "Saved" indicator and mark dirty whenever the user changes anything.
         PropertyChanged += (_, e) =>
@@ -160,7 +180,8 @@ public class SourceSelectionViewModel : ViewModelBase
                     or nameof(CanEditSelectedTierSet)
                     or nameof(IsCalculatingSize) or nameof(SizeCalculationResult)
                     or nameof(IsSeeding) or nameof(SeedResult)
-                    or nameof(DestinationSpaceText)))
+                    or nameof(DestinationSpaceText)
+                    or nameof(IsAnalyzingDedup) or nameof(DedupAnalysisResult)))
             {
                 if (!string.IsNullOrEmpty(_saveStatusText))
                     SaveStatusText = "";
@@ -316,7 +337,55 @@ public class SourceSelectionViewModel : ViewModelBase
         // the size report can be recalculated with the new filters.
         if (e.PropertyName is nameof(TierSetViewModel.FilePatternsText)
                            or nameof(TierSetViewModel.FileExemptPatternsText))
+        {
+            _excludeFilterDirty = true;
             ExclusionSettingsChanged?.Invoke();
+            // Refresh "selected only" sizes with updated exclusion filter.
+            if (_showSelectedSizesOnly)
+            {
+                foreach (var root in Roots)
+                    root.RefreshFormattedSize();
+                RefreshSelectedSize();
+            }
+        }
+    }
+
+    /// <summary>
+    /// Build the combined exclusion filter from tier sets with 0 tiers and
+    /// global excluded extensions.  Mirrors <c>DirectoryBackupService.BuildExclusionFilter</c>.
+    /// The result is cached and rebuilt only when tier set patterns change.
+    /// </summary>
+    internal Func<string, bool>? GetExcludeFilter()
+    {
+        if (!_excludeFilterDirty)
+            return _cachedExcludeFilter;
+
+        _excludeFilterDirty = false;
+        _cachedExcludeFilter = null;
+
+        // Build tier-set-based exclusion (0-tier sets with patterns).
+        Func<string, VersionTierSet>? tierResolver = null;
+        var tierModels = TierSets.Select(ts => ts.ToModel()).ToList();
+        if (tierModels.Count > 0)
+        {
+            bool hasExclusion = tierModels.Any(ts =>
+                ts.Tiers.Count == 0
+                && ts.FilePatterns.Count > 0
+                && !string.Equals(ts.Name, "Default", StringComparison.OrdinalIgnoreCase));
+            if (hasExclusion)
+                tierResolver = VersionTierSet.BuildTierResolver(tierModels);
+        }
+
+        if (tierResolver is null)
+            return null;
+
+        _cachedExcludeFilter = path =>
+        {
+            if (tierResolver(path).Tiers.Count == 0)
+                return true;
+            return false;
+        };
+        return _cachedExcludeFilter;
     }
 
     /// <summary>
@@ -370,6 +439,15 @@ public class SourceSelectionViewModel : ViewModelBase
             // Refresh all loaded nodes so FormattedSize re-evaluates.
             foreach (var root in Roots)
                 root.RefreshFormattedSize();
+
+            // Re-sort when the size column is active because the effective
+            // sort keys change between raw size and selected-only size.
+            if (_sortColumn == SortColumn.Size)
+            {
+                SortRoots();
+                foreach (var root in Roots)
+                    root.SortChildren();
+            }
         }
     }
 
@@ -580,8 +658,13 @@ public class SourceSelectionViewModel : ViewModelBase
     /// True while <see cref="ApplySelectionsAsync"/> is restoring saved state.
     /// External listeners (e.g. auto-save) should ignore <see cref="SelectionChanged"/>
     /// events while this is set, to avoid overwriting saved data with partially-restored state.
+    /// The view can bind to this to show a loading overlay while the tree is populated.
     /// </summary>
-    public bool IsApplyingSelections => _isApplyingSelections;
+    public bool IsApplyingSelections
+    {
+        get => _isApplyingSelections;
+        private set => SetProperty(ref _isApplyingSelections, value);
+    }
 
     /// <summary>
     /// When true the view is in "edit existing set" mode: shows Save/Close
@@ -648,6 +731,20 @@ public class SourceSelectionViewModel : ViewModelBase
     /// <summary>Token for the in-progress seed operation (read by the handler).</summary>
     public CancellationToken SeedCancellationToken => _seedCts?.Token ?? CancellationToken.None;
 
+    /// <summary>True while a dedup analysis is running.</summary>
+    public bool IsAnalyzingDedup
+    {
+        get => _isAnalyzingDedup;
+        private set => SetProperty(ref _isAnalyzingDedup, value);
+    }
+
+    /// <summary>Multi-line result string from the last dedup analysis.</summary>
+    public string DedupAnalysisResult
+    {
+        get => _dedupAnalysisResult;
+        private set => SetProperty(ref _dedupAnalysisResult, value);
+    }
+
     /// <summary>
     /// True when there are unsaved changes. Used by the dialog to decide
     /// whether to prompt before closing, and by the Save button CanExecute.
@@ -681,6 +778,8 @@ public class SourceSelectionViewModel : ViewModelBase
     public ICommand RemoveTierSetCommand { get; }
     public ICommand AddPathCommand { get; }
     public ICommand AutoIncludeCheckedCommand { get; }
+    public ICommand AnalyzeDedupCommand { get; }
+    public ICommand CancelDedupCommand { get; }
 
     /// <summary>
     /// Called by the view (or a timer) to recheck whether any files are selected.
@@ -699,7 +798,8 @@ public class SourceSelectionViewModel : ViewModelBase
         long total = 0;
         int fileCount = 0;
         int dirCount = 0;
-        ComputeSelectedSize(Roots, ref total, ref fileCount, ref dirCount);
+        var filter = _showSelectedSizesOnly ? GetExcludeFilter() : null;
+        ComputeSelectedSize(Roots, filter, ref total, ref fileCount, ref dirCount);
 
         if (fileCount == 0 && dirCount == 0)
         {
@@ -716,12 +816,23 @@ public class SourceSelectionViewModel : ViewModelBase
 
     private static void ComputeSelectedSize(
         IEnumerable<SourceSelectionNodeViewModel> nodes,
+        Func<string, bool>? excludeFilter,
         ref long total, ref int fileCount, ref int dirCount)
     {
         foreach (var node in nodes)
         {
             if (node.IsSelected == false)
                 continue;
+
+            // Skip nodes excluded by the backup filter (0-tier tier sets).
+            if (excludeFilter is not null)
+            {
+                string testPath = node.IsDirectory
+                    ? System.IO.Path.Combine(node.Path, "_")
+                    : node.Path;
+                if (excludeFilter(testPath))
+                    continue;
+            }
 
             if (!node.IsDirectory)
             {
@@ -745,7 +856,7 @@ public class SourceSelectionViewModel : ViewModelBase
                 // Partially selected directory — recurse to count only
                 // selected children.
                 dirCount++;
-                ComputeSelectedSize(node.Children, ref total, ref fileCount, ref dirCount);
+                ComputeSelectedSize(node.Children, excludeFilter, ref total, ref fileCount, ref dirCount);
             }
         }
     }
@@ -764,7 +875,8 @@ public class SourceSelectionViewModel : ViewModelBase
             () => ShowSizes, () => (_sortColumn, _sortAscending), _scheduler,
             () => { RefreshHasSelection(); RefreshSelectedSize(); SizeCalculationResult = ""; SelectionChanged?.Invoke(); },
             () => ShowSelectedSizesOnly,
-            _catalogInfo);
+            _catalogInfo,
+            getExcludeFilter: () => GetExcludeFilter());
         RootNode = root;
 
         // Mark as loaded BEFORE setting IsExpanded — otherwise the
@@ -956,7 +1068,7 @@ public class SourceSelectionViewModel : ViewModelBase
     {
         if (RootNode is null) return;
 
-        _isApplyingSelections = true;
+        IsApplyingSelections = true;
         try
         {
 
@@ -1021,7 +1133,7 @@ public class SourceSelectionViewModel : ViewModelBase
         }
         finally
         {
-            _isApplyingSelections = false;
+            IsApplyingSelections = false;
         }
     }
 
@@ -1084,6 +1196,177 @@ public class SourceSelectionViewModel : ViewModelBase
         IsCalculatingSize = false;
     }
 
+    // -------------------------------------------------------------------
+    // Dedup analysis
+    // -------------------------------------------------------------------
+
+    /// <summary>
+    /// Run file-level dedup analysis: scan selected files, group by size,
+    /// hash same-size candidates (reusing cached hashes where possible),
+    /// and report savings. Results are persisted in <see cref="FileHashCache"/>
+    /// so the actual backup reuses them.
+    /// </summary>
+    private async Task OnAnalyzeDedupAsync()
+    {
+        if (_fileHashCache is null || _scanner is null) return;
+
+        IsAnalyzingDedup = true;
+        DedupAnalysisResult = "Scanning selected files...";
+        _dedupCts = new CancellationTokenSource();
+        var ct = _dedupCts.Token;
+
+        try
+        {
+            // 1. Collect the set of files to analyse by scanning the
+            //    current selections with the exclusion filter applied.
+            var selections = GetSelections();
+            if (selections.Count == 0)
+            {
+                DedupAnalysisResult = "No files selected.";
+                return;
+            }
+
+            var excludeFilter = GetExcludeFilter();
+            var scanned = await _scanner.ScanAsync(selections, progress: null, ct, excludeFilter);
+            ct.ThrowIfCancellationRequested();
+
+            if (scanned.Count == 0)
+            {
+                DedupAnalysisResult = "No files found.";
+                return;
+            }
+
+            // 2. Group files by size — only groups with 2+ files need hashing.
+            var sizeGroups = scanned
+                .GroupBy(f => f.SizeBytes)
+                .Where(g => g.Count() >= 2)
+                .ToList();
+
+            int candidateFiles = sizeGroups.Sum(g => g.Count());
+            int uniqueSizeFiles = scanned.Count - candidateFiles;
+
+            DedupAnalysisResult = $"Scanning: {scanned.Count:N0} files, " +
+                $"{candidateFiles:N0} share a size with another file...";
+
+            // 3. Hash candidates on a background thread.
+            int filesHashed = 0;
+            int filesProcessed = 0;
+            long lastProgressTick = 0;
+            long totalRawSize = scanned.Sum(f => f.SizeBytes);
+            var hashMap = new Dictionary<string, List<ScannedFile>>();
+
+            await Task.Run(async () =>
+            {
+                foreach (var group in sizeGroups)
+                {
+                    foreach (var file in group)
+                    {
+                        ct.ThrowIfCancellationRequested();
+
+                        // Rate-limited progress (~4 updates/sec).
+                        long now = Environment.TickCount64;
+                        if (now - lastProgressTick >= 250)
+                        {
+                            lastProgressTick = now;
+                            int n = filesProcessed;
+                            int h = filesHashed;
+                            _ = Application.Current.Dispatcher.InvokeAsync(() =>
+                                DedupAnalysisResult =
+                                    $"Hashing candidate {n + 1:N0} of {candidateFiles:N0}" +
+                                    (h > 0 ? $" ({h:N0} new)" : "") + "...");
+                        }
+
+                        string? hash = _fileHashCache.TryGetHash(
+                            file.FullPath, file.SizeBytes, file.LastWriteUtc);
+
+                        if (hash is null)
+                        {
+                            try
+                            {
+                                await using var stream = new FileStream(
+                                    file.FullPath, FileMode.Open, FileAccess.Read,
+                                    FileShare.Read, bufferSize: 81920, useAsync: true);
+                                var bytes = await SHA256.HashDataAsync(stream, ct);
+                                hash = Convert.ToHexString(bytes).ToLowerInvariant();
+
+                                _fileHashCache.Set(
+                                    file.FullPath, file.SizeBytes, file.LastWriteUtc, hash);
+                                filesHashed++;
+                            }
+                            catch (OperationCanceledException) { throw; }
+                            catch
+                            {
+                                // File locked or inaccessible — skip it.
+                                filesProcessed++;
+                                continue;
+                            }
+                        }
+
+                        if (!hashMap.TryGetValue(hash, out var list))
+                        {
+                            list = [];
+                            hashMap[hash] = list;
+                        }
+                        list.Add(file);
+
+                        filesProcessed++;
+                    }
+                }
+
+                _fileHashCache.Flush();
+            }, ct);
+
+            ct.ThrowIfCancellationRequested();
+
+            // 4. Compute savings.
+            long bytesSaved = 0;
+            int duplicateFiles = 0;
+            foreach (var (_, files) in hashMap)
+            {
+                if (files.Count <= 1) continue;
+                // Keep one copy; the rest are duplicates.
+                var ordered = files.OrderByDescending(f => f.SizeBytes).ToList();
+                for (int i = 1; i < ordered.Count; i++)
+                {
+                    bytesSaved += ordered[i].SizeBytes;
+                    duplicateFiles++;
+                }
+            }
+
+            int uniqueHashes = hashMap.Count + uniqueSizeFiles;
+            long dedupSize = totalRawSize - bytesSaved;
+
+            // 5. Build result text.
+            var lines = new List<string>
+            {
+                $"Scanned: {scanned.Count:N0} files, {SourceSelectionNodeViewModel.FormatBytes(totalRawSize)}",
+                $"Unique files: {uniqueHashes:N0}  |  Duplicates: {duplicateFiles:N0}",
+                $"Dedup savings: {SourceSelectionNodeViewModel.FormatBytes(bytesSaved)} " +
+                    $"({(totalRawSize > 0 ? (double)bytesSaved / totalRawSize * 100 : 0):F1}%)",
+                $"Post-dedup size: {SourceSelectionNodeViewModel.FormatBytes(dedupSize)}",
+            };
+            if (filesHashed > 0)
+                lines.Add($"({filesHashed:N0} files hashed, {candidateFiles - filesHashed:N0} from cache)");
+
+            DedupAnalysisResult = string.Join("\n", lines);
+        }
+        catch (OperationCanceledException)
+        {
+            DedupAnalysisResult = "Dedup analysis cancelled.";
+        }
+        catch (Exception ex)
+        {
+            DedupAnalysisResult = $"Dedup analysis failed: {ex.Message}";
+        }
+        finally
+        {
+            IsAnalyzingDedup = false;
+            _dedupCts?.Dispose();
+            _dedupCts = null;
+            CommandManager.InvalidateRequerySuggested();
+        }
+    }
+
     /// <summary>
     /// Build a detailed multi-line size report showing total selected,
     /// already-backed-up, new/changed to write, and destination space.
@@ -1093,7 +1376,7 @@ public class SourceSelectionViewModel : ViewModelBase
         long totalSize = 0;
         int fileCount = 0;
         int dirCount = 0;
-        ComputeSelectedSize(Roots, ref totalSize, ref fileCount, ref dirCount);
+        ComputeSelectedSize(Roots, GetExcludeFilter(), ref totalSize, ref fileCount, ref dirCount);
 
         if (fileCount == 0 && dirCount == 0)
         {
@@ -1393,6 +1676,7 @@ public class SourceSelectionViewModel : ViewModelBase
     /// </summary>
     public void LoadTierSets(List<VersionTierSet> tierSets)
     {
+        _excludeFilterDirty = true;
         TierSets.Clear();
 
         if (tierSets.Count == 0)

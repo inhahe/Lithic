@@ -41,12 +41,12 @@ public class SourceSelectionNodeViewModel : ViewModelBase
     private Task? _loadTask;
     private long _size = -1;
     private int _fileCount = -1;
-    private bool _isComputing;
     private BackupStatus _backupStatus = BackupStatus.Unknown;
     private readonly Func<bool>? _getShowSizes;
     private readonly Func<(SortColumn Column, bool Ascending)>? _getSortMode;
     private readonly SizeComputeScheduler? _scheduler;
     private readonly Func<bool>? _getShowSelectedOnly;
+    private readonly Func<Func<string, bool>?>? _getExcludeFilter;
     private readonly Action? _onSelectionChanged;
     private readonly Dictionary<string, FileVersionInfo>? _catalogInfo;
 
@@ -56,7 +56,8 @@ public class SourceSelectionNodeViewModel : ViewModelBase
         Func<(SortColumn Column, bool Ascending)>? getSortMode = null,
         SizeComputeScheduler? scheduler = null, Action? onSelectionChanged = null,
         Func<bool>? getShowSelectedOnly = null,
-        Dictionary<string, FileVersionInfo>? catalogInfo = null)
+        Dictionary<string, FileVersionInfo>? catalogInfo = null,
+        Func<Func<string, bool>?>? getExcludeFilter = null)
     {
         Path = path;
         Name = System.IO.Path.GetFileName(path);
@@ -69,6 +70,7 @@ public class SourceSelectionNodeViewModel : ViewModelBase
         _scheduler = scheduler ?? parent?._scheduler;
         _onSelectionChanged = onSelectionChanged ?? parent?._onSelectionChanged;
         _getShowSelectedOnly = getShowSelectedOnly ?? parent?._getShowSelectedOnly;
+        _getExcludeFilter = getExcludeFilter ?? parent?._getExcludeFilter;
         _catalogInfo = catalogInfo ?? parent?._catalogInfo;
         Depth = parent is null ? 0 : parent.Depth + 1;
         Children = [];
@@ -111,7 +113,14 @@ public class SourceSelectionNodeViewModel : ViewModelBase
         internal set
         {
             if (SetProperty(ref _size, value))
+            {
                 OnPropertyChanged(nameof(FormattedSize));
+                // In "selected only" mode, partially-selected ancestors
+                // compute their displayed size from children's _size values.
+                // Propagate the notification up so they re-evaluate.
+                if ((_getShowSelectedOnly?.Invoke() ?? false) && Parent is not null)
+                    Parent.InvalidateSelectedSize();
+            }
         }
     }
 
@@ -125,20 +134,10 @@ public class SourceSelectionNodeViewModel : ViewModelBase
         internal set
         {
             if (SetProperty(ref _fileCount, value))
-                OnPropertyChanged(nameof(FormattedFileCount));
-        }
-    }
-
-    /// <summary>Whether this node's size is currently being computed by the scheduler.</summary>
-    public bool IsComputing
-    {
-        get => _isComputing;
-        internal set
-        {
-            if (SetProperty(ref _isComputing, value))
             {
-                OnPropertyChanged(nameof(FormattedSize));
                 OnPropertyChanged(nameof(FormattedFileCount));
+                if ((_getShowSelectedOnly?.Invoke() ?? false) && Parent is not null)
+                    Parent.InvalidateSelectedFileCount();
             }
         }
     }
@@ -146,73 +145,156 @@ public class SourceSelectionNodeViewModel : ViewModelBase
     /// <summary>Human-readable size string (e.g. "1.2 GB"). Empty when
     /// "selected only" mode is active and this node is not selected.
     /// In "selected only" mode, partially-selected directories show the
-    /// sum of their selected children rather than the full filesystem size.</summary>
+    /// sum of their selected children rather than the full filesystem size.
+    /// Shows "Working..." while any contributing child's size is unknown.</summary>
     public string FormattedSize
     {
         get
         {
-            if (_size < 0)
-                return _isComputing ? "Working..." : "";
             bool selectedOnly = _getShowSelectedOnly?.Invoke() ?? false;
-            if (selectedOnly && IsSelected == false) return "";
-            if (selectedOnly && IsDirectory && IsSelected == null && _isLoaded)
-                return FormatBytes(ComputeSelectedChildrenSize());
-            return FormatBytes(_size);
+            if (selectedOnly)
+            {
+                if (IsSelected == false) return "";
+                // Node itself excluded by the backup filter (0-tier tier
+                // set pattern or global exclusion) — nothing will be backed up.
+                if (IsExcludedByFilter(this, _getExcludeFilter?.Invoke())) return "";
+                if (IsDirectory && IsSelected == null && _isLoaded)
+                {
+                    var total = ComputeSelectedChildrenSize();
+                    return total.HasValue ? FormatBytes(total.Value) : "Working...";
+                }
+                // Fully-selected directory or file in "selected only" mode.
+                return _size < 0 ? "Working..." : FormatBytes(_size);
+            }
+            return _size < 0 ? "Working..." : FormatBytes(_size);
         }
     }
 
     /// <summary>Formatted file count string (e.g. "1,234"). Empty for
     /// individual files or when the count is not yet computed.
     /// In "selected only" mode, partially-selected directories show the
-    /// count of selected children only.</summary>
+    /// count of selected children only.
+    /// Shows "Working..." while any contributing child's count is unknown.</summary>
     public string FormattedFileCount
     {
         get
         {
             if (!IsDirectory) return "";
-            if (_fileCount < 0)
-                return _isComputing ? "Working..." : "";
             bool selectedOnly = _getShowSelectedOnly?.Invoke() ?? false;
-            if (selectedOnly && IsSelected == false) return "";
-            if (selectedOnly && IsSelected == null && _isLoaded)
-                return ComputeSelectedChildrenFileCount().ToString("N0");
-            return _fileCount.ToString("N0");
+            if (selectedOnly)
+            {
+                if (IsSelected == false) return "";
+                if (IsExcludedByFilter(this, _getExcludeFilter?.Invoke())) return "";
+                if (IsSelected == null && _isLoaded)
+                {
+                    var total = ComputeSelectedChildrenFileCount();
+                    return total.HasValue ? total.Value.ToString("N0") : "Working...";
+                }
+                return _fileCount < 0 ? "Working..." : _fileCount.ToString("N0");
+            }
+            return _fileCount < 0 ? "Working..." : _fileCount.ToString("N0");
         }
     }
 
-    /// <summary>Recursively sum the sizes of selected children.</summary>
-    private long ComputeSelectedChildrenSize()
+    /// <summary>
+    /// Recursively sum the sizes of selected children.
+    /// Returns <c>null</c> when any contributing child's size is still unknown,
+    /// signalling the caller to display "Working..." instead of a partial total.
+    /// Skips nodes that match the configured exclusion filter (0-tier tier sets
+    /// and global excluded extensions), since those files aren't actually backed up.
+    /// </summary>
+    private long? ComputeSelectedChildrenSize()
     {
+        var filter = _getExcludeFilter?.Invoke();
         long total = 0;
         foreach (var child in Children)
         {
             if (child.IsSelected == false) continue;
-            if (child._size < 0) continue;
+            if (IsExcludedByFilter(child, filter)) continue;
 
             if (!child.IsDirectory || child.IsSelected == true)
+            {
+                if (child._size < 0) return null;
                 total += child._size;
+            }
             else if (child._isLoaded)
-                total += child.ComputeSelectedChildrenSize();
+            {
+                var sub = child.ComputeSelectedChildrenSize();
+                if (sub is null) return null;
+                total += sub.Value;
+            }
+            else
+            {
+                // Child directory not loaded — can't compute its contribution.
+                return null;
+            }
         }
         return total;
     }
 
-    /// <summary>Recursively count files in selected children.</summary>
-    private int ComputeSelectedChildrenFileCount()
+    /// <summary>
+    /// Recursively count files in selected children.
+    /// Returns <c>null</c> when any contributing child's count is still unknown.
+    /// </summary>
+    private int? ComputeSelectedChildrenFileCount()
     {
+        var filter = _getExcludeFilter?.Invoke();
         int total = 0;
         foreach (var child in Children)
         {
             if (child.IsSelected == false) continue;
+            if (IsExcludedByFilter(child, filter)) continue;
 
             if (!child.IsDirectory)
+            {
                 total += 1;
-            else if (child.IsSelected == true && child._fileCount >= 0)
+            }
+            else if (child.IsSelected == true)
+            {
+                if (child._fileCount < 0) return null;
                 total += child._fileCount;
+            }
             else if (child._isLoaded)
-                total += child.ComputeSelectedChildrenFileCount();
+            {
+                var sub = child.ComputeSelectedChildrenFileCount();
+                if (sub is null) return null;
+                total += sub.Value;
+            }
+            else
+            {
+                return null;
+            }
         }
         return total;
+    }
+
+    /// <summary>
+    /// Test whether a node is excluded by the backup exclusion filter.
+    /// For directories, tests a synthetic child path (same approach as
+    /// <c>DirectoryBackupService.BuildExclusionFilter</c>).
+    /// For files, tests the file path directly.
+    /// </summary>
+    private static bool IsExcludedByFilter(
+        SourceSelectionNodeViewModel node, Func<string, bool>? filter)
+    {
+        if (filter is null) return false;
+        return node.IsDirectory
+            ? filter(System.IO.Path.Combine(node.Path, "_"))
+            : filter(node.Path);
+    }
+
+    /// <summary>
+    /// Compute the size that would be displayed for this node in "selected only"
+    /// mode, accounting for the exclusion filter.  Used as the sort key so that
+    /// sort order matches the visible numbers.
+    /// </summary>
+    internal long GetEffectiveSize(Func<string, bool>? filter)
+    {
+        if (IsSelected == false) return -1;
+        if (IsExcludedByFilter(this, filter)) return -1;
+        if (IsDirectory && IsSelected == null && _isLoaded)
+            return ComputeSelectedChildrenSize() ?? -1;
+        return _size;
     }
 
     /// <summary>Backup status relative to the catalog.</summary>
@@ -308,15 +390,16 @@ public class SourceSelectionNodeViewModel : ViewModelBase
     }
 
     /// <summary>
-    /// Ensure children are loaded (expanding the node if needed) and wait
-    /// for the load to complete.
+    /// Ensure children are loaded and wait for the load to complete.
+    /// Does NOT change <see cref="IsExpanded"/> — callers that want the
+    /// node visually expanded must set it separately after loading.
     /// </summary>
     internal async Task EnsureChildrenLoadedAsync()
     {
         if (!IsDirectory) return;
 
         if (!_isLoaded)
-            IsExpanded = true;
+            _loadTask = LoadChildrenAsync();
 
         if (_loadTask is not null)
             await _loadTask;
@@ -324,7 +407,8 @@ public class SourceSelectionNodeViewModel : ViewModelBase
 
     /// <summary>
     /// Apply a saved <see cref="Core.Models.SourceSelection"/> to this node,
-    /// restoring selection state, options, and recursing into children.
+    /// restoring selection state, options, expansion state, and recursing
+    /// into children.
     /// </summary>
     internal async Task ApplySelectionAsync(Core.Models.SourceSelection model)
     {
@@ -338,10 +422,9 @@ public class SourceSelectionNodeViewModel : ViewModelBase
         _autoIncludeNew = model.AutoIncludeNewSubdirectories;
         OnPropertyChanged(nameof(AutoIncludeNew));
 
-        // If this directory has child selections to restore, expand and apply.
-        // Suppress size computation during this expansion — we're restoring
-        // saved state, not responding to a user click.  Sizes are computed
-        // lazily after the dialog opens.
+        // If this directory has child selections to restore, load children
+        // and apply.  Suppress size computation during this phase — we're
+        // restoring saved state, not responding to a user click.
         if (IsDirectory && model.Children.Count > 0)
         {
             _suppressSizeComputation = true;
@@ -361,6 +444,23 @@ public class SourceSelectionNodeViewModel : ViewModelBase
             }
             await Task.WhenAll(tasks);
         }
+
+        // Restore expansion state from the saved model.  Children are
+        // already loaded above (if any), so setting IsExpanded here only
+        // controls the visual state — it won't re-trigger LoadChildrenAsync
+        // because _isLoaded is already true.
+        if (IsDirectory)
+        {
+            if (model.IsExpanded && !_isLoaded)
+            {
+                // Node was expanded but had no child selections saved
+                // (e.g. fully selected directory).  Load children now.
+                _suppressSizeComputation = true;
+                await EnsureChildrenLoadedAsync();
+                _suppressSizeComputation = false;
+            }
+            IsExpanded = model.IsExpanded;
+        }
     }
 
     /// <summary>
@@ -377,9 +477,29 @@ public class SourceSelectionNodeViewModel : ViewModelBase
         IEnumerable<SourceSelectionNodeViewModel> sorted;
         if (column == SortColumn.Size)
         {
-            sorted = ascending
-                ? Children.OrderBy(c => c._size)
-                : Children.OrderByDescending(c => c._size);
+            bool selectedOnly = _getShowSelectedOnly?.Invoke() ?? false;
+            if (selectedOnly)
+            {
+                // Sort by the effective displayed size (accounts for
+                // exclusion filters) so the visual order matches the
+                // numbers the user sees.  Pre-compute once to avoid
+                // repeated recursion inside the comparator.
+                var filter = _getExcludeFilter?.Invoke();
+                var keys = new Dictionary<SourceSelectionNodeViewModel, long>(
+                    Children.Count);
+                foreach (var c in Children)
+                    keys[c] = c.GetEffectiveSize(filter);
+
+                sorted = ascending
+                    ? Children.OrderBy(c => keys[c])
+                    : Children.OrderByDescending(c => keys[c]);
+            }
+            else
+            {
+                sorted = ascending
+                    ? Children.OrderBy(c => c._size)
+                    : Children.OrderByDescending(c => c._size);
+            }
         }
         else
         {
@@ -421,20 +541,27 @@ public class SourceSelectionNodeViewModel : ViewModelBase
 
         try
         {
-            // Pre-compute sizes on the background thread when the parent's
-            // size is already known — the cache has the data from the parent's
-            // computation so each child lookup is fast (no file enumeration).
-            // For fresh directories (parent not yet computed), sizes stay at -1
-            // and Phase 2 uses the scheduler for progressive fill-in.
+            // Pre-compute sizes on the background thread when the cache
+            // likely has the data, making each child lookup fast (timestamp
+            // check + dictionary read, no file enumeration for unchanged dirs).
+            //
+            // This fires in two cases:
+            // 1. Parent was computed by the scheduler this session (both _size
+            //    and _fileCount are set), which guarantees the cache is warm
+            //    for all child directories.
+            // 2. Parent has an entry in the persistent cache from a prior
+            //    session, so child directories are very likely cached too.
+            //
+            // Drive nodes have _size set from DriveInfo but _fileCount == -1
+            // and typically no cache entry, so they correctly skip pre-
+            // computation — otherwise ComputeInline would recursively scan
+            // the entire drive during expansion.
             bool showSizes = _getShowSizes?.Invoke() ?? false;
-            // Only pre-compute when both _size and _fileCount are set, which
-            // means the scheduler computed this node's size (populating the
-            // cache for all its subdirectories).  Drive nodes have _size set
-            // from DriveInfo but _fileCount == -1, so they correctly skip
-            // precomputation — otherwise ComputeInline would recursively
-            // scan the entire drive during expansion.
+            bool computedThisSession = _size >= 0 && _fileCount >= 0;
+            bool cachedFromPriorSession = !computedThisSession
+                && _scheduler is not null && _scheduler.HasCacheEntry(Path);
             bool precomputeSizes = showSizes && _scheduler is not null
-                && _size >= 0 && _fileCount >= 0;
+                && (computedThisSession || cachedFromPriorSession);
 
             // Phase 1: enumerate entries. When precomputeSizes is true,
             // directory sizes are computed inline using the shared cache.
@@ -539,6 +666,12 @@ public class SourceSelectionNodeViewModel : ViewModelBase
             // Swap in one shot: replace all items with a single Reset
             // notification instead of N individual Add events.
             Children.ReplaceAll(childNodes);
+
+            // Apply the current sort preference (e.g. size descending).
+            // When sizes were pre-computed this sorts immediately; when
+            // sizes still need async computation the name sort is applied
+            // now, and ComputePrioritySizesAsync re-sorts once sizes arrive.
+            SortChildren();
 
             // Compute aggregate backup status for this directory.
             if (_catalogInfo is not null)
@@ -751,20 +884,11 @@ public class SourceSelectionNodeViewModel : ViewModelBase
         return (total, count);
     }
 
-    /// <summary>Format a byte count as a human-readable string.</summary>
+    /// <summary>Format a byte count as a comma-separated number.</summary>
     internal static string FormatBytes(long bytes)
     {
         if (bytes < 0) return "";
-        if (bytes == 0) return "0 B";
-        string[] units = ["B", "KB", "MB", "GB", "TB"];
-        int i = 0;
-        double size = bytes;
-        while (size >= 1024 && i < units.Length - 1)
-        {
-            size /= 1024;
-            i++;
-        }
-        return i == 0 ? $"{size:F0} {units[i]}" : $"{size:F1} {units[i]}";
+        return $"{bytes:N0}";
     }
 
     /// <summary>
@@ -781,6 +905,34 @@ public class SourceSelectionNodeViewModel : ViewModelBase
             foreach (var child in Children)
                 child.RefreshFormattedSize();
         }
+    }
+
+    /// <summary>
+    /// Called by a child when its <see cref="Size"/> changes while "selected
+    /// only" mode is active.  Propagates up through partially-selected
+    /// ancestors so their <see cref="FormattedSize"/> re-evaluates.
+    /// </summary>
+    private void InvalidateSelectedSize()
+    {
+        // Only partially-selected directories derive their displayed size
+        // from children (ComputeSelectedChildrenSize).  Fully-selected or
+        // unselected nodes use their own _size, so they stop the cascade.
+        if (IsSelected != null) return;
+
+        OnPropertyChanged(nameof(FormattedSize));
+        Parent?.InvalidateSelectedSize();
+    }
+
+    /// <summary>
+    /// Same as <see cref="InvalidateSelectedSize"/> but for
+    /// <see cref="FormattedFileCount"/>.
+    /// </summary>
+    private void InvalidateSelectedFileCount()
+    {
+        if (IsSelected != null) return;
+
+        OnPropertyChanged(nameof(FormattedFileCount));
+        Parent?.InvalidateSelectedFileCount();
     }
 
     /// <summary>
@@ -858,6 +1010,7 @@ public class SourceSelectionNodeViewModel : ViewModelBase
             Path = Path,
             IsDirectory = IsDirectory,
             IsSelected = IsSelected,
+            IsExpanded = IsExpanded,
             AutoIncludeNewSubdirectories = AutoIncludeNew,
         };
 

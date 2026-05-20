@@ -21,6 +21,7 @@ public class MainViewModel : ViewModelBase
     private readonly DirectoryBackupService _directoryBackupService;
     private readonly Services.TrayService? _trayService;
     private readonly SimulatedDiscBurner? _simulatedBurner;
+    private readonly FileHashCache? _fileHashCache;
 
     private string _statusText = "Ready";
     private int _recorderCount;
@@ -31,6 +32,8 @@ public class MainViewModel : ViewModelBase
     private string _serviceStatusText = "";
     private int? _runningBackupSetId;
     private CancellationTokenSource? _scanCts;
+    private CancellationTokenSource? _checkSizeCts;
+    private int? _checkingSizeSetId;
     private BackupSetEditorWindow? _editorWindow;
     private Window? _largestFilesWindow;
     private Func<Task>? _pendingSettingsSave;
@@ -43,7 +46,8 @@ public class MainViewModel : ViewModelBase
         IBackupOrchestrator orchestrator,
         IRestoreService restoreService,
         DirectoryBackupService directoryBackupService,
-        Services.TrayService? trayService = null)
+        Services.TrayService? trayService = null,
+        FileHashCache? fileHashCache = null)
     {
         _catalog = catalog;
         _burner = burner;
@@ -52,6 +56,7 @@ public class MainViewModel : ViewModelBase
         _restoreService = restoreService;
         _directoryBackupService = directoryBackupService;
         _trayService = trayService;
+        _fileHashCache = fileHashCache;
         _simulatedBurner = burner as SimulatedDiscBurner;
 
         BackupSets = [];
@@ -108,7 +113,10 @@ public class MainViewModel : ViewModelBase
         // Per-set action commands (take BackupSet via CommandParameter).
         SetCheckCommand = new RelayCommand(
             o => { if (o is BackupSet s) { SelectedBackupSet = s; _ = CheckSizeAsync(); } },
-            o => !IsBurning);
+            o => !IsBurning && _checkingSizeSetId is null);
+        AbortCheckCommand = new RelayCommand(
+            _ => _checkSizeCts?.Cancel(),
+            _ => _checkingSizeSetId is not null);
         SetBackupCommand = new RelayCommand(
             o => { if (o is BackupSet s) { SelectedBackupSet = s; StartIncrementalFlow(); } },
             o => !IsBurning);
@@ -164,6 +172,8 @@ public class MainViewModel : ViewModelBase
             {
                 Application.Current.Dispatcher.Invoke(() =>
                 {
+                    // Don't overwrite status while a size/dedup check is running.
+                    if (_checkingSizeSetId is not null) return;
                     StatusText = $"Background: {reason}";
                 });
             };
@@ -248,6 +258,7 @@ public class MainViewModel : ViewModelBase
 
     // Per-set action commands (take BackupSet as CommandParameter)
     public ICommand SetCheckCommand { get; }
+    public ICommand AbortCheckCommand { get; }
     public ICommand SetBackupCommand { get; }
     public ICommand SetModifyCommand { get; }
     public ICommand SetRestoreCommand { get; }
@@ -263,6 +274,17 @@ public class MainViewModel : ViewModelBase
     {
         get => _runningBackupSetId;
         private set => SetProperty(ref _runningBackupSetId, value);
+    }
+
+    /// <summary>
+    /// The ID of the backup set currently being size-checked, or <c>null</c>
+    /// if no check is in progress.  The XAML swaps "Check Size" to
+    /// "Abort Check" for the matching row.
+    /// </summary>
+    public int? CheckingSizeSetId
+    {
+        get => _checkingSizeSetId;
+        private set => SetProperty(ref _checkingSizeSetId, value);
     }
 
     // --- Worker Service management ---
@@ -356,38 +378,19 @@ public class MainViewModel : ViewModelBase
         var catalogInfo = catalogTask.Result;
         var drives = drivesTask.Result;
 
-        var sourceSelection = new SourceSelectionViewModel(catalogInfo, drives);
+        var sourceSelection = new SourceSelectionViewModel(catalogInfo, drives,
+            fileHashCache: _fileHashCache, scanner: _scanner);
         sourceSelection.IsEditMode = true;
 
         // Restore backup set settings from saved state.
         sourceSelection.SetName = backupSet.Name;
         RestoreSourceSettings(sourceSelection, backupSet.JobOptions);
 
-        // Restore saved selections into the treeview.
-        // Must await so the tree is fully populated before the dialog is shown —
-        // otherwise nodes expand/check after the window is visible, causing
-        // visible layout shifts.
-        if (backupSet.SourceSelections is { Count: > 0 })
-            await sourceSelection.ApplySelectionsAsync(backupSet.SourceSelections);
-
-        // Sizes were suppressed during ApplySelectionsAsync to avoid flooding
-        // the scheduler at high priority (which would peg the CPU for minutes).
-        // Now queue a lazy background scan so sizes fill in after the dialog
-        // opens without blocking the UI or grinding the system.
-        // After sizes are ready, run PlanAsync for accurate new/changed counts.
-        // Re-runs automatically (debounced) when the user changes selections.
+        // Selection restore and size computation are deferred to after the
+        // dialog is visible (see PostShowInitAsync below).  The view shows a
+        // "Restoring selections..." overlay while this runs.
         CancellationTokenSource? autoCheckCts = null;
         bool planCheckReady = false;
-
-        _ = InitialSizeScanAsync();
-
-        async Task InitialSizeScanAsync()
-        {
-            await sourceSelection.ComputeAllUnknownSizesAsync();
-            planCheckReady = true;
-            autoCheckCts = new CancellationTokenSource();
-            await RunPlanCheckInEditorAsync(sourceSelection, backupSet, autoCheckCts.Token);
-        }
 
         // Enable Save if selections already exist; for new empty sets, the user
         // must check at least one box first.
@@ -405,12 +408,6 @@ public class MainViewModel : ViewModelBase
             sourceSelection.SeedResult =
                 $"{catalogInfo.Count:N0} files ({FormatBytes(totalBytes)}) in catalog.";
         }
-
-        // For existing sets, start clean — Save enables only when the user
-        // changes something.  New sets (_unsavedNewSetId) keep _needsSave=true
-        // so Save is immediately available.
-        if (_unsavedNewSetId is null)
-            sourceSelection.MarkClean();
 
         // Helper: sync all VM settings into the BackupSet and write to DB.
         async Task SaveAllAsync()
@@ -706,6 +703,40 @@ public class MainViewModel : ViewModelBase
         dialog.Show();
 
         StatusText = $"Editing backup set \"{backupSet.Name}\".";
+
+        // ---------------------------------------------------------------
+        // Phase 3: restore selections and compute sizes (dialog visible)
+        // ---------------------------------------------------------------
+        // The view shows a "Restoring selections..." overlay (bound to
+        // IsApplyingSelections) while this runs.  This avoids blocking
+        // the UI for seconds before the window appears.
+
+        if (backupSet.SourceSelections is { Count: > 0 })
+            await sourceSelection.ApplySelectionsAsync(backupSet.SourceSelections);
+
+        // Selections are now restored — re-sort so size-based ordering uses
+        // the correct effective sizes (during initial load, children had
+        // IsSelected = false so GetEffectiveSize returned -1 for everything).
+        if (sourceSelection.CurrentSortColumn == SortColumn.Size)
+        {
+            foreach (var root in sourceSelection.Roots)
+                root.SortChildren();
+        }
+
+        // For existing sets, mark clean AFTER selections are restored so
+        // the restore itself doesn't count as a user change.
+        if (_unsavedNewSetId is null)
+            sourceSelection.MarkClean();
+
+        _ = PostShowInitAsync();
+
+        async Task PostShowInitAsync()
+        {
+            await sourceSelection.ComputeAllUnknownSizesAsync();
+            planCheckReady = true;
+            autoCheckCts = new CancellationTokenSource();
+            await RunPlanCheckInEditorAsync(sourceSelection, backupSet, autoCheckCts.Token);
+        }
     }
 
     // -------------------------------------------------------------------
@@ -920,6 +951,19 @@ public class MainViewModel : ViewModelBase
             return;
         }
 
+        // Ask upfront whether to also check duplicates (only when dedup is on).
+        bool alsoCheckDuplicates = false;
+        if ((opts.EnableFileDeduplication || opts.EnableDeduplication) && _fileHashCache is not null)
+        {
+            var answer = MessageBox.Show(
+                "Also scan for duplicate files?\n\n" +
+                "Hashes are cached, so this also speeds up the next backup.",
+                "Check Size",
+                MessageBoxButton.YesNo,
+                MessageBoxImage.Question);
+            alsoCheckDuplicates = answer == MessageBoxResult.Yes;
+        }
+
         string? effectiveTargetDir = opts.TargetDirectory;
         if (effectiveTargetDir is not null && opts.CreateSubdirectory
             && !string.IsNullOrWhiteSpace(opts.SubdirectoryName))
@@ -952,6 +996,11 @@ public class MainViewModel : ViewModelBase
 
         bool isDir = job.TargetDirectory is not null;
 
+        _checkSizeCts = new CancellationTokenSource();
+        var ct = _checkSizeCts.Token;
+        CheckingSizeSetId = backupSet.Id;
+        CommandManager.InvalidateRequerySuggested();
+
         StatusText = $"Checking \"{backupSet.Name}\"...";
 
         try
@@ -974,7 +1023,7 @@ public class MainViewModel : ViewModelBase
             if (isDir && _directoryBackupService is not null)
             {
                 var (diff, bytes, files) = await Task.Run(
-                    () => _directoryBackupService.PlanAsync(job, CancellationToken.None, scanProgress));
+                    () => _directoryBackupService.PlanAsync(job, ct, scanProgress));
                 totalFiles = files;
                 totalBytes = bytes;
 
@@ -1009,7 +1058,7 @@ public class MainViewModel : ViewModelBase
             else if (!isDir)
             {
                 var plan = await Task.Run(
-                    () => _orchestrator.PlanAsync(job, CancellationToken.None, scanProgress));
+                    () => _orchestrator.PlanAsync(job, ct, scanProgress));
                 totalFiles = plan.Diff.NewFiles.Count + plan.Diff.ChangedFiles.Count;
                 totalBytes = plan.TotalBytes;
 
@@ -1022,10 +1071,175 @@ public class MainViewModel : ViewModelBase
             {
                 StatusText = "Directory backup service not available.";
             }
+
+            // Phase 2: duplicate analysis (same CTS, same flag).
+            if (alsoCheckDuplicates)
+                await RunDuplicateAnalysisAsync(backupSet, ct);
+        }
+        catch (OperationCanceledException)
+        {
+            StatusText = "Check aborted.";
         }
         catch (Exception ex)
         {
             StatusText = $"Check failed: {ex.Message}";
+        }
+        finally
+        {
+            // Flush any hashes computed before abort/completion so they
+            // survive to the next run even if we didn't reach the end.
+            try { _fileHashCache?.Flush(); } catch { }
+
+            CheckingSizeSetId = null;
+            _checkSizeCts?.Dispose();
+            _checkSizeCts = null;
+            CommandManager.InvalidateRequerySuggested();
+        }
+    }
+
+    // -------------------------------------------------------------------
+    // Duplicate analysis (called from CheckSizeAsync when user opts in)
+    // -------------------------------------------------------------------
+
+    /// <summary>
+    /// Scan files for duplicates by grouping by size, then hashing same-size
+    /// candidates. Exceptions propagate to the caller (which owns the
+    /// <see cref="CheckingSizeSetId"/> flag and CTS).
+    /// </summary>
+    private async Task RunDuplicateAnalysisAsync(BackupSet backupSet, CancellationToken ct)
+    {
+        if (_fileHashCache is null) return;
+
+        var sources = backupSet.SourceSelections;
+        var opts = backupSet.JobOptions;
+        if (sources is null or { Count: 0 } || opts is null) return;
+
+        StatusText = $"Scanning \"{backupSet.Name}\" for duplicates...";
+
+        // Build exclusion filter matching what the backup service uses.
+        var job = new BackupJob
+        {
+            Sources = sources,
+            ExcludedExtensions = opts.ExcludedExtensions,
+            TierSets = opts.TierSets,
+        };
+        var excludeFilter = DirectoryBackupService.BuildExclusionFilter(job);
+
+        // Scan files.
+        var scanned = await Task.Run(
+            () => _scanner.ScanAsync(sources, progress: null, ct, excludeFilter));
+        ct.ThrowIfCancellationRequested();
+
+        if (scanned.Count == 0)
+        {
+            StatusText = $"\"{backupSet.Name}\": no files found.";
+            return;
+        }
+
+        long totalRawSize = scanned.Sum(f => f.SizeBytes);
+        StatusText = $"Scanning \"{backupSet.Name}\" for duplicates... " +
+            $"{scanned.Count:N0} files, grouping by size...";
+
+        // Group by size — only groups with 2+ files need hashing.
+        var sizeGroups = scanned
+            .GroupBy(f => f.SizeBytes)
+            .Where(g => g.Count() >= 2)
+            .ToList();
+
+        int candidateFiles = sizeGroups.Sum(g => g.Count());
+        int uniqueSizeFiles = scanned.Count - candidateFiles;
+
+        // Hash candidates on a background thread.
+        int filesHashed = 0;
+        int filesProcessed = 0;
+        long lastProgressTick = 0;
+        var hashMap = new Dictionary<string, List<ScannedFile>>();
+        string setName = backupSet.Name;
+
+        await Task.Run(async () =>
+        {
+            foreach (var group in sizeGroups)
+            {
+                foreach (var file in group)
+                {
+                    ct.ThrowIfCancellationRequested();
+
+                    // Rate-limited progress (~4 updates/sec).
+                    long now = Environment.TickCount64;
+                    if (now - lastProgressTick >= 250)
+                    {
+                        lastProgressTick = now;
+                        int n = filesProcessed;
+                        int h = filesHashed;
+                        _ = Application.Current.Dispatcher.InvokeAsync(() =>
+                            StatusText = $"Scanning \"{setName}\" for duplicates... " +
+                                $"hashing candidate {n + 1:N0} of {candidateFiles:N0}" +
+                                (h > 0 ? $" ({h:N0} new)" : ""));
+                    }
+
+                    string? hash = _fileHashCache.TryGetHash(
+                        file.FullPath, file.SizeBytes, file.LastWriteUtc);
+
+                    if (hash is null)
+                    {
+                        try
+                        {
+                            await using var stream = new FileStream(
+                                file.FullPath, FileMode.Open, FileAccess.Read,
+                                FileShare.Read, bufferSize: 81920, useAsync: true);
+                            var bytes = await System.Security.Cryptography.SHA256
+                                .HashDataAsync(stream, ct);
+                            hash = Convert.ToHexString(bytes).ToLowerInvariant();
+
+                            _fileHashCache.Set(
+                                file.FullPath, file.SizeBytes, file.LastWriteUtc, hash);
+                            filesHashed++;
+                        }
+                        catch (OperationCanceledException) { throw; }
+                        catch
+                        {
+                            filesProcessed++;
+                            continue;
+                        }
+                    }
+
+                    if (!hashMap.TryGetValue(hash, out var list))
+                    {
+                        list = [];
+                        hashMap[hash] = list;
+                    }
+                    list.Add(file);
+                    filesProcessed++;
+                }
+            }
+
+            _fileHashCache.Flush();
+        }, ct);
+
+        // Compute savings.
+        long bytesSaved = 0;
+        int duplicateFiles = 0;
+        foreach (var (_, files) in hashMap)
+        {
+            if (files.Count <= 1) continue;
+            for (int i = 1; i < files.Count; i++)
+            {
+                bytesSaved += files[i].SizeBytes;
+                duplicateFiles++;
+            }
+        }
+
+        if (duplicateFiles == 0)
+        {
+            StatusText = $"\"{backupSet.Name}\": {scanned.Count:N0} files " +
+                $"({FormatBytes(totalRawSize)}), no duplicates found.";
+        }
+        else
+        {
+            StatusText = $"\"{backupSet.Name}\": {scanned.Count:N0} files " +
+                $"({FormatBytes(totalRawSize)}), {duplicateFiles:N0} duplicates " +
+                $"({FormatBytes(bytesSaved)} saveable with file-level dedup)" +
+                (filesHashed > 0 ? $"  [{filesHashed:N0} hashed, {candidateFiles - filesHashed:N0} cached]" : "");
         }
     }
 
@@ -1515,8 +1729,9 @@ public class MainViewModel : ViewModelBase
             if (driveNode is null)
                 continue;
 
-            // Expand the drive so its children are loaded.
+            // Load and expand the drive so its children are visible.
             await driveNode.EnsureChildrenLoadedAsync();
+            driveNode.IsExpanded = true;
 
             // Check subdirectories that have files in the mirror.
             bool anyChecked = false;
@@ -2359,14 +2574,7 @@ public class MainViewModel : ViewModelBase
         }
     }
 
-    private static string FormatBytes(long bytes)
-    {
-        string[] units = ["B", "KB", "MB", "GB", "TB"];
-        int i = 0;
-        double size = bytes;
-        while (size >= 1024 && i < units.Length - 1) { size /= 1024; i++; }
-        return i == 0 ? $"{size:N0} {units[i]}" : $"{size:N1} {units[i]}";
-    }
+    private static string FormatBytes(long bytes) => $"{bytes:N0}";
 }
 
 /// <summary>Simple ICommand implementation for MVVM binding.</summary>

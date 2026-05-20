@@ -26,17 +26,20 @@ public class DirectoryBackupService
     private readonly IFileScanner _scanner;
     private readonly VersionRetentionService _retention;
     private readonly IDeduplicationEngine? _dedup;
+    private readonly IFileHashLookup? _hashCache;
 
     public DirectoryBackupService(
         ICatalogRepository catalog,
         IFileScanner scanner,
         VersionRetentionService retention,
-        IDeduplicationEngine? dedup = null)
+        IDeduplicationEngine? dedup = null,
+        IFileHashLookup? hashCache = null)
     {
         _catalog = catalog;
         _scanner = scanner;
         _retention = retention;
         _dedup = dedup;
+        _hashCache = hashCache;
     }
 
     /// <summary>
@@ -282,7 +285,11 @@ public class DirectoryBackupService
             {
                 // Compute hash up front — needed for file-level dedup checks
                 // and the catalog record regardless.
-                string hash = await ComputeFileHashAsync(file.FullPath, ct);
+                // Check the pre-computed hash cache first (populated by dedup
+                // analysis) to avoid re-reading files that were already hashed.
+                string hash = _hashCache?.TryGetHash(
+                                  file.FullPath, file.SizeBytes, file.LastWriteUtc)
+                              ?? await ComputeFileHashAsync(file.FullPath, ct);
 
                 // Decide storage format. Priority:
                 //   1. File-level dedup (cheap whole-file hash match)
@@ -833,7 +840,7 @@ public class DirectoryBackupService
     /// Build the combined file exclusion filter from global extension patterns
     /// and tier-based exclusion (tier sets with 0 tiers = excluded from backup).
     /// </summary>
-    internal static Func<string, bool>? BuildExclusionFilter(BackupJob job)
+    public static Func<string, bool>? BuildExclusionFilter(BackupJob job)
     {
         var globalFilter = job.ExcludedExtensions.Count > 0
             ? GlobMatcher.CreateFilter(job.ExcludedExtensions) : null;

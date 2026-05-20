@@ -79,6 +79,13 @@ public class SourceSelection
     /// </summary>
     public List<string> VersionIncludedPatterns { get; set; } = [];
 
+    /// <summary>
+    /// Whether this directory node was expanded in the TreeView when the
+    /// selection was last saved.  Persisted so the UI can restore the same
+    /// expansion state instead of expanding every ancestor of a selected node.
+    /// </summary>
+    public bool IsExpanded { get; set; }
+
     /// <summary>Child nodes (subdirectories and files).</summary>
     public List<SourceSelection> Children { get; set; } = [];
 

@@ -35,11 +35,7 @@
                         Command="{Binding AddPathCommand}"
                         Padding="10,6" Margin="0,0,8,0" Cursor="Hand"
                         ToolTip="Add a network share or unmapped drive as a backup source." />
-                <Button Content="Auto-include Checked"
-                        Command="{Binding AutoIncludeCheckedCommand}"
-                        Padding="10,6" Margin="0,0,8,0" Cursor="Hand"
-                        ToolTip="Set 'Auto-include new' on every directory that is currently checked." />
-                <Button Content="Largest Files &amp; Directories"
+<Button Content="Largest Files &amp; Directories"
                         Command="{Binding LargestFilesCommand}"
                         Padding="10,6" Margin="0,0,8,0" Cursor="Hand"
                         Visibility="{Binding ShowLargestFiles, Converter={StaticResource BoolToVis}}"
@@ -579,8 +575,26 @@
             </ScrollViewer>
         </Border>
 
+        <Grid>
+        <!-- Loading overlay while saved selections are being restored -->
+        <Border Visibility="{Binding IsApplyingSelections, Converter={StaticResource BoolToVis}}"
+                Background="{StaticResource SurfaceBrush}"
+                VerticalAlignment="Center" HorizontalAlignment="Center"
+                CornerRadius="6" Padding="24,16"
+                Panel.ZIndex="1">
+            <StackPanel Orientation="Horizontal">
+                <ProgressBar IsIndeterminate="True" Width="100" Height="4"
+                             Foreground="{StaticResource PrimaryBrush}"
+                             Margin="0,0,12,0" VerticalAlignment="Center" />
+                <TextBlock Text="Restoring selections..."
+                           Foreground="{StaticResource TextSecondaryBrush}"
+                           FontSize="13" VerticalAlignment="Center" />
+            </StackPanel>
+        </Border>
+
         <!-- TreeView with integrated column headers -->
         <TreeView ItemsSource="{Binding Roots}"
+                  BorderThickness="0"
                   VirtualizingStackPanel.IsVirtualizing="True"
                   VirtualizingStackPanel.VirtualizationMode="Recycling"
                   VirtualizingPanel.ScrollUnit="Pixel">
@@ -612,7 +626,7 @@
                                     <ColumnDefinition Width="Auto" SharedSizeGroup="IncludeCol" />
                                     <ColumnDefinition Width="*" />
                                     <ColumnDefinition Width="Auto" MinWidth="56" SharedSizeGroup="FilesCol" />
-                                    <ColumnDefinition Width="Auto" MinWidth="72" SharedSizeGroup="SizeCol" />
+                                    <ColumnDefinition Width="Auto" MinWidth="120" SharedSizeGroup="SizeCol" />
                                 </Grid.ColumnDefinitions>
                                 <Border Grid.Column="0"
                                         BorderBrush="{StaticResource BorderBrush}"
@@ -667,7 +681,7 @@
                                     </Border.Style>
                                     <TextBlock FontSize="11"
                                                Foreground="{StaticResource TextSecondaryBrush}"
-                                               HorizontalAlignment="Right"
+                                               TextAlignment="Right"
                                                Text="Files" />
                                 </Border>
                                 <Border Grid.Column="4"
@@ -691,7 +705,7 @@
                                     </Border.InputBindings>
                                     <TextBlock FontSize="11"
                                                Foreground="{StaticResource TextSecondaryBrush}"
-                                               HorizontalAlignment="Right">
+                                               TextAlignment="Right">
                                         <Run Text="Size" /><Run Text="{Binding SizeSortIndicator, Mode=OneWay}" />
                                     </TextBlock>
                                 </Border>
@@ -714,6 +728,8 @@
             <!-- Custom TreeViewItem template: fixed checkbox columns + indented name -->
             <TreeView.ItemContainerStyle>
                 <Style TargetType="TreeViewItem">
+                    <EventSetter Event="RequestBringIntoView"
+                                 Handler="TreeViewItem_RequestBringIntoView" />
                     <Setter Property="IsExpanded" Value="{Binding IsExpanded, Mode=TwoWay}" />
                     <Setter Property="Margin" Value="0" />
                     <Setter Property="Padding" Value="0" />
@@ -729,7 +745,7 @@
                                             <ColumnDefinition Width="Auto" SharedSizeGroup="IncludeCol" />
                                             <ColumnDefinition Width="*" />
                                             <ColumnDefinition Width="Auto" MinWidth="56" SharedSizeGroup="FilesCol" />
-                                            <ColumnDefinition Width="Auto" MinWidth="72" SharedSizeGroup="SizeCol" />
+                                            <ColumnDefinition Width="Auto" MinWidth="120" SharedSizeGroup="SizeCol" />
                                         </Grid.ColumnDefinitions>
 
                                         <!-- Col 0: Auto-include new (fixed position, not indented) -->
@@ -824,11 +840,10 @@
                                             </Border.Style>
                                             <TextBlock Text="{Binding FormattedFileCount}"
                                                        VerticalAlignment="Center"
-                                                       HorizontalAlignment="Right"
+                                                       TextAlignment="Right"
                                                        FontSize="11"
                                                        Foreground="{StaticResource TextSecondaryBrush}"
-                                                       Padding="8,0,8,0"
-                                                       MinWidth="40" />
+                                                       Padding="8,0,8,0" />
                                         </Border>
 
                                         <!-- Col 4: Size (visible only when ShowSizes is on) -->
@@ -846,11 +861,10 @@
                                             </Border.Style>
                                             <TextBlock Text="{Binding FormattedSize}"
                                                        VerticalAlignment="Center"
-                                                       HorizontalAlignment="Right"
+                                                       TextAlignment="Right"
                                                        FontSize="11"
                                                        Foreground="{StaticResource TextSecondaryBrush}"
-                                                       Padding="8,0,8,0"
-                                                       MinWidth="60" />
+                                                       Padding="8,0,8,0" />
                                         </Border>
                                     </Grid>
 
@@ -911,5 +925,6 @@
                 </HierarchicalDataTemplate>
             </TreeView.ItemTemplate>
         </TreeView>
+        </Grid>
     </DockPanel>
 </UserControl>

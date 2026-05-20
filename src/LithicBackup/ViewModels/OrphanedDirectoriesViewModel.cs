@@ -10,9 +10,11 @@ namespace LithicBackup.ViewModels;
 /// <summary>
 /// Shows directories in a backup set that are no longer covered by the
 /// current source roots — either because the user removed them or because
-/// the directory was deleted from disk.  Also supports scanning for files
-/// that match exclusion patterns (e.g. *.log, */.vs/*) so the user can
-/// purge them from the catalog.
+/// the directory was deleted from disk.  Also auto-detects files matching
+/// configured exclusion patterns and excess file versions that no longer
+/// fit the retention tier rules.  Supports scanning for additional files
+/// that match user-typed exclusion patterns so the user can purge them
+/// from the catalog.
 /// </summary>
 public class OrphanedDirectoriesViewModel : ViewModelBase
 {
@@ -190,8 +192,17 @@ public class OrphanedDirectoriesViewModel : ViewModelBase
                 }
             }
 
+            // --- Phase 2: Auto-detect files matching configured exclusion patterns ---
+            var excludedItems = await Task.Run(() => DetectExcludedFiles(collapsed));
+
+            // --- Phase 3: Auto-detect excess file versions from retention tiers ---
+            var excessItems = await Task.Run(() => DetectExcessVersions(collapsed, excludedItems));
+
             Items.Clear();
-            foreach (var item in collapsed.OrderBy(i => i.DirectoryPath, StringComparer.OrdinalIgnoreCase))
+            foreach (var item in collapsed
+                .Concat(excludedItems)
+                .Concat(excessItems)
+                .OrderBy(i => i.DirectoryPath, StringComparer.OrdinalIgnoreCase))
             {
                 item.PropertyChanged += (_, _) => OnPropertyChanged(nameof(IsAllSelected));
                 Items.Add(item);
@@ -209,6 +220,250 @@ public class OrphanedDirectoriesViewModel : ViewModelBase
         }
     }
 
+    // ------------------------------------------------------------------
+    // Phase 2: Configured exclusion detection
+    // ------------------------------------------------------------------
+
+    /// <summary>
+    /// Detect files in the catalog that match the backup set's configured
+    /// exclusion patterns (global excluded extensions + tier sets with 0 tiers).
+    /// Mirrors the logic of DirectoryBackupService.BuildExclusionFilter.
+    /// </summary>
+    private List<OrphanedDirectoryItem> DetectExcludedFiles(
+        List<OrphanedDirectoryItem> orphanedDirs)
+    {
+        if (_activeFiles is null) return [];
+
+        var jobOptions = _backupSet.JobOptions;
+        if (jobOptions is null) return [];
+
+        // Build exclusion filter — same logic as DirectoryBackupService.BuildExclusionFilter.
+        var globalFilter = jobOptions.ExcludedExtensions.Count > 0
+            ? GlobMatcher.CreateFilter(jobOptions.ExcludedExtensions) : null;
+
+        Func<string, VersionTierSet>? tierResolver = null;
+        if (jobOptions.TierSets.Count > 0)
+        {
+            var resolver = VersionTierSet.BuildTierResolver(jobOptions.TierSets);
+            bool hasExclusionTierSet = jobOptions.TierSets.Any(ts =>
+                ts.Tiers.Count == 0
+                && ts.FilePatterns.Count > 0
+                && !string.Equals(ts.Name, "Default", StringComparison.OrdinalIgnoreCase));
+            if (hasExclusionTierSet)
+                tierResolver = resolver;
+        }
+
+        if (globalFilter is null && tierResolver is null)
+            return [];
+
+        Func<string, bool> exclusionFilter = path =>
+        {
+            if (globalFilter?.Invoke(path) ?? false)
+                return true;
+            if (tierResolver is not null && tierResolver(path).Tiers.Count == 0)
+                return true;
+            return false;
+        };
+
+        // Build set of orphaned directory prefixes to skip (files there are
+        // already covered by orphaned directory items).
+        var orphanedDirPrefixes = orphanedDirs
+            .Select(i => i.DirectoryPath + "\\")
+            .ToList();
+
+        var excluded = _activeFiles
+            .Where(f =>
+            {
+                if (orphanedDirPrefixes.Any(p =>
+                    f.SourcePath.StartsWith(p, StringComparison.OrdinalIgnoreCase)))
+                    return false;
+
+                return exclusionFilter(f.SourcePath);
+            })
+            .ToList();
+
+        if (excluded.Count == 0)
+            return [];
+
+        // Group by parent directory.
+        var results = new List<OrphanedDirectoryItem>();
+        var dirGroups = excluded
+            .GroupBy(f => Path.GetDirectoryName(f.SourcePath) ?? f.SourcePath,
+                     StringComparer.OrdinalIgnoreCase);
+
+        foreach (var group in dirGroups.OrderBy(g => g.Key, StringComparer.OrdinalIgnoreCase))
+        {
+            results.Add(new OrphanedDirectoryItem
+            {
+                DirectoryPath = group.Key,
+                Reason = OrphanedReason.MatchesConfiguredExclusion,
+                FileCount = group.Count(),
+                TotalSizeBytes = group.Sum(f => f.SizeBytes),
+                MatchingSourcePaths = group.Select(f => f.SourcePath).ToList(),
+            });
+        }
+
+        return results;
+    }
+
+    // ------------------------------------------------------------------
+    // Phase 3: Excess version detection
+    // ------------------------------------------------------------------
+
+    /// <summary>
+    /// Detect file versions that exceed the configured retention tier limits.
+    /// Replicates the core logic of VersionRetentionService.ComputeRetentionAsync
+    /// using the already-loaded in-memory file list.
+    /// </summary>
+    private List<OrphanedDirectoryItem> DetectExcessVersions(
+        List<OrphanedDirectoryItem> orphanedDirs,
+        List<OrphanedDirectoryItem> excludedItems)
+    {
+        if (_activeFiles is null) return [];
+
+        var jobOptions = _backupSet.JobOptions;
+        if (jobOptions is null) return [];
+
+        // Build per-file tier selector: file path → retention tiers.
+        Func<string, IReadOnlyList<VersionRetentionTier>> tierSelector;
+
+        if (jobOptions.TierSets.Count > 0)
+        {
+            var resolver = VersionTierSet.BuildTierResolver(jobOptions.TierSets);
+            tierSelector = path => resolver(path).Tiers;
+        }
+        else if (jobOptions.RetentionTiers.Count > 0)
+        {
+            var flatTiers = jobOptions.RetentionTiers;
+            tierSelector = _ => flatTiers;
+        }
+        else
+        {
+            return []; // No retention rules configured.
+        }
+
+        // Build skip-sets: files in orphaned dirs or matched by exclusion filter.
+        var orphanedDirPrefixes = orphanedDirs
+            .Select(i => i.DirectoryPath + "\\")
+            .ToList();
+        var excludedPaths = new HashSet<string>(
+            excludedItems
+                .Where(i => i.MatchingSourcePaths is not null)
+                .SelectMany(i => i.MatchingSourcePaths!),
+            StringComparer.OrdinalIgnoreCase);
+
+        // Filter active files to only those not already flagged.
+        var eligibleFiles = _activeFiles
+            .Where(f =>
+            {
+                if (orphanedDirPrefixes.Any(p =>
+                    f.SourcePath.StartsWith(p, StringComparison.OrdinalIgnoreCase)))
+                    return false;
+                if (excludedPaths.Contains(f.SourcePath))
+                    return false;
+                return true;
+            })
+            .ToList();
+
+        var now = DateTime.UtcNow;
+        var excessRecords = new List<FileRecord>();
+
+        // Group by source path — same approach as VersionRetentionService.
+        var groupedByPath = eligibleFiles
+            .GroupBy(f => f.SourcePath, StringComparer.OrdinalIgnoreCase);
+
+        foreach (var group in groupedByPath)
+        {
+            // Sort versions by BackedUpUtc descending (newest first).
+            var versions = group
+                .OrderByDescending(f => f.BackedUpUtc)
+                .ToList();
+
+            if (versions.Count <= 1)
+                continue; // Only one version, nothing to trim.
+
+            var tiers = tierSelector(group.Key);
+            if (tiers.Count == 0)
+                continue; // 0 tiers = no retention rules (excluded or no history).
+
+            // Never delete the most recent version of any file.
+            long newestId = versions[0].Id;
+
+            // Walk tiers from youngest to oldest.
+            var sortedTiers = tiers
+                .OrderBy(t => t.MaxAge ?? TimeSpan.MaxValue)
+                .ToList();
+
+            var processed = new HashSet<long>();
+            TimeSpan previousBoundary = TimeSpan.Zero;
+
+            foreach (var tier in sortedTiers)
+            {
+                TimeSpan upperBoundary = tier.MaxAge ?? TimeSpan.MaxValue;
+
+                // Find versions in this tier's age range.
+                var tierVersions = versions
+                    .Where(v => !processed.Contains(v.Id))
+                    .Where(v =>
+                    {
+                        var age = now - v.BackedUpUtc;
+                        return age >= previousBoundary && age < upperBoundary;
+                    })
+                    .OrderByDescending(v => v.BackedUpUtc) // Keep newest first.
+                    .ToList();
+
+                if (tier.MaxVersions.HasValue && tierVersions.Count > tier.MaxVersions.Value)
+                {
+                    // Keep MaxVersions newest, mark rest for deletion.
+                    int toKeep = tier.MaxVersions.Value;
+                    for (int i = 0; i < tierVersions.Count; i++)
+                    {
+                        processed.Add(tierVersions[i].Id);
+                        if (i >= toKeep && tierVersions[i].Id != newestId)
+                        {
+                            excessRecords.Add(tierVersions[i]);
+                        }
+                    }
+                }
+                else
+                {
+                    // Unlimited or within limit — keep all.
+                    foreach (var v in tierVersions)
+                        processed.Add(v.Id);
+                }
+
+                previousBoundary = upperBoundary;
+            }
+        }
+
+        if (excessRecords.Count == 0)
+            return [];
+
+        // Group excess records by parent directory.
+        var results = new List<OrphanedDirectoryItem>();
+        var dirGroups = excessRecords
+            .GroupBy(f => Path.GetDirectoryName(f.SourcePath) ?? f.SourcePath,
+                     StringComparer.OrdinalIgnoreCase);
+
+        foreach (var group in dirGroups.OrderBy(g => g.Key, StringComparer.OrdinalIgnoreCase))
+        {
+            results.Add(new OrphanedDirectoryItem
+            {
+                DirectoryPath = group.Key,
+                Reason = OrphanedReason.ExcessVersion,
+                FileCount = group.Count(),
+                TotalSizeBytes = group.Sum(f => f.SizeBytes),
+                ExcessVersionRecords = group.ToList(),
+            });
+        }
+
+        return results;
+    }
+
+    // ------------------------------------------------------------------
+    // Manual exclusion scan
+    // ------------------------------------------------------------------
+
     /// <summary>
     /// Scan the catalog for files matching the exclusion patterns and add them
     /// to the list as purgeable items.
@@ -218,7 +473,7 @@ public class OrphanedDirectoriesViewModel : ViewModelBase
         if (_activeFiles is null)
             return;
 
-        // Remove previous exclusion-pattern items.
+        // Remove previous manual exclusion-pattern items (keep auto-detected ones).
         for (int i = Items.Count - 1; i >= 0; i--)
         {
             if (Items[i].Reason == OrphanedReason.MatchesExclusionPattern)
@@ -244,12 +499,19 @@ public class OrphanedDirectoriesViewModel : ViewModelBase
 
         try
         {
-            // Build set of directories already shown (orphaned for other reasons)
-            // so we don't double-count files.
+            // Build set of directories already shown as orphaned so we don't
+            // double-count files.
             var orphanedDirPrefixes = Items
-                .Where(i => i.Reason != OrphanedReason.MatchesExclusionPattern)
+                .Where(i => i.Reason is OrphanedReason.RemovedFromSources or OrphanedReason.DeletedFromDisk)
                 .Select(i => i.DirectoryPath + "\\")
                 .ToList();
+
+            // Also skip files already flagged by auto-detected exclusions.
+            var alreadyFlaggedPaths = new HashSet<string>(
+                Items
+                    .Where(i => i.Reason == OrphanedReason.MatchesConfiguredExclusion && i.MatchingSourcePaths is not null)
+                    .SelectMany(i => i.MatchingSourcePaths!),
+                StringComparer.OrdinalIgnoreCase);
 
             // Run the filter on a background thread — could be thousands of files.
             var excluded = await Task.Run(() =>
@@ -260,6 +522,10 @@ public class OrphanedDirectoriesViewModel : ViewModelBase
                         // Skip files already covered by an orphaned directory.
                         if (orphanedDirPrefixes.Any(p =>
                             f.SourcePath.StartsWith(p, StringComparison.OrdinalIgnoreCase)))
+                            return false;
+
+                        // Skip files already covered by auto-detected exclusions.
+                        if (alreadyFlaggedPaths.Contains(f.SourcePath))
                             return false;
 
                         return filter(f.SourcePath);
@@ -304,6 +570,10 @@ public class OrphanedDirectoriesViewModel : ViewModelBase
         }
     }
 
+    // ------------------------------------------------------------------
+    // Purge
+    // ------------------------------------------------------------------
+
     private async void PurgeSelected()
     {
         var selected = Items.Where(i => i.IsSelected).ToList();
@@ -316,13 +586,14 @@ public class OrphanedDirectoriesViewModel : ViewModelBase
         try
         {
             // Snapshot data needed by the background thread before leaving
-            // the UI thread.  MatchingSourcePaths and DirectoryPath are
-            // plain properties, safe to capture.
+            // the UI thread.  MatchingSourcePaths, ExcessVersionRecords, and
+            // DirectoryPath are plain properties, safe to capture.
             var workItems = selected.Select(item => new
             {
                 item.DirectoryPath,
                 item.Reason,
                 item.MatchingSourcePaths,
+                item.ExcessVersionRecords,
             }).ToList();
 
             int backupSetId = _backupSet.Id;
@@ -346,7 +617,19 @@ public class OrphanedDirectoriesViewModel : ViewModelBase
                         ((IProgress<string>)progress).Report(
                             $"Purging {i + 1:N0}/{workItems.Count:N0}: {dirName}");
 
-                        if (wi.Reason == OrphanedReason.MatchesExclusionPattern
+                        if (wi.Reason == OrphanedReason.ExcessVersion
+                            && wi.ExcessVersionRecords is not null)
+                        {
+                            // Mark individual excess version records as deleted.
+                            foreach (var record in wi.ExcessVersionRecords)
+                            {
+                                record.IsDeleted = true;
+                                _catalog.UpdateFileRecordAsync(record).GetAwaiter().GetResult();
+                                purged++;
+                            }
+                        }
+                        else if (wi.Reason is OrphanedReason.MatchesExclusionPattern
+                                           or OrphanedReason.MatchesConfiguredExclusion
                             && wi.MatchingSourcePaths is not null)
                         {
                             purged += _catalog.MarkFilesDeletedBySourcePathsAsync(
@@ -375,13 +658,18 @@ public class OrphanedDirectoriesViewModel : ViewModelBase
                                  .SelectMany(w => w.MatchingSourcePaths!),
                         StringComparer.OrdinalIgnoreCase);
                     var purgedDirs = workItems
-                        .Where(w => w.Reason != OrphanedReason.MatchesExclusionPattern)
+                        .Where(w => w.Reason is OrphanedReason.RemovedFromSources or OrphanedReason.DeletedFromDisk)
                         .Select(w => w.DirectoryPath + "\\")
                         .ToList();
+                    var purgedRecordIds = new HashSet<long>(
+                        workItems.Where(w => w.ExcessVersionRecords is not null)
+                                 .SelectMany(w => w.ExcessVersionRecords!)
+                                 .Select(r => r.Id));
 
                     _activeFiles.RemoveAll(f =>
                         purgedPaths.Contains(f.SourcePath)
-                        || purgedDirs.Any(d => f.SourcePath.StartsWith(d, StringComparison.OrdinalIgnoreCase)));
+                        || purgedDirs.Any(d => f.SourcePath.StartsWith(d, StringComparison.OrdinalIgnoreCase))
+                        || purgedRecordIds.Contains(f.Id));
                 }
 
                 return purged;
@@ -404,16 +692,19 @@ public class OrphanedDirectoriesViewModel : ViewModelBase
         }
     }
 
+    // ------------------------------------------------------------------
+
     private void UpdateSummaryText()
     {
         if (Items.Count == 0)
         {
-            SummaryText = "No orphaned directories or excluded files found.";
+            SummaryText = "No orphaned directories, excluded files, or excess versions found.";
             return;
         }
 
-        int orphanedCount = Items.Count(i => i.Reason != OrphanedReason.MatchesExclusionPattern);
-        int excludedCount = Items.Count(i => i.Reason == OrphanedReason.MatchesExclusionPattern);
+        int orphanedCount = Items.Count(i => i.Reason is OrphanedReason.RemovedFromSources or OrphanedReason.DeletedFromDisk);
+        int excludedCount = Items.Count(i => i.Reason is OrphanedReason.MatchesExclusionPattern or OrphanedReason.MatchesConfiguredExclusion);
+        int excessCount = Items.Count(i => i.Reason == OrphanedReason.ExcessVersion);
 
         var parts = new List<string>();
         if (orphanedCount > 0)
@@ -421,9 +712,16 @@ public class OrphanedDirectoriesViewModel : ViewModelBase
         if (excludedCount > 0)
         {
             int totalExcludedFiles = Items
-                .Where(i => i.Reason == OrphanedReason.MatchesExclusionPattern)
+                .Where(i => i.Reason is OrphanedReason.MatchesExclusionPattern or OrphanedReason.MatchesConfiguredExclusion)
                 .Sum(i => i.FileCount);
-            parts.Add($"{totalExcludedFiles} excluded file{(totalExcludedFiles == 1 ? "" : "s")} in {excludedCount} director{(excludedCount == 1 ? "y" : "ies")}");
+            parts.Add($"{totalExcludedFiles:N0} excluded file{(totalExcludedFiles == 1 ? "" : "s")} in {excludedCount} director{(excludedCount == 1 ? "y" : "ies")}");
+        }
+        if (excessCount > 0)
+        {
+            int totalExcessVersions = Items
+                .Where(i => i.Reason == OrphanedReason.ExcessVersion)
+                .Sum(i => i.FileCount);
+            parts.Add($"{totalExcessVersions:N0} excess version{(totalExcessVersions == 1 ? "" : "s")} in {excessCount} director{(excessCount == 1 ? "y" : "ies")}");
         }
 
         SummaryText = string.Join(", ", parts) + " found.";
@@ -452,8 +750,15 @@ public enum OrphanedReason
     /// <summary>The directory no longer exists on disk.</summary>
     DeletedFromDisk,
 
-    /// <summary>Files in this directory match an exclusion pattern.</summary>
+    /// <summary>Files in this directory match a user-typed exclusion pattern (manual scan).</summary>
     MatchesExclusionPattern,
+
+    /// <summary>Files in this directory match the backup set's configured exclusion rules
+    /// (global excluded extensions or tier sets with 0 tiers).</summary>
+    MatchesConfiguredExclusion,
+
+    /// <summary>File versions that exceed the configured retention tier limits.</summary>
+    ExcessVersion,
 }
 
 /// <summary>
@@ -469,11 +774,19 @@ public class OrphanedDirectoryItem : ViewModelBase
     public long TotalSizeBytes { get; set; }
 
     /// <summary>
-    /// For <see cref="OrphanedReason.MatchesExclusionPattern"/> items, the specific
+    /// For <see cref="OrphanedReason.MatchesExclusionPattern"/> and
+    /// <see cref="OrphanedReason.MatchesConfiguredExclusion"/> items, the specific
     /// source paths of matching files.  Used for targeted purging (instead of
     /// deleting all files under the directory).
     /// </summary>
     public List<string>? MatchingSourcePaths { get; set; }
+
+    /// <summary>
+    /// For <see cref="OrphanedReason.ExcessVersion"/> items, the specific
+    /// file records (individual versions) that exceed the retention tier limits.
+    /// Used for targeted purging of individual version records.
+    /// </summary>
+    public List<FileRecord>? ExcessVersionRecords { get; set; }
 
     public bool IsSelected
     {
@@ -486,17 +799,12 @@ public class OrphanedDirectoryItem : ViewModelBase
         OrphanedReason.RemovedFromSources => "Removed from sources",
         OrphanedReason.DeletedFromDisk => "Deleted from disk",
         OrphanedReason.MatchesExclusionPattern => "Matches exclusion pattern",
+        OrphanedReason.MatchesConfiguredExclusion => "Matches configured exclusion",
+        OrphanedReason.ExcessVersion => "Excess version (retention)",
         _ => "Unknown",
     };
 
     public string SizeText => FormatBytes(TotalSizeBytes);
 
-    private static string FormatBytes(long bytes)
-    {
-        string[] units = ["B", "KB", "MB", "GB", "TB"];
-        int i = 0;
-        double size = bytes;
-        while (size >= 1024 && i < units.Length - 1) { size /= 1024; i++; }
-        return i == 0 ? $"{size:N0} {units[i]}" : $"{size:N1} {units[i]}";
-    }
+    private static string FormatBytes(long bytes) => $"{bytes:N0}";
 }

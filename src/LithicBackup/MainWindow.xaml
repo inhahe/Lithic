@@ -296,12 +296,35 @@
                                                                                                          RelativeSource="{RelativeSource AncestorType=Window}" />
                                                                                             </MultiBinding>
                                                                                         </WrapPanel.Visibility>
+                                                                                        <!-- Check Size (hidden while this set is being checked) -->
                                                                                         <Button Style="{StaticResource LinkButton}"
                                                                                                 Command="{Binding DataContext.SetCheckCommand,
                                                                                                           RelativeSource={RelativeSource AncestorType=Window}}"
                                                                                                 CommandParameter="{Binding}"
                                                                                                 Margin="0,0,12,0">
+                                                                                            <Button.Visibility>
+                                                                                                <MultiBinding Converter="{StaticResource IntEqualsVis}"
+                                                                                                              ConverterParameter="Invert">
+                                                                                                    <Binding Path="Id" />
+                                                                                                    <Binding Path="DataContext.CheckingSizeSetId"
+                                                                                                             RelativeSource="{RelativeSource AncestorType=Window}" />
+                                                                                                </MultiBinding>
+                                                                                            </Button.Visibility>
                                                                                             <TextBlock><Run Text="&#x2139;" FontSize="10" /> Check Size</TextBlock>
+                                                                                        </Button>
+                                                                                        <!-- Abort Check (shown only while this set is being checked) -->
+                                                                                        <Button Style="{StaticResource LinkButton}"
+                                                                                                Command="{Binding DataContext.AbortCheckCommand,
+                                                                                                          RelativeSource={RelativeSource AncestorType=Window}}"
+                                                                                                Margin="0,0,12,0">
+                                                                                            <Button.Visibility>
+                                                                                                <MultiBinding Converter="{StaticResource IntEqualsVis}">
+                                                                                                    <Binding Path="Id" />
+                                                                                                    <Binding Path="DataContext.CheckingSizeSetId"
+                                                                                                             RelativeSource="{RelativeSource AncestorType=Window}" />
+                                                                                                </MultiBinding>
+                                                                                            </Button.Visibility>
+                                                                                            <TextBlock><Run Text="&#x2716;" FontSize="10" /> Abort Check</TextBlock>
                                                                                         </Button>
                                                                                         <Button Style="{StaticResource LinkButton}"
                                                                                                 Command="{Binding DataContext.SetBackupCommand,

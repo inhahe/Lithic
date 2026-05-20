@@ -35,6 +35,13 @@ public sealed class SizeComputeScheduler
     }
 
     /// <summary>
+    /// Check whether the persistent cache has an entry for the given path.
+    /// Used to decide whether inline size computation is likely fast
+    /// (cache warm from a prior session) without committing to a full scan.
+    /// </summary>
+    internal bool HasCacheEntry(string path) => _cache.TryGet(path).HasValue;
+
+    /// <summary>
     /// Enqueue directory nodes for size computation.
     /// </summary>
     /// <param name="nodes">Directory nodes whose <see cref="SourceSelectionNodeViewModel.Size"/> should be set.</param>
