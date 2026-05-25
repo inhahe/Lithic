@@ -666,8 +666,15 @@
                     CornerRadius="4"
                     Padding="12,8"
                     Margin="0,12,0,0">
-                <TextBlock Text="{Binding StatusText}"
-                           FontSize="12" />
+                <StackPanel>
+                    <TextBlock Text="{Binding StatusText}"
+                               FontSize="12" />
+                    <TextBlock Text="{Binding BackgroundStatusText}"
+                               FontSize="10"
+                               Foreground="#FF888888"
+                               Margin="0,2,0,0"
+                               Visibility="{Binding BackgroundStatusText, Converter={StaticResource NonEmptyVis}}" />
+                </StackPanel>
             </Border>
         </Grid>
     </DockPanel>

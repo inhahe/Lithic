@@ -24,6 +24,7 @@ public class MainViewModel : ViewModelBase
     private readonly FileHashCache? _fileHashCache;
 
     private string _statusText = "Ready";
+    private string _backgroundStatusText = "";
     private int _recorderCount;
     private ViewModelBase? _currentView;
     private BackupSet? _selectedBackupSet;
@@ -172,9 +173,7 @@ public class MainViewModel : ViewModelBase
             {
                 Application.Current.Dispatcher.Invoke(() =>
                 {
-                    // Don't overwrite status while a size/dedup check is running.
-                    if (_checkingSizeSetId is not null) return;
-                    StatusText = $"Background: {reason}";
+                    BackgroundStatusText = $"Background: {reason}";
                 });
             };
         }
@@ -189,6 +188,12 @@ public class MainViewModel : ViewModelBase
     {
         get => _statusText;
         set => SetProperty(ref _statusText, value);
+    }
+
+    public string BackgroundStatusText
+    {
+        get => _backgroundStatusText;
+        set => SetProperty(ref _backgroundStatusText, value);
     }
 
     public int RecorderCount

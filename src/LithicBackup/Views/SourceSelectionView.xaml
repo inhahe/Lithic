@@ -390,6 +390,11 @@
                                  VerticalScrollBarVisibility="Auto" TextWrapping="NoWrap"
                                  BorderBrush="{StaticResource BorderBrush}"
                                  ToolTip="One glob pattern per line — files matching these are NOT assigned to this tier set" />
+                        <Button Content="Apply"
+                                Command="{Binding ApplyFiltersCommand}"
+                                FontSize="11" Padding="10,2" Margin="0,4,0,0"
+                                HorizontalAlignment="Left"
+                                ToolTip="Apply the current filter patterns to recalculate sizes" />
                     </StackPanel>
 
                     <!-- "Default" description -->
@@ -576,22 +581,6 @@
         </Border>
 
         <Grid>
-        <!-- Loading overlay while saved selections are being restored -->
-        <Border Visibility="{Binding IsApplyingSelections, Converter={StaticResource BoolToVis}}"
-                Background="{StaticResource SurfaceBrush}"
-                VerticalAlignment="Center" HorizontalAlignment="Center"
-                CornerRadius="6" Padding="24,16"
-                Panel.ZIndex="1">
-            <StackPanel Orientation="Horizontal">
-                <ProgressBar IsIndeterminate="True" Width="100" Height="4"
-                             Foreground="{StaticResource PrimaryBrush}"
-                             Margin="0,0,12,0" VerticalAlignment="Center" />
-                <TextBlock Text="Restoring selections..."
-                           Foreground="{StaticResource TextSecondaryBrush}"
-                           FontSize="13" VerticalAlignment="Center" />
-            </StackPanel>
-        </Border>
-
         <!-- TreeView with integrated column headers -->
         <TreeView ItemsSource="{Binding Roots}"
                   BorderThickness="0"

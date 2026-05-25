@@ -4,18 +4,18 @@ using Microsoft.Data.Sqlite;
 namespace LithicBackup.ViewModels;
 
 /// <summary>
-/// Persistent cache of per-directory file sizes. Each entry stores the total
-/// size of files directly in that directory (not recursive) along with the
-/// directory's <see cref="DirectoryInfo.LastWriteTimeUtc"/> at the time the
-/// size was computed. On subsequent lookups the timestamp is compared — if it
-/// still matches the filesystem, the cached value is reused; otherwise files
-/// are re-enumerated and the cache is updated.
+/// Persistent cache of per-directory file sizes. Each entry stores:
 ///
-/// The recursive total for a directory is computed by summing its cached
-/// direct file size with the recursively-computed sizes of all subdirectories.
-/// This means only directories whose direct contents actually changed need
-/// to have their files enumerated — unchanged subtrees are served from cache
-/// after a single timestamp check per directory.
+/// <list type="bullet">
+/// <item><b>Direct sizes</b>: total size and count of files directly in the
+/// directory (not recursive), validated by the directory's
+/// <see cref="DirectoryInfo.LastWriteTimeUtc"/>.</item>
+/// <item><b>Recursive totals</b>: the last-computed recursive size and file
+/// count for the entire subtree. These are used as instant initial values
+/// when displaying directories that haven't changed, avoiding the need to
+/// walk the entire subtree on each load. They are re-validated by the
+/// background scheduler and updated whenever a full computation runs.</item>
+/// </list>
 ///
 /// Storage: in-memory <see cref="Dictionary{TKey,TValue}"/> loaded from a
 /// SQLite database at construction time. Dirty entries are flushed to disk
@@ -56,17 +56,69 @@ public sealed class DirectorySizeCache : IDisposable
     }
 
     /// <summary>
-    /// Store or update a cache entry. Auto-flushes to disk every 500 writes.
+    /// Look up the cached recursive total for <paramref name="path"/>.
+    /// Returns <c>null</c> if the path is not in the cache or the recursive
+    /// total has not been computed yet.
+    /// </summary>
+    public (long RecursiveSize, int RecursiveFileCount)? TryGetRecursive(string path)
+    {
+        lock (_lock)
+        {
+            if (_cache.TryGetValue(path, out var entry) && entry.RecursiveSize >= 0)
+                return (entry.RecursiveSize, entry.RecursiveFileCount);
+        }
+        return null;
+    }
+
+    /// <summary>
+    /// Store or update the direct file size for a directory.
+    /// Auto-flushes to disk every 500 writes.
     /// </summary>
     public void Set(string path, long directFileSize, int directFileCount, DateTime dirLastWriteUtc)
     {
         lock (_lock)
         {
-            _cache[path] = new CacheEntry(directFileSize, directFileCount, dirLastWriteUtc);
+            if (_cache.TryGetValue(path, out var existing))
+            {
+                // Preserve existing recursive totals when only updating direct sizes.
+                _cache[path] = existing with
+                {
+                    DirectFileSize = directFileSize,
+                    DirectFileCount = directFileCount,
+                    DirLastWriteUtc = dirLastWriteUtc,
+                };
+            }
+            else
+            {
+                _cache[path] = new CacheEntry(directFileSize, directFileCount, dirLastWriteUtc, -1, -1);
+            }
             _dirtyPaths.Add(path);
 
             if (_dirtyPaths.Count >= 500)
                 FlushInternal();
+        }
+    }
+
+    /// <summary>
+    /// Store the recursive total for a directory. Called after a full
+    /// recursive computation completes for this path.
+    /// </summary>
+    public void SetRecursive(string path, long recursiveSize, int recursiveFileCount)
+    {
+        lock (_lock)
+        {
+            if (_cache.TryGetValue(path, out var existing))
+            {
+                _cache[path] = existing with
+                {
+                    RecursiveSize = recursiveSize,
+                    RecursiveFileCount = recursiveFileCount,
+                };
+                _dirtyPaths.Add(path);
+
+                if (_dirtyPaths.Count >= 500)
+                    FlushInternal();
+            }
         }
     }
 
@@ -92,7 +144,11 @@ public sealed class DirectorySizeCache : IDisposable
             EnsureTable(conn);
 
             using var cmd = conn.CreateCommand();
-            cmd.CommandText = "SELECT Path, DirectFileSize, DirectFileCount, DirLastWriteUtc FROM DirectorySizeCache";
+            cmd.CommandText = """
+                SELECT Path, DirectFileSize, DirectFileCount, DirLastWriteUtc,
+                       RecursiveSize, RecursiveFileCount
+                FROM DirectorySizeCache
+                """;
 
             using var reader = cmd.ExecuteReader();
             while (reader.Read())
@@ -103,7 +159,9 @@ public sealed class DirectorySizeCache : IDisposable
                 var lastWrite = DateTime.Parse(
                     reader.GetString(3), null,
                     System.Globalization.DateTimeStyles.RoundtripKind);
-                _cache[path] = new CacheEntry(size, count, lastWrite);
+                var recSize = reader.IsDBNull(4) ? -1L : reader.GetInt64(4);
+                var recCount = reader.IsDBNull(5) ? -1 : reader.GetInt32(5);
+                _cache[path] = new CacheEntry(size, count, lastWrite, recSize, recCount);
             }
         }
         catch
@@ -134,13 +192,17 @@ public sealed class DirectorySizeCache : IDisposable
             using var tx = conn.BeginTransaction();
             using var cmd = conn.CreateCommand();
             cmd.CommandText = """
-                INSERT OR REPLACE INTO DirectorySizeCache (Path, DirectFileSize, DirectFileCount, DirLastWriteUtc)
-                VALUES ($path, $size, $count, $lastWrite)
+                INSERT OR REPLACE INTO DirectorySizeCache
+                    (Path, DirectFileSize, DirectFileCount, DirLastWriteUtc,
+                     RecursiveSize, RecursiveFileCount)
+                VALUES ($path, $size, $count, $lastWrite, $recSize, $recCount)
                 """;
             var pPath = cmd.Parameters.Add("$path", SqliteType.Text);
             var pSize = cmd.Parameters.Add("$size", SqliteType.Integer);
             var pCount = cmd.Parameters.Add("$count", SqliteType.Integer);
             var pLw = cmd.Parameters.Add("$lastWrite", SqliteType.Text);
+            var pRecSize = cmd.Parameters.Add("$recSize", SqliteType.Integer);
+            var pRecCount = cmd.Parameters.Add("$recCount", SqliteType.Integer);
 
             foreach (var (path, entry) in toSave)
             {
@@ -148,6 +210,8 @@ public sealed class DirectorySizeCache : IDisposable
                 pSize.Value = entry.DirectFileSize;
                 pCount.Value = entry.DirectFileCount;
                 pLw.Value = entry.DirLastWriteUtc.ToString("O");
+                pRecSize.Value = entry.RecursiveSize >= 0 ? entry.RecursiveSize : DBNull.Value;
+                pRecCount.Value = entry.RecursiveFileCount >= 0 ? entry.RecursiveFileCount : DBNull.Value;
                 cmd.ExecuteNonQuery();
             }
 
@@ -174,16 +238,25 @@ public sealed class DirectorySizeCache : IDisposable
                 Path TEXT PRIMARY KEY,
                 DirectFileSize INTEGER NOT NULL,
                 DirectFileCount INTEGER NOT NULL DEFAULT 0,
-                DirLastWriteUtc TEXT NOT NULL
+                DirLastWriteUtc TEXT NOT NULL,
+                RecursiveSize INTEGER,
+                RecursiveFileCount INTEGER
             )
             """;
         cmd.ExecuteNonQuery();
 
-        // Migrate existing databases that lack the DirectFileCount column.
+        // Migrate existing databases that lack newer columns.
+        TryAddColumn(conn, "DirectFileCount", "INTEGER NOT NULL DEFAULT 0");
+        TryAddColumn(conn, "RecursiveSize", "INTEGER");
+        TryAddColumn(conn, "RecursiveFileCount", "INTEGER");
+    }
+
+    private static void TryAddColumn(SqliteConnection conn, string column, string type)
+    {
         try
         {
             using var alter = conn.CreateCommand();
-            alter.CommandText = "ALTER TABLE DirectorySizeCache ADD COLUMN DirectFileCount INTEGER NOT NULL DEFAULT 0";
+            alter.CommandText = $"ALTER TABLE DirectorySizeCache ADD COLUMN {column} {type}";
             alter.ExecuteNonQuery();
         }
         catch
@@ -192,5 +265,7 @@ public sealed class DirectorySizeCache : IDisposable
         }
     }
 
-    private sealed record CacheEntry(long DirectFileSize, int DirectFileCount, DateTime DirLastWriteUtc);
+    private sealed record CacheEntry(
+        long DirectFileSize, int DirectFileCount, DateTime DirLastWriteUtc,
+        long RecursiveSize, int RecursiveFileCount);
 }

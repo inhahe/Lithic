@@ -23,6 +23,15 @@ public sealed class SizeComputeScheduler
     private readonly DirectorySizeCache _cache = new();
 
     /// <summary>
+    /// When set, the scheduler computes both unfiltered and filtered sizes
+    /// for every directory.  The filtered size is stored on the node's
+    /// <see cref="SourceSelectionNodeViewModel.FilteredSize"/> and accounts
+    /// for excluded subdirectories so that "selected only" mode shows the
+    /// correct backup size without requiring children to be loaded.
+    /// </summary>
+    internal Func<string, bool>? GlobalExcludeFilter { get; set; }
+
+    /// <summary>
     /// Compute a directory's size synchronously using the shared cache.
     /// Intended for callers that already run on a background thread and
     /// want to avoid the per-node scheduler overhead (e.g. pre-populating
@@ -40,6 +49,17 @@ public sealed class SizeComputeScheduler
     /// (cache warm from a prior session) without committing to a full scan.
     /// </summary>
     internal bool HasCacheEntry(string path) => _cache.TryGet(path).HasValue;
+
+    /// <summary>
+    /// Try to get the cached recursive total for a directory. This is an
+    /// O(1) lookup (single dictionary read + one filesystem stat) — no
+    /// subdirectory traversal. Returns <c>null</c> if the directory is not
+    /// cached or its timestamp has changed since the cache was written.
+    /// </summary>
+    internal (long Size, int FileCount)? TryGetCachedSize(string path)
+    {
+        return SourceSelectionNodeViewModel.TryGetCachedRecursiveSize(path, _cache);
+    }
 
     /// <summary>
     /// Enqueue directory nodes for size computation.
@@ -108,13 +128,18 @@ public sealed class SizeComputeScheduler
     /// <summary>Minimum interval between progress reports (ms).</summary>
     private const long ProgressIntervalMs = 150;
 
+    /// <summary>Minimum interval between SQLite cache flushes (ms).</summary>
+    private const long CacheFlushIntervalMs = 1000;
+
     private async Task ProcessQueueAsync()
     {
         try
         {
             var batch = new List<(SourceSelectionNodeViewModel Node, long Size,
-                                  int FileCount, Action OnComplete)>();
+                                  int FileCount, long FilteredSize,
+                                  int FilteredFileCount, Action OnComplete)>();
             long lastProgressTick = 0;
+            long lastCacheFlushTick = Environment.TickCount64;
 
             while (true)
             {
@@ -137,9 +162,14 @@ public sealed class SizeComputeScheduler
                     }
                 }
 
-                // Already computed by another code path (e.g. node was
-                // duplicated across a priority and background batch).
-                if (item.Node.Size >= 0)
+                // Check if this node still needs work. A node might
+                // already have its unfiltered size (from cached recursive
+                // totals) but still need its filtered size computed.
+                bool needsUnfiltered = item.Node.Size < 0;
+                var gf = GlobalExcludeFilter;
+                bool needsFiltered = gf is not null && item.Node.FilteredSize < 0;
+
+                if (!needsUnfiltered && !needsFiltered)
                 {
                     item.OnComplete();
                     continue;
@@ -159,15 +189,31 @@ public sealed class SizeComputeScheduler
 
                 long size = -1;
                 int fileCount = -1;
+                long filteredSize = -1;
+                int filteredFileCount = -1;
                 try
                 {
                     var dirInfo = new DirectoryInfo(item.Node.Path);
-                    (size, fileCount) = SourceSelectionNodeViewModel.ComputeDirectorySize(
-                        dirInfo, _cache, item.ExcludeFilter);
+
+                    if (needsUnfiltered)
+                    {
+                        // Full recursive computation (uses persistent cache).
+                        (size, fileCount) = SourceSelectionNodeViewModel.ComputeDirectorySize(
+                            dirInfo, _cache, item.ExcludeFilter);
+                    }
+
+                    // When an exclusion filter is active, compute the
+                    // filtered size so "selected only" mode is correct.
+                    if (needsFiltered)
+                    {
+                        (filteredSize, filteredFileCount) =
+                            SourceSelectionNodeViewModel.ComputeDirectorySizeFiltered(dirInfo, gf!);
+                    }
                 }
                 catch { }
 
-                batch.Add((item.Node, size, fileCount, item.OnComplete));
+                batch.Add((item.Node, size, fileCount, filteredSize,
+                           filteredFileCount, item.OnComplete));
 
                 // Flush when the batch is full or when priority items
                 // arrived (so they aren't delayed by the current batch).
@@ -180,6 +226,16 @@ public sealed class SizeComputeScheduler
 
                 if (shouldFlush)
                     await FlushBatchAsync(batch);
+
+                // Persist computed sizes to SQLite periodically so they
+                // survive if the user closes the app mid-computation.
+                long nowMs = Environment.TickCount64;
+                if (nowMs - lastCacheFlushTick >= CacheFlushIntervalMs)
+                {
+                    try { _cache.Flush(); }
+                    catch { }
+                    lastCacheFlushTick = nowMs;
+                }
             }
 
             // Flush any remaining results.
@@ -188,7 +244,7 @@ public sealed class SizeComputeScheduler
         }
         finally
         {
-            // Flush cached sizes to disk when the queue drains.
+            // Final flush when the queue drains.
             try { _cache.Flush(); }
             catch { }
 
@@ -213,7 +269,8 @@ public sealed class SizeComputeScheduler
     /// </summary>
     private static async Task FlushBatchAsync(
         List<(SourceSelectionNodeViewModel Node, long Size,
-              int FileCount, Action OnComplete)> batch)
+              int FileCount, long FilteredSize,
+              int FilteredFileCount, Action OnComplete)> batch)
     {
         if (batch.Count == 0) return;
 
@@ -226,17 +283,22 @@ public sealed class SizeComputeScheduler
         // instead of 2N passes (IsComputing + Size per node).
         await System.Windows.Application.Current.Dispatcher.InvokeAsync(() =>
         {
-            foreach (var (node, size, fileCount, _) in results)
+            foreach (var (node, size, fileCount, filteredSize, filteredFileCount, _) in results)
             {
                 if (size >= 0)
                 {
                     node.Size = size;
                     node.FileCount = fileCount;
                 }
+                if (filteredSize >= 0)
+                {
+                    node.FilteredSize = filteredSize;
+                    node.FilteredFileCount = filteredFileCount;
+                }
             }
         });
 
-        foreach (var (_, _, _, onComplete) in results)
+        foreach (var (_, _, _, _, _, onComplete) in results)
             onComplete();
     }
 

@@ -159,6 +159,7 @@ public class SourceSelectionViewModel : ViewModelBase
         CancelSeedCommand = new RelayCommand(
             _ => _seedCts?.Cancel(),
             _ => IsSeeding && _seedCts is not null && !_seedCts.IsCancellationRequested);
+        ApplyFiltersCommand = new RelayCommand(_ => ApplyFilters(), _ => _filtersPendingApply);
         AnalyzeDedupCommand = new RelayCommand(
             _ => _ = OnAnalyzeDedupAsync(),
             _ => !_isAnalyzingDedup);
@@ -333,21 +334,44 @@ public class SourceSelectionViewModel : ViewModelBase
             CommandManager.InvalidateRequerySuggested();
         }
 
-        // Notify listeners when exclusion-affecting patterns change so
-        // the size report can be recalculated with the new filters.
+        // Mark the cached exclusion filter as stale so the next
+        // ApplyFilters call rebuilds it.  Don't trigger the expensive
+        // tree refresh automatically — the user clicks "Apply" when
+        // they're done editing patterns.
         if (e.PropertyName is nameof(TierSetViewModel.FilePatternsText)
                            or nameof(TierSetViewModel.FileExemptPatternsText))
         {
             _excludeFilterDirty = true;
-            ExclusionSettingsChanged?.Invoke();
-            // Refresh "selected only" sizes with updated exclusion filter.
-            if (_showSelectedSizesOnly)
-            {
-                foreach (var root in Roots)
-                    root.RefreshFormattedSize();
-                RefreshSelectedSize();
-            }
+            _filtersPendingApply = true;
+            CommandManager.InvalidateRequerySuggested();
         }
+    }
+
+    /// <summary>
+    /// Whether the user has edited filter patterns since the last Apply.
+    /// Drives the Apply button's enabled state.
+    /// </summary>
+    private bool _filtersPendingApply;
+
+    /// <summary>
+    /// Rebuild the exclusion filter from the current pattern fields and
+    /// refresh all filtered sizes in the tree.  Called when the user clicks
+    /// the "Apply" button next to the pattern fields.
+    /// </summary>
+    internal void ApplyFilters()
+    {
+        _filtersPendingApply = false;
+        CommandManager.InvalidateRequerySuggested();
+
+        var newFilter = GetExcludeFilter();
+        _scheduler.GlobalExcludeFilter = newFilter;
+        foreach (var root in Roots)
+            root.ResetFilteredSizes();
+        if (_showSelectedSizesOnly)
+            RefreshSelectedSize();
+        _ = ComputeAllUnknownSizesAsync();
+
+        ExclusionSettingsChanged?.Invoke();
     }
 
     /// <summary>
@@ -778,6 +802,7 @@ public class SourceSelectionViewModel : ViewModelBase
     public ICommand RemoveTierSetCommand { get; }
     public ICommand AddPathCommand { get; }
     public ICommand AutoIncludeCheckedCommand { get; }
+    public ICommand ApplyFiltersCommand { get; }
     public ICommand AnalyzeDedupCommand { get; }
     public ICommand CancelDedupCommand { get; }
 
@@ -1711,6 +1736,10 @@ public class SourceSelectionViewModel : ViewModelBase
         }
 
         SelectedTierSet = TierSets.FirstOrDefault();
+
+        // Push the exclusion filter to the scheduler so that both inline
+        // and queued size computations produce filtered values.
+        _scheduler.GlobalExcludeFilter = GetExcludeFilter();
     }
 
     /// <summary>
