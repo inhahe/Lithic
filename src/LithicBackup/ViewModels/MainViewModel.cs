@@ -537,9 +537,15 @@ public class MainViewModel : ViewModelBase
             }
 
             long lastSeedUpdate = 0;
+            int lastSkippedExisting = 0;
             var seedSw = System.Diagnostics.Stopwatch.StartNew();
             var scanProgress = new Progress<ScanProgress>(sp =>
             {
+                // Track the most recent skipped count so the post-completion
+                // message can show "X already in catalog" even after the
+                // throttled progress reports stop firing.
+                lastSkippedExisting = sp.FilesSkipped;
+
                 long now = seedSw.ElapsedMilliseconds;
                 if (now - lastSeedUpdate < ProgressUpdateIntervalMs)
                     return;
@@ -547,8 +553,11 @@ public class MainViewModel : ViewModelBase
 
                 string current = string.IsNullOrEmpty(sp.CurrentDirectory) ? ""
                     : $"\n{sp.CurrentDirectory}";
+                string skipped = sp.FilesSkipped > 0
+                    ? $", {sp.FilesSkipped:N0} already in catalog"
+                    : "";
                 sourceSelection.SeedResult =
-                    $"Importing... {sp.FilesFound:N0} files ({FormatBytes(sp.TotalBytes)}){current}";
+                    $"Importing... {sp.FilesFound:N0} files ({FormatBytes(sp.TotalBytes)}){skipped}{current}";
             });
 
             bool skipHash = sourceSelection.SeedSkipHashing;
@@ -560,14 +569,22 @@ public class MainViewModel : ViewModelBase
 
             if (count > 0)
             {
+                string skippedSuffix = lastSkippedExisting > 0
+                    ? $" ({lastSkippedExisting:N0} already in catalog were skipped)"
+                    : "";
                 sourceSelection.SeedResult =
-                    $"Imported {count:N0} files. Future backups will be incremental.";
+                    $"Imported {count:N0} files{skippedSuffix}. Future backups will be incremental.";
 
                 // Check source tree nodes matching the seeded directory structure
                 // so the user sees which drives/directories are covered.
                 await ApplySeedSelectionsAsync(sourceSelection, dir!);
 
                 sourceSelection.HasSelection = true;
+            }
+            else if (lastSkippedExisting > 0)
+            {
+                sourceSelection.SeedResult =
+                    $"Nothing new to import — all {lastSkippedExisting:N0} files were already in the catalog.";
             }
             else
             {
@@ -1454,6 +1471,11 @@ public class MainViewModel : ViewModelBase
         var scanToken = _scanCts.Token;
         StatusText = $"Scanning \"{backupSet.Name}\"...";
 
+        // Show a wait cursor until the burn progress panel appears.  Scan +
+        // plan can take many seconds on large sets, and without this the
+        // user has no immediate visual confirmation that the click landed.
+        Mouse.OverrideCursor = Cursors.Wait;
+
         try
         {
             // Throttled scan progress reporter.  The `scanning` flag is
@@ -1551,6 +1573,10 @@ public class MainViewModel : ViewModelBase
         {
             _scanCts?.Dispose();
             _scanCts = null;
+            // Clear the wait cursor.  By this point either the burn progress
+            // panel is visible (StartBurn assigned ActiveBackupProgress) or we
+            // bailed out with an error / cancellation / nothing-to-do.
+            Mouse.OverrideCursor = null;
         }
     }
 
@@ -2228,7 +2254,7 @@ public class MainViewModel : ViewModelBase
     }
 
     // -------------------------------------------------------------------
-    // Flow 4: Orphaned Directories
+    // Flow 4: Cleanup (orphaned catalog records + optional destination scan)
     // -------------------------------------------------------------------
 
     private async void StartOrphanedDirsFlow()
@@ -2236,18 +2262,18 @@ public class MainViewModel : ViewModelBase
         if (SelectedBackupSet is null)
             return;
 
+        // Catalog load + classification can take several seconds on large
+        // backup sets.  Show a wait cursor for the entire load so the user
+        // gets immediate feedback that the click landed; the view itself is
+        // displayed right away so the in-progress phase counters are visible.
         Mouse.OverrideCursor = Cursors.Wait;
         try
         {
             var vm = new OrphanedDirectoriesViewModel(_catalog, SelectedBackupSet);
             vm.DoneRequested += GoHome;
-
-            // Wait for the initial data load so the view appears fully populated
-            // instead of flashing a "Loading..." placeholder.
-            await vm.WaitForLoadAsync();
-
             CurrentView = vm;
-            StatusText = "Review directories no longer in the backup sources.";
+            StatusText = "Review files and directories that can be cleaned up.";
+            await vm.WaitForLoadAsync();
         }
         finally
         {

@@ -750,40 +750,38 @@ public class SqliteCatalogRepository : ICatalogRepository
         return Task.FromResult(rows);
     }
 
-    public async Task<int> MarkFilesDeletedBySourcePathsAsync(
+    public Task<int> MarkFilesDeletedBySourcePathsAsync(
         int backupSetId, IEnumerable<string> sourcePaths, CancellationToken ct = default)
     {
         ct.ThrowIfCancellationRequested();
 
+        // No internal transaction: this method is always called from inside
+        // a caller-managed transaction (Cleanup's purge wraps every catalog
+        // mutation in one).  Microsoft.Data.Sqlite doesn't allow nested
+        // transactions, and starting one here when an outer transaction is
+        // already active throws "SqliteConnection does not support nested
+        // transactions".  If a future caller needs batching efficiency
+        // without an outer transaction, they should wrap the call in one
+        // themselves via BeginTransactionAsync.
         int totalRows = 0;
-        var tx = await BeginTransactionAsync(ct);
-        try
-        {
-            using var cmd = _connection.CreateCommand();
-            cmd.CommandText = """
-                UPDATE Files SET IsDeleted = 1
-                WHERE IsDeleted = 0
-                  AND DiscId IN (SELECT Id FROM Discs WHERE BackupSetId = $setId)
-                  AND SourcePath = $path
-                """;
-            cmd.Parameters.AddWithValue("$setId", backupSetId);
-            var pathParam = cmd.Parameters.AddWithValue("$path", "");
+        using var cmd = _connection.CreateCommand();
+        cmd.CommandText = """
+            UPDATE Files SET IsDeleted = 1
+            WHERE IsDeleted = 0
+              AND DiscId IN (SELECT Id FROM Discs WHERE BackupSetId = $setId)
+              AND SourcePath = $path
+            """;
+        cmd.Parameters.AddWithValue("$setId", backupSetId);
+        var pathParam = cmd.Parameters.AddWithValue("$path", "");
 
-            foreach (var path in sourcePaths)
-            {
-                ct.ThrowIfCancellationRequested();
-                pathParam.Value = path;
-                totalRows += cmd.ExecuteNonQuery();
-            }
-
-            tx.Complete();
-        }
-        finally
+        foreach (var path in sourcePaths)
         {
-            tx.Dispose();
+            ct.ThrowIfCancellationRequested();
+            pathParam.Value = path;
+            totalRows += cmd.ExecuteNonQuery();
         }
 
-        return totalRows;
+        return Task.FromResult(totalRows);
     }
 
     // ---------------------------------------------------------------

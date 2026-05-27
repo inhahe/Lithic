@@ -32,6 +32,15 @@ public sealed class SizeComputeScheduler
     internal Func<string, bool>? GlobalExcludeFilter { get; set; }
 
     /// <summary>
+    /// Deterministic signature of <see cref="GlobalExcludeFilter"/>. Used by
+    /// <see cref="DirectorySizeCache"/> to persist filtered recursive sizes
+    /// across sessions and to invalidate the cache when filter patterns
+    /// change. Should be updated whenever <see cref="GlobalExcludeFilter"/>
+    /// is reassigned.
+    /// </summary>
+    internal string? GlobalExcludeFilterSignature { get; set; }
+
+    /// <summary>
     /// Compute a directory's size synchronously using the shared cache.
     /// Intended for callers that already run on a background thread and
     /// want to avoid the per-node scheduler overhead (e.g. pre-populating
@@ -40,6 +49,15 @@ public sealed class SizeComputeScheduler
     internal (long Size, int FileCount) ComputeInline(
         DirectoryInfo dir, Func<string, bool>? excludeFilter)
     {
+        // When an inline call uses the global filter, route through the
+        // cached filtered path so that result is persisted.
+        if (excludeFilter is not null
+            && ReferenceEquals(excludeFilter, GlobalExcludeFilter)
+            && GlobalExcludeFilterSignature is { } sig)
+        {
+            return SourceSelectionNodeViewModel.ComputeDirectorySizeFilteredCached(
+                dir, excludeFilter, _cache, sig);
+        }
         return SourceSelectionNodeViewModel.ComputeDirectorySize(dir, _cache, excludeFilter);
     }
 
@@ -62,6 +80,21 @@ public sealed class SizeComputeScheduler
     }
 
     /// <summary>
+    /// Try to get the cached filtered recursive total for a directory,
+    /// using the scheduler's current <see cref="GlobalExcludeFilterSignature"/>.
+    /// Returns <c>null</c> if no filter signature is set, the directory isn't
+    /// cached, the signature doesn't match (filter patterns changed since
+    /// the cached value was written), or the directory's timestamp has
+    /// advanced past the cached entry.
+    /// </summary>
+    internal (long Size, int FileCount)? TryGetCachedFilteredSize(string path)
+    {
+        if (GlobalExcludeFilterSignature is not { } sig)
+            return null;
+        return SourceSelectionNodeViewModel.TryGetCachedFilteredRecursiveSize(path, _cache, sig);
+    }
+
+    /// <summary>
     /// Enqueue directory nodes for size computation.
     /// </summary>
     /// <param name="nodes">Directory nodes whose <see cref="SourceSelectionNodeViewModel.Size"/> should be set.</param>
@@ -79,9 +112,12 @@ public sealed class SizeComputeScheduler
         bool isPriority, IProgress<string>? progress = null)
     {
         var pending = new List<SourceSelectionNodeViewModel>();
+        var gf = GlobalExcludeFilter;
         foreach (var n in nodes)
         {
-            if (n.Size < 0 && n.IsDirectory)
+            if (!n.IsDirectory) continue;
+            // Accept nodes that need unfiltered size OR filtered size.
+            if (n.Size < 0 || (gf is not null && n.FilteredSize < 0))
                 pending.Add(n);
         }
 
@@ -206,8 +242,18 @@ public sealed class SizeComputeScheduler
                     // filtered size so "selected only" mode is correct.
                     if (needsFiltered)
                     {
-                        (filteredSize, filteredFileCount) =
-                            SourceSelectionNodeViewModel.ComputeDirectorySizeFiltered(dirInfo, gf!);
+                        var sig = GlobalExcludeFilterSignature;
+                        if (sig is not null)
+                        {
+                            (filteredSize, filteredFileCount) =
+                                SourceSelectionNodeViewModel.ComputeDirectorySizeFilteredCached(
+                                    dirInfo, gf!, _cache, sig);
+                        }
+                        else
+                        {
+                            (filteredSize, filteredFileCount) =
+                                SourceSelectionNodeViewModel.ComputeDirectorySizeFiltered(dirInfo, gf!);
+                        }
                     }
                 }
                 catch { }

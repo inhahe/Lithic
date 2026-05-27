@@ -8,7 +8,7 @@
         mc:Ignorable="d"
         d:DataContext="{d:DesignInstance Type=vm:MainViewModel, IsDesignTimeCreatable=False}"
         Style="{StaticResource MainWindowStyle}"
-        Title="Lithic Backup" Height="820" Width="1050"
+        Title="Lithic Backup" Height="1000" Width="1500"
         MinHeight="480" MinWidth="700"
         WindowStartupLocation="CenterScreen">
 
@@ -152,7 +152,7 @@
                                                                                               Command="{Binding PlacementTarget.Tag.SetModifyCommand, RelativeSource={RelativeSource AncestorType=ContextMenu}}"
                                                                                               CommandParameter="{Binding}" />
                                                                                     <Separator />
-                                                                                    <MenuItem Header="Review Orphaned Directories"
+                                                                                    <MenuItem Header="Cleanup..."
                                                                                               Command="{Binding PlacementTarget.Tag.SetOrphanedDirsCommand, RelativeSource={RelativeSource AncestorType=ContextMenu}}"
                                                                                               CommandParameter="{Binding}" />
                                                                                     <MenuItem Header="Backup Coverage"

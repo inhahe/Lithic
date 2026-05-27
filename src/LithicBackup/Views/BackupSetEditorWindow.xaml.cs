@@ -28,6 +28,31 @@ public partial class BackupSetEditorWindow : Window
     }
 
     /// <summary>
+    /// When an owned window closes, WPF normally hands focus back to the
+    /// owner — but Windows refuses to bring a window to the foreground if
+    /// some other process currently owns the foreground.  This commonly
+    /// happens here because the editor windows run background scans that
+    /// release focus, letting other apps steal it while the dialog is open.
+    /// Explicitly activating the owner restores the expected behavior:
+    /// closing the dialog returns the user to LithicBackup, not to whatever
+    /// app happens to be in front.
+    /// </summary>
+    protected override void OnClosed(EventArgs e)
+    {
+        base.OnClosed(e);
+
+        // If the owner itself is hidden (e.g. main window minimized to tray),
+        // don't force-show it — that would override an intentional hide.
+        var owner = Owner;
+        if (owner is not null && owner.IsVisible)
+        {
+            if (owner.WindowState == WindowState.Minimized)
+                owner.WindowState = WindowState.Normal;
+            owner.Activate();
+        }
+    }
+
+    /// <summary>
     /// Set the view model displayed in the editor content area.
     /// The implicit DataTemplates in ContentArea.Resources handle rendering.
     /// </summary>

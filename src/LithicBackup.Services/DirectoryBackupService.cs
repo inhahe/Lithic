@@ -1238,10 +1238,20 @@ public class DirectoryBackupService
         }, ct);
 
         int importedCount = 0;
+        int skippedExisting = 0;
         long totalBytes = 0;
         var progressSw = System.Diagnostics.Stopwatch.StartNew();
         long lastProgressMs = 0;
         const int ProgressIntervalMs = 500;
+
+        // Idempotency guard: load the set of SourcePaths already present in
+        // the catalog so re-running the seed on the same destination doesn't
+        // create duplicate FileRecords.  GetLatestVersionInfoAsync returns
+        // one entry per unique source path (non-deleted), which is exactly
+        // the set we need to skip.
+        var existing = await _catalog.GetLatestVersionInfoAsync(backupSetId, ct);
+        var existingPaths = new HashSet<string>(
+            existing.Keys, StringComparer.OrdinalIgnoreCase);
 
         // Enumerate all single-letter (or short) subdirectories that look like
         // drive prefixes: C, D, E, etc.
@@ -1269,10 +1279,28 @@ public class DirectoryBackupService
                     file.Name.EndsWith(".fileref", StringComparison.OrdinalIgnoreCase))
                     continue;
 
-                // Skip files in _prev directories (versioned history).
+                // Skip files under any "_prev" segment — these are
+                // versioned-history copies kept by other backup tools (e.g.
+                // backup4all stores superseded files in per-folder _prev
+                // subdirectories) and importing them would create catalog
+                // rows whose SourcePath isn't a real source location.
                 string relativeToDrive = System.IO.Path.GetRelativePath(driveDir.FullName, file.FullName);
+                if (relativeToDrive.Split(['\\', '/'])
+                        .Any(seg => seg.Equals("_prev", StringComparison.OrdinalIgnoreCase)))
+                    continue;
+
                 string fullSourcePath = System.IO.Path.Combine(driveRoot, relativeToDrive);
                 string discPath = System.IO.Path.Combine(dirName, relativeToDrive);
+
+                // Idempotent skip: this source path is already in the catalog
+                // (from a previous seed of the same destination).  Re-importing
+                // would create a duplicate FileRecord that retention logic
+                // would later flag as an excess version.
+                if (existingPaths.Contains(fullSourcePath))
+                {
+                    skippedExisting++;
+                    continue;
+                }
 
                 string hash;
                 if (skipHashing)
@@ -1294,6 +1322,7 @@ public class DirectoryBackupService
                             CurrentDirectory = fullSourcePath,
                             FilesFound = importedCount,
                             TotalBytes = totalBytes,
+                            FilesSkipped = skippedExisting,
                         });
                     }
 
@@ -1337,6 +1366,7 @@ public class DirectoryBackupService
                         CurrentDirectory = fullSourcePath,
                         FilesFound = importedCount,
                         TotalBytes = totalBytes,
+                        FilesSkipped = skippedExisting,
                     });
                 }
             }
@@ -1348,6 +1378,7 @@ public class DirectoryBackupService
             CurrentDirectory = "",
             FilesFound = importedCount,
             TotalBytes = totalBytes,
+            FilesSkipped = skippedExisting,
         });
 
         // Update disc used bytes.

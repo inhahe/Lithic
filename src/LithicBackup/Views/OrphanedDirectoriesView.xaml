@@ -4,175 +4,527 @@
              xmlns:d="http://schemas.microsoft.com/expression/blend/2008"
              xmlns:mc="http://schemas.openxmlformats.org/markup-compatibility/2006"
              xmlns:vm="clr-namespace:LithicBackup.ViewModels"
+             xmlns:b="clr-namespace:LithicBackup.Behaviors"
              mc:Ignorable="d"
              d:DataContext="{d:DesignInstance Type=vm:OrphanedDirectoriesViewModel, IsDesignTimeCreatable=False}">
 
-    <DockPanel>
-        <!-- Header -->
-        <StackPanel DockPanel.Dock="Top" Margin="0,0,0,12">
-            <TextBlock Style="{StaticResource H2}" Text="Orphaned Directories" />
-            <TextBlock Style="{StaticResource SubText}"
-                       Text="{Binding SummaryText}" />
+    <UserControl.Resources>
+        <!-- ===========================================================
+             Custom TreeViewItem template for the cleanup tree.
 
-            <!-- Exclusion pattern scanner -->
-            <Border Style="{StaticResource Card}" Padding="10" Margin="0,10,0,0">
-                <StackPanel>
-                    <TextBlock Text="Scan for Excluded Files" FontWeight="SemiBold"
-                               Margin="0,0,0,4" />
-                    <TextBlock Foreground="{StaticResource TextSecondaryBrush}" FontSize="11"
-                               TextWrapping="Wrap" Margin="0,0,0,8"
-                               Text="Enter exclusion patterns to find catalogued files that should be purged (one per line, e.g. *.log, */.vs/*, */bin/*)." />
-                    <DockPanel>
-                        <Button DockPanel.Dock="Right" Content="Scan"
-                                Command="{Binding ScanExcludedCommand}"
-                                Padding="12,6" Margin="8,0,0,0" Cursor="Hand"
-                                VerticalAlignment="Top" />
-                        <TextBox Text="{Binding ExclusionPatterns, UpdateSourceTrigger=PropertyChanged}"
-                                 Padding="6,4" Height="80"
-                                 AcceptsReturn="True"
-                                 VerticalScrollBarVisibility="Auto"
-                                 TextWrapping="NoWrap"
-                                 BorderBrush="{StaticResource BorderBrush}"
-                                 ToolTip="One pattern per line.&#x0a;Examples: *.log  *.tmp  *.bak  */.vs/*  */bin/*  */obj/*" />
-                    </DockPanel>
-                </StackPanel>
-            </Border>
-        </StackPanel>
+             The row is a 4-column Grid whose columns participate in a
+             SharedSizeGroup so every row (regardless of nesting depth)
+             aligns with the column header at the top of the TreeView.
 
-        <!-- Bottom buttons -->
-        <DockPanel DockPanel.Dock="Bottom" Margin="0,12,0,0">
-            <!-- Purge status (left-aligned, visible during purge) -->
-            <TextBlock Text="{Binding PurgeStatusText}"
-                       Foreground="{StaticResource TextSecondaryBrush}"
-                       FontSize="11" VerticalAlignment="Center"
-                       TextTrimming="CharacterEllipsis"
-                       Margin="0,0,12,0" />
-
-            <!-- Buttons (right-aligned) -->
-            <StackPanel Orientation="Horizontal" HorizontalAlignment="Right">
-                <Button Content="Close" Command="{Binding CloseCommand}"
-                        Padding="16,8" Margin="0,0,8,0" Cursor="Hand" />
-                <Button Style="{StaticResource PrimaryButton}"
-                        Content="Purge Selected" Command="{Binding PurgeSelectedCommand}" />
-            </StackPanel>
-        </DockPanel>
-
-        <!-- Directory list -->
-        <Border BorderThickness="1"
-                BorderBrush="{StaticResource BorderBrush}"
-                Background="{StaticResource SurfaceBrush}">
-            <DockPanel>
-                <!-- Column header row -->
-                <Border DockPanel.Dock="Top"
-                        BorderBrush="{StaticResource BorderBrush}"
-                        BorderThickness="0,0,0,1"
-                        Padding="8,6">
-                    <Grid>
-                        <Grid.ColumnDefinitions>
-                            <ColumnDefinition Width="Auto" />
-                            <ColumnDefinition Width="*" />
-                            <ColumnDefinition Width="150" />
-                            <ColumnDefinition Width="80" />
-                            <ColumnDefinition Width="130" />
-                        </Grid.ColumnDefinitions>
-                        <CheckBox Grid.Column="0"
-                                  IsChecked="{Binding IsAllSelected, Mode=TwoWay}"
-                                  IsThreeState="True"
-                                  VerticalAlignment="Center"
-                                  Margin="0,0,8,0"
-                                  ToolTip="Select/deselect all" />
-                        <TextBlock Grid.Column="1" Text="Directory"
-                                   FontWeight="SemiBold" FontSize="11"
-                                   Foreground="{StaticResource TextSecondaryBrush}"
-                                   VerticalAlignment="Center" />
-                        <TextBlock Grid.Column="2" Text="Status"
-                                   FontWeight="SemiBold" FontSize="11"
-                                   Foreground="{StaticResource TextSecondaryBrush}"
-                                   VerticalAlignment="Center" />
-                        <TextBlock Grid.Column="3" Text="Files"
-                                   FontWeight="SemiBold" FontSize="11"
-                                   Foreground="{StaticResource TextSecondaryBrush}"
-                                   VerticalAlignment="Center"
-                                   TextAlignment="Right" />
-                        <TextBlock Grid.Column="4" Text="Size"
-                                   FontWeight="SemiBold" FontSize="11"
-                                   Foreground="{StaticResource TextSecondaryBrush}"
-                                   VerticalAlignment="Center"
-                                   TextAlignment="Right" />
-                    </Grid>
-                </Border>
-
-                <!-- Items -->
-                <ListView ItemsSource="{Binding Items}"
-                          BorderThickness="0"
-                          Background="Transparent"
-                          ScrollViewer.HorizontalScrollBarVisibility="Disabled">
-                    <ListView.ItemContainerStyle>
-                        <Style TargetType="ListViewItem">
-                            <Setter Property="HorizontalContentAlignment" Value="Stretch" />
-                            <Setter Property="Padding" Value="8,4" />
-                        </Style>
-                    </ListView.ItemContainerStyle>
-                    <ListView.ItemTemplate>
-                        <DataTemplate>
-                            <Grid>
+             The tree's indent affects only the name column's content
+             (via a per-node Depth binding through DepthToIndent), so the
+             Files and Size columns stay anchored to the right of the
+             tree's full width — not the right of each individual row.
+             ============================================================ -->
+        <Style x:Key="CleanupTreeViewItem" TargetType="TreeViewItem">
+            <Setter Property="IsExpanded" Value="{Binding IsExpanded, Mode=TwoWay}" />
+            <Setter Property="HorizontalContentAlignment" Value="Stretch" />
+            <Setter Property="Padding" Value="0" />
+            <Setter Property="Margin" Value="0" />
+            <Setter Property="FocusVisualStyle" Value="{x:Null}" />
+            <Setter Property="Template">
+                <Setter.Value>
+                    <ControlTemplate TargetType="TreeViewItem">
+                        <StackPanel>
+                            <Grid MinHeight="22">
                                 <Grid.ColumnDefinitions>
-                                    <ColumnDefinition Width="Auto" />
+                                    <ColumnDefinition Width="Auto" SharedSizeGroup="CleanupCheckCol" />
                                     <ColumnDefinition Width="*" />
-                                    <ColumnDefinition Width="150" />
-                                    <ColumnDefinition Width="80" />
-                                    <ColumnDefinition Width="130" />
+                                    <ColumnDefinition Width="Auto" MinWidth="56" SharedSizeGroup="CleanupFilesCol" />
+                                    <ColumnDefinition Width="Auto" MinWidth="80" SharedSizeGroup="CleanupSizeCol" />
                                 </Grid.ColumnDefinitions>
+
+                                <!-- Col 0: Check -->
                                 <CheckBox Grid.Column="0"
-                                          IsChecked="{Binding IsSelected, Mode=TwoWay}"
+                                          IsChecked="{Binding IsChecked, Mode=TwoWay}"
+                                          IsThreeState="True"
                                           VerticalAlignment="Center"
-                                          Margin="0,0,8,0" />
-                                <TextBlock Grid.Column="1"
-                                           Text="{Binding DirectoryPath}"
-                                           VerticalAlignment="Center"
-                                           TextTrimming="CharacterEllipsis"
-                                           Foreground="{StaticResource TextPrimaryBrush}"
-                                           ToolTip="{Binding DirectoryPath}" />
+                                          Margin="2,0,4,0" />
+
+                                <!-- Col 1: Name (indented per Depth, with expand arrow) -->
+                                <Border x:Name="NameArea" Grid.Column="1"
+                                        Background="Transparent"
+                                        Padding="0,1,0,1">
+                                    <Border.InputBindings>
+                                        <MouseBinding MouseAction="LeftClick"
+                                                      Command="{Binding ToggleExpandCommand}" />
+                                    </Border.InputBindings>
+                                    <StackPanel Orientation="Horizontal"
+                                                Margin="{Binding Depth, Converter={StaticResource DepthToIndent}}"
+                                                VerticalAlignment="Center">
+                                        <Border x:Name="ExpanderIcon"
+                                                Width="16" Height="16" Margin="0,0,2,0">
+                                            <Path x:Name="Arrow"
+                                                  Data="M 4 2 L 12 6 L 4 10 Z"
+                                                  Fill="{StaticResource TextDimBrush}"
+                                                  VerticalAlignment="Center"
+                                                  HorizontalAlignment="Center"
+                                                  RenderTransformOrigin="0.5,0.5">
+                                                <Path.RenderTransform>
+                                                    <RotateTransform Angle="0" />
+                                                </Path.RenderTransform>
+                                            </Path>
+                                        </Border>
+                                        <TextBlock Text="{Binding Name}"
+                                                   VerticalAlignment="Center"
+                                                   TextTrimming="CharacterEllipsis"
+                                                   ToolTip="{Binding FullPath}"
+                                                   FontSize="12" />
+                                    </StackPanel>
+                                </Border>
+
+                                <!-- Col 2: File count -->
                                 <TextBlock Grid.Column="2"
-                                           Text="{Binding ReasonText}"
+                                           Text="{Binding FormattedFileCount}"
                                            VerticalAlignment="Center"
-                                           FontSize="11">
-                                    <TextBlock.Style>
-                                        <Style TargetType="TextBlock">
+                                           TextAlignment="Right"
+                                           FontSize="11"
+                                           Foreground="{StaticResource TextSecondaryBrush}"
+                                           Padding="8,0,8,0" />
+
+                                <!-- Col 3: Size -->
+                                <TextBlock Grid.Column="3"
+                                           Text="{Binding FormattedSize}"
+                                           VerticalAlignment="Center"
+                                           TextAlignment="Right"
+                                           FontSize="11"
+                                           Foreground="{StaticResource TextSecondaryBrush}"
+                                           Padding="8,0,8,0" />
+                            </Grid>
+
+                            <!-- Children -->
+                            <ItemsPresenter x:Name="ItemsHost" Visibility="Collapsed" />
+                        </StackPanel>
+                        <ControlTemplate.Triggers>
+                            <Trigger Property="IsExpanded" Value="True">
+                                <Setter TargetName="ItemsHost" Property="Visibility" Value="Visible" />
+                                <Setter TargetName="Arrow" Property="RenderTransform">
+                                    <Setter.Value>
+                                        <RotateTransform Angle="90" />
+                                    </Setter.Value>
+                                </Setter>
+                            </Trigger>
+                            <Trigger Property="HasItems" Value="False">
+                                <Setter TargetName="ExpanderIcon" Property="Visibility" Value="Hidden" />
+                            </Trigger>
+                            <DataTrigger Binding="{Binding IsDirectory}" Value="True">
+                                <Setter TargetName="NameArea" Property="Cursor" Value="Hand" />
+                            </DataTrigger>
+                        </ControlTemplate.Triggers>
+                    </ControlTemplate>
+                </Setter.Value>
+            </Setter>
+        </Style>
+
+        <!-- ===========================================================
+             Custom TreeView template:
+              • SharedSizeScope wraps both header & items so columns line up.
+              • Header row's right margin compensates for the scrollbar
+                so the Size header doesn't sit on top of the scrollbar
+                when the tree is tall enough to scroll.
+              • Clicking Name / Files / Size headers triggers sort on the
+                parent OrphanedDirectoriesViewModel (resolved through
+                RelativeSource AncestorType=UserControl since each
+                TreeView's DataContext is its OrphanedCategoryViewModel).
+             ============================================================ -->
+        <Style x:Key="CleanupTreeView" TargetType="TreeView">
+            <Setter Property="BorderThickness" Value="0" />
+            <Setter Property="Background" Value="Transparent" />
+            <Setter Property="Padding" Value="0" />
+            <Setter Property="Template">
+                <Setter.Value>
+                    <ControlTemplate TargetType="TreeView">
+                        <Border Grid.IsSharedSizeScope="True"
+                                BorderThickness="1"
+                                BorderBrush="{StaticResource BorderBrush}"
+                                Background="{StaticResource SurfaceBrush}">
+                            <DockPanel>
+                                <!-- Column header row.
+                                     Right margin shifts when the scrollbar is
+                                     visible so headers stay aligned with the
+                                     scrolled item rows underneath. -->
+                                <Grid DockPanel.Dock="Top">
+                                    <Grid.Style>
+                                        <Style TargetType="Grid">
+                                            <Setter Property="Background" Value="{StaticResource BackgroundBrush}" />
                                             <Style.Triggers>
-                                                <DataTrigger Binding="{Binding Reason}"
-                                                             Value="{x:Static vm:OrphanedReason.DeletedFromDisk}">
-                                                    <Setter Property="Foreground" Value="#C62828" />
-                                                </DataTrigger>
-                                                <DataTrigger Binding="{Binding Reason}"
-                                                             Value="{x:Static vm:OrphanedReason.RemovedFromSources}">
-                                                    <Setter Property="Foreground" Value="#EF6C00" />
-                                                </DataTrigger>
-                                                <DataTrigger Binding="{Binding Reason}"
-                                                             Value="{x:Static vm:OrphanedReason.MatchesExclusionPattern}">
-                                                    <Setter Property="Foreground" Value="#6A1B9A" />
+                                                <DataTrigger Binding="{Binding ComputedVerticalScrollBarVisibility, ElementName=CleanupTreeScroll}" Value="Visible">
+                                                    <Setter Property="Margin" Value="0,0,17,0" />
                                                 </DataTrigger>
                                             </Style.Triggers>
                                         </Style>
-                                    </TextBlock.Style>
-                                </TextBlock>
-                                <TextBlock Grid.Column="3"
-                                           Text="{Binding FileCount}"
-                                           VerticalAlignment="Center"
-                                           TextAlignment="Right"
-                                           Foreground="{StaticResource TextSecondaryBrush}"
-                                           FontSize="11" />
-                                <TextBlock Grid.Column="4"
-                                           Text="{Binding SizeText}"
-                                           VerticalAlignment="Center"
-                                           TextAlignment="Right"
-                                           Foreground="{StaticResource TextSecondaryBrush}"
-                                           FontSize="11" />
-                            </Grid>
-                        </DataTemplate>
-                    </ListView.ItemTemplate>
-                </ListView>
+                                    </Grid.Style>
+                                    <Grid.ColumnDefinitions>
+                                        <ColumnDefinition Width="Auto" SharedSizeGroup="CleanupCheckCol" />
+                                        <ColumnDefinition Width="*" />
+                                        <ColumnDefinition Width="Auto" MinWidth="56" SharedSizeGroup="CleanupFilesCol" />
+                                        <ColumnDefinition Width="Auto" MinWidth="80" SharedSizeGroup="CleanupSizeCol" />
+                                    </Grid.ColumnDefinitions>
+
+                                    <!-- (Col 0 header is blank — that's the checkbox column.) -->
+
+                                    <!-- Name header (clickable) -->
+                                    <Border Grid.Column="1"
+                                            BorderBrush="{StaticResource BorderBrush}"
+                                            BorderThickness="0,0,1,1"
+                                            Padding="4,4"
+                                            Cursor="Hand"
+                                            Background="Transparent">
+                                        <Border.InputBindings>
+                                            <MouseBinding MouseAction="LeftClick"
+                                                          Command="{Binding DataContext.SortByNameCommand,
+                                                                            RelativeSource={RelativeSource AncestorType=UserControl}}" />
+                                        </Border.InputBindings>
+                                        <TextBlock FontSize="10"
+                                                   FontWeight="SemiBold"
+                                                   Foreground="{StaticResource TextSecondaryBrush}">
+                                            <Run Text="Directory" /><Run Text="{Binding DataContext.NameSortIndicator,
+                                                                                        RelativeSource={RelativeSource AncestorType=UserControl},
+                                                                                        Mode=OneWay}" />
+                                        </TextBlock>
+                                    </Border>
+
+                                    <!-- Files header (clickable) -->
+                                    <Border Grid.Column="2"
+                                            BorderBrush="{StaticResource BorderBrush}"
+                                            BorderThickness="0,0,1,1"
+                                            Padding="8,4"
+                                            Cursor="Hand"
+                                            Background="Transparent">
+                                        <Border.InputBindings>
+                                            <MouseBinding MouseAction="LeftClick"
+                                                          Command="{Binding DataContext.SortByFilesCommand,
+                                                                            RelativeSource={RelativeSource AncestorType=UserControl}}" />
+                                        </Border.InputBindings>
+                                        <TextBlock FontSize="10"
+                                                   FontWeight="SemiBold"
+                                                   TextAlignment="Right"
+                                                   Foreground="{StaticResource TextSecondaryBrush}">
+                                            <Run Text="Files" /><Run Text="{Binding DataContext.FilesSortIndicator,
+                                                                                    RelativeSource={RelativeSource AncestorType=UserControl},
+                                                                                    Mode=OneWay}" />
+                                        </TextBlock>
+                                    </Border>
+
+                                    <!-- Size header (clickable) -->
+                                    <Border Grid.Column="3"
+                                            BorderBrush="{StaticResource BorderBrush}"
+                                            BorderThickness="0,0,0,1"
+                                            Padding="8,4"
+                                            Cursor="Hand"
+                                            Background="Transparent">
+                                        <Border.InputBindings>
+                                            <MouseBinding MouseAction="LeftClick"
+                                                          Command="{Binding DataContext.SortBySizeCommand,
+                                                                            RelativeSource={RelativeSource AncestorType=UserControl}}" />
+                                        </Border.InputBindings>
+                                        <TextBlock FontSize="10"
+                                                   FontWeight="SemiBold"
+                                                   TextAlignment="Right"
+                                                   Foreground="{StaticResource TextSecondaryBrush}">
+                                            <Run Text="Size" /><Run Text="{Binding DataContext.SizeSortIndicator,
+                                                                                   RelativeSource={RelativeSource AncestorType=UserControl},
+                                                                                   Mode=OneWay}" />
+                                        </TextBlock>
+                                    </Border>
+                                </Grid>
+
+                                <!-- Scrollable item area -->
+                                <ScrollViewer x:Name="CleanupTreeScroll"
+                                              Focusable="False"
+                                              CanContentScroll="True"
+                                              HorizontalScrollBarVisibility="Disabled"
+                                              VerticalScrollBarVisibility="Auto"
+                                              Padding="0">
+                                    <ItemsPresenter />
+                                </ScrollViewer>
+                            </DockPanel>
+                        </Border>
+                    </ControlTemplate>
+                </Setter.Value>
+            </Setter>
+        </Style>
+    </UserControl.Resources>
+
+    <DockPanel>
+        <!-- Header -->
+        <StackPanel DockPanel.Dock="Top" Margin="0,0,0,8">
+            <TextBlock Style="{StaticResource H2}" Text="Cleanup" />
+            <TextBlock Style="{StaticResource SubText}"
+                       Text="{Binding SummaryText}"
+                       TextWrapping="Wrap" />
+
+            <!-- Optional scans: exclusion-pattern scan + destination filesystem scan -->
+            <Grid Margin="0,10,0,0">
+                <Grid.ColumnDefinitions>
+                    <ColumnDefinition Width="*" />
+                    <ColumnDefinition Width="*" />
+                </Grid.ColumnDefinitions>
+
+                <!-- Exclusion pattern scanner -->
+                <Border Grid.Column="0" Style="{StaticResource Card}" Padding="10" Margin="0,0,4,0">
+                    <StackPanel>
+                        <TextBlock Text="Scan for Excluded Files" FontWeight="SemiBold"
+                                   Margin="0,0,0,4" />
+                        <TextBlock Foreground="{StaticResource TextSecondaryBrush}" FontSize="11"
+                                   TextWrapping="Wrap" Margin="0,0,0,8"
+                                   Text="Enter exclusion patterns to find catalogued files that should be purged (one per line, e.g. *.log, */.vs/*, */bin/*)." />
+                        <DockPanel>
+                            <Button DockPanel.Dock="Right" Content="Scan"
+                                    Command="{Binding ScanExcludedCommand}"
+                                    Padding="12,6" Margin="8,0,0,0" Cursor="Hand"
+                                    VerticalAlignment="Top" />
+                            <TextBox Text="{Binding ExclusionPatterns, UpdateSourceTrigger=PropertyChanged}"
+                                     Padding="6,4" Height="60"
+                                     AcceptsReturn="True"
+                                     VerticalScrollBarVisibility="Auto"
+                                     TextWrapping="NoWrap"
+                                     BorderBrush="{StaticResource BorderBrush}"
+                                     ToolTip="One pattern per line.&#x0a;Examples: *.log  *.tmp  *.bak  */.vs/*  */bin/*  */obj/*" />
+                        </DockPanel>
+                    </StackPanel>
+                </Border>
+
+                <!-- Destination filesystem scan -->
+                <Border Grid.Column="1" Padding="10" Margin="4,0,0,0">
+                    <Border.Style>
+                        <Style TargetType="Border" BasedOn="{StaticResource Card}">
+                            <Style.Triggers>
+                                <DataTrigger Binding="{Binding CanScanDestination}" Value="False">
+                                    <Setter Property="Visibility" Value="Collapsed" />
+                                </DataTrigger>
+                            </Style.Triggers>
+                        </Style>
+                    </Border.Style>
+                    <StackPanel>
+                        <TextBlock Text="Scan Destination Filesystem" FontWeight="SemiBold"
+                                   Margin="0,0,0,4" />
+                        <TextBlock Foreground="{StaticResource TextSecondaryBrush}" FontSize="11"
+                                   TextWrapping="Wrap" Margin="0,0,0,8"
+                                   Text="Walk the backup destination to find untracked files (not in the catalog at all) and catalog-deleted files (marked deleted but still on disk). Slower than the catalog scan above." />
+                        <DockPanel>
+                            <Button DockPanel.Dock="Right" Content="Scan"
+                                    Command="{Binding ScanDestinationCommand}"
+                                    Padding="12,6" Margin="8,0,0,0" Cursor="Hand"
+                                    VerticalAlignment="Top" />
+                            <TextBlock Text="{Binding DestinationScanStatusText}"
+                                       Foreground="{StaticResource TextSecondaryBrush}"
+                                       FontSize="11"
+                                       VerticalAlignment="Center"
+                                       TextWrapping="Wrap" />
+                        </DockPanel>
+                    </StackPanel>
+                </Border>
+            </Grid>
+        </StackPanel>
+
+        <!-- Bottom area: persistent last-cleanup result above the action row -->
+        <DockPanel DockPanel.Dock="Bottom" Margin="0,8,0,0">
+            <!-- Persistent result line from the last cleanup.  Hidden until a
+                 cleanup has run; never overwritten by other actions, so the
+                 user can step away and still see the result on return. -->
+            <Border DockPanel.Dock="Top"
+                    Background="{StaticResource SurfaceBrush}"
+                    BorderBrush="{StaticResource BorderBrush}"
+                    BorderThickness="1"
+                    CornerRadius="3"
+                    Padding="8,4"
+                    Margin="0,0,0,6"
+                    Visibility="{Binding HasLastCleanupResult, Converter={StaticResource BoolToVis}}">
+                <TextBlock Text="{Binding LastCleanupResultText}"
+                           Foreground="{StaticResource TextSecondaryBrush}"
+                           FontSize="11"
+                           TextWrapping="Wrap" />
+            </Border>
+
+            <!-- Action row: transient purge progress (left) + buttons (right) -->
+            <DockPanel>
+                <TextBlock Text="{Binding PurgeStatusText}"
+                           Foreground="{StaticResource TextSecondaryBrush}"
+                           FontSize="11" VerticalAlignment="Center"
+                           TextTrimming="CharacterEllipsis"
+                           Margin="0,0,12,0" />
+
+                <StackPanel Orientation="Horizontal" HorizontalAlignment="Right">
+                    <Button Content="Close" Command="{Binding CloseCommand}"
+                            Padding="16,8" Margin="0,0,8,0" Cursor="Hand" />
+                    <Button Style="{StaticResource PrimaryButton}"
+                            Content="Clean Selected"
+                            Command="{Binding PurgeSelectedCommand}"
+                            ToolTip="Marks the selected catalog records as deleted and physically removes the matching files from the backup destination (when one is configured)." />
+                </StackPanel>
             </DockPanel>
-        </Border>
+        </DockPanel>
+
+        <!-- Category cards laid out as a 3-column wrapping grid -->
+        <ScrollViewer VerticalScrollBarVisibility="Auto"
+                      HorizontalScrollBarVisibility="Disabled"
+                      Padding="0,0,4,0">
+            <ItemsControl ItemsSource="{Binding Categories}">
+                <ItemsControl.ItemsPanel>
+                    <ItemsPanelTemplate>
+                        <!-- 3-column uniform grid: cards flow row-by-row,
+                             empty categories don't appear, remaining cards
+                             reflow to fill rows. -->
+                        <UniformGrid Columns="3" />
+                    </ItemsPanelTemplate>
+                </ItemsControl.ItemsPanel>
+                <ItemsControl.ItemTemplate>
+                    <DataTemplate DataType="{x:Type vm:OrphanedCategoryViewModel}">
+                        <Border Style="{StaticResource Card}"
+                                Padding="10" Margin="0,0,8,8">
+                            <StackPanel>
+                                <!-- Category header -->
+                                <DockPanel>
+                                    <ToggleButton DockPanel.Dock="Left"
+                                                  IsChecked="{Binding IsExpanded}"
+                                                  Background="Transparent"
+                                                  BorderThickness="0"
+                                                  Padding="4,2"
+                                                  VerticalAlignment="Center"
+                                                  Cursor="Hand">
+                                        <ToggleButton.Style>
+                                            <Style TargetType="ToggleButton">
+                                                <Setter Property="Template">
+                                                    <Setter.Value>
+                                                        <ControlTemplate TargetType="ToggleButton">
+                                                            <Border Background="Transparent" Padding="4,2">
+                                                                <TextBlock x:Name="Arrow" Text="▶" FontSize="10"
+                                                                           Foreground="{StaticResource TextSecondaryBrush}"
+                                                                           RenderTransformOrigin="0.5,0.5">
+                                                                    <TextBlock.RenderTransform>
+                                                                        <RotateTransform Angle="0" />
+                                                                    </TextBlock.RenderTransform>
+                                                                </TextBlock>
+                                                            </Border>
+                                                            <ControlTemplate.Triggers>
+                                                                <Trigger Property="IsChecked" Value="True">
+                                                                    <Setter TargetName="Arrow"
+                                                                            Property="RenderTransform">
+                                                                        <Setter.Value>
+                                                                            <RotateTransform Angle="90" />
+                                                                        </Setter.Value>
+                                                                    </Setter>
+                                                                </Trigger>
+                                                            </ControlTemplate.Triggers>
+                                                        </ControlTemplate>
+                                                    </Setter.Value>
+                                                </Setter>
+                                            </Style>
+                                        </ToggleButton.Style>
+                                    </ToggleButton>
+
+                                    <CheckBox DockPanel.Dock="Left"
+                                              IsChecked="{Binding IsAllChecked, Mode=TwoWay}"
+                                              IsThreeState="True"
+                                              VerticalAlignment="Center"
+                                              Margin="4,0,8,0" />
+
+                                    <StackPanel DockPanel.Dock="Right"
+                                                Orientation="Horizontal"
+                                                VerticalAlignment="Center"
+                                                Margin="12,0,0,0">
+                                        <TextBlock Text="{Binding FormattedTotalFileCount}"
+                                                   FontSize="11"
+                                                   Foreground="{StaticResource TextSecondaryBrush}"
+                                                   Margin="0,0,4,0" />
+                                        <TextBlock Text="files,"
+                                                   FontSize="11"
+                                                   Foreground="{StaticResource TextSecondaryBrush}"
+                                                   Margin="0,0,4,0" />
+                                        <TextBlock Text="{Binding FormattedTotalSize}"
+                                                   FontSize="11"
+                                                   Foreground="{StaticResource TextSecondaryBrush}" />
+                                    </StackPanel>
+
+                                    <TextBlock FontWeight="SemiBold"
+                                               FontSize="13"
+                                               VerticalAlignment="Center"
+                                               TextTrimming="CharacterEllipsis"
+                                               Text="{Binding Title}">
+                                        <TextBlock.Style>
+                                            <Style TargetType="TextBlock">
+                                                <Setter Property="Foreground" Value="#757575" />
+                                                <Style.Triggers>
+                                                    <DataTrigger Binding="{Binding Reason}"
+                                                                 Value="{x:Static vm:OrphanedReason.RemovedFromSources}">
+                                                        <Setter Property="Foreground" Value="#6A1B9A" />
+                                                    </DataTrigger>
+                                                    <DataTrigger Binding="{Binding Reason}"
+                                                                 Value="{x:Static vm:OrphanedReason.DeletedFromDisk}">
+                                                        <Setter Property="Foreground" Value="#C62828" />
+                                                    </DataTrigger>
+                                                    <DataTrigger Binding="{Binding Reason}"
+                                                                 Value="{x:Static vm:OrphanedReason.MatchesConfiguredExclusion}">
+                                                        <Setter Property="Foreground" Value="#2E7D32" />
+                                                    </DataTrigger>
+                                                    <DataTrigger Binding="{Binding Reason}"
+                                                                 Value="{x:Static vm:OrphanedReason.MatchesExclusionPattern}">
+                                                        <Setter Property="Foreground" Value="#1565C0" />
+                                                    </DataTrigger>
+                                                    <DataTrigger Binding="{Binding Reason}"
+                                                                 Value="{x:Static vm:OrphanedReason.ExcessVersion}">
+                                                        <Setter Property="Foreground" Value="#EF6C00" />
+                                                    </DataTrigger>
+                                                    <DataTrigger Binding="{Binding Reason}"
+                                                                 Value="{x:Static vm:OrphanedReason.UntrackedFile}">
+                                                        <Setter Property="Foreground" Value="#00838F" />
+                                                    </DataTrigger>
+                                                    <DataTrigger Binding="{Binding Reason}"
+                                                                 Value="{x:Static vm:OrphanedReason.CatalogDeleted}">
+                                                        <Setter Property="Foreground" Value="#795548" />
+                                                    </DataTrigger>
+                                                </Style.Triggers>
+                                            </Style>
+                                        </TextBlock.Style>
+                                    </TextBlock>
+                                </DockPanel>
+
+                                <!-- Description -->
+                                <TextBlock Text="{Binding Description}"
+                                           FontSize="11"
+                                           Foreground="{StaticResource TextSecondaryBrush}"
+                                           TextWrapping="Wrap"
+                                           Margin="28,2,0,6" />
+
+                                <!-- Tree view (collapsed/expanded) -->
+                                <Border Margin="0,4,0,0"
+                                        MaxHeight="400">
+                                    <Border.Style>
+                                        <Style TargetType="Border">
+                                            <Style.Triggers>
+                                                <DataTrigger Binding="{Binding IsExpanded}" Value="False">
+                                                    <Setter Property="Visibility" Value="Collapsed" />
+                                                </DataTrigger>
+                                            </Style.Triggers>
+                                        </Style>
+                                    </Border.Style>
+
+                                    <TreeView ItemsSource="{Binding RootNodes}"
+                                              Style="{StaticResource CleanupTreeView}"
+                                              ItemContainerStyle="{StaticResource CleanupTreeViewItem}"
+                                              ScrollViewer.HorizontalScrollBarVisibility="Disabled"
+                                              ScrollViewer.VerticalScrollBarVisibility="Auto"
+                                              VirtualizingStackPanel.IsVirtualizing="True"
+                                              VirtualizingStackPanel.VirtualizationMode="Recycling"
+                                              b:BubbleScrollWheel.IsEnabled="True">
+                                        <TreeView.ItemTemplate>
+                                            <HierarchicalDataTemplate
+                                                DataType="{x:Type vm:OrphanedNodeViewModel}"
+                                                ItemsSource="{Binding Children}" />
+                                        </TreeView.ItemTemplate>
+                                    </TreeView>
+                                </Border>
+                            </StackPanel>
+                        </Border>
+                    </DataTemplate>
+                </ItemsControl.ItemTemplate>
+            </ItemsControl>
+        </ScrollViewer>
     </DockPanel>
 </UserControl>

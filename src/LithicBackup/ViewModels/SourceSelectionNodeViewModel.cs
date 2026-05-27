@@ -282,10 +282,14 @@ public class SourceSelectionNodeViewModel : ViewModelBase
             else if (child.IsSelected == true)
             {
                 // Fully-selected directory — use filtered size when a
-                // filter is active and the value has been computed,
-                // otherwise fall back to the unfiltered size.
-                if (filter is not null && child._filteredSize >= 0)
+                // filter is active, unfiltered otherwise.  Return null
+                // (unknown) if the needed value isn't computed yet so the
+                // parent shows "Working..." consistently with the child.
+                if (filter is not null)
+                {
+                    if (child._filteredSize < 0) return null;
                     total += child._filteredSize;
+                }
                 else if (child._size < 0) return null;
                 else total += child._size;
             }
@@ -325,8 +329,11 @@ public class SourceSelectionNodeViewModel : ViewModelBase
             }
             else if (child.IsSelected == true)
             {
-                if (filter is not null && child._filteredFileCount >= 0)
+                if (filter is not null)
+                {
+                    if (child._filteredFileCount < 0) return null;
                     total += child._filteredFileCount;
+                }
                 else if (child._fileCount < 0) return null;
                 else total += child._fileCount;
             }
@@ -708,20 +715,20 @@ public class SourceSelectionNodeViewModel : ViewModelBase
                                 }
                             }
 
-                            // Compute filtered sizes only when we already
-                            // did a full recursive computation (precomputeAll).
-                            // The fast-path (precomputeCachedOnly) skips this
-                            // because ComputeDirectorySizeFiltered does a full
-                            // subtree traversal — the scheduler handles it later.
-                            if (dirSize >= 0 && activeFilter is not null && precomputeAll)
+                            // Filtered sizes: a full recursive traversal is
+                            // expensive, but cached filtered totals from a
+                            // prior session are an O(1) lookup, so try those
+                            // inline.  Anything not cached is left to the
+                            // scheduler in Phase 2.
+                            if (activeFilter is not null
+                                && (precomputeAll || precomputeCachedOnly))
                             {
-                                try
+                                var filtRec = _scheduler!.TryGetCachedFilteredSize(subDir.FullName);
+                                if (filtRec.HasValue)
                                 {
-                                    var (fsz, ffc) = ComputeDirectorySizeFiltered(subDir, activeFilter);
-                                    filtDirSize = fsz;
-                                    filtDirFileCount = ffc;
+                                    filtDirSize = filtRec.Value.Size;
+                                    filtDirFileCount = filtRec.Value.FileCount;
                                 }
-                                catch { }
                             }
 
                             result.Add((subDir.FullName, true, dirSize, dirFileCount,
@@ -818,7 +825,7 @@ public class SourceSelectionNodeViewModel : ViewModelBase
             // - have no unfiltered size yet (_size < 0), OR
             // - have an unfiltered size (from recursive cache) but still
             //   need their filtered size computed (when a filter is active).
-            if (showSizes && _scheduler is not null && !precomputeAll && !_suppressSizeComputation)
+            if (showSizes && _scheduler is not null && !_suppressSizeComputation)
             {
                 bool hasFilter = activeFilter is not null;
                 var dirNodes = Children.Where(c => c.IsDirectory
@@ -861,65 +868,95 @@ public class SourceSelectionNodeViewModel : ViewModelBase
         if (!_isLoaded || _scheduler is null)
             return;
 
-        var dirNodes = Children.Where(c => c.IsDirectory && c._size < 0).ToList();
+        // Include directories that need unfiltered size OR filtered size.
+        var gf = _scheduler.GlobalExcludeFilter;
+        bool hasFilter = gf is not null;
+        var dirNodes = Children.Where(c => c.IsDirectory
+            && (c._size < 0 || (hasFilter && c._filteredSize < 0))).ToList();
         if (dirNodes.Count > 0)
         {
             if (isVisible)
             {
-                // Fast path: resolve cached directories using stored
-                // recursive totals (single dictionary lookup per directory,
-                // no subtree traversal) so the UI shows numbers instantly.
-                var activeFilter = _scheduler.GlobalExcludeFilter;
-                var scheduler = _scheduler;
-                var uncached = await Task.Run(() =>
+                // Fast path: resolve unfiltered sizes from cached recursive
+                // totals (single dictionary lookup per directory, no subtree
+                // traversal) so the UI shows numbers instantly.  Filtered
+                // sizes are NOT computed inline — the scheduler handles them
+                // asynchronously so we don't block the UI.
+                var needsUnfiltered = dirNodes.Where(n => n._size < 0).ToList();
+                if (needsUnfiltered.Count > 0)
                 {
-                    var remaining = new List<SourceSelectionNodeViewModel>();
-                    var resolved = new List<(SourceSelectionNodeViewModel Node,
-                        long Size, int FileCount, long FilteredSize,
-                        int FilteredFileCount)>();
-
-                    foreach (var node in dirNodes)
+                    var scheduler = _scheduler;
+                    var (remaining, resolved) = await Task.Run(() =>
                     {
-                        var rec = scheduler.TryGetCachedSize(node.Path);
-                        if (rec.HasValue)
+                        var rem = new List<SourceSelectionNodeViewModel>();
+                        var res = new List<(SourceSelectionNodeViewModel Node,
+                            long Size, int FileCount)>();
+
+                        foreach (var node in needsUnfiltered)
                         {
-                            long fsz = -1;
-                            int ffc = -1;
-                            if (activeFilter is not null)
-                            {
-                                try
-                                {
-                                    (fsz, ffc) = ComputeDirectorySizeFiltered(
-                                        new DirectoryInfo(node.Path), activeFilter);
-                                }
-                                catch { }
-                            }
-                            resolved.Add((node, rec.Value.Size, rec.Value.FileCount, fsz, ffc));
+                            var rec = scheduler.TryGetCachedSize(node.Path);
+                            if (rec.HasValue)
+                                res.Add((node, rec.Value.Size, rec.Value.FileCount));
+                            else
+                                rem.Add(node);
                         }
-                        else
-                        {
-                            remaining.Add(node);
-                        }
+
+                        return (rem, res);
+                    });
+
+                    // Apply cached results on the UI thread.
+                    foreach (var (node, sz, fc) in resolved)
+                    {
+                        node.Size = sz;
+                        node.FileCount = fc;
                     }
 
-                    return (remaining, resolved);
-                });
-
-                // Apply cached results on the UI thread.
-                foreach (var (node, sz, fc, fsz, ffc) in uncached.resolved)
-                {
-                    node.Size = sz;
-                    node.FileCount = fc;
-                    if (fsz >= 0)
-                    {
-                        node.FilteredSize = fsz;
-                        node.FilteredFileCount = ffc;
-                    }
+                    // Submit uncached directories at high priority.
+                    if (remaining.Count > 0)
+                        await _scheduler.EnqueueAsync(remaining, isPriority: true);
                 }
 
-                // Submit remaining uncached directories at high priority.
-                if (uncached.remaining.Count > 0)
-                    await _scheduler.EnqueueAsync(uncached.remaining, isPriority: true);
+                // Submit nodes that still need filtered sizes to the
+                // scheduler.  Fire-and-forget: filtered sizes are a
+                // refinement — don't block the size report or recursion.
+                if (hasFilter)
+                {
+                    var needFiltered = dirNodes.Where(n => n._filteredSize < 0
+                        && n._size >= 0).ToList();
+                    if (needFiltered.Count > 0)
+                    {
+                        // Fast path: resolve filtered sizes from cached
+                        // values when their signature still matches, so the
+                        // UI populates instantly without re-walking the tree.
+                        var scheduler = _scheduler;
+                        var (remaining, resolved) = await Task.Run(() =>
+                        {
+                            var rem = new List<SourceSelectionNodeViewModel>();
+                            var res = new List<(SourceSelectionNodeViewModel Node,
+                                long Size, int FileCount)>();
+
+                            foreach (var node in needFiltered)
+                            {
+                                var rec = scheduler.TryGetCachedFilteredSize(node.Path);
+                                if (rec.HasValue)
+                                    res.Add((node, rec.Value.Size, rec.Value.FileCount));
+                                else
+                                    rem.Add(node);
+                            }
+
+                            return (rem, res);
+                        });
+
+                        foreach (var (node, sz, fc) in resolved)
+                        {
+                            node.FilteredSize = sz;
+                            node.FilteredFileCount = fc;
+                        }
+
+                        if (remaining.Count > 0)
+                            _ = _scheduler.EnqueueAsync(remaining, isPriority: true);
+                    }
+                }
             }
             else
             {
@@ -1006,6 +1043,110 @@ public class SourceSelectionNodeViewModel : ViewModelBase
         catch { }
 
         return (totalSize, totalCount);
+    }
+
+    /// <summary>
+    /// Same as <see cref="ComputeDirectorySizeFiltered"/> but consults the
+    /// persistent cache.  A cached filtered total is reused when:
+    /// <list type="bullet">
+    /// <item>The directory's <see cref="DirectoryInfo.LastWriteTimeUtc"/> hasn't
+    /// changed since the cached entry was written.</item>
+    /// <item>The cached entry's filter signature matches
+    /// <paramref name="filterSignature"/>.</item>
+    /// </list>
+    /// Otherwise the subtree is walked and the result is stored back into the
+    /// cache for the next session.
+    /// </summary>
+    internal static (long Size, int FileCount) ComputeDirectorySizeFilteredCached(
+        DirectoryInfo dir, Func<string, bool> isExcluded,
+        DirectorySizeCache cache, string filterSignature)
+    {
+        // Fast path: cached filtered total whose directory timestamp is
+        // still current and whose filter signature matches.
+        var cachedRec = cache.TryGetFilteredRecursive(dir.FullName, filterSignature);
+        if (cachedRec is not null)
+        {
+            DateTime currentLastWrite;
+            try { currentLastWrite = dir.LastWriteTimeUtc; }
+            catch { currentLastWrite = DateTime.MinValue; }
+
+            var entry = cache.TryGet(dir.FullName);
+            if (entry is not null && entry.Value.DirLastWriteUtc >= currentLastWrite)
+                return cachedRec.Value;
+        }
+
+        long totalSize = 0;
+        int totalCount = 0;
+
+        try
+        {
+            foreach (var file in dir.EnumerateFiles())
+            {
+                try
+                {
+                    if (!isExcluded(file.FullName))
+                    {
+                        totalSize += file.Length;
+                        totalCount++;
+                    }
+                }
+                catch { }
+            }
+        }
+        catch { }
+
+        try
+        {
+            foreach (var subDir in dir.EnumerateDirectories())
+            {
+                try
+                {
+                    if ((subDir.Attributes & (FileAttributes.System | FileAttributes.Hidden)) != 0)
+                        continue;
+                }
+                catch { continue; }
+
+                if (isExcluded(System.IO.Path.Combine(subDir.FullName, "_")))
+                    continue;
+
+                var (subSize, subCount) = ComputeDirectorySizeFilteredCached(
+                    subDir, isExcluded, cache, filterSignature);
+                totalSize += subSize;
+                totalCount += subCount;
+            }
+        }
+        catch { }
+
+        // Store the computed filtered total so future sessions / re-loads
+        // can return it instantly via TryGetCachedFilteredRecursiveSize.
+        cache.SetFilteredRecursive(dir.FullName, totalSize, totalCount, filterSignature);
+        return (totalSize, totalCount);
+    }
+
+    /// <summary>
+    /// Look up the cached filtered recursive total for a directory.  This is
+    /// the filtered counterpart of <see cref="TryGetCachedRecursiveSize"/>:
+    /// an O(1) lookup (single dictionary read + one filesystem stat) that
+    /// returns a cached value when both the directory's timestamp and the
+    /// filter signature match.
+    /// </summary>
+    internal static (long Size, int FileCount)? TryGetCachedFilteredRecursiveSize(
+        string path, DirectorySizeCache cache, string filterSignature)
+    {
+        var rec = cache.TryGetFilteredRecursive(path, filterSignature);
+        if (rec is null) return null;
+
+        var entry = cache.TryGet(path);
+        if (entry is null) return null;
+
+        DateTime currentLastWrite;
+        try { currentLastWrite = new DirectoryInfo(path).LastWriteTimeUtc; }
+        catch { return null; }
+
+        if (entry.Value.DirLastWriteUtc < currentLastWrite)
+            return null;
+
+        return rec;
     }
 
     /// <summary>

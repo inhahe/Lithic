@@ -57,6 +57,7 @@ public class SourceSelectionViewModel : ViewModelBase
     private bool _showLargestFiles;
     private bool _isApplyingSelections;
     private Func<string, bool>? _cachedExcludeFilter;
+    private string? _cachedExcludeFilterSignature;
     private bool _excludeFilterDirty = true;
     private bool _isEditMode;
     private string _saveStatusText = "";
@@ -365,6 +366,7 @@ public class SourceSelectionViewModel : ViewModelBase
 
         var newFilter = GetExcludeFilter();
         _scheduler.GlobalExcludeFilter = newFilter;
+        _scheduler.GlobalExcludeFilterSignature = _cachedExcludeFilterSignature;
         foreach (var root in Roots)
             root.ResetFilteredSizes();
         if (_showSelectedSizesOnly)
@@ -386,6 +388,7 @@ public class SourceSelectionViewModel : ViewModelBase
 
         _excludeFilterDirty = false;
         _cachedExcludeFilter = null;
+        _cachedExcludeFilterSignature = null;
 
         // Build tier-set-based exclusion (0-tier sets with patterns).
         Func<string, VersionTierSet>? tierResolver = null;
@@ -409,7 +412,37 @@ public class SourceSelectionViewModel : ViewModelBase
                 return true;
             return false;
         };
+        _cachedExcludeFilterSignature = ComputeExcludeFilterSignature(tierModels);
         return _cachedExcludeFilter;
+    }
+
+    /// <summary>
+    /// Compute a deterministic signature for the active exclusion filter.
+    /// Used by <see cref="DirectorySizeCache"/> to invalidate cached filtered
+    /// recursive sizes when the user changes tier-set patterns. All tier-set
+    /// inputs that <c>BuildTierResolver</c> consumes are included, since any
+    /// of them can change which tier set a given path resolves to.
+    /// </summary>
+    private static string ComputeExcludeFilterSignature(List<VersionTierSet> tierModels)
+    {
+        var sb = new System.Text.StringBuilder();
+        // Sort by name for determinism — TierSets order should not affect
+        // the signature when the same sets are present.
+        foreach (var ts in tierModels.OrderBy(t => t.Name, StringComparer.OrdinalIgnoreCase))
+        {
+            sb.Append("ts=").Append(ts.Name);
+            sb.Append("|tiers=").Append(ts.Tiers.Count);
+            sb.Append("|fp=");
+            foreach (var p in ts.FilePatterns.OrderBy(s => s, StringComparer.OrdinalIgnoreCase))
+                sb.Append(p).Append(';');
+            sb.Append("|fxp=");
+            foreach (var p in ts.FileExemptPatterns.OrderBy(s => s, StringComparer.OrdinalIgnoreCase))
+                sb.Append(p).Append(';');
+            sb.Append('\n');
+        }
+        var bytes = System.Text.Encoding.UTF8.GetBytes(sb.ToString());
+        var hash = SHA256.HashData(bytes);
+        return Convert.ToHexString(hash);
     }
 
     /// <summary>
@@ -1426,6 +1459,12 @@ public class SourceSelectionViewModel : ViewModelBase
             var filePaths = new HashSet<string>(StringComparer.OrdinalIgnoreCase);
             CollectSelectedPaths(Roots, dirPrefixes, filePaths);
 
+            // Apply the same exclusion filter used for the "Selected" line
+            // so the two numbers are comparable.  Without this, catalog
+            // entries in excluded directories (e.g. *\target\*) inflate
+            // the "already backed up" total.
+            var excludeFilter = GetExcludeFilter();
+
             // Single pass over the catalog: sum entries that fall under
             // any selected prefix or match a selected file.
             long catalogSize = 0;
@@ -1446,6 +1485,12 @@ public class SourceSelectionViewModel : ViewModelBase
                 }
                 if (covered)
                 {
+                    // Skip files that match the exclusion filter (0-tier
+                    // tier sets) — they won't be backed up regardless of
+                    // whether they were backed up in a prior session.
+                    if (excludeFilter is not null && excludeFilter(path))
+                        continue;
+
                     catalogSize += info.SizeBytes;
                     catalogFiles++;
                 }
@@ -1740,6 +1785,7 @@ public class SourceSelectionViewModel : ViewModelBase
         // Push the exclusion filter to the scheduler so that both inline
         // and queued size computations produce filtered values.
         _scheduler.GlobalExcludeFilter = GetExcludeFilter();
+        _scheduler.GlobalExcludeFilterSignature = _cachedExcludeFilterSignature;
     }
 
     /// <summary>

@@ -10,9 +10,9 @@ namespace LithicBackup.Infrastructure.Burning;
 /// <summary>
 /// <see cref="IDiscBurner"/> implementation using IMAPI2 COM interop.
 ///
-/// All COM property/method access (except IDiscMaster2) uses <c>dynamic</c>
-/// late-binding to avoid vtable ordering issues inherent in manual COM interop.
-/// Long-running operations run on dedicated STA threads.
+/// All COM property/method access uses <c>dynamic</c> late-binding to avoid
+/// vtable ordering issues inherent in manual COM interop. Long-running
+/// operations run on dedicated STA threads.
 /// </summary>
 public class Imapi2DiscBurner : IDiscBurner
 {
@@ -22,12 +22,17 @@ public class Imapi2DiscBurner : IDiscBurner
 
     public IReadOnlyList<string> GetRecorderIds()
     {
+        // Use dynamic / IDispatch late-binding like the rest of this class.
+        // The previously strongly-typed IDiscMaster2 interop was missing
+        // get__NewEnum (the first method in the IDL), which made the vtable
+        // slots line up wrong — Count was actually calling get_Item, etc.
         try
         {
-            var master = (IDiscMaster2)new MsftDiscMaster2();
-            var ids = new List<string>();
-            for (int i = 0; i < master.Count; i++)
-                ids.Add(master[i]);
+            dynamic master = new MsftDiscMaster2();
+            int count = (int)master.Count;
+            var ids = new List<string>(count);
+            for (int i = 0; i < count; i++)
+                ids.Add((string)master[i]);
             return ids;
         }
         catch (COMException)

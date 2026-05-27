@@ -99,12 +99,12 @@ These buttons only appear in `--simulate-burner` mode and reset automatically wh
 
 ### Other Features
 
-- **Orphaned directory cleanup** — detect directories that were removed from source selections, deleted from disk, or match exclusion patterns, and purge them from the catalog
+- **Cleanup** — a single unified view that surfaces files and directories worth removing across the catalog and the backup destination. Categories include directories removed from sources, directories deleted from disk, files matching configured or manual exclusion patterns, excess versions beyond the retention tiers (limited to actual `_prev` records on disk, so the category stays empty when no real history exists yet), and catalog duplicates (stray rows pointing at the current copy of a file — typically left over from re-running "Seed from existing backup" on the same destination). An optional "Scan destination filesystem" step adds two more categories — untracked files (present on disk but not in the catalog) and catalog-deleted files (marked deleted but still physically present). The "Clean Selected" action both purges the matching catalog records and physically removes the corresponding files from the destination (when one is configured), then sweeps any newly-empty directories. Catalog-duplicate cleanups remove only the extra rows; the physical file is left alone.
 - **Copy backup sets** — duplicate a backup set's configuration (sources, options, schedule, retention tiers) as a starting point for a new set
 - **Edit backup sets** — modify sources, options, name, and schedule of existing sets
 - **Change destination** — relocate a backup set's target directory (e.g., when an external drive changes drive letters) without re-running the backup
-- **Seed from existing backup** — import files from an existing mirror-format backup directory (e.g. a backup4all mirror or robocopy mirror) into the catalog so future backups are incremental rather than re-copying everything. The seed operation scans the destination directory, hashes each file, and creates catalog entries.
-- **Right-click context menu** on backup sets — quick access to all operations (Backup, Restore, Modify, Orphaned Directories, Backup Coverage, Largest Files, Copy, Change Destination, Export)
+- **Seed from existing backup** — import files from an existing mirror-format backup directory (e.g. a backup4all mirror or robocopy mirror) into the catalog so future backups are incremental rather than re-copying everything. The seed operation scans the destination directory, hashes each file, and creates catalog entries. Idempotent: re-running it on the same destination skips files already in the catalog, and files under any `_prev` subdirectory are ignored so versioned-history copies from the source tool don't pollute the catalog.
+- **Right-click context menu** on backup sets — quick access to all operations (Backup, Restore, Modify, Cleanup, Backup Coverage, Largest Files, Copy, Change Destination, Export)
 
 ## Architecture
 

@@ -65,20 +65,30 @@ public class VersionRetentionService : IVersionRetentionService
         {
             ct.ThrowIfCancellationRequested();
 
-            // Sort versions by BackedUpUtc descending (newest first).
+            // Tier-based retention only applies to actual previous-version
+            // records, which always live under "{drive}_prev/..." (see
+            // DirectoryBackupService.GetPrevDiscPath).  A SourcePath with
+            // only current-location rows isn't carrying historical
+            // versions, so there's nothing for retention to trim — even if
+            // there's more than one such row (which is a catalog anomaly
+            // surfaced separately by the Cleanup view's CatalogDuplicate
+            // detection, not a retention concern).
             var versions = group
+                .Where(f => IsPreviousVersionPath(f.DiscPath))
                 .OrderByDescending(f => f.BackedUpUtc)
                 .ToList();
 
-            if (versions.Count <= 1)
-                continue; // Only one version, nothing to trim.
+            if (versions.Count == 0)
+                continue; // No real prev-version records to consider.
 
             // Resolve this file's retention tiers.
             var tiers = tierSelector(group.Key);
             if (tiers.Count == 0)
                 continue; // "None" tier set — no retention rules to apply.
 
-            // Never delete the most recent version of any file.
+            // Never delete the most recent prev version (we'd lose the
+            // ability to roll back at all).  The current-location record
+            // is automatically safe — it's not in `versions`.
             long newestId = versions[0].Id;
 
             // Walk tiers from youngest to oldest.
@@ -150,5 +160,21 @@ public class VersionRetentionService : IVersionRetentionService
             file.IsDeleted = true;
             await _catalog.UpdateFileRecordAsync(file, ct);
         }
+    }
+
+    /// <summary>
+    /// True when <paramref name="discPath"/> points at a previous version of
+    /// a file (i.e. lives under a "{drive}_prev/" subtree).  See
+    /// <c>DirectoryBackupService.GetPrevDiscPath</c> for the writer side.
+    /// Tolerates both path separators because catalog DiscPaths normalize
+    /// inconsistently in different code paths.
+    /// </summary>
+    private static bool IsPreviousVersionPath(string discPath)
+    {
+        if (string.IsNullOrEmpty(discPath)) return false;
+        int sep = discPath.IndexOfAny(['\\', '/']);
+        if (sep < 0) return false;
+        var firstSegment = discPath.AsSpan(0, sep);
+        return firstSegment.EndsWith("_prev", StringComparison.OrdinalIgnoreCase);
     }
 }
