@@ -832,6 +832,97 @@ public class DirectoryBackupService
         return (diff, totalBytes, files.Count);
     }
 
+    /// <summary>
+    /// Back up an explicit list of candidate file paths instead of scanning the
+    /// whole source tree. Used by the continuous-backup worker, which is handed
+    /// the exact set of changed paths by the NTFS USN change journal.
+    /// </summary>
+    /// <remarks>
+    /// Candidates are filtered by the job's glob/extension exclusions and
+    /// compared against the catalog so only genuinely new or changed files are
+    /// versioned (a USN record can fire for metadata-only touches). Missing
+    /// files are skipped — deletions are reconciled by the periodic full scan.
+    /// The resulting <see cref="BackupDiff"/> is handed to
+    /// <see cref="ExecuteAsync"/>, reusing all per-file versioning, dedup,
+    /// retention, and catalog machinery.
+    /// </remarks>
+    public async Task<BackupResult> ExecuteTargetedAsync(
+        BackupJob job,
+        string targetDirectory,
+        IReadOnlyList<string> candidatePaths,
+        IReadOnlyList<VersionRetentionTier>? retentionTiers,
+        CancellationToken ct)
+    {
+        if (!job.BackupSetId.HasValue)
+            throw new ArgumentException("Targeted backup requires an existing backup set.", nameof(job));
+
+        var isExcluded = BuildExclusionFilter(job);
+        var versionInfo = await _catalog.GetLatestVersionInfoAsync(job.BackupSetId.Value, ct);
+
+        var newFiles = new List<ScannedFile>();
+        var changedFiles = new List<ScannedFile>();
+
+        foreach (var path in candidatePaths.Distinct(StringComparer.OrdinalIgnoreCase))
+        {
+            ct.ThrowIfCancellationRequested();
+
+            if (isExcluded is not null && isExcluded(path))
+                continue;
+
+            FileInfo info;
+            try
+            {
+                info = new FileInfo(path);
+                if (!info.Exists)
+                    continue; // deleted — handled by the periodic full scan
+            }
+            catch (Exception ex) when (ex is IOException or UnauthorizedAccessException)
+            {
+                continue;
+            }
+
+            var scanned = new ScannedFile
+            {
+                FullPath = info.FullName,
+                SizeBytes = info.Length,
+                LastWriteUtc = info.LastWriteTimeUtc,
+            };
+
+            if (!versionInfo.TryGetValue(scanned.FullPath, out var last))
+            {
+                newFiles.Add(scanned);
+            }
+            else if (scanned.SizeBytes != last.SizeBytes
+                     || scanned.LastWriteUtc > last.SourceLastWriteUtc)
+            {
+                changedFiles.Add(scanned);
+            }
+            // else: catalog already has this exact version — nothing to do.
+        }
+
+        if (newFiles.Count == 0 && changedFiles.Count == 0)
+        {
+            return new BackupResult
+            {
+                Success = true,
+                DiscsWritten = 0,
+                BytesWritten = 0,
+                FailedFiles = [],
+            };
+        }
+
+        var diff = new BackupDiff
+        {
+            NewFiles = newFiles,
+            ChangedFiles = changedFiles,
+            DeletedFiles = [],
+        };
+
+        return await ExecuteAsync(
+            job, targetDirectory, retentionTiers,
+            progress: null, ct, precomputedDiff: diff);
+    }
+
     // -------------------------------------------------------------------
     // Exclusion filter
     // -------------------------------------------------------------------
@@ -892,29 +983,53 @@ public class DirectoryBackupService
         if (destDir is not null)
             Directory.CreateDirectory(destDir);
 
-        await using var srcStream = new FileStream(
-            sourcePath, FileMode.Open, FileAccess.Read,
-            FileShare.Read, bufferSize: 81920, useAsync: true);
-        await using var dstStream = new FileStream(
-            destPath, FileMode.Create, FileAccess.Write,
-            FileShare.None, bufferSize: 81920, useAsync: true);
+        // Write to a sibling temp file first, then atomically move it into
+        // place.  This guarantees the destination is only ever the complete
+        // file or absent — never a truncated/0-byte partial.  Without this,
+        // an interrupted copy (cancellation, I/O error, drive disconnect,
+        // crash) would leave a corrupt "current" file that the next backup
+        // run would promote to _prev as a bogus version.
+        string tempPath = destPath + ".lbtmp";
 
-        if (onProgress is null && pauseEvent is null)
+        try
         {
-            await srcStream.CopyToAsync(dstStream, ct);
-            return;
+            await using (var srcStream = new FileStream(
+                sourcePath, FileMode.Open, FileAccess.Read,
+                FileShare.Read, bufferSize: 81920, useAsync: true))
+            await using (var dstStream = new FileStream(
+                tempPath, FileMode.Create, FileAccess.Write,
+                FileShare.None, bufferSize: 81920, useAsync: true))
+            {
+                if (onProgress is null && pauseEvent is null)
+                {
+                    await srcStream.CopyToAsync(dstStream, ct);
+                }
+                else
+                {
+                    // Chunked copy with progress callback and pause support.
+                    var buffer = new byte[81920];
+                    long totalCopied = 0;
+                    int read;
+                    while ((read = await srcStream.ReadAsync(buffer, ct)) > 0)
+                    {
+                        pauseEvent?.Wait(ct);
+                        await dstStream.WriteAsync(buffer.AsMemory(0, read), ct);
+                        totalCopied += read;
+                        onProgress?.Invoke(totalCopied);
+                    }
+                }
+            }
+
+            // Atomic promotion of the fully-written temp file.
+            File.Move(tempPath, destPath, overwrite: true);
         }
-
-        // Chunked copy with progress callback and pause support.
-        var buffer = new byte[81920];
-        long totalCopied = 0;
-        int read;
-        while ((read = await srcStream.ReadAsync(buffer, ct)) > 0)
+        catch
         {
-            pauseEvent?.Wait(ct);
-            await dstStream.WriteAsync(buffer.AsMemory(0, read), ct);
-            totalCopied += read;
-            onProgress?.Invoke(totalCopied);
+            // Clean up the partial temp file so it can't linger or be
+            // mistaken for real backup content.
+            try { if (File.Exists(tempPath)) File.Delete(tempPath); }
+            catch { /* best effort — nothing more we can do here */ }
+            throw;
         }
     }
 
@@ -1275,8 +1390,11 @@ public class DirectoryBackupService
                 ct.ThrowIfCancellationRequested();
 
                 // Skip .dedup and .fileref manifests — those are LithicBackup internal files.
+                // Skip .lbtmp — a partial copy left behind by an interrupted
+                // backup (CopyFileAsync writes there before the atomic rename).
                 if (file.Name.EndsWith(".dedup", StringComparison.OrdinalIgnoreCase) ||
-                    file.Name.EndsWith(".fileref", StringComparison.OrdinalIgnoreCase))
+                    file.Name.EndsWith(".fileref", StringComparison.OrdinalIgnoreCase) ||
+                    file.Name.EndsWith(".lbtmp", StringComparison.OrdinalIgnoreCase))
                     continue;
 
                 // Skip files under any "_prev" segment — these are

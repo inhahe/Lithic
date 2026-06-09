@@ -32,6 +32,7 @@ public class SourceSelectionViewModel : ViewModelBase
     private bool _showSelectedSizesOnly;
     private string _selectedSizeText = "";
     private string _setName = "";
+    private string _excludedExtensions = "";
     private string _targetDirectory = "";
     private bool _isDirectoryMode;
     private bool _createSubdirectory;
@@ -549,6 +550,18 @@ public class SourceSelectionViewModel : ViewModelBase
     {
         get => _setName;
         set => SetProperty(ref _setName, value);
+    }
+
+    /// <summary>
+    /// Newline-separated glob patterns to exclude from the backup at the set
+    /// level. Round-trips to <see cref="JobOptions.ExcludedExtensions"/>.
+    /// Despite the stored field's legacy name these are full glob patterns
+    /// (e.g. <c>*.log</c>, <c>*/bin/*</c>), not just file extensions.
+    /// </summary>
+    public string ExcludedExtensions
+    {
+        get => _excludedExtensions;
+        set => SetProperty(ref _excludedExtensions, value);
     }
 
     /// <summary>Whether to back up to a directory instead of optical disc.</summary>

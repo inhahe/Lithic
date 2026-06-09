@@ -19,6 +19,7 @@
     <EmbeddedResource Include="Data\Migrations\001_InitialSchema.sql" />
     <EmbeddedResource Include="Data\Migrations\002_BackupSetConfig.sql" />
     <EmbeddedResource Include="Data\Migrations\003_CatalogQueryIndex.sql" />
+    <EmbeddedResource Include="Data\Migrations\004_UsnCursors.sql" />
   </ItemGroup>
 
 </Project>

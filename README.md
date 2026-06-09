@@ -60,7 +60,7 @@ A Windows Service (LithicBackup Worker) runs in the background and backs up your
 
 - **Interval** — run a backup every N hours (default: 24)
 - **Daily** — run once per day at a specific time (default: 2:00 AM)
-- **Continuous** — watch source directories for file changes and trigger a backup after a configurable quiet period (default: 60 seconds of no changes). This prevents thrashing while you're actively editing files — the backup waits until you stop.
+- **Continuous** — track file changes via the NTFS USN change journal and back up exactly the files that changed, after a configurable quiet period (default: 60 seconds of no changes). The journal records every change the moment it happens — including those that occur while the Worker is offline — so nothing is missed across reboots or service restarts, and only changed files are versioned rather than rescanning whole drives. Each file is debounced individually (with a 5-minute cap so a constantly-written file can't starve its own backup), which prevents thrashing while you're actively editing. Continuous mode requires NTFS source volumes; non-NTFS volumes fall back to the scheduled full scan.
 
 Each backup set can have its own schedule and mode. The Worker Service is installed, started, and stopped directly from the GUI — no command-line work required.
 

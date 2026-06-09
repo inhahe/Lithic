@@ -52,6 +52,7 @@ public class SqliteCatalogRepository : ICatalogRepository
         {
             (2, "LithicBackup.Infrastructure.Data.Migrations.002_BackupSetConfig.sql"),
             (3, "LithicBackup.Infrastructure.Data.Migrations.003_CatalogQueryIndex.sql"),
+            (4, "LithicBackup.Infrastructure.Data.Migrations.004_UsnCursors.sql"),
         };
 
         foreach (var (version, resourceName) in migrations)
@@ -477,17 +478,30 @@ public class SqliteCatalogRepository : ICatalogRepository
         ct.ThrowIfCancellationRequested();
 
         using var cmd = _connection.CreateCommand();
+        // Pick the single newest non-deleted record per source path.
+        // We deliberately avoid "MAX(Version) + bare columns", which relies on
+        // SQLite's non-standard single-aggregate rule and returns an ARBITRARY
+        // row when several rows tie at the max version (e.g. duplicate records
+        // left by repeated seed/import runs). ROW_NUMBER with an explicit
+        // tie-break on Id makes the result deterministic.
         cmd.CommandText = """
-            SELECT f.SourcePath,
-                   MAX(f.Version)          AS MaxVersion,
-                   f.SizeBytes,
-                   f.SourceLastWriteUtc,
-                   f.IsDeduped,
-                   f.IsFileRef
-            FROM Files f
-            INNER JOIN Discs d ON f.DiscId = d.Id
-            WHERE d.BackupSetId = $setId AND f.IsDeleted = 0
-            GROUP BY f.SourcePath
+            SELECT SourcePath, Version, SizeBytes, SourceLastWriteUtc, IsDeduped, IsFileRef
+            FROM (
+                SELECT f.SourcePath,
+                       f.Version,
+                       f.SizeBytes,
+                       f.SourceLastWriteUtc,
+                       f.IsDeduped,
+                       f.IsFileRef,
+                       ROW_NUMBER() OVER (
+                           PARTITION BY f.SourcePath
+                           ORDER BY f.Version DESC, f.Id DESC
+                       ) AS rn
+                FROM Files f
+                INNER JOIN Discs d ON f.DiscId = d.Id
+                WHERE d.BackupSetId = $setId AND f.IsDeleted = 0
+            )
+            WHERE rn = 1
             """;
         cmd.Parameters.AddWithValue("$setId", backupSetId);
 
@@ -945,6 +959,53 @@ public class SqliteCatalogRepository : ICatalogRepository
                 _transaction = null;
             }
         }
+    }
+
+    // ---------------------------------------------------------------
+    // USN change-journal cursors
+    // ---------------------------------------------------------------
+
+    public Task<UsnCursor?> GetUsnCursorAsync(string volumeId, CancellationToken ct = default)
+    {
+        ct.ThrowIfCancellationRequested();
+
+        using var cmd = _connection.CreateCommand();
+        cmd.CommandText =
+            "SELECT VolumeId, JournalId, NextUsn, UpdatedUtc FROM UsnCursors WHERE VolumeId = $vol";
+        cmd.Parameters.AddWithValue("$vol", volumeId);
+
+        using var r = cmd.ExecuteReader();
+        if (!r.Read())
+            return Task.FromResult<UsnCursor?>(null);
+
+        var cursor = new UsnCursor(
+            r.GetString(0),
+            r.GetInt64(1),
+            r.GetInt64(2),
+            DateTime.Parse(r.GetString(3), CultureInfo.InvariantCulture,
+                DateTimeStyles.RoundtripKind));
+        return Task.FromResult<UsnCursor?>(cursor);
+    }
+
+    public Task SaveUsnCursorAsync(UsnCursor cursor, CancellationToken ct = default)
+    {
+        ct.ThrowIfCancellationRequested();
+
+        using var cmd = _connection.CreateCommand();
+        cmd.CommandText = """
+            INSERT INTO UsnCursors (VolumeId, JournalId, NextUsn, UpdatedUtc)
+            VALUES ($vol, $journal, $next, $updated)
+            ON CONFLICT(VolumeId) DO UPDATE SET
+                JournalId = excluded.JournalId,
+                NextUsn = excluded.NextUsn,
+                UpdatedUtc = excluded.UpdatedUtc
+            """;
+        cmd.Parameters.AddWithValue("$vol", cursor.VolumeId);
+        cmd.Parameters.AddWithValue("$journal", cursor.JournalId);
+        cmd.Parameters.AddWithValue("$next", cursor.NextUsn);
+        cmd.Parameters.AddWithValue("$updated", cursor.UpdatedUtc.ToString("o"));
+        cmd.ExecuteNonQuery();
+        return Task.CompletedTask;
     }
 
     // ---------------------------------------------------------------

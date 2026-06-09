@@ -31,3 +31,4 @@
 2026-05-25 04:29:04,361 [orchestrator2] INFO: server started on port 8420, cwd=D:\visual studio projects\backup
 2026-05-25 04:29:04,361 [sdk_bridge] INFO: connect: resume=f3ec861c-f833-440c-a4d9-44f12545b54e, cwd=D:\visual studio projects\backup
 2026-05-25 04:29:04,414 [claude_agent_sdk._internal.transport.subprocess_cli] INFO: Using bundled Claude Code CLI: D:\python314\Lib\site-packages\claude_agent_sdk\_bundled\claude.exe
+2026-05-29 08:11:38,726 [orchestrator2] INFO: no browser tabs connected for 30s — shutting down

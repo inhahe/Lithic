@@ -1,4 +1,5 @@
 using System.IO;
+using System.Threading;
 using System.Windows;
 using LithicBackup.Core.Interfaces;
 using LithicBackup.Infrastructure.Burning;
@@ -18,6 +19,14 @@ public partial class App : Application
     private WinForms.NotifyIcon? _notifyIcon;
     private UserSettings _settings = new();
 
+    // --- Single-instance enforcement ---
+    /// <summary>Shared name for the per-session single-instance primitives.</summary>
+    private const string SingleInstanceName = "LithicBackup.SingleInstance";
+    private Mutex? _singleInstanceMutex;
+    private EventWaitHandle? _showInstanceEvent;
+    private RegisteredWaitHandle? _showInstanceWait;
+    private bool _ownsSingleInstance;
+
     /// <summary>
     /// Set when the user chooses Exit from the tray menu.
     /// Allows <see cref="MainWindow.OnClosing"/> to distinguish
@@ -29,6 +38,36 @@ public partial class App : Application
     {
         base.OnStartup(e);
 
+        // --- Single-instance enforcement ---
+        // Only one LithicBackup UI may run per user session.  Acquire a named
+        // mutex; if it's already held, we're a second launch — signal the
+        // running instance to surface its window, then exit immediately.
+        // The names are unprefixed, so they live in the session-local
+        // namespace (one instance per logged-in session, no cross-session
+        // permission concerns).
+        _singleInstanceMutex = new Mutex(initiallyOwned: true, SingleInstanceName, out _ownsSingleInstance);
+        _showInstanceEvent = new EventWaitHandle(
+            false, EventResetMode.AutoReset, SingleInstanceName + ".ShowWindow");
+
+        if (!_ownsSingleInstance)
+        {
+            // Another instance owns the mutex — wake it and bow out before
+            // any windows or services are created.
+            _showInstanceEvent.Set();
+            Shutdown();
+            return;
+        }
+
+        // We're the primary instance.  Listen for future launches asking us
+        // to bring the window forward.  The callback marshals onto the UI
+        // dispatcher; ShowMainWindow tolerates a not-yet-created window.
+        _showInstanceWait = ThreadPool.RegisterWaitForSingleObject(
+            _showInstanceEvent,
+            (_, _) => Current?.Dispatcher.BeginInvoke(new Action(ShowMainWindow)),
+            state: null,
+            millisecondsTimeOutInterval: Timeout.Infinite,
+            executeOnlyOnce: false);
+
         // Show splash screen immediately while services initialize.
         var splash = new SplashWindow();
         splash.Show();
@@ -39,12 +78,10 @@ public partial class App : Application
 
         // --- Composition root: wire up services ---
 
-        var appDataDir = Path.Combine(
-            Environment.GetFolderPath(Environment.SpecialFolder.LocalApplicationData),
-            "LithicBackup");
-        Directory.CreateDirectory(appDataDir);
-
-        var catalogPath = Path.Combine(appDataDir, "catalog.db");
+        // Shared, account-independent catalog path (ProgramData) so the GUI and
+        // the Windows Service (LocalSystem) open the SAME database. See
+        // CatalogLocation for the rationale.
+        var catalogPath = CatalogLocation.Resolve();
         _catalog = new SqliteCatalogRepository(catalogPath);
 
         // --simulate-burner: use a mock disc burner for testing without hardware.
@@ -202,8 +239,17 @@ public partial class App : Application
         if (window is null) return;
 
         window.Show();
-        window.WindowState = WindowState.Normal;
+        if (window.WindowState == WindowState.Minimized)
+            window.WindowState = WindowState.Normal;
         window.Activate();
+
+        // Force the window to the foreground even when the activation request
+        // comes from another process (a second launch).  Windows suppresses
+        // SetForegroundWindow for non-foreground callers, so briefly toggling
+        // Topmost reliably raises the window above the requesting process.
+        window.Topmost = true;
+        window.Topmost = false;
+        window.Focus();
     }
 
     private async Task StartBackgroundMonitoringAsync()
@@ -239,6 +285,14 @@ public partial class App : Application
         _notifyIcon?.Dispose();
         _trayService?.Dispose();
         _catalog?.Dispose();
+
+        // Release single-instance primitives.
+        _showInstanceWait?.Unregister(null);
+        _showInstanceEvent?.Dispose();
+        if (_ownsSingleInstance)
+            _singleInstanceMutex?.ReleaseMutex();
+        _singleInstanceMutex?.Dispose();
+
         base.OnExit(e);
     }
 }

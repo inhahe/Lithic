@@ -105,6 +105,19 @@ public interface ICatalogRepository : IDisposable
     /// </summary>
     Task ExportDatabaseAsync(string destinationPath, CancellationToken ct = default);
 
+    // --- USN change-journal cursors ---
+
+    /// <summary>
+    /// Get the saved USN-journal resume point for a volume, or null if none has
+    /// been persisted yet (first run for that volume).
+    /// </summary>
+    Task<UsnCursor?> GetUsnCursorAsync(string volumeId, CancellationToken ct = default);
+
+    /// <summary>
+    /// Persist (insert or update) the USN-journal resume point for a volume.
+    /// </summary>
+    Task SaveUsnCursorAsync(UsnCursor cursor, CancellationToken ct = default);
+
     // --- Transactions ---
     Task<ICatalogTransaction> BeginTransactionAsync(CancellationToken ct = default);
 }

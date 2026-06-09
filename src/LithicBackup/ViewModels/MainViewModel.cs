@@ -1826,6 +1826,9 @@ public class MainViewModel : ViewModelBase
         if (opts.DeduplicationBlockSize > 0)
             vm.BlockSizeKb = (opts.DeduplicationBlockSize / 1024).ToString();
 
+        // Excluded-from-backup glob patterns (set level).
+        vm.ExcludedExtensions = BackupJobViewModel.FormatExclusionPatterns(opts.ExcludedExtensions);
+
         // Retention tier sets.
         if (opts.TierSets.Count > 0)
         {
@@ -1900,6 +1903,9 @@ public class MainViewModel : ViewModelBase
         if (int.TryParse(vm.BlockSizeKb, out int blockKb) && blockKb > 0)
             opts.DeduplicationBlockSize = blockKb * 1024;
 
+        // Excluded-from-backup glob patterns (set level).
+        opts.ExcludedExtensions = BackupJobViewModel.ParseExclusionPatterns(vm.ExcludedExtensions);
+
         // Tier sets.
         opts.TierSets = vm.TierSets.Select(ts => ts.ToModel()).ToList();
         var defaultTs = vm.TierSets.FirstOrDefault(t => t.Name == "Default");
@@ -1962,6 +1968,10 @@ public class MainViewModel : ViewModelBase
         job.EnableFileDeduplication = src.EnableFileDeduplication;
         job.EnableDeduplication = src.EnableBlockDeduplication;
         job.DeduplicationBlockSizeKb = src.BlockSizeKb;
+
+        // Excluded-from-backup glob patterns (carried forward to the job page,
+        // which has its own editor for the same value).
+        job.ExcludedExtensions = src.ExcludedExtensions;
 
         // Retention tier sets.
         job.TierSets.Clear();

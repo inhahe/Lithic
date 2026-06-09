@@ -39,6 +39,15 @@ public class SourceSelectionNodeViewModel : ViewModelBase
     /// </summary>
     internal bool _suppressSizeComputation;
     private Task? _loadTask;
+    /// <summary>
+    /// The saved <see cref="Core.Models.SourceSelection"/> this node was
+    /// restored from, captured in <see cref="ApplySelectionAsync"/>.  Used as
+    /// a lossless fallback in <see cref="ToModel"/> when the directory's
+    /// children could not be enumerated (drive not ready, I/O error, access
+    /// denied) — without it, a transient enumeration failure would serialise
+    /// an empty subtree and permanently destroy the saved selections.
+    /// </summary>
+    private Core.Models.SourceSelection? _restoredModel;
     private long _size = -1;
     private int _fileCount = -1;
     /// <summary>
@@ -497,6 +506,10 @@ public class SourceSelectionNodeViewModel : ViewModelBase
     /// </summary>
     internal async Task ApplySelectionAsync(Core.Models.SourceSelection model)
     {
+        // Remember the saved subtree so ToModel can fall back to it if this
+        // directory's children can't be enumerated later (see _restoredModel).
+        _restoredModel = model;
+
         // Apply state without triggering propagation.
         _suppressPropagation = true;
         _isSelected = model.IsSelected;
@@ -658,10 +671,15 @@ public class SourceSelectionNodeViewModel : ViewModelBase
             // When an exclusion filter is active, the filtered size is
             // also computed inline so that "selected only" display shows
             // correct values without needing children to be loaded.
-            var entries = await Task.Run(() =>
+            var (entries, readFailed) = await Task.Run(() =>
             {
                 var result = new List<(string FullName, bool IsDirectory,
                     long Size, int FileCount, long FilteredSize, int FilteredFileCount)>();
+                // Set when a top-level enumeration of this directory fails
+                // (drive not ready, I/O error, access denied).  Distinguishes a
+                // genuinely-empty directory (no exception) from one we simply
+                // could not read — the latter must NOT clobber a saved selection.
+                bool failed = false;
                 var dirInfo = new DirectoryInfo(Path);
 
                 try
@@ -737,8 +755,8 @@ public class SourceSelectionNodeViewModel : ViewModelBase
                         catch (UnauthorizedAccessException) { }
                     }
                 }
-                catch (UnauthorizedAccessException) { }
-                catch (IOException) { }
+                catch (UnauthorizedAccessException) { failed = true; }
+                catch (IOException) { failed = true; }
 
                 try
                 {
@@ -754,8 +772,8 @@ public class SourceSelectionNodeViewModel : ViewModelBase
                         catch (UnauthorizedAccessException) { }
                     }
                 }
-                catch (UnauthorizedAccessException) { }
-                catch (IOException) { }
+                catch (UnauthorizedAccessException) { failed = true; }
+                catch (IOException) { failed = true; }
 
                 // Initial sort: directories first, then files, alphabetically.
                 result = result
@@ -764,8 +782,22 @@ public class SourceSelectionNodeViewModel : ViewModelBase
                             StringComparer.OrdinalIgnoreCase)
                     .ToList();
 
-                return result;
+                return (result, failed);
             });
+
+            // If we could not read this directory at all (drive not ready,
+            // I/O error, access denied) leave the node "not loaded" rather than
+            // committing an empty child list.  This is critical: a partial
+            // (tri-state) directory whose children were wiped to empty would be
+            // serialised by ToModel as a selected-but-childless node, silently
+            // destroying the saved selection on the next auto-save.  Keeping
+            // _isLoaded == false makes ToModel fall back to _restoredModel and
+            // lets a later expansion retry the enumeration.
+            if (readFailed && entries.Count == 0)
+            {
+                _isLoaded = false;
+                return;
+            }
 
             // Build the full list of child nodes before touching the
             // ObservableCollection.  ReplaceAll fires a single Reset
@@ -838,6 +870,12 @@ public class SourceSelectionNodeViewModel : ViewModelBase
         {
             // Remove the "Loading..." placeholder on error so it doesn't linger.
             Children.Clear();
+
+            // Mark the node not-loaded so the failure is recoverable on a
+            // later expansion and ToModel falls back to _restoredModel instead
+            // of serialising the now-empty subtree (which would destroy a
+            // saved selection — see _restoredModel and the readFailed guard).
+            _isLoaded = false;
         }
     }
 
@@ -1418,6 +1456,15 @@ public class SourceSelectionNodeViewModel : ViewModelBase
     {
         if (IsSelected == false)
             return null;
+
+        // Lossless fallback: this directory has a saved selection but its
+        // children were never successfully enumerated (drive not ready, I/O
+        // error, access denied — _isLoaded is false).  Re-deriving from the
+        // empty Children collection would emit a selected-but-childless node
+        // and permanently destroy the saved subtree.  Return the originally
+        // restored model verbatim so the selection survives untouched.
+        if (IsDirectory && !_isLoaded && _restoredModel is not null)
+            return _restoredModel;
 
         var model = new Core.Models.SourceSelection
         {

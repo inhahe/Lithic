@@ -581,8 +581,15 @@
         </Border>
 
         <Grid>
+        <Grid.RowDefinitions>
+            <RowDefinition Height="*" MinHeight="120" />
+            <RowDefinition Height="Auto" />
+            <RowDefinition Height="120" MinHeight="72" />
+        </Grid.RowDefinitions>
+
         <!-- TreeView with integrated column headers -->
-        <TreeView ItemsSource="{Binding Roots}"
+        <TreeView Grid.Row="0"
+                  ItemsSource="{Binding Roots}"
                   BorderThickness="0"
                   VirtualizingStackPanel.IsVirtualizing="True"
                   VirtualizingStackPanel.VirtualizationMode="Recycling"
@@ -914,6 +921,38 @@
                 </HierarchicalDataTemplate>
             </TreeView.ItemTemplate>
         </TreeView>
+
+        <!-- Drag handle: let the user trade vertical space between the tree and
+             the exclusion panel. -->
+        <GridSplitter Grid.Row="1" Height="6"
+                      HorizontalAlignment="Stretch" VerticalAlignment="Center"
+                      Background="Transparent" Cursor="SizeNS"
+                      ResizeBehavior="PreviousAndNext" ResizeDirection="Rows" />
+
+        <!-- Exclude-from-backup patterns (shares the tree's space). -->
+        <Border Grid.Row="2"
+                BorderThickness="1"
+                BorderBrush="{StaticResource BorderBrush}"
+                Background="{StaticResource SurfaceBrush}">
+            <DockPanel Margin="10">
+                <TextBlock DockPanel.Dock="Top" Text="Exclude from Backup"
+                           FontWeight="SemiBold" Margin="0,0,0,4" />
+                <TextBlock DockPanel.Dock="Top"
+                           Text="Glob patterns, one per line. Matching files are not backed up."
+                           Foreground="{StaticResource TextSecondaryBrush}"
+                           FontSize="11" TextWrapping="Wrap" Margin="0,0,0,6" />
+                <TextBox Text="{Binding ExcludedExtensions, UpdateSourceTrigger=PropertyChanged}"
+                         AcceptsReturn="True"
+                         VerticalScrollBarVisibility="Auto"
+                         HorizontalScrollBarVisibility="Auto"
+                         TextWrapping="NoWrap"
+                         Padding="6,4"
+                         BorderBrush="{StaticResource BorderBrush}"
+                         FontFamily="Consolas, Courier New, monospace"
+                         FontSize="12"
+                         ToolTip="Examples:  *.log  *.tmp  *.bak  */.vs/*  */bin/*  */obj/*&#x0a;&#x0a;Use * to match any characters in a file name.&#x0a;Use */ to match directory paths." />
+            </DockPanel>
+        </Border>
         </Grid>
     </DockPanel>
 </UserControl>

@@ -1450,6 +1450,13 @@ public class OrphanedDirectoriesViewModel : ViewModelBase
                         continue;
                     }
 
+                    // Skip partial-copy temp files left by an interrupted backup
+                    // (DirectoryBackupService.CopyFileAsync writes to "*.lbtmp"
+                    // before the atomic rename).  They aren't real backup
+                    // content and shouldn't surface as untracked files.
+                    if (fileName.EndsWith(".lbtmp", StringComparison.OrdinalIgnoreCase))
+                        continue;
+
                     string relativePath = relativeDir.Length == 0
                         ? fileName
                         : relativeDir + "\\" + fileName;
