@@ -107,9 +107,17 @@
                        FontSize="12"
                        VerticalAlignment="Center" />
 
-            <Button Grid.Column="1"
-                    Content="Close" Command="{Binding CloseCommand}"
-                    Padding="16,8" Cursor="Hand" />
+            <StackPanel Grid.Column="1" Orientation="Horizontal" VerticalAlignment="Center">
+                <TextBlock Text="{Binding SaveStatusText}"
+                           Foreground="{StaticResource AccentBrush}"
+                           FontWeight="SemiBold" FontSize="12"
+                           VerticalAlignment="Center" Margin="0,0,12,0" />
+                <Button Content="Save" Command="{Binding SaveCommand}"
+                        Style="{StaticResource PrimaryButton}"
+                        Padding="16,8" Margin="0,0,8,0" Cursor="Hand" />
+                <Button Content="Close" Command="{Binding CloseCommand}"
+                        Padding="16,8" Cursor="Hand" />
+            </StackPanel>
         </Grid>
 
         <!-- Content area (FILL) — single Border, hidden during loading.
@@ -165,7 +173,7 @@
                                         <ColumnDefinition Width="20" />
                                         <ColumnDefinition Width="*" MinWidth="120" />
                                         <ColumnDefinition Width="1.5*" MinWidth="150" />
-                                        <ColumnDefinition Width="80" />
+                                        <ColumnDefinition Width="130" />
                                     </Grid.ColumnDefinitions>
 
                                     <!-- Checkbox + status dot header cells (empty) -->
@@ -255,7 +263,7 @@
                                         <ColumnDefinition Width="20" />
                                         <ColumnDefinition Width="*" MinWidth="120" />
                                         <ColumnDefinition Width="1.5*" MinWidth="150" />
-                                        <ColumnDefinition Width="80" />
+                                        <ColumnDefinition Width="130" />
                                     </Grid.ColumnDefinitions>
 
                                     <!-- Include checkbox -->
@@ -368,7 +376,6 @@
                                             </Grid.Style>
                                             <Grid.ColumnDefinitions>
                                                 <ColumnDefinition Width="Auto" SharedSizeGroup="DirCheckCol" />
-                                                <ColumnDefinition Width="Auto" SharedSizeGroup="DirFilterCol" />
                                                 <ColumnDefinition Width="*" />
                                                 <ColumnDefinition Width="Auto" SharedSizeGroup="DirFilesCol" />
                                                 <ColumnDefinition Width="Auto" SharedSizeGroup="DirSizeCol" />
@@ -380,32 +387,42 @@
 
                                             <Border Grid.Column="1"
                                                     BorderBrush="{StaticResource BorderBrush}"
-                                                    BorderThickness="0,0,1,1" />
+                                                    BorderThickness="0,0,1,1"
+                                                    Padding="8,6"
+                                                    Cursor="Hand" Background="Transparent">
+                                                <Border.InputBindings>
+                                                    <MouseBinding MouseAction="LeftClick"
+                                                                  Command="{Binding SortByNameCommand}" />
+                                                </Border.InputBindings>
+                                                <TextBlock FontSize="11" FontWeight="SemiBold"
+                                                           Foreground="{StaticResource TextSecondaryBrush}">
+                                                    <Run Text="Directory" /><Run Text="{Binding DirTreeNameSortIndicator, Mode=OneWay}" />
+                                                </TextBlock>
+                                            </Border>
 
                                             <Border Grid.Column="2"
                                                     BorderBrush="{StaticResource BorderBrush}"
                                                     BorderThickness="0,0,1,1"
                                                     Padding="8,6">
-                                                <TextBlock Text="Directory" FontSize="11" FontWeight="SemiBold"
-                                                           Foreground="{StaticResource TextSecondaryBrush}" />
+                                                <TextBlock Text="Files" FontSize="11" FontWeight="SemiBold"
+                                                           Foreground="{StaticResource TextSecondaryBrush}"
+                                                           TextAlignment="Right" />
                                             </Border>
 
                                             <Border Grid.Column="3"
                                                     BorderBrush="{StaticResource BorderBrush}"
-                                                    BorderThickness="0,0,1,1"
-                                                    Padding="8,6">
-                                                <TextBlock Text="Files" FontSize="11" FontWeight="SemiBold"
-                                                           Foreground="{StaticResource TextSecondaryBrush}"
-                                                           HorizontalAlignment="Right" />
-                                            </Border>
-
-                                            <Border Grid.Column="4"
-                                                    BorderBrush="{StaticResource BorderBrush}"
                                                     BorderThickness="0,0,0,1"
-                                                    Padding="8,6">
-                                                <TextBlock Text="Size" FontSize="11" FontWeight="SemiBold"
+                                                    Padding="8,6"
+                                                    Cursor="Hand" Background="Transparent">
+                                                <Border.InputBindings>
+                                                    <MouseBinding MouseAction="LeftClick"
+                                                                  Command="{Binding SortBySizeCommand}" />
+                                                </Border.InputBindings>
+                                                <TextBlock FontSize="11" FontWeight="SemiBold"
                                                            Foreground="{StaticResource TextSecondaryBrush}"
-                                                           HorizontalAlignment="Right" />
+                                                           TextAlignment="Right">
+                                                    <Run Text="Size" /><Run Text="{Binding SizeSortIndicator, Mode=OneWay}" />
+                                                </TextBlock>
                                             </Border>
                                         </Grid>
 
@@ -438,7 +455,6 @@
                                                 <Grid MinHeight="24">
                                                     <Grid.ColumnDefinitions>
                                                         <ColumnDefinition Width="Auto" SharedSizeGroup="DirCheckCol" />
-                                                        <ColumnDefinition Width="Auto" SharedSizeGroup="DirFilterCol" />
                                                         <ColumnDefinition Width="*" />
                                                         <ColumnDefinition Width="Auto" SharedSizeGroup="DirFilesCol" />
                                                         <ColumnDefinition Width="Auto" SharedSizeGroup="DirSizeCol" />
@@ -465,25 +481,8 @@
                                                         </StackPanel>
                                                     </Border>
 
-                                                    <!-- Col 1: Filter button -->
+                                                    <!-- Col 1: Name area with tree indentation -->
                                                     <Border Grid.Column="1"
-                                                            BorderBrush="{StaticResource BorderBrush}"
-                                                            BorderThickness="0,0,1,0">
-                                                        <Button Command="{Binding EditExclusionsCommand}"
-                                                                Padding="3,1" Margin="2"
-                                                                VerticalAlignment="Center" HorizontalAlignment="Center"
-                                                                Cursor="Hand"
-                                                                Background="Transparent"
-                                                                BorderBrush="{StaticResource BorderBrush}"
-                                                                BorderThickness="1"
-                                                                ToolTip="Edit exclusion/inclusion rules for this directory">
-                                                            <TextBlock Text="Filter" FontSize="10"
-                                                                       Foreground="{StaticResource TextDimBrush}" />
-                                                        </Button>
-                                                    </Border>
-
-                                                    <!-- Col 2: Name area with tree indentation -->
-                                                    <Border Grid.Column="2"
                                                             BorderBrush="{StaticResource BorderBrush}"
                                                             BorderThickness="0,0,1,0"
                                                             Background="Transparent">
@@ -511,28 +510,26 @@
                                                         </StackPanel>
                                                     </Border>
 
-                                                    <!-- Col 3: File count -->
-                                                    <Border Grid.Column="3"
+                                                    <!-- Col 2: File count -->
+                                                    <Border Grid.Column="2"
                                                             BorderBrush="{StaticResource BorderBrush}"
                                                             BorderThickness="0,0,1,0">
                                                         <TextBlock Text="{Binding FileCountText}"
                                                                    Foreground="{StaticResource TextSecondaryBrush}"
                                                                    FontSize="11"
-                                                                   HorizontalAlignment="Right"
+                                                                   TextAlignment="Right"
                                                                    VerticalAlignment="Center"
-                                                                   Padding="8,0"
-                                                                   MinWidth="50" />
+                                                                   Padding="8,0" />
                                                     </Border>
 
-                                                    <!-- Col 4: Size -->
-                                                    <Border Grid.Column="4">
+                                                    <!-- Col 3: Size -->
+                                                    <Border Grid.Column="3">
                                                         <TextBlock Text="{Binding SizeText}"
                                                                    Foreground="{StaticResource TextSecondaryBrush}"
                                                                    FontSize="12"
-                                                                   HorizontalAlignment="Right"
+                                                                   TextAlignment="Right"
                                                                    VerticalAlignment="Center"
-                                                                   Padding="8,0"
-                                                                   MinWidth="60" />
+                                                                   Padding="8,0" />
                                                     </Border>
                                                 </Grid>
 

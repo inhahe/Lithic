@@ -1,20 +1,19 @@
 using System.Globalization;
+using System.Windows;
 using System.Windows.Data;
 
 namespace LithicBackup.Converters;
 
 /// <summary>
-/// Converts a byte count to a comma-separated number string.
+/// Returns <see cref="Visibility.Visible"/> when the bound string value is
+/// non-null and non-empty, <see cref="Visibility.Collapsed"/> otherwise.
 /// </summary>
-public class FileSizeConverter : IValueConverter
+public class NonEmptyStringToVisibilityConverter : IValueConverter
 {
     public object Convert(object value, Type targetType, object parameter, CultureInfo culture)
-    {
-        if (value is not long bytes)
-            return "0";
-
-        return $"{bytes:N0}";
-    }
+        => value is string s && s.Length > 0
+            ? Visibility.Visible
+            : Visibility.Collapsed;
 
     public object ConvertBack(object value, Type targetType, object parameter, CultureInfo culture)
         => throw new NotSupportedException();

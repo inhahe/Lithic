@@ -1,3 +1,4 @@
+using System.Globalization;
 using System.Text.Json;
 using Microsoft.Data.Sqlite;
 using LithicBackup.Core.Interfaces;
@@ -50,6 +51,8 @@ public class SqliteCatalogRepository : ICatalogRepository
         var migrations = new (int Version, string ResourceName)[]
         {
             (2, "LithicBackup.Infrastructure.Data.Migrations.002_BackupSetConfig.sql"),
+            (3, "LithicBackup.Infrastructure.Data.Migrations.003_CatalogQueryIndex.sql"),
+            (4, "LithicBackup.Infrastructure.Data.Migrations.004_UsnCursors.sql"),
         };
 
         foreach (var (version, resourceName) in migrations)
@@ -189,9 +192,9 @@ public class SqliteCatalogRepository : ICatalogRepository
             DefaultFilesystemType = (FilesystemType)r.GetInt32(r.GetOrdinal("DefaultFilesystemType")),
             CapacityOverrideBytes = r.IsDBNull(r.GetOrdinal("CapacityOverrideBytes"))
                 ? null : r.GetInt64(r.GetOrdinal("CapacityOverrideBytes")),
-            CreatedUtc = DateTime.Parse(r.GetString(r.GetOrdinal("CreatedUtc"))),
+            CreatedUtc = DateTime.Parse(r.GetString(r.GetOrdinal("CreatedUtc")), null, DateTimeStyles.RoundtripKind),
             LastBackupUtc = r.IsDBNull(r.GetOrdinal("LastBackupUtc"))
-                ? null : DateTime.Parse(r.GetString(r.GetOrdinal("LastBackupUtc"))),
+                ? null : DateTime.Parse(r.GetString(r.GetOrdinal("LastBackupUtc")), null, DateTimeStyles.RoundtripKind),
         };
 
         // New columns — may not exist in legacy databases before migration 002.
@@ -349,9 +352,9 @@ public class SqliteCatalogRepository : ICatalogRepository
         IsMultisession = r.GetInt32(r.GetOrdinal("IsMultisession")) != 0,
         IsBad = r.GetInt32(r.GetOrdinal("IsBad")) != 0,
         Status = (BurnSessionStatus)r.GetInt32(r.GetOrdinal("Status")),
-        CreatedUtc = DateTime.Parse(r.GetString(r.GetOrdinal("CreatedUtc"))),
+        CreatedUtc = DateTime.Parse(r.GetString(r.GetOrdinal("CreatedUtc")), null, DateTimeStyles.RoundtripKind),
         LastWrittenUtc = r.IsDBNull(r.GetOrdinal("LastWrittenUtc"))
-            ? null : DateTime.Parse(r.GetString(r.GetOrdinal("LastWrittenUtc"))),
+            ? null : DateTime.Parse(r.GetString(r.GetOrdinal("LastWrittenUtc")), null, DateTimeStyles.RoundtripKind),
     };
 
     // ---------------------------------------------------------------
@@ -475,17 +478,31 @@ public class SqliteCatalogRepository : ICatalogRepository
         ct.ThrowIfCancellationRequested();
 
         using var cmd = _connection.CreateCommand();
+        // Pick the single newest non-deleted record per source path.
+        // We deliberately avoid "MAX(Version) + bare columns", which relies on
+        // SQLite's non-standard single-aggregate rule and returns an ARBITRARY
+        // row when several rows tie at the max version (e.g. duplicate records
+        // left by repeated seed/import runs). ROW_NUMBER with an explicit
+        // tie-break on Id makes the result deterministic.
         cmd.CommandText = """
-            SELECT f.SourcePath,
-                   MAX(f.Version)          AS MaxVersion,
-                   f.SizeBytes,
-                   f.SourceLastWriteUtc,
-                   f.IsDeduped,
-                   f.IsFileRef
-            FROM Files f
-            INNER JOIN Discs d ON f.DiscId = d.Id
-            WHERE d.BackupSetId = $setId AND f.IsDeleted = 0
-            GROUP BY f.SourcePath
+            SELECT SourcePath, Version, SizeBytes, SourceLastWriteUtc, IsDeduped, IsFileRef, Hash
+            FROM (
+                SELECT f.SourcePath,
+                       f.Version,
+                       f.SizeBytes,
+                       f.SourceLastWriteUtc,
+                       f.IsDeduped,
+                       f.IsFileRef,
+                       f.Hash,
+                       ROW_NUMBER() OVER (
+                           PARTITION BY f.SourcePath
+                           ORDER BY f.Version DESC, f.Id DESC
+                       ) AS rn
+                FROM Files f
+                INNER JOIN Discs d ON f.DiscId = d.Id
+                WHERE d.BackupSetId = $setId AND f.IsDeleted = 0
+            )
+            WHERE rn = 1
             """;
         cmd.Parameters.AddWithValue("$setId", backupSetId);
 
@@ -497,9 +514,10 @@ public class SqliteCatalogRepository : ICatalogRepository
             dict[path] = new FileVersionInfo(
                 MaxVersion: r.GetInt32(1),
                 SizeBytes: r.GetInt64(2),
-                SourceLastWriteUtc: DateTime.Parse(r.GetString(3)),
+                SourceLastWriteUtc: DateTime.Parse(r.GetString(3), null, DateTimeStyles.RoundtripKind),
                 IsDeduped: r.GetInt32(4) != 0,
-                IsFileRef: r.GetInt32(5) != 0);
+                IsFileRef: r.GetInt32(5) != 0,
+                Hash: r.IsDBNull(6) ? "" : r.GetString(6));
         }
 
         return Task.FromResult(dict);
@@ -573,8 +591,8 @@ public class SqliteCatalogRepository : ICatalogRepository
         IsFileRef = r.GetInt32(r.GetOrdinal("IsFileRef")) != 0,
         Version = r.GetInt32(r.GetOrdinal("Version")),
         IsDeleted = r.GetInt32(r.GetOrdinal("IsDeleted")) != 0,
-        SourceLastWriteUtc = DateTime.Parse(r.GetString(r.GetOrdinal("SourceLastWriteUtc"))),
-        BackedUpUtc = DateTime.Parse(r.GetString(r.GetOrdinal("BackedUpUtc"))),
+        SourceLastWriteUtc = DateTime.Parse(r.GetString(r.GetOrdinal("SourceLastWriteUtc")), null, DateTimeStyles.RoundtripKind),
+        BackedUpUtc = DateTime.Parse(r.GetString(r.GetOrdinal("BackedUpUtc")), null, DateTimeStyles.RoundtripKind),
     };
 
     // ---------------------------------------------------------------
@@ -748,40 +766,38 @@ public class SqliteCatalogRepository : ICatalogRepository
         return Task.FromResult(rows);
     }
 
-    public async Task<int> MarkFilesDeletedBySourcePathsAsync(
+    public Task<int> MarkFilesDeletedBySourcePathsAsync(
         int backupSetId, IEnumerable<string> sourcePaths, CancellationToken ct = default)
     {
         ct.ThrowIfCancellationRequested();
 
+        // No internal transaction: this method is always called from inside
+        // a caller-managed transaction (Cleanup's purge wraps every catalog
+        // mutation in one).  Microsoft.Data.Sqlite doesn't allow nested
+        // transactions, and starting one here when an outer transaction is
+        // already active throws "SqliteConnection does not support nested
+        // transactions".  If a future caller needs batching efficiency
+        // without an outer transaction, they should wrap the call in one
+        // themselves via BeginTransactionAsync.
         int totalRows = 0;
-        var tx = await BeginTransactionAsync(ct);
-        try
-        {
-            using var cmd = _connection.CreateCommand();
-            cmd.CommandText = """
-                UPDATE Files SET IsDeleted = 1
-                WHERE IsDeleted = 0
-                  AND DiscId IN (SELECT Id FROM Discs WHERE BackupSetId = $setId)
-                  AND SourcePath = $path
-                """;
-            cmd.Parameters.AddWithValue("$setId", backupSetId);
-            var pathParam = cmd.Parameters.AddWithValue("$path", "");
+        using var cmd = _connection.CreateCommand();
+        cmd.CommandText = """
+            UPDATE Files SET IsDeleted = 1
+            WHERE IsDeleted = 0
+              AND DiscId IN (SELECT Id FROM Discs WHERE BackupSetId = $setId)
+              AND SourcePath = $path
+            """;
+        cmd.Parameters.AddWithValue("$setId", backupSetId);
+        var pathParam = cmd.Parameters.AddWithValue("$path", "");
 
-            foreach (var path in sourcePaths)
-            {
-                ct.ThrowIfCancellationRequested();
-                pathParam.Value = path;
-                totalRows += cmd.ExecuteNonQuery();
-            }
-
-            tx.Complete();
-        }
-        finally
+        foreach (var path in sourcePaths)
         {
-            tx.Dispose();
+            ct.ThrowIfCancellationRequested();
+            pathParam.Value = path;
+            totalRows += cmd.ExecuteNonQuery();
         }
 
-        return totalRows;
+        return Task.FromResult(totalRows);
     }
 
     // ---------------------------------------------------------------
@@ -830,7 +846,7 @@ public class SqliteCatalogRepository : ICatalogRepository
                 MatchingFileCount = r.GetInt32(2),
                 TotalSizeBytes = r.GetInt64(3),
                 LatestVersion = r.GetInt32(4),
-                LastBackedUpUtc = r.IsDBNull(5) ? null : DateTime.Parse(r.GetString(5)),
+                LastBackedUpUtc = r.IsDBNull(5) ? null : DateTime.Parse(r.GetString(5), null, DateTimeStyles.RoundtripKind),
             });
         }
 
@@ -852,6 +868,228 @@ public class SqliteCatalogRepository : ICatalogRepository
         cmd.ExecuteNonQuery();
 
         return Task.CompletedTask;
+    }
+
+    // ---------------------------------------------------------------
+    // Delete Backup Set
+    // ---------------------------------------------------------------
+
+    public async Task DeleteBackupSetAsync(int backupSetId, CancellationToken ct = default)
+    {
+        ct.ThrowIfCancellationRequested();
+
+        var tx = await BeginTransactionAsync(ct);
+        try
+        {
+            // Delete in dependency order: chunks → files → discs → backup set.
+            using var cmd = _connection.CreateCommand();
+
+            cmd.CommandText = """
+                DELETE FROM FileChunks
+                WHERE FileRecordId IN (
+                    SELECT f.Id FROM Files f
+                    INNER JOIN Discs d ON f.DiscId = d.Id
+                    WHERE d.BackupSetId = $setId
+                )
+                """;
+            cmd.Parameters.AddWithValue("$setId", backupSetId);
+            cmd.ExecuteNonQuery();
+
+            cmd.CommandText = """
+                DELETE FROM Files
+                WHERE DiscId IN (SELECT Id FROM Discs WHERE BackupSetId = $setId)
+                """;
+            cmd.ExecuteNonQuery();
+
+            cmd.CommandText = "DELETE FROM Discs WHERE BackupSetId = $setId";
+            cmd.ExecuteNonQuery();
+
+            cmd.CommandText = "DELETE FROM BackupSets WHERE Id = $setId";
+            cmd.ExecuteNonQuery();
+
+            tx.Complete();
+        }
+        finally
+        {
+            tx.Dispose();
+        }
+    }
+
+    public async Task ClearBackupSetCatalogAsync(int backupSetId, CancellationToken ct = default)
+    {
+        ct.ThrowIfCancellationRequested();
+
+        var tx = await BeginTransactionAsync(ct);
+        try
+        {
+            // Same dependency order as DeleteBackupSetAsync, but stop short of
+            // removing the BackupSets row — we want to keep the set and its
+            // configuration, only wiping its record of what's been backed up.
+            using var cmd = _connection.CreateCommand();
+
+            cmd.CommandText = """
+                DELETE FROM FileChunks
+                WHERE FileRecordId IN (
+                    SELECT f.Id FROM Files f
+                    INNER JOIN Discs d ON f.DiscId = d.Id
+                    WHERE d.BackupSetId = $setId
+                )
+                """;
+            cmd.Parameters.AddWithValue("$setId", backupSetId);
+            cmd.ExecuteNonQuery();
+
+            cmd.CommandText = """
+                DELETE FROM Files
+                WHERE DiscId IN (SELECT Id FROM Discs WHERE BackupSetId = $setId)
+                """;
+            cmd.ExecuteNonQuery();
+
+            cmd.CommandText = "DELETE FROM Discs WHERE BackupSetId = $setId";
+            cmd.ExecuteNonQuery();
+
+            tx.Complete();
+        }
+        finally
+        {
+            tx.Dispose();
+        }
+    }
+
+    public async Task CopyBackupSetCatalogAsync(int sourceSetId, int destSetId, CancellationToken ct = default)
+    {
+        ct.ThrowIfCancellationRequested();
+
+        var tx = await BeginTransactionAsync(ct);
+        try
+        {
+            // 1. Copy discs, remembering old-disc-Id -> new-disc-Id.
+            var discIdMap = new Dictionary<long, long>();
+            var sourceDiscIds = new List<long>();
+
+            using (var read = _connection.CreateCommand())
+            {
+                read.CommandText = "SELECT Id FROM Discs WHERE BackupSetId = $src ORDER BY Id";
+                read.Parameters.AddWithValue("$src", sourceSetId);
+                using var r = read.ExecuteReader();
+                while (r.Read())
+                    sourceDiscIds.Add(r.GetInt64(0));
+            }
+
+            using (var insDisc = _connection.CreateCommand())
+            {
+                insDisc.CommandText = """
+                    INSERT INTO Discs
+                        (BackupSetId, Label, SequenceNumber, MediaType, FilesystemType,
+                         Capacity, BytesUsed, RewriteCount, IsMultisession, IsBad,
+                         Status, CreatedUtc, LastWrittenUtc)
+                    SELECT
+                        $dest, Label, SequenceNumber, MediaType, FilesystemType,
+                        Capacity, BytesUsed, RewriteCount, IsMultisession, IsBad,
+                        Status, CreatedUtc, LastWrittenUtc
+                    FROM Discs WHERE Id = $oldId;
+                    SELECT last_insert_rowid();
+                    """;
+                var pDest = insDisc.Parameters.Add("$dest", SqliteType.Integer);
+                var pOld = insDisc.Parameters.Add("$oldId", SqliteType.Integer);
+                pDest.Value = destSetId;
+
+                foreach (var oldDiscId in sourceDiscIds)
+                {
+                    pOld.Value = oldDiscId;
+                    var newId = Convert.ToInt64(insDisc.ExecuteScalar());
+                    discIdMap[oldDiscId] = newId;
+                }
+            }
+
+            // 2. Copy files per old disc, remembering old-file-Id -> new-file-Id.
+            var fileIdMap = new Dictionary<long, long>();
+
+            foreach (var (oldDiscId, newDiscId) in discIdMap)
+            {
+                var sourceFileIds = new List<long>();
+                using (var read = _connection.CreateCommand())
+                {
+                    read.CommandText = "SELECT Id FROM Files WHERE DiscId = $disc ORDER BY Id";
+                    read.Parameters.AddWithValue("$disc", oldDiscId);
+                    using var r = read.ExecuteReader();
+                    while (r.Read())
+                        sourceFileIds.Add(r.GetInt64(0));
+                }
+
+                using var insFile = _connection.CreateCommand();
+                insFile.CommandText = """
+                    INSERT INTO Files
+                        (DiscId, SourcePath, DiscPath, SizeBytes, Hash, IsZipped,
+                         IsSplit, IsDeduped, IsFileRef, Version, IsDeleted,
+                         SourceLastWriteUtc, BackedUpUtc)
+                    SELECT
+                        $newDisc, SourcePath, DiscPath, SizeBytes, Hash, IsZipped,
+                        IsSplit, IsDeduped, IsFileRef, Version, IsDeleted,
+                        SourceLastWriteUtc, BackedUpUtc
+                    FROM Files WHERE Id = $oldId;
+                    SELECT last_insert_rowid();
+                    """;
+                var pNewDisc = insFile.Parameters.Add("$newDisc", SqliteType.Integer);
+                var pOldFile = insFile.Parameters.Add("$oldId", SqliteType.Integer);
+                pNewDisc.Value = newDiscId;
+
+                foreach (var oldFileId in sourceFileIds)
+                {
+                    pOldFile.Value = oldFileId;
+                    var newId = Convert.ToInt64(insFile.ExecuteScalar());
+                    fileIdMap[oldFileId] = newId;
+                }
+            }
+
+            // 3. Copy file chunks (split files), remapping both file and disc Ids.
+            foreach (var (oldFileId, newFileId) in fileIdMap)
+            {
+                var chunks = new List<(long DiscId, int Sequence, long Offset, long Length, string DiscFilename)>();
+                using (var read = _connection.CreateCommand())
+                {
+                    read.CommandText =
+                        "SELECT DiscId, Sequence, Offset, Length, DiscFilename FROM FileChunks WHERE FileRecordId = $file ORDER BY Id";
+                    read.Parameters.AddWithValue("$file", oldFileId);
+                    using var r = read.ExecuteReader();
+                    while (r.Read())
+                        chunks.Add((r.GetInt64(0), r.GetInt32(1), r.GetInt64(2), r.GetInt64(3), r.GetString(4)));
+                }
+
+                if (chunks.Count == 0)
+                    continue;
+
+                using var insChunk = _connection.CreateCommand();
+                insChunk.CommandText = """
+                    INSERT INTO FileChunks (FileRecordId, DiscId, Sequence, Offset, Length, DiscFilename)
+                    VALUES ($file, $disc, $seq, $off, $len, $name)
+                    """;
+                var pFile = insChunk.Parameters.Add("$file", SqliteType.Integer);
+                var pDisc = insChunk.Parameters.Add("$disc", SqliteType.Integer);
+                var pSeq = insChunk.Parameters.Add("$seq", SqliteType.Integer);
+                var pOff = insChunk.Parameters.Add("$off", SqliteType.Integer);
+                var pLen = insChunk.Parameters.Add("$len", SqliteType.Integer);
+                var pName = insChunk.Parameters.Add("$name", SqliteType.Text);
+                pFile.Value = newFileId;
+
+                foreach (var c in chunks)
+                {
+                    // Remap the chunk's disc reference if it points at a copied
+                    // disc; otherwise keep it (defensive — should always map).
+                    pDisc.Value = discIdMap.TryGetValue(c.DiscId, out var nd) ? nd : c.DiscId;
+                    pSeq.Value = c.Sequence;
+                    pOff.Value = c.Offset;
+                    pLen.Value = c.Length;
+                    pName.Value = c.DiscFilename;
+                    insChunk.ExecuteNonQuery();
+                }
+            }
+
+            tx.Complete();
+        }
+        finally
+        {
+            tx.Dispose();
+        }
     }
 
     // ---------------------------------------------------------------
@@ -900,6 +1138,53 @@ public class SqliteCatalogRepository : ICatalogRepository
                 _transaction = null;
             }
         }
+    }
+
+    // ---------------------------------------------------------------
+    // USN change-journal cursors
+    // ---------------------------------------------------------------
+
+    public Task<UsnCursor?> GetUsnCursorAsync(string volumeId, CancellationToken ct = default)
+    {
+        ct.ThrowIfCancellationRequested();
+
+        using var cmd = _connection.CreateCommand();
+        cmd.CommandText =
+            "SELECT VolumeId, JournalId, NextUsn, UpdatedUtc FROM UsnCursors WHERE VolumeId = $vol";
+        cmd.Parameters.AddWithValue("$vol", volumeId);
+
+        using var r = cmd.ExecuteReader();
+        if (!r.Read())
+            return Task.FromResult<UsnCursor?>(null);
+
+        var cursor = new UsnCursor(
+            r.GetString(0),
+            r.GetInt64(1),
+            r.GetInt64(2),
+            DateTime.Parse(r.GetString(3), CultureInfo.InvariantCulture,
+                DateTimeStyles.RoundtripKind));
+        return Task.FromResult<UsnCursor?>(cursor);
+    }
+
+    public Task SaveUsnCursorAsync(UsnCursor cursor, CancellationToken ct = default)
+    {
+        ct.ThrowIfCancellationRequested();
+
+        using var cmd = _connection.CreateCommand();
+        cmd.CommandText = """
+            INSERT INTO UsnCursors (VolumeId, JournalId, NextUsn, UpdatedUtc)
+            VALUES ($vol, $journal, $next, $updated)
+            ON CONFLICT(VolumeId) DO UPDATE SET
+                JournalId = excluded.JournalId,
+                NextUsn = excluded.NextUsn,
+                UpdatedUtc = excluded.UpdatedUtc
+            """;
+        cmd.Parameters.AddWithValue("$vol", cursor.VolumeId);
+        cmd.Parameters.AddWithValue("$journal", cursor.JournalId);
+        cmd.Parameters.AddWithValue("$next", cursor.NextUsn);
+        cmd.Parameters.AddWithValue("$updated", cursor.UpdatedUtc.ToString("o"));
+        cmd.ExecuteNonQuery();
+        return Task.CompletedTask;
     }
 
     // ---------------------------------------------------------------

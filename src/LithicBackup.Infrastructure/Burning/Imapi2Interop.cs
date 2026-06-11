@@ -9,8 +9,7 @@ namespace LithicBackup.Infrastructure.Burning;
 // Strategy: CoClasses are [ComImport] with correct CLSIDs so we can
 // instantiate them with `new`. All property/method access on the resulting
 // objects goes through `dynamic` (IDispatch late-binding) to avoid vtable
-// ordering issues. Only IDiscMaster2 uses a strongly-typed interface
-// because its layout is simple and known to work.
+// ordering issues with manual COM interop.
 //
 // Progress events use IConnectionPointContainer with event sink classes
 // that implement the dispinterfaces.
@@ -32,22 +31,6 @@ internal class MsftDiscFormat2Erase { }
 
 [ComImport, Guid("2C941FE1-975B-59BE-A960-9A2A262853A5")]
 internal class MsftFileSystemImage { }
-
-// --- IDiscMaster2 (simple enough to use strongly-typed) ---
-
-[ComImport, Guid("27354210-7F64-5B0F-8F00-5D77AFBE261E")]
-[InterfaceType(ComInterfaceType.InterfaceIsDual)]
-internal interface IDiscMaster2
-{
-    [DispId(0)]
-    string this[int index] { get; }
-
-    [DispId(1)]
-    int Count { get; }
-
-    [DispId(2)]
-    bool IsSupportedEnvironment { get; }
-}
 
 // --- Progress event dispinterfaces ---
 

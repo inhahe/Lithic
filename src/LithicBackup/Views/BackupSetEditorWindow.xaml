@@ -5,14 +5,14 @@
         xmlns:views="clr-namespace:LithicBackup.Views"
         Style="{StaticResource MainWindowStyle}"
         Title="Modify Backup Set"
-        SizeToContent="Height" Width="950"
+        Height="950" Width="950"
         MinHeight="500" MinWidth="700"
         WindowStartupLocation="CenterOwner"
         ShowInTaskbar="False"
         Opacity="0">
 
     <Border Style="{StaticResource Card}" Margin="12">
-        <ContentControl x:Name="ContentArea">
+        <ContentControl x:Name="ContentArea" Focusable="False">
             <ContentControl.Resources>
                 <DataTemplate DataType="{x:Type vm:SourceSelectionViewModel}">
                     <views:SourceSelectionView />

@@ -10,4 +10,5 @@ public readonly record struct FileVersionInfo(
     long SizeBytes,
     DateTime SourceLastWriteUtc,
     bool IsDeduped,
-    bool IsFileRef);
+    bool IsFileRef,
+    string Hash = "");

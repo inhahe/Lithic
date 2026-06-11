@@ -1,0 +1,18 @@
+DISCLAIMER
+
+THIS SOFTWARE IS PROVIDED "AS IS", WITHOUT WARRANTY OF ANY KIND, EXPRESS OR
+IMPLIED, INCLUDING BUT NOT LIMITED TO THE WARRANTIES OF MERCHANTABILITY,
+FITNESS FOR A PARTICULAR PURPOSE AND NONINFRINGEMENT. IN NO EVENT SHALL THE
+AUTHORS OR COPYRIGHT HOLDERS BE LIABLE FOR ANY CLAIM, DAMAGES OR OTHER
+LIABILITY, WHETHER IN AN ACTION OF CONTRACT, TORT OR OTHERWISE, ARISING FROM,
+OUT OF OR IN CONNECTION WITH THE SOFTWARE OR THE USE OR OTHER DEALINGS IN THE
+SOFTWARE.
+
+The author(s) of this software accept no responsibility for any loss of data,
+corruption of files, damage to hardware, or any other direct, indirect,
+incidental, special, or consequential damages resulting from the use or
+inability to use this software.
+
+Backup software, by its nature, handles irreplaceable data. You are solely
+responsible for verifying that your backups are complete and restorable.
+This software should not be relied upon as your only means of data protection.

@@ -319,15 +319,7 @@ public class BackupCoverageViewModel : ViewModelBase
         }
     }
 
-    private static string FormatBytes(long bytes)
-    {
-        if (bytes <= 0) return "0 B";
-        string[] units = ["B", "KB", "MB", "GB", "TB"];
-        int i = 0;
-        double size = bytes;
-        while (size >= 1024 && i < units.Length - 1) { size /= 1024; i++; }
-        return i == 0 ? $"{size:N0} {units[i]}" : $"{size:N1} {units[i]}";
-    }
+    private static string FormatBytes(long bytes) => $"{bytes:N0}";
 }
 
 /// <summary>A single file entry in the coverage results.</summary>
@@ -335,15 +327,5 @@ public class CoverageFileItem
 {
     public required string FilePath { get; init; }
     public required long SizeBytes { get; init; }
-    public string SizeText => FormatBytes(SizeBytes);
-
-    private static string FormatBytes(long bytes)
-    {
-        if (bytes <= 0) return "0 B";
-        string[] units = ["B", "KB", "MB", "GB", "TB"];
-        int i = 0;
-        double size = bytes;
-        while (size >= 1024 && i < units.Length - 1) { size /= 1024; i++; }
-        return i == 0 ? $"{size:N0} {units[i]}" : $"{size:N1} {units[i]}";
-    }
+    public string SizeText => $"{SizeBytes:N0}";
 }

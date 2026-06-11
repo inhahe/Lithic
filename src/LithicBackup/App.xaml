@@ -15,6 +15,7 @@
             <converters:FileSizeConverter x:Key="FileSize" />
             <converters:DepthToIndentConverter x:Key="DepthToIndent" />
             <converters:IntEqualsVisibilityConverter x:Key="IntEqualsVis" />
+            <converters:NonEmptyStringToVisibilityConverter x:Key="NonEmptyVis" />
         </ResourceDictionary>
     </Application.Resources>
 </Application>

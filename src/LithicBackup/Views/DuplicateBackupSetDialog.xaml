@@ -1,0 +1,92 @@
+<Window x:Class="LithicBackup.Views.DuplicateBackupSetDialog"
+        xmlns="http://schemas.microsoft.com/winfx/2006/xaml/presentation"
+        xmlns:x="http://schemas.microsoft.com/winfx/2006/xaml"
+        Title="Duplicate Backup Set"
+        Width="480" SizeToContent="Height"
+        WindowStartupLocation="CenterOwner"
+        ResizeMode="NoResize"
+        ShowInTaskbar="False"
+        Style="{StaticResource MainWindowStyle}">
+
+    <StackPanel Margin="16">
+        <!-- Name -->
+        <TextBlock Text="Name for the new backup set:"
+                   Foreground="{StaticResource TextSecondaryBrush}"
+                   FontSize="11" Margin="0,0,0,4" />
+        <TextBox x:Name="NameBox"
+                 Text="{Binding Name, UpdateSourceTrigger=PropertyChanged}"
+                 Padding="6,4"
+                 BorderBrush="{StaticResource BorderBrush}"
+                 Margin="0,0,0,16" />
+
+        <!-- What to duplicate -->
+        <TextBlock Text="Duplicate the following:"
+                   Foreground="{StaticResource TextSecondaryBrush}"
+                   FontSize="11" Margin="0,0,0,8" />
+
+        <CheckBox Content="Source selections (files and folders to back up)"
+                  IsChecked="{Binding CopySourceSelections}"
+                  Margin="0,0,0,8" />
+        <CheckBox Content="Settings (deduplication, filesystem, verification)"
+                  IsChecked="{Binding CopySettings}"
+                  Margin="0,0,0,8" />
+        <CheckBox Content="Retention tier sets"
+                  IsChecked="{Binding CopyTierSets}"
+                  Margin="0,0,0,8" />
+        <CheckBox Content="Exclusion patterns"
+                  IsChecked="{Binding CopyExclusionPatterns}"
+                  ToolTip="The set's list of patterns that exclude matching files (filename wildcards and full-path wildcards)."
+                  Margin="0,0,0,8" />
+        <CheckBox Content="Schedule"
+                  IsChecked="{Binding CopySchedule}"
+                  Margin="0,0,0,16" />
+
+        <!-- Destination directory (inline, editable, pre-filled from source) -->
+        <TextBlock Text="Destination directory:"
+                   Foreground="{StaticResource TextSecondaryBrush}"
+                   FontSize="11" Margin="0,0,0,4" />
+        <Grid Margin="0,0,0,4">
+            <Grid.ColumnDefinitions>
+                <ColumnDefinition Width="*" />
+                <ColumnDefinition Width="Auto" />
+            </Grid.ColumnDefinitions>
+            <TextBox Grid.Column="0"
+                     Text="{Binding TargetDirectory, UpdateSourceTrigger=PropertyChanged}"
+                     Padding="6,4"
+                     VerticalContentAlignment="Center"
+                     BorderBrush="{StaticResource BorderBrush}" />
+            <Button Grid.Column="1"
+                    Content="Browse…" Padding="12,4" Margin="8,0,0,0"
+                    Cursor="Hand"
+                    Command="{Binding BrowseTargetCommand}" />
+        </Grid>
+        <TextBlock Text="Leave empty to choose a location later, or change it to back up the same sources elsewhere."
+                   Foreground="{StaticResource TextDimBrush}"
+                   FontSize="11" FontStyle="Italic"
+                   TextWrapping="Wrap"
+                   Margin="0,0,0,16" />
+
+        <CheckBox Content="Backup history (records of files already backed up)"
+                  IsChecked="{Binding CopyBackupHistory}"
+                  IsEnabled="{Binding CanCopyBackupHistory}"
+                  ToolTip="Only available when the destination is unchanged from the source set. Otherwise the new set starts fresh and treats every source file as new on its first run."
+                  Margin="0,0,0,4" />
+        <TextBlock Text="Available only when the destination matches the source set. Without it, the new set re-copies everything on its first run."
+                   Foreground="{StaticResource TextDimBrush}"
+                   FontSize="11" FontStyle="Italic"
+                   TextWrapping="Wrap"
+                   Margin="20,0,0,0" />
+
+        <!-- Buttons -->
+        <StackPanel Orientation="Horizontal" HorizontalAlignment="Right"
+                    Margin="0,16,0,0">
+            <Button Content="Cancel" Padding="16,8" Margin="0,0,8,0"
+                    Cursor="Hand" IsCancel="True"
+                    Click="Cancel_Click" />
+            <Button Style="{StaticResource PrimaryButton}"
+                    Content="Duplicate" Padding="16,8"
+                    Cursor="Hand" IsDefault="True"
+                    Click="OK_Click" />
+        </StackPanel>
+    </StackPanel>
+</Window>

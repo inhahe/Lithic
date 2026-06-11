@@ -49,6 +49,14 @@ public class LargestFilesViewModel : ViewModelBase
     /// <summary>Fired when the user clicks "Close".</summary>
     public event Action? DoneRequested;
 
+    /// <summary>Fired when the user clicks "Save".</summary>
+    public event Func<Task>? SaveRequested;
+
+    private string _saveStatusText = "";
+
+    /// <summary>Cancel any running scan (e.g. when the host window closes).</summary>
+    public void CancelScan() => _cts?.Cancel();
+
     public LargestFilesViewModel(
         IFileScanner scanner,
         ICatalogRepository catalog,
@@ -68,6 +76,8 @@ public class LargestFilesViewModel : ViewModelBase
             _cts?.Cancel();
             DoneRequested?.Invoke();
         });
+
+        SaveCommand = new RelayCommand(_ => OnSave());
 
         SortByNameCommand = new RelayCommand(_ => ApplySort("Name"));
         SortByDirectoryCommand = new RelayCommand(_ => ApplySort("Directory"));
@@ -167,6 +177,11 @@ public class LargestFilesViewModel : ViewModelBase
     public string SizeSortIndicator => _sortColumn == "Size"
         ? (_sortAscending ? " \u25B2" : " \u25BC") : "";
 
+    /// <summary>Sort indicator for the directory tree "Directory" header.
+    /// Shows when sort is by Name or Directory (both map to directory name in tree).</summary>
+    public string DirTreeNameSortIndicator => _sortColumn is "Name" or "Directory"
+        ? (_sortAscending ? " \u25B2" : " \u25BC") : "";
+
     private ObservableCollection<LargestFileItem> _filesCollection = [];
     public ObservableCollection<LargestFileItem> Files
     {
@@ -181,14 +196,34 @@ public class LargestFilesViewModel : ViewModelBase
         private set => SetProperty(ref _filesView, value);
     }
 
+    /// <summary>Transient confirmation text shown after a save.</summary>
+    public string SaveStatusText
+    {
+        get => _saveStatusText;
+        set => SetProperty(ref _saveStatusText, value);
+    }
+
     // --- Commands ---
 
     public ICommand CloseCommand { get; }
+    public ICommand SaveCommand { get; }
     public ICommand SortByNameCommand { get; }
     public ICommand SortByDirectoryCommand { get; }
     public ICommand SortBySizeCommand { get; }
     public ICommand ShowFilesCommand { get; }
     public ICommand ShowDirectoriesCommand { get; }
+
+    private async void OnSave()
+    {
+        if (SaveRequested is not null)
+            await SaveRequested.Invoke();
+
+        if (!string.IsNullOrEmpty(SaveStatusText))
+        {
+            await Task.Delay(3000);
+            SaveStatusText = "";
+        }
+    }
 
     // --- Sort ---
 
@@ -213,7 +248,9 @@ public class LargestFilesViewModel : ViewModelBase
         OnPropertyChanged(nameof(NameSortIndicator));
         OnPropertyChanged(nameof(DirectorySortIndicator));
         OnPropertyChanged(nameof(SizeSortIndicator));
+        OnPropertyChanged(nameof(DirTreeNameSortIndicator));
 
+        // Sort flat file list.
         FilesView.SortDescriptions.Clear();
         var direction = ascending
             ? ListSortDirection.Ascending
@@ -226,6 +263,49 @@ public class LargestFilesViewModel : ViewModelBase
             _ => "SizeBytes",
         };
         FilesView.SortDescriptions.Add(new SortDescription(prop, direction));
+
+        // Sort directory tree recursively.
+        SortDirectoryTree();
+    }
+
+    /// <summary>
+    /// Recursively sort the directory tree according to the current sort column
+    /// and direction.  Preserves expansion state (IsExpanded lives on the
+    /// DirectoryItem data objects, not on the UI containers).
+    /// </summary>
+    private void SortDirectoryTree()
+    {
+        if (_directories is null) return;
+
+        Comparison<DirectoryItem> comparison = _sortColumn switch
+        {
+            "Name" or "Directory" => _sortAscending
+                ? (a, b) => string.Compare(a.Name, b.Name, StringComparison.OrdinalIgnoreCase)
+                : (a, b) => string.Compare(b.Name, a.Name, StringComparison.OrdinalIgnoreCase),
+            _ => _sortAscending
+                ? (a, b) => a.SizeBytes.CompareTo(b.SizeBytes)
+                : (a, b) => b.SizeBytes.CompareTo(a.SizeBytes),
+        };
+
+        foreach (var root in _directories)
+            SortDirectoryChildrenRecursive(root.Children, comparison);
+
+        // Force the TreeView to re-bind.  IsExpanded is preserved because it
+        // lives on the DirectoryItem objects, not on the WPF containers.
+        var dirs = _directories;
+        Directories = null;
+        Directories = dirs;
+    }
+
+    private static void SortDirectoryChildrenRecursive(
+        List<DirectoryItem> items, Comparison<DirectoryItem> comparison)
+    {
+        items.Sort(comparison);
+        foreach (var item in items)
+        {
+            if (item.Children.Count > 0)
+                SortDirectoryChildrenRecursive(item.Children, comparison);
+        }
     }
 
     // --- Inclusion toggle ---
@@ -275,168 +355,6 @@ public class LargestFilesViewModel : ViewModelBase
         }
     }
 
-    // --- Per-directory exclusion editing ---
-
-    private void OnDirectoryExclusionEditRequested(DirectoryItem item)
-    {
-        var selections = _backupSet.SourceSelections ?? [];
-        var node = FindSelectionNode(selections, item.FullPath);
-
-        // Collect current patterns (empty if no node exists yet).
-        var excluded = node?.ExcludedPatterns ?? [];
-        var included = node?.IncludedPatterns ?? [];
-
-        // Build inherited exclusions text by walking ancestor directories.
-        var inherited = BuildInheritedText(selections, item.FullPath);
-
-        var editorVm = new ExclusionEditorViewModel(
-            item.Name, item.FullPath, excluded, included, inherited);
-
-        var dialog = new ExclusionEditorDialog
-        {
-            DataContext = editorVm,
-            Owner = Application.Current.MainWindow,
-        };
-
-        if (dialog.ShowDialog() != true) return;
-
-        // Parse results.
-        var newExcluded = ParseLines(editorVm.ExcludedPatterns);
-        var newIncluded = ParseLines(editorVm.IncludedPatterns);
-
-        // Find or create the node in the selection tree.
-        node = FindOrCreateSelectionNode(selections, item.FullPath);
-        node.ExcludedPatterns = newExcluded;
-        node.IncludedPatterns = newIncluded;
-
-        _backupSet.SourceSelections = selections;
-        _ = SaveBackupSetAsync();
-    }
-
-    private async Task SaveBackupSetAsync()
-    {
-        try { await _catalog.UpdateBackupSetAsync(_backupSet); } catch { }
-    }
-
-    private static SourceSelection? FindSelectionNode(
-        IReadOnlyList<SourceSelection> nodes, string path)
-    {
-        foreach (var node in nodes)
-        {
-            if (string.Equals(node.Path, path, StringComparison.OrdinalIgnoreCase))
-                return node;
-            var found = FindSelectionNode(node.Children, path);
-            if (found is not null) return found;
-        }
-        return null;
-    }
-
-    /// <summary>
-    /// Find or create a SourceSelection node for the given path, building
-    /// intermediate parent nodes as needed.
-    /// </summary>
-    private static SourceSelection FindOrCreateSelectionNode(
-        List<SourceSelection> roots, string targetPath)
-    {
-        // Try to find an existing node first.
-        var existing = FindSelectionNode(roots, targetPath);
-        if (existing is not null) return existing;
-
-        // Walk up from targetPath to find the deepest existing ancestor.
-        var ancestors = new List<string>();
-        string? current = targetPath;
-        while (current is not null)
-        {
-            ancestors.Add(current);
-            string? parent = Path.GetDirectoryName(current);
-            if (parent == current) break;
-            current = parent;
-        }
-
-        // Walk from shallowest to deepest, creating nodes as needed.
-        List<SourceSelection> container = roots;
-        SourceSelection? parentNode = null;
-
-        // Also check the virtual root (empty path).
-        var virtualRoot = roots.FirstOrDefault(r => r.Path == "");
-        if (virtualRoot is not null)
-        {
-            parentNode = virtualRoot;
-            container = virtualRoot.Children;
-        }
-
-        for (int i = ancestors.Count - 1; i >= 0; i--)
-        {
-            var path = ancestors[i];
-            var node = container.FirstOrDefault(n =>
-                string.Equals(n.Path, path, StringComparison.OrdinalIgnoreCase));
-            if (node is null)
-            {
-                node = new SourceSelection
-                {
-                    Path = path,
-                    IsDirectory = true,
-                    IsSelected = true,
-                    AutoIncludeNewSubdirectories = true,
-                };
-                container.Add(node);
-            }
-            parentNode = node;
-            container = node.Children;
-        }
-
-        return parentNode!;
-    }
-
-    private static string BuildInheritedText(
-        IReadOnlyList<SourceSelection> roots, string targetPath)
-    {
-        var lines = new List<string>();
-
-        // Collect the ancestor chain.
-        var ancestors = new List<string>();
-        string? current = Path.GetDirectoryName(targetPath);
-        while (current is not null)
-        {
-            ancestors.Add(current);
-            string? parent = Path.GetDirectoryName(current);
-            if (parent == current) break;
-            current = parent;
-        }
-
-        // Check virtual root.
-        var virtualRoot = roots.FirstOrDefault(r => r.Path == "");
-        if (virtualRoot?.ExcludedPatterns is { Count: > 0 } rootPatterns)
-        {
-            foreach (var p in rootPatterns)
-                lines.Add($"{p}  (All Drives)");
-        }
-
-        // Walk shallowest-first.
-        for (int i = ancestors.Count - 1; i >= 0; i--)
-        {
-            var node = FindSelectionNode(roots, ancestors[i]);
-            if (node?.ExcludedPatterns is { Count: > 0 } patterns)
-            {
-                string label = Path.GetFileName(node.Path);
-                if (string.IsNullOrEmpty(label)) label = node.Path;
-                foreach (var p in patterns)
-                    lines.Add($"{p}  ({label})");
-            }
-        }
-
-        return lines.Count > 0 ? string.Join("\n", lines) : "";
-    }
-
-    private static List<string> ParseLines(string input)
-    {
-        if (string.IsNullOrWhiteSpace(input)) return [];
-        return input
-            .Split(['\r', '\n'], StringSplitOptions.RemoveEmptyEntries | StringSplitOptions.TrimEntries)
-            .Distinct(StringComparer.OrdinalIgnoreCase)
-            .ToList();
-    }
-
     // --- Logic ---
 
     private async Task LoadAsync(CancellationToken ct)
@@ -461,9 +379,9 @@ public class LargestFilesViewModel : ViewModelBase
                         })
                         .ToList();
 
-                var filter = GlobMatcher.CreateCombinedFilter(
-                    _backupSet.JobOptions?.ExcludedExtensions ?? [],
-                    src);
+                var filter = (_backupSet.JobOptions?.ExcludedExtensions is { Count: > 0 } excl)
+                    ? GlobMatcher.CreateFilter(excl)
+                    : null;
                 return (src, filter);
             });
 
@@ -599,7 +517,6 @@ public class LargestFilesViewModel : ViewModelBase
         foreach (var item in items)
         {
             item.InclusionToggled = OnDirectoryInclusionToggled;
-            item.ExclusionEditRequested = OnDirectoryExclusionEditRequested;
             WireDirectoryCallbacks(item.Children);
         }
     }
@@ -797,15 +714,7 @@ public class LargestFilesViewModel : ViewModelBase
         ];
     }
 
-    internal static string FormatBytes(long bytes)
-    {
-        if (bytes <= 0) return "0 B";
-        string[] units = ["B", "KB", "MB", "GB", "TB"];
-        int i = 0;
-        double size = bytes;
-        while (size >= 1024 && i < units.Length - 1) { size /= 1024; i++; }
-        return i == 0 ? $"{size:N0} {units[i]}" : $"{size:N1} {units[i]}";
-    }
+    internal static string FormatBytes(long bytes) => $"{bytes:N0}";
 }
 
 /// <summary>A single file entry for the largest files view.</summary>
@@ -886,13 +795,6 @@ public class DirectoryItem : ViewModelBase
 
     /// <summary>Callback invoked when <see cref="IsIncluded"/> is toggled.</summary>
     internal Action<DirectoryItem>? InclusionToggled;
-
-    /// <summary>Callback invoked when the user wants to edit exclusion rules.</summary>
-    internal Action<DirectoryItem>? ExclusionEditRequested;
-
-    /// <summary>Opens the exclusion editor for this directory.</summary>
-    public ICommand EditExclusionsCommand => new RelayCommand(
-        _ => ExclusionEditRequested?.Invoke(this));
 
     public bool IsExpanded
     {

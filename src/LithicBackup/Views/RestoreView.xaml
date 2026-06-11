@@ -53,7 +53,7 @@
                             </GridViewColumn>
                             <GridViewColumn Header="File" Width="300"
                                             DisplayMemberBinding="{Binding SourcePath}" />
-                            <GridViewColumn Header="Size" Width="80"
+                            <GridViewColumn Header="Size" Width="130"
                                             DisplayMemberBinding="{Binding SizeBytes, Converter={StaticResource FileSize}}" />
                             <GridViewColumn Header="Disc" Width="100"
                                             DisplayMemberBinding="{Binding DiscLabel}" />

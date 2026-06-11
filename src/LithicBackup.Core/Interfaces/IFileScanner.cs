@@ -45,6 +45,13 @@ public class ScanProgress
     public string CurrentDirectory { get; init; } = string.Empty;
     public int FilesFound { get; init; }
     public long TotalBytes { get; init; }
+
+    /// <summary>
+    /// Number of files skipped because they were already present in the
+    /// catalog.  Currently only reported by the seed-from-existing flow,
+    /// which checks for existing SourcePath records to stay idempotent.
+    /// </summary>
+    public int FilesSkipped { get; init; }
 }
 
 /// <summary>Diff between current source state and last backup.</summary>

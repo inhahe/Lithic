@@ -212,11 +212,22 @@ public class BurnProgressViewModel : ViewModelBase
     /// </summary>
     public void OnBackupProgress(BackupProgress progress)
     {
-        // Status-message-only reports (e.g. "Verifying backup...") always go through.
+        // Status-message reports (e.g. "Verifying backup...") always go through
+        // without throttling.  Also update numeric fields when provided so
+        // progress bars reflect the actual state (e.g. 100% after copying).
         if (!string.IsNullOrEmpty(progress.StatusMessage))
         {
             StatusText = progress.StatusMessage;
             CurrentFile = progress.CurrentFile;
+
+            if (progress.BytesTotalAll > 0)
+            {
+                OverallPercentage = progress.OverallPercentage;
+                BytesWrittenText = $"{FormatBytes(progress.BytesWrittenTotal)} / {FormatBytes(progress.BytesTotalAll)}";
+                ElapsedText = FormatTimeSpan(_stopwatch.Elapsed);
+            }
+            CurrentFilePercentage = 0;
+            CurrentFileSizeText = "";
             return;
         }
 
@@ -287,6 +298,7 @@ public class BurnProgressViewModel : ViewModelBase
         IsBurning = true;
         IsComplete = false;
         StatusText = IsDirectoryMode ? "Copying files..." : "Burning...";
+        _lastUiUpdateMs = -ProgressUpdateIntervalMs; // ensure first report gets through
         _stopwatch.Restart();
         return _cts;
     }
@@ -303,7 +315,12 @@ public class BurnProgressViewModel : ViewModelBase
         ElapsedText = FormatTimeSpan(_stopwatch.Elapsed);
         RemainingText = "00:00";
         string verb = IsDirectoryMode ? "Backup" : "Burn";
-        StatusText = success ? $"{verb} completed successfully." : $"{verb} failed: {message}";
+        if (success && (failedFiles is null or { Count: 0 }))
+            StatusText = $"{verb} completed.";
+        else if (failedFiles is { Count: > 0 })
+            StatusText = $"{verb} completed with errors — {failedFiles.Count:N0} file(s) skipped or failed.";
+        else
+            StatusText = string.IsNullOrEmpty(message) ? $"{verb} failed." : $"{verb} failed: {message}";
         ResultDetail = detail;
 
         FailedFiles.Clear();
@@ -350,14 +367,7 @@ public class BurnProgressViewModel : ViewModelBase
         }
     }
 
-    private static string FormatBytes(long bytes)
-    {
-        string[] units = ["B", "KB", "MB", "GB", "TB"];
-        int i = 0;
-        double size = bytes;
-        while (size >= 1024 && i < units.Length - 1) { size /= 1024; i++; }
-        return i == 0 ? $"{size:N0} {units[i]}" : $"{size:N1} {units[i]}";
-    }
+    private static string FormatBytes(long bytes) => $"{bytes:N0}";
 
     private static string FormatTimeSpan(TimeSpan ts)
     {

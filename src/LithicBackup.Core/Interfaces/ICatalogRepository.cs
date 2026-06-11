@@ -12,6 +12,27 @@ public interface ICatalogRepository : IDisposable
     Task<BackupSet?> GetBackupSetAsync(int id, CancellationToken ct = default);
     Task<IReadOnlyList<BackupSet>> GetAllBackupSetsAsync(CancellationToken ct = default);
     Task UpdateBackupSetAsync(BackupSet set, CancellationToken ct = default);
+    Task DeleteBackupSetAsync(int backupSetId, CancellationToken ct = default);
+
+    /// <summary>
+    /// Delete all catalog records of what has been backed up for a set
+    /// (discs, file records, and file chunks) while keeping the backup set
+    /// itself and its configuration intact.  After this, the set behaves as
+    /// if it had never run a backup — the next run treats every source file
+    /// as new.  Files already written to the destination are not touched, and
+    /// shared deduplication blocks are left in place.
+    /// </summary>
+    Task ClearBackupSetCatalogAsync(int backupSetId, CancellationToken ct = default);
+
+    /// <summary>
+    /// Copy the backup history (discs, file records, and file chunks) from one
+    /// backup set to another, remapping the disc/file primary keys.  Used when
+    /// duplicating a set and opting to carry over its record of what is already
+    /// backed up.  The destination set must already exist; its existing history
+    /// is left untouched (callers should clear it first if a clean copy is
+    /// desired).  Shared deduplication blocks are not duplicated.
+    /// </summary>
+    Task CopyBackupSetCatalogAsync(int sourceSetId, int destSetId, CancellationToken ct = default);
 
     // --- Discs ---
     Task<DiscRecord> CreateDiscAsync(DiscRecord disc, CancellationToken ct = default);
@@ -103,6 +124,19 @@ public interface ICatalogRepository : IDisposable
     /// Export the catalog database to a file (for writing onto a disc).
     /// </summary>
     Task ExportDatabaseAsync(string destinationPath, CancellationToken ct = default);
+
+    // --- USN change-journal cursors ---
+
+    /// <summary>
+    /// Get the saved USN-journal resume point for a volume, or null if none has
+    /// been persisted yet (first run for that volume).
+    /// </summary>
+    Task<UsnCursor?> GetUsnCursorAsync(string volumeId, CancellationToken ct = default);
+
+    /// <summary>
+    /// Persist (insert or update) the USN-journal resume point for a volume.
+    /// </summary>
+    Task SaveUsnCursorAsync(UsnCursor cursor, CancellationToken ct = default);
 
     // --- Transactions ---
     Task<ICatalogTransaction> BeginTransactionAsync(CancellationToken ct = default);

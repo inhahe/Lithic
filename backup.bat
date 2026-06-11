@@ -1,0 +1,1 @@
+start "" "D:\visual studio projects\backup\src\LithicBackup\bin\Release\net8.0-windows\LithicBackup.exe"

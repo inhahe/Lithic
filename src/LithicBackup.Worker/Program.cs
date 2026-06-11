@@ -12,12 +12,10 @@ var builder = Host.CreateDefaultBuilder(args)
     })
     .ConfigureServices(services =>
     {
-        // Catalog database — same path the GUI uses.
-        var appDataDir = Path.Combine(
-            Environment.GetFolderPath(Environment.SpecialFolder.LocalApplicationData),
-            "LithicBackup");
-        Directory.CreateDirectory(appDataDir);
-        var catalogPath = Path.Combine(appDataDir, "catalog.db");
+        // Catalog database — shared, account-independent path (ProgramData) so
+        // the service (LocalSystem) and the GUI (interactive user) open the SAME
+        // database. See CatalogLocation for the rationale.
+        var catalogPath = CatalogLocation.Resolve();
 
         services.AddSingleton<ICatalogRepository>(
             _ => new SqliteCatalogRepository(catalogPath));
@@ -26,9 +24,6 @@ var builder = Host.CreateDefaultBuilder(args)
         services.AddSingleton<IDeduplicationEngine, BlockDeduplicationEngine>();
         services.AddSingleton<VersionRetentionService>();
         services.AddSingleton<DirectoryBackupService>();
-
-        // File-system monitor for continuous-mode change detection.
-        services.AddSingleton<IFileSystemMonitor, FileSystemMonitorImpl>();
 
         services.AddHostedService<BackupWorker>();
     });

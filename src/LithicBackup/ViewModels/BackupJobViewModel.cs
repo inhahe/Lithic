@@ -458,6 +458,25 @@ public class BackupJobViewModel : ViewModelBase
                     summary += "\n\nNothing to back up. All files are already current.";
                 }
 
+                // Check available space on the target drive.
+                if (totalFiles > 0)
+                {
+                    try
+                    {
+                        string pathRoot = System.IO.Path.GetPathRoot(effectiveTargetDir!) ?? effectiveTargetDir!;
+                        var driveInfo = new System.IO.DriveInfo(pathRoot);
+                        if (driveInfo.IsReady)
+                        {
+                            long freeSpace = driveInfo.AvailableFreeSpace;
+                            string driveLetter = pathRoot.TrimEnd('\\');
+                            summary += $"\nFree space ({driveLetter}): {FormatBytes(freeSpace)}";
+                            if (totalBytes > freeSpace)
+                                summary += $"\n\n\u26A0 WARNING: Not enough free space! Need {FormatBytes(totalBytes)} but only {FormatBytes(freeSpace)} available.";
+                        }
+                    }
+                    catch { }
+                }
+
                 PlanSummary = summary;
                 IsPlanReady = totalFiles > 0;
             }
@@ -575,12 +594,5 @@ public class BackupJobViewModel : ViewModelBase
         return string.Join("\n", patterns);
     }
 
-    private static string FormatBytes(long bytes)
-    {
-        string[] units = ["B", "KB", "MB", "GB", "TB"];
-        int i = 0;
-        double size = bytes;
-        while (size >= 1024 && i < units.Length - 1) { size /= 1024; i++; }
-        return i == 0 ? $"{size:N0} {units[i]}" : $"{size:N1} {units[i]}";
-    }
+    private static string FormatBytes(long bytes) => $"{bytes:N0}";
 }

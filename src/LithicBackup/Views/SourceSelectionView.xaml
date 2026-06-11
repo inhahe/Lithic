@@ -35,12 +35,27 @@
                         Command="{Binding AddPathCommand}"
                         Padding="10,6" Margin="0,0,8,0" Cursor="Hand"
                         ToolTip="Add a network share or unmapped drive as a backup source." />
-                <Button Content="Largest Files &amp; Directories"
+<Button Content="Largest Files &amp; Directories"
                         Command="{Binding LargestFilesCommand}"
-                        Padding="10,6" Cursor="Hand"
+                        Padding="10,6" Margin="0,0,8,0" Cursor="Hand"
                         Visibility="{Binding ShowLargestFiles, Converter={StaticResource BoolToVis}}"
                         ToolTip="View the largest files and directories in this backup set's sources." />
             </StackPanel>
+            <!-- Size report (auto-populated when background sizes are ready) -->
+            <TextBlock Text="{Binding SizeCalculationResult}"
+                       Foreground="{StaticResource TextSecondaryBrush}"
+                       FontSize="11" Margin="0,4,0,0">
+                <TextBlock.Style>
+                    <Style TargetType="TextBlock">
+                        <Setter Property="Visibility" Value="Visible" />
+                        <Style.Triggers>
+                            <DataTrigger Binding="{Binding SizeCalculationResult}" Value="">
+                                <Setter Property="Visibility" Value="Collapsed" />
+                            </DataTrigger>
+                        </Style.Triggers>
+                    </Style>
+                </TextBlock.Style>
+            </TextBlock>
         </StackPanel>
 
         <!-- Bottom: summary + buttons -->
@@ -75,7 +90,7 @@
                             <Style.Triggers>
                                 <Trigger Property="IsEnabled" Value="False">
                                     <Setter Property="ToolTip"
-                                            Value="Select at least one file or directory to back up." />
+                                            Value="No changes to save." />
                                 </Trigger>
                             </Style.Triggers>
                         </Style>
@@ -110,6 +125,10 @@
         <!-- Backup set settings -->
         <Border DockPanel.Dock="Bottom" Style="{StaticResource Card}"
                 Padding="12" Margin="0,10,0,0">
+            <ScrollViewer VerticalScrollBarVisibility="Auto"
+                          HorizontalScrollBarVisibility="Disabled"
+                          Focusable="False"
+                          Padding="0,0,4,0">
             <StackPanel>
                 <TextBlock Text="Backup Settings" FontWeight="SemiBold" Margin="0,0,0,8" />
 
@@ -163,6 +182,25 @@
                             Padding="8,4" Margin="4,0,0,0" Cursor="Hand" />
                 </Grid>
 
+                <!-- Destination drive space (directory mode) -->
+                <TextBlock Text="{Binding DestinationSpaceText}"
+                           Foreground="{StaticResource TextSecondaryBrush}"
+                           FontSize="11" Margin="0,0,0,6">
+                    <TextBlock.Style>
+                        <Style TargetType="TextBlock">
+                            <Setter Property="Visibility" Value="Visible" />
+                            <Style.Triggers>
+                                <DataTrigger Binding="{Binding IsDirectoryMode}" Value="False">
+                                    <Setter Property="Visibility" Value="Collapsed" />
+                                </DataTrigger>
+                                <DataTrigger Binding="{Binding DestinationSpaceText}" Value="">
+                                    <Setter Property="Visibility" Value="Collapsed" />
+                                </DataTrigger>
+                            </Style.Triggers>
+                        </Style>
+                    </TextBlock.Style>
+                </TextBlock>
+
                 <!-- Subdirectory option (directory mode) -->
                 <StackPanel Orientation="Horizontal" Margin="0,0,0,8"
                             Visibility="{Binding IsDirectoryMode, Converter={StaticResource BoolToVis}}">
@@ -174,6 +212,70 @@
                              Padding="6,4" Width="250"
                              BorderBrush="{StaticResource BorderBrush}"
                              IsEnabled="{Binding CreateSubdirectory}" />
+                </StackPanel>
+
+                <!-- Seed from existing mirror backup (directory mode, edit mode) -->
+                <StackPanel Margin="0,0,0,8"
+                            Visibility="{Binding IsDirectoryMode, Converter={StaticResource BoolToVis}}">
+                    <StackPanel Orientation="Horizontal">
+                        <Button Command="{Binding SeedFromExistingCommand}"
+                                Padding="10,6" Margin="0,0,8,0" Cursor="Hand"
+                                Visibility="{Binding IsEditMode, Converter={StaticResource BoolToVis}}"
+                                ToolTip="Import files from an existing mirror backup (e.g. backup4all) in the destination directory so future backups are incremental.">
+                            <StackPanel Orientation="Horizontal">
+                                <TextBlock Text="Seed from Existing Backup" />
+                                <TextBlock Text=" ..." Visibility="{Binding IsSeeding, Converter={StaticResource BoolToVis}}" />
+                            </StackPanel>
+                        </Button>
+                        <Button Content="Cancel" Command="{Binding CancelSeedCommand}"
+                                Padding="10,6" Margin="0,0,8,0" Cursor="Hand"
+                                Visibility="{Binding IsSeeding, Converter={StaticResource BoolToVis}}" />
+                        <CheckBox Content="Skip hashing (fast)"
+                                  IsChecked="{Binding SeedSkipHashing}"
+                                  VerticalContentAlignment="Center"
+                                  Margin="0,0,12,0"
+                                  Visibility="{Binding IsEditMode, Converter={StaticResource BoolToVis}}"
+                                  ToolTip="Skip SHA-256 hashing during import. Much faster — incremental detection uses file size and timestamps, not content hashes." />
+                        <TextBlock Text="{Binding SeedResult}"
+                                   Foreground="{StaticResource TextSecondaryBrush}"
+                                   FontSize="11" VerticalAlignment="Center"
+                                   TextWrapping="Wrap" TextTrimming="CharacterEllipsis">
+                            <TextBlock.Style>
+                                <Style TargetType="TextBlock">
+                                    <Setter Property="Visibility" Value="Visible" />
+                                    <Style.Triggers>
+                                        <DataTrigger Binding="{Binding SeedResult}" Value="">
+                                            <Setter Property="Visibility" Value="Collapsed" />
+                                        </DataTrigger>
+                                    </Style.Triggers>
+                                </Style>
+                            </TextBlock.Style>
+                        </TextBlock>
+                    </StackPanel>
+                </StackPanel>
+
+                <!-- Clear backup history (edit mode) -->
+                <StackPanel Orientation="Horizontal" Margin="0,0,0,8"
+                            Visibility="{Binding IsEditMode, Converter={StaticResource BoolToVis}}">
+                    <Button Content="Clear Backup History"
+                            Command="{Binding ClearHistoryCommand}"
+                            Padding="10,6" Margin="0,0,8,0" Cursor="Hand"
+                            ToolTip="Delete this set's catalog records of what has been backed up (discs and file entries), keeping all settings. The next backup treats every source file as new. Files already on the destination are not deleted." />
+                    <TextBlock Text="{Binding ClearHistoryResult}"
+                               Foreground="{StaticResource TextSecondaryBrush}"
+                               FontSize="11" VerticalAlignment="Center"
+                               TextWrapping="Wrap" TextTrimming="CharacterEllipsis">
+                        <TextBlock.Style>
+                            <Style TargetType="TextBlock">
+                                <Setter Property="Visibility" Value="Visible" />
+                                <Style.Triggers>
+                                    <DataTrigger Binding="{Binding ClearHistoryResult}" Value="">
+                                        <Setter Property="Visibility" Value="Collapsed" />
+                                    </DataTrigger>
+                                </Style.Triggers>
+                            </Style>
+                        </TextBlock.Style>
+                    </TextBlock>
                 </StackPanel>
 
                 <!-- ====== Disc-mode options ====== -->
@@ -285,10 +387,60 @@
                                  BorderBrush="{StaticResource BorderBrush}" />
                     </Grid>
 
+                    <!-- File pattern matching (not shown for "Default" — it's the fallback) -->
+                    <StackPanel Margin="20,0,0,4">
+                        <StackPanel.Style>
+                            <Style TargetType="StackPanel">
+                                <Style.Triggers>
+                                    <DataTrigger Binding="{Binding SelectedTierSet.Name}" Value="Default">
+                                        <Setter Property="Visibility" Value="Collapsed" />
+                                    </DataTrigger>
+                                </Style.Triggers>
+                            </Style>
+                        </StackPanel.Style>
+                        <TextBlock Text="Match files:" FontSize="11" Margin="0,0,0,2"
+                                   ToolTip="Glob patterns for files that use this tier set (e.g. *.log, *\Temp\*)" />
+                        <TextBox Text="{Binding SelectedTierSet.FilePatternsText, UpdateSourceTrigger=PropertyChanged}"
+                                 FontSize="11" Padding="4,3"
+                                 AcceptsReturn="True" Height="60"
+                                 VerticalScrollBarVisibility="Auto" TextWrapping="NoWrap"
+                                 BorderBrush="{StaticResource BorderBrush}"
+                                 ToolTip="One glob pattern per line (e.g. *.log, *.tmp, *\Temp\*)" />
+                        <TextBlock Text="Exempt files:" FontSize="11" Margin="0,6,0,2"
+                                   ToolTip="Glob patterns to exclude from matching (override the patterns above)" />
+                        <TextBox Text="{Binding SelectedTierSet.FileExemptPatternsText, UpdateSourceTrigger=PropertyChanged}"
+                                 FontSize="11" Padding="4,3"
+                                 AcceptsReturn="True" Height="40"
+                                 VerticalScrollBarVisibility="Auto" TextWrapping="NoWrap"
+                                 BorderBrush="{StaticResource BorderBrush}"
+                                 ToolTip="One glob pattern per line — files matching these are NOT assigned to this tier set" />
+                        <Button Content="Apply"
+                                Command="{Binding ApplyFiltersCommand}"
+                                FontSize="11" Padding="10,2" Margin="0,4,0,0"
+                                HorizontalAlignment="Left"
+                                ToolTip="Apply the current filter patterns to recalculate sizes" />
+                    </StackPanel>
+
+                    <!-- "Default" description -->
+                    <TextBlock Margin="20,0,0,4" FontSize="11" FontStyle="Italic"
+                               Foreground="{StaticResource TextDimBrush}"
+                               Text="Fallback tier set — applies to all files not matched by another tier set.">
+                        <TextBlock.Style>
+                            <Style TargetType="TextBlock">
+                                <Setter Property="Visibility" Value="Collapsed" />
+                                <Style.Triggers>
+                                    <DataTrigger Binding="{Binding SelectedTierSet.Name}" Value="Default">
+                                        <Setter Property="Visibility" Value="Visible" />
+                                    </DataTrigger>
+                                </Style.Triggers>
+                            </Style>
+                        </TextBlock.Style>
+                    </TextBlock>
+
                     <!-- "None" description -->
                     <TextBlock Margin="20,0,0,4" FontSize="11" FontStyle="Italic"
                                Foreground="{StaticResource TextDimBrush}"
-                               Text="No version history — files are overwritten in place.">
+                               Text="Excluded from backup — matching files are not saved.">
                         <TextBlock.Style>
                             <Style TargetType="TextBlock">
                                 <Setter Property="Visibility" Value="Collapsed" />
@@ -449,10 +601,23 @@
                     </StackPanel>
                 </StackPanel>
             </StackPanel>
+            </ScrollViewer>
         </Border>
 
+        <Grid>
+        <Grid.RowDefinitions>
+            <RowDefinition Height="*" MinHeight="120" />
+            <RowDefinition Height="Auto" />
+            <RowDefinition Height="120" MinHeight="72" />
+        </Grid.RowDefinitions>
+
         <!-- TreeView with integrated column headers -->
-        <TreeView ItemsSource="{Binding Roots}">
+        <TreeView Grid.Row="0"
+                  ItemsSource="{Binding Roots}"
+                  BorderThickness="0"
+                  VirtualizingStackPanel.IsVirtualizing="True"
+                  VirtualizingStackPanel.VirtualizationMode="Recycling"
+                  VirtualizingPanel.ScrollUnit="Pixel">
 
             <!-- Custom TreeView ControlTemplate: column headers + items in one visual tree -->
             <TreeView.Template>
@@ -477,25 +642,13 @@
                                     </Style>
                                 </Grid.Style>
                                 <Grid.ColumnDefinitions>
-                                    <ColumnDefinition Width="Auto" SharedSizeGroup="RetentionCol" />
                                     <ColumnDefinition Width="Auto" SharedSizeGroup="AutoIncludeCol" />
                                     <ColumnDefinition Width="Auto" SharedSizeGroup="IncludeCol" />
-                                    <ColumnDefinition Width="Auto" SharedSizeGroup="FilterCol" />
                                     <ColumnDefinition Width="*" />
-                                    <ColumnDefinition Width="Auto" SharedSizeGroup="FilesCol" />
-                                    <ColumnDefinition Width="Auto" SharedSizeGroup="SizeCol" />
+                                    <ColumnDefinition Width="Auto" MinWidth="56" SharedSizeGroup="FilesCol" />
+                                    <ColumnDefinition Width="Auto" MinWidth="120" SharedSizeGroup="SizeCol" />
                                 </Grid.ColumnDefinitions>
                                 <Border Grid.Column="0"
-                                        BorderBrush="{StaticResource BorderBrush}"
-                                        BorderThickness="0,0,1,1"
-                                        Padding="4,6">
-                                    <TextBlock Text="Retention"
-                                               FontSize="11"
-                                               Foreground="{StaticResource TextSecondaryBrush}"
-                                               VerticalAlignment="Center"
-                                               ToolTip="Version retention policy (right-click to inherit from parent)" />
-                                </Border>
-                                <Border Grid.Column="1"
                                         BorderBrush="{StaticResource BorderBrush}"
                                         BorderThickness="0,0,1,1"
                                         Padding="4,6">
@@ -507,7 +660,7 @@
                                               VerticalContentAlignment="Center"
                                               ToolTip="Check/uncheck all auto-include" />
                                 </Border>
-                                <Border Grid.Column="2"
+                                <Border Grid.Column="1"
                                         BorderBrush="{StaticResource BorderBrush}"
                                         BorderThickness="0,0,1,1"
                                         Padding="4,6">
@@ -517,11 +670,7 @@
                                               HorizontalAlignment="Center"
                                               ToolTip="Check/uncheck all" />
                                 </Border>
-                                <Border Grid.Column="3"
-                                        BorderBrush="{StaticResource BorderBrush}"
-                                        BorderThickness="0,0,1,1"
-                                        Padding="4,6" />
-                                <Border Grid.Column="4"
+                                <Border Grid.Column="2"
                                         BorderBrush="{StaticResource BorderBrush}"
                                         BorderThickness="0,0,1,1"
                                         Padding="4,6"
@@ -536,7 +685,7 @@
                                         <Run Text="Name" /><Run Text="{Binding NameSortIndicator, Mode=OneWay}" />
                                     </TextBlock>
                                 </Border>
-                                <Border Grid.Column="5"
+                                <Border Grid.Column="3"
                                         BorderBrush="{StaticResource BorderBrush}"
                                         BorderThickness="0,0,1,1"
                                         Padding="8,6"
@@ -552,10 +701,10 @@
                                     </Border.Style>
                                     <TextBlock FontSize="11"
                                                Foreground="{StaticResource TextSecondaryBrush}"
-                                               HorizontalAlignment="Right"
+                                               TextAlignment="Right"
                                                Text="Files" />
                                 </Border>
-                                <Border Grid.Column="6"
+                                <Border Grid.Column="4"
                                         BorderBrush="{StaticResource BorderBrush}"
                                         BorderThickness="0,0,0,1"
                                         Padding="8,6"
@@ -576,7 +725,7 @@
                                     </Border.InputBindings>
                                     <TextBlock FontSize="11"
                                                Foreground="{StaticResource TextSecondaryBrush}"
-                                               HorizontalAlignment="Right">
+                                               TextAlignment="Right">
                                         <Run Text="Size" /><Run Text="{Binding SizeSortIndicator, Mode=OneWay}" />
                                     </TextBlock>
                                 </Border>
@@ -585,7 +734,7 @@
                             <!-- Scrollable tree items -->
                             <ScrollViewer x:Name="TreeScroll"
                                           Focusable="False"
-                                          CanContentScroll="False"
+                                          CanContentScroll="True"
                                           HorizontalScrollBarVisibility="Disabled"
                                           VerticalScrollBarVisibility="Auto"
                                           Padding="0">
@@ -599,6 +748,8 @@
             <!-- Custom TreeViewItem template: fixed checkbox columns + indented name -->
             <TreeView.ItemContainerStyle>
                 <Style TargetType="TreeViewItem">
+                    <EventSetter Event="RequestBringIntoView"
+                                 Handler="TreeViewItem_RequestBringIntoView" />
                     <Setter Property="IsExpanded" Value="{Binding IsExpanded, Mode=TwoWay}" />
                     <Setter Property="Margin" Value="0" />
                     <Setter Property="Padding" Value="0" />
@@ -610,63 +761,36 @@
                                     <!-- This node's row -->
                                     <Grid MinHeight="24">
                                         <Grid.ColumnDefinitions>
-                                            <ColumnDefinition Width="Auto" SharedSizeGroup="RetentionCol" />
                                             <ColumnDefinition Width="Auto" SharedSizeGroup="AutoIncludeCol" />
                                             <ColumnDefinition Width="Auto" SharedSizeGroup="IncludeCol" />
-                                            <ColumnDefinition Width="Auto" SharedSizeGroup="FilterCol" />
                                             <ColumnDefinition Width="*" />
-                                            <ColumnDefinition Width="Auto" SharedSizeGroup="FilesCol" />
-                                            <ColumnDefinition Width="Auto" SharedSizeGroup="SizeCol" />
+                                            <ColumnDefinition Width="Auto" MinWidth="56" SharedSizeGroup="FilesCol" />
+                                            <ColumnDefinition Width="Auto" MinWidth="120" SharedSizeGroup="SizeCol" />
                                         </Grid.ColumnDefinitions>
 
-                                        <!-- Col 0: Retention policy (tier set) -->
+                                        <!-- Col 0: Auto-include new (fixed position, not indented) -->
                                         <Border Grid.Column="0"
-                                                BorderBrush="{StaticResource BorderBrush}"
-                                                BorderThickness="0,0,1,0"
-                                                Padding="2,0">
-                                            <ComboBox SelectedItem="{Binding DisplayTierSetName, Mode=TwoWay}"
-                                                      ItemsSource="{Binding DataContext.AvailableTierSetNames,
-                                                                    RelativeSource={RelativeSource AncestorType=TreeView}}"
-                                                      IsEnabled="{Binding IsNodeEnabled}"
-                                                      FontSize="10"
-                                                      Padding="2,1"
-                                                      MinWidth="70"
-                                                      VerticalAlignment="Center"
-                                                      BorderThickness="0">
-                                                <ComboBox.ContextMenu>
-                                                    <ContextMenu>
-                                                        <MenuItem Header="Inherit from parent"
-                                                                  Command="{Binding ResetTierToInheritCommand}"
-                                                                  ToolTip="Remove explicit assignment; inherit retention policy from parent directory" />
-                                                    </ContextMenu>
-                                                </ComboBox.ContextMenu>
-                                                <ComboBox.Style>
-                                                    <Style TargetType="ComboBox">
-                                                        <Setter Property="Foreground" Value="{StaticResource TextPrimaryBrush}" />
-                                                        <Style.Triggers>
-                                                            <DataTrigger Binding="{Binding IsInheritedTier}" Value="True">
-                                                                <Setter Property="Foreground" Value="{StaticResource TextDimBrush}" />
-                                                            </DataTrigger>
-                                                        </Style.Triggers>
-                                                    </Style>
-                                                </ComboBox.Style>
-                                            </ComboBox>
-                                        </Border>
-
-                                        <!-- Col 1: Auto-include new (fixed position, not indented) -->
-                                        <Border Grid.Column="1"
                                                 BorderBrush="{StaticResource BorderBrush}"
                                                 BorderThickness="0,0,1,0">
                                             <CheckBox IsChecked="{Binding AutoIncludeNew, Mode=TwoWay}"
-                                                      IsEnabled="{Binding IsNodeEnabled}"
                                                       VerticalAlignment="Center"
                                                       HorizontalAlignment="Center"
                                                       ToolTip="Auto-include new subdirectories"
-                                                      Visibility="{Binding IsDirectory, Converter={StaticResource BoolToVis}}" />
+                                                      Visibility="{Binding IsDirectory, Converter={StaticResource BoolToVis}}">
+                                                <CheckBox.Style>
+                                                    <Style TargetType="CheckBox">
+                                                        <Style.Triggers>
+                                                            <DataTrigger Binding="{Binding IsNodeEnabled}" Value="False">
+                                                                <Setter Property="Opacity" Value="0.35" />
+                                                            </DataTrigger>
+                                                        </Style.Triggers>
+                                                    </Style>
+                                                </CheckBox.Style>
+                                            </CheckBox>
                                         </Border>
 
-                                        <!-- Col 2: Include -->
-                                        <Border Grid.Column="2"
+                                        <!-- Col 1: Include -->
+                                        <Border Grid.Column="1"
                                                 BorderBrush="{StaticResource BorderBrush}"
                                                 BorderThickness="0,0,1,0">
                                             <CheckBox IsChecked="{Binding IsSelected, Mode=TwoWay}"
@@ -675,38 +799,11 @@
                                                       HorizontalAlignment="Center" />
                                         </Border>
 
-                                        <!-- Col 3: Filter button (directories only) -->
-                                        <Border Grid.Column="3"
-                                                BorderBrush="{StaticResource BorderBrush}"
-                                                BorderThickness="0,0,1,0">
-                                            <Button x:Name="ExclusionBtn"
-                                                    Command="{Binding EditExclusionsCommand}"
-                                                    Padding="3,1" Margin="2"
-                                                    VerticalAlignment="Center" HorizontalAlignment="Center"
-                                                    Cursor="Hand"
-                                                    Background="Transparent"
-                                                    BorderBrush="{StaticResource BorderBrush}"
-                                                    BorderThickness="1"
-                                                    ToolTip="Edit exclusion/inclusion rules for this directory"
-                                                    Visibility="Collapsed">
-                                                <TextBlock x:Name="ExclusionBtnText"
-                                                           Text="Filter"
-                                                           FontSize="10"
-                                                           Foreground="{StaticResource TextDimBrush}" />
-                                            </Button>
-                                        </Border>
-
-                                        <!-- Col 4: Clickable name area (single-click expands directories) -->
-                                        <Border x:Name="NameArea" Grid.Column="4"
+                                        <!-- Col 2: Clickable name area (single-click expands directories) -->
+                                        <Border x:Name="NameArea" Grid.Column="2"
                                                 Background="Transparent"
                                                 BorderBrush="{StaticResource BorderBrush}"
                                                 BorderThickness="0,0,1,0">
-                                            <Border.ContextMenu>
-                                                <ContextMenu>
-                                                    <MenuItem Header="Edit Exclusion Rules..."
-                                                              Command="{Binding EditExclusionsCommand}" />
-                                                </ContextMenu>
-                                            </Border.ContextMenu>
                                             <Border.InputBindings>
                                                 <MouseBinding MouseAction="LeftClick"
                                                               Command="{Binding ToggleExpandCommand}" />
@@ -746,8 +843,8 @@
                                             </StackPanel>
                                         </Border>
 
-                                        <!-- Col 5: File count (visible only when ShowSizes is on) -->
-                                        <Border Grid.Column="5"
+                                        <!-- Col 3: File count (visible only when ShowSizes is on) -->
+                                        <Border Grid.Column="3"
                                                 BorderBrush="{StaticResource BorderBrush}"
                                                 BorderThickness="0,0,1,0">
                                             <Border.Style>
@@ -763,15 +860,14 @@
                                             </Border.Style>
                                             <TextBlock Text="{Binding FormattedFileCount}"
                                                        VerticalAlignment="Center"
-                                                       HorizontalAlignment="Right"
+                                                       TextAlignment="Right"
                                                        FontSize="11"
                                                        Foreground="{StaticResource TextSecondaryBrush}"
-                                                       Padding="8,0,8,0"
-                                                       MinWidth="40" />
+                                                       Padding="8,0,8,0" />
                                         </Border>
 
-                                        <!-- Col 6: Size (visible only when ShowSizes is on) -->
-                                        <Border Grid.Column="6">
+                                        <!-- Col 4: Size (visible only when ShowSizes is on) -->
+                                        <Border Grid.Column="4">
                                             <Border.Style>
                                                 <Style TargetType="Border">
                                                     <Style.Triggers>
@@ -785,11 +881,10 @@
                                             </Border.Style>
                                             <TextBlock Text="{Binding FormattedSize}"
                                                        VerticalAlignment="Center"
-                                                       HorizontalAlignment="Right"
+                                                       TextAlignment="Right"
                                                        FontSize="11"
                                                        Foreground="{StaticResource TextSecondaryBrush}"
-                                                       Padding="8,0,8,0"
-                                                       MinWidth="60" />
+                                                       Padding="8,0,8,0" />
                                         </Border>
                                     </Grid>
 
@@ -811,12 +906,6 @@
                                     </Trigger>
                                     <DataTrigger Binding="{Binding IsDirectory}" Value="True">
                                         <Setter TargetName="NameArea" Property="Cursor" Value="Hand" />
-                                        <Setter TargetName="ExclusionBtn" Property="Visibility" Value="Visible" />
-                                    </DataTrigger>
-                                    <DataTrigger Binding="{Binding HasExclusionRules}" Value="True">
-                                        <Setter TargetName="ExclusionBtnText" Property="Foreground" Value="#1976D2" />
-                                        <Setter TargetName="ExclusionBtn" Property="BorderBrush" Value="#1976D2" />
-                                        <Setter TargetName="ExclusionBtnText" Property="FontWeight" Value="SemiBold" />
                                     </DataTrigger>
 
                                     <!-- Backup status dot colors -->
@@ -856,5 +945,38 @@
                 </HierarchicalDataTemplate>
             </TreeView.ItemTemplate>
         </TreeView>
+
+        <!-- Drag handle: let the user trade vertical space between the tree and
+             the exclusion panel. -->
+        <GridSplitter Grid.Row="1" Height="6"
+                      HorizontalAlignment="Stretch" VerticalAlignment="Center"
+                      Background="Transparent" Cursor="SizeNS"
+                      ResizeBehavior="PreviousAndNext" ResizeDirection="Rows" />
+
+        <!-- Exclude-from-backup patterns (shares the tree's space). -->
+        <Border Grid.Row="2"
+                BorderThickness="1"
+                BorderBrush="{StaticResource BorderBrush}"
+                Background="{StaticResource SurfaceBrush}">
+            <DockPanel Margin="10">
+                <TextBlock DockPanel.Dock="Top" Text="Exclude from Backup"
+                           FontWeight="SemiBold" Margin="0,0,0,4" />
+                <TextBlock DockPanel.Dock="Top"
+                           Text="Glob patterns, one per line. Matching files are not backed up."
+                           Foreground="{StaticResource TextSecondaryBrush}"
+                           FontSize="11" TextWrapping="Wrap" Margin="0,0,0,6" />
+                <TextBox Text="{Binding ExcludedExtensions, UpdateSourceTrigger=PropertyChanged}"
+                         AcceptsReturn="True"
+                         VerticalScrollBarVisibility="Auto"
+                         HorizontalScrollBarVisibility="Auto"
+                         TextWrapping="NoWrap"
+                         Padding="6,4"
+                         BorderBrush="{StaticResource BorderBrush}"
+                         FontFamily="Consolas, Courier New, monospace"
+                         FontSize="12"
+                         ToolTip="Examples:  *.log  *.tmp  *.bak  */.vs/*  */bin/*  */obj/*&#x0a;&#x0a;Use * to match any characters in a file name.&#x0a;Use */ to match directory paths." />
+            </DockPanel>
+        </Border>
+        </Grid>
     </DockPanel>
 </UserControl>
