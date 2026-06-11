@@ -936,8 +936,11 @@ public class MainViewModel : ViewModelBase
 
                 // Destination is set directly in the dialog (pre-filled from the
                 // source). Carry the source's subdirectory shaping only when the
-                // destination is unchanged from the original target.
-                copiedOptions.TargetDirectory = vm.TargetDirectory?.Trim() ?? string.Empty;
+                // destination is unchanged from the original target. Store null
+                // (not empty) for a blank destination so the Worker treats the
+                // set as inactive until a real destination is chosen.
+                copiedOptions.TargetDirectory =
+                    string.IsNullOrWhiteSpace(vm.TargetDirectory) ? null : vm.TargetDirectory.Trim();
                 if (vm.KeepsOriginalTarget)
                 {
                     copiedOptions.CreateSubdirectory = src.JobOptions.CreateSubdirectory;
