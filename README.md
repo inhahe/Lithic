@@ -71,7 +71,7 @@ Only directory-mode backup sets can be scheduled (disc burns require physical me
 ### Source Selection
 
 - Treeview file browser with tristate checkboxes — select entire drives, individual directories, or specific files
-- New subdirectories are automatically included under fully-selected parents
+- New subdirectories are automatically included for parents with "Auto-include new" checked
 - **Global exclusion patterns**: each backup set carries a list of glob patterns (one per line, e.g. `*.log`, `temp_*`, `*\bin\*`) that exclude matching files from the backup entirely. Filename patterns match against the file name; patterns containing a path separator match against the full path. Excluded files are never copied or versioned.
 - **Pre-backup size calculator**: calculate how much data will be written before actually running the backup. Shows new files, changed files, per-source-root breakdown, destination free space, and whether the data will fit.
 
