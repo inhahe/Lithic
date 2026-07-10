@@ -18,7 +18,11 @@ namespace LithicBackup.Services;
 ///   targetDir/C_prev/Users/foo/bigfile.dat.v2.dedup  -- previous (block-deduplicated)
 ///   targetDir/C_prev/Users/foo/samefile.txt.v1.fileref -- previous (file ref)
 ///   targetDir/_blocks/{hash}.blk                     -- shared block store (block-level dedup)
-///   targetDir/_filestore/{hash}.dat                  -- shared file store (file-level dedup)
+///
+/// File-level dedup has no separate content store. Each unique file's content
+/// is written once as a plain, normally-named file (in the current tree or a
+/// "{drive}_prev" version); any byte-identical duplicate is a small .fileref
+/// manifest that resolves to that plain copy by content hash via the catalog.
 /// </summary>
 public class DirectoryBackupService
 {
@@ -27,6 +31,19 @@ public class DirectoryBackupService
     private readonly VersionRetentionService _retention;
     private readonly IDeduplicationEngine? _dedup;
     private readonly IFileHashLookup? _hashCache;
+
+    /// <summary>
+    /// TESTING ONLY — when <c>true</c>, plain (non-deduplicated) file copies are
+    /// written as tiny hash+size stubs instead of real content, so a dedup test
+    /// run doesn't fill the destination drive. The block store (<c>_blocks</c>)
+    /// and all manifests are kept fully real, so block-level dedup restore and
+    /// verification still work — but any plain-copied file is non-functional and
+    /// cannot be restored. Because file-level dedup references resolve to a plain
+    /// copy, .fileref restore is also non-functional in this mode.  This does not
+    /// produce a real backup and must never be enabled for one.
+    /// Gated behind <c>--test-mode</c> in the UI.
+    /// </summary>
+    public bool StubPlainContentForTesting { get; set; }
 
     public DirectoryBackupService(
         ICatalogRepository catalog,
@@ -123,6 +140,21 @@ public class DirectoryBackupService
             ? await _catalog.GetLatestVersionInfoAsync(backupSetId, ct)
             : new Dictionary<string, FileVersionInfo>(StringComparer.OrdinalIgnoreCase);
 
+        // Map of content hash -> destination-relative path of an active PLAIN
+        // copy of that content somewhere in the backup tree (a real-bytes file
+        // stored under its own name, in the current tree or a "{drive}_prev"
+        // version — never a .fileref/.dedup). File-level dedup uses this to tell
+        // a genuine duplicate from brand-new unique content: a later byte-
+        // identical file becomes a .fileref ONLY when a plain copy of that
+        // content is known to exist (so the reference always resolves). Unique
+        // content is stored as a plain, normally-named file. The value also
+        // stamps each new .fileref's ContentPath hint. Seeded from the catalog
+        // and extended/updated as plain files are written and moved during this
+        // run.
+        var knownContentPaths = job.BackupSetId.HasValue
+            ? await _catalog.GetActivePlainContentPathsAsync(backupSetId, ct)
+            : new Dictionary<string, string>(StringComparer.OrdinalIgnoreCase);
+
         // Build a set of changed paths for quick lookup.
         var changedPaths = new HashSet<string>(
             diff.ChangedFiles.Select(f => f.FullPath),
@@ -139,14 +171,154 @@ public class DirectoryBackupService
         // 5. Create a single "virtual" DiscRecord for this backup run.
         Directory.CreateDirectory(targetDirectory);
 
-        // Ensure store directories exist when dedup might be used.
+        // Ensure the block store exists when block-level dedup might be used.
+        // File-level dedup no longer uses a dedicated content store: unique
+        // content is written as a plain named file, and a duplicate is a
+        // .fileref that resolves to an existing plain copy via the catalog.
         string blockStoreDir = Path.Combine(targetDirectory, "_blocks");
-        if (job.EnableDeduplication && _dedup is not null)
+        bool blockDedupEnabled = job.EnableDeduplication && _dedup is not null;
+        if (blockDedupEnabled)
             Directory.CreateDirectory(blockStoreDir);
 
-        string fileStoreDir = Path.Combine(targetDirectory, "_filestore");
-        if (job.EnableFileDeduplication)
-            Directory.CreateDirectory(fileStoreDir);
+        // In-memory content cache to read each file only once. A file that must
+        // be examined before it can be written (block-dedup analysis, or a
+        // file-level dedup hash check) is read into a buffer; the main loop then
+        // writes that file's blocks / plain copy straight from the buffer
+        // instead of reading it from disk a second time. Bounded by a total byte
+        // budget so a backup larger than memory still works — files that don't
+        // fit are read again the old way. Buffers are released as the main loop
+        // consumes them. The budget comes from the user's memory policy (default:
+        // min(50% of total RAM, available RAM minus a 2 GB reserve)), so the
+        // backup speeds up by trading RAM for disk reads without starving other
+        // programs. A 0 budget simply disables buffering (still correct).
+        long bufferBudgetBytes = MemoryBudget.Resolve(job.MemoryBudget ?? MemoryBudgetOptions.Default);
+        var bufferedContent = new Dictionary<string, byte[]>(StringComparer.OrdinalIgnoreCase);
+        long bufferedBytes = 0;
+
+        // 5b. Block-dedup pre-pass.
+        // Block-level dedup must decide, BEFORE writing anything, which files
+        // actually have duplicate blocks — because a file is stored as a .dedup
+        // manifest ONLY when it has a duplicate block (shared with another file
+        // in this run, already present in the block store from a previous
+        // version, or repeated within the file itself). Every other file is
+        // written as a plain, normally-named copy, exactly like a non-dedup
+        // backup. Cross-file sharing within a single run can't be detected file-
+        // by-file (the first file of a sharing pair has nothing to compare
+        // against yet), so we scan all candidate files up front:
+        //   * preRecipes     : path -> block recipe (block hashes + whole-file
+        //                      hash), computed in ONE read per file and reused by
+        //                      the main loop so files aren't read twice to hash.
+        //   * wholeFileCount : whole-file hash -> number of occurrences in this
+        //                      run. With file-level dedup also on, the FIRST copy
+        //                      of a whole-file duplicate is stored plain (the
+        //                      anchor) and the rest become .fileref pointers — so
+        //                      file-level dedup keeps working even with block
+        //                      dedup on.
+        //   * blockOccur     : block hash -> occurrences across files that are
+        //                      NOT handled by file-level dedup (intra-file
+        //                      repeats counted). A block is "duplicate" when its
+        //                      count reaches 2.
+        var preRecipes = new Dictionary<string, DeduplicationRecipe>(
+            StringComparer.OrdinalIgnoreCase);
+        var wholeFileCount = new Dictionary<string, int>(StringComparer.OrdinalIgnoreCase);
+        var blockOccur = new Dictionary<string, int>(StringComparer.OrdinalIgnoreCase);
+        if (blockDedupEnabled)
+        {
+            progress?.Report(new BackupProgress
+            {
+                StatusMessage = "Analyzing files for deduplication...",
+            });
+            foreach (var file in filesToBackup)
+            {
+                ct.ThrowIfCancellationRequested();
+                pauseEvent?.Wait(ct);
+                try
+                {
+                    DeduplicationRecipe r;
+                    // Read the file into memory once if it fits the remaining
+                    // budget, so the main loop can write its blocks / plain copy
+                    // from the buffer without reading it again. Otherwise fall
+                    // back to the streaming analysis (the main loop re-reads).
+                    if (file.SizeBytes <= bufferBudgetBytes - bufferedBytes)
+                    {
+                        byte[] content = await File.ReadAllBytesAsync(file.FullPath, ct);
+                        r = _dedup!.DeduplicateBytes(
+                            blockStoreDir, file.FullPath, content, job.DeduplicationBlockSize);
+                        bufferedContent[file.FullPath] = content;
+                        bufferedBytes += content.Length;
+                    }
+                    else
+                    {
+                        r = await _dedup!.DeduplicateAsync(
+                            blockStoreDir, file.FullPath, job.DeduplicationBlockSize, ct);
+                    }
+                    preRecipes[file.FullPath] = r;
+                    wholeFileCount[r.OriginalHash] =
+                        wholeFileCount.GetValueOrDefault(r.OriginalHash) + 1;
+                }
+                catch
+                {
+                    // Unreadable right now — leave it out of the analysis; the
+                    // main loop falls back to a plain copy (and its own
+                    // retry/failure handling) for this file.
+                }
+            }
+            // Count block occurrences, skipping files that file-level dedup will
+            // handle as a plain anchor + .fileref (their blocks never enter the
+            // store, so they must not make other files look "shared").
+            foreach (var r in preRecipes.Values)
+            {
+                if (job.EnableFileDeduplication
+                    && wholeFileCount.GetValueOrDefault(r.OriginalHash) >= 2)
+                    continue;
+                foreach (var b in r.Blocks)
+                    blockOccur[b.Hash] = blockOccur.GetValueOrDefault(b.Hash) + 1;
+            }
+        }
+
+        // A candidate file is stored as .dedup only when it truly has a
+        // duplicate block: one shared with another file this run (blockOccur
+        // >= 2), one already in the store from a previous version, or one
+        // repeated within the file itself. (DeduplicateAsync flags both
+        // store-resident and within-file-repeated blocks as IsExisting, and
+        // intra-file repeats also push blockOccur to >= 2.) Files with no
+        // duplicate block are written plain.
+        bool HasDuplicateBlocks(DeduplicationRecipe r) =>
+            r.Blocks.Any(b => b.IsExisting || blockOccur.GetValueOrDefault(b.Hash) >= 2);
+
+        // 5c. Whole-file-duplicate size pre-check (single-read fast path).
+        // A plain file is normally read twice: once to hash it (needed to decide
+        // whether it's a duplicate) and once to copy it. That second read is
+        // avoidable for any file we can prove is NOT a whole-file duplicate, since
+        // such a file is certainly stored as a plain copy and can be hashed while
+        // it is copied, in a single streaming pass. A file can only be a whole-
+        // file duplicate of content of the SAME byte size, so a file whose size
+        // matches no other file in this run AND no existing plain copy cannot be a
+        // duplicate. (Only relevant when file-level dedup is on and block dedup is
+        // off; block dedup already reads every file once in the pre-pass above,
+        // and with file dedup off there are no .fileref duplicates to worry about
+        // — every file is plain anyway, so the single-pass copy always applies.)
+        var candidateSizeCounts = new Dictionary<long, int>();
+        var existingPlainSizes = new HashSet<long>();
+        bool sizePrecheckActive = !blockDedupEnabled && job.EnableFileDeduplication;
+        if (sizePrecheckActive)
+        {
+            foreach (var f in filesToBackup)
+                candidateSizeCounts[f.SizeBytes] =
+                    candidateSizeCounts.GetValueOrDefault(f.SizeBytes) + 1;
+            if (job.BackupSetId.HasValue)
+            {
+                try { existingPlainSizes = await _catalog.GetActivePlainContentSizesAsync(backupSetId, ct); }
+                catch { /* fall back to "could be a duplicate" for safety */ existingPlainSizes = new HashSet<long>(); }
+            }
+        }
+
+        // True when a file could possibly be a whole-file duplicate (so it must be
+        // hashed before its storage format is decided). False guarantees the file
+        // is unique content and can take the single-pass hash-while-copy path.
+        bool CouldBeWholeFileDuplicate(ScannedFile f) =>
+            candidateSizeCounts.GetValueOrDefault(f.SizeBytes) >= 2
+            || existingPlainSizes.Contains(f.SizeBytes);
 
         // 6. Copy files.
         var failedFiles = new List<FailedFile>();
@@ -171,7 +343,7 @@ public class DirectoryBackupService
         const double CommitIntervalSeconds = 30;
         int batchCount = 0;
         var commitTimer = System.Diagnostics.Stopwatch.StartNew();
-        var tx = await _catalog.BeginTransactionAsync(ct);
+        var tx = await _catalog.BeginTransactionAsync(backupSetId, ct);
 
         try
         {
@@ -263,7 +435,7 @@ public class DirectoryBackupService
                 await _catalog.UpdateDiscAsync(discRecord, ct);
                 tx.Complete();
                 tx.Dispose();
-                tx = await _catalog.BeginTransactionAsync(ct);
+                tx = await _catalog.BeginTransactionAsync(backupSetId, ct);
                 batchCount = 0;
                 commitTimer.Restart();
             }
@@ -287,9 +459,137 @@ public class DirectoryBackupService
                 // and the catalog record regardless.
                 // Check the pre-computed hash cache first (populated by dedup
                 // analysis) to avoid re-reading files that were already hashed.
-                string hash = _hashCache?.TryGetHash(
-                                  file.FullPath, file.SizeBytes, file.LastWriteUtc)
-                              ?? await ComputeFileHashAsync(file.FullPath, ct);
+                // The persisted size must reflect the bytes we actually hashed
+                // and store, not the directory-scan size. When a file is edited
+                // between the scan and this read those differ; recording the
+                // stale scan size leaves change detection (which compares stored
+                // size) perpetually re-flagging the file as changed, re-hashing
+                // it every run forever.
+                long contentSize = file.SizeBytes;
+                string hash = "";
+
+                // In-memory content for this file, when available. The block-dedup
+                // pre-pass may have already read it into the buffer cache; if so,
+                // reuse those bytes for the write below instead of reading again.
+                // (For the file-level-dedup-only path it may instead be read inline
+                // just below.) When non-null, the write step writes from it.
+                byte[]? contentBuffer = null;
+                bufferedContent.TryGetValue(file.FullPath, out contentBuffer);
+
+                // Single-pass fast path: when a file is provably NOT a whole-file
+                // duplicate and is not block-deduped, it is certainly stored as a
+                // plain copy. Such a file can be hashed WHILE it is copied (one
+                // streaming read) instead of being read once to hash and again to
+                // copy. We can only defer the hash, though, when nothing before
+                // the copy needs it:
+                //   - mightBeUnchanged: the content-identity short-circuit needs
+                //     the hash up front to compare against the stored version, so
+                //     a changed file that has a prior hashed version must be hashed
+                //     now (it might be unchanged content with a new timestamp).
+                //   - the test stub path writes a placeholder instead of copying,
+                //     so it can't produce a hash as a side effect.
+                bool mightBeUnchanged = isChanged && hasExistingInfo
+                    && !string.IsNullOrEmpty(existingInfo.Hash);
+                bool definitelyPlain = !blockDedupEnabled
+                    && (!job.EnableFileDeduplication || !CouldBeWholeFileDuplicate(file));
+                bool deferHashToCopy = definitelyPlain
+                    && !mightBeUnchanged
+                    && !StubPlainContentForTesting;
+
+                if (!deferHashToCopy)
+                {
+                    // Compute the hash now — needed for the content-identity
+                    // short-circuit, file-level dedup, and/or the block-dedup
+                    // format decision below.
+                    if (preRecipes.TryGetValue(file.FullPath, out var preRecipe))
+                    {
+                        // The block-dedup pre-pass already read and hashed this file
+                        // (whole-file hash + block hashes) in a single pass; reuse it
+                        // instead of reading the file again just to hash it.
+                        hash = preRecipe.OriginalHash;
+                        contentSize = preRecipe.OriginalSize;
+                    }
+                    else
+                    {
+                        string? cachedHash = _hashCache?.TryGetHash(
+                            file.FullPath, file.SizeBytes, file.LastWriteUtc);
+                        if (cachedHash is not null)
+                        {
+                            // Cache hit is validated against file.SizeBytes, so the
+                            // scan size already matches the hashed content.
+                            hash = cachedHash;
+                        }
+                        else if (contentBuffer is null && file.SizeBytes <= bufferBudgetBytes)
+                        {
+                            // File-level-dedup-only path (no block-dedup pre-pass):
+                            // read the file once into memory and hash it there, so a
+                            // file that turns out to be a plain copy is written from
+                            // the buffer with no second read, and a whole-file
+                            // duplicate just discards the buffer (a .fileref needs no
+                            // copy at all). One file's bytes at a time here; the
+                            // buffer is dropped when this iteration ends.
+                            try
+                            {
+                                contentBuffer = await File.ReadAllBytesAsync(file.FullPath, ct);
+                                contentSize = contentBuffer.Length;
+                                hash = ComputeHashOfBuffer(contentBuffer);
+                            }
+                            catch
+                            {
+                                contentBuffer = null;
+                                (hash, contentSize) = await ComputeFileHashAndSizeAsync(file.FullPath, ct);
+                            }
+                        }
+                        else
+                        {
+                            (hash, contentSize) = await ComputeFileHashAndSizeAsync(file.FullPath, ct);
+                        }
+                    }
+                }
+
+                // Content-identity short-circuit.
+                // Change detection (both the targeted USN diff and the full
+                // scan) flags a file as "changed" on a size or mtime
+                // difference — it never inspects content.  A file re-saved
+                // with identical bytes but a newer timestamp would therefore
+                // cut a redundant version: pure version-history churn, and
+                // under file-level dedup a chain of .fileref pointers all
+                // referencing the same _filestore blob.
+                // We've already computed the hash above (it's needed for every
+                // file regardless), so compare it against the latest stored
+                // version.  On a match the file is functionally unchanged:
+                // skip versioning entirely and just refresh the recorded
+                // source timestamp so the next run doesn't re-detect it.
+                if (isChanged && hasExistingInfo
+                    && !string.IsNullOrEmpty(existingInfo.Hash)
+                    && string.Equals(hash, existingInfo.Hash, StringComparison.OrdinalIgnoreCase))
+                {
+                    // Refresh the stored timestamp AND size so the next scan
+                    // stops re-detecting this file. A stale stored size (from a
+                    // prior scan that raced an edit) would otherwise keep the
+                    // file flagged as changed and re-hashed on every run.
+                    if (job.BackupSetId.HasValue
+                        && (existingInfo.SourceLastWriteUtc != file.LastWriteUtc
+                            || existingInfo.SizeBytes != contentSize))
+                    {
+                        var latest = await _catalog.GetFileRecordByPathAndVersionAsync(
+                            job.BackupSetId.Value, file.FullPath, existingInfo.MaxVersion, ct);
+                        if (latest is not null)
+                        {
+                            latest.SourceLastWriteUtc = file.LastWriteUtc;
+                            latest.SizeBytes = contentSize;
+                            await _catalog.UpdateFileRecordAsync(latest, ct);
+                        }
+                    }
+
+                    // Keep the in-memory view current for the rest of this run.
+                    versionInfo[file.FullPath] = existingInfo with
+                    {
+                        SourceLastWriteUtc = file.LastWriteUtc,
+                        SizeBytes = contentSize,
+                    };
+                    break; // unchanged content — move on to the next file
+                }
 
                 // Decide storage format. Priority:
                 //   1. File-level dedup (cheap whole-file hash match)
@@ -297,6 +597,7 @@ public class DirectoryBackupService
                 //   3. Plain copy
                 bool isDeduped = false;
                 bool isFileRef = false;
+                bool stubbedPlain = false;
                 DeduplicationRecipe? recipe = null;
 
                 // Build a throttled per-file progress callback for large files.
@@ -330,36 +631,62 @@ public class DirectoryBackupService
                     };
                 }
 
-                if (job.EnableFileDeduplication)
+                // Storage-format decision. Priority:
+                //   1. File-level dedup HIT — the whole file is byte-identical
+                //      to content that already has a plain copy somewhere in the
+                //      tree (current or a "{drive}_prev" version). Write a
+                //      .fileref pointer ONLY; no bytes are stored, because the
+                //      reference resolves to that existing plain copy by hash via
+                //      the catalog at restore/verify time.
+                //   2. Block-level dedup (when enabled) — but ONLY for files that
+                //      actually have a duplicate block (shared with another file
+                //      this run, already in the block store from a previous
+                //      version, or repeated within the file). Such a file is
+                //      stored as a .dedup manifest plus any new blocks. The
+                //      pre-pass above pre-computed which files qualify.
+                //   3. Plain named copy — everything else: brand-new unique
+                //      content AND files with no duplicate blocks. The file is
+                //      written under its own name with its real bytes, so it is a
+                //      normal, directly-usable file just like a non-dedup backup.
+                if (job.EnableFileDeduplication && knownContentPaths.ContainsKey(hash))
                 {
-                    // File-level dedup: store the canonical copy in
-                    // _filestore/{hash}.dat and write a .fileref pointer.
-                    string fileStorePath = Path.Combine(fileStoreDir, hash + ".dat");
-                    if (!File.Exists(fileStorePath))
-                    {
-                        // First occurrence of this content — copy to the store.
-                        await CopyFileAsync(file.FullPath, fileStorePath, ct, fileProgress, pauseEvent);
-                    }
+                    // (1) Genuine whole-file duplicate: byte-identical content
+                    // already has a plain copy stored somewhere in the tree.
+                    // Write a .fileref pointer and store no bytes — restore
+                    // resolves the hash to that plain copy via the catalog.
                     isFileRef = true;
                 }
-                else if (job.EnableDeduplication && _dedup is not null)
+                else if (blockDedupEnabled
+                    && preRecipes.TryGetValue(file.FullPath, out var blockRecipe))
                 {
-                    try
-                    {
-                        recipe = await _dedup.DeduplicateAsync(
-                            file.FullPath, job.DeduplicationBlockSize, ct);
+                    bool wholeFileDuplicated = job.EnableFileDeduplication
+                        && wholeFileCount.GetValueOrDefault(blockRecipe.OriginalHash) >= 2;
 
-                        // Only use dedup format if we actually saved space
-                        // (some blocks were shared with other files).
-                        isDeduped = recipe.BytesSaved > 0;
-                    }
-                    catch
+                    if (wholeFileDuplicated)
                     {
-                        // Dedup failure is non-fatal; fall back to plain copy.
-                        recipe = null;
-                        isDeduped = false;
+                        // This content appears as a whole-file duplicate elsewhere
+                        // in the run, but no plain copy exists yet — so THIS is
+                        // the first occurrence. Store it plain (flags stay false)
+                        // so it anchors the later copies' .fileref pointers: this
+                        // is what keeps file-level dedup working with block dedup
+                        // on. (Its blocks were intentionally excluded from the
+                        // block-occurrence count, so it never looks "shared".)
                     }
+                    else if (HasDuplicateBlocks(blockRecipe))
+                    {
+                        // (2) The file has at least one duplicate block — store it
+                        // as a .dedup manifest. Reuse the pre-pass recipe; the
+                        // store may have grown since, but WriteNewBlocksAsync
+                        // re-checks each block before writing and the manifest
+                        // stores only block hashes (not IsExisting flags).
+                        recipe = blockRecipe;
+                        isDeduped = true;
+                    }
+                    // else: (3) no duplicate blocks — leave flags false so the
+                    // write section copies the real bytes to a plain named file.
                 }
+                // else: (3) file-level dedup miss with block dedup off, or the
+                // pre-pass couldn't read this file — write a plain named copy.
 
                 // Check if this file should keep version history.
                 // The tier resolver determines versioning: tier sets with
@@ -398,6 +725,9 @@ public class DirectoryBackupService
 
                         File.Move(oldCurrentPath, prevPath, overwrite: true);
 
+                        string prevDiscPath = GetPrevDiscPath(
+                            file.FullPath, oldVersion, oldDeduped, oldFileRef);
+
                         // Load the specific old record on-demand (not pre-loaded)
                         // to update its DiscPath to the new _prev location.
                         if (job.BackupSetId.HasValue)
@@ -406,11 +736,24 @@ public class DirectoryBackupService
                                 job.BackupSetId.Value, file.FullPath, oldVersion, ct);
                             if (oldRecord is not null)
                             {
-                                oldRecord.DiscPath = GetPrevDiscPath(
-                                    file.FullPath, oldVersion,
-                                    oldDeduped, oldFileRef);
+                                oldRecord.DiscPath = prevDiscPath;
                                 await _catalog.UpdateFileRecordAsync(oldRecord, ct);
                             }
+                        }
+
+                        // The moved plain copy held the real bytes for its content
+                        // hash; any .fileref pointing at it must have its
+                        // ContentPath hint repointed to the new _prev location.
+                        // (Hash-anchored, so this is best-effort upkeep only.)
+                        if (!oldDeduped && !oldFileRef
+                            && !string.IsNullOrEmpty(existingInfo.Hash)
+                            && job.BackupSetId.HasValue)
+                        {
+                            await UpdateFileRefContentPathsAsync(
+                                backupSetId, existingInfo.Hash, prevDiscPath,
+                                targetDirectory, ct);
+                            if (knownContentPaths.ContainsKey(existingInfo.Hash))
+                                knownContentPaths[existingInfo.Hash] = prevDiscPath;
                         }
                     }
                 }
@@ -424,21 +767,35 @@ public class DirectoryBackupService
 
                 if (isFileRef)
                 {
-                    // Write a .fileref manifest pointing to _filestore/{hash}.dat.
+                    // Write a .fileref manifest. It stores no bytes — the Hash
+                    // resolves to an existing plain copy of the same content via
+                    // the catalog at restore/verify time. SourcePath (this file's
+                    // own source path) and ContentPath (where the bytes live) are
+                    // self-describing extras for inspection and catalog-free
+                    // restore; ContentPath is a hint, anchored by Hash.
+                    knownContentPaths.TryGetValue(hash, out string? contentDiscPath);
                     var manifest = new FileRefManifest
                     {
                         OriginalName = Path.GetFileName(file.FullPath),
-                        OriginalSize = file.SizeBytes,
+                        OriginalSize = contentSize,
                         Hash = hash,
+                        SourcePath = file.FullPath,
+                        ContentPath = contentDiscPath ?? "",
                     };
                     string json = JsonSerializer.Serialize(manifest, _jsonOptions);
                     await File.WriteAllTextAsync(currentPath, json, ct);
                 }
                 else if (isDeduped && recipe is not null)
                 {
-                    // Write new blocks to the block store.
-                    await WriteNewBlocksAsync(file.FullPath, recipe,
-                        job.DeduplicationBlockSize, blockStoreDir, ct);
+                    // Write new blocks to the block store — from the in-memory
+                    // buffer if the pre-pass kept it (no second read), otherwise
+                    // by streaming the file from disk.
+                    if (contentBuffer is not null)
+                        await WriteNewBlocksFromBufferAsync(contentBuffer, recipe,
+                            job.DeduplicationBlockSize, blockStoreDir, ct);
+                    else
+                        await WriteNewBlocksAsync(file.FullPath, recipe,
+                            job.DeduplicationBlockSize, blockStoreDir, ct);
 
                     // Write the .dedup manifest (JSON recipe).
                     var manifest = new DedupManifest
@@ -452,16 +809,54 @@ public class DirectoryBackupService
                     string json = JsonSerializer.Serialize(manifest, _jsonOptions);
                     await File.WriteAllTextAsync(currentPath, json, ct);
                 }
+                else if (StubPlainContentForTesting)
+                {
+                    // TESTING ONLY — write a tiny stub in place of the real bytes
+                    // so a dedup test run doesn't fill the drive. The real
+                    // directory tree and filename are preserved; only the content
+                    // is a placeholder. Such a file can't be restored, so it's
+                    // excluded from verification below.
+                    await WritePlainTestStubAsync(currentPath, hash, contentSize, ct);
+                    stubbedPlain = true;
+                }
+                else if (contentBuffer is not null)
+                {
+                    // Plain copy straight from the in-memory buffer — the file was
+                    // already read (by the block-dedup pre-pass or the file-dedup
+                    // hash read above), so it is not read from disk a second time.
+                    await WritePlainFromBufferAsync(
+                        contentBuffer, currentPath, ct, fileProgress, pauseEvent);
+                }
+                else if (deferHashToCopy)
+                {
+                    // Plain copy with the hash deferred to this single streaming
+                    // pass: the file is read once, its bytes flow to the
+                    // destination and through the hash at the same time. The hash
+                    // and true byte count weren't known above (we proved the file
+                    // is plain without reading it), so capture them here for the
+                    // version info, content-path seeding, and catalog record below.
+                    (hash, contentSize) = await CopyFileWithHashAsync(
+                        file.FullPath, currentPath, ct, fileProgress, pauseEvent);
+                }
                 else
                 {
-                    // Plain copy.
+                    // Plain copy (hash already computed above; file not buffered).
                     await CopyFileAsync(file.FullPath, currentPath, ct, fileProgress, pauseEvent);
                 }
 
                 // Update version info so a later file in this same run
                 // picks up the correct format for prev-moves.
                 versionInfo[file.FullPath] = new FileVersionInfo(
-                    version, file.SizeBytes, file.LastWriteUtc, isDeduped, isFileRef);
+                    version, contentSize, file.LastWriteUtc, isDeduped, isFileRef, hash);
+
+                // If this file was stored as a plain named copy, its content now
+                // has a real-bytes home in the tree: remember the hash -> its
+                // disc path so a later byte-identical file in this same run
+                // becomes a .fileref (and gets its ContentPath hint) instead of a
+                // second plain copy. Only plain copies seed this map — .fileref
+                // and .dedup entries don't themselves hold the bytes.
+                if (!isFileRef && !isDeduped && !string.IsNullOrEmpty(hash))
+                    knownContentPaths[hash] = GetCurrentDiscPath(file.FullPath, false, false);
 
                 // Create catalog record.
                 await _catalog.CreateFileRecordAsync(new FileRecord
@@ -469,7 +864,7 @@ public class DirectoryBackupService
                     DiscId = discRecord.Id,
                     SourcePath = file.FullPath,
                     DiscPath = GetCurrentDiscPath(file.FullPath, isDeduped, isFileRef),
-                    SizeBytes = file.SizeBytes,
+                    SizeBytes = contentSize,
                     Hash = hash,
                     IsZipped = false,
                     IsSplit = false,
@@ -480,7 +875,10 @@ public class DirectoryBackupService
                     BackedUpUtc = DateTime.UtcNow,
                 }, ct);
 
-                backedUp?.TryAdd(file.FullPath, (hash, isDeduped, isFileRef));
+                // A stubbed plain file holds placeholder content, so it would
+                // fail a hash read-back — skip it during verification.
+                if (!stubbedPlain)
+                    backedUp?.TryAdd(file.FullPath, (hash, isDeduped, isFileRef));
 
                 bytesWritten += file.SizeBytes;
                 batchCount++;
@@ -508,7 +906,8 @@ public class DirectoryBackupService
                 FailureDecision decision;
                 try
                 {
-                    decision = await onFailure(file.FullPath, errorDetail);
+                    decision = await onFailure(
+                        file.FullPath, errorDetail, BackupErrorClassifier.Classify(ex));
                 }
                 catch
                 {
@@ -557,6 +956,12 @@ public class DirectoryBackupService
             }
             } // while (fileRetrying)
 
+            // Release this file's cached buffer (if any) now that it has been
+            // written, freeing its memory back to the budget. Done here so the
+            // bytes stay available across any retries above.
+            if (bufferedContent.Remove(file.FullPath, out var releasedBuffer))
+                bufferedBytes -= releasedBuffer.Length;
+
             // Commit when: batch is full, a large file just finished, or
             // enough wall-clock time has elapsed since the last commit.
             if (batchCount >= CommitBatchSize
@@ -568,7 +973,7 @@ public class DirectoryBackupService
                 await _catalog.UpdateDiscAsync(discRecord, ct);
                 tx.Complete();
                 tx.Dispose();
-                tx = await _catalog.BeginTransactionAsync(ct);
+                tx = await _catalog.BeginTransactionAsync(backupSetId, ct);
                 batchCount = 0;
                 commitTimer.Restart();
             }
@@ -648,19 +1053,34 @@ public class DirectoryBackupService
                 {
                     if (info.IsFileRef)
                     {
-                        // Verify the canonical copy in _filestore/{hash}.dat.
-                        string fileStorePath = Path.Combine(fileStoreDir, info.Hash + ".dat");
+                        // A .fileref stores no bytes — verify that the content it
+                        // references resolves to an existing plain copy elsewhere
+                        // in the tree with the correct hash.
                         if (!verifiedBlocks.Contains(info.Hash))
                         {
-                            string destHash = await ComputeFileHashAsync(fileStorePath, ct);
-                            if (destHash != info.Hash)
+                            string? plainPath = await ResolvePlainContentPathAsync(
+                                backupSetId, info.Hash, targetDirectory, ct);
+                            if (plainPath is null || !File.Exists(plainPath))
                             {
                                 failedFiles.Add(new FailedFile
                                 {
                                     Path = sourcePath,
-                                    Error = "Verification failed: filestore hash mismatch",
+                                    Error = "Verification failed: file reference has no backing plain copy",
                                     ActionTaken = BurnFailureAction.Skip,
                                 });
+                            }
+                            else
+                            {
+                                string destHash = await ComputeFileHashAsync(plainPath, ct);
+                                if (destHash != info.Hash)
+                                {
+                                    failedFiles.Add(new FailedFile
+                                    {
+                                        Path = sourcePath,
+                                        Error = "Verification failed: referenced content hash mismatch",
+                                        ActionTaken = BurnFailureAction.Skip,
+                                    });
+                                }
                             }
                             verifiedBlocks.Add(info.Hash);
                         }
@@ -761,6 +1181,8 @@ public class DirectoryBackupService
                     toDelete = await _retention.ComputeRetentionAsync(backupSetId, retentionTiers!, ct);
                 }
 
+                var toDeleteIds = toDelete.Select(f => f.Id).ToHashSet();
+
                 foreach (var fileRecord in toDelete)
                 {
                     ct.ThrowIfCancellationRequested();
@@ -770,16 +1192,68 @@ public class DirectoryBackupService
                     string prevPath = GetPrevPath(
                         targetDirectory, fileRecord.SourcePath,
                         fileRecord.Version, fileRecord.IsDeduped, fileRecord.IsFileRef);
+
+                    // Last-plain-copy guard. A plain _prev file holds the real
+                    // bytes for its content hash, and file-level dedup .fileref
+                    // entries elsewhere resolve to it by hash. If this is the only
+                    // surviving plain copy of that content and a SURVIVING .fileref
+                    // still references it, deleting the bytes would orphan that
+                    // reference (an unrestorable file). In that case promote one
+                    // surviving reference into a real plain file first, using these
+                    // bytes, before deleting.
+                    if (!fileRecord.IsFileRef && !fileRecord.IsDeduped
+                        && !string.IsNullOrEmpty(fileRecord.Hash)
+                        && File.Exists(prevPath))
+                    {
+                        var others = (await _catalog.GetActiveRecordsByHashAsync(
+                                backupSetId, fileRecord.Hash, ct))
+                            .Where(r => r.Id != fileRecord.Id)
+                            .ToList();
+
+                        var survivingPlain = others.FirstOrDefault(r =>
+                            !r.IsFileRef && !r.IsDeduped && !toDeleteIds.Contains(r.Id));
+                        bool anotherPlainSurvives = survivingPlain is not null;
+
+                        if (!anotherPlainSurvives)
+                        {
+                            var survivingRef = others.FirstOrDefault(r =>
+                                r.IsFileRef && !toDeleteIds.Contains(r.Id));
+
+                            if (survivingRef is not null)
+                            {
+                                // Promote the surviving reference to a plain copy
+                                // (it becomes the content's new home), then fall
+                                // through to delete this one. If promotion fails,
+                                // keep this file so nothing is ever orphaned.
+                                if (!await TryPromoteFileRefToPlainAsync(
+                                        targetDirectory, prevPath, survivingRef, ct))
+                                {
+                                    continue; // leave this file + record intact
+                                }
+
+                                // The promoted reference now holds the bytes at its
+                                // suffix-less path; repoint every other .fileref's
+                                // ContentPath hint to it (best-effort).
+                                await UpdateFileRefContentPathsAsync(
+                                    backupSetId, fileRecord.Hash,
+                                    survivingRef.DiscPath, targetDirectory, ct);
+                            }
+                        }
+                        else
+                        {
+                            // A different plain copy survives; the bytes don't move,
+                            // but this deleted plain may have been a .fileref's
+                            // ContentPath target. Repoint hints to the survivor.
+                            await UpdateFileRefContentPathsAsync(
+                                backupSetId, fileRecord.Hash,
+                                survivingPlain!.DiscPath, targetDirectory, ct);
+                        }
+                    }
+
                     if (File.Exists(prevPath))
                     {
                         File.Delete(prevPath);
                     }
-
-                    // Note: _filestore/{hash}.dat entries are NOT deleted here
-                    // because other .fileref files may still reference them.
-                    // A separate maintenance/GC task could clean up unreferenced
-                    // entries by cross-checking against all non-deleted IsFileRef
-                    // records in the catalog.
 
                     // Mark as deleted in catalog.
                     fileRecord.IsDeleted = true;
@@ -1033,6 +1507,134 @@ public class DirectoryBackupService
         }
     }
 
+    /// <summary>
+    /// Async file copy that computes the content's SHA-256 in the SAME streaming
+    /// pass, returning the lowercase-hex hash and the exact number of bytes
+    /// copied. Used for files proven to be plain (non-deduplicated, non-duplicate)
+    /// content so the source is read only once for both hashing and copying,
+    /// instead of once to hash and again to copy. Same atomic temp-file + move
+    /// semantics as <see cref="CopyFileAsync"/>.
+    /// </summary>
+    private static async Task<(string Hash, long Size)> CopyFileWithHashAsync(
+        string sourcePath, string destPath, CancellationToken ct,
+        Action<long>? onProgress = null,
+        ManualResetEventSlim? pauseEvent = null)
+    {
+        string? destDir = Path.GetDirectoryName(destPath);
+        if (destDir is not null)
+            Directory.CreateDirectory(destDir);
+
+        string tempPath = destPath + ".lbtmp";
+
+        try
+        {
+            using var hasher = IncrementalHash.CreateHash(HashAlgorithmName.SHA256);
+            long totalCopied = 0;
+
+            await using (var srcStream = new FileStream(
+                sourcePath, FileMode.Open, FileAccess.Read,
+                FileShare.Read, bufferSize: 81920, useAsync: true))
+            await using (var dstStream = new FileStream(
+                tempPath, FileMode.Create, FileAccess.Write,
+                FileShare.None, bufferSize: 81920, useAsync: true))
+            {
+                var buffer = new byte[81920];
+                int read;
+                while ((read = await srcStream.ReadAsync(buffer, ct)) > 0)
+                {
+                    pauseEvent?.Wait(ct);
+                    await dstStream.WriteAsync(buffer.AsMemory(0, read), ct);
+                    hasher.AppendData(buffer, 0, read);
+                    totalCopied += read;
+                    onProgress?.Invoke(totalCopied);
+                }
+            }
+
+            // Atomic promotion of the fully-written temp file.
+            File.Move(tempPath, destPath, overwrite: true);
+
+            string hash = Convert.ToHexString(hasher.GetHashAndReset()).ToLowerInvariant();
+            return (hash, totalCopied);
+        }
+        catch
+        {
+            try { if (File.Exists(tempPath)) File.Delete(tempPath); }
+            catch { /* best effort — nothing more we can do here */ }
+            throw;
+        }
+    }
+
+    /// <summary>
+    /// Write a plain copy from bytes already held in memory — used when the file
+    /// was read into a buffer earlier (dedup analysis or a file-level dedup hash
+    /// check) so it is not read from disk a second time to be copied. Same atomic
+    /// temp-file + move semantics as <see cref="CopyFileAsync"/>. The content is
+    /// written in chunks so per-file progress and pause still work.
+    /// </summary>
+    private static async Task WritePlainFromBufferAsync(
+        byte[] content, string destPath, CancellationToken ct,
+        Action<long>? onProgress = null,
+        ManualResetEventSlim? pauseEvent = null)
+    {
+        string? destDir = Path.GetDirectoryName(destPath);
+        if (destDir is not null)
+            Directory.CreateDirectory(destDir);
+
+        string tempPath = destPath + ".lbtmp";
+
+        try
+        {
+            await using (var dstStream = new FileStream(
+                tempPath, FileMode.Create, FileAccess.Write,
+                FileShare.None, bufferSize: 81920, useAsync: true))
+            {
+                const int chunk = 81920;
+                int offset = 0;
+                while (offset < content.Length)
+                {
+                    pauseEvent?.Wait(ct);
+                    int len = Math.Min(chunk, content.Length - offset);
+                    await dstStream.WriteAsync(content.AsMemory(offset, len), ct);
+                    offset += len;
+                    onProgress?.Invoke(offset);
+                }
+            }
+
+            // Atomic promotion of the fully-written temp file.
+            File.Move(tempPath, destPath, overwrite: true);
+        }
+        catch
+        {
+            try { if (File.Exists(tempPath)) File.Delete(tempPath); }
+            catch { /* best effort — nothing more we can do here */ }
+            throw;
+        }
+    }
+
+    /// <summary>Lowercase-hex SHA-256 of an in-memory buffer.</summary>
+    private static string ComputeHashOfBuffer(byte[] content)
+        => Convert.ToHexString(SHA256.HashData(content)).ToLowerInvariant();
+
+    /// <summary>
+    /// TESTING ONLY — write a tiny placeholder file (hash + logical size) in
+    /// place of a real plain copy. Used when <see cref="StubPlainContentForTesting"/>
+    /// is on so dedup test runs don't fill the destination drive. The resulting
+    /// file is NOT restorable.
+    /// </summary>
+    private static async Task WritePlainTestStubAsync(
+        string destPath, string hash, long size, CancellationToken ct)
+    {
+        string? destDir = Path.GetDirectoryName(destPath);
+        if (destDir is not null)
+            Directory.CreateDirectory(destDir);
+
+        await File.WriteAllTextAsync(
+            destPath,
+            $"[LithicBackup TEST STUB \u2014 not real content, not restorable]\n" +
+            $"sha256: {hash}\nsize: {size}\n",
+            ct);
+    }
+
     // -------------------------------------------------------------------
     // Block I/O
     // -------------------------------------------------------------------
@@ -1070,6 +1672,40 @@ public class DirectoryBackupService
                     await dst.WriteAsync(buffer.AsMemory(0, bytesRead), ct);
                 }
             }
+        }
+    }
+
+    /// <summary>
+    /// Write new blocks (those not already in the store) from bytes already held
+    /// in memory — used when the file was read into a buffer by the dedup pre-pass
+    /// so it is not read from disk again to extract its blocks.
+    /// </summary>
+    private static async Task WriteNewBlocksFromBufferAsync(
+        byte[] content,
+        DeduplicationRecipe recipe,
+        int blockSize,
+        string blockStoreDir,
+        CancellationToken ct)
+    {
+        int offset = 0;
+        foreach (var block in recipe.Blocks)
+        {
+            int len = Math.Min(blockSize, content.Length - offset);
+            if (len <= 0) break;
+
+            if (!block.IsExisting)
+            {
+                string blockPath = Path.Combine(blockStoreDir, block.Hash + ".blk");
+                if (!File.Exists(blockPath))
+                {
+                    await using var dst = new FileStream(
+                        blockPath, FileMode.Create, FileAccess.Write,
+                        FileShare.None, bufferSize: 81920, useAsync: true);
+                    await dst.WriteAsync(content.AsMemory(offset, len), ct);
+                }
+            }
+
+            offset += len;
         }
     }
 
@@ -1162,14 +1798,153 @@ public class DirectoryBackupService
         return path + GetFormatSuffix(isDeduped, isFileRef);
     }
 
+    /// <summary>
+    /// Materialise a <c>.fileref</c> record into a real plain file using bytes
+    /// from <paramref name="sourceBytesPath"/> — an existing plain copy of the
+    /// same content that is about to be deleted by retention. Replaces the
+    /// reference's on-disk <c>.fileref</c> manifest with the actual content and
+    /// flips its catalog record to a plain copy at the new (suffix-less) path.
+    /// Returns <c>false</c> (leaving everything untouched) on any failure, so the
+    /// caller can keep the source bytes rather than orphan the reference.
+    /// </summary>
+    private async Task<bool> TryPromoteFileRefToPlainAsync(
+        string targetDirectory, string sourceBytesPath, FileRecord fileRef, CancellationToken ct)
+    {
+        try
+        {
+            string refAbsPath = Path.Combine(targetDirectory, fileRef.DiscPath);
+            string plainDiscPath = StripFileRefSuffix(fileRef.DiscPath);
+            string plainAbsPath = Path.Combine(targetDirectory, plainDiscPath);
+
+            string? dir = Path.GetDirectoryName(plainAbsPath);
+            if (dir is not null)
+                Directory.CreateDirectory(dir);
+
+            // Write the real bytes into the reference's location (suffix-less).
+            File.Copy(sourceBytesPath, plainAbsPath, overwrite: true);
+
+            // Remove the now-redundant .fileref manifest (it differs from the
+            // plain path only by the ".fileref" suffix).
+            if (!string.Equals(refAbsPath, plainAbsPath, StringComparison.OrdinalIgnoreCase)
+                && File.Exists(refAbsPath))
+            {
+                File.Delete(refAbsPath);
+            }
+
+            // Flip the catalog record to a plain copy at its new path.
+            fileRef.IsFileRef = false;
+            fileRef.DiscPath = plainDiscPath;
+            await _catalog.UpdateFileRecordAsync(fileRef, ct);
+            return true;
+        }
+        catch
+        {
+            return false;
+        }
+    }
+
+    private static string StripFileRefSuffix(string discPath)
+        => discPath.EndsWith(".fileref", StringComparison.OrdinalIgnoreCase)
+            ? discPath[..^".fileref".Length]
+            : discPath;
+
+    /// <summary>
+    /// Resolve a content hash to the absolute path of an active plain copy of
+    /// that content somewhere in the backup tree, or <c>null</c> if none exists.
+    /// This is how a <c>.fileref</c> (which stores no bytes) is turned back into
+    /// real content for verification and restore.
+    /// </summary>
+    private async Task<string?> ResolvePlainContentPathAsync(
+        int backupSetId, string hash, string targetDirectory, CancellationToken ct)
+    {
+        if (string.IsNullOrEmpty(hash))
+            return null;
+        var candidates = await _catalog.GetActiveRecordsByHashAsync(backupSetId, hash, ct);
+        var plain = candidates.FirstOrDefault(r => !r.IsFileRef && !r.IsDeduped);
+        return plain is null ? null : Path.Combine(targetDirectory, plain.DiscPath);
+    }
+
+    /// <summary>
+    /// Repoint the <see cref="FileRefManifest.ContentPath"/> hint of every active
+    /// <c>.fileref</c> sharing <paramref name="hash"/> to
+    /// <paramref name="newContentDiscPath"/> — the destination-relative location
+    /// where the plain copy of that content now lives (after an eviction to
+    /// <c>_prev</c>, a retention promotion, or a deletion that leaves a different
+    /// plain copy surviving). This rewrites only the on-disk JSON manifests; the
+    /// catalog is unchanged because Lithic resolves references by
+    /// <see cref="FileRefManifest.Hash"/>, not by ContentPath. The hint exists
+    /// solely for catalog-free restore, so all I/O here is best-effort: a failure
+    /// to rewrite a manifest leaves a stale hint that catalog-free restore
+    /// recovers from via its hash-verify + scan fallback.
+    /// </summary>
+    private async Task UpdateFileRefContentPathsAsync(
+        int backupSetId, string hash, string newContentDiscPath,
+        string targetDirectory, CancellationToken ct)
+    {
+        if (string.IsNullOrEmpty(hash))
+            return;
+
+        IReadOnlyList<FileRecord> refs;
+        try
+        {
+            refs = await _catalog.GetActiveRecordsByHashAsync(backupSetId, hash, ct);
+        }
+        catch
+        {
+            return;
+        }
+
+        foreach (var r in refs)
+        {
+            if (!r.IsFileRef)
+                continue;
+
+            string refAbs = Path.Combine(targetDirectory, r.DiscPath);
+            if (!File.Exists(refAbs))
+                continue;
+
+            try
+            {
+                string json = await File.ReadAllTextAsync(refAbs, ct);
+                var m = JsonSerializer.Deserialize<FileRefManifest>(json, _jsonOptions);
+                if (m is null)
+                    continue;
+
+                // Don't repoint a reference at itself.
+                if (string.Equals(m.ContentPath, newContentDiscPath, StringComparison.OrdinalIgnoreCase))
+                    continue;
+
+                m.ContentPath = newContentDiscPath;
+                await File.WriteAllTextAsync(
+                    refAbs, JsonSerializer.Serialize(m, _jsonOptions), ct);
+            }
+            catch
+            {
+                // Best-effort hint upkeep — ignore and move on.
+            }
+        }
+    }
+
     private static async Task<string> ComputeFileHashAsync(string filePath, CancellationToken ct)
+        => (await ComputeFileHashAndSizeAsync(filePath, ct)).Hash;
+
+    /// <summary>
+    /// Hash a file and report the number of bytes actually read. The returned
+    /// size is authoritative for the hashed content: it is captured from the
+    /// same read that produced the hash, so it cannot drift from the stored
+    /// bytes the way a separately-scanned size can when the file is edited
+    /// between the directory scan and this read.
+    /// </summary>
+    private static async Task<(string Hash, long Size)> ComputeFileHashAndSizeAsync(
+        string filePath, CancellationToken ct)
     {
         await using var stream = new FileStream(
             filePath, FileMode.Open, FileAccess.Read, FileShare.Read,
             bufferSize: 81920, useAsync: true);
 
         var hash = await SHA256.HashDataAsync(stream, ct);
-        return Convert.ToHexString(hash).ToLowerInvariant();
+        // Position after HashDataAsync == total bytes consumed == content length.
+        return (Convert.ToHexString(hash).ToLowerInvariant(), stream.Position);
     }
 
     /// <summary>
@@ -1389,12 +2164,20 @@ public class DirectoryBackupService
             {
                 ct.ThrowIfCancellationRequested();
 
-                // Skip .dedup and .fileref manifests — those are LithicBackup internal files.
-                // Skip .lbtmp — a partial copy left behind by an interrupted
-                // backup (CopyFileAsync writes there before the atomic rename).
-                if (file.Name.EndsWith(".dedup", StringComparison.OrdinalIgnoreCase) ||
-                    file.Name.EndsWith(".fileref", StringComparison.OrdinalIgnoreCase) ||
-                    file.Name.EndsWith(".lbtmp", StringComparison.OrdinalIgnoreCase))
+                // Classify the stored file by its LithicBackup suffix:
+                //   .fileref — a file-level duplicate (no bytes of its own; its
+                //              content lives as a plain copy elsewhere). Import
+                //              it as an IsFileRef record so dedup'd source files
+                //              are represented in the catalog.
+                //   .dedup   — a block-deduplicated file (manifest + _blocks).
+                //              Import as an IsDeduped record.
+                //   .lbtmp   — a partial copy left behind by an interrupted
+                //              backup (CopyFileAsync writes there before the
+                //              atomic rename); ignore it entirely.
+                // Anything else is a plain named copy holding its own bytes.
+                bool isFileRefFile = file.Name.EndsWith(".fileref", StringComparison.OrdinalIgnoreCase);
+                bool isDedupFile = file.Name.EndsWith(".dedup", StringComparison.OrdinalIgnoreCase);
+                if (file.Name.EndsWith(".lbtmp", StringComparison.OrdinalIgnoreCase))
                     continue;
 
                 // Skip files under any "_prev" segment — these are
@@ -1407,7 +2190,58 @@ public class DirectoryBackupService
                         .Any(seg => seg.Equals("_prev", StringComparison.OrdinalIgnoreCase)))
                     continue;
 
-                string fullSourcePath = System.IO.Path.Combine(driveRoot, relativeToDrive);
+                // For stored-content manifests (.fileref / .dedup) the real
+                // file metadata — original size, content hash, and (for new-
+                // format filerefs) the original source path — comes from the
+                // manifest, NOT from the tiny JSON file on disk. Using the
+                // manifest's OriginalSize is essential: seeding the manifest
+                // file's own length would make every duplicate look "changed"
+                // to the next incremental backup (size mismatch) and force a
+                // needless re-copy.
+                long recordSize = file.Length;
+                string? manifestHash = null;
+                string? manifestSourcePath = null;
+                if (isFileRefFile || isDedupFile)
+                {
+                    try
+                    {
+                        string manifestJson = await File.ReadAllTextAsync(file.FullName, ct);
+                        if (isFileRefFile)
+                        {
+                            var m = JsonSerializer.Deserialize<FileRefManifest>(manifestJson, _jsonOptions);
+                            if (m is null) continue;
+                            recordSize = m.OriginalSize;
+                            manifestHash = m.Hash ?? "";
+                            manifestSourcePath = string.IsNullOrEmpty(m.SourcePath) ? null : m.SourcePath;
+                        }
+                        else
+                        {
+                            var m = JsonSerializer.Deserialize<DedupManifest>(manifestJson, _jsonOptions);
+                            if (m is null) continue;
+                            recordSize = m.OriginalSize;
+                            manifestHash = m.OriginalHash ?? "";
+                        }
+                    }
+                    catch
+                    {
+                        // Unreadable / malformed manifest — skip it.
+                        continue;
+                    }
+                }
+
+                // Reconstruct the original source path. New-format filerefs
+                // carry it explicitly; otherwise rebuild it from the drive
+                // prefix plus the relative path with any storage suffix removed.
+                string logicalRelative = relativeToDrive;
+                if (isFileRefFile)
+                    logicalRelative = relativeToDrive[..^".fileref".Length];
+                else if (isDedupFile)
+                    logicalRelative = relativeToDrive[..^".dedup".Length];
+
+                string fullSourcePath = manifestSourcePath
+                    ?? System.IO.Path.Combine(driveRoot, logicalRelative);
+                // DiscPath is the path of the stored file itself, INCLUDING the
+                // .fileref / .dedup suffix, so restore/verify can locate it.
                 string discPath = System.IO.Path.Combine(dirName, relativeToDrive);
 
                 // Idempotent skip: this source path is already in the catalog
@@ -1421,7 +2255,13 @@ public class DirectoryBackupService
                 }
 
                 string hash;
-                if (skipHashing)
+                if (manifestHash is not null)
+                {
+                    // Stored-content manifest: the content hash is recorded in
+                    // the manifest — no need to (and we must not) hash the JSON.
+                    hash = manifestHash;
+                }
+                else if (skipHashing)
                 {
                     // Use empty hash — incremental detection relies on
                     // size + last-write-time, not content hash.
@@ -1460,19 +2300,19 @@ public class DirectoryBackupService
                     DiscId = discRecord.Id,
                     SourcePath = fullSourcePath,
                     DiscPath = discPath,
-                    SizeBytes = file.Length,
+                    SizeBytes = recordSize,
                     Hash = hash,
                     IsZipped = false,
                     IsSplit = false,
-                    IsDeduped = false,
-                    IsFileRef = false,
+                    IsDeduped = isDedupFile,
+                    IsFileRef = isFileRefFile,
                     Version = 1,
                     SourceLastWriteUtc = file.LastWriteTimeUtc,
                     BackedUpUtc = DateTime.UtcNow,
                 }, ct);
 
                 importedCount++;
-                totalBytes += file.Length;
+                totalBytes += recordSize;
 
                 // Throttle progress reports to avoid flooding the UI thread.
                 long nowPost = progressSw.ElapsedMilliseconds;

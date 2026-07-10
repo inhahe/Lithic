@@ -18,7 +18,6 @@ public class BackupOrchestrator : IBackupOrchestrator
     private readonly IZipHandler _zipHandler;
     private readonly IFileSplitter _fileSplitter;
     private readonly IDiscSessionStrategy _sessionStrategy;
-    private readonly IDeduplicationEngine? _deduplicationEngine;
     private readonly IFileSystemMonitor? _fileSystemMonitor;
 
     public BackupOrchestrator(
@@ -29,7 +28,6 @@ public class BackupOrchestrator : IBackupOrchestrator
         IZipHandler zipHandler,
         IFileSplitter fileSplitter,
         IDiscSessionStrategy sessionStrategy,
-        IDeduplicationEngine? deduplicationEngine = null,
         IFileSystemMonitor? fileSystemMonitor = null)
     {
         _catalog = catalog;
@@ -39,7 +37,6 @@ public class BackupOrchestrator : IBackupOrchestrator
         _zipHandler = zipHandler;
         _fileSplitter = fileSplitter;
         _sessionStrategy = sessionStrategy;
-        _deduplicationEngine = deduplicationEngine;
         _fileSystemMonitor = fileSystemMonitor;
     }
 
@@ -161,6 +158,10 @@ public class BackupOrchestrator : IBackupOrchestrator
         // Tracks a "skip all" decision: SkipAllForDisc resets per-disc,
         // SkipAllPermanently persists for the entire run.
         BurnFailureAction? permanentSkip = null;
+
+        // Error categories the user chose to "skip all of this type" for.
+        // Persists for the entire run (across discs), like permanentSkip.
+        var skippedCategories = new HashSet<BackupErrorCategory>();
 
         var filesystemType = plan.Job.FilesystemType;
 
@@ -304,34 +305,15 @@ public class BackupOrchestrator : IBackupOrchestrator
                     // that happen DURING the copy below.
                     coordinator?.RegisterStagedFile(file.FullPath);
 
-                    // --- Deduplication ---
-                    if (plan.Job.EnableDeduplication && _deduplicationEngine is not null)
-                    {
-                        try
-                        {
-                            var recipe = await _deduplicationEngine.DeduplicateAsync(
-                                file.FullPath, plan.Job.DeduplicationBlockSize, ct);
-
-                            if (recipe.BytesSaved > 0)
-                            {
-                                progress?.Report(new BackupProgress
-                                {
-                                    CurrentDisc = discSequence,
-                                    TotalDiscs = plan.TotalDiscsRequired,
-                                    CurrentFile = $"Deduplicated {file.FullPath} (saved {recipe.BytesSaved} bytes)",
-                                    BytesWrittenTotal = totalBytesWritten,
-                                    BytesTotalAll = plan.TotalBytes,
-                                    OverallPercentage = plan.TotalBytes > 0
-                                        ? (double)totalBytesWritten / plan.TotalBytes * 100
-                                        : 0,
-                                });
-                            }
-                        }
-                        catch
-                        {
-                            // Deduplication failure is non-fatal; proceed with normal staging.
-                        }
-                    }
+                    // NOTE: Block-level deduplication is intentionally not applied
+                    // to optical/disc backups. Block dedup relies on a persistent
+                    // content-addressed _blocks store on the destination that later
+                    // runs deduplicate against; optical media is write-once with no
+                    // such shared store, so there is nothing to dedup against. (The
+                    // previous code here computed a recipe and discarded it apart
+                    // from a progress message, storing no blocks — dead work.)
+                    // Block dedup is a directory-backup feature; see
+                    // DirectoryBackupService.
 
                     // --- File splitting ---
                     // If a file is larger than the total disc capacity, always split.
@@ -447,6 +429,7 @@ public class BackupOrchestrator : IBackupOrchestrator
                         {
                             // Determine what action to take.
                             BurnFailureAction action;
+                            var category = BackupErrorClassifier.Classify(ex);
 
                             if (permanentSkip.HasValue)
                             {
@@ -456,9 +439,15 @@ public class BackupOrchestrator : IBackupOrchestrator
                             {
                                 action = discSkip.Value;
                             }
+                            else if (skippedCategories.Contains(category))
+                            {
+                                // User chose "skip all of this type" for this
+                                // error category earlier in the run.
+                                action = BurnFailureAction.Skip;
+                            }
                             else if (onFailure is not null)
                             {
-                                var decision = await onFailure(file.FullPath, ex.Message);
+                                var decision = await onFailure(file.FullPath, ex.Message, category);
                                 action = decision.Action;
                             }
                             else
@@ -475,6 +464,12 @@ public class BackupOrchestrator : IBackupOrchestrator
                                     break;
                                 case BurnFailureAction.SkipAllPermanently:
                                     permanentSkip = action;
+                                    break;
+                                case BurnFailureAction.SkipAllOfThisType:
+                                    // Remember this category and skip this file;
+                                    // future failures of the same kind auto-skip.
+                                    skippedCategories.Add(category);
+                                    action = BurnFailureAction.Skip;
                                     break;
                             }
 
@@ -516,13 +511,16 @@ public class BackupOrchestrator : IBackupOrchestrator
                                         // Zip also failed — ask user what to do.
                                         // Only offer Skip / Skip All / Abort (zip
                                         // already failed so Zip/Retry won't help).
+                                        var zipCategory = BackupErrorClassifier.Classify(zipEx);
                                         if (onFailure is not null
                                             && !permanentSkip.HasValue
-                                            && discSkip is not BurnFailureAction.SkipAllForDisc)
+                                            && discSkip is not BurnFailureAction.SkipAllForDisc
+                                            && !skippedCategories.Contains(zipCategory))
                                         {
                                             var zipDecision = await onFailure(
                                                 file.FullPath,
-                                                $"Zip also failed: {zipEx.Message}");
+                                                $"Zip also failed: {zipEx.Message}",
+                                                zipCategory);
 
                                             switch (zipDecision.Action)
                                             {
@@ -531,6 +529,9 @@ public class BackupOrchestrator : IBackupOrchestrator
                                                     goto default;
                                                 case BurnFailureAction.SkipAllPermanently:
                                                     permanentSkip = BurnFailureAction.SkipAllPermanently;
+                                                    goto default;
+                                                case BurnFailureAction.SkipAllOfThisType:
+                                                    skippedCategories.Add(zipCategory);
                                                     goto default;
                                                 case BurnFailureAction.Abort:
                                                     failedFiles.Add(new FailedFile
@@ -640,7 +641,7 @@ public class BackupOrchestrator : IBackupOrchestrator
                 if (plan.Job.IncludeCatalogOnDisc && discIndex == plan.DiscAllocations.Count - 1)
                 {
                     string catalogDest = Path.Combine(stagingDir, "LithicBackup-Catalog.db");
-                    await _catalog.ExportDatabaseAsync(catalogDest, ct);
+                    await _catalog.ExportDatabaseAsync(backupSetId, catalogDest, ct);
                 }
 
                 // Burn.
@@ -675,7 +676,7 @@ public class BackupOrchestrator : IBackupOrchestrator
                 await _burner.BurnAsync(recorderId, stagingDir, burnOptions, burnProgress, ct);
 
                 // Record this disc and its files in the catalog.
-                using var tx = await _catalog.BeginTransactionAsync(ct);
+                using var tx = await _catalog.BeginTransactionAsync(backupSetId, ct);
 
                 // If erasing and rewriting, update the existing disc record.
                 DiscRecord discRecord;
@@ -719,7 +720,7 @@ public class BackupOrchestrator : IBackupOrchestrator
                     // Update the lookup so subsequent files in this same run get
                     // the correct version (shouldn't happen, but be safe).
                     versionInfo[staged.Source.FullPath] = new FileVersionInfo(
-                        version, staged.Source.SizeBytes, staged.Source.LastWriteUtc, false, false);
+                        version, staged.Source.SizeBytes, staged.Source.LastWriteUtc, false, false, hash);
 
                     var fileRecord = await _catalog.CreateFileRecordAsync(new FileRecord
                     {
@@ -915,7 +916,7 @@ public class BackupOrchestrator : IBackupOrchestrator
                 await _burner.BurnAsync(recorderId, stagingDir, burnOptions, burnProgress, ct);
 
                 // Record the new disc and files in the catalog.
-                using var tx = await _catalog.BeginTransactionAsync(ct);
+                using var tx = await _catalog.BeginTransactionAsync(backupSetId, ct);
 
                 var newDisc = await _catalog.CreateDiscAsync(new DiscRecord
                 {
@@ -1032,7 +1033,7 @@ public class BackupOrchestrator : IBackupOrchestrator
             await _burner.BurnAsync(recorderId, stagingDir, burnOptions, progress: null, ct);
 
             // 5. Update the catalog: create new disc, new file records.
-            using var tx = await _catalog.BeginTransactionAsync(ct);
+            using var tx = await _catalog.BeginTransactionAsync(badDisc.BackupSetId, ct);
 
             var newDisc = await _catalog.CreateDiscAsync(new DiscRecord
             {

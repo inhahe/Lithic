@@ -21,6 +21,7 @@ project.lock.json
 # Logs / temp
 stdout.txt
 stderr.txt
+orchestrator2.log
 
 # Tool metadata
 .orchestrator_history

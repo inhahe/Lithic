@@ -66,6 +66,8 @@ public class SourceSelectionViewModel : ViewModelBase
     private string _sizeCalculationResult = "";
     private bool _isSeeding;
     private string _seedResult = "";
+    private bool _isClearingHistory;
+    private string _clearHistoryResult = "";
     private bool _seedSkipHashing = true;
     private CancellationTokenSource? _seedCts;
     private bool _needsSave = true;
@@ -96,6 +98,9 @@ public class SourceSelectionViewModel : ViewModelBase
 
     /// <summary>Fired when the user clicks "Seed from Existing Backup".</summary>
     public event Func<Task>? SeedFromExistingRequested;
+
+    /// <summary>Fired when the user clicks "Clear Backup History".</summary>
+    public event Func<Task>? ClearHistoryRequested;
 
     /// <summary>
     /// Pre-computed drive data from a background thread.
@@ -158,6 +163,9 @@ public class SourceSelectionViewModel : ViewModelBase
         SeedFromExistingCommand = new RelayCommand(
             _ => _ = OnSeedFromExisting(),
             _ => !IsSeeding && IsEditMode && IsDirectoryMode && !string.IsNullOrWhiteSpace(TargetDirectory));
+        ClearHistoryCommand = new RelayCommand(
+            _ => OnClearHistory(),
+            _ => IsEditMode && !_isClearingHistory);
         CancelSeedCommand = new RelayCommand(
             _ => _seedCts?.Cancel(),
             _ => IsSeeding && _seedCts is not null && !_seedCts.IsCancellationRequested);
@@ -787,6 +795,13 @@ public class SourceSelectionViewModel : ViewModelBase
         set => SetProperty(ref _seedResult, value);
     }
 
+    /// <summary>Result of the most recent clear-history operation.</summary>
+    public string ClearHistoryResult
+    {
+        get => _clearHistoryResult;
+        set => SetProperty(ref _clearHistoryResult, value);
+    }
+
     /// <summary>
     /// When true, the seed operation skips SHA-256 hashing and records only
     /// file size + last-write-time.  Much faster — hashing is not needed for
@@ -840,6 +855,7 @@ public class SourceSelectionViewModel : ViewModelBase
     public ICommand CalculateSizeCommand { get; }
     public ICommand SeedFromExistingCommand { get; }
     public ICommand CancelSeedCommand { get; }
+    public ICommand ClearHistoryCommand { get; }
     public ICommand SortByNameCommand { get; }
     public ICommand SortBySizeCommand { get; }
     public ICommand BrowseDirectoryCommand { get; }
@@ -1213,6 +1229,24 @@ public class SourceSelectionViewModel : ViewModelBase
         var selections = GetSelections();
         if (selections.Count > 0)
             NextRequested?.Invoke(selections);
+    }
+
+    private async void OnClearHistory()
+    {
+        if (ClearHistoryRequested is null)
+            return;
+
+        _isClearingHistory = true;
+        CommandManager.InvalidateRequerySuggested();
+        try
+        {
+            await ClearHistoryRequested.Invoke();
+        }
+        finally
+        {
+            _isClearingHistory = false;
+            CommandManager.InvalidateRequerySuggested();
+        }
     }
 
     private async void OnSave()

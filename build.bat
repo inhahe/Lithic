@@ -16,6 +16,50 @@ if %errorlevel% neq 0 (
 echo.
 echo Build succeeded.
 echo.
-echo Executable:
+
+REM --- Build the background Worker service ---
+REM The service locks its DLLs while running, so stop it first (if running),
+REM build, then restart it. Stopping/starting needs admin; if it's not
+REM running or not installed, we just build.
+
+set "WORKER_WAS_RUNNING="
+sc query LithicBackup 2>nul | find "RUNNING" >nul
+if %errorlevel% equ 0 (
+    set "WORKER_WAS_RUNNING=1"
+    echo Stopping LithicBackup Worker service...
+    net stop LithicBackup
+    if errorlevel 1 (
+        echo.
+        echo Could not stop the service ^(run this script as Administrator^).
+        echo The Worker build may fail because its files are locked.
+        echo.
+    )
+)
+
+echo Building LithicBackup Worker...
+echo.
+
+dotnet build src\LithicBackup.Worker\LithicBackup.Worker.csproj -c Release
+
+set "WORKER_BUILD_RESULT=%errorlevel%"
+
+if defined WORKER_WAS_RUNNING (
+    echo.
+    echo Restarting LithicBackup Worker service...
+    net start LithicBackup
+)
+
+if %WORKER_BUILD_RESULT% neq 0 (
+    echo.
+    echo WORKER BUILD FAILED.
+    pause
+    exit /b %WORKER_BUILD_RESULT%
+)
+
+echo.
+echo Build succeeded.
+echo.
+echo Executables:
 echo   %~dp0src\LithicBackup\bin\Release\net8.0-windows\LithicBackup.exe
+echo   %~dp0src\LithicBackup.Worker\bin\Release\net8.0-windows\LithicBackup.Worker.exe
 echo.

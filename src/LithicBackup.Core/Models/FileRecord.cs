@@ -41,8 +41,9 @@ public class FileRecord
 
     /// <summary>
     /// Whether this file is stored as a file-level dedup reference (.fileref manifest).
-    /// The actual contents live in _filestore/{hash}.dat; the .fileref file is a small
-    /// JSON pointer. Tracked in the database because a source file could legitimately
+    /// The .fileref file holds no content; the actual bytes live as a plain copy of the
+    /// same content elsewhere in the backup tree, located by <see cref="Hash"/> via the
+    /// catalog. Tracked in the database because a source file could legitimately
     /// end in .fileref.
     /// </summary>
     public bool IsFileRef { get; set; }

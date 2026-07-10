@@ -48,6 +48,17 @@ public class SourceSelectionNodeViewModel : ViewModelBase
     /// an empty subtree and permanently destroy the saved selections.
     /// </summary>
     private Core.Models.SourceSelection? _restoredModel;
+    /// <summary>
+    /// Saved child selections whose paths were NOT present on disk when this
+    /// directory's children were enumerated (e.g. a selected subfolder was
+    /// renamed, moved, or temporarily disconnected).  Without preserving them,
+    /// <see cref="ToModel"/> would re-derive the subtree from only the live
+    /// children and silently, permanently drop the missing selection — so a
+    /// folder that is later restored under its original name would no longer be
+    /// backed up.  These are re-emitted verbatim by <see cref="ToModel"/> so the
+    /// selection survives until the user explicitly changes it.
+    /// </summary>
+    private List<Core.Models.SourceSelection>? _orphanedChildModels;
     private long _size = -1;
     private int _fileCount = -1;
     /// <summary>
@@ -538,7 +549,18 @@ public class SourceSelectionNodeViewModel : ViewModelBase
                 var childNode = Children.FirstOrDefault(c =>
                     string.Equals(c.Path, childModel.Path, StringComparison.OrdinalIgnoreCase));
                 if (childNode is not null)
+                {
                     tasks.Add(childNode.ApplySelectionAsync(childModel));
+                }
+                else if (childModel.IsSelected != false)
+                {
+                    // The saved selection referenced a child that is no longer
+                    // on disk (renamed/moved/disconnected).  Preserve it so a
+                    // later save (ToModel) doesn't silently drop the selection;
+                    // if the path comes back under its original name it will be
+                    // backed up again.
+                    (_orphanedChildModels ??= []).Add(childModel);
+                }
             }
             await Task.WhenAll(tasks);
         }
@@ -1482,6 +1504,18 @@ public class SourceSelectionNodeViewModel : ViewModelBase
                 var childModel = child.ToModel();
                 if (childModel is not null)
                     model.Children.Add(childModel);
+            }
+
+            // Re-emit saved selections whose paths weren't on disk this session
+            // (see _orphanedChildModels) so they survive a re-save untouched.
+            if (_orphanedChildModels is not null)
+            {
+                foreach (var orphan in _orphanedChildModels)
+                {
+                    if (!model.Children.Any(c =>
+                            string.Equals(c.Path, orphan.Path, StringComparison.OrdinalIgnoreCase)))
+                        model.Children.Add(orphan);
+                }
             }
         }
 

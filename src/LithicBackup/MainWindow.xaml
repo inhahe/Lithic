@@ -19,6 +19,8 @@
               Foreground="{StaticResource TextPrimaryBrush}"
               Padding="4,2">
             <MenuItem Header="_File">
+                <MenuItem Header="_Settings…" Click="Settings_Click" />
+                <Separator />
                 <MenuItem Header="E_xit" Click="Exit_Click"
                           InputGestureText="Alt+F4" />
             </MenuItem>
@@ -31,7 +33,6 @@
             <Grid.RowDefinitions>
                 <RowDefinition Height="Auto" />
                 <RowDefinition Height="*" />
-                <RowDefinition Height="Auto" />
                 <RowDefinition Height="Auto" />
             </Grid.RowDefinitions>
 
@@ -56,6 +57,9 @@
                         <DataTemplate DataType="{x:Type vm:RestoreViewModel}">
                             <views:RestoreView />
                         </DataTemplate>
+                        <DataTemplate DataType="{x:Type vm:CatalogFreeRestoreViewModel}">
+                            <views:CatalogFreeRestoreView />
+                        </DataTemplate>
                         <DataTemplate DataType="{x:Type vm:OrphanedDirectoriesViewModel}">
                             <views:OrphanedDirectoriesView />
                         </DataTemplate>
@@ -64,6 +68,9 @@
                         </DataTemplate>
                         <DataTemplate DataType="{x:Type vm:BackupCoverageViewModel}">
                             <views:BackupCoverageView />
+                        </DataTemplate>
+                        <DataTemplate DataType="{x:Type vm:VerifyIntegrityViewModel}">
+                            <views:VerifyIntegrityView />
                         </DataTemplate>
                         <DataTemplate DataType="{x:Type vm:LargestFilesViewModel}">
                             <views:LargestFilesView />
@@ -85,23 +92,12 @@
                                                                 Margin="0,0,0,12">
                                                         <Button Command="{Binding DataContext.NewBackupSetCommand,
                                                                           RelativeSource={RelativeSource AncestorType=Window}}"
-                                                                Padding="12,6" Margin="0,0,8,0"
-                                                                ToolTipService.ShowOnDisabled="True"
-                                                                ToolTipService.InitialShowDelay="0">
+                                                                Style="{StaticResource PrimaryButton}"
+                                                                Padding="12,6" Margin="0,0,8,0">
                                                             <StackPanel Orientation="Horizontal">
                                                                 <TextBlock Text="+" FontWeight="Bold" Margin="0,0,4,0" />
                                                                 <TextBlock Text="New Backup Set" />
                                                             </StackPanel>
-                                                            <Button.Style>
-                                                                <Style TargetType="Button" BasedOn="{StaticResource PrimaryButton}">
-                                                                    <Style.Triggers>
-                                                                        <Trigger Property="IsEnabled" Value="False">
-                                                                            <Setter Property="ToolTip"
-                                                                                    Value="A backup is currently in progress." />
-                                                                        </Trigger>
-                                                                    </Style.Triggers>
-                                                                </Style>
-                                                            </Button.Style>
                                                         </Button>
                                                         <Button Command="{Binding DataContext.FindFileCommand,
                                                                           RelativeSource={RelativeSource AncestorType=Window}}"
@@ -113,9 +109,18 @@
                                                         </Button>
                                                         <Button Command="{Binding DataContext.ImportBackupSetCommand,
                                                                           RelativeSource={RelativeSource AncestorType=Window}}"
-                                                                Padding="12,6" Cursor="Hand">
+                                                                Padding="12,6" Margin="0,0,8,0" Cursor="Hand">
                                                             <StackPanel Orientation="Horizontal">
                                                                 <TextBlock Text="Import" />
+                                                            </StackPanel>
+                                                        </Button>
+                                                        <Button Command="{Binding DataContext.CatalogFreeRestoreCommand,
+                                                                          RelativeSource={RelativeSource AncestorType=Window}}"
+                                                                Padding="12,6" Cursor="Hand"
+                                                                ToolTip="Rebuild files directly from a backup folder when the catalog is lost">
+                                                            <StackPanel Orientation="Horizontal">
+                                                                <TextBlock Text="&#x1F198;" Margin="0,0,4,0" />
+                                                                <TextBlock Text="Restore Without Catalog" />
                                                             </StackPanel>
                                                         </Button>
                                                     </StackPanel>
@@ -158,6 +163,9 @@
                                                                                     <MenuItem Header="Backup Coverage"
                                                                                               Command="{Binding PlacementTarget.Tag.SetCoverageCommand, RelativeSource={RelativeSource AncestorType=ContextMenu}}"
                                                                                               CommandParameter="{Binding}" />
+                                                                                    <MenuItem Header="Verify Integrity"
+                                                                                              Command="{Binding PlacementTarget.Tag.SetVerifyIntegrityCommand, RelativeSource={RelativeSource AncestorType=ContextMenu}}"
+                                                                                              CommandParameter="{Binding}" />
                                                                                     <MenuItem Header="Largest Files"
                                                                                               Command="{Binding PlacementTarget.Tag.SetLargestFilesCommand, RelativeSource={RelativeSource AncestorType=ContextMenu}}"
                                                                                               CommandParameter="{Binding}" />
@@ -190,96 +198,196 @@
                                                                                                FontWeight="SemiBold" FontSize="14" />
 
                                                                                     <!-- Idle status line (hidden when this set is running) -->
-                                                                                    <TextBlock FontSize="11"
-                                                                                               Foreground="{StaticResource TextDimBrush}">
-                                                                                        <TextBlock.Visibility>
-                                                                                            <MultiBinding Converter="{StaticResource IntEqualsVis}"
-                                                                                                          ConverterParameter="Invert">
-                                                                                                <Binding Path="Id" />
-                                                                                                <Binding Path="DataContext.RunningBackupSetId"
-                                                                                                         RelativeSource="{RelativeSource AncestorType=Window}" />
-                                                                                            </MultiBinding>
-                                                                                        </TextBlock.Visibility>
-                                                                                        <Run Text="{Binding SourceRoots.Count, Mode=OneWay, StringFormat='{}{0} source(s)'}" />
-                                                                                        <Run Text="  ·  " />
-                                                                                        <Run Text="{Binding LastBackupUtc, Mode=OneWay,
-                                                                                                    StringFormat='Last: {0:MMM d, yyyy}',
-                                                                                                    TargetNullValue='Never backed up'}" />
-                                                                                    </TextBlock>
+                                                                                    <StackPanel Visibility="{Binding IsRunning, Converter={StaticResource BoolToVis}, ConverterParameter=Invert}">
+                                                                                        <TextBlock FontSize="11"
+                                                                                                   Foreground="{StaticResource TextDimBrush}">
+                                                                                            <Run Text="{Binding SourceRoots.Count, Mode=OneWay, StringFormat='{}{0} source(s)'}" />
+                                                                                            <Run Text="  ·  " />
+                                                                                            <Run Text="{Binding LastBackupUtc, Mode=OneWay,
+                                                                                                        StringFormat='Last: {0:MMM d, yyyy}',
+                                                                                                        TargetNullValue='Never backed up'}" />
+                                                                                        </TextBlock>
 
-                                                                                    <!-- Running status (visible only for the running set) -->
-                                                                                    <StackPanel>
-                                                                                        <StackPanel.Visibility>
-                                                                                            <MultiBinding Converter="{StaticResource IntEqualsVis}">
-                                                                                                <Binding Path="Id" />
-                                                                                                <Binding Path="DataContext.RunningBackupSetId"
-                                                                                                         RelativeSource="{RelativeSource AncestorType=Window}" />
-                                                                                            </MultiBinding>
-                                                                                        </StackPanel.Visibility>
+                                                                                        <!-- Most-recent run result (persists on the row until the next run) -->
+                                                                                        <TextBlock FontSize="11"
+                                                                                                   Margin="0,2,0,0"
+                                                                                                   TextWrapping="Wrap"
+                                                                                                   Text="{Binding LastResultText}"
+                                                                                                   Visibility="{Binding HasLastResult, Converter={StaticResource BoolToVis}}">
+                                                                                            <TextBlock.Style>
+                                                                                                <Style TargetType="TextBlock">
+                                                                                                    <Setter Property="Foreground" Value="{StaticResource TextSecondaryBrush}" />
+                                                                                                    <Style.Triggers>
+                                                                                                        <DataTrigger Binding="{Binding LastResultIsError}" Value="True">
+                                                                                                            <Setter Property="Foreground" Value="{StaticResource ErrorBrush}" />
+                                                                                                        </DataTrigger>
+                                                                                                    </Style.Triggers>
+                                                                                                </Style>
+                                                                                            </TextBlock.Style>
+                                                                                        </TextBlock>
+                                                                                    </StackPanel>
 
-                                                                                        <!-- Scanning phase (no ActiveBackupProgress yet) -->
-                                                                                        <TextBlock Text="{Binding DataContext.StatusText,
-                                                                                                         RelativeSource={RelativeSource AncestorType=Window}}"
+                                                                                    <!-- Running status (visible only while this set is running) -->
+                                                                                    <StackPanel Visibility="{Binding IsRunning, Converter={StaticResource BoolToVis}}">
+
+                                                                                        <!-- Scanning phase (no Progress panel yet) -->
+                                                                                        <TextBlock Text="{Binding RunningStatusText}"
                                                                                                    FontSize="11"
                                                                                                    Foreground="{StaticResource TextSecondaryBrush}"
                                                                                                    Margin="0,2,0,0"
-                                                                                                   Visibility="{Binding DataContext.HasActiveBackupProgress,
-                                                                                                                RelativeSource={RelativeSource AncestorType=Window},
+                                                                                                   Visibility="{Binding HasProgress,
                                                                                                                 Converter={StaticResource BoolToVis},
                                                                                                                 ConverterParameter=Invert}" />
 
-                                                                                        <!-- Burn/copy phase (ActiveBackupProgress available) -->
-                                                                                        <StackPanel Visibility="{Binding DataContext.HasActiveBackupProgress,
-                                                                                                                 RelativeSource={RelativeSource AncestorType=Window},
-                                                                                                                 Converter={StaticResource BoolToVis}}">
+                                                                                        <!-- Burn/copy phase (Progress panel available) -->
+                                                                                        <StackPanel Visibility="{Binding HasProgress, Converter={StaticResource BoolToVis}}"
+                                                                                                    DataContext="{Binding Progress}">
                                                                                             <!-- Status text -->
-                                                                                            <TextBlock Text="{Binding DataContext.ActiveBackupProgress.StatusText,
-                                                                                                             RelativeSource={RelativeSource AncestorType=Window}}"
+                                                                                            <TextBlock Text="{Binding StatusText}"
                                                                                                        FontSize="11"
                                                                                                        Foreground="{StaticResource TextSecondaryBrush}"
                                                                                                        Margin="0,2,0,0" />
-                                                                                            <!-- Progress bar -->
-                                                                                            <Grid Margin="0,3,0,0" HorizontalAlignment="Left" Width="300">
-                                                                                                <ProgressBar Minimum="0" Maximum="100"
-                                                                                                             Value="{Binding DataContext.ActiveBackupProgress.OverallPercentage,
-                                                                                                                     RelativeSource={RelativeSource AncestorType=Window},
-                                                                                                                     Mode=OneWay}"
-                                                                                                             Height="14"
-                                                                                                             Foreground="{StaticResource AccentBrush}" />
-                                                                                                <TextBlock HorizontalAlignment="Center"
-                                                                                                           VerticalAlignment="Center"
-                                                                                                           FontSize="9">
-                                                                                                    <TextBlock.Text>
-                                                                                                        <Binding Path="DataContext.ActiveBackupProgress.OverallPercentage"
-                                                                                                                 RelativeSource="{RelativeSource AncestorType=Window}"
-                                                                                                                 StringFormat="{}{0:F1}%" />
-                                                                                                    </TextBlock.Text>
+
+                                                                                            <!-- Live progress (hidden once burn/copy finishes) -->
+                                                                                            <StackPanel Visibility="{Binding IsBurning, Converter={StaticResource BoolToVis}}">
+                                                                                                <!-- Disc progress (disc burns only) -->
+                                                                                                <DockPanel Margin="0,3,0,0" HorizontalAlignment="Left" Width="300"
+                                                                                                           Visibility="{Binding IsDirectoryMode, Converter={StaticResource BoolToVis}, ConverterParameter=Invert}">
+                                                                                                    <TextBlock DockPanel.Dock="Left"
+                                                                                                               VerticalAlignment="Center" Margin="0,0,8,0"
+                                                                                                               Foreground="{StaticResource TextSecondaryBrush}" FontSize="10">
+                                                                                                        <TextBlock.Text>
+                                                                                                            <MultiBinding StringFormat="Disc {0} of {1}">
+                                                                                                                <Binding Path="CurrentDisc" />
+                                                                                                                <Binding Path="TotalDiscs" />
+                                                                                                            </MultiBinding>
+                                                                                                        </TextBlock.Text>
+                                                                                                    </TextBlock>
+                                                                                                    <ProgressBar Minimum="0" Maximum="100"
+                                                                                                                 Value="{Binding DiscPercentage, Mode=OneWay}"
+                                                                                                                 Height="12"
+                                                                                                                 Foreground="{StaticResource PrimaryBrush}" />
+                                                                                                </DockPanel>
+
+                                                                                                <!-- Overall progress bar -->
+                                                                                                <Grid Margin="0,3,0,0" HorizontalAlignment="Left" Width="300">
+                                                                                                    <ProgressBar Minimum="0" Maximum="100"
+                                                                                                                 Value="{Binding OverallPercentage, Mode=OneWay}"
+                                                                                                                 Height="14"
+                                                                                                                 Foreground="{StaticResource AccentBrush}" />
+                                                                                                    <TextBlock HorizontalAlignment="Center"
+                                                                                                               VerticalAlignment="Center"
+                                                                                                               FontSize="9">
+                                                                                                        <TextBlock.Text>
+                                                                                                            <Binding Path="OverallPercentage"
+                                                                                                                     StringFormat="{}{0:F1}%" />
+                                                                                                        </TextBlock.Text>
+                                                                                                    </TextBlock>
+                                                                                                </Grid>
+                                                                                                <!-- Current file + stats -->
+                                                                                                <TextBlock Foreground="{StaticResource TextDimBrush}"
+                                                                                                           FontSize="10" Margin="0,2,0,0"
+                                                                                                           TextTrimming="CharacterEllipsis">
+                                                                                                    <Run Text="{Binding CurrentFile, Mode=OneWay}" />
                                                                                                 </TextBlock>
-                                                                                            </Grid>
-                                                                                            <!-- Current file + stats -->
-                                                                                            <TextBlock Foreground="{StaticResource TextDimBrush}"
-                                                                                                       FontSize="10" Margin="0,2,0,0"
-                                                                                                       TextTrimming="CharacterEllipsis">
-                                                                                                <Run Text="{Binding DataContext.ActiveBackupProgress.CurrentFile,
-                                                                                                            RelativeSource={RelativeSource AncestorType=Window},
-                                                                                                            Mode=OneWay}" />
-                                                                                            </TextBlock>
-                                                                                            <TextBlock Foreground="{StaticResource TextDimBrush}"
-                                                                                                       FontSize="10" Margin="0,1,0,0">
-                                                                                                <Run Text="{Binding DataContext.ActiveBackupProgress.BytesWrittenText,
-                                                                                                            RelativeSource={RelativeSource AncestorType=Window},
-                                                                                                            Mode=OneWay}" />
-                                                                                                <Run Text="  ·  " />
-                                                                                                <Run Text="{Binding DataContext.ActiveBackupProgress.ElapsedText,
-                                                                                                            RelativeSource={RelativeSource AncestorType=Window},
-                                                                                                            Mode=OneWay}" />
-                                                                                                <Run Text=" elapsed" />
-                                                                                                <Run Text="  ·  ~" />
-                                                                                                <Run Text="{Binding DataContext.ActiveBackupProgress.RemainingText,
-                                                                                                            RelativeSource={RelativeSource AncestorType=Window},
-                                                                                                            Mode=OneWay}" />
-                                                                                                <Run Text=" remaining" />
-                                                                                            </TextBlock>
+                                                                                                <TextBlock Foreground="{StaticResource TextDimBrush}"
+                                                                                                           FontSize="10" Margin="0,1,0,0">
+                                                                                                    <Run Text="{Binding BytesWrittenText, Mode=OneWay}" />
+                                                                                                    <Run Text="  ·  " />
+                                                                                                    <Run Text="{Binding ElapsedText, Mode=OneWay}" />
+                                                                                                    <Run Text=" elapsed" />
+                                                                                                    <Run Text="  ·  ~" />
+                                                                                                    <Run Text="{Binding RemainingText, Mode=OneWay}" />
+                                                                                                    <Run Text=" remaining" />
+                                                                                                </TextBlock>
+
+                                                                                                <!-- Simulated burner failure injection (test mode only) -->
+                                                                                                <Border Visibility="{Binding DataContext.IsTestMode,
+                                                                                                                     RelativeSource={RelativeSource AncestorType=Window},
+                                                                                                                     Converter={StaticResource BoolToVis}}"
+                                                                                                        BorderBrush="#FF886622" BorderThickness="1"
+                                                                                                        CornerRadius="4" Padding="8,5"
+                                                                                                        Margin="0,8,0,0"
+                                                                                                        HorizontalAlignment="Left"
+                                                                                                        Background="#18886622">
+                                                                                                    <StackPanel Orientation="Horizontal"
+                                                                                                                VerticalAlignment="Center">
+                                                                                                        <TextBlock Text="&#x26A0; Inject failure:"
+                                                                                                                   FontWeight="SemiBold" FontSize="11"
+                                                                                                                   Foreground="#FFCC8833"
+                                                                                                                   VerticalAlignment="Center"
+                                                                                                                   Margin="0,0,10,0" />
+                                                                                                        <Button Content="File Write Error"
+                                                                                                                Command="{Binding DataContext.SimFileFailureCommand,
+                                                                                                                          RelativeSource={RelativeSource AncestorType=Window}}"
+                                                                                                                Padding="8,3" Margin="0,0,6,0" FontSize="11"
+                                                                                                                Cursor="Hand" Focusable="False" />
+                                                                                                        <Button Content="Catastrophic Disc Failure"
+                                                                                                                Command="{Binding DataContext.SimCatastrophicFailureCommand,
+                                                                                                                          RelativeSource={RelativeSource AncestorType=Window}}"
+                                                                                                                Padding="8,3" Margin="0,0,6,0" FontSize="11"
+                                                                                                                Cursor="Hand" Focusable="False" />
+                                                                                                        <Button Content="Verify Fails"
+                                                                                                                Command="{Binding DataContext.SimVerifyFailureCommand,
+                                                                                                                          RelativeSource={RelativeSource AncestorType=Window}}"
+                                                                                                                Padding="8,3" FontSize="11"
+                                                                                                                Cursor="Hand" Focusable="False" />
+                                                                                                    </StackPanel>
+                                                                                                </Border>
+                                                                                            </StackPanel>
+
+                                                                                            <!-- Result detail (after completion) -->
+                                                                                            <TextBlock Text="{Binding ResultDetail}"
+                                                                                                       Foreground="{StaticResource TextSecondaryBrush}"
+                                                                                                       FontSize="11"
+                                                                                                       TextWrapping="Wrap"
+                                                                                                       Visibility="{Binding IsComplete, Converter={StaticResource BoolToVis}}"
+                                                                                                       Margin="0,4,0,0" />
+
+                                                                                            <!-- Failed files (after completion, if any) -->
+                                                                                            <Border Visibility="{Binding HasFailedFiles, Converter={StaticResource BoolToVis}}"
+                                                                                                    BorderBrush="{StaticResource BorderBrush}"
+                                                                                                    BorderThickness="1" CornerRadius="4"
+                                                                                                    HorizontalAlignment="Left" Width="300"
+                                                                                                    Margin="0,6,0,0" MaxHeight="120">
+                                                                                                <DockPanel>
+                                                                                                    <DockPanel DockPanel.Dock="Top" Margin="8,4,8,2">
+                                                                                                        <TextBlock FontWeight="SemiBold" FontSize="11"
+                                                                                                                   Foreground="{StaticResource TextPrimaryBrush}">
+                                                                                                            <Run Text="Failed/skipped: " />
+                                                                                                            <Run Text="{Binding FailedFiles.Count, Mode=OneWay}" />
+                                                                                                        </TextBlock>
+                                                                                                        <StackPanel Orientation="Horizontal" HorizontalAlignment="Right">
+                                                                                                            <Button Content="Copy" Command="{Binding CopyFailedFilesCommand}"
+                                                                                                                    Padding="6,2" Margin="0,0,4,0" Cursor="Hand" FontSize="10" />
+                                                                                                            <Button Content="Export..." Command="{Binding ExportFailedFilesCommand}"
+                                                                                                                    Padding="6,2" Cursor="Hand" FontSize="10" />
+                                                                                                        </StackPanel>
+                                                                                                    </DockPanel>
+                                                                                                    <ScrollViewer VerticalScrollBarVisibility="Auto"
+                                                                                                                  HorizontalScrollBarVisibility="Disabled">
+                                                                                                        <ItemsControl ItemsSource="{Binding FailedFiles}">
+                                                                                                            <ItemsControl.ItemTemplate>
+                                                                                                                <DataTemplate>
+                                                                                                                    <Border BorderBrush="{StaticResource BorderBrush}"
+                                                                                                                            BorderThickness="0,1,0,0" Padding="8,2">
+                                                                                                                        <DockPanel>
+                                                                                                                            <TextBlock DockPanel.Dock="Right"
+                                                                                                                                       Text="{Binding Error}"
+                                                                                                                                       Foreground="#FFCC4444"
+                                                                                                                                       FontSize="10" Margin="8,0,0,0" />
+                                                                                                                            <TextBlock Text="{Binding Path}"
+                                                                                                                                       FontSize="10"
+                                                                                                                                       TextTrimming="CharacterEllipsis"
+                                                                                                                                       ToolTip="{Binding Path}" />
+                                                                                                                        </DockPanel>
+                                                                                                                    </Border>
+                                                                                                                </DataTemplate>
+                                                                                                            </ItemsControl.ItemTemplate>
+                                                                                                        </ItemsControl>
+                                                                                                    </ScrollViewer>
+                                                                                                </DockPanel>
+                                                                                            </Border>
                                                                                         </StackPanel>
                                                                                     </StackPanel>
                                                                                 </StackPanel>
@@ -287,43 +395,23 @@
                                                                                 <!-- Right: Action links -->
                                                                                 <StackPanel Grid.Column="1" VerticalAlignment="Center">
                                                                                     <!-- Idle actions (hidden when this set is running) -->
-                                                                                    <WrapPanel>
-                                                                                        <WrapPanel.Visibility>
-                                                                                            <MultiBinding Converter="{StaticResource IntEqualsVis}"
-                                                                                                          ConverterParameter="Invert">
-                                                                                                <Binding Path="Id" />
-                                                                                                <Binding Path="DataContext.RunningBackupSetId"
-                                                                                                         RelativeSource="{RelativeSource AncestorType=Window}" />
-                                                                                            </MultiBinding>
-                                                                                        </WrapPanel.Visibility>
+                                                                                    <WrapPanel Visibility="{Binding IsRunning, Converter={StaticResource BoolToVis}, ConverterParameter=Invert}">
                                                                                         <!-- Check Size (hidden while this set is being checked) -->
                                                                                         <Button Style="{StaticResource LinkButton}"
                                                                                                 Command="{Binding DataContext.SetCheckCommand,
                                                                                                           RelativeSource={RelativeSource AncestorType=Window}}"
                                                                                                 CommandParameter="{Binding}"
-                                                                                                Margin="0,0,12,0">
-                                                                                            <Button.Visibility>
-                                                                                                <MultiBinding Converter="{StaticResource IntEqualsVis}"
-                                                                                                              ConverterParameter="Invert">
-                                                                                                    <Binding Path="Id" />
-                                                                                                    <Binding Path="DataContext.CheckingSizeSetId"
-                                                                                                             RelativeSource="{RelativeSource AncestorType=Window}" />
-                                                                                                </MultiBinding>
-                                                                                            </Button.Visibility>
+                                                                                                Margin="0,0,12,0"
+                                                                                                Visibility="{Binding IsChecking, Converter={StaticResource BoolToVis}, ConverterParameter=Invert}">
                                                                                             <TextBlock><Run Text="&#x2139;" FontSize="10" /> Check Size</TextBlock>
                                                                                         </Button>
                                                                                         <!-- Abort Check (shown only while this set is being checked) -->
                                                                                         <Button Style="{StaticResource LinkButton}"
                                                                                                 Command="{Binding DataContext.AbortCheckCommand,
                                                                                                           RelativeSource={RelativeSource AncestorType=Window}}"
-                                                                                                Margin="0,0,12,0">
-                                                                                            <Button.Visibility>
-                                                                                                <MultiBinding Converter="{StaticResource IntEqualsVis}">
-                                                                                                    <Binding Path="Id" />
-                                                                                                    <Binding Path="DataContext.CheckingSizeSetId"
-                                                                                                             RelativeSource="{RelativeSource AncestorType=Window}" />
-                                                                                                </MultiBinding>
-                                                                                            </Button.Visibility>
+                                                                                                CommandParameter="{Binding}"
+                                                                                                Margin="0,0,12,0"
+                                                                                                Visibility="{Binding IsChecking, Converter={StaticResource BoolToVis}}">
                                                                                             <TextBlock><Run Text="&#x2716;" FontSize="10" /> Abort Check</TextBlock>
                                                                                         </Button>
                                                                                         <Button Style="{StaticResource LinkButton}"
@@ -350,40 +438,62 @@
                                                                                         <Button Style="{StaticResource LinkButton}"
                                                                                                 Command="{Binding DataContext.SetOrphanedDirsCommand,
                                                                                                           RelativeSource={RelativeSource AncestorType=Window}}"
-                                                                                                CommandParameter="{Binding}">
+                                                                                                CommandParameter="{Binding}"
+                                                                                                Margin="0,0,12,0">
                                                                                             <TextBlock><Run Text="&#x267B;" FontSize="10" /> Cleanup</TextBlock>
+                                                                                        </Button>
+                                                                                        <Button Style="{StaticResource LinkButton}"
+                                                                                                Command="{Binding DataContext.SetVerifyIntegrityCommand,
+                                                                                                          RelativeSource={RelativeSource AncestorType=Window}}"
+                                                                                                CommandParameter="{Binding}">
+                                                                                            <TextBlock><Run Text="&#x2714;" FontSize="10" /> Verify</TextBlock>
                                                                                         </Button>
                                                                                     </WrapPanel>
 
-                                                                                    <!-- Running actions -->
-                                                                                    <WrapPanel>
-                                                                                        <WrapPanel.Visibility>
-                                                                                            <MultiBinding Converter="{StaticResource IntEqualsVis}">
-                                                                                                <Binding Path="Id" />
-                                                                                                <Binding Path="DataContext.RunningBackupSetId"
-                                                                                                         RelativeSource="{RelativeSource AncestorType=Window}" />
-                                                                                            </MultiBinding>
-                                                                                        </WrapPanel.Visibility>
-                                                                                        <Button Style="{StaticResource LinkButton}"
-                                                                                                Command="{Binding DataContext.ActiveBackupProgress.PauseResumeCommand,
-                                                                                                          RelativeSource={RelativeSource AncestorType=Window}}"
+                                                                                    <!-- Running actions (visible while this set is running) -->
+                                                                                    <WrapPanel Visibility="{Binding IsRunning, Converter={StaticResource BoolToVis}}">
+                                                                                        <!-- Pause/Resume (directory backups only, while burning) -->
+                                                                                        <Button Command="{Binding Progress.PauseResumeCommand}"
                                                                                                 Focusable="False"
                                                                                                 Margin="0,0,12,0">
+                                                                                            <Button.Style>
+                                                                                                <Style TargetType="Button" BasedOn="{StaticResource LinkButton}">
+                                                                                                    <Setter Property="Visibility" Value="Visible" />
+                                                                                                    <Style.Triggers>
+                                                                                                        <DataTrigger Binding="{Binding Progress.IsBurning, FallbackValue=False}" Value="False">
+                                                                                                            <Setter Property="Visibility" Value="Collapsed" />
+                                                                                                        </DataTrigger>
+                                                                                                        <DataTrigger Binding="{Binding Progress.IsDirectoryMode, FallbackValue=False}" Value="False">
+                                                                                                            <Setter Property="Visibility" Value="Collapsed" />
+                                                                                                        </DataTrigger>
+                                                                                                    </Style.Triggers>
+                                                                                                </Style>
+                                                                                            </Button.Style>
                                                                                             <TextBlock>
                                                                                                 <Run Text="&#x23F8;" FontSize="10" />
-                                                                                                <Run Text="{Binding DataContext.ActiveBackupProgress.PauseResumeLabel,
-                                                                                                            RelativeSource={RelativeSource AncestorType=Window},
+                                                                                                <Run Text="{Binding Progress.PauseResumeLabel,
                                                                                                             Mode=OneWay,
                                                                                                             FallbackValue=Pause}" />
                                                                                             </TextBlock>
                                                                                         </Button>
+                                                                                        <!-- Abort (while running, before completion) -->
                                                                                         <Button Style="{StaticResource LinkButton}"
                                                                                                 Command="{Binding DataContext.AbortBackupCommand,
                                                                                                           RelativeSource={RelativeSource AncestorType=Window}}"
+                                                                                                CommandParameter="{Binding}"
                                                                                                 Focusable="False"
                                                                                                 Margin="0,0,12,0"
-                                                                                                Foreground="{StaticResource ErrorBrush}">
+                                                                                                Foreground="{StaticResource ErrorBrush}"
+                                                                                                Visibility="{Binding Progress.IsComplete, Converter={StaticResource BoolToVis}, ConverterParameter=Invert, FallbackValue=Visible}">
                                                                                             <TextBlock><Run Text="&#x2715;" FontSize="10" /> Abort</TextBlock>
+                                                                                        </Button>
+                                                                                        <!-- Dismiss (after completion) -->
+                                                                                        <Button Style="{StaticResource LinkButton}"
+                                                                                                Command="{Binding Progress.DoneCommand}"
+                                                                                                Focusable="False"
+                                                                                                Margin="0,0,12,0"
+                                                                                                Visibility="{Binding Progress.IsComplete, Converter={StaticResource BoolToVis}, FallbackValue=Collapsed}">
+                                                                                            <TextBlock><Run Text="&#x2713;" FontSize="10" /> Dismiss</TextBlock>
                                                                                         </Button>
                                                                                     </WrapPanel>
                                                                                 </StackPanel>
@@ -461,6 +571,63 @@
                                                                                Text="The Worker Service runs automated backups in the background." />
                                                                 </StackPanel>
                                                             </Border>
+
+                                                            <!-- Simulated-burner pre-burn test controls (only in test mode) -->
+                                                            <Border BorderBrush="#FFCC8833"
+                                                                    BorderThickness="1" CornerRadius="4"
+                                                                    Padding="16,12" Margin="0,16,0,0"
+                                                                    MaxWidth="500"
+                                                                    Background="#18886622"
+                                                                    HorizontalAlignment="Center"
+                                                                    Visibility="{Binding DataContext.IsTestMode,
+                                                                                 RelativeSource={RelativeSource AncestorType=Window},
+                                                                                 Converter={StaticResource BoolToVis}}">
+                                                                <StackPanel>
+                                                                    <TextBlock Text="&#x26A0; Simulated burner — pre-burn failures"
+                                                                               FontWeight="SemiBold" FontSize="12"
+                                                                               Foreground="#FFCC8833"
+                                                                               HorizontalAlignment="Center"
+                                                                               Margin="0,0,0,8" />
+                                                                    <StackPanel Orientation="Horizontal"
+                                                                                HorizontalAlignment="Center">
+                                                                        <ToggleButton Content="No recorder"
+                                                                                      IsChecked="{Binding DataContext.SimNoRecorder,
+                                                                                                  RelativeSource={RelativeSource AncestorType=Window}}"
+                                                                                      Padding="10,4" Margin="0,0,6,0" Cursor="Hand" FontSize="11" />
+                                                                        <ToggleButton Content="No media"
+                                                                                      IsChecked="{Binding DataContext.SimNoMedia,
+                                                                                                  RelativeSource={RelativeSource AncestorType=Window}}"
+                                                                                      Padding="10,4" Margin="0,0,6,0" Cursor="Hand" FontSize="11" />
+                                                                        <ToggleButton Content="Erase fails"
+                                                                                      IsChecked="{Binding DataContext.SimEraseFail,
+                                                                                                  RelativeSource={RelativeSource AncestorType=Window}}"
+                                                                                      Padding="10,4" Cursor="Hand" FontSize="11" />
+                                                                    </StackPanel>
+                                                                    <TextBlock Foreground="{StaticResource TextSecondaryBrush}"
+                                                                               FontSize="11" TextWrapping="Wrap"
+                                                                               TextAlignment="Center"
+                                                                               Margin="0,8,0,0"
+                                                                               Text="Arm these before starting a burn to test failures that occur before writing begins. While-burning failures (file write, catastrophic, verify) appear during the burn." />
+
+                                                                    <Separator Margin="0,12,0,10" Background="#33CC8833" />
+
+                                                                    <TextBlock Text="Disc shelf storage"
+                                                                               FontWeight="SemiBold" FontSize="12"
+                                                                               Foreground="#FFCC8833"
+                                                                               HorizontalAlignment="Center"
+                                                                               Margin="0,0,0,8" />
+                                                                    <ToggleButton Content="Metadata only (no file content)"
+                                                                                  HorizontalAlignment="Center"
+                                                                                  IsChecked="{Binding DataContext.SimMetadataOnly,
+                                                                                              RelativeSource={RelativeSource AncestorType=Window}}"
+                                                                                  Padding="10,4" Cursor="Hand" FontSize="11" />
+                                                                    <TextBlock Foreground="{StaticResource TextSecondaryBrush}"
+                                                                               FontSize="11" TextWrapping="Wrap"
+                                                                               TextAlignment="Center"
+                                                                               Margin="0,8,0,0"
+                                                                               Text="Recreate the real directory tree and filenames on the shelf, but store a tiny hash+size stub in each file instead of the real bytes — keeps it tiny while mirroring the true structure. Restore and block-dedup round-trips need the actual content, so leave this off to test those." />
+                                                                </StackPanel>
+                                                            </Border>
                                                         </StackPanel>
                                                     </ScrollViewer>
                                                 </DockPanel>
@@ -474,192 +641,8 @@
                 </ContentControl>
             </Border>
 
-            <!-- Inline backup progress panel -->
-            <Border Grid.Row="2"
-                    Style="{StaticResource Card}" Padding="12"
-                    Margin="0,8,0,0"
-                    Visibility="{Binding HasActiveBackupProgress, Converter={StaticResource BoolToVis}}">
-                <StackPanel DataContext="{Binding ActiveBackupProgress}">
-                    <!-- Status text + action buttons -->
-                    <DockPanel Margin="0,0,0,6">
-                        <StackPanel DockPanel.Dock="Right" Orientation="Horizontal"
-                                    VerticalAlignment="Center">
-                            <!-- Pause/Resume (directory backups only, while running) -->
-                            <Button Content="{Binding PauseResumeLabel}"
-                                    Command="{Binding PauseResumeCommand}"
-                                    Padding="10,4" Margin="0,0,6,0" Cursor="Hand">
-                                <Button.Style>
-                                    <Style TargetType="Button">
-                                        <Setter Property="Visibility" Value="Visible" />
-                                        <Style.Triggers>
-                                            <DataTrigger Binding="{Binding IsBurning}" Value="False">
-                                                <Setter Property="Visibility" Value="Collapsed" />
-                                            </DataTrigger>
-                                            <DataTrigger Binding="{Binding IsDirectoryMode}" Value="False">
-                                                <Setter Property="Visibility" Value="Collapsed" />
-                                            </DataTrigger>
-                                        </Style.Triggers>
-                                    </Style>
-                                </Button.Style>
-                            </Button>
-                            <!-- Cancel (while running) -->
-                            <Button Content="Cancel"
-                                    Command="{Binding CancelCommand}"
-                                    Visibility="{Binding IsBurning, Converter={StaticResource BoolToVis}}"
-                                    Padding="10,4" Margin="0,0,6,0" Cursor="Hand" />
-                            <!-- Dismiss (after completion) -->
-                            <Button Style="{StaticResource PrimaryButton}"
-                                    Content="Dismiss"
-                                    Command="{Binding DoneCommand}"
-                                    Visibility="{Binding IsComplete, Converter={StaticResource BoolToVis}}"
-                                    Padding="10,4" Cursor="Hand" />
-                        </StackPanel>
-                        <TextBlock Text="{Binding StatusText}"
-                                   FontWeight="SemiBold" FontSize="13"
-                                   VerticalAlignment="Center" />
-                    </DockPanel>
-
-                    <!-- Live progress (hidden once burn/copy finishes) -->
-                    <StackPanel Visibility="{Binding IsBurning, Converter={StaticResource BoolToVis}}">
-                        <!-- Disc progress (disc burns only) -->
-                        <DockPanel Margin="0,0,0,4"
-                                   Visibility="{Binding IsDirectoryMode, Converter={StaticResource BoolToVis}, ConverterParameter=Invert}">
-                            <TextBlock DockPanel.Dock="Left"
-                                       VerticalAlignment="Center" Margin="0,0,8,0"
-                                       Foreground="{StaticResource TextSecondaryBrush}" FontSize="11">
-                                <TextBlock.Text>
-                                    <MultiBinding StringFormat="Disc {0} of {1}">
-                                        <Binding Path="CurrentDisc" />
-                                        <Binding Path="TotalDiscs" />
-                                    </MultiBinding>
-                                </TextBlock.Text>
-                            </TextBlock>
-                            <ProgressBar Minimum="0" Maximum="100"
-                                         Value="{Binding DiscPercentage, Mode=OneWay}"
-                                         Height="14"
-                                         Foreground="{StaticResource PrimaryBrush}" />
-                        </DockPanel>
-
-                        <!-- Overall progress bar -->
-                        <Grid Margin="0,0,0,6">
-                            <ProgressBar Minimum="0" Maximum="100"
-                                         Value="{Binding OverallPercentage, Mode=OneWay}"
-                                         Height="16"
-                                         Foreground="{StaticResource AccentBrush}" />
-                            <TextBlock HorizontalAlignment="Center" VerticalAlignment="Center"
-                                       FontSize="10">
-                                <TextBlock.Text>
-                                    <Binding Path="OverallPercentage" StringFormat="{}{0:F1}%" />
-                                </TextBlock.Text>
-                            </TextBlock>
-                        </Grid>
-
-                        <!-- Current file -->
-                        <TextBlock Text="{Binding CurrentFile}"
-                                   Foreground="{StaticResource TextSecondaryBrush}"
-                                   FontSize="11" TextTrimming="CharacterEllipsis" />
-
-                        <!-- Stats row -->
-                        <TextBlock Foreground="{StaticResource TextDimBrush}" FontSize="11"
-                                   Margin="0,2,0,0">
-                            <Run Text="{Binding BytesWrittenText, Mode=OneWay}" />
-                            <Run Text="  ·  " />
-                            <Run Text="{Binding ElapsedText, Mode=OneWay}" />
-                            <Run Text=" elapsed" />
-                            <Run Text="  ·  ~" />
-                            <Run Text="{Binding RemainingText, Mode=OneWay}" />
-                            <Run Text=" remaining" />
-                        </TextBlock>
-
-                        <!-- Simulated burner failure injection (simulate-burner flag only) -->
-                        <Border Visibility="{Binding DataContext.IsSimulatedBurner,
-                                             RelativeSource={RelativeSource AncestorType=Window},
-                                             Converter={StaticResource BoolToVis}}"
-                                BorderBrush="#FF886622" BorderThickness="1"
-                                CornerRadius="4" Padding="8,5"
-                                Margin="0,8,0,0"
-                                Background="#18886622">
-                            <StackPanel Orientation="Horizontal"
-                                        VerticalAlignment="Center">
-                                <TextBlock Text="&#x26A0; Inject failure:"
-                                           FontWeight="SemiBold" FontSize="11"
-                                           Foreground="#FFCC8833"
-                                           VerticalAlignment="Center"
-                                           Margin="0,0,10,0" />
-                                <Button Content="File Write Error"
-                                        Command="{Binding DataContext.SimFileFailureCommand,
-                                                  RelativeSource={RelativeSource AncestorType=Window}}"
-                                        Padding="8,3" Margin="0,0,6,0" FontSize="11"
-                                        Cursor="Hand" Focusable="False" />
-                                <Button Content="Catastrophic Disc Failure"
-                                        Command="{Binding DataContext.SimCatastrophicFailureCommand,
-                                                  RelativeSource={RelativeSource AncestorType=Window}}"
-                                        Padding="8,3" Margin="0,0,6,0" FontSize="11"
-                                        Cursor="Hand" Focusable="False" />
-                                <Button Content="Arm Erase Failure"
-                                        Command="{Binding DataContext.SimEraseFailureCommand,
-                                                  RelativeSource={RelativeSource AncestorType=Window}}"
-                                        Padding="8,3" FontSize="11"
-                                        Cursor="Hand" Focusable="False" />
-                            </StackPanel>
-                        </Border>
-                    </StackPanel>
-
-                    <!-- Result detail (after completion) -->
-                    <TextBlock Text="{Binding ResultDetail}"
-                               Foreground="{StaticResource TextSecondaryBrush}"
-                               TextWrapping="Wrap"
-                               Visibility="{Binding IsComplete, Converter={StaticResource BoolToVis}}"
-                               Margin="0,4,0,0" />
-
-                    <!-- Failed files (after completion, if any) -->
-                    <Border Visibility="{Binding HasFailedFiles, Converter={StaticResource BoolToVis}}"
-                            BorderBrush="{StaticResource BorderBrush}"
-                            BorderThickness="1" CornerRadius="4"
-                            Margin="0,6,0,0" MaxHeight="120">
-                        <DockPanel>
-                            <DockPanel DockPanel.Dock="Top" Margin="8,4,8,2">
-                                <TextBlock FontWeight="SemiBold" FontSize="11"
-                                           Foreground="{StaticResource TextPrimaryBrush}">
-                                    <Run Text="Failed/skipped: " />
-                                    <Run Text="{Binding FailedFiles.Count, Mode=OneWay}" />
-                                </TextBlock>
-                                <StackPanel Orientation="Horizontal" HorizontalAlignment="Right">
-                                    <Button Content="Copy" Command="{Binding CopyFailedFilesCommand}"
-                                            Padding="6,2" Margin="0,0,4,0" Cursor="Hand" FontSize="10" />
-                                    <Button Content="Export..." Command="{Binding ExportFailedFilesCommand}"
-                                            Padding="6,2" Cursor="Hand" FontSize="10" />
-                                </StackPanel>
-                            </DockPanel>
-                            <ScrollViewer VerticalScrollBarVisibility="Auto"
-                                          HorizontalScrollBarVisibility="Disabled">
-                                <ItemsControl ItemsSource="{Binding FailedFiles}">
-                                    <ItemsControl.ItemTemplate>
-                                        <DataTemplate>
-                                            <Border BorderBrush="{StaticResource BorderBrush}"
-                                                    BorderThickness="0,1,0,0" Padding="8,2">
-                                                <DockPanel>
-                                                    <TextBlock DockPanel.Dock="Right"
-                                                               Text="{Binding Error}"
-                                                               Foreground="#FFCC4444"
-                                                               FontSize="10" Margin="8,0,0,0" />
-                                                    <TextBlock Text="{Binding Path}"
-                                                               FontSize="10"
-                                                               TextTrimming="CharacterEllipsis"
-                                                               ToolTip="{Binding Path}" />
-                                                </DockPanel>
-                                            </Border>
-                                        </DataTemplate>
-                                    </ItemsControl.ItemTemplate>
-                                </ItemsControl>
-                            </ScrollViewer>
-                        </DockPanel>
-                    </Border>
-                </StackPanel>
-            </Border>
-
             <!-- Status bar -->
-            <Border Grid.Row="3"
+            <Border Grid.Row="2"
                     Background="{StaticResource SurfaceBrush}"
                     BorderBrush="{StaticResource BorderBrush}"
                     BorderThickness="1"

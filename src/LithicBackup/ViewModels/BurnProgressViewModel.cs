@@ -44,6 +44,13 @@ public class BurnProgressViewModel : ViewModelBase
     /// <summary>Fired when the user clicks "Done" after burn completes.</summary>
     public event Action? DoneRequested;
 
+    /// <summary>
+    /// Trigger the same finalization as the "Dismiss" button without a click —
+    /// used to auto-clear the completed panel after a clean backup so the result
+    /// drops straight onto the row's persistent line.
+    /// </summary>
+    public void RequestDone() => DoneRequested?.Invoke();
+
     public int CurrentDisc
     {
         get => _currentDisc;

@@ -23,8 +23,9 @@ public class BackupJob
     /// <summary>
     /// Whether to enable file-level deduplication. Whole-file matching by SHA-256 hash.
     /// Cheaper than block-level dedup and effective when many files are exact copies.
-    /// Identical files are stored once in _filestore/{hash}.dat and referenced via
-    /// .fileref manifests. Checked before block-level dedup when both are enabled.
+    /// Unique content is stored as a plain, normally-named file; a byte-identical
+    /// duplicate is written as a .fileref manifest that resolves to that plain copy
+    /// by hash via the catalog. Checked before block-level dedup when both are enabled.
     /// </summary>
     public bool EnableFileDeduplication { get; set; }
 
@@ -40,6 +41,15 @@ public class BackupJob
     /// earlier runs will not match blocks from new runs.
     /// </summary>
     public int DeduplicationBlockSize { get; set; } = 64 * 1024; // 64 KB default
+
+    /// <summary>
+    /// How much RAM a directory backup may use to buffer file contents in memory
+    /// (so each file is read from disk only once for both analysis and writing).
+    /// Null means use the built-in default policy. This is a machine/runtime
+    /// concern stamped onto the job from global user settings, not persisted
+    /// per-set.
+    /// </summary>
+    public MemoryBudgetOptions? MemoryBudget { get; set; }
 
     /// <summary>Whether to allow splitting large files across discs.</summary>
     public bool AllowFileSplitting { get; set; } = true;

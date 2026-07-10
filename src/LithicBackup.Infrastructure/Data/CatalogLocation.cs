@@ -59,6 +59,26 @@ public static class CatalogLocation
     }
 
     /// <summary>
+    /// Returns the shared directory for diagnostic logs and crash reports,
+    /// creating it (and widening its ACL) so both the interactive user (GUI) and
+    /// LocalSystem (service) can write to it. Lives alongside the catalog under
+    /// <c>C:\ProgramData\LithicBackup\logs</c> so a single location holds the
+    /// rolling diagnostic log and any crash dumps from either process.
+    /// </summary>
+    public static string LogsDirectory()
+    {
+        var logsDir = Path.Combine(
+            Environment.GetFolderPath(Environment.SpecialFolder.CommonApplicationData),
+            AppFolderName,
+            "logs");
+
+        Directory.CreateDirectory(logsDir);
+        TryGrantSharedAccess(logsDir);
+
+        return logsDir;
+    }
+
+    /// <summary>
     /// Grant the built-in Users group full control of the shared directory, with
     /// inheritance so the database file (and its <c>-wal</c>/<c>-shm</c> sidecars)
     /// are writable no matter which account created them. Without this, a file

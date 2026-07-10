@@ -91,6 +91,10 @@
                 </Button.Style>
             </Button>
 
+            <Button Content="{Binding SkipAllOfTypeLabel}" Click="OnSkipAllOfThisType"
+                    Padding="14,6" Margin="0,0,6,0" Cursor="Hand"
+                    ToolTip="Skip all remaining files that fail with this same kind of error, but keep prompting for other kinds" />
+
             <Button Content="Skip All" Click="OnSkipAllPermanently"
                     Padding="14,6" Margin="0,0,6,0" Cursor="Hand"
                     ToolTip="Skip all remaining failures" />

@@ -24,6 +24,7 @@ public sealed class BackupWorker : BackgroundService
     private readonly ILogger<BackupWorker> _logger;
     private readonly ICatalogRepository _catalog;
     private readonly DirectoryBackupService _directoryBackup;
+    private readonly IDestinationResolver _destinationResolver;
 
     /// <summary>How often we reload backup sets, check schedules, and read journals.</summary>
     private static readonly TimeSpan PollInterval = TimeSpan.FromSeconds(30);
@@ -51,11 +52,45 @@ public sealed class BackupWorker : BackgroundService
     public BackupWorker(
         ILogger<BackupWorker> logger,
         ICatalogRepository catalog,
-        DirectoryBackupService directoryBackup)
+        DirectoryBackupService directoryBackup,
+        IDestinationResolver destinationResolver)
     {
         _logger = logger;
         _catalog = catalog;
         _directoryBackup = directoryBackup;
+        _destinationResolver = destinationResolver;
+    }
+
+    /// <summary>
+    /// Resolve a set's destination to a live path, following any drive-letter
+    /// reassignment, backfilling/persisting the volume identity when it
+    /// changes, and logging a letter move.  Returns the live target directory,
+    /// or <c>null</c> when the destination volume is not currently connected
+    /// (the caller should skip the run).
+    /// </summary>
+    private async Task<string?> ResolveDestinationAsync(BackupSet set, JobOptions opts, CancellationToken ct)
+    {
+        var resolution = _destinationResolver.Resolve(opts);
+
+        if (resolution.MetadataChanged)
+            await _catalog.UpdateBackupSetAsync(set, ct);
+
+        if (!resolution.IsConnected)
+        {
+            _logger.LogWarning(
+                "Skipping backup for \"{Name}\": destination drive not connected ({Path}).",
+                set.Name, resolution.PreviousPath ?? "unknown path");
+            return null;
+        }
+
+        if (resolution.LetterChanged)
+        {
+            _logger.LogInformation(
+                "Destination drive for \"{Name}\" moved: {Old} -> {New}. Updated automatically.",
+                set.Name, resolution.PreviousPath, resolution.LivePath);
+        }
+
+        return resolution.LivePath;
     }
 
     // ------------------------------------------------------------------
@@ -399,7 +434,15 @@ public sealed class BackupWorker : BackgroundService
         {
             var set = state.BackupSet;
             var opts = set.JobOptions!;
-            var targetDir = opts.TargetDirectory!;
+            var targetDir = await ResolveDestinationAsync(set, opts, ct);
+            if (targetDir is null)
+            {
+                // Destination not connected — requeue these paths for next poll.
+                var requeueNow = DateTime.UtcNow;
+                foreach (var p in paths)
+                    state.Pending.TryAdd(p, (requeueNow, requeueNow));
+                return;
+            }
             var job = BuildJob(set, opts, targetDir);
 
             var retentionTiers = opts.RetentionTiers.Count > 0
@@ -456,7 +499,9 @@ public sealed class BackupWorker : BackgroundService
         {
             var set = state.BackupSet;
             var opts = set.JobOptions!;
-            var targetDir = opts.TargetDirectory!;
+            var targetDir = await ResolveDestinationAsync(set, opts, ct);
+            if (targetDir is null)
+                return; // Destination not connected; retry on the next scheduled run.
 
             _logger.LogInformation("Starting backup for \"{Name}\" → {Target}", set.Name, targetDir);
 
@@ -543,6 +588,9 @@ public sealed class BackupWorker : BackgroundService
             ExcludedExtensions = opts.ExcludedExtensions,
             RetentionTiers = opts.RetentionTiers,
             TierSets = opts.TierSets,
+            // Machine-global memory budget (shared with the interactive app via
+            // settings.json) so scheduled backups honor the same limit.
+            MemoryBudget = UserSettings.Load().MemoryBudget,
         };
     }
 

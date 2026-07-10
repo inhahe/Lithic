@@ -5,6 +5,7 @@ using LithicBackup.Core.Interfaces;
 using LithicBackup.Infrastructure.Burning;
 using LithicBackup.Infrastructure.Data;
 using LithicBackup.Infrastructure.Deduplication;
+using LithicBackup.Infrastructure.Diagnostics;
 using LithicBackup.Infrastructure.FileSystem;
 using LithicBackup.Services;
 using LithicBackup.ViewModels;
@@ -17,6 +18,7 @@ public partial class App : Application
     private SqliteCatalogRepository? _catalog;
     private TrayService? _trayService;
     private WinForms.NotifyIcon? _notifyIcon;
+    private WinForms.ToolStripMenuItem? _remindersItem;
     private UserSettings _settings = new();
 
     // --- Single-instance enforcement ---
@@ -38,6 +40,63 @@ public partial class App : Application
     {
         base.OnStartup(e);
 
+        // --- Crash diagnostics ---
+        // Install process-global exception capture as the very first thing, so
+        // even a failure during startup is recorded. Writes full stack traces +
+        // environment context to C:\ProgramData\LithicBackup\logs.
+        CrashLogger.Initialize("gui");
+        DispatcherUnhandledException += (_, args) =>
+        {
+            CrashLogger.LogFatal(args.Exception, "Dispatcher.UnhandledException");
+            try
+            {
+                MessageBox.Show(
+                    "LithicBackup hit an unexpected error and may be in an unstable state.\n\n" +
+                    "A crash report has been written to:\n" +
+                    CatalogLocation.LogsDirectory() + "\n\n" +
+                    args.Exception.Message,
+                    "LithicBackup \u2014 Unexpected Error",
+                    MessageBoxButton.OK,
+                    MessageBoxImage.Error);
+            }
+            catch
+            {
+                // Never let the error dialog throw.
+            }
+            // Leave args.Handled at its default (false): WPF's default policy
+            // still applies, but the crash is now durably recorded.
+        };
+
+        try
+        {
+            await StartupCoreAsync();
+        }
+        catch (Exception ex)
+        {
+            CrashLogger.LogFatal(ex, "OnStartup initialization failed");
+            try
+            {
+                MessageBox.Show(
+                    "LithicBackup failed to start.\n\n" +
+                    "A crash report has been written to:\n" +
+                    CatalogLocation.LogsDirectory() + "\n\n" +
+                    ex.Message,
+                    "LithicBackup \u2014 Startup Failed",
+                    MessageBoxButton.OK,
+                    MessageBoxImage.Error);
+            }
+            catch { }
+            Shutdown();
+        }
+    }
+
+    /// <summary>
+    /// Core startup logic (composition root + window creation), wrapped by
+    /// <see cref="OnStartup"/> in crash diagnostics so an initialization failure
+    /// is logged rather than silently terminating the process.
+    /// </summary>
+    private async Task StartupCoreAsync()
+    {
         // --- Single-instance enforcement ---
         // Only one LithicBackup UI may run per user session.  Acquire a named
         // mutex; if it's already held, we're a second launch — signal the
@@ -84,11 +143,20 @@ public partial class App : Application
         var catalogPath = CatalogLocation.Resolve();
         _catalog = new SqliteCatalogRepository(catalogPath);
 
-        // --simulate-burner: use a mock disc burner for testing without hardware.
+        // Volume-identity + destination resolution: lets backup sets follow
+        // their destination drive across Windows drive-letter reassignments.
+        IVolumeResolver volumeResolver = new Win32VolumeResolver();
+        IDestinationResolver destinationResolver = new DestinationResolver(volumeResolver);
+
+        // --test-mode: enable the testing features (simulated burner + the
+        // non-functional directory stub mode). The features are not engaged just
+        // by passing the flag — it reveals opt-in checkboxes in the UI. The
+        // burner is wrapped so that, even in test mode, real hardware is used
+        // until the user ticks "use simulated burner".
         var args = Environment.GetCommandLineArgs();
-        bool simulateBurner = args.Any(a => a.Equals("--simulate-burner", StringComparison.OrdinalIgnoreCase));
-        IDiscBurner burner = simulateBurner
-            ? new SimulatedDiscBurner()
+        bool testMode = args.Any(a => a.Equals("--test-mode", StringComparison.OrdinalIgnoreCase));
+        IDiscBurner burner = testMode
+            ? new SwitchableDiscBurner(new Imapi2DiscBurner(), new SimulatedDiscBurner())
             : new Imapi2DiscBurner();
         var scanner = new FileScanner(_catalog);
         var packer = new BinPacker();
@@ -96,8 +164,9 @@ public partial class App : Application
         var fileSplitter = new FileSplitter();
         var sessionStrategy = new DiscSessionStrategy(burner, _catalog);
 
-        // Block-level deduplication engine.
-        IDeduplicationEngine deduplicationEngine = new BlockDeduplicationEngine(_catalog);
+        // Block-level deduplication engine. Deduplicates directly against the
+        // destination's content-addressed _blocks store (no catalog index).
+        IDeduplicationEngine deduplicationEngine = new BlockDeduplicationEngine();
 
         // Filesystem monitor — shared between TrayService (background monitoring)
         // and BackupOrchestrator (live change detection during burns).
@@ -110,11 +179,14 @@ public partial class App : Application
         var orchestrator = new BackupOrchestrator(
             _catalog, burner, scanner, packer,
             zipHandler, fileSplitter, sessionStrategy,
-            deduplicationEngine,
             fileSystemMonitor: burnMonitor);
 
         // Restore service.
         var restoreService = new RestoreService(_catalog);
+
+        // Catalog-free (disaster-recovery) restore service — reconstructs files
+        // from a backup destination tree alone, no catalog required.
+        var catalogFreeRestoreService = new CatalogFreeRestoreService();
 
         // Tray/background monitoring service.
         _trayService = new TrayService(fileSystemMonitor, _catalog);
@@ -130,13 +202,17 @@ public partial class App : Application
         var directoryBackupService = new DirectoryBackupService(
             _catalog, scanner, retentionService, deduplicationEngine, fileHashCache);
 
+        // --- User settings (load before building the view model so the
+        // memory budget and other preferences flow into backup jobs) ---
+        _settings = UserSettings.Load();
+
         var mainViewModel = new MainViewModel(
-            _catalog, burner, scanner, orchestrator, restoreService, directoryBackupService, _trayService,
-            fileHashCache);
+            _catalog, burner, scanner, orchestrator, restoreService, catalogFreeRestoreService,
+            directoryBackupService, _trayService,
+            fileHashCache, destinationResolver, _settings);
         var mainWindow = new MainWindow { DataContext = mainViewModel };
 
-        // --- User settings & system tray icon ---
-        _settings = UserSettings.Load();
+        // --- System tray icon ---
         SetupNotifyIcon(mainWindow);
 
         // Wire up tray service to show balloon tips when changes accumulate.
@@ -191,6 +267,7 @@ public partial class App : Application
             _settings.Save();
         };
         contextMenu.Items.Add(remindersItem);
+        _remindersItem = remindersItem;
 
         contextMenu.Items.Add(new WinForms.ToolStripSeparator());
         contextMenu.Items.Add("Exit", null, (_, _) => ExitApplication());
@@ -217,6 +294,17 @@ public partial class App : Application
     {
         IsExiting = true;
         Shutdown();
+    }
+
+    /// <summary>
+    /// Open the application settings dialog (memory budget, reminders).
+    /// Keeps the tray reminders checkbox in sync with any change made here.
+    /// </summary>
+    internal void OpenSettings(Window owner)
+    {
+        var dialog = new Views.SettingsDialog(_settings) { Owner = owner };
+        if (dialog.ShowDialog() == true && _remindersItem is not null)
+            _remindersItem.Checked = !_settings.SuppressBackupSuggestions;
     }
 
     /// <summary>

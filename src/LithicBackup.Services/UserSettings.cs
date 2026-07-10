@@ -1,10 +1,12 @@
-using System.IO;
 using System.Text.Json;
+using LithicBackup.Core.Models;
 
-namespace LithicBackup;
+namespace LithicBackup.Services;
 
 /// <summary>
-/// Persistent user preferences stored as JSON in the app data directory.
+/// Persistent, machine-global user preferences stored as JSON in the app data
+/// directory. Shared by the interactive app and the headless Worker so settings
+/// like the memory budget apply to both manual and scheduled backups.
 /// </summary>
 public class UserSettings
 {
@@ -17,6 +19,12 @@ public class UserSettings
     /// a backup after file changes accumulate.
     /// </summary>
     public bool SuppressBackupSuggestions { get; set; }
+
+    /// <summary>
+    /// How much RAM directory backups may use to buffer file contents in memory
+    /// (read each file once instead of twice). Applies to all backups.
+    /// </summary>
+    public MemoryBudgetOptions MemoryBudget { get; set; } = new();
 
     public static UserSettings Load()
     {

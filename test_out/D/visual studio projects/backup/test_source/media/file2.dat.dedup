@@ -1,0 +1,12 @@
+{
+  "OriginalName": "file2.dat",
+  "OriginalSize": 262144,
+  "OriginalHash": "3c681b77f51877106e406e7f76ca850c7860bbcf8333711184942858f93c9906",
+  "BlockSize": 65536,
+  "BlockHashes": [
+    "a6547307e56b4cbcc65e0cf9864b913ef6b3563cc0f78a3e1056032fe1685ff1",
+    "61a8d96b43a86496b11c6fa0e9c30a3dc187d12c2c33fd64b6849c076e7474fa",
+    "4ede77a77ac11929933d59614dca26c0c42a460826d3bc009e5a50cd6de16c9b",
+    "c1a299cf1cabcb0e4029aa41576f6e9e66c7ec0d961314be1db0aecc3de0cdb8"
+  ]
+}

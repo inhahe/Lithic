@@ -254,6 +254,30 @@
                     </StackPanel>
                 </StackPanel>
 
+                <!-- Clear backup history (edit mode) -->
+                <StackPanel Orientation="Horizontal" Margin="0,0,0,8"
+                            Visibility="{Binding IsEditMode, Converter={StaticResource BoolToVis}}">
+                    <Button Content="Clear Backup History"
+                            Command="{Binding ClearHistoryCommand}"
+                            Padding="10,6" Margin="0,0,8,0" Cursor="Hand"
+                            ToolTip="Delete this set's catalog records of what has been backed up (discs and file entries), keeping all settings. The next backup treats every source file as new. Files already on the destination are not deleted." />
+                    <TextBlock Text="{Binding ClearHistoryResult}"
+                               Foreground="{StaticResource TextSecondaryBrush}"
+                               FontSize="11" VerticalAlignment="Center"
+                               TextWrapping="Wrap" TextTrimming="CharacterEllipsis">
+                        <TextBlock.Style>
+                            <Style TargetType="TextBlock">
+                                <Setter Property="Visibility" Value="Visible" />
+                                <Style.Triggers>
+                                    <DataTrigger Binding="{Binding ClearHistoryResult}" Value="">
+                                        <Setter Property="Visibility" Value="Collapsed" />
+                                    </DataTrigger>
+                                </Style.Triggers>
+                            </Style>
+                        </TextBlock.Style>
+                    </TextBlock>
+                </StackPanel>
+
                 <!-- ====== Disc-mode options ====== -->
                 <StackPanel Visibility="{Binding IsDirectoryMode, Converter={StaticResource BoolToVis}, ConverterParameter=Invert}">
                     <Grid Margin="0,0,0,6">

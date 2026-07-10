@@ -1638,7 +1638,7 @@ public class OrphanedDirectoriesViewModel : ViewModelBase
                 long lastProgressMs = -ProgressUpdateIntervalMs;
 
                 // -- 1. Catalog updates inside a single transaction. --
-                var tx = _catalog.BeginTransactionAsync().GetAwaiter().GetResult();
+                var tx = _catalog.BeginTransactionAsync(backupSetId).GetAwaiter().GetResult();
                 try
                 {
                     for (int i = 0; i < workItems.Count; i++)

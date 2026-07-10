@@ -23,6 +23,13 @@ public enum BurnFailureAction
     /// <summary>Skip all remaining failures permanently.</summary>
     SkipAllPermanently,
 
+    /// <summary>
+    /// Skip all remaining failures that share the same error category as the
+    /// current one (e.g. all "permission denied" or all "file locked"
+    /// failures), while still prompting for failures of other kinds.
+    /// </summary>
+    SkipAllOfThisType,
+
     /// <summary>Abort the entire backup operation.</summary>
     Abort,
 }

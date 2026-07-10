@@ -10,10 +10,18 @@ public interface IRestoreService
     /// <summary>List all files in a backup set with their disc locations.</summary>
     Task<IReadOnlyList<RestorableFile>> GetRestorableFilesAsync(int backupSetId, CancellationToken ct = default);
 
-    /// <summary>Restore specific files. User must insert the required discs.</summary>
+    /// <summary>
+    /// Restore specific files, routing each to a destination chosen per source
+    /// drive. <paramref name="driveDestinations"/> maps an uppercase drive
+    /// letter (e.g. <c>"D"</c>) to the directory under which that drive's files
+    /// are recreated, preserving their path below the drive root. For example,
+    /// mapping <c>"D"</c> to <c>E:\restored</c> restores <c>D:\docs\a.txt</c> to
+    /// <c>E:\restored\docs\a.txt</c>; mapping <c>"D"</c> to <c>D:\</c> restores
+    /// it to its original location. User must insert the required discs.
+    /// </summary>
     Task<RestoreResult> RestoreAsync(
         IReadOnlyList<RestorableFile> files,
-        string destinationDirectory,
+        IReadOnlyDictionary<string, string> driveDestinations,
         IProgress<RestoreProgress>? progress = null,
         CancellationToken ct = default);
 }
