@@ -233,23 +233,28 @@
                                                                                     <!-- Running status (visible only while this set is running) -->
                                                                                     <StackPanel Visibility="{Binding IsRunning, Converter={StaticResource BoolToVis}}">
 
-                                                                                        <!-- Scanning phase (no Progress panel yet) -->
+                                                                                        <!-- Scanning phase (no Progress panel yet). FallbackValue guards
+                                                                                             against the inverted binding resolving truthy against a null
+                                                                                             DataContext during list virtualization, which would leak the
+                                                                                             scan text into the burn phase as a stray blank/duplicate line. -->
                                                                                         <TextBlock Text="{Binding RunningStatusText}"
                                                                                                    FontSize="11"
                                                                                                    Foreground="{StaticResource TextSecondaryBrush}"
                                                                                                    Margin="0,2,0,0"
                                                                                                    Visibility="{Binding HasProgress,
                                                                                                                 Converter={StaticResource BoolToVis},
-                                                                                                                ConverterParameter=Invert}" />
+                                                                                                                ConverterParameter=Invert,
+                                                                                                                FallbackValue=Collapsed}" />
 
                                                                                         <!-- Burn/copy phase (Progress panel available) -->
                                                                                         <StackPanel Visibility="{Binding HasProgress, Converter={StaticResource BoolToVis}}"
                                                                                                     DataContext="{Binding Progress}">
-                                                                                            <!-- Status text -->
+                                                                                            <!-- Status text (collapsed when empty so it reserves no blank line) -->
                                                                                             <TextBlock Text="{Binding StatusText}"
                                                                                                        FontSize="11"
                                                                                                        Foreground="{StaticResource TextSecondaryBrush}"
-                                                                                                       Margin="0,2,0,0" />
+                                                                                                       Margin="0,2,0,0"
+                                                                                                       Visibility="{Binding StatusText, Converter={StaticResource NonEmptyVis}}" />
 
                                                                                             <!-- Live progress (hidden once burn/copy finishes) -->
                                                                                             <StackPanel Visibility="{Binding IsBurning, Converter={StaticResource BoolToVis}}">
@@ -273,7 +278,7 @@
                                                                                                 </DockPanel>
 
                                                                                                 <!-- Overall progress bar -->
-                                                                                                <Grid Margin="0,3,0,0" HorizontalAlignment="Left" Width="300">
+                                                                                                <Grid HorizontalAlignment="Left" Width="300">
                                                                                                     <ProgressBar Minimum="0" Maximum="100"
                                                                                                                  Value="{Binding OverallPercentage, Mode=OneWay}"
                                                                                                                  Height="14"
@@ -287,14 +292,16 @@
                                                                                                         </TextBlock.Text>
                                                                                                     </TextBlock>
                                                                                                 </Grid>
-                                                                                                <!-- Current file + stats -->
+                                                                                                <!-- Current file (collapsed when idle, e.g. during the scan) -->
                                                                                                 <TextBlock Foreground="{StaticResource TextDimBrush}"
-                                                                                                           FontSize="10" Margin="0,2,0,0"
-                                                                                                           TextTrimming="CharacterEllipsis">
-                                                                                                    <Run Text="{Binding CurrentFile, Mode=OneWay}" />
-                                                                                                </TextBlock>
+                                                                                                           FontSize="10" Margin="0,3,0,0"
+                                                                                                           TextTrimming="CharacterEllipsis"
+                                                                                                           Text="{Binding CurrentFile, Mode=OneWay}"
+                                                                                                           Visibility="{Binding CurrentFile, Converter={StaticResource NonEmptyVis}}" />
+                                                                                                <!-- Byte/time stats (collapsed until real copy figures arrive) -->
                                                                                                 <TextBlock Foreground="{StaticResource TextDimBrush}"
-                                                                                                           FontSize="10" Margin="0,1,0,0">
+                                                                                                           FontSize="10" Margin="0,3,0,0"
+                                                                                                           Visibility="{Binding BytesWrittenText, Converter={StaticResource NonEmptyVis}}">
                                                                                                     <Run Text="{Binding BytesWrittenText, Mode=OneWay}" />
                                                                                                     <Run Text="  ·  " />
                                                                                                     <Run Text="{Binding ElapsedText, Mode=OneWay}" />
