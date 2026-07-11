@@ -253,9 +253,9 @@
 
                                                                                             <!-- Live progress (hidden once burn/copy finishes) -->
                                                                                             <StackPanel Visibility="{Binding IsBurning, Converter={StaticResource BoolToVis}}">
-                                                                                                <!-- Disc progress (disc burns only) -->
+                                                                                                <!-- Disc progress (multi-disc optical burns only) -->
                                                                                                 <DockPanel Margin="0,3,0,0" HorizontalAlignment="Left" Width="300"
-                                                                                                           Visibility="{Binding IsDirectoryMode, Converter={StaticResource BoolToVis}, ConverterParameter=Invert}">
+                                                                                                           Visibility="{Binding ShowDiscProgress, Converter={StaticResource BoolToVis}, FallbackValue=Collapsed}">
                                                                                                     <TextBlock DockPanel.Dock="Left"
                                                                                                                VerticalAlignment="Center" Margin="0,0,8,0"
                                                                                                                Foreground="{StaticResource TextSecondaryBrush}" FontSize="10">
@@ -364,7 +364,10 @@
                                                                                                             <Button Content="Copy" Command="{Binding CopyFailedFilesCommand}"
                                                                                                                     Padding="6,2" Margin="0,0,4,0" Cursor="Hand" FontSize="10" />
                                                                                                             <Button Content="Export..." Command="{Binding ExportFailedFilesCommand}"
-                                                                                                                    Padding="6,2" Cursor="Hand" FontSize="10" />
+                                                                                                                    Padding="6,2" Margin="0,0,4,0" Cursor="Hand" FontSize="10" />
+                                                                                                            <Button Content="Dismiss" Command="{Binding DismissFailedFilesCommand}"
+                                                                                                                    Padding="6,2" Cursor="Hand" FontSize="10"
+                                                                                                                    ToolTip="Hide this failed/skipped list" />
                                                                                                         </StackPanel>
                                                                                                     </DockPanel>
                                                                                                     <ScrollViewer VerticalScrollBarVisibility="Auto"

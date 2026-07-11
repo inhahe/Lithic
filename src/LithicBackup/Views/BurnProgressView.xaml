@@ -11,9 +11,9 @@
         <!-- Header -->
         <TextBlock Style="{StaticResource H2}" Text="{Binding StatusText}" Margin="0,0,0,16" />
 
-        <!-- Disc progress (hidden in directory mode) -->
+        <!-- Disc progress (multi-disc optical burns only) -->
         <Grid Margin="0,0,0,12"
-              Visibility="{Binding IsDirectoryMode, Converter={StaticResource BoolToVis}, ConverterParameter=Invert}">
+              Visibility="{Binding ShowDiscProgress, Converter={StaticResource BoolToVis}, FallbackValue=Collapsed}">
             <Grid.ColumnDefinitions>
                 <ColumnDefinition Width="Auto" />
                 <ColumnDefinition Width="*" />
@@ -127,8 +127,13 @@
                                 FontSize="11" />
                         <Button Content="Export..."
                                 Command="{Binding ExportFailedFilesCommand}"
-                                Padding="8,2" Cursor="Hand"
+                                Padding="8,2" Margin="0,0,6,0" Cursor="Hand"
                                 FontSize="11" />
+                        <Button Content="Dismiss"
+                                Command="{Binding DismissFailedFilesCommand}"
+                                Padding="8,2" Cursor="Hand"
+                                FontSize="11"
+                                ToolTip="Hide this failed/skipped list" />
                     </StackPanel>
                 </DockPanel>
 
