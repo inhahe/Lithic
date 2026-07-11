@@ -2,6 +2,7 @@ using System.Collections.ObjectModel;
 using System.Windows.Input;
 using LithicBackup.Core.Interfaces;
 using LithicBackup.Core.Models;
+using LithicBackup.Infrastructure.Burning;
 using LithicBackup.Services;
 
 namespace LithicBackup.ViewModels;
@@ -89,6 +90,55 @@ public class BackupJobViewModel : ViewModelBase
     internal IBackupOrchestrator Orchestrator { get; }
     internal IDiscBurner Burner { get; }
     internal DirectoryBackupService? DirectoryBackup { get; }
+
+    // --- Test mode (--test-mode only) ---
+
+    private SwitchableDiscBurner? Switchable => Burner as SwitchableDiscBurner;
+
+    /// <summary>True when the app was launched with <c>--test-mode</c>, which
+    /// surfaces the simulated-burner and stub-content test controls.</summary>
+    public bool IsTestMode => Switchable is not null;
+
+    /// <summary>
+    /// When on, the disc burner routes to the simulated burner instead of real
+    /// hardware. Defaults to off so that, even in test mode, real hardware is
+    /// used until the user opts in. Reloads media info on change so the UI
+    /// reflects the newly-active burner.
+    /// </summary>
+    public bool UseSimulatedBurner
+    {
+        get => Switchable?.UseSimulated ?? false;
+        set
+        {
+            if (Switchable is not null && Switchable.UseSimulated != value)
+            {
+                Switchable.UseSimulated = value;
+                OnPropertyChanged();
+                _ = LoadMediaInfoAsync();
+            }
+        }
+    }
+
+    /// <summary>
+    /// TESTING ONLY — when on, directory backups write plain (non-deduplicated)
+    /// files as tiny hash+size stubs instead of real content, so a dedup test
+    /// run doesn't fill the destination drive. The block/file dedup stores and
+    /// manifests stay real, so dedup restore is still verifiable — but the
+    /// plain-copied files are non-functional and can't be restored. Only
+    /// surfaced in <c>--test-mode</c>.
+    /// </summary>
+    public bool StubPlainContent
+    {
+        get => DirectoryBackup?.StubPlainContentForTesting ?? false;
+        set
+        {
+            if (DirectoryBackup is not null && DirectoryBackup.StubPlainContentForTesting != value)
+            {
+                DirectoryBackup.StubPlainContentForTesting = value;
+                OnPropertyChanged();
+            }
+        }
+    }
 
     // --- Editable options ---
 

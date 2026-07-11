@@ -11,6 +11,7 @@ public class FailureDialogViewModel : ViewModelBase
     private string _errorMessage = string.Empty;
     private BurnFailureAction _chosenAction = BurnFailureAction.Skip;
     private bool _isDirectoryMode;
+    private BackupErrorCategory _errorCategory = BackupErrorCategory.Other;
 
     /// <summary>The path of the file that failed.</summary>
     public string FilePath
@@ -43,4 +44,21 @@ public class FailureDialogViewModel : ViewModelBase
         get => _isDirectoryMode;
         set => SetProperty(ref _isDirectoryMode, value);
     }
+
+    /// <summary>The coarse category of this failure, used to label and drive
+    /// the "skip all of this type" option.</summary>
+    public BackupErrorCategory ErrorCategory
+    {
+        get => _errorCategory;
+        set
+        {
+            if (SetProperty(ref _errorCategory, value))
+                OnPropertyChanged(nameof(SkipAllOfTypeLabel));
+        }
+    }
+
+    /// <summary>Button label for the "skip all of this type" action, naming the
+    /// current error category (e.g. "Skip all 'permission denied' errors").</summary>
+    public string SkipAllOfTypeLabel
+        => $"Skip all '{BackupErrorClassifier.Describe(_errorCategory)}' errors";
 }

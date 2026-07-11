@@ -232,7 +232,13 @@ public class Imapi2DiscBurner : IDiscBurner
                 }
             }
 
-            // 6. Report final progress.
+            // 6. Optional post-burn read-back verification.
+            if (options.VerifyAfterBurn)
+            {
+                VerifyBurnedDisc(recorder, sourceDirectory, totalBytes, stopwatch, progress, ct);
+            }
+
+            // 7. Report final progress.
             stopwatch.Stop();
             progress?.Report(new BurnProgress
             {
@@ -244,6 +250,92 @@ public class Imapi2DiscBurner : IDiscBurner
                 EstimatedRemaining = TimeSpan.Zero,
             });
         });
+    }
+
+    /// <summary>
+    /// Read every file back off the freshly burned disc and confirm it matches
+    /// the staging source (see <see cref="BurnVerifier"/>). The disc is ejected
+    /// and reloaded first so Windows mounts the newly written filesystem instead
+    /// of serving a stale (empty) view. Throws <see cref="BurnException"/> if the
+    /// disc can't be remounted or any file fails to verify.
+    /// </summary>
+    private static void VerifyBurnedDisc(
+        dynamic recorder,
+        string sourceDirectory,
+        long totalBytes,
+        Stopwatch stopwatch,
+        IProgress<BurnProgress>? progress,
+        CancellationToken ct)
+    {
+        ct.ThrowIfCancellationRequested();
+
+        progress?.Report(new BurnProgress
+        {
+            CurrentFile = "Preparing to verify (reloading disc)...",
+            BytesWritten = totalBytes,
+            TotalBytes = totalBytes,
+            Percentage = 100,
+            Elapsed = stopwatch.Elapsed,
+        });
+
+        // Force a remount so the OS sees the just-written filesystem. Eject then
+        // close the tray; slot/auto-loaders may ignore one or both — that's fine,
+        // we fall back to polling whatever volume path the recorder reports.
+        try { recorder.EjectMedia(); } catch { /* not all drives support eject */ }
+        try { recorder.CloseTray(); } catch { /* slot loaders / open trays */ }
+
+        // Wait for a readable volume mount (up to ~60s for the drive to spin up
+        // and Windows to mount the new media).
+        string? volumeRoot = null;
+        var deadline = DateTime.UtcNow + TimeSpan.FromSeconds(60);
+        while (DateTime.UtcNow < deadline)
+        {
+            ct.ThrowIfCancellationRequested();
+            volumeRoot = TryGetVolumePath(recorder);
+            if (volumeRoot is not null && Directory.Exists(volumeRoot))
+                break;
+            Thread.Sleep(1000);
+        }
+
+        if (volumeRoot is null || !Directory.Exists(volumeRoot))
+        {
+            throw new BurnException(
+                "Post-burn verification could not read the disc back: the drive did not "
+                + "remount the newly written media within the timeout. The burn itself "
+                + "completed; re-insert the disc and run Verify Integrity to check it.");
+        }
+
+        // Block on the async verifier — we're already on a dedicated STA thread.
+        BurnVerifier
+            .VerifyAsync(sourceDirectory, volumeRoot, totalBytes, stopwatch, progress, ct)
+            .GetAwaiter()
+            .GetResult();
+    }
+
+    /// <summary>
+    /// Return the first mounted volume path (e.g. <c>"E:\"</c>) for the disc in
+    /// <paramref name="recorder"/>, or <c>null</c> if none is reported.
+    /// </summary>
+    private static string? TryGetVolumePath(dynamic recorder)
+    {
+        try
+        {
+            var names = recorder.VolumePathNames;
+            if (names is not null)
+            {
+                foreach (var name in (System.Collections.IEnumerable)names)
+                {
+                    string? s = name?.ToString();
+                    if (!string.IsNullOrEmpty(s))
+                        return s;
+                }
+            }
+        }
+        catch
+        {
+            // VolumePathNames can throw if no volume is mounted yet.
+        }
+        return null;
     }
 
     // -------------------------------------------------------------------

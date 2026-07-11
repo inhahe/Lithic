@@ -1,6 +1,7 @@
 using System.Diagnostics;
 using System.Security.Cryptography;
 using System.Text.Json;
+using LithicBackup.Core.Exceptions;
 using LithicBackup.Core.Interfaces;
 using LithicBackup.Core.Models;
 
@@ -17,8 +18,9 @@ namespace LithicBackup.Infrastructure.Burning;
 /// <c>_manifest.json</c> with per-file metadata (path, size, SHA-256).
 /// </para>
 ///
-/// Usage: pass <c>--simulate-burner</c> on the command line, or swap
-/// <c>Imapi2DiscBurner</c> for <c>SimulatedDiscBurner</c> in App.xaml.cs.
+/// Usage: pass <c>--test-mode</c> on the command line (which wires up a
+/// <c>SwitchableDiscBurner</c>), or swap <c>Imapi2DiscBurner</c> for
+/// <c>SimulatedDiscBurner</c> in App.xaml.cs.
 /// </summary>
 public class SimulatedDiscBurner : IDiscBurner
 {
@@ -44,8 +46,35 @@ public class SimulatedDiscBurner : IDiscBurner
     /// <summary>If true, <see cref="EraseAsync"/> simulates failure.</summary>
     public bool SimulateEraseFail { get; set; }
 
+    /// <summary>If true, <see cref="GetRecorderIds"/> reports no drives, so a
+    /// backup fails at start with "No disc recorder detected." (pre-burn).</summary>
+    public bool SimulateNoRecorder { get; set; }
+
+    /// <summary>If true, <see cref="GetMediaInfoAsync"/> throws as though the
+    /// drive were empty — surfaces during planning / at burn start (pre-burn).</summary>
+    public bool SimulateNoMedia { get; set; }
+
+    /// <summary>If true, <see cref="BurnAsync"/> writes the disc normally but then
+    /// fails the post-burn verification step (an end-of-burn error).</summary>
+    public bool SimulateVerifyFailure { get; set; }
+
     /// <summary>Number of simulated recorder drives.</summary>
     public int RecorderCount { get; set; } = 1;
+
+    /// <summary>
+    /// When <c>true</c> (default), the actual file bytes are copied to the disc
+    /// shelf so that verify and restore work against real data.  When
+    /// <c>false</c>, the full directory tree and real filenames are still
+    /// recreated on the shelf, but each file holds a tiny stub recording its
+    /// hash and size instead of the real content — so the shelf mirrors the true
+    /// structure for easy inspection while staying tiny (no 100&#160;GB of
+    /// duplicated data on the system drive).  This is sufficient for exercising
+    /// burn timing, capacity, bin-packing, spanning, and failure-injection
+    /// behaviour.  The trade-off: <em>restore</em> from a metadata-only disc
+    /// cannot reconstruct file content, so restore (and block-dedup round-trips
+    /// that read the stored bytes back) require the default full-content mode.
+    /// </summary>
+    public bool StoreFileContents { get; set; } = true;
 
     /// <summary>Root directory where virtual discs are stored.
     /// Defaults to <c>%LOCALAPPDATA%/LithicBackup/simulated-discs</c>.</summary>
@@ -84,6 +113,9 @@ public class SimulatedDiscBurner : IDiscBurner
 
     public IReadOnlyList<string> GetRecorderIds()
     {
+        if (SimulateNoRecorder)
+            return [];
+
         return Enumerable.Range(0, RecorderCount)
             .Select(i => $"SIM_RECORDER_{i}")
             .ToList();
@@ -91,6 +123,9 @@ public class SimulatedDiscBurner : IDiscBurner
 
     public Task<MediaInfo> GetMediaInfoAsync(string recorderId, CancellationToken ct = default)
     {
+        if (SimulateNoMedia)
+            throw new IOException("Simulated: no media present in the drive.");
+
         var state = GetRecorderState(recorderId);
         long used = state.BytesUsed;
 
@@ -163,12 +198,8 @@ public class SimulatedDiscBurner : IDiscBurner
                     $"Simulated write error on file: {Path.GetFileName(fullPath)}");
             }
 
-            // Copy the file to the shelf (the simulated "disc surface").
-            string destPath = Path.Combine(discDir, relativePath);
-            string? destDir = Path.GetDirectoryName(destPath);
-            if (destDir is not null)
-                Directory.CreateDirectory(destDir);
-
+            // Always hash the source (reads from the user's drive, costs no
+            // shelf space) so the manifest records accurate per-file hashes.
             string hash;
             using (var stream = File.OpenRead(fullPath))
             {
@@ -176,7 +207,28 @@ public class SimulatedDiscBurner : IDiscBurner
                 hash = Convert.ToHexString(hashBytes).ToLowerInvariant();
             }
 
-            File.Copy(fullPath, destPath, overwrite: true);
+            // Recreate the file on the shelf (the simulated "disc surface") at
+            // its real relative path. In full mode we copy the actual bytes; in
+            // metadata-only mode we still create the same directory tree and a
+            // file with the same name, but its content is a tiny stub recording
+            // the hash and size instead of the real bytes — so the shelf mirrors
+            // the true structure for easy inspection without the disk cost.
+            string destPath = Path.Combine(discDir, relativePath);
+            string? destDir = Path.GetDirectoryName(destPath);
+            if (destDir is not null)
+                Directory.CreateDirectory(destDir);
+
+            if (StoreFileContents)
+            {
+                File.Copy(fullPath, destPath, overwrite: true);
+            }
+            else
+            {
+                await File.WriteAllTextAsync(
+                    destPath,
+                    $"[LithicBackup simulated metadata-only stub]\nsha256: {hash}\nsize: {fileSize}\n",
+                    ct);
+            }
 
             manifest.Add(new DiscFileEntry
             {
@@ -245,6 +297,38 @@ public class SimulatedDiscBurner : IDiscBurner
         string manifestJson = JsonSerializer.Serialize(manifestObj, _jsonOptions);
         await File.WriteAllTextAsync(
             Path.Combine(discDir, "_manifest.json"), manifestJson, ct);
+
+        // Post-burn read-back verification — mirrors the real burner. The data
+        // was written to the shelf above; now read it back and confirm it
+        // matches the source.
+        if (options.VerifyAfterBurn)
+        {
+            // Failure injection: pretend the read-back found a mismatch.
+            if (SimulateVerifyFailure)
+            {
+                progress?.Report(new BurnProgress
+                {
+                    CurrentFile = "Verifying disc...",
+                    BytesWritten = totalBytes,
+                    TotalBytes = totalBytes,
+                    Percentage = 100,
+                    Elapsed = sw.Elapsed,
+                });
+                await Task.Delay(300, ct);
+                throw new BurnException(
+                    "Simulated post-burn verification failed: data mismatch on disc.");
+            }
+
+            // Real read-back is only meaningful when the shelf holds actual
+            // bytes. In metadata-only mode (StoreFileContents = false) the shelf
+            // files are tiny stubs, so a byte-for-byte check would always fail —
+            // skip it there.
+            if (StoreFileContents)
+            {
+                await BurnVerifier.VerifyAsync(
+                    sourceDirectory, discDir, totalBytes, sw, progress, ct);
+            }
+        }
 
         // Simulated finalization.
         progress?.Report(new BurnProgress

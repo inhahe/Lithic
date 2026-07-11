@@ -139,6 +139,9 @@ public class MainViewModel : ViewModelBase
         SetBackupCommand = new RelayCommand(
             o => { if (o is BackupSetRowViewModel r) { SelectedBackupSet = r.Model; StartIncrementalFlow(r); } },
             o => o is BackupSetRowViewModel r && !r.IsRunning);
+        SetReviewCommand = new RelayCommand(
+            o => { if (o is BackupSetRowViewModel r) { SelectedBackupSet = r.Model; _ = RunIncrementalFlowAsync(r, forceReview: true); } },
+            o => o is BackupSetRowViewModel r && !r.IsRunning);
         SetModifyCommand = new RelayCommand(
             o => { if (o is BackupSetRowViewModel r) { SelectedBackupSet = r.Model; StartEditFlow(); } },
             o => o is BackupSetRowViewModel r && !r.IsRunning);
@@ -274,6 +277,7 @@ public class MainViewModel : ViewModelBase
     public ICommand SetCheckCommand { get; }
     public ICommand AbortCheckCommand { get; }
     public ICommand SetBackupCommand { get; }
+    public ICommand SetReviewCommand { get; }
     public ICommand SetModifyCommand { get; }
     public ICommand SetRestoreCommand { get; }
     public ICommand SetOrphanedDirsCommand { get; }
@@ -1561,6 +1565,16 @@ public class MainViewModel : ViewModelBase
     }
 
     private async void StartIncrementalFlow(BackupSetRowViewModel row)
+        => await RunIncrementalFlowAsync(row, forceReview: false);
+
+    /// <summary>
+    /// Scan a set and start its backup.  When <paramref name="forceReview"/> is
+    /// true (or the destination lacks free space for the full delta), the
+    /// post-scan file-review dialog is shown first so the user can inspect and
+    /// deselect files before the backup runs.
+    /// </summary>
+    private async Task RunIncrementalFlowAsync(
+        BackupSetRowViewModel row, bool forceReview)
     {
         if (row.IsRunning)
             return;
@@ -1703,6 +1717,53 @@ public class MainViewModel : ViewModelBase
 
                 StatusText = $"{totalFiles:N0} file(s) to back up ({FormatBytes(totalBytes)})";
 
+                // Determine whether to pause for the post-scan review dialog:
+                // always when explicitly requested, or automatically when the
+                // destination can't fit the full delta.
+                var (hasFreeInfo, freeBytes) = GetDestinationFreeSpace(job.TargetDirectory!);
+                bool insufficientSpace = hasFreeInfo && freeBytes < totalBytes;
+
+                if (forceReview || insufficientSpace)
+                {
+                    // Stop scan-progress callbacks from overwriting the review.
+                    scanning = false;
+
+                    var review = ShowBackupReviewDialog(
+                        backupSet.Name, diff, totalBytes, freeBytes, hasFreeInfo,
+                        triggeredByLowSpace: insufficientSpace);
+
+                    if (review is null)
+                    {
+                        // User cancelled the backup from the review dialog.
+                        StatusText = $"\"{backupSet.Name}\": backup cancelled.";
+                        row.IsRunning = false;
+                        return;
+                    }
+
+                    diff = review.Value.Diff;
+                    totalBytes = review.Value.TotalBytes;
+
+                    // Persist source removals if the user opted in.
+                    if (review.Value.RemovedPaths.Count > 0)
+                    {
+                        await PersistSourceRemovalsAsync(backupSet, review.Value.RemovedPaths);
+                        // Reflect the new exclusions in the running job so this
+                        // very run also honors them (belt-and-suspenders — the
+                        // diff is already filtered to the selected files).
+                        job.ExcludedExtensions = backupSet.JobOptions!.ExcludedExtensions;
+                    }
+
+                    int selectedFiles = diff.NewFiles.Count + diff.ChangedFiles.Count;
+                    if (selectedFiles == 0)
+                    {
+                        ShowNoOpCompletion(row,
+                            BuildNothingToBackUpMessage(diff.DeletedFiles.Count));
+                        return;
+                    }
+
+                    StatusText = $"{selectedFiles:N0} file(s) to back up ({FormatBytes(totalBytes)})";
+                }
+
                 plan = new BackupPlan
                 {
                     Job = job,
@@ -1712,8 +1773,10 @@ public class MainViewModel : ViewModelBase
                     TotalBytes = totalBytes,
                 };
 
-                // Check free space before starting.
-                if (!CheckFreeSpaceBeforeBackup(job.TargetDirectory!, totalBytes))
+                // When the review dialog wasn't shown, keep the lightweight
+                // free-space warning as a safety net.
+                if (!forceReview && !insufficientSpace
+                    && !CheckFreeSpaceBeforeBackup(job.TargetDirectory!, totalBytes))
                 {
                     row.IsRunning = false;
                     return;
@@ -2262,6 +2325,113 @@ public class MainViewModel : ViewModelBase
     /// When space is insufficient a confirmation dialog lets the user
     /// continue anyway (partial backup) or cancel.
     /// </summary>
+    /// <summary>
+    /// Query the available free space on the drive hosting a directory-mode
+    /// destination.  Returns (false, 0) when the drive can't be inspected
+    /// (not ready, path error) so callers can skip the space-based prompts.
+    /// </summary>
+    private static (bool HasInfo, long FreeBytes) GetDestinationFreeSpace(string targetDirectory)
+    {
+        try
+        {
+            string pathRoot = System.IO.Path.GetPathRoot(targetDirectory) ?? targetDirectory;
+            var driveInfo = new System.IO.DriveInfo(pathRoot);
+            if (!driveInfo.IsReady)
+                return (false, 0);
+            return (true, driveInfo.AvailableFreeSpace);
+        }
+        catch
+        {
+            return (false, 0);
+        }
+    }
+
+    /// <summary>
+    /// The outcome of the post-scan review dialog: the (possibly filtered) diff
+    /// to back up, its total byte size, and glob exclusion patterns to persist
+    /// for any paths the user chose to remove from the set's sources.
+    /// </summary>
+    private readonly record struct BackupReviewOutcome(
+        BackupDiff Diff, long TotalBytes, List<string> RemovedPaths);
+
+    /// <summary>
+    /// Show the tristate post-scan review dialog modally.  Returns the filtered
+    /// backup (files the user left selected) plus any source-removal patterns,
+    /// or <c>null</c> if the user cancelled the backup.
+    /// </summary>
+    private BackupReviewOutcome? ShowBackupReviewDialog(
+        string setName, BackupDiff diff, long totalBytes,
+        long freeBytes, bool hasFreeInfo, bool triggeredByLowSpace)
+    {
+        var vm = new BackupReviewViewModel(
+            setName, diff, totalBytes, freeBytes, hasFreeInfo, triggeredByLowSpace);
+
+        var win = new Views.BackupSetEditorWindow
+        {
+            Owner = _editorWindow ?? Application.Current.MainWindow,
+            Title = $"Review Files \u2014 {setName}",
+        };
+
+        vm.ProceedRequested += () => { try { win.DialogResult = true; } catch { win.Close(); } };
+        vm.CancelRequested += () => { try { win.DialogResult = false; } catch { win.Close(); } };
+
+        win.SetEditorContent(vm);
+        win.ShowDialog();
+
+        if (!vm.Confirmed)
+            return null;
+
+        var selected = vm.SelectedFilePaths();
+
+        var filteredNew = diff.NewFiles.Where(f => selected.Contains(f.FullPath)).ToList();
+        var filteredChanged = diff.ChangedFiles.Where(f => selected.Contains(f.FullPath)).ToList();
+
+        long filteredBytes = 0;
+        foreach (var f in filteredNew) filteredBytes += f.SizeBytes;
+        foreach (var f in filteredChanged) filteredBytes += f.SizeBytes;
+
+        var filteredDiff = new BackupDiff
+        {
+            NewFiles = filteredNew,
+            ChangedFiles = filteredChanged,
+            DeletedFiles = diff.DeletedFiles,
+        };
+
+        var removed = new List<string>();
+        if (vm.RemoveDeselectedFromSources)
+        {
+            // Mirror the LargestFiles removal mechanism: exclude a file by its
+            // full path, and a directory (and its whole subtree) via a "dir\*"
+            // glob.  These patterns are honoured by the scanner's exclusion
+            // filter (DirectoryBackupService.BuildExclusionFilter).
+            foreach (var (path, isDir) in vm.DeselectedPaths())
+            {
+                if (string.IsNullOrEmpty(path))
+                    continue;
+                removed.Add(isDir ? path.TrimEnd('\\') + @"\*" : path);
+            }
+        }
+
+        return new BackupReviewOutcome(filteredDiff, filteredBytes, removed);
+    }
+
+    /// <summary>
+    /// Add source-removal exclusion patterns to a set's job options and persist
+    /// them, so future backups also skip the paths the user deselected.
+    /// </summary>
+    private async Task PersistSourceRemovalsAsync(BackupSet set, List<string> patterns)
+    {
+        set.JobOptions ??= new JobOptions();
+        var excl = set.JobOptions.ExcludedExtensions;
+        foreach (var p in patterns)
+        {
+            if (!excl.Contains(p, StringComparer.OrdinalIgnoreCase))
+                excl.Add(p);
+        }
+        try { await Task.Run(() => _catalog.UpdateBackupSetAsync(set)); }
+        catch { /* best effort — the run still honours the filtered diff */ }
+    }
+
     private bool CheckFreeSpaceBeforeBackup(string targetDirectory, long requiredBytes)
     {
         try

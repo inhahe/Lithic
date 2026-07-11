@@ -27,58 +27,253 @@
             </TextBlock>
         </StackPanel>
 
-        <!-- File list with checkboxes -->
-        <Border Grid.Row="1" BorderBrush="{StaticResource BorderBrush}" BorderThickness="1"
-                CornerRadius="4" Padding="4" Margin="0,0,0,12">
-            <Grid>
-                <!-- Loading indicator -->
-                <TextBlock Text="Loading files..."
-                           HorizontalAlignment="Center" VerticalAlignment="Center"
-                           Foreground="{StaticResource TextSecondaryBrush}"
-                           Visibility="{Binding IsLoading, Converter={StaticResource BoolToVis}}" />
+        <!-- File tree with tristate checkboxes -->
+        <Grid Grid.Row="1" Margin="0,0,0,12">
+            <!-- Loading indicator -->
+            <TextBlock Text="Loading files..."
+                       HorizontalAlignment="Center" VerticalAlignment="Center"
+                       Panel.ZIndex="1"
+                       Foreground="{StaticResource TextSecondaryBrush}"
+                       Visibility="{Binding IsLoading, Converter={StaticResource BoolToVis}}" />
 
-                <!-- File list -->
-                <ListView ItemsSource="{Binding RestorableFiles}"
-                          BorderThickness="0"
-                          Background="Transparent"
-                          ScrollViewer.HorizontalScrollBarVisibility="Auto">
-                    <ListView.View>
-                        <GridView>
-                            <GridViewColumn Width="30">
-                                <GridViewColumn.CellTemplate>
-                                    <DataTemplate>
-                                        <CheckBox IsChecked="{Binding IsSelected}" />
-                                    </DataTemplate>
-                                </GridViewColumn.CellTemplate>
-                            </GridViewColumn>
-                            <GridViewColumn Header="File" Width="300"
-                                            DisplayMemberBinding="{Binding SourcePath}" />
-                            <GridViewColumn Header="Size" Width="130"
-                                            DisplayMemberBinding="{Binding SizeBytes, Converter={StaticResource FileSize}}" />
-                            <GridViewColumn Header="Disc" Width="100"
-                                            DisplayMemberBinding="{Binding DiscLabel}" />
-                            <GridViewColumn Header="Backed Up" Width="150"
-                                            DisplayMemberBinding="{Binding BackedUpUtc, StringFormat={}{0:yyyy-MM-dd HH:mm}}" />
-                        </GridView>
-                    </ListView.View>
-                </ListView>
-            </Grid>
-        </Border>
+            <TreeView ItemsSource="{Binding Roots}"
+                      BorderThickness="0"
+                      VirtualizingStackPanel.IsVirtualizing="True"
+                      VirtualizingStackPanel.VirtualizationMode="Recycling"
+                      VirtualizingPanel.ScrollUnit="Pixel">
 
-        <!-- Destination path -->
-        <Grid Grid.Row="2" Margin="0,0,0,12">
-            <Grid.ColumnDefinitions>
-                <ColumnDefinition Width="*" />
-                <ColumnDefinition Width="Auto" />
-            </Grid.ColumnDefinitions>
+                <!-- Custom TreeView template: column headers + scrollable items -->
+                <TreeView.Template>
+                    <ControlTemplate TargetType="TreeView">
+                        <Border Grid.IsSharedSizeScope="True"
+                                BorderThickness="1"
+                                BorderBrush="{StaticResource BorderBrush}"
+                                Background="{StaticResource SurfaceBrush}"
+                                CornerRadius="4">
+                            <DockPanel>
+                                <!-- Header row (right margin compensates for the scrollbar) -->
+                                <Grid DockPanel.Dock="Top">
+                                    <Grid.Style>
+                                        <Style TargetType="Grid">
+                                            <Style.Triggers>
+                                                <DataTrigger Binding="{Binding ComputedVerticalScrollBarVisibility, ElementName=TreeScroll}" Value="Visible">
+                                                    <Setter Property="Margin" Value="0,0,17,0" />
+                                                </DataTrigger>
+                                            </Style.Triggers>
+                                        </Style>
+                                    </Grid.Style>
+                                    <Grid.ColumnDefinitions>
+                                        <ColumnDefinition Width="Auto" SharedSizeGroup="IncludeCol" />
+                                        <ColumnDefinition Width="*" />
+                                        <ColumnDefinition Width="Auto" MinWidth="120" SharedSizeGroup="SizeCol" />
+                                        <ColumnDefinition Width="Auto" MinWidth="150" SharedSizeGroup="DateCol" />
+                                    </Grid.ColumnDefinitions>
+                                    <Border Grid.Column="0"
+                                            BorderBrush="{StaticResource BorderBrush}"
+                                            BorderThickness="0,0,1,1"
+                                            Padding="4,6">
+                                        <CheckBox IsChecked="{Binding IsAllSelected, Mode=TwoWay}"
+                                                  IsThreeState="False"
+                                                  VerticalAlignment="Center"
+                                                  HorizontalAlignment="Center"
+                                                  ToolTip="Check/uncheck all" />
+                                    </Border>
+                                    <Border Grid.Column="1"
+                                            BorderBrush="{StaticResource BorderBrush}"
+                                            BorderThickness="0,0,1,1"
+                                            Padding="4,6">
+                                        <TextBlock Text="Name" FontSize="11"
+                                                   Foreground="{StaticResource TextSecondaryBrush}" />
+                                    </Border>
+                                    <Border Grid.Column="2"
+                                            BorderBrush="{StaticResource BorderBrush}"
+                                            BorderThickness="0,0,1,1"
+                                            Padding="8,6">
+                                        <TextBlock Text="Size" FontSize="11"
+                                                   TextAlignment="Right"
+                                                   Foreground="{StaticResource TextSecondaryBrush}" />
+                                    </Border>
+                                    <Border Grid.Column="3"
+                                            BorderBrush="{StaticResource BorderBrush}"
+                                            BorderThickness="0,0,0,1"
+                                            Padding="8,6">
+                                        <TextBlock Text="Backed Up" FontSize="11"
+                                                   Foreground="{StaticResource TextSecondaryBrush}" />
+                                    </Border>
+                                </Grid>
 
-            <TextBox Grid.Column="0"
-                     Text="{Binding DestinationPath, UpdateSourceTrigger=PropertyChanged}"
-                     Padding="6,4" Margin="0,0,8,0" />
-            <Button Grid.Column="1" Content="Browse..."
-                    Command="{Binding BrowseCommand}"
-                    Padding="12,4" />
+                                <!-- Scrollable tree items -->
+                                <ScrollViewer x:Name="TreeScroll"
+                                              Focusable="False"
+                                              CanContentScroll="True"
+                                              HorizontalScrollBarVisibility="Disabled"
+                                              VerticalScrollBarVisibility="Auto"
+                                              Padding="0">
+                                    <ItemsPresenter />
+                                </ScrollViewer>
+                            </DockPanel>
+                        </Border>
+                    </ControlTemplate>
+                </TreeView.Template>
+
+                <!-- Custom TreeViewItem template: fixed checkbox column + indented name -->
+                <TreeView.ItemContainerStyle>
+                    <Style TargetType="TreeViewItem">
+                        <EventSetter Event="RequestBringIntoView"
+                                     Handler="TreeViewItem_RequestBringIntoView" />
+                        <Setter Property="IsExpanded" Value="{Binding IsExpanded, Mode=TwoWay}" />
+                        <Setter Property="Margin" Value="0" />
+                        <Setter Property="Padding" Value="0" />
+                        <Setter Property="FocusVisualStyle" Value="{x:Null}" />
+                        <Setter Property="Template">
+                            <Setter.Value>
+                                <ControlTemplate TargetType="TreeViewItem">
+                                    <StackPanel>
+                                        <!-- This node's row -->
+                                        <Grid MinHeight="24">
+                                            <Grid.ColumnDefinitions>
+                                                <ColumnDefinition Width="Auto" SharedSizeGroup="IncludeCol" />
+                                                <ColumnDefinition Width="*" />
+                                                <ColumnDefinition Width="Auto" MinWidth="120" SharedSizeGroup="SizeCol" />
+                                                <ColumnDefinition Width="Auto" MinWidth="150" SharedSizeGroup="DateCol" />
+                                            </Grid.ColumnDefinitions>
+
+                                            <!-- Col 0: Include checkbox -->
+                                            <Border Grid.Column="0"
+                                                    BorderBrush="{StaticResource BorderBrush}"
+                                                    BorderThickness="0,0,1,0">
+                                                <CheckBox IsChecked="{Binding IsSelected, Mode=TwoWay}"
+                                                          IsThreeState="False"
+                                                          VerticalAlignment="Center"
+                                                          HorizontalAlignment="Center" />
+                                            </Border>
+
+                                            <!-- Col 1: Clickable, indented name (single-click expands dirs) -->
+                                            <Border x:Name="NameArea" Grid.Column="1"
+                                                    Background="Transparent"
+                                                    BorderBrush="{StaticResource BorderBrush}"
+                                                    BorderThickness="0,0,1,0">
+                                                <Border.InputBindings>
+                                                    <MouseBinding MouseAction="LeftClick"
+                                                                  Command="{Binding ToggleExpandCommand}" />
+                                                </Border.InputBindings>
+                                                <StackPanel Orientation="Horizontal"
+                                                            Margin="{Binding Depth, Converter={StaticResource DepthToIndent}}"
+                                                            VerticalAlignment="Center">
+                                                    <!-- Expand arrow -->
+                                                    <Border x:Name="ExpanderIcon"
+                                                            Width="16" Height="16" Margin="0,0,2,0">
+                                                        <Path x:Name="Arrow"
+                                                              Data="M 4 2 L 12 6 L 4 10 Z"
+                                                              Fill="{StaticResource TextDimBrush}"
+                                                              VerticalAlignment="Center"
+                                                              HorizontalAlignment="Center"
+                                                              RenderTransformOrigin="0.5,0.5">
+                                                            <Path.RenderTransform>
+                                                                <RotateTransform Angle="0" />
+                                                            </Path.RenderTransform>
+                                                        </Path>
+                                                    </Border>
+                                                    <ContentPresenter x:Name="PART_Header"
+                                                                      ContentSource="Header"
+                                                                      VerticalAlignment="Center" />
+                                                </StackPanel>
+                                            </Border>
+
+                                            <!-- Col 2: Size -->
+                                            <Border Grid.Column="2"
+                                                    BorderBrush="{StaticResource BorderBrush}"
+                                                    BorderThickness="0,0,1,0">
+                                                <TextBlock Text="{Binding SizeBytes, Converter={StaticResource FileSize}}"
+                                                           VerticalAlignment="Center"
+                                                           TextAlignment="Right"
+                                                           FontSize="11"
+                                                           Foreground="{StaticResource TextSecondaryBrush}"
+                                                           Padding="8,0,8,0" />
+                                            </Border>
+
+                                            <!-- Col 3: Backed-up date (files only) -->
+                                            <Border Grid.Column="3">
+                                                <TextBlock Text="{Binding BackedUpUtc, StringFormat={}{0:yyyy-MM-dd HH:mm}}"
+                                                           VerticalAlignment="Center"
+                                                           FontSize="11"
+                                                           Foreground="{StaticResource TextSecondaryBrush}"
+                                                           Padding="8,0,8,0" />
+                                            </Border>
+                                        </Grid>
+
+                                        <!-- Children (full width, columns stay aligned) -->
+                                        <ItemsPresenter x:Name="ItemsHost" Visibility="Collapsed" />
+                                    </StackPanel>
+                                    <ControlTemplate.Triggers>
+                                        <Trigger Property="IsExpanded" Value="True">
+                                            <Setter TargetName="ItemsHost" Property="Visibility" Value="Visible" />
+                                            <Setter TargetName="Arrow" Property="RenderTransform">
+                                                <Setter.Value>
+                                                    <RotateTransform Angle="90" />
+                                                </Setter.Value>
+                                            </Setter>
+                                        </Trigger>
+                                        <Trigger Property="HasItems" Value="False">
+                                            <Setter TargetName="ExpanderIcon" Property="Visibility" Value="Hidden" />
+                                        </Trigger>
+                                        <DataTrigger Binding="{Binding IsDirectory}" Value="True">
+                                            <Setter TargetName="NameArea" Property="Cursor" Value="Hand" />
+                                        </DataTrigger>
+                                    </ControlTemplate.Triggers>
+                                </ControlTemplate>
+                            </Setter.Value>
+                        </Setter>
+                    </Style>
+                </TreeView.ItemContainerStyle>
+
+                <!-- Data template: name only (checkboxes live in the ControlTemplate) -->
+                <TreeView.ItemTemplate>
+                    <HierarchicalDataTemplate ItemsSource="{Binding Children}">
+                        <TextBlock Text="{Binding Name}"
+                                   VerticalAlignment="Center"
+                                   Foreground="{StaticResource TextPrimaryBrush}" />
+                    </HierarchicalDataTemplate>
+                </TreeView.ItemTemplate>
+            </TreeView>
         </Grid>
+
+        <!-- Per-drive destinations -->
+        <StackPanel Grid.Row="2" Margin="0,0,0,12">
+            <TextBlock Text="Restore destination" FontSize="11"
+                       Foreground="{StaticResource TextSecondaryBrush}"
+                       Margin="0,0,0,4" />
+
+            <CheckBox Content="Restore to original locations"
+                      IsChecked="{Binding RestoreToOriginal, Mode=TwoWay}"
+                      Margin="0,0,0,6"
+                      ToolTip="Write each file back to the drive and folder it came from." />
+
+            <!-- One row per source drive; disabled when restoring in place -->
+            <ItemsControl ItemsSource="{Binding DriveDestinations}"
+                          IsEnabled="{Binding IsCustomDestination}">
+                <ItemsControl.ItemTemplate>
+                    <DataTemplate>
+                        <Grid Margin="0,0,0,4">
+                            <Grid.ColumnDefinitions>
+                                <ColumnDefinition Width="Auto" MinWidth="44" />
+                                <ColumnDefinition Width="*" />
+                                <ColumnDefinition Width="Auto" />
+                            </Grid.ColumnDefinitions>
+                            <TextBlock Grid.Column="0" Text="{Binding DriveLetter}"
+                                       FontWeight="SemiBold"
+                                       VerticalAlignment="Center" Margin="0,0,8,0" />
+                            <TextBox Grid.Column="1"
+                                     Text="{Binding DestinationPath, UpdateSourceTrigger=PropertyChanged}"
+                                     Padding="6,4" Margin="0,0,8,0" />
+                            <Button Grid.Column="2" Content="Browse..."
+                                    Command="{Binding BrowseCommand}"
+                                    Padding="12,4" />
+                        </Grid>
+                    </DataTemplate>
+                </ItemsControl.ItemTemplate>
+            </ItemsControl>
+        </StackPanel>
 
         <!-- Progress area -->
         <StackPanel Grid.Row="3" Margin="0,0,0,12"
@@ -108,6 +303,11 @@
                     Content="Restore Selected"
                     Command="{Binding RestoreCommand}"
                     Margin="0,0,8,0" />
+            <TextBlock VerticalAlignment="Center" Margin="0,0,12,0"
+                       Foreground="{StaticResource TextSecondaryBrush}" FontSize="12">
+                <Run Text="{Binding SelectedFileCount, Mode=OneWay}" />
+                <Run Text="file(s) selected" />
+            </TextBlock>
             <Button Content="Cancel"
                     Command="{Binding CancelCommand}"
                     Padding="16,8" Margin="0,0,8,0"

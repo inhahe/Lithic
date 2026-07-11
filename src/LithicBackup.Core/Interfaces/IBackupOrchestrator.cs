@@ -3,7 +3,8 @@ using LithicBackup.Core.Models;
 namespace LithicBackup.Core.Interfaces;
 
 /// <summary>Callback for per-file failure decisions. Must be invoked on the UI thread.</summary>
-public delegate Task<FailureDecision> FailureCallback(string filePath, string error);
+public delegate Task<FailureDecision> FailureCallback(
+    string filePath, string error, BackupErrorCategory category);
 
 /// <summary>The user's decision for a file failure.</summary>
 public class FailureDecision

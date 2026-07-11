@@ -24,6 +24,7 @@ public sealed class BackupWorker : BackgroundService
     private readonly ILogger<BackupWorker> _logger;
     private readonly ICatalogRepository _catalog;
     private readonly DirectoryBackupService _directoryBackup;
+    private readonly IDestinationResolver _destinationResolver;
 
     /// <summary>How often we reload backup sets, check schedules, and read journals.</summary>
     private static readonly TimeSpan PollInterval = TimeSpan.FromSeconds(30);
@@ -51,11 +52,45 @@ public sealed class BackupWorker : BackgroundService
     public BackupWorker(
         ILogger<BackupWorker> logger,
         ICatalogRepository catalog,
-        DirectoryBackupService directoryBackup)
+        DirectoryBackupService directoryBackup,
+        IDestinationResolver destinationResolver)
     {
         _logger = logger;
         _catalog = catalog;
         _directoryBackup = directoryBackup;
+        _destinationResolver = destinationResolver;
+    }
+
+    /// <summary>
+    /// Resolve a set's destination to a live path, following any drive-letter
+    /// reassignment, backfilling/persisting the volume identity when it
+    /// changes, and logging a letter move.  Returns the live target directory,
+    /// or <c>null</c> when the destination volume is not currently connected
+    /// (the caller should skip the run).
+    /// </summary>
+    private async Task<string?> ResolveDestinationAsync(BackupSet set, JobOptions opts, CancellationToken ct)
+    {
+        var resolution = _destinationResolver.Resolve(opts);
+
+        if (resolution.MetadataChanged)
+            await _catalog.UpdateBackupSetAsync(set, ct);
+
+        if (!resolution.IsConnected)
+        {
+            _logger.LogWarning(
+                "Skipping backup for \"{Name}\": destination drive not connected ({Path}).",
+                set.Name, resolution.PreviousPath ?? "unknown path");
+            return null;
+        }
+
+        if (resolution.LetterChanged)
+        {
+            _logger.LogInformation(
+                "Destination drive for \"{Name}\" moved: {Old} -> {New}. Updated automatically.",
+                set.Name, resolution.PreviousPath, resolution.LivePath);
+        }
+
+        return resolution.LivePath;
     }
 
     // ------------------------------------------------------------------
@@ -234,11 +269,16 @@ public sealed class BackupWorker : BackgroundService
             .Distinct()
             .ToList();
 
+        var truncatedDrives = new HashSet<char>();
+
         foreach (var drive in driveLetters)
         {
             ct.ThrowIfCancellationRequested();
 
-            var changes = await ReadVolumeChangesAsync(drive, ct);
+            var (changes, truncated) = await ReadVolumeChangesAsync(drive, ct);
+            if (truncated)
+                truncatedDrives.Add(drive);
+
             foreach (var change in changes)
             {
                 if (change.IsDirectory)
@@ -257,11 +297,55 @@ public sealed class BackupWorker : BackgroundService
             }
         }
 
-        // 2. Per-file debounce: back up files that have been quiet for the
+        // 2. If a watched volume's journal lost continuity (it wrapped or was
+        //    recreated while the service was down), the incremental USN stream
+        //    skipped everything that changed in the gap — those records are gone
+        //    from the journal and can't be read here. Flag each affected set for
+        //    a full reconciling scan so nothing is silently missed.
+        if (truncatedDrives.Count > 0)
+        {
+            foreach (var state in continuousSets)
+            {
+                if (state.NeedsReconcile)
+                    continue;
+
+                bool affected = state.WatchRoots
+                    .Select(GetDriveLetter)
+                    .Any(truncatedDrives.Contains);
+
+                if (affected)
+                {
+                    state.NeedsReconcile = true;
+                    _logger.LogWarning(
+                        "USN journal continuity lost on a source volume for \"{Name}\" " +
+                        "(journal wrapped or was recreated during downtime). Running a full " +
+                        "reconciling backup to capture changes missed while the service was off.",
+                        state.BackupSet.Name);
+                }
+            }
+        }
+
+        // 3. Reconcile flagged sets with a full scan. A full scan supersedes any
+        //    queued per-file deltas for that set. The flag is cleared only once
+        //    the scan actually runs, so it retries on later polls if a backup is
+        //    already in progress or the destination is offline.
+        foreach (var state in continuousSets)
+        {
+            if (!state.NeedsReconcile)
+                continue;
+
+            if (await RunFullBackupAsync(state, ct))
+            {
+                state.NeedsReconcile = false;
+                state.Pending.Clear();
+            }
+        }
+
+        // 4. Per-file debounce: back up files that have been quiet for the
         //    debounce window, or that have been pending past the max-wait cap.
         foreach (var state in continuousSets)
         {
-            if (state.Pending.Count == 0)
+            if (state.NeedsReconcile || state.Pending.Count == 0)
                 continue;
 
             var schedule = state.BackupSet.JobOptions!.Schedule!;
@@ -288,7 +372,8 @@ public sealed class BackupWorker : BackgroundService
     /// and persisting the cursor. Opens (and, if necessary, creates) the
     /// journal on first use; returns empty when the volume has no usable journal.
     /// </summary>
-    private async Task<IReadOnlyList<UsnChange>> ReadVolumeChangesAsync(char drive, CancellationToken ct)
+    private async Task<(IReadOnlyList<UsnChange> Changes, bool Truncated)> ReadVolumeChangesAsync(
+        char drive, CancellationToken ct)
     {
         if (!_journalReaders.TryGetValue(drive, out var reader))
         {
@@ -303,27 +388,39 @@ public sealed class BackupWorker : BackgroundService
         }
 
         if (reader is null)
-            return [];
+            return ([], false);
 
         var volumeId = reader.VolumeId;
         var cursor = await _catalog.GetUsnCursorAsync(volumeId, ct);
 
-        // First run for this volume, or the journal was re-created: start from
-        // the current end so we don't replay the entire journal as "changes".
-        // Initial file state is captured by the scheduled/manual full backup.
-        if (cursor is null || cursor.Value.JournalId != reader.JournalId)
+        // First time we've tracked this volume: seed the cursor to the current
+        // end and watch forward. The set's initial full backup captures the
+        // baseline, so there is no prior gap to reconcile here.
+        if (cursor is null)
         {
             await _catalog.SaveUsnCursorAsync(
                 new UsnCursor(volumeId, reader.JournalId, reader.CurrentNextUsn, DateTime.UtcNow), ct);
-            return [];
+            return ([], false);
+        }
+
+        // The journal was deleted and recreated since we last read it (e.g. a
+        // very long outage, or `fsutil usn deletejournal`). Our saved position is
+        // meaningless against the new journal and the intervening changes are gone
+        // from it — re-seed to the current end and reconcile with a full scan.
+        if (cursor.Value.JournalId != reader.JournalId)
+        {
+            await _catalog.SaveUsnCursorAsync(
+                new UsnCursor(volumeId, reader.JournalId, reader.CurrentNextUsn, DateTime.UtcNow), ct);
+            return ([], true);
         }
 
         long startUsn = cursor.Value.NextUsn;
         IReadOnlyList<UsnChange> changes;
         long nextUsn;
+        bool truncated;
         try
         {
-            changes = reader.ReadChanges(startUsn, out nextUsn, ct);
+            changes = reader.ReadChanges(startUsn, out nextUsn, out truncated, ct);
         }
         catch (OperationCanceledException) when (ct.IsCancellationRequested)
         {
@@ -334,7 +431,22 @@ public sealed class BackupWorker : BackgroundService
             _logger.LogWarning(ex, "Failed reading USN journal on {Drive}: — will reopen next poll.", drive);
             reader.Dispose();
             _journalReaders.Remove(drive);
-            return [];
+            return ([], false);
+        }
+
+        if (truncated)
+        {
+            // Our saved cursor points before the journal's retained window: the
+            // records that changed while we were down have been purged (the
+            // journal wrapped). Re-seed the cursor to the journal's current end so
+            // live detection resumes instead of failing forever, and tell the
+            // caller to reconcile the missed gap with a full scan.
+            long resumeUsn = reader.TryRefreshPosition(out _, out long liveNext)
+                ? liveNext
+                : reader.CurrentNextUsn;
+            await _catalog.SaveUsnCursorAsync(
+                new UsnCursor(volumeId, reader.JournalId, resumeUsn, DateTime.UtcNow), ct);
+            return ([], true);
         }
 
         if (nextUsn != startUsn)
@@ -343,7 +455,7 @@ public sealed class BackupWorker : BackgroundService
                 new UsnCursor(volumeId, reader.JournalId, nextUsn, DateTime.UtcNow), ct);
         }
 
-        return changes;
+        return (changes, false);
     }
 
     /// <summary>
@@ -399,7 +511,15 @@ public sealed class BackupWorker : BackgroundService
         {
             var set = state.BackupSet;
             var opts = set.JobOptions!;
-            var targetDir = opts.TargetDirectory!;
+            var targetDir = await ResolveDestinationAsync(set, opts, ct);
+            if (targetDir is null)
+            {
+                // Destination not connected — requeue these paths for next poll.
+                var requeueNow = DateTime.UtcNow;
+                foreach (var p in paths)
+                    state.Pending.TryAdd(p, (requeueNow, requeueNow));
+                return;
+            }
             var job = BuildJob(set, opts, targetDir);
 
             var retentionTiers = opts.RetentionTiers.Count > 0
@@ -442,21 +562,29 @@ public sealed class BackupWorker : BackgroundService
         }
     }
 
-    /// <summary>Run a full scan-and-backup (scheduled interval/daily runs).</summary>
-    private async Task RunFullBackupAsync(SetState state, CancellationToken ct)
+    /// <summary>
+    /// Run a full scan-and-backup (scheduled interval/daily runs, and continuous
+    /// reconciliation after a journal gap). Returns <c>true</c> when the scan
+    /// actually ran to completion, or <c>false</c> when it was skipped because a
+    /// backup was already in progress or the destination was not connected (so a
+    /// caller that needs the run to happen can retry later).
+    /// </summary>
+    private async Task<bool> RunFullBackupAsync(SetState state, CancellationToken ct)
     {
         if (!await _backupLock.WaitAsync(0, ct))
         {
             _logger.LogInformation(
                 "Skipping backup for \"{Name}\" — another backup is in progress.", state.BackupSet.Name);
-            return;
+            return false;
         }
 
         try
         {
             var set = state.BackupSet;
             var opts = set.JobOptions!;
-            var targetDir = opts.TargetDirectory!;
+            var targetDir = await ResolveDestinationAsync(set, opts, ct);
+            if (targetDir is null)
+                return false; // Destination not connected; retry on a later run.
 
             _logger.LogInformation("Starting backup for \"{Name}\" → {Target}", set.Name, targetDir);
 
@@ -468,7 +596,7 @@ public sealed class BackupWorker : BackgroundService
             {
                 _logger.LogInformation("Nothing to back up for \"{Name}\".", set.Name);
                 state.LastRunUtc = DateTime.UtcNow;
-                return;
+                return true;
             }
 
             _logger.LogInformation(
@@ -500,14 +628,18 @@ public sealed class BackupWorker : BackgroundService
                 foreach (var f in result.FailedFiles.Take(10))
                     _logger.LogWarning("  Failed: {Path} — {Error}", f.Path, f.Error);
             }
+
+            return true;
         }
         catch (OperationCanceledException) when (ct.IsCancellationRequested)
         {
             _logger.LogInformation("Backup for \"{Name}\" cancelled.", state.BackupSet.Name);
+            return false;
         }
         catch (Exception ex)
         {
             _logger.LogError(ex, "Backup failed for \"{Name}\".", state.BackupSet.Name);
+            return false;
         }
         finally
         {
@@ -543,6 +675,9 @@ public sealed class BackupWorker : BackgroundService
             ExcludedExtensions = opts.ExcludedExtensions,
             RetentionTiers = opts.RetentionTiers,
             TierSets = opts.TierSets,
+            // Machine-global memory budget (shared with the interactive app via
+            // settings.json) so scheduled backups honor the same limit.
+            MemoryBudget = UserSettings.Load().MemoryBudget,
         };
     }
 
@@ -567,5 +702,13 @@ public sealed class BackupWorker : BackgroundService
         /// </summary>
         public Dictionary<string, (DateTime First, DateTime Last)> Pending { get; } =
             new(StringComparer.OrdinalIgnoreCase);
+
+        /// <summary>
+        /// True when a watched source volume's USN journal lost continuity (it
+        /// wrapped or was recreated during downtime), so this set needs a full
+        /// reconciling scan to catch changes the incremental journal stream
+        /// missed. Cleared once that scan runs.
+        /// </summary>
+        public bool NeedsReconcile { get; set; }
     }
 }

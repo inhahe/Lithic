@@ -118,8 +118,17 @@ public sealed class UsnJournalReader : IDisposable
     /// each to an absolute path. Returns the distinct set of changed items and
     /// the USN to resume from next time via <paramref name="nextUsn"/>.
     /// </summary>
-    public IReadOnlyList<UsnChange> ReadChanges(long startUsn, out long nextUsn, CancellationToken ct = default)
+    /// <param name="journalTruncated">
+    /// Set to <c>true</c> when <paramref name="startUsn"/> refers to a record that
+    /// has already been purged from the journal (the journal wrapped, so the
+    /// history between the saved cursor and now is gone). The caller cannot read
+    /// the gap incrementally and should reconcile with a full scan.
+    /// </param>
+    public IReadOnlyList<UsnChange> ReadChanges(
+        long startUsn, out long nextUsn, out bool journalTruncated, CancellationToken ct = default)
     {
+        journalTruncated = false;
+
         // Deduplicate by path — a single edit produces many records (extend,
         // overwrite, close, ...); we only care that the file changed.
         var byPath = new Dictionary<string, UsnChange>(StringComparer.OrdinalIgnoreCase);
@@ -144,8 +153,13 @@ public sealed class UsnJournalReader : IDisposable
                     input, input.Length, buffer, buffer.Length,
                     out int bytesReturned, IntPtr.Zero))
             {
-                // On any read failure, stop and keep the cursor where it was so
-                // the caller does not skip changes; the next poll retries.
+                // ERROR_JOURNAL_ENTRY_DELETED means our start USN has been purged
+                // because the journal wrapped (records older than the retained
+                // window are gone). The gap can't be read incrementally — flag it
+                // so the caller reconciles with a full scan. Any other failure
+                // just stops, keeping the cursor so the next poll retries.
+                if (Marshal.GetLastWin32Error() == ERROR_JOURNAL_ENTRY_DELETED)
+                    journalTruncated = true;
                 break;
             }
 
@@ -251,6 +265,15 @@ public sealed class UsnJournalReader : IDisposable
         return resolved;
     }
 
+    /// <summary>
+    /// Re-query the journal's live identity and next-USN position. Used to
+    /// re-seed the resume cursor to the journal's current end after it wrapped,
+    /// so live change detection resumes instead of endlessly re-reading a purged
+    /// start USN.
+    /// </summary>
+    public bool TryRefreshPosition(out long journalId, out long nextUsn)
+        => TryQueryJournal(_volume, out journalId, out nextUsn);
+
     private static bool TryQueryJournal(SafeFileHandle handle, out long journalId, out long nextUsn)
     {
         journalId = 0;
@@ -300,6 +323,9 @@ public sealed class UsnJournalReader : IDisposable
     private const uint FSCTL_QUERY_USN_JOURNAL = 0x000900f4;
     private const uint FSCTL_READ_USN_JOURNAL = 0x000900bb;
     private const uint FSCTL_CREATE_USN_JOURNAL = 0x000900e7;
+
+    /// <summary>The requested start USN has been purged from the journal (it wrapped).</summary>
+    private const int ERROR_JOURNAL_ENTRY_DELETED = 1181;
 
     [StructLayout(LayoutKind.Sequential)]
     private struct FILE_ID_DESCRIPTOR

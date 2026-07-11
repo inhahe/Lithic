@@ -1,0 +1,214 @@
+using System.Collections.ObjectModel;
+using System.Windows.Input;
+
+namespace LithicBackup.ViewModels;
+
+/// <summary>Whether a reviewed file is new or a changed version of an existing one.</summary>
+public enum ReviewFileStatus
+{
+    /// <summary>File is not yet in the catalog.</summary>
+    New,
+    /// <summary>File exists in the catalog but has changed since the last backup.</summary>
+    Changed,
+}
+
+/// <summary>
+/// A single node in the post-scan backup-review treeview.  Unlike
+/// <see cref="SourceSelectionNodeViewModel"/> (which lazily enumerates the whole
+/// filesystem), this tree is fully populated up-front from the computed backup
+/// diff, so sizes and counts reflect <em>only the files that will actually be
+/// backed up</em> (the incremental delta), not the entire source.
+/// </summary>
+public class BackupReviewNodeViewModel : ViewModelBase
+{
+    private bool? _isSelected = true;
+    private bool _isExpanded;
+    private bool _suppressPropagation;
+    private readonly Action? _onSelectionChanged;
+
+    public BackupReviewNodeViewModel(
+        string name, string fullPath, bool isDirectory,
+        BackupReviewNodeViewModel? parent,
+        Action? onSelectionChanged = null)
+    {
+        Name = name;
+        FullPath = fullPath;
+        IsDirectory = isDirectory;
+        Parent = parent;
+        _onSelectionChanged = onSelectionChanged ?? parent?._onSelectionChanged;
+        Depth = parent is null ? 0 : parent.Depth + 1;
+        Children = [];
+        ToggleExpandCommand = new RelayCommand(_ =>
+        {
+            if (IsDirectory)
+                IsExpanded = !IsExpanded;
+        });
+    }
+
+    /// <summary>Display name (leaf segment of the path).</summary>
+    public string Name { get; }
+
+    /// <summary>Absolute path to this file or directory.</summary>
+    public string FullPath { get; }
+
+    public bool IsDirectory { get; }
+    public BackupReviewNodeViewModel? Parent { get; }
+    public ObservableCollection<BackupReviewNodeViewModel> Children { get; }
+
+    /// <summary>Tree depth (0 = root) — drives the indent converter in the view.</summary>
+    public int Depth { get; }
+
+    /// <summary>For file nodes: new vs. changed. Null for directories.</summary>
+    public ReviewFileStatus? Status { get; set; }
+
+    /// <summary>
+    /// Size of this leaf file in bytes.  For directories this is 0; the
+    /// directory's displayed size is computed from selected descendants.
+    /// </summary>
+    public long OwnSizeBytes { get; set; }
+
+    public ICommand ToggleExpandCommand { get; }
+
+    /// <summary>Whether the expander arrow should be shown.</summary>
+    public bool HasChildren => Children.Count > 0;
+
+    public bool IsExpanded
+    {
+        get => _isExpanded;
+        set => SetProperty(ref _isExpanded, value);
+    }
+
+    /// <summary>
+    /// Tristate: true = will be backed up, false = excluded, null = partial.
+    /// </summary>
+    public bool? IsSelected
+    {
+        get => _isSelected;
+        set
+        {
+            if (_isSelected == value)
+                return;
+
+            _isSelected = value;
+            OnPropertyChanged();
+
+            if (_suppressPropagation)
+                return;
+
+            // Propagate down: set every child to the same definite state.
+            if (value.HasValue && IsDirectory)
+            {
+                foreach (var child in Children)
+                {
+                    child._suppressPropagation = true;
+                    child.IsSelected = value;
+                    child._suppressPropagation = false;
+                }
+            }
+
+            // Propagate up: recompute the parent's tristate.
+            Parent?.UpdateFromChildren();
+
+            // Sizes/counts changed for this node and every ancestor.
+            RefreshSizeSelfAndAncestors();
+
+            // Notify the owning viewmodel so it can refresh totals / fit status.
+            _onSelectionChanged?.Invoke();
+        }
+    }
+
+    /// <summary>Recompute this node's tristate from its children.</summary>
+    internal void UpdateFromChildren()
+    {
+        if (Children.Count == 0)
+            return;
+
+        bool allSelected = Children.All(c => c.IsSelected == true);
+        bool allDeselected = Children.All(c => c.IsSelected == false);
+
+        _suppressPropagation = true;
+        IsSelected = allSelected ? true : allDeselected ? false : null;
+        _suppressPropagation = false;
+
+        Parent?.UpdateFromChildren();
+    }
+
+    /// <summary>Sum of the sizes of all <em>selected</em> descendant files.</summary>
+    public long SelectedSizeBytes
+    {
+        get
+        {
+            if (!IsDirectory)
+                return IsSelected == true ? OwnSizeBytes : 0;
+            long total = 0;
+            foreach (var child in Children)
+                total += child.SelectedSizeBytes;
+            return total;
+        }
+    }
+
+    /// <summary>Count of all <em>selected</em> descendant files.</summary>
+    public int SelectedFileCount
+    {
+        get
+        {
+            if (!IsDirectory)
+                return IsSelected == true ? 1 : 0;
+            int total = 0;
+            foreach (var child in Children)
+                total += child.SelectedFileCount;
+            return total;
+        }
+    }
+
+    /// <summary>Human-readable selected size (e.g. "1.2 GB").</summary>
+    public string FormattedSize => FormatBytes(SelectedSizeBytes);
+
+    /// <summary>File-count column text. Empty for individual files.</summary>
+    public string FormattedFileCount
+        => IsDirectory ? $"{SelectedFileCount:N0}" : string.Empty;
+
+    /// <summary>Status label ("New"/"Changed") for file rows; empty for directories.</summary>
+    public string StatusText => Status switch
+    {
+        ReviewFileStatus.New => "New",
+        ReviewFileStatus.Changed => "Changed",
+        _ => string.Empty,
+    };
+
+    private void RefreshSizeSelfAndAncestors()
+    {
+        var node = this;
+        while (node is not null)
+        {
+            node.OnPropertyChanged(nameof(SelectedSizeBytes));
+            node.OnPropertyChanged(nameof(SelectedFileCount));
+            node.OnPropertyChanged(nameof(FormattedSize));
+            node.OnPropertyChanged(nameof(FormattedFileCount));
+            node = node.Parent;
+        }
+    }
+
+    /// <summary>Expand this node and all descendants.</summary>
+    public void ExpandAll()
+    {
+        if (!IsDirectory)
+            return;
+        IsExpanded = true;
+        foreach (var child in Children)
+            child.ExpandAll();
+    }
+
+    internal static string FormatBytes(long bytes)
+    {
+        string[] units = ["B", "KB", "MB", "GB", "TB"];
+        double size = bytes;
+        int unit = 0;
+        while (size >= 1024 && unit < units.Length - 1)
+        {
+            size /= 1024;
+            unit++;
+        }
+        return unit == 0 ? $"{bytes:N0} B" : $"{size:N1} {units[unit]}";
+    }
+}

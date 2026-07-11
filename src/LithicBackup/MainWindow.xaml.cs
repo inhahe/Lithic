@@ -67,6 +67,11 @@ public partial class MainWindow : Window
         new AboutDialog { Owner = this }.ShowDialog();
     }
 
+    private void Settings_Click(object sender, RoutedEventArgs e)
+    {
+        (Application.Current as App)?.OpenSettings(this);
+    }
+
     /// <summary>
     /// Intercept the window close (X button, Alt+F4) and minimize to the
     /// system tray instead. The app only truly exits via the tray icon's

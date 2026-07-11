@@ -46,7 +46,7 @@ public class RestoreService : IRestoreService
                     continue;
 
                 var chunks = file.IsSplit
-                    ? await _catalog.GetChunksForFileAsync(file.Id, ct)
+                    ? await _catalog.GetChunksForFileAsync(disc.Id, file.Id, ct)
                     : [];
 
                 results.Add(new RestorableFile
@@ -62,16 +62,14 @@ public class RestoreService : IRestoreService
     }
 
     /// <summary>
-    /// Restore specific files to a destination directory.
+    /// Restore specific files, routing each to a per-drive destination.
     /// </summary>
     public async Task<RestoreResult> RestoreAsync(
         IReadOnlyList<RestorableFile> files,
-        string destinationDirectory,
+        IReadOnlyDictionary<string, string> driveDestinations,
         IProgress<RestoreProgress>? progress = null,
         CancellationToken ct = default)
     {
-        Directory.CreateDirectory(destinationDirectory);
-
         // Group files by disc ID for efficient disc-at-a-time processing.
         var byDisc = files
             .GroupBy(f => f.Disc.Id)
@@ -120,7 +118,13 @@ public class RestoreService : IRestoreService
                 discRoot = FindDiscRoot(disc.Label);
                 if (discRoot is null)
                 {
-                    errors.Add($"Could not find mounted disc '{disc.Label}'. Skipping {discGroup.Count()} files.");
+                    // Directory-mode backups store their data in a folder whose
+                    // path is the disc label; optical backups use a volume
+                    // label. Tailor the message so a missing backup folder
+                    // isn't reported as a missing disc.
+                    errors.Add(LooksLikeDirectoryPath(disc.Label)
+                        ? $"Backup folder not found: '{disc.Label}'. The backup data may have been moved or deleted. Skipping {discGroup.Count()} files."
+                        : $"Could not find mounted disc '{disc.Label}'. Skipping {discGroup.Count()} files.");
                     continue;
                 }
             }
@@ -144,9 +148,18 @@ public class RestoreService : IRestoreService
 
                 try
                 {
-                    // Compute destination path preserving relative structure.
-                    string relativePath = GetRelativeRestorePath(record.SourcePath);
-                    string destPath = Path.Combine(destinationDirectory, relativePath);
+                    // Route to the destination chosen for this file's source
+                    // drive, recreating its path below the drive root.
+                    var (driveKey, relative) = SplitSourcePath(record.SourcePath);
+                    if (!driveDestinations.TryGetValue(driveKey, out var destRoot)
+                        || string.IsNullOrWhiteSpace(destRoot))
+                    {
+                        errors.Add(
+                            $"No destination set for drive '{driveKey}:' — skipping '{record.SourcePath}'.");
+                        continue;
+                    }
+
+                    string destPath = Path.Combine(destRoot, relative);
                     string? destDir = Path.GetDirectoryName(destPath);
                     if (destDir is not null)
                         Directory.CreateDirectory(destDir);
@@ -165,12 +178,11 @@ public class RestoreService : IRestoreService
                     }
                     else if (record.IsFileRef)
                     {
-                        // Restore from file-level dedup: read .fileref manifest,
-                        // copy canonical file from _filestore/{hash}.dat.
+                        // Restore from file-level dedup: a .fileref stores no
+                        // bytes. Its content lives as a plain copy elsewhere in
+                        // the tree; resolve the hash to that copy via the catalog.
                         await RestoreFileRefAsync(
-                            Path.Combine(discRoot, record.DiscPath),
-                            Path.Combine(discRoot, "_filestore"),
-                            destPath, ct);
+                            disc.BackupSetId, record.Hash, discRoot, destPath, ct);
                     }
                     else if (record.IsDeduped)
                     {
@@ -264,25 +276,30 @@ public class RestoreService : IRestoreService
     }
 
     /// <summary>
-    /// Read a .fileref manifest and copy the canonical file from the file store.
+    /// Restore a file-level dedup reference. A <c>.fileref</c> stores no bytes;
+    /// its content is held by a plain copy elsewhere in the same backup set's
+    /// tree. Resolve <paramref name="hash"/> to that plain copy via the catalog
+    /// and copy it to the destination.
     /// </summary>
-    private static async Task RestoreFileRefAsync(
-        string fileRefPath,
-        string fileStoreDir,
+    private async Task RestoreFileRefAsync(
+        int backupSetId,
+        string hash,
+        string discRoot,
         string destPath,
         CancellationToken ct)
     {
-        string json = await File.ReadAllTextAsync(fileRefPath, ct);
-        var manifest = JsonSerializer.Deserialize<FileRefManifest>(json)
-            ?? throw new InvalidOperationException(
-                $"Failed to parse fileref manifest: {fileRefPath}");
-
-        string canonicalPath = Path.Combine(fileStoreDir, manifest.Hash + ".dat");
-        if (!File.Exists(canonicalPath))
+        var candidates = await _catalog.GetActiveRecordsByHashAsync(backupSetId, hash, ct);
+        var plain = candidates.FirstOrDefault(r => !r.IsFileRef && !r.IsDeduped);
+        if (plain is null)
             throw new FileNotFoundException(
-                $"Missing file in store: {manifest.Hash}.dat", canonicalPath);
+                $"No plain copy found for referenced content {hash}.");
 
-        File.Copy(canonicalPath, destPath, overwrite: true);
+        string sourcePath = Path.Combine(discRoot, plain.DiscPath);
+        if (!File.Exists(sourcePath))
+            throw new FileNotFoundException(
+                $"Referenced content file missing: {plain.DiscPath}", sourcePath);
+
+        File.Copy(sourcePath, destPath, overwrite: true);
     }
 
     /// <summary>
@@ -320,6 +337,17 @@ public class RestoreService : IRestoreService
     }
 
     /// <summary>
+    /// Whether a disc label looks like a directory path (directory-mode backup)
+    /// rather than an optical volume label. Rooted paths such as
+    /// <c>D:\backups\out</c> or <c>\\server\share</c> qualify.
+    /// </summary>
+    private static bool LooksLikeDirectoryPath(string label) =>
+        !string.IsNullOrWhiteSpace(label)
+        && (Path.IsPathRooted(label)
+            || label.Contains('\\')
+            || label.Contains('/'));
+
+    /// <summary>
     /// Try to find a mounted disc or directory backup target.
     /// </summary>
     private static string? FindDiscRoot(string discLabel)
@@ -341,16 +369,19 @@ public class RestoreService : IRestoreService
     }
 
     /// <summary>
-    /// Build a relative path from a source path for restore destination.
+    /// Split a source path into its drive key (uppercase drive letter, or
+    /// <c>"_"</c> for non-drive paths such as UNC) and the path relative to the
+    /// drive root. For example <c>D:\docs\a.txt</c> → (<c>"D"</c>,
+    /// <c>"docs\a.txt"</c>).
     /// </summary>
-    private static string GetRelativeRestorePath(string sourcePath)
+    private static (string driveKey, string relative) SplitSourcePath(string sourcePath)
     {
         string root = Path.GetPathRoot(sourcePath) ?? "";
         string relative = sourcePath[root.Length..];
 
-        char driveLetter = sourcePath.Length >= 2 && sourcePath[1] == ':'
-            ? sourcePath[0]
-            : '_';
-        return Path.Combine(driveLetter.ToString(), relative);
+        string driveKey = sourcePath.Length >= 2 && sourcePath[1] == ':'
+            ? char.ToUpperInvariant(sourcePath[0]).ToString()
+            : "_";
+        return (driveKey, relative);
     }
 }

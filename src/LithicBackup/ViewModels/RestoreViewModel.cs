@@ -16,7 +16,8 @@ public class RestoreViewModel : ViewModelBase
     private readonly IRestoreService _restoreService;
 
     private BackupSet? _selectedBackupSet;
-    private string _destinationPath = "";
+    private bool _restoreToOriginal;
+    private HashSet<string> _selectedDriveKeys = new(StringComparer.OrdinalIgnoreCase);
     private bool _isLoading;
     private bool _isRestoring;
     private bool _isComplete;
@@ -38,10 +39,9 @@ public class RestoreViewModel : ViewModelBase
         _catalog = catalog;
         _restoreService = restoreService;
         _selectedBackupSet = backupSet;
-        RestorableFiles = [];
-        SelectedFiles = [];
+        Roots = [];
+        DriveDestinations = [];
 
-        BrowseCommand = new RelayCommand(_ => BrowseDestination());
         RestoreCommand = new RelayCommand(_ => _ = RestoreAsync(), _ => CanRestore());
         CancelCommand = new RelayCommand(_ => _cts?.Cancel(), _ => IsRestoring);
         DoneCommand = new RelayCommand(_ => DoneRequested?.Invoke());
@@ -54,16 +54,67 @@ public class RestoreViewModel : ViewModelBase
 
     public BackupSet SelectedBackupSet => _selectedBackupSet!;
 
-    public ObservableCollection<RestorableFileViewModel> RestorableFiles { get; }
+    /// <summary>Root nodes of the restorable-file tree (one per drive).</summary>
+    public ObservableCollection<RestoreNodeViewModel> Roots { get; }
 
-    /// <summary>Files the user has selected for restore.</summary>
-    public ObservableCollection<RestorableFileViewModel> SelectedFiles { get; }
-
-    public string DestinationPath
+    /// <summary>Number of files currently checked for restore.</summary>
+    public int SelectedFileCount
     {
-        get => _destinationPath;
-        set => SetProperty(ref _destinationPath, value);
+        get => _selectedFileCount;
+        private set => SetProperty(ref _selectedFileCount, value);
     }
+    private int _selectedFileCount;
+
+    /// <summary>
+    /// Tristate "check all" bound to the header checkbox: true when every root
+    /// is fully selected, false when none are, null when partial.
+    /// </summary>
+    public bool? IsAllSelected
+    {
+        get
+        {
+            if (Roots.Count == 0)
+                return false;
+            bool allTrue = Roots.All(r => r.IsSelected == true);
+            bool allFalse = Roots.All(r => r.IsSelected == false);
+            return allTrue ? true : (allFalse ? false : (bool?)null);
+        }
+        set
+        {
+            // A click forces a definite state (false when toggling off an
+            // indeterminate box); apply it to every root, which cascades down.
+            bool target = value == true;
+            foreach (var root in Roots)
+                root.IsSelected = target;
+            OnPropertyChanged();
+        }
+    }
+
+    /// <summary>
+    /// One row per distinct source drive in the backup set, each with its own
+    /// editable destination folder.
+    /// </summary>
+    public ObservableCollection<DriveDestinationViewModel> DriveDestinations { get; }
+
+    /// <summary>
+    /// When true, each drive's files are restored to their original locations
+    /// (the drive's own root) and the per-drive destination inputs are ignored.
+    /// </summary>
+    public bool RestoreToOriginal
+    {
+        get => _restoreToOriginal;
+        set
+        {
+            if (SetProperty(ref _restoreToOriginal, value))
+            {
+                OnPropertyChanged(nameof(IsCustomDestination));
+                CommandManager.InvalidateRequerySuggested();
+            }
+        }
+    }
+
+    /// <summary>Inverse of <see cref="RestoreToOriginal"/>, for enabling the per-drive inputs.</summary>
+    public bool IsCustomDestination => !_restoreToOriginal;
 
     public bool IsLoading
     {
@@ -115,7 +166,6 @@ public class RestoreViewModel : ViewModelBase
 
     // --- Commands ---
 
-    public ICommand BrowseCommand { get; }
     public ICommand RestoreCommand { get; }
     public ICommand CancelCommand { get; }
     public ICommand DoneCommand { get; }
@@ -126,8 +176,8 @@ public class RestoreViewModel : ViewModelBase
     {
         IsLoading = true;
         StatusText = "Loading files from catalog...";
-        RestorableFiles.Clear();
-        SelectedFiles.Clear();
+        Roots.Clear();
+        SelectedFileCount = 0;
 
         try
         {
@@ -137,21 +187,28 @@ public class RestoreViewModel : ViewModelBase
             var latestByPath = files
                 .GroupBy(f => f.Record.SourcePath, StringComparer.OrdinalIgnoreCase)
                 .Select(g => g.OrderByDescending(f => f.Record.BackedUpUtc).First())
-                .OrderBy(f => f.Record.SourcePath)
+                .OrderBy(f => f.Record.SourcePath, StringComparer.OrdinalIgnoreCase)
                 .ToList();
 
-            foreach (var file in latestByPath)
+            BuildTree(latestByPath);
+
+            // One destination row per distinct source drive.
+            DriveDestinations.Clear();
+            var drives = latestByPath
+                .Select(f => GetDriveLetter(f.Record.SourcePath))
+                .Distinct(StringComparer.OrdinalIgnoreCase)
+                .OrderBy(d => d, StringComparer.OrdinalIgnoreCase);
+            foreach (var drive in drives)
             {
-                var vm = new RestorableFileViewModel(file);
-                vm.PropertyChanged += (_, e) =>
-                {
-                    if (e.PropertyName == nameof(RestorableFileViewModel.IsSelected))
-                        UpdateSelectedFiles();
-                };
-                RestorableFiles.Add(vm);
+                var driveVm = new DriveDestinationViewModel(drive);
+                // Re-evaluate the Restore button when a destination is edited.
+                driveVm.PropertyChanged += (_, _) =>
+                    CommandManager.InvalidateRequerySuggested();
+                DriveDestinations.Add(driveVm);
             }
 
-            StatusText = $"{RestorableFiles.Count:N0} files available for restore.";
+            OnPropertyChanged(nameof(IsAllSelected));
+            StatusText = $"{latestByPath.Count:N0} files available for restore.";
         }
         catch (Exception ex)
         {
@@ -163,35 +220,146 @@ public class RestoreViewModel : ViewModelBase
         }
     }
 
-    private void UpdateSelectedFiles()
+    /// <summary>
+    /// Build the directory/file tree from the flat list of restorable files.
+    /// Each file's full source path (e.g. <c>D:\dir\sub\file.txt</c>) is split
+    /// into path segments; directory nodes are created/reused on the way down
+    /// and the file is attached as a leaf. Directories sort before files, both
+    /// alphabetically. Directory sizes aggregate their descendants.
+    /// </summary>
+    private void BuildTree(IReadOnlyList<RestorableFile> files)
     {
-        SelectedFiles.Clear();
-        foreach (var f in RestorableFiles.Where(f => f.IsSelected))
-            SelectedFiles.Add(f);
+        // Map of directory full-path -> node, so repeated prefixes are reused.
+        var dirNodes = new Dictionary<string, RestoreNodeViewModel>(StringComparer.OrdinalIgnoreCase);
+        var rootNodes = new Dictionary<string, RestoreNodeViewModel>(StringComparer.OrdinalIgnoreCase);
+
+        foreach (var file in files)
+        {
+            string path = file.Record.SourcePath;
+            string[] segments = path.Split(
+                ['\\', '/'], StringSplitOptions.RemoveEmptyEntries);
+            if (segments.Length == 0)
+                continue;
+
+            // Walk/create the directory chain for everything but the last
+            // segment (which is the file name).
+            RestoreNodeViewModel? parent = null;
+            string accumulated = "";
+            for (int i = 0; i < segments.Length - 1; i++)
+            {
+                accumulated = accumulated.Length == 0
+                    ? segments[i] + (segments[i].EndsWith(':') ? "\\" : "")
+                    : Path.Combine(accumulated, segments[i]);
+
+                if (!dirNodes.TryGetValue(accumulated, out var dirNode))
+                {
+                    dirNode = new RestoreNodeViewModel(
+                        segments[i], accumulated, i, OnNodeSelectionChanged);
+                    dirNodes[accumulated] = dirNode;
+
+                    if (parent is null)
+                        rootNodes[accumulated] = dirNode;
+                    else
+                    {
+                        dirNode.Parent = parent;
+                        parent.Children.Add(dirNode);
+                    }
+                }
+                parent = dirNode;
+            }
+
+            // Leaf file node.
+            string fileName = segments[^1];
+            var fileNode = new RestoreNodeViewModel(
+                fileName, file, segments.Length - 1, OnNodeSelectionChanged)
+            {
+                Parent = parent,
+            };
+            if (parent is null)
+                rootNodes[path] = fileNode;
+            else
+                parent.Children.Add(fileNode);
+        }
+
+        // Sort each node's children (directories first, then files), aggregate
+        // directory sizes, and publish the roots.
+        foreach (var root in rootNodes.Values
+                     .OrderByDescending(n => n.IsDirectory)
+                     .ThenBy(n => n.Name, StringComparer.OrdinalIgnoreCase))
+        {
+            SortAndAggregate(root);
+            // Expand the top level so the tree isn't a single collapsed row.
+            if (root.IsDirectory)
+                root.IsExpanded = true;
+            Roots.Add(root);
+        }
+    }
+
+    /// <summary>
+    /// Recursively sort a node's children (directories before files, each
+    /// alphabetical) and roll descendant file sizes up into directory sizes.
+    /// </summary>
+    private static long SortAndAggregate(RestoreNodeViewModel node)
+    {
+        if (!node.IsDirectory)
+            return node.SizeBytes;
+
+        var sorted = node.Children
+            .OrderByDescending(c => c.IsDirectory)
+            .ThenBy(c => c.Name, StringComparer.OrdinalIgnoreCase)
+            .ToList();
+        node.Children.Clear();
+
+        long total = 0;
+        foreach (var child in sorted)
+        {
+            total += SortAndAggregate(child);
+            node.Children.Add(child);
+        }
+        node.SizeBytes = total;
+        return total;
+    }
+
+    private void OnNodeSelectionChanged()
+    {
+        var selected = new List<RestorableFile>();
+        foreach (var root in Roots)
+            root.CollectSelectedFiles(selected);
+        SelectedFileCount = selected.Count;
+        _selectedDriveKeys = selected
+            .Select(f => GetDriveKey(f.Record.SourcePath))
+            .ToHashSet(StringComparer.OrdinalIgnoreCase);
+        OnPropertyChanged(nameof(IsAllSelected));
+        CommandManager.InvalidateRequerySuggested();
     }
 
     private bool CanRestore()
     {
-        return !IsRestoring
-               && SelectedFiles.Count > 0
-               && !string.IsNullOrWhiteSpace(DestinationPath);
+        if (IsRestoring || SelectedFileCount == 0)
+            return false;
+
+        // Restoring to original locations needs no destinations; otherwise
+        // every drive that has selected files must have a destination set.
+        if (RestoreToOriginal)
+            return true;
+
+        return _selectedDriveKeys.All(key =>
+            DriveDestinations.Any(d =>
+                d.DriveKey.Equals(key, StringComparison.OrdinalIgnoreCase)
+                && !string.IsNullOrWhiteSpace(d.DestinationPath)));
     }
 
-    private void BrowseDestination()
-    {
-        // Use WinForms FolderBrowserDialog since WPF doesn't have one built in.
-        // This avoids adding a NuGet dependency.
-        var dialog = new System.Windows.Forms.FolderBrowserDialog
-        {
-            Description = "Select destination folder for restored files",
-            UseDescriptionForTitle = true,
-        };
+    /// <summary>Drive letter with colon (e.g. "D:"), or "_" for non-drive paths.</summary>
+    private static string GetDriveLetter(string sourcePath) =>
+        sourcePath.Length >= 2 && sourcePath[1] == ':'
+            ? char.ToUpperInvariant(sourcePath[0]) + ":"
+            : "_";
 
-        if (dialog.ShowDialog() == System.Windows.Forms.DialogResult.OK)
-        {
-            DestinationPath = dialog.SelectedPath;
-        }
-    }
+    /// <summary>Uppercase drive letter without colon (e.g. "D"), or "_".</summary>
+    private static string GetDriveKey(string sourcePath) =>
+        sourcePath.Length >= 2 && sourcePath[1] == ':'
+            ? char.ToUpperInvariant(sourcePath[0]).ToString()
+            : "_";
 
     private async Task RestoreAsync()
     {
@@ -206,9 +374,15 @@ public class RestoreViewModel : ViewModelBase
 
         try
         {
-            var filesToRestore = SelectedFiles
-                .Select(vm => vm.File)
-                .ToList();
+            var filesToRestore = new List<RestorableFile>();
+            foreach (var root in Roots)
+                root.CollectSelectedFiles(filesToRestore);
+
+            // Build the per-drive destination map: original roots when restoring
+            // in place, otherwise the user's chosen folder for each drive.
+            var mapping = new Dictionary<string, string>(StringComparer.OrdinalIgnoreCase);
+            foreach (var d in DriveDestinations)
+                mapping[d.DriveKey] = RestoreToOriginal ? d.OriginalRoot : d.DestinationPath;
 
             var progress = new Progress<RestoreProgress>(p =>
             {
@@ -219,7 +393,7 @@ public class RestoreViewModel : ViewModelBase
             });
 
             var result = await _restoreService.RestoreAsync(
-                filesToRestore, DestinationPath, progress, _cts.Token);
+                filesToRestore, mapping, progress, _cts.Token);
 
             StatusText = result.Success
                 ? "Restore completed successfully."
@@ -227,6 +401,17 @@ public class RestoreViewModel : ViewModelBase
 
             ResultDetail = $"Files restored: {result.FilesRestored:N0}\n" +
                            $"Data restored: {FormatBytes(result.BytesRestored)}";
+
+            // Show where files landed so they're easy to find.
+            if (result.FilesRestored > 0)
+            {
+                ResultDetail += "\n\nRestored to:";
+                foreach (var d in DriveDestinations.Where(d => _selectedDriveKeys.Contains(d.DriveKey)))
+                {
+                    string dest = RestoreToOriginal ? d.OriginalRoot : d.DestinationPath;
+                    ResultDetail += $"\n  {d.DriveLetter} → {dest}";
+                }
+            }
 
             if (result.Errors.Count > 0)
             {
@@ -255,33 +440,4 @@ public class RestoreViewModel : ViewModelBase
     }
 
     private static string FormatBytes(long bytes) => $"{bytes:N0}";
-}
-
-/// <summary>
-/// ViewModel for a single restorable file with a selection checkbox.
-/// </summary>
-public class RestorableFileViewModel : ViewModelBase
-{
-    private bool _isSelected;
-
-    public RestorableFileViewModel(RestorableFile file)
-    {
-        File = file;
-    }
-
-    public RestorableFile File { get; }
-
-    public bool IsSelected
-    {
-        get => _isSelected;
-        set => SetProperty(ref _isSelected, value);
-    }
-
-    // Convenience properties for binding.
-    public string SourcePath => File.Record.SourcePath;
-    public string DiscLabel => File.Disc.Label;
-    public long SizeBytes => File.Record.SizeBytes;
-    public DateTime BackedUpUtc => File.Record.BackedUpUtc;
-    public bool IsZipped => File.Record.IsZipped;
-    public bool IsSplit => File.Record.IsSplit;
 }

@@ -20,6 +20,8 @@
     <EmbeddedResource Include="Data\Migrations\002_BackupSetConfig.sql" />
     <EmbeddedResource Include="Data\Migrations\003_CatalogQueryIndex.sql" />
     <EmbeddedResource Include="Data\Migrations\004_UsnCursors.sql" />
+    <EmbeddedResource Include="Data\Migrations\005_DiscOwners.sql" />
+    <EmbeddedResource Include="Data\SetSchema.sql" />
   </ItemGroup>
 
 </Project>

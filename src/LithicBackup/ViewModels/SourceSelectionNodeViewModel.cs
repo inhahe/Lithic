@@ -48,6 +48,17 @@ public class SourceSelectionNodeViewModel : ViewModelBase
     /// an empty subtree and permanently destroy the saved selections.
     /// </summary>
     private Core.Models.SourceSelection? _restoredModel;
+    /// <summary>
+    /// Saved child selections whose paths were NOT present on disk when this
+    /// directory's children were enumerated (e.g. a selected subfolder was
+    /// renamed, moved, or temporarily disconnected).  Without preserving them,
+    /// <see cref="ToModel"/> would re-derive the subtree from only the live
+    /// children and silently, permanently drop the missing selection — so a
+    /// folder that is later restored under its original name would no longer be
+    /// backed up.  These are re-emitted verbatim by <see cref="ToModel"/> so the
+    /// selection survives until the user explicitly changes it.
+    /// </summary>
+    private List<Core.Models.SourceSelection>? _orphanedChildModels;
     private long _size = -1;
     private int _fileCount = -1;
     /// <summary>
@@ -538,7 +549,18 @@ public class SourceSelectionNodeViewModel : ViewModelBase
                 var childNode = Children.FirstOrDefault(c =>
                     string.Equals(c.Path, childModel.Path, StringComparison.OrdinalIgnoreCase));
                 if (childNode is not null)
+                {
                     tasks.Add(childNode.ApplySelectionAsync(childModel));
+                }
+                else if (childModel.IsSelected != false)
+                {
+                    // The saved selection referenced a child that is no longer
+                    // on disk (renamed/moved/disconnected).  Preserve it so a
+                    // later save (ToModel) doesn't silently drop the selection;
+                    // if the path comes back under its original name it will be
+                    // backed up again.
+                    (_orphanedChildModels ??= []).Add(childModel);
+                }
             }
             await Task.WhenAll(tasks);
         }
@@ -639,27 +661,15 @@ public class SourceSelectionNodeViewModel : ViewModelBase
 
         try
         {
-            // Pre-compute sizes on the background thread when the cache
-            // likely has the data, making each child lookup fast (timestamp
-            // check + dictionary read, no file enumeration for unchanged dirs).
-            //
-            // precomputeAll: parent was computed this session or has a prior
-            // cache entry, so all child directories are very likely cached —
-            // try inline computation for every child unconditionally.
-            //
-            // precomputeCachedOnly: parent is NOT cached (e.g. drive root)
-            // but individual children may have their own cache entries from
-            // a prior session.  Check each child individually: if it has a
-            // cache entry, compute inline (fast); otherwise leave it for the
-            // scheduler queue.
+            // Populate child directory sizes cheaply during enumeration by
+            // reading the shared cache: each lookup is a single dictionary read
+            // plus a timestamp check, with no subtree traversal.  We deliberately
+            // never walk uncached subtrees inline — that could block direct
+            // children from appearing for seconds on large trees.  Any child
+            // whose recursive total isn't cached is handed to the background
+            // scheduler in Phase 2 (it shows "Working..." until the size lands).
             bool showSizes = _getShowSizes?.Invoke() ?? false;
-            bool computedThisSession = _size >= 0 && _fileCount >= 0;
-            bool cachedFromPriorSession = !computedThisSession
-                && _scheduler is not null && _scheduler.HasCacheEntry(Path);
-            bool precomputeAll = showSizes && _scheduler is not null
-                && (computedThisSession || cachedFromPriorSession);
-            bool precomputeCachedOnly = showSizes && _scheduler is not null
-                && !precomputeAll;
+            bool precomputeCachedSizes = showSizes && _scheduler is not null;
 
             // Grab the exclusion filter once for the whole enumeration (it
             // doesn't change mid-load and invoking the delegate is cheap
@@ -696,35 +706,11 @@ public class SourceSelectionNodeViewModel : ViewModelBase
                             long filtDirSize = -1;
                             int filtDirFileCount = -1;
 
-                            if (precomputeAll)
+                            if (precomputeCachedSizes)
                             {
-                                // Try O(1) cached recursive total first
+                                // O(1) cached recursive total lookup only
                                 // (single dictionary lookup + timestamp check).
-                                var rec = _scheduler!.TryGetCachedSize(subDir.FullName);
-                                if (rec.HasValue)
-                                {
-                                    dirSize = rec.Value.Size;
-                                    dirFileCount = rec.Value.FileCount;
-                                }
-                                else if (!_suppressSizeComputation)
-                                {
-                                    // Full recursive computation — only when the
-                                    // user clicked to expand, not during restore.
-                                    try
-                                    {
-                                        var (sz, fc) = _scheduler!.ComputeInline(subDir, excludeFilter: null);
-                                        dirSize = sz;
-                                        dirFileCount = fc;
-                                    }
-                                    catch { }
-                                }
-                            }
-                            else if (precomputeCachedOnly)
-                            {
-                                // Parent is NOT cached (e.g. drive root), but
-                                // the child might have a cached recursive total
-                                // from a prior session — single dictionary lookup,
-                                // no subdirectory traversal.
+                                // Never a recursive walk — see the comment above.
                                 var rec = _scheduler!.TryGetCachedSize(subDir.FullName);
                                 if (rec.HasValue)
                                 {
@@ -738,8 +724,7 @@ public class SourceSelectionNodeViewModel : ViewModelBase
                             // prior session are an O(1) lookup, so try those
                             // inline.  Anything not cached is left to the
                             // scheduler in Phase 2.
-                            if (activeFilter is not null
-                                && (precomputeAll || precomputeCachedOnly))
+                            if (activeFilter is not null && precomputeCachedSizes)
                             {
                                 var filtRec = _scheduler!.TryGetCachedFilteredSize(subDir.FullName);
                                 if (filtRec.HasValue)
@@ -1482,6 +1467,18 @@ public class SourceSelectionNodeViewModel : ViewModelBase
                 var childModel = child.ToModel();
                 if (childModel is not null)
                     model.Children.Add(childModel);
+            }
+
+            // Re-emit saved selections whose paths weren't on disk this session
+            // (see _orphanedChildModels) so they survive a re-save untouched.
+            if (_orphanedChildModels is not null)
+            {
+                foreach (var orphan in _orphanedChildModels)
+                {
+                    if (!model.Children.Any(c =>
+                            string.Equals(c.Path, orphan.Path, StringComparison.OrdinalIgnoreCase)))
+                        model.Children.Add(orphan);
+                }
             }
         }
 

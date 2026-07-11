@@ -293,6 +293,71 @@ so the editor reflects the true stored config regardless of Enabled.
   properties (System.Text.Json does NOT omit defaults unless `DefaultIgnoreCondition`
   is set), so `Enabled`/`Mode` persist correctly in `sets`/master DB JobOptions JSON.
 
+## Continuous backup misses changes when the USN journal wraps during downtime (2026-07-11)
+
+**Status:** FIXED 2026-07-11. Continuous mode now detects a lost-continuity journal
+(wrap or recreation during downtime) and self-heals by running a full reconciling
+backup, then re-seeding the cursor to the journal's current end. See "Fix" below.
+
+**Fix:** `UsnJournalReader.ReadChanges` now reports an `out bool journalTruncated`,
+set when `FSCTL_READ_USN_JOURNAL` fails with `ERROR_JOURNAL_ENTRY_DELETED` (1181) —
+i.e. the saved start USN was purged. A new `UsnJournalReader.TryRefreshPosition`
+re-queries the live `NextUsn`. In `BackupWorker.ReadVolumeChangesAsync`, the old
+combined "cursor null OR JournalId mismatch → reset to now, return no changes" branch
+was split: a truly first-seen volume (`cursor is null`) still just seeds forward
+quietly, but a **JournalId mismatch on an existing cursor** (journal recreated) and a
+**truncation during read** (journal wrapped) both re-seed the cursor to the current
+end AND return a `Truncated` signal. `CheckContinuousAsync` collects the truncated
+drives, flags every continuous set watching them (`SetState.NeedsReconcile`), and runs
+a full `RunFullBackupAsync` reconcile (which now returns `bool` so the flag is cleared
+only when the scan actually runs — it retries on later polls if the backup lock is
+busy or the destination is offline). The debounce pass skips reconcile-pending sets.
+Net: no more silently-stuck cursor and no more missed downtime changes.
+
+**Scenario:** A set is on `ScheduleMode.Continuous`. The Worker (or whole machine) is
+off for a while, or the source volume sees heavy churn while off. On restart, a
+brand-new directory / new files added during the gap should be backed up.
+
+**Normal path (works):** Continuous mode is driven by the NTFS USN change journal,
+which NTFS keeps writing to whether or not Lithic runs. `BackupWorker.ReadVolumeChangesAsync`
+(BackupWorker.cs:326) loads the per-volume cursor from the `UsnCursors` catalog table,
+and as long as the `JournalId` still matches (line 349) it reads **every** record since
+that cursor via `UsnJournalReader.ReadChanges` (UsnJournalReader.cs:121) — full catch-up.
+New files under the new directory get enqueued (the directory-creation record itself is
+skipped at BackupWorker.cs:279 `if (change.IsDirectory) continue;`, but the file
+create/write records inside it are picked up), matched by `PathBelongsToSet` (honoring
+`AutoIncludeNewSubdirectories`, default true), debounced, and backed up through the same
+`DirectoryBackupService.ExecuteTargetedAsync` incremental machinery. So the new directory
+**is** backed up in the typical case.
+
+**The bug (journal wrap):** The USN journal has a fixed max size; NTFS purges the oldest
+records once it fills. After a long gap or heavy churn, the saved cursor USN can already
+be purged. Then `FSCTL_READ_USN_JOURNAL` fails and `ReadChanges` just `break`s
+(UsnJournalReader.cs:147-150), returning **empty** with `nextUsn == startUsn`, so
+`ReadVolumeChangesAsync` does **not** advance/save the cursor (line 375). A wrap does
+**not** change the `JournalId`, so the "reset to current end" branch (line 349) never
+fires either. Net effect: the cursor stays stuck on the purged USN and every future poll
+silently reads nothing — continuous detection for that volume is **permanently stuck**
+until the journal is deleted+recreated (new JournalId), which then resets to "now" and
+skips the gap anyway. The gap's changes (including the new directory) are lost to
+continuous mode. It's also **silent** — the failing `DeviceIoControl` doesn't throw, so
+`ReadVolumeChangesAsync`'s catch/log path (line 367) isn't even hit.
+
+**No fallback:** Continuous sets get no periodic full rescan — `CheckSchedulesAsync`
+maps `ScheduleMode.Continuous` to `_ => false` (BackupWorker.cs:218). So nothing walks
+the source tree to close the gap. The only recovery today is a **manual backup** (full
+`PlanAsync` scan) from the GUI, which would pick up the new directory.
+
+**Proper fix:** (1) Detect the purged-cursor case — check the read failure for
+`ERROR_JOURNAL_ENTRY_DELETED` (and/or compare the saved cursor against the journal's
+`FirstUsn`/lowest valid USN from `FSCTL_QUERY_USN_JOURNAL`). When the cursor is behind
+the journal's start, treat it like a journal reset. (2) On that reset, don't silently
+skip — trigger a one-off **full incremental backup** (`RunFullBackupAsync`) to
+reconcile the source against the catalog, then re-seed the cursor to the current
+`NextUsn`. That makes continuous mode self-healing across any downtime/wrap. Optionally
+also run a periodic safety-net full scan for continuous sets (e.g. daily) so a stuck
+journal can't hide indefinitely.
+
 ## Tech debt: dead schedule-wipe landmine in SaveBackupSetAsync
 
 **Status:** Dead code (no callers), low priority. Landmine if re-wired.

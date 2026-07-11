@@ -149,6 +149,23 @@
                           Content="Allow file splitting across discs"
                           IsChecked="{Binding AllowFileSplitting}"
                           Margin="0,0,0,6" />
+
+                <!-- Test mode: simulated burner (only shown in test mode) -->
+                <Border Grid.Row="5" Grid.Column="0" Grid.ColumnSpan="2"
+                        Margin="0,8,0,0" Padding="10"
+                        BorderBrush="#FFFFB300" BorderThickness="1" CornerRadius="4"
+                        Background="#22FFB300"
+                        Visibility="{Binding IsTestMode, Converter={StaticResource BoolToVis}}">
+                    <StackPanel>
+                        <CheckBox Content="Use simulated burner (test mode)"
+                                  IsChecked="{Binding UseSimulatedBurner}"
+                                  FontWeight="SemiBold"
+                                  Margin="0,0,0,6" />
+                        <TextBlock TextWrapping="Wrap" FontSize="11"
+                                   Foreground="#FFFFB300"
+                                   Text="When checked, burns are simulated against a virtual recorder instead of real hardware. No disc is written — this is non-functional and for testing only." />
+                    </StackPanel>
+                </Border>
             </Grid>
 
             <!-- Directory-specific options (visible only in directory mode) -->
@@ -176,6 +193,22 @@
                                  Padding="6,4" Width="80"
                                  BorderBrush="{StaticResource BorderBrush}" />
                     </StackPanel>
+
+                    <!-- Test mode: stub plain content (only shown in test mode) -->
+                    <Border Margin="0,4,0,8" Padding="10"
+                            BorderBrush="#FFFFB300" BorderThickness="1" CornerRadius="4"
+                            Background="#22FFB300"
+                            Visibility="{Binding IsTestMode, Converter={StaticResource BoolToVis}}">
+                        <StackPanel>
+                            <CheckBox Content="Stub plain (non-deduplicated) file content"
+                                      IsChecked="{Binding StubPlainContent}"
+                                      FontWeight="SemiBold"
+                                      Margin="0,0,0,6" />
+                            <TextBlock TextWrapping="Wrap" FontSize="11"
+                                       Foreground="#FFFFB300"
+                                       Text="When checked, plain (non-deduplicated) files are written as tiny hash+size stubs instead of real content, so a dedup test run doesn't fill the drive. Deduplicated content stays real and restorable, but the stubbed files are non-functional and can't be restored. For testing dedup only — this does not produce a real backup." />
+                        </StackPanel>
+                    </Border>
 
                     <TextBlock Text="Version Retention Tier Sets" FontWeight="SemiBold" Margin="0,8,0,4" />
                     <TextBlock Foreground="{StaticResource TextSecondaryBrush}" FontSize="11" Margin="0,0,0,8"

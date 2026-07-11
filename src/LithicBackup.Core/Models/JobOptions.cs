@@ -26,7 +26,32 @@ public class JobOptions
     /// </summary>
     public List<VersionTierSet> TierSets { get; set; } = [];
 
+    /// <summary>
+    /// The last-resolved full destination path (e.g. <c>"E:\Backups\Photos"</c>).
+    /// This is a <i>cache</i> for display and backward compatibility, kept in
+    /// sync with the current drive letter; the durable identity is
+    /// <see cref="DestinationVolumeId"/> + <see cref="DestinationSubpath"/>.
+    /// When the volume cannot be resolved (drive not connected) this is the
+    /// best-known path to show the user.
+    /// </summary>
     public string? TargetDirectory { get; set; }
+
+    /// <summary>
+    /// Stable volume GUID path (<c>\\?\Volume{GUID}\</c>) of the destination
+    /// drive.  Survives Windows drive-letter reassignments.  Null for sets
+    /// created before the volume-identity feature or whose volume has never
+    /// been resolvable; such sets fall back to <see cref="TargetDirectory"/>
+    /// and are backfilled the first time the volume resolves.
+    /// </summary>
+    public string? DestinationVolumeId { get; set; }
+
+    /// <summary>
+    /// Destination path relative to the volume root (e.g. <c>"Backups\Photos"</c>).
+    /// Combined with the volume's current mount point to form the live target
+    /// path.  Null when <see cref="DestinationVolumeId"/> is null.
+    /// </summary>
+    public string? DestinationSubpath { get; set; }
+
     public bool CreateSubdirectory { get; set; }
     public string? SubdirectoryName { get; set; }
     public List<string> ExcludedExtensions { get; set; } = [];
