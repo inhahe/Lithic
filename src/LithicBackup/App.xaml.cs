@@ -240,6 +240,12 @@ public partial class App : Application
         mainWindow.Show();
         splash.Close();
 
+        // Closing the splash doesn't reliably transfer foreground activation to
+        // the newly shown main window, so it can come up behind other windows.
+        // Force it to the front with the same activation dance (Activate + brief
+        // Topmost toggle) the tray "Open" path uses.
+        ShowMainWindow();
+
         // Start background monitoring if there are existing backup sets.
         _ = StartBackgroundMonitoringAsync();
     }
