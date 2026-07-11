@@ -79,6 +79,22 @@ public interface ICatalogRepository : IDisposable
     Task<FileRecord?> GetFileRecordByPathAndVersionAsync(int backupSetId, string sourcePath, int version, CancellationToken ct = default);
 
     /// <summary>
+    /// All catalog records (every version, including deleted history) for one
+    /// exact source path in a set, ordered by version. Used to relocate a file's
+    /// destination copy when its source is renamed/moved, and to decide whether
+    /// relocation is safe (a single plain version) or must fall back to a re-copy.
+    /// </summary>
+    Task<IReadOnlyList<FileRecord>> GetFileRecordsByPathAsync(int backupSetId, string sourcePath, CancellationToken ct = default);
+
+    /// <summary>
+    /// All catalog records (every version, including deleted history) whose
+    /// SourcePath is the given directory or lies under it. Used to relocate an
+    /// entire subtree's destination copies when a source directory is
+    /// renamed/moved, and to gate whether that relocation is safe.
+    /// </summary>
+    Task<IReadOnlyList<FileRecord>> GetFileRecordsUnderDirectoryAsync(int backupSetId, string directoryPrefix, CancellationToken ct = default);
+
+    /// <summary>
     /// Distinct content hashes in a backup set that have at least one active
     /// (non-deleted) PLAIN copy — a record that holds the real bytes under its
     /// own name (not a <c>.fileref</c> pointer and not a <c>.dedup</c> manifest).

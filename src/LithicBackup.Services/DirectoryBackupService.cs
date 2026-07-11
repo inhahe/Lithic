@@ -8,6 +8,22 @@ using LithicBackup.Core.Models;
 namespace LithicBackup.Services;
 
 /// <summary>
+/// Result of a targeted relocation attempt (<see cref="DirectoryBackupService.MoveTargetedAsync"/>).
+/// </summary>
+public enum TargetedMoveOutcome
+{
+    /// <summary>The destination copy was renamed/moved in place and the catalog updated.</summary>
+    Relocated,
+
+    /// <summary>
+    /// Relocation was not safe/possible (special storage format, version history,
+    /// missing/locked destination copy). The caller should back up the new source
+    /// path as fresh files instead.
+    /// </summary>
+    FellBack,
+}
+
+/// <summary>
 /// Backs up files to a directory target with versioned file history.
 ///
 /// Layout on disk:
@@ -1395,6 +1411,151 @@ public class DirectoryBackupService
         return await ExecuteAsync(
             job, targetDirectory, retentionTiers,
             progress: null, ct, precomputedDiff: diff);
+    }
+
+    /// <summary>
+    /// Relocate a file's or directory's existing destination copy to match a
+    /// same-volume source rename/move, instead of re-copying its bytes. Only
+    /// applies when every affected catalog record is a single plain current
+    /// version (no <c>.dedup</c>/<c>.fileref</c>/split/zip formats and no version
+    /// history) — those live in the shared block store or the <c>_prev</c> history
+    /// tree and cannot be moved with a simple rename, so the caller must fall back
+    /// to a re-copy. A moved directory relocates its whole current subtree with a
+    /// single <see cref="Directory.Move"/>.
+    /// </summary>
+    /// <returns>
+    /// <see cref="TargetedMoveOutcome.Relocated"/> when the destination copy was
+    /// moved and the catalog updated; <see cref="TargetedMoveOutcome.FellBack"/>
+    /// when relocation was not safe/possible and the caller should back up the new
+    /// path as fresh files (leaving the old copy for the next full scan to prune).
+    /// </returns>
+    public async Task<TargetedMoveOutcome> MoveTargetedAsync(
+        BackupJob job,
+        string targetDirectory,
+        string oldPath,
+        string newPath,
+        bool isDirectory,
+        CancellationToken ct)
+    {
+        if (!job.BackupSetId.HasValue)
+            throw new ArgumentException("Targeted move requires an existing backup set.", nameof(job));
+
+        int setId = job.BackupSetId.Value;
+
+        var records = isDirectory
+            ? await _catalog.GetFileRecordsUnderDirectoryAsync(setId, oldPath, ct)
+            : await _catalog.GetFileRecordsByPathAsync(setId, oldPath, ct);
+
+        // Nothing tracked under the old path — treat the new side as fresh.
+        if (records.Count == 0)
+            return TargetedMoveOutcome.FellBack;
+
+        // Phase 1 relocates only plain, single-version copies. Any special format
+        // (block-dedup manifest, file-level reference, split, zip) or any file
+        // with more than one catalog version lives partly in the shared block
+        // store or the _prev history tree, which a plain rename cannot relocate.
+        var byPathVersions = records
+            .GroupBy(r => r.SourcePath, StringComparer.OrdinalIgnoreCase);
+        foreach (var grp in byPathVersions)
+        {
+            if (grp.Count() > 1)
+                return TargetedMoveOutcome.FellBack;
+            var rec = grp.First();
+            if (rec.IsDeduped || rec.IsFileRef || rec.IsSplit || rec.IsZipped || rec.IsDeleted)
+                return TargetedMoveOutcome.FellBack;
+        }
+
+        try
+        {
+            if (isDirectory)
+            {
+                string oldDir = Path.Combine(
+                    targetDirectory, GetDrivePrefix(oldPath), GetRelativePath(oldPath));
+                string newDir = Path.Combine(
+                    targetDirectory, GetDrivePrefix(newPath), GetRelativePath(newPath));
+
+                if (!Directory.Exists(oldDir))
+                    return TargetedMoveOutcome.FellBack;
+
+                string? newParent = Path.GetDirectoryName(newDir);
+                if (newParent is not null)
+                    Directory.CreateDirectory(newParent);
+
+                // A same-volume rename of the whole current subtree in one move —
+                // children are relocated implicitly, mirroring the source move.
+                Directory.Move(oldDir, newDir);
+
+                foreach (var rec in records)
+                {
+                    ct.ThrowIfCancellationRequested();
+                    string newSource = RemapPathPrefix(rec.SourcePath, oldPath, newPath);
+                    rec.SourcePath = newSource;
+                    rec.DiscPath = GetCurrentDiscPath(newSource, rec.IsDeduped, rec.IsFileRef);
+                    await _catalog.UpdateFileRecordAsync(rec, ct);
+                }
+            }
+            else
+            {
+                var rec = records[0];
+                string oldAbs = GetCurrentPath(targetDirectory, oldPath, false, false);
+                string newAbs = GetCurrentPath(targetDirectory, newPath, false, false);
+
+                if (!File.Exists(oldAbs))
+                    return TargetedMoveOutcome.FellBack;
+
+                string? newParent = Path.GetDirectoryName(newAbs);
+                if (newParent is not null)
+                    Directory.CreateDirectory(newParent);
+
+                File.Move(oldAbs, newAbs, overwrite: false);
+
+                try
+                {
+                    rec.SourcePath = newPath;
+                    rec.DiscPath = GetCurrentDiscPath(newPath, false, false);
+                    await _catalog.UpdateFileRecordAsync(rec, ct);
+                }
+                catch
+                {
+                    // Catalog update failed after the on-disk move — roll the file
+                    // back so the record and its bytes stay consistent, then let the
+                    // caller re-copy from the new source path.
+                    try { File.Move(newAbs, oldAbs, overwrite: false); } catch { /* best effort */ }
+                    throw;
+                }
+            }
+
+            return TargetedMoveOutcome.Relocated;
+        }
+        catch (OperationCanceledException) when (ct.IsCancellationRequested)
+        {
+            throw;
+        }
+        catch (Exception ex) when (ex is IOException or UnauthorizedAccessException)
+        {
+            // Destination busy/locked or a name collision — fall back to a re-copy
+            // rather than risk a half-applied relocation.
+            return TargetedMoveOutcome.FellBack;
+        }
+    }
+
+    /// <summary>
+    /// Replace an <paramref name="oldPrefix"/> path prefix on <paramref name="path"/>
+    /// with <paramref name="newPrefix"/>, respecting directory boundaries. When
+    /// <paramref name="path"/> equals <paramref name="oldPrefix"/> exactly (the
+    /// moved item itself), it maps to <paramref name="newPrefix"/>.
+    /// </summary>
+    private static string RemapPathPrefix(string path, string oldPrefix, string newPrefix)
+    {
+        if (string.Equals(path, oldPrefix, StringComparison.OrdinalIgnoreCase))
+            return newPrefix;
+
+        string trimmedOld = oldPrefix.TrimEnd('\\');
+        string trimmedNew = newPrefix.TrimEnd('\\');
+        if (path.StartsWith(trimmedOld + "\\", StringComparison.OrdinalIgnoreCase))
+            return trimmedNew + path[trimmedOld.Length..];
+
+        return path; // not under the prefix — leave untouched
     }
 
     // -------------------------------------------------------------------

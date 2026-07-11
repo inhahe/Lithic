@@ -373,3 +373,58 @@ path `SyncSettingsToJobOptions`, which preserves the existing schedule object.
 **Proper fix if revived:** either delete `ShowJobConfig`/`SaveBackupSetAsync`/
 `BuildSchedule` if truly unused, or make the save path preserve/merge the existing
 `Schedule` instead of overwriting it with a possibly-null rebuild.
+
+## Move/rename relocation — Phase 1 shipped; Phase 2 (special formats & history) pending (2026-07-11)
+
+**Status:** Phase 1 IMPLEMENTED 2026-07-11. Continuous backup now detects same-volume
+renames/moves from the USN journal and relocates the destination copy in place instead
+of re-copying, for the common case. Phase 2 (below) is the remaining follow-up.
+
+**What Phase 1 does:** `UsnJournalReader.ReadChanges` now captures each record's own
+File Reference Number (offset 8) and pairs `RENAME_OLD_NAME`/`RENAME_NEW_NAME` records
+sharing that FRN into `UsnMove(OldPath, NewPath, IsDirectory)` intents (returned via a
+new `out IReadOnlyList<UsnMove> moves`). Because a same-volume directory move emits a
+single pair on the directory's own FRN (its children are **not** re-journaled), one move
+relocates a whole subtree. `BackupWorker.CheckContinuousAsync` routes moves to every set
+either endpoint touches (`SetState.PendingMoves`) and applies them each poll via
+`RunMovesAsync` (under the backup lock, requeued while the destination is offline).
+`DirectoryBackupService.MoveTargetedAsync` renames the destination copy
+(`File.Move`/`Directory.Move`) and rewrites the affected catalog records' `SourcePath` +
+`DiscPath`, returning `TargetedMoveOutcome.Relocated` or `FellBack`.
+
+**Phase 1 fallback (intentional, correct-but-suboptimal):** relocation is only attempted
+when **every** affected catalog record is a single plain current version. If any record
+is `.dedup` (block store), `.fileref` (file-level dedup), split, zipped, or has version
+history in the `{drive}_prev` tree, `MoveTargetedAsync` returns `FellBack` and the worker
+re-copies the new path as fresh files (`EnqueueForBackup`), leaving the stale old-path
+copy for the next full scan to prune. This is correct (no data loss) but re-copies bytes
+that a relocation could have moved. A directory falls back **as a whole** if *any* file
+under it is a special format — so one deduped file in a large moved folder currently
+forces re-copying the entire folder.
+
+**Phase 2 (TODO) — relocate special formats and history in place:**
+1. **`.dedup`/`.fileref` current copies:** these are small manifests under
+   `{drive}/relative.{dedup,fileref}`. A rename can move the manifest and rewrite its
+   `DiscPath`; the shared `_blocks/` store and hash-keyed content pointers are unaffected
+   by a path change, so this should be a manifest move + catalog update (watch the
+   `.fileref` `ContentPath` hint — verify whether it stores an absolute/relative path
+   that must be repointed).
+2. **Version history (`{drive}_prev/relative.v{n}[.suffix]`):** relocate the `_prev`
+   subtree alongside the current tree so old versions keep resolving by the new
+   `SourcePath`. Needs to move both `{drive}/relDir` and `{drive}_prev/relDir` and rewrite
+   every version record.
+3. **Per-file directory relocation:** instead of all-or-nothing per directory, relocate
+   the plain files individually and fall back only the special-format ones, so a single
+   deduped file doesn't force re-copying a whole moved folder.
+4. **Atomicity:** `MoveTargetedAsync` currently moves on disk then updates catalog rows
+   one by one (with a single-file rollback-move on catalog failure). For multi-record
+   directory moves there's a small window where a mid-loop failure leaves the catalog
+   partially rewritten until the next full scan reconciles. Consider wrapping the record
+   updates in a catalog transaction (`BeginTransactionAsync`).
+
+**Not handled (by design, matches existing continuous-delete behavior):** an item moved
+**out** of a set's scope (e.g. to the Recycle Bin or another location outside the
+selection) is not marked deleted immediately — its removal is reconciled by the next full
+scan. Pure continuous mode has no periodic full rescan (see the journal-wrap issue
+above), so out-of-scope move-deletes rely on a manual/scheduled full run, same as
+in-place deletes.

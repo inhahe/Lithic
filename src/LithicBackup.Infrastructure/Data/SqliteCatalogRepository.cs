@@ -412,6 +412,12 @@ public class SqliteCatalogRepository : ICatalogRepository
     public Task<FileRecord?> GetFileRecordByPathAndVersionAsync(int backupSetId, string sourcePath, int version, CancellationToken ct = default)
         => GetSet(backupSetId).GetFileRecordByPathAndVersionAsync(backupSetId, sourcePath, version, ct);
 
+    public Task<IReadOnlyList<FileRecord>> GetFileRecordsByPathAsync(int backupSetId, string sourcePath, CancellationToken ct = default)
+        => GetSet(backupSetId).GetFileRecordsByPathAsync(backupSetId, sourcePath, ct);
+
+    public Task<IReadOnlyList<FileRecord>> GetFileRecordsUnderDirectoryAsync(int backupSetId, string directoryPrefix, CancellationToken ct = default)
+        => GetSet(backupSetId).GetFileRecordsUnderDirectoryAsync(backupSetId, directoryPrefix, ct);
+
     public Task<HashSet<string>> GetActivePlainHashesAsync(int backupSetId, CancellationToken ct = default)
         => GetSet(backupSetId).GetActivePlainHashesAsync(backupSetId, ct);
 

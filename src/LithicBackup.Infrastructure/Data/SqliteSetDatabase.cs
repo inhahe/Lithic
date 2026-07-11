@@ -492,6 +492,56 @@ internal sealed class SqliteSetDatabase : IDisposable
         return r.Read() ? ReadFile(r) : null;
     }
 
+    public async Task<IReadOnlyList<FileRecord>> GetFileRecordsByPathAsync(int backupSetId, string sourcePath, CancellationToken ct = default)
+    {
+        ct.ThrowIfCancellationRequested();
+        using var _ = await LockAsync(ct).ConfigureAwait(false);
+
+        using var cmd = _connection.CreateCommand();
+        cmd.CommandText = """
+            SELECT f.* FROM Files f
+            INNER JOIN Discs d ON f.DiscId = d.Id
+            WHERE d.BackupSetId = $setId
+              AND f.SourcePath = $path
+            ORDER BY f.Version
+            """;
+        cmd.Parameters.AddWithValue("$setId", backupSetId);
+        cmd.Parameters.AddWithValue("$path", sourcePath);
+
+        var list = new List<FileRecord>();
+        using var r = cmd.ExecuteReader();
+        while (r.Read())
+            list.Add(ReadFile(r));
+        return list;
+    }
+
+    public async Task<IReadOnlyList<FileRecord>> GetFileRecordsUnderDirectoryAsync(int backupSetId, string directoryPrefix, CancellationToken ct = default)
+    {
+        ct.ThrowIfCancellationRequested();
+        using var _ = await LockAsync(ct).ConfigureAwait(false);
+
+        var prefix = directoryPrefix.TrimEnd('\\') + "\\";
+        var escaped = prefix.Replace("[", "\\[").Replace("%", "\\%").Replace("_", "\\_");
+
+        using var cmd = _connection.CreateCommand();
+        cmd.CommandText = """
+            SELECT f.* FROM Files f
+            INNER JOIN Discs d ON f.DiscId = d.Id
+            WHERE d.BackupSetId = $setId
+              AND (f.SourcePath LIKE $prefix ESCAPE '\' OR f.SourcePath = $exact)
+            ORDER BY f.SourcePath, f.Version
+            """;
+        cmd.Parameters.AddWithValue("$setId", backupSetId);
+        cmd.Parameters.AddWithValue("$prefix", escaped + "%");
+        cmd.Parameters.AddWithValue("$exact", directoryPrefix);
+
+        var list = new List<FileRecord>();
+        using var r = cmd.ExecuteReader();
+        while (r.Read())
+            list.Add(ReadFile(r));
+        return list;
+    }
+
     public async Task<HashSet<string>> GetActivePlainHashesAsync(int backupSetId, CancellationToken ct = default)
     {
         ct.ThrowIfCancellationRequested();
