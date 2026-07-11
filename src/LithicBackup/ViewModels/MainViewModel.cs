@@ -1735,8 +1735,15 @@ public class MainViewModel : ViewModelBase
                     if (review is null)
                     {
                         // User cancelled the backup from the review dialog.
-                        StatusText = $"\"{backupSet.Name}\": backup cancelled.";
+                        row.Progress = null;
                         row.IsRunning = false;
+                        row.LastResultIsError = insufficientSpace;
+                        row.LastResultText = insufficientSpace
+                            ? "Backup cancelled — not enough free space on the destination."
+                            : "Backup cancelled.";
+                        StatusText = insufficientSpace
+                            ? "Backup cancelled — not enough free space."
+                            : $"\"{backupSet.Name}\": backup cancelled.";
                         return;
                     }
 
@@ -1778,7 +1785,11 @@ public class MainViewModel : ViewModelBase
                 if (!forceReview && !insufficientSpace
                     && !CheckFreeSpaceBeforeBackup(job.TargetDirectory!, totalBytes))
                 {
+                    row.Progress = null;
                     row.IsRunning = false;
+                    row.LastResultIsError = true;
+                    row.LastResultText = "Backup cancelled — not enough free space on the destination.";
+                    StatusText = "Backup cancelled — not enough free space.";
                     return;
                 }
             }
@@ -2446,20 +2457,26 @@ public class MainViewModel : ViewModelBase
                 return true; // plenty of space
 
             string driveLetter = pathRoot.TrimEnd('\\');
-            var result = MessageBox.Show(
+            string message =
                 $"The target drive ({driveLetter}) only has {FormatBytes(freeSpace)} free, " +
                 $"but the backup needs {FormatBytes(requiredBytes)}.\n\n" +
                 $"The backup will run out of space and may be incomplete.\n\n" +
-                $"Start anyway?",
-                "Insufficient Disk Space",
-                MessageBoxButton.YesNo,
-                MessageBoxImage.Warning);
+                $"Start anyway?";
+
+            // Show the prompt owned by (and activated over) the main window.
+            // An ownerless MessageBox can open behind the app and never take
+            // focus, so the backup appears frozen on "Scanning…" while it
+            // silently waits for a click the user can't see.
+            var owner = _editorWindow ?? Application.Current.MainWindow;
+            owner?.Activate();
+            var result = owner is not null
+                ? MessageBox.Show(owner, message, "Insufficient Disk Space",
+                    MessageBoxButton.YesNo, MessageBoxImage.Warning)
+                : MessageBox.Show(message, "Insufficient Disk Space",
+                    MessageBoxButton.YesNo, MessageBoxImage.Warning);
 
             if (result != MessageBoxResult.Yes)
-            {
-                StatusText = "Backup cancelled — not enough free space.";
                 return false;
-            }
         }
         catch { /* can't check — let it proceed */ }
         return true;
