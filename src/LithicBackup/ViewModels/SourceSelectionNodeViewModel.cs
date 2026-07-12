@@ -80,6 +80,7 @@ public class SourceSelectionNodeViewModel : ViewModelBase
     /// lossless.
     /// </summary>
     private bool _pendingDeferredRestore;
+    private bool _isSelectionRestored;
     private long _size = -1;
     private int _fileCount = -1;
     /// <summary>
@@ -531,6 +532,23 @@ public class SourceSelectionNodeViewModel : ViewModelBase
     }
 
     /// <summary>
+    /// Whether this node's <see cref="IsSelected"/> value reflects its final,
+    /// intended state — i.e. it has been settled (restored from the saved model,
+    /// or derived at creation for a freshly enumerated child).  Bound by the
+    /// tree's Include checkbox visibility: the box stays hidden (space reserved)
+    /// until this is true, so the user never sees a column of default-unchecked
+    /// boxes flip to their real state.  Because each node reveals itself the
+    /// instant its own state settles — independent of its descendants' restore —
+    /// checkboxes appear top-down almost immediately instead of waiting for the
+    /// entire recursive restore (including deep filesystem enumeration) to finish.
+    /// </summary>
+    public bool IsSelectionRestored
+    {
+        get => _isSelectionRestored;
+        internal set => SetProperty(ref _isSelectionRestored, value);
+    }
+
+    /// <summary>
     /// Whether new subdirectories added in the future should be automatically included.
     /// Only meaningful for directories.
     /// </summary>
@@ -616,6 +634,11 @@ public class SourceSelectionNodeViewModel : ViewModelBase
         _autoIncludeNew = model.AutoIncludeNewSubdirectories;
         OnPropertyChanged(nameof(AutoIncludeNew));
 
+        // This node's own state is now settled — reveal its checkbox immediately,
+        // without waiting for its (possibly deep, slow-to-enumerate) descendants
+        // to finish restoring.  This is what makes checkboxes appear top-down.
+        IsSelectionRestored = true;
+
         // Decide whether to restore this subtree's children eagerly now, or
         // defer it until the user expands the node.  To keep the initial dialog
         // open snappy we only eagerly walk currently-visible subtrees: the
@@ -683,6 +706,16 @@ public class SourceSelectionNodeViewModel : ViewModelBase
     private async Task ApplyChildModelsAsync(
         IReadOnlyList<Core.Models.SourceSelection> childModels)
     {
+        // Reveal every direct child's checkbox up front.  Children already carry
+        // their correct state: freshly enumerated ones inherited it at creation
+        // (CreateChildNode), and any that also appear in the saved model have it
+        // corrected synchronously by the ApplySelectionAsync calls below — all
+        // before the UI thread next renders — so no checkbox flashes a wrong
+        // value.  Doing this before recursing means a directory's own row and its
+        // immediate children appear without waiting for grandchildren to load.
+        foreach (var child in Children)
+            child.IsSelectionRestored = true;
+
         var tasks = new List<Task>(childModels.Count);
         foreach (var childModel in childModels)
         {
@@ -703,6 +736,23 @@ public class SourceSelectionNodeViewModel : ViewModelBase
             }
         }
         await Task.WhenAll(tasks);
+    }
+
+    /// <summary>
+    /// Reveal this node's Include checkbox and those of all currently-loaded
+    /// descendants.  A safety net run once the restore finishes: it flips any
+    /// node the restore never touched (e.g. a drive present on the system but
+    /// absent from the saved model, or the old serialisation format's untouched
+    /// nodes) from hidden to visible.  Nodes reached by the restore already set
+    /// this eagerly, so this only affects the stragglers and never regresses a
+    /// value that's already correct.
+    /// </summary>
+    internal void RevealCheckboxesRecursive()
+    {
+        IsSelectionRestored = true;
+        if (_isLoaded)
+            foreach (var child in Children)
+                child.RevealCheckboxesRecursive();
     }
 
     /// <summary>
@@ -986,6 +1036,11 @@ public class SourceSelectionNodeViewModel : ViewModelBase
             _fileCount = entry.FileCount,
             _filteredSize = entry.FilteredSize,
             _filteredFileCount = entry.FilteredFileCount,
+            // A freshly enumerated child's selection state is known synchronously
+            // here (inherited from this parent).  If it also appears in a saved
+            // model, ApplyChildModelsAsync corrects it before the next render, so
+            // its checkbox can be shown immediately without a wrong-state flash.
+            _isSelectionRestored = true,
         };
 
         // Determine backup status for files from the catalog.

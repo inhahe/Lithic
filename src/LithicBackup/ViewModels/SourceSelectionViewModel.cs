@@ -1392,6 +1392,12 @@ public class SourceSelectionViewModel : ViewModelBase
         OnPropertyChanged(nameof(IsAllSelected));
         OnPropertyChanged(nameof(IsAllAutoIncludeNew));
 
+        // Safety net: reveal any checkbox the restore didn't touch (drives with
+        // no saved selection, old-format untouched nodes).  Per-node reveal has
+        // already shown the matched/enumerated nodes top-down; this catches the
+        // stragglers so no checkbox stays permanently hidden.
+        RootNode.RevealCheckboxesRecursive();
+
         }
         finally
         {
