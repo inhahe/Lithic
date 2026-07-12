@@ -1936,10 +1936,15 @@ public class MainViewModel : ViewModelBase
                     TotalBytes = totalBytes,
                 };
 
-                // When the review dialog wasn't shown, keep the lightweight
-                // free-space warning as a safety net.
-                if (!forceReview && !insufficientSpace
-                    && !CheckFreeSpaceBeforeBackup(job.TargetDirectory!, totalBytes))
+                // Final free-space gate — ALWAYS re-check, reading the
+                // destination's free space fresh right before writing and
+                // comparing it against the (possibly review-reduced) total.
+                // This is the re-check after the user deselects items in the
+                // review dialog: the earlier scan-time figure is stale once the
+                // selection changes, so confirm the trimmed set actually fits
+                // now. CheckFreeSpaceBeforeBackup only prompts when it still
+                // doesn't fit, and lets the user override with "Start anyway".
+                if (!CheckFreeSpaceBeforeBackup(job.TargetDirectory!, totalBytes))
                 {
                     row.Progress = null;
                     row.IsRunning = false;

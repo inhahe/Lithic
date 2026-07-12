@@ -339,8 +339,19 @@ public class DirectoryBackupService
         // 6. Copy files.
         var failedFiles = new List<FailedFile>();
         long totalBytes = filesToBackup.Sum(f => f.SizeBytes);
+        // Physical bytes actually stored — drives the disc record's BytesUsed.
         long bytesWritten = 0;
+        // Progress numerator: planned bytes *dealt with* so far, whatever the
+        // outcome (written, deduped, unchanged, or skipped/failed). This is what
+        // the UI's "copied / total" reflects, so the bar keeps advancing to 100%
+        // instead of freezing whenever a run hits a long stretch of unchanged
+        // files or files that fail to copy (e.g. the disk filling up).
+        long bytesProcessed = 0;
         bool permanentSkipAll = false;
+        // Set when the destination runs out of space mid-run: rather than
+        // recording a "disk full" failure for every remaining file (which spams
+        // the failed/skipped list), stop the run cleanly after the first one.
+        bool diskFullAbort = false;
 
         // Track hashes + formats of successfully backed-up files for verification.
         var backedUp = job.VerifyAfterBackup
@@ -408,7 +419,7 @@ public class DirectoryBackupService
                     if (driveInfo.IsReady)
                     {
                         long freeSpace = driveInfo.AvailableFreeSpace;
-                        long bytesRemaining = totalBytes - bytesWritten;
+                        long bytesRemaining = totalBytes - bytesProcessed;
                         if (freeSpace < bytesRemaining)
                         {
                             lowSpaceWarned = true;
@@ -417,10 +428,10 @@ public class DirectoryBackupService
                                 StatusMessage = $"\u26A0 Low disk space: {FormatBytes(freeSpace)} free, " +
                                     $"{FormatBytes(bytesRemaining)} remaining to copy",
                                 CurrentFile = file.FullPath,
-                                BytesWrittenTotal = bytesWritten,
+                                BytesWrittenTotal = bytesProcessed,
                                 BytesTotalAll = totalBytes,
                                 OverallPercentage = totalBytes > 0
-                                    ? (double)bytesWritten / totalBytes * 100 : 0,
+                                    ? (double)bytesProcessed / totalBytes * 100 : 0,
                             });
                         }
                     }
@@ -433,10 +444,10 @@ public class DirectoryBackupService
                 CurrentDisc = 1,
                 TotalDiscs = 1,
                 CurrentFile = file.FullPath,
-                BytesWrittenTotal = bytesWritten,
+                BytesWrittenTotal = bytesProcessed,
                 BytesTotalAll = totalBytes,
                 OverallPercentage = totalBytes > 0
-                    ? (double)bytesWritten / totalBytes * 100
+                    ? (double)bytesProcessed / totalBytes * 100
                     : 0,
                 CurrentFileBytesWritten = 0,
                 CurrentFileTotalBytes = file.SizeBytes,
@@ -604,6 +615,10 @@ public class DirectoryBackupService
                         SourceLastWriteUtc = file.LastWriteUtc,
                         SizeBytes = contentSize,
                     };
+                    // Unchanged content writes nothing, but it's a planned file
+                    // now dealt with — advance the progress numerator so a run
+                    // over a large unchanged tree doesn't look frozen.
+                    bytesProcessed += file.SizeBytes;
                     break; // unchanged content — move on to the next file
                 }
 
@@ -617,12 +632,12 @@ public class DirectoryBackupService
                 DeduplicationRecipe? recipe = null;
 
                 // Build a throttled per-file progress callback for large files.
-                // Captures the current bytesWritten so intermediate reports show
-                // accurate overall progress too.
+                // Captures the current bytesProcessed so intermediate reports
+                // show accurate overall progress too.
                 Action<long>? fileProgress = null;
                 if (file.SizeBytes >= PerFileProgressThreshold && progress is not null)
                 {
-                    long capturedBytesWritten = bytesWritten;
+                    long capturedBytesProcessed = bytesProcessed;
                     long lastReportedAt = 0;
                     fileProgress = bytesCopied =>
                     {
@@ -635,10 +650,10 @@ public class DirectoryBackupService
                                 CurrentDisc = 1,
                                 TotalDiscs = 1,
                                 CurrentFile = file.FullPath,
-                                BytesWrittenTotal = capturedBytesWritten + bytesCopied,
+                                BytesWrittenTotal = capturedBytesProcessed + bytesCopied,
                                 BytesTotalAll = totalBytes,
                                 OverallPercentage = totalBytes > 0
-                                    ? (double)(capturedBytesWritten + bytesCopied) / totalBytes * 100
+                                    ? (double)(capturedBytesProcessed + bytesCopied) / totalBytes * 100
                                     : 0,
                                 CurrentFileBytesWritten = bytesCopied,
                                 CurrentFileTotalBytes = file.SizeBytes,
@@ -897,12 +912,43 @@ public class DirectoryBackupService
                     backedUp?.TryAdd(file.FullPath, (hash, isDeduped, isFileRef));
 
                 bytesWritten += file.SizeBytes;
+                bytesProcessed += file.SizeBytes;
                 batchCount++;
             }
             catch (OperationCanceledException) { throw; }
             catch (Exception ex)
             {
                 string errorDetail = DescribeFileError(ex, file.FullPath);
+                var category = BackupErrorClassifier.Classify(ex);
+
+                // Destination out of space: this isn't a per-file problem — every
+                // remaining file will fail the same way. Record this one failure,
+                // stop the run cleanly (preserving everything already committed),
+                // and let the user free space / deselect and run again, instead of
+                // filling the failed/skipped list with hundreds of identical
+                // "disk full" entries or prompting once per file.
+                if (category == BackupErrorCategory.DiskFull)
+                {
+                    failedFiles.Add(new FailedFile
+                    {
+                        Path = file.FullPath,
+                        Error = errorDetail,
+                        ActionTaken = BurnFailureAction.Abort,
+                    });
+                    bytesProcessed += file.SizeBytes;
+                    diskFullAbort = true;
+                    progress?.Report(new BackupProgress
+                    {
+                        StatusMessage = "Destination disk is full — stopping backup. "
+                            + "Free space or deselect files, then run again.",
+                        CurrentFile = file.FullPath,
+                        BytesWrittenTotal = bytesProcessed,
+                        BytesTotalAll = totalBytes,
+                        OverallPercentage = totalBytes > 0
+                            ? (double)bytesProcessed / totalBytes * 100 : 0,
+                    });
+                    break; // leave the retry loop; the for-loop breaks below
+                }
 
                 // If the user previously chose "Skip All", skip without
                 // prompting again.
@@ -914,6 +960,7 @@ public class DirectoryBackupService
                         Error = errorDetail,
                         ActionTaken = BurnFailureAction.Skip,
                     });
+                    bytesProcessed += file.SizeBytes;
                     continue;
                 }
 
@@ -922,8 +969,7 @@ public class DirectoryBackupService
                 FailureDecision decision;
                 try
                 {
-                    decision = await onFailure(
-                        file.FullPath, errorDetail, BackupErrorClassifier.Classify(ex));
+                    decision = await onFailure(file.FullPath, errorDetail, category);
                 }
                 catch
                 {
@@ -934,6 +980,7 @@ public class DirectoryBackupService
                         Error = errorDetail,
                         ActionTaken = BurnFailureAction.Skip,
                     });
+                    bytesProcessed += file.SizeBytes;
                     continue;
                 }
 
@@ -966,11 +1013,17 @@ public class DirectoryBackupService
                             Error = errorDetail,
                             ActionTaken = decision.Action,
                         });
+                        bytesProcessed += file.SizeBytes;
                         break;
                 }
 
             }
             } // while (fileRetrying)
+
+            // Destination filled up — stop processing further files. Whatever was
+            // committed is preserved; the next run picks up the rest.
+            if (diskFullAbort)
+                break;
 
             // Release this file's cached buffer (if any) now that it has been
             // written, freeing its memory back to the budget. Done here so the
@@ -997,14 +1050,16 @@ public class DirectoryBackupService
 
         // Report completion of file copying so the UI shows 100%
         // even when many small files all processed within one throttle
-        // window.
+        // window. (After a disk-full stop this reflects the partial run.)
         progress?.Report(new BackupProgress
         {
-            StatusMessage = "Finalizing...",
+            StatusMessage = diskFullAbort ? "Stopped — disk full." : "Finalizing...",
             CurrentFile = "",
-            BytesWrittenTotal = bytesWritten,
+            BytesWrittenTotal = bytesProcessed,
             BytesTotalAll = totalBytes,
-            OverallPercentage = 100,
+            OverallPercentage = diskFullAbort && totalBytes > 0
+                ? (double)bytesProcessed / totalBytes * 100
+                : 100,
         });
 
         // Final batch: update disc record and commit remaining records.
@@ -1042,7 +1097,7 @@ public class DirectoryBackupService
             progress?.Report(new BackupProgress
             {
                 StatusMessage = "Verifying backup...",
-                BytesWrittenTotal = bytesWritten,
+                BytesWrittenTotal = bytesProcessed,
                 BytesTotalAll = totalBytes,
                 OverallPercentage = 100,
             });
@@ -1060,7 +1115,7 @@ public class DirectoryBackupService
                 {
                     StatusMessage = $"Verifying backup ({verifiedCount:N0} / {backedUp.Count:N0})...",
                     CurrentFile = sourcePath,
-                    BytesWrittenTotal = bytesWritten,
+                    BytesWrittenTotal = bytesProcessed,
                     BytesTotalAll = totalBytes,
                     OverallPercentage = 100,
                 });
@@ -1177,7 +1232,7 @@ public class DirectoryBackupService
             progress?.Report(new BackupProgress
             {
                 StatusMessage = "Applying retention rules...",
-                BytesWrittenTotal = bytesWritten,
+                BytesWrittenTotal = bytesProcessed,
                 BytesTotalAll = totalBytes,
                 OverallPercentage = 100,
             });
