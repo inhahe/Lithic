@@ -2849,8 +2849,14 @@ public class MainViewModel : ViewModelBase
         }
         catch (OperationCanceledException)
         {
-            progressVm.CompleteBurn(false, "Cancelled by user.");
+            progressVm.CompleteBurn(false, "Cancelled by user.", cancelled: true);
             StatusText = "Backup cancelled.";
+            // A user abort with no failed files leaves nothing to review, so
+            // finalize straight to the row's persistent result line instead of
+            // parking a Dismiss button over an empty panel. If files did fail
+            // before the abort, keep the panel up so that list stays available.
+            if (!progressVm.HasFailedFiles)
+                progressVm.RequestDone();
         }
         catch (Exception ex)
         {
@@ -2910,8 +2916,14 @@ public class MainViewModel : ViewModelBase
         }
         catch (OperationCanceledException)
         {
-            progressVm.CompleteBurn(false, "Cancelled by user.");
+            progressVm.CompleteBurn(false, "Cancelled by user.", cancelled: true);
             StatusText = "Directory backup cancelled.";
+            // A user abort with no failed files leaves nothing to review, so
+            // finalize straight to the row's persistent result line instead of
+            // parking a Dismiss button over an empty panel. If files did fail
+            // before the abort, keep the panel up so that list stays available.
+            if (!progressVm.HasFailedFiles)
+                progressVm.RequestDone();
         }
         catch (Exception ex)
         {
