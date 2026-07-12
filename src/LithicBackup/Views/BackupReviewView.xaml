@@ -41,10 +41,10 @@
 
         <!-- Bottom: summary + option + buttons -->
         <StackPanel DockPanel.Dock="Bottom" Margin="0,12,0,0">
-            <CheckBox Content="Also remove deselected files/folders from this backup set's sources"
+            <CheckBox Content="Also remove the deselected files from this backup set's sources (future backups skip them too)"
                       IsChecked="{Binding RemoveDeselectedFromSources}"
                       Margin="0,0,0,10"
-                      ToolTip="When checked, anything you deselect here is removed from the backup set permanently (future backups skip it too), not just for this run." />
+                      ToolTip="When checked, the individual files you deselect here are excluded from the backup set permanently, not just for this run.&#x0a;&#x0a;Only the specific files shown in this list are removed. Deselecting a folder here removes just its listed files — never the whole folder — because this list shows only what's about to be backed up now, not the folder's full contents. To stop backing up an entire folder, use Modify." />
             <Grid>
                 <Grid.ColumnDefinitions>
                     <ColumnDefinition Width="*" />

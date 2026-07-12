@@ -2618,15 +2618,20 @@ public class MainViewModel : ViewModelBase
         var removed = new List<string>();
         if (vm.RemoveDeselectedFromSources)
         {
-            // Mirror the LargestFiles removal mechanism: exclude a file by its
-            // full path, and a directory (and its whole subtree) via a "dir\*"
-            // glob.  These patterns are honoured by the scanner's exclusion
-            // filter (DirectoryBackupService.BuildExclusionFilter).
-            foreach (var (path, isDir) in vm.DeselectedPaths())
+            // Exclude ONLY the individual files the user actually saw and
+            // deselected in the review — never a "dir\*" glob for a deselected
+            // directory. The review lists only the current backup delta, so a
+            // directory glob could exclude source files that live in that
+            // directory but weren't shown here (already-backed-up / unchanged
+            // files). Per-file exclusions (a full path is honoured as an exact
+            // path pattern by DirectoryBackupService.BuildExclusionFilter)
+            // guarantee we only remove what the user looked at. To stop backing
+            // up a whole folder going forward, the user uses Modify, whose tree
+            // shows the folder's full contents.
+            foreach (var path in vm.DeselectedFiles())
             {
-                if (string.IsNullOrEmpty(path))
-                    continue;
-                removed.Add(isDir ? path.TrimEnd('\\') + @"\*" : path);
+                if (!string.IsNullOrEmpty(path))
+                    removed.Add(path);
             }
         }
 

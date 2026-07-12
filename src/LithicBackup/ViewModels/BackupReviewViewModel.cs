@@ -208,15 +208,27 @@ public class BackupReviewViewModel : ViewModelBase
     }
 
     /// <summary>
-    /// Absolute paths the user deselected, collapsed to the highest-level
-    /// fully-deselected node (a whole directory rather than each file under it).
-    /// Used to remove entries from the backup set's sources.
+    /// Absolute paths of every individual <em>file</em> the user deselected in
+    /// the review. Only files actually shown in this dialog are returned — a
+    /// deselected directory is expanded to the shown files beneath it rather
+    /// than the directory itself.
+    /// <para>
+    /// This is deliberate: the review tree contains only the current backup
+    /// delta (new/changed files), never a source directory's full contents. A
+    /// directory node that reads as fully deselected only means "every delta
+    /// file shown under it is unchecked" — it says nothing about the other,
+    /// unchanged files that live in that same source directory but weren't
+    /// listed here. Collapsing such a node to a "dir\*" source exclusion would
+    /// silently drop those unshown files from the backup, which the user has no
+    /// way to see or intend. Removing only the shown files guarantees we never
+    /// exclude anything the user didn't actually look at and deselect.
+    /// </para>
     /// </summary>
-    public List<(string Path, bool IsDirectory)> DeselectedPaths()
+    public List<string> DeselectedFiles()
     {
-        var result = new List<(string, bool)>();
+        var result = new List<string>();
         foreach (var root in Roots)
-            CollectDeselected(root, result);
+            CollectDeselectedFiles(root, result);
         return result;
     }
 
@@ -263,22 +275,22 @@ public class BackupReviewViewModel : ViewModelBase
         }
     }
 
-    private static void CollectDeselected(
-        BackupReviewNodeViewModel node, List<(string, bool)> result)
+    private static void CollectDeselectedFiles(
+        BackupReviewNodeViewModel node, List<string> result)
     {
-        if (node.IsSelected == false)
-        {
-            // Whole subtree is deselected — record this node and don't descend.
-            result.Add((node.FullPath, node.IsDirectory));
-            return;
-        }
-
-        // Partially or fully selected directory — descend to find deselected
-        // descendants.
         if (node.IsDirectory)
         {
+            // Always descend. A directory's tri-state is derived from its
+            // children, so its deselected file leaves are found below whether
+            // the directory itself reads as fully or partially deselected. We
+            // never record the directory itself — only the concrete files that
+            // were shown here (see DeselectedFiles for why).
             foreach (var child in node.Children)
-                CollectDeselected(child, result);
+                CollectDeselectedFiles(child, result);
+        }
+        else if (node.IsSelected == false)
+        {
+            result.Add(node.FullPath);
         }
     }
 
