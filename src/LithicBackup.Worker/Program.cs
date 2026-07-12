@@ -20,7 +20,7 @@ NativeCrashDumps.TryEnableLocalDumps();
 var builder = Host.CreateDefaultBuilder(args)
     .UseWindowsService(options =>
     {
-        options.ServiceName = "LithicBackup";
+        options.ServiceName = "Lithic Backup";
     })
     .ConfigureLogging(logging =>
     {

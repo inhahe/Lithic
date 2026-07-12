@@ -198,7 +198,7 @@ Because it installs a service, the installer requests administrator elevation.
 > The Worker service can still be installed/started/stopped from within the GUI
 > (see *Scheduled and Continuous Backups*) — the installer just does it for you
 > up front. If you previously installed the service manually from the GUI,
-> remove it there (or with `sc delete LithicBackup`) before running the MSI so
+> remove it there (or with `sc delete "Lithic Backup"`) before running the MSI so
 > the installer can manage its own copy.
 
 ## Requirements

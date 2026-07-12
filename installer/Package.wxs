@@ -5,7 +5,7 @@
   Produces a per-machine MSI that:
     * installs the self-contained GUI + Worker into "Program Files\LithicBackup"
       (no .NET runtime prerequisite — the publish output is self-contained),
-    * installs and starts the "LithicBackup" Windows service (the Worker), so the
+    * installs and starts the "Lithic Backup" Windows service (the Worker), so the
       background backup engine is ready out of the box,
     * adds a Start Menu shortcut for the GUI, and
     * registers a normal Add/Remove Programs uninstaller that stops + removes the
@@ -81,7 +81,7 @@
       <File Id="WorkerExe" Source="publish\LithicBackup.Worker.exe" KeyPath="yes" />
 
       <ServiceInstall Id="WorkerServiceInstall"
-                      Name="LithicBackup"
+                      Name="Lithic Backup"
                       DisplayName="Lithic Backup Worker"
                       Description="Runs scheduled and on-demand Lithic Backup backups in the background."
                       Type="ownProcess"
@@ -92,13 +92,13 @@
 
       <!-- Start on install (don't fail the install if start is slow). -->
       <ServiceControl Id="WorkerServiceStart"
-                      Name="LithicBackup"
+                      Name="Lithic Backup"
                       Start="install"
                       Wait="no" />
 
       <!-- Stop and remove on uninstall (wait so files aren't locked). -->
       <ServiceControl Id="WorkerServiceStopRemove"
-                      Name="LithicBackup"
+                      Name="Lithic Backup"
                       Stop="uninstall"
                       Remove="uninstall"
                       Wait="yes" />
