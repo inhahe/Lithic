@@ -41,9 +41,9 @@ public sealed class SwitchableDiscBurner : IDiscBurner
     public Task<MediaInfo> GetMediaInfoAsync(string recorderId, CancellationToken ct = default)
         => Active.GetMediaInfoAsync(recorderId, ct);
 
-    public Task BurnAsync(string recorderId, string sourceDirectory, BurnOptions options,
+    public Task BurnAsync(string recorderId, IReadOnlyList<BurnItem> items, BurnOptions options,
         IProgress<BurnProgress>? progress = null, CancellationToken ct = default)
-        => Active.BurnAsync(recorderId, sourceDirectory, options, progress, ct);
+        => Active.BurnAsync(recorderId, items, options, progress, ct);
 
     public Task EraseAsync(string recorderId, bool fullErase = false, CancellationToken ct = default)
         => Active.EraseAsync(recorderId, fullErase, ct);

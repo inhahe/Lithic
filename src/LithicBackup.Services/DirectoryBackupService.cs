@@ -16,9 +16,19 @@ public enum TargetedMoveOutcome
     Relocated,
 
     /// <summary>
-    /// Relocation was not safe/possible (special storage format, version history,
-    /// missing/locked destination copy). The caller should back up the new source
-    /// path as fresh files instead.
+    /// The old path had nothing tracked in the catalog, so there was no destination
+    /// copy to relocate — the new path is simply a fresh source (the common
+    /// atomic-save pattern: write <c>foo.tmp</c>, rename it over <c>foo</c>). The
+    /// caller should back up the new path normally; there is no stale old record to
+    /// reconcile. Not a failure.
+    /// </summary>
+    NothingToRelocate,
+
+    /// <summary>
+    /// The old path <em>was</em> tracked but relocation was not safe/possible
+    /// (special storage format, version history, missing/locked destination copy).
+    /// The caller should back up the new source path as fresh files and reconcile
+    /// the vacated old path.
     /// </summary>
     FellBack,
 }
@@ -1506,9 +1516,12 @@ public class DirectoryBackupService
     /// </remarks>
     /// <returns>
     /// <see cref="TargetedMoveOutcome.Relocated"/> when the destination copy was
-    /// moved and the catalog updated; <see cref="TargetedMoveOutcome.FellBack"/>
-    /// when relocation was not safe/possible and the caller should back up the new
-    /// path as fresh files (leaving the old copy for the next full scan to prune).
+    /// moved and the catalog updated; <see cref="TargetedMoveOutcome.NothingToRelocate"/>
+    /// when the old path was never tracked (no destination copy exists — back up the
+    /// new path as a fresh source, nothing to reconcile);
+    /// <see cref="TargetedMoveOutcome.FellBack"/> when a tracked item could not be
+    /// relocated safely and the caller should back up the new path as fresh files and
+    /// reconcile the vacated old path.
     /// </returns>
     public async Task<TargetedMoveOutcome> MoveTargetedAsync(
         BackupJob job,
@@ -1527,9 +1540,10 @@ public class DirectoryBackupService
             ? await _catalog.GetFileRecordsUnderDirectoryAsync(setId, oldPath, ct)
             : await _catalog.GetFileRecordsByPathAsync(setId, oldPath, ct);
 
-        // Nothing tracked under the old path — treat the new side as fresh.
+        // Nothing tracked under the old path — there is no destination copy to
+        // relocate. The new side is just a fresh source (typically an atomic save).
         if (records.Count == 0)
-            return TargetedMoveOutcome.FellBack;
+            return TargetedMoveOutcome.NothingToRelocate;
 
         // Directory backups only ever produce plain / .dedup / .fileref records
         // (IsSplit and IsZipped are always false — those are optical-media

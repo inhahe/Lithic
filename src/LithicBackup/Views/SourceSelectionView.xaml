@@ -670,7 +670,10 @@
                                               FontSize="11"
                                               Foreground="{StaticResource TextSecondaryBrush}"
                                               VerticalContentAlignment="Center"
-                                              ToolTip="Check/uncheck all auto-include" />
+                                              ToolTip="Check/uncheck all auto-include"
+                                              Visibility="{Binding IsApplyingSelections,
+                                                           Converter={StaticResource BoolToVis},
+                                                           ConverterParameter='Invert,Hidden'}" />
                                 </Border>
                                 <Border Grid.Column="1"
                                         BorderBrush="{StaticResource BorderBrush}"
@@ -680,7 +683,10 @@
                                               IsThreeState="False"
                                               VerticalAlignment="Center"
                                               HorizontalAlignment="Center"
-                                              ToolTip="Check/uncheck all" />
+                                              ToolTip="Check/uncheck all"
+                                              Visibility="{Binding IsApplyingSelections,
+                                                           Converter={StaticResource BoolToVis},
+                                                           ConverterParameter='Invert,Hidden'}" />
                                 </Border>
                                 <Border Grid.Column="2"
                                         BorderBrush="{StaticResource BorderBrush}"
@@ -787,11 +793,28 @@
                                             <CheckBox IsChecked="{Binding AutoIncludeNew, Mode=TwoWay}"
                                                       VerticalAlignment="Center"
                                                       HorizontalAlignment="Center"
-                                                      ToolTip="Auto-include new subdirectories"
-                                                      Visibility="{Binding IsDirectory, Converter={StaticResource BoolToVis}}">
+                                                      ToolTip="Auto-include new subdirectories">
                                                 <CheckBox.Style>
                                                     <Style TargetType="CheckBox">
+                                                        <!-- Files never get this checkbox. Directories show it,
+                                                             but only once THIS node's selection state has
+                                                             settled (IsSelectionRestored); until then it's
+                                                             Hidden (not Collapsed) so the column keeps its
+                                                             width and nothing shifts when the box appears.
+                                                             Per-node (not the global IsApplyingSelections flag)
+                                                             so boxes reveal top-down as each row restores. -->
+                                                        <Setter Property="Visibility" Value="Collapsed" />
                                                         <Style.Triggers>
+                                                            <DataTrigger Binding="{Binding IsDirectory}" Value="True">
+                                                                <Setter Property="Visibility" Value="Hidden" />
+                                                            </DataTrigger>
+                                                            <MultiDataTrigger>
+                                                                <MultiDataTrigger.Conditions>
+                                                                    <Condition Binding="{Binding IsDirectory}" Value="True" />
+                                                                    <Condition Binding="{Binding IsSelectionRestored}" Value="True" />
+                                                                </MultiDataTrigger.Conditions>
+                                                                <Setter Property="Visibility" Value="Visible" />
+                                                            </MultiDataTrigger>
                                                             <DataTrigger Binding="{Binding IsNodeEnabled}" Value="False">
                                                                 <Setter Property="Opacity" Value="0.35" />
                                                             </DataTrigger>
@@ -805,10 +828,21 @@
                                         <Border Grid.Column="1"
                                                 BorderBrush="{StaticResource BorderBrush}"
                                                 BorderThickness="0,0,1,0">
+                                            <!-- Hidden (not collapsed, so its column keeps its width and
+                                                 nothing shifts) until THIS node's selection state has
+                                                 settled, so the user never sees a full column of unchecked
+                                                 boxes and fears their sources were lost.  Bound per-node
+                                                 (IsSelectionRestored) rather than to the global
+                                                 IsApplyingSelections flag so checkboxes appear top-down as
+                                                 each row's state is restored, instead of all at once after
+                                                 the entire (deep) restore finishes. -->
                                             <CheckBox IsChecked="{Binding IsSelected, Mode=TwoWay}"
                                                       IsThreeState="False"
                                                       VerticalAlignment="Center"
-                                                      HorizontalAlignment="Center" />
+                                                      HorizontalAlignment="Center"
+                                                      Visibility="{Binding IsSelectionRestored,
+                                                                   Converter={StaticResource BoolToVis},
+                                                                   ConverterParameter='Hidden'}" />
                                         </Border>
 
                                         <!-- Col 2: Clickable name area (single-click expands directories) -->

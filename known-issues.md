@@ -1,5 +1,288 @@
 # LithicBackup — Known Issues & Tech Debt
 
+## FIXED: Changed file re-burned to the same multisession disc collided/shadowed (2026-07-12)
+
+**Symptom (hardware edge case, follow-on from the multisession fix below):** once
+multisession append works, a file that *changed* between two runs to the same set
+is re-staged as a new version (v2). If that append lands on the **same physical
+disc** as the earlier version, both versions map to the *same* on-disc path (the
+disc path was just the drive-relative source path). After `ImportFileSystem()`
+imports the earlier session, IMAPI's `AddFile` **rejects the duplicate path**
+(burn fails); and even where it didn't, the newer entry would **shadow** the older
+one so the earlier version could no longer be read back. This affects only the
+`ExecuteAsync` disc pipeline — splits (unique chunk names), repair/re-burn discs
+(fresh discs), and consolidation (latest-only) don't collide.
+
+**Fix — version-unique disc paths.** The file's version is now resolved at *staging*
+time (`fileVersion = versionInfo[path].MaxVersion + 1`, computable because
+`versionInfo` is only mutated at record time) and carried on `StagedFileInfo.Version`.
+A new helper `VersionedDiscPath(relativePath, version)` leaves v1 at its natural
+path and inserts a `.v{N}` tag before the extension for later versions
+(`docs\report.txt` → `docs\report.v2.txt`). Both the `BurnItem` written to disc and
+the recorded `FileRecord.DiscPath` use this versioned path, so every version of a
+source file occupies a **distinct** disc path — eliminating both the `AddFile`
+collision and the restore shadowing. Restore is unaffected by design: it reads bytes
+from `DiscPath` on the platter and writes to the destination derived from
+`SourcePath`, so a `.v2`-tagged file still restores to the original location.
+
+**Test:** `tools/disc_test_harness` case `changed-file-reburn-gets-distinct-disc-path`
+backs up a file, changes it in place, backs up again to the same set, and asserts two
+records (versions 1 and 2) with **distinct** disc paths (v2 carrying a `.v2` tag),
+then restores the latest content byte-for-byte. Full matrix 24/24. (The simulator
+models each session as its own disc surface, so it can't exhibit the single-volume
+`AddFile` collision directly; the distinct-DiscPath invariant is what makes the
+real-hardware union safe, and that invariant is what the test pins down.)
+
+## FIXED: Multisession append lost earlier sessions' files on real hardware (2026-07-12)
+
+**Symptom (hardware):** An incremental (multisession) backup that *appended* a new
+session to a disc that already had data would, on real IMAPI2 hardware, mount
+showing **only the newest session's files**. Files written in earlier sessions
+became invisible on the volume and therefore unrestorable — a silent data-loss
+bug for anyone relying on incremental disc backups. The decision logic
+(`DiscSessionStrategy`) and the `SimulatedDiscBurner` handled multisession fine;
+the gap was entirely in the real burner and in cross-run disc labelling.
+
+**Two root causes, both fixed:**
+
+1. **No file-system import in the IMAPI2 burn.** `Imapi2DiscBurner.BurnAsync` built
+   a *fresh* standalone `MsftFileSystemImage` on every burn — it never set
+   `fsi.MultisessionInterfaces` or called `fsi.ImportFileSystem()`, so an appended
+   session's directory tree did not carry forward the earlier sessions' entries.
+   **Fix:** `format2Data` is now created up front so its `MultisessionInterfaces`
+   can be read before the image is built; when `options.Multisession` and the media
+   is non-blank, the burner sets `fsi.MultisessionInterfaces` and calls
+   `fsi.ImportFileSystem()` (the standard IMAPI2 append pattern) so the new session
+   is the union of all prior sessions. **Hardware-untested** — validated by code
+   review only, like the rest of the IMAPI2 path. The simulator can't exercise the
+   IMAPI union directly (it models each session as its own disc surface), so the
+   real-hardware `ImportFileSystem` call remains the one unverified link.
+
+2. **Disc labels/sequence numbers reset every run → collisions.**
+   `BackupOrchestrator.ExecuteAsync` computed `discSequence = discIndex + 1`, so
+   *every* run's first disc was `Disc-001`. A second run to the same set produced a
+   second `Disc-001` record; restore maps a disc *label* to a physical volume, so
+   the collision made the second session's files unresolvable even in simulation.
+   **Fix:** the run now seeds `sequenceBase` from the set's existing max
+   `SequenceNumber` and numbers this run's discs from there, so labels are unique
+   across runs (`Disc-001`, then `Disc-002`, …). This also fixes restore for any
+   multi-run backup, not just multisession.
+
+**Test:** `tools/disc_test_harness` case `multisession-append-restores-both-sessions`
+runs two backups to the same set/burner, asserts the append produces a second disc
+record with a unique label, and restores files from **both** sessions byte-for-byte.
+Full matrix 24/24.
+
+**Remaining nuance (not a bug, logged for awareness):** with unique labels, the two
+sessions of one *physical* multisession disc are recorded as two logical disc
+records (`Disc-001`, `Disc-002`). On real hardware both live on the same platter, so
+restore may prompt "insert Disc-002" when the disc is already in the drive; the
+files are still present (the imported union) so restore succeeds. A future
+improvement could give restore a physical-disc identity so it doesn't re-prompt for
+a disc that's already loaded.
+
+## FEATURE: Burn-in-place disc staging mode (no full temp copy) (2026-07-12)
+
+**What:** Disc backups can now burn plain files directly from their original
+location instead of copying every file to a temp staging directory first. This
+removes the biggest temp-space cost — previously a full disc's worth of data (up
+to ~100 GB for a Blu-ray) had to be duplicated on the temp volume before the
+burn. Selectable in **Settings → Disc staging**; default remains *copy to temp*
+(`DiscStagingMode.TemporaryCopy`) so behaviour is unchanged unless the user opts
+into *burn in place* (`DiscStagingMode.InPlace`).
+
+**How it works:** The burn contract changed from "burn everything under this one
+staging directory" to an explicit item list — `IDiscBurner.BurnAsync` now takes
+`IReadOnlyList<BurnItem>` where each `BurnItem(DiscRelativePath, SourceAbsolutePath)`
+maps a disc path to the bytes to read. In `TemporaryCopy` mode every item's source
+is a temp copy (unchanged behaviour). In `InPlace` mode plain files' items point at
+the *original* source path, and `BackupOrchestrator.ExecuteAsync` holds a
+`FileShare.Read` lock (`StagedFileInfo.HeldLock`) on each such file from the moment
+its size is validated until after the burn and catalog recording complete (released
+in the per-disc `finally`). `FileShare.Read` blocks writers, so the file cannot grow,
+change, or be deleted mid-burn, while still letting the burner read it concurrently.
+Zipped and split files always stage to temp because their on-disc bytes differ from
+the source; the software payload and exported catalog also live under temp.
+
+- **Growth safety preserved:** the in-place path re-checks the file's length under
+  the held lock (same as the copy path) and re-queues/bumps a grown file to a later
+  disc rather than overflowing. Covered by harness test `burn-in-place-growth-safe`.
+- **IMAPI path (hardware-untested):** `Imapi2DiscBurner.BurnAsync` was rewritten from
+  `root.AddTree(stagingDir)` to per-item `root.AddFile(discRelativePath, stream)`,
+  where `stream` is an `IStream` opened over the source via `SHCreateStreamOnFileEx`
+  (read + deny-write). This mirrors the tested simulated path but, like all IMAPI2
+  code here, has not been run against real hardware.
+- **Config placement:** stored on global `UserSettings.DiscStagingMode` (machine-wide,
+  like `MemoryBudget`) and stamped onto `BackupJob.StagingMode` when the job is built
+  (MainViewModel + BackupWorker). Not persisted per backup set.
+- **Tests:** `burn-in-place-basic` (multi-disc, byte-exact restore, no overflow) and
+  `burn-in-place-growth-safe`. Full matrix 23/23.
+
+The split-file spill snapshot (below) still copies each *oversized* file to temp even
+in `InPlace` mode — that transient cost is unchanged and remains logged as tech debt.
+
+## FIXED: Bin-packer crammed every file onto disc 1 (multi-disc spanning broken) (2026-07-12)
+
+**Status:** Fixed 2026-07-12 in `BinPacker`.
+
+**Symptom:** A disc backup whose data exceeds a single disc's capacity did not span
+multiple discs — the planner allocated *every* file that individually fit onto the
+first disc. On simulated media this went unnoticed (the `SimulatedDiscBurner` writes
+to a shelf and doesn't enforce capacity), but a real IMAPI burn would overflow /
+fail on disc 1. Found by the new headless disc-test harness
+(`tools/disc_test_harness`): 5×80 KB files with a 200 KB disc produced 1 allocation
+(400 KB) instead of 3.
+
+**Root cause:** `DiscAllocation.FreeBytes` is `init`-only. `BinPacker`'s first-fit
+loop checked `alloc.FreeBytes >= file.SizeBytes` but never decremented `FreeBytes`
+as it added files (it couldn't — the property is immutable), so every existing bin
+always reported its *full* capacity as free. Result: the first bin "fit" everything.
+
+**Fix:** `BinPacker` now packs into a mutable private `Bin` working type that tracks
+running `Used`/`Free`, and builds the immutable `DiscAllocation` list at the end.
+First-fit-decreasing now sees each bin's true remaining space and opens new discs
+when needed. Verified by the harness `happy-multi-disc-span` case (now 3 discs).
+
+## FIXED: Oversized file split into chunks does not span physical discs (2026-07-12)
+
+**Status:** Fixed 2026-07-12 in `BackupOrchestrator.ExecuteAsync` +
+`RestoreService`. Verified by `tools/disc_test_harness` (`happy-file-splitting`,
+which now asserts chunks land on ≥2 distinct discs with zero disc overflow and a
+byte-exact restore).
+
+**Symptom (before fix):** A single file larger than one disc's capacity was split
+into disc-sized chunks, but *all* the chunks were staged to the **same** disc and
+burned together — so the file never spanned multiple physical discs. In the harness a
+300 KB file with a 150 KB disc produced two 150 KB `.discburn-split` chunks both on
+`disc-1` (300 KB on a 150 KB disc). Restore still reassembled correctly in
+simulation because both chunks were co-located, but on real media disc 1 would
+overflow.
+
+**Root cause:** the per-disc staging loop called
+`_fileSplitter.SplitAsync(file, stagingDir, chunkSize, ct)`, writing *every* chunk
+into that one disc's staging directory. Nothing distributed the chunks across the
+plan's discs, and each chunk was recorded against a single disc.
+
+**Fix:** `ExecuteAsync`'s staging loop was rewritten around a `SplitCarry`/overflow
+model. When a file can't fit the remaining space on the current disc (and splitting
+is allowed, or the file exceeds a whole disc), `BeginSplitAsync` snapshots it to a
+spill file and `PlaceSplitChunksAsync` writes as many disc-sized chunks as fit onto
+the current disc, carrying the remainder to subsequent discs across loop iterations
+(the loop now continues while a carry or overflow list is non-empty, opening fresh
+discs as needed). One shared `FileRecord` is created for the split file and each
+`FileChunk` records its own `DiscId`/`Offset`/`Length`. Files that simply don't fit
+the remaining space (but fit a whole disc) now go to an `overflowFiles` list for the
+next disc instead of overflowing the current one — a latent overflow bug fixed in the
+same pass. Spill directories are cleaned up in a `finally`.
+`RestoreService.RestoreSplitFilesAsync` reassembles across discs: it pre-sizes each
+destination, groups chunks by `DiscId`, mounts each disc once via
+`DiscInsertCallback`, and writes each chunk at its `chunk.Offset`. The catalog layer
+already returned all chunks for a file record regardless of disc
+(`GetChunksForFileAsync`), so no schema change was needed. The old
+`FileSplitter`/`IFileSplitter` (which chunked a whole file into one directory) was
+now fully unused and was deleted along with the orchestrator's dead `_fileSplitter`
+dependency.
+
+**Tech debt (transient disk cost):** `BeginSplitAsync` snapshots the entire oversized
+file to a spill file (`%TEMP%\LithicBackup\spill-*/data`) before carving chunks, so
+the split is taken from a stable, self-consistent byte source and the SHA-256 is
+computed once. The cost is up to one extra full copy of the file on the temp volume
+for the duration of the burn (cleaned up in `finally`). For a genuinely huge file
+(e.g. 100 GB across several BluRays) that transient doubling could be significant.
+Proper fix if it ever bites: chunk directly from the source with offset seeks and a
+one-shot streamed hash, guarded against mid-burn source mutation (size/mtime recheck),
+avoiding the snapshot — the snapshot is currently the simplest way to guarantee
+consistency across a multi-disc, possibly multi-hour burn.
+
+## FIXED: File that grows between plan and burn could overflow a disc (2026-07-12)
+
+**Status:** Fixed 2026-07-12 in `BackupOrchestrator.ExecuteAsync`. Verified by
+`tools/disc_test_harness` (`file-grows-between-plan-and-burn`).
+
+**Symptom:** The plan bin-packs to each file's scanned size, but staging happens
+later. If a file grew between planning and staging, the plain-copy path recorded the
+staged item at the *planned* size (`StagedSizeBytes = file.SizeBytes`) while copying
+the file's larger current content. The per-disc capacity accounting then undercounted,
+so a grown file could push a disc over its real capacity. Split files had a related
+metadata inconsistency: the `FileRecord.SizeBytes` used the planned scan size while
+the chunks were carved from a fresh snapshot of the (possibly larger) live file.
+
+**Root cause (two parts):**
+1. `StagedSizeBytes = file.SizeBytes` used the planned size, not the bytes actually
+   copied. There was also a TOCTOU gap between the pre-copy metadata check and the
+   copy: the file could grow in between and be copied larger than checked.
+2. A latent bug in the same loop: `TryFillGapFromPending` appends a replacement file
+   to `filesToProcess`, but the loop was a `foreach` over that same list — modifying a
+   `List<T>` mid-`foreach` throws `InvalidOperationException`. This never fired only
+   because no test previously triggered a mid-staging skip/re-queue during a normal
+   plan+execute.
+
+**Fix:**
+- The plain-copy path now opens the source with `FileShare.Read` (a read lock that
+  blocks writers) **first**, then re-checks the size *under the lock*. Once locked the
+  file cannot grow, so the staged bytes and the capacity accounting are guaranteed
+  consistent. If the locked size differs from the plan or no longer fits the space left
+  on the disc, the file is re-queued at its true size for a later disc (and the gap it
+  leaves is filled from the pending queue). `StagedSizeBytes` is set to the locked size.
+- Split files carry the snapshot's actual byte length (`SplitContext.Size`, captured
+  under the read lock in `BeginSplitAsync`) and the split `FileRecord.SizeBytes` uses
+  it, so the record matches the sum of its chunk lengths.
+- The staging loop is now an index-based `for` loop so gap-fill appends are both
+  tolerated and processed.
+
+## OPEN (minor): disc that over-reports capacity fails the burn instead of re-planning (2026-07-12)
+
+**Status:** Behaves safely (fails loud, no corruption) but not gracefully. Covered by
+`tools/disc_test_harness` (`disc-over-reports-capacity`).
+
+**Symptom:** When media physically holds less than `GetMediaInfoAsync` reported (a
+disc that over-states its size), the plan bin-packs to the reported capacity and the
+burn only discovers the shortfall mid-write. `SimulatedDiscBurner` (with the
+`ActualCapacityBytes` test knob) and a real burner both throw `IOException` once the
+committed bytes exceed the true capacity — the backup aborts with an error rather than
+silently truncating. That is the correct fail-safe.
+
+**Not-yet-done (graceful path):** ideally the executor would catch the
+capacity-exceeded failure, re-plan the remainder of that disc's files (plus anything
+already staged for it) onto a fresh disc at the observed smaller capacity, and
+continue — instead of aborting the whole run. This needs a re-plan/resume hook in
+`ExecuteAsync` and a way to feed the observed actual capacity back into the packer.
+Deferred; the safe-abort behavior is acceptable in the meantime.
+
+## FIXED: Auto-include-new ignored on partially-selected directories (2026-07-12)
+
+**Status:** Fixed 2026-07-12 in `SourceSelection`, `FileScanner`, and
+`OrphanedDirectoriesViewModel`.
+
+**Symptom:** With `D:\` set as a source (auto-include-new on) but *partially*
+selected — i.e. a few subfolders deselected, which flips the node's tristate
+`IsSelected` from `true` to `null` — new top-level entries under `D:\` were never
+backed up. Reported via a continuous-mode rename: `D:\warez` → `D:\test_warez` was
+not renamed at the destination. The USN journal produced the move, but the
+continuous path judged `D:\test_warez` (a new, unlisted child of the partial `D:\`
+node) as *not in the set*, so it classified the rename as "moved out": it
+soft-deleted `warez`'s catalog records and ignored `test_warez` entirely.
+
+**Root cause:** three separate copies of the inclusion rule
+(`FileScanner.ScanNode`, `SourceSelection.IsPathIncluded`/`EvaluateNode`, and
+`OrphanedDirectoriesViewModel.SelectionCoversPath`) all gated auto-include-new
+behind `IsSelected == true`, so a partially-selected (`null`) directory never
+picked up unlisted descendants even with `AutoIncludeNewSubdirectories = true`.
+This was a silent data-loss risk on full scans too, not just continuous renames.
+
+**Fix:** extracted one shared predicate,
+`SourceSelection.IncludesUnlistedDescendants(node)`, used by all three sites. A
+not-excluded directory covers unlisted descendants when it's either fully selected
+with no child overrides (whole subtree) *or* has auto-include-new enabled —
+regardless of whether it is fully or partially selected. The per-directory
+auto-include toggle is now the sole control, as intended.
+
+**Recovery for the already-broken state:** the earlier rename already soft-deleted
+`warez` and skipped `test_warez`; the fix does not retroactively repair that. A full
+/reconciling backup will now pick up `test_warez` as fresh files (the stale `warez`
+destination copy lingers until the next cleanup/retention purge). Future renames
+under a partial+auto-include directory will relocate in place correctly.
+
 ## ADDED: Continuous-mode fallback for non-NTFS source volumes (2026-07-12)
 
 **Status:** Implemented 2026-07-12 in `BackupWorker`, `FileSystemMonitorImpl`, and

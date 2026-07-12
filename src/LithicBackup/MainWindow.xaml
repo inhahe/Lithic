@@ -97,7 +97,7 @@
                                                         <Button Command="{Binding DataContext.NewBackupSetCommand,
                                                                           RelativeSource={RelativeSource AncestorType=Window}}"
                                                                 Style="{StaticResource PrimaryButton}"
-                                                                Padding="12,6" Margin="0,0,8,0">
+                                                                Margin="0,0,8,0">
                                                             <StackPanel Orientation="Horizontal">
                                                                 <TextBlock Text="+" FontWeight="Bold" Margin="0,0,4,0" />
                                                                 <TextBlock Text="New Backup Set" />
@@ -105,7 +105,7 @@
                                                         </Button>
                                                         <Button Command="{Binding DataContext.FindFileCommand,
                                                                           RelativeSource={RelativeSource AncestorType=Window}}"
-                                                                Padding="12,6" Margin="0,0,8,0" Cursor="Hand">
+                                                                Margin="0,0,8,0">
                                                             <StackPanel Orientation="Horizontal">
                                                                 <TextBlock Text="&#x1F50D;" Margin="0,0,4,0" />
                                                                 <TextBlock Text="Find File/Directory" />
@@ -113,14 +113,13 @@
                                                         </Button>
                                                         <Button Command="{Binding DataContext.ImportBackupSetCommand,
                                                                           RelativeSource={RelativeSource AncestorType=Window}}"
-                                                                Padding="12,6" Margin="0,0,8,0" Cursor="Hand">
+                                                                Margin="0,0,8,0">
                                                             <StackPanel Orientation="Horizontal">
                                                                 <TextBlock Text="Import" />
                                                             </StackPanel>
                                                         </Button>
                                                         <Button Command="{Binding DataContext.CatalogFreeRestoreCommand,
                                                                           RelativeSource={RelativeSource AncestorType=Window}}"
-                                                                Padding="12,6" Cursor="Hand"
                                                                 ToolTip="Rebuild files directly from a backup folder when the catalog is lost">
                                                             <StackPanel Orientation="Horizontal">
                                                                 <TextBlock Text="&#x1F198;" Margin="0,0,4,0" />
@@ -572,25 +571,28 @@
                                                                     <StackPanel Orientation="Horizontal"
                                                                                 HorizontalAlignment="Center">
                                                                         <Button Content="Install Service"
-                                                                                Padding="12,6" Margin="0,0,6,0" Cursor="Hand"
+                                                                                Style="{StaticResource PrimaryButton}"
+                                                                                Margin="0,0,6,0"
                                                                                 Command="{Binding DataContext.InstallServiceCommand,
                                                                                           RelativeSource={RelativeSource AncestorType=Window}}"
                                                                                 IsEnabled="{Binding DataContext.CanInstallService,
                                                                                            RelativeSource={RelativeSource AncestorType=Window}}" />
                                                                         <Button Content="Start"
-                                                                                Padding="12,6" Margin="0,0,6,0" Cursor="Hand"
+                                                                                Style="{StaticResource PrimaryButton}"
+                                                                                Margin="0,0,6,0"
                                                                                 Command="{Binding DataContext.StartServiceCommand,
                                                                                           RelativeSource={RelativeSource AncestorType=Window}}"
                                                                                 IsEnabled="{Binding DataContext.CanStartService,
                                                                                            RelativeSource={RelativeSource AncestorType=Window}}" />
                                                                         <Button Content="Stop"
-                                                                                Padding="12,6" Margin="0,0,6,0" Cursor="Hand"
+                                                                                Style="{StaticResource DangerButton}"
+                                                                                Margin="0,0,6,0"
                                                                                 Command="{Binding DataContext.StopServiceCommand,
                                                                                           RelativeSource={RelativeSource AncestorType=Window}}"
                                                                                 IsEnabled="{Binding DataContext.CanStopService,
                                                                                            RelativeSource={RelativeSource AncestorType=Window}}" />
                                                                         <Button Content="Uninstall"
-                                                                                Padding="12,6" Cursor="Hand"
+                                                                                Style="{StaticResource DangerButton}"
                                                                                 Command="{Binding DataContext.UninstallServiceCommand,
                                                                                           RelativeSource={RelativeSource AncestorType=Window}}"
                                                                                 IsEnabled="{Binding DataContext.CanUninstallService,

@@ -16,7 +16,6 @@ public class BackupOrchestrator : IBackupOrchestrator
     private readonly IFileScanner _scanner;
     private readonly IBinPacker _packer;
     private readonly IZipHandler _zipHandler;
-    private readonly IFileSplitter _fileSplitter;
     private readonly IDiscSessionStrategy _sessionStrategy;
     private readonly IFileSystemMonitor? _fileSystemMonitor;
 
@@ -26,7 +25,6 @@ public class BackupOrchestrator : IBackupOrchestrator
         IFileScanner scanner,
         IBinPacker packer,
         IZipHandler zipHandler,
-        IFileSplitter fileSplitter,
         IDiscSessionStrategy sessionStrategy,
         IFileSystemMonitor? fileSystemMonitor = null)
     {
@@ -35,7 +33,6 @@ public class BackupOrchestrator : IBackupOrchestrator
         _scanner = scanner;
         _packer = packer;
         _zipHandler = zipHandler;
-        _fileSplitter = fileSplitter;
         _sessionStrategy = sessionStrategy;
         _fileSystemMonitor = fileSystemMonitor;
     }
@@ -148,6 +145,15 @@ public class BackupOrchestrator : IBackupOrchestrator
         int discsWritten = 0;
         long totalBytesWritten = 0;
 
+        // Continue disc numbering from any discs already recorded for this set so
+        // an incremental (multisession) run doesn't reuse "Disc-001" and collide
+        // with an earlier run's disc. Each run's discs get fresh, unique sequence
+        // numbers/labels within the set.
+        var existingDiscsForSet = await _catalog.GetDiscsForBackupSetAsync(backupSetId, ct);
+        int sequenceBase = existingDiscsForSet.Count > 0
+            ? existingDiscsForSet.Max(d => d.SequenceNumber)
+            : 0;
+
         // Build a lookup of max existing version per source path so we can
         // increment version numbers for changed files.  Uses a lightweight
         // SQL aggregate query instead of loading all FileRecord objects.
@@ -168,6 +174,25 @@ public class BackupOrchestrator : IBackupOrchestrator
         // Files that were found to have changed during staging get re-queued
         // for the next disc.
         var reQueuedFiles = new List<ScannedFile>();
+
+        // Whole files bumped off a disc because a split (or a previous file) had
+        // already filled it. They are placed on the next disc the loop opens.
+        var overflowFiles = new List<ScannedFile>();
+
+        // Remainder of a file being split across discs: non-null between the disc
+        // that started the split and the disc that finishes it.
+        SplitCarry? carry = null;
+
+        // Spill snapshots created for split files; deleted after the whole run.
+        var spillDirs = new List<string>();
+
+        // Capacity of the most recently opened disc, reused for any discs the loop
+        // must open beyond the planned allocations (to finish a spanning file or
+        // place overflow). The bin-packer guarantees TotalBytes+FreeBytes == the
+        // disc capacity for every allocation.
+        long lastCapacity = plan.DiscAllocations.Count > 0
+            ? plan.DiscAllocations[0].TotalBytes + plan.DiscAllocations[0].FreeBytes
+            : 25L * 1024 * 1024 * 1024;
 
         // Live burn coordinator: real-time FSW-based change detection that
         // catches modifications DURING file copy (complements the inline
@@ -191,12 +216,23 @@ public class BackupOrchestrator : IBackupOrchestrator
         try
         {
 
-        for (int discIndex = 0; discIndex < plan.DiscAllocations.Count; discIndex++)
+        // The loop is driven by the planned allocations, but continues opening
+        // extra discs while a split file still has bytes to write (carry) or whole
+        // files were bumped off earlier discs (overflowFiles), so a large file can
+        // genuinely span multiple physical discs.
+        int discIndex = 0;
+        while (discIndex < plan.DiscAllocations.Count || carry is not null || overflowFiles.Count > 0)
         {
             ct.ThrowIfCancellationRequested();
 
-            var allocation = plan.DiscAllocations[discIndex];
-            int discSequence = discIndex + 1;
+            DiscAllocation? allocation = discIndex < plan.DiscAllocations.Count
+                ? plan.DiscAllocations[discIndex]
+                : null;
+            long discCapacityForDisc = allocation is not null
+                ? allocation.TotalBytes + allocation.FreeBytes
+                : lastCapacity;
+            lastCapacity = discCapacityForDisc;
+            int discSequence = sequenceBase + discIndex + 1;
 
             // Per-disc "skip all" decision resets at each new disc.
             BurnFailureAction? discSkip = null;
@@ -211,7 +247,7 @@ public class BackupOrchestrator : IBackupOrchestrator
             progress?.Report(new BackupProgress
             {
                 CurrentDisc = discSequence,
-                TotalDiscs = plan.TotalDiscsRequired,
+                TotalDiscs = Math.Max(plan.TotalDiscsRequired, discSequence),
                 CurrentFile = "Staging files...",
                 BytesWrittenTotal = totalBytesWritten,
                 BytesTotalAll = plan.TotalBytes,
@@ -226,11 +262,23 @@ public class BackupOrchestrator : IBackupOrchestrator
                 Directory.Delete(stagingDir, true);
             Directory.CreateDirectory(stagingDir);
 
+            // Read locks held on in-place (uncopied) source files. Kept open from
+            // size-validation through the burn so the files can't change, then
+            // released in the finally below. Empty in TemporaryCopy mode.
+            var heldLocks = new List<FileStream>();
+
             try
             {
                 // Copy files to staging, recording which ones succeed.
                 var stagedFiles = new List<StagedFileInfo>();
-                long discCapacity = allocation.TotalBytes + allocation.FreeBytes;
+                long discCapacity = discCapacityForDisc;
+
+                // --- Continue any split carried from the previous disc ---
+                // A carried split is placed first, filling this disc before any
+                // other file, until either the file is fully written or the disc
+                // is full (in which case the carry rolls over to the next disc).
+                carry = await PlaceSplitChunksAsync(
+                    carry, stagedFiles, stagingDir, discCapacity, ct);
 
                 // Build a pending queue from remaining allocations for
                 // LiveBurnCoordinator to draw replacements from.
@@ -248,10 +296,20 @@ public class BackupOrchestrator : IBackupOrchestrator
                         pendingQueue.Enqueue(f);
                 }
 
-                var filesToProcess = new List<ScannedFile>(allocation.Files);
+                // Whole files bumped off earlier discs go first, then this disc's
+                // planned files.
+                var filesToProcess = new List<ScannedFile>(overflowFiles);
+                overflowFiles.Clear();
+                if (allocation is not null)
+                    filesToProcess.AddRange(allocation.Files);
 
-                foreach (var file in filesToProcess)
+                // Index-based loop (not foreach): TryFillGapFromPending appends a
+                // replacement file to filesToProcess when the current one is skipped
+                // or re-queued, and those appended files must themselves be processed.
+                // A foreach would throw because the list is modified mid-iteration.
+                for (int fileIndex = 0; fileIndex < filesToProcess.Count; fileIndex++)
                 {
+                    var file = filesToProcess[fileIndex];
                     ct.ThrowIfCancellationRequested();
 
                     // --- Live change detection ---
@@ -315,34 +373,44 @@ public class BackupOrchestrator : IBackupOrchestrator
                     // Block dedup is a directory-backup feature; see
                     // DirectoryBackupService.
 
-                    // --- File splitting ---
-                    // If a file is larger than the total disc capacity, always split.
-                    // If it doesn't fit in remaining space and splitting is allowed, split.
+                    // --- File splitting / spanning ---
+                    // Decide whether this file fits in the space left on the disc.
+                    // If not, either split it (writing what fits here and carrying
+                    // the rest to the next disc) or, when splitting isn't allowed,
+                    // bump the whole file to the next disc.
                     long currentUsed = stagedFiles.Sum(sf => sf.StagedSizeBytes);
                     long remainingSpace = discCapacity - currentUsed;
-                    bool fileExceedsDisc = file.SizeBytes > discCapacity;
-                    bool fileExceedsRemaining = file.SizeBytes > remainingSpace && remainingSpace > 0;
 
-                    if ((fileExceedsDisc || fileExceedsRemaining)
-                        && (plan.Job.AllowFileSplitting || fileExceedsDisc))
+                    if (remainingSpace <= 0)
                     {
+                        // Disc already full (e.g. a carried split filled it) —
+                        // place this whole file on the next disc.
+                        overflowFiles.Add(file);
+                        continue;
+                    }
+
+                    bool fileExceedsDisc = file.SizeBytes > discCapacity;
+                    bool fileExceedsRemaining = file.SizeBytes > remainingSpace;
+
+                    if (fileExceedsRemaining)
+                    {
+                        bool canSplit = plan.Job.AllowFileSplitting || fileExceedsDisc;
+                        if (!canSplit)
+                        {
+                            // Won't fit and can't split: try later files that do fit
+                            // this disc, and place this one on the next disc.
+                            overflowFiles.Add(file);
+                            continue;
+                        }
+
                         try
                         {
-                            long chunkSize = fileExceedsDisc ? discCapacity : remainingSpace;
-                            if (chunkSize <= 0) chunkSize = discCapacity;
-
-                            var chunks = await _fileSplitter.SplitAsync(
-                                file.FullPath, stagingDir, chunkSize, ct);
-
-                            stagedFiles.Add(new StagedFileInfo
-                            {
-                                Source = file,
-                                StagedPath = chunks[0].DiscFilename,
-                                IsZipped = false,
-                                IsSplit = true,
-                                Chunks = chunks,
-                                StagedSizeBytes = chunks.Sum(c => c.Length),
-                            });
+                            // Snapshot the file so every chunk (even those written to
+                            // later discs) is byte-consistent, then write as many
+                            // chunks as fit here and carry the remainder forward.
+                            var newCarry = await BeginSplitAsync(file, spillDirs, ct);
+                            carry = await PlaceSplitChunksAsync(
+                                newCarry, stagedFiles, stagingDir, discCapacity, ct);
                             continue;
                         }
                         catch (Exception ex)
@@ -371,6 +439,22 @@ public class BackupOrchestrator : IBackupOrchestrator
                         shouldZip = !_zipHandler.IsPathCompatible(file.FullPath, filesystemType);
                     }
 
+                    // Resolve this file's version now (from the pre-run max) so its
+                    // disc path can be made version-unique BEFORE the burn writes it.
+                    // A file re-backed-up after changing gets version > 1; on a
+                    // multisession append that lands on the SAME physical disc as an
+                    // earlier version, a shared disc path would (a) collide in IMAPI's
+                    // AddFile after ImportFileSystem imports the earlier session, and
+                    // (b) let the newer session shadow the older file so the earlier
+                    // version could no longer be read back. Encoding the version into
+                    // the disc path (see VersionedDiscPath) keeps every version at a
+                    // distinct path, so both problems disappear. versionInfo still
+                    // holds the pre-run max here (it's mutated only at record time),
+                    // so this matches the version assigned when the record is written.
+                    int fileVersion = versionInfo.TryGetValue(file.FullPath, out var fvi)
+                        ? fvi.MaxVersion + 1
+                        : 1;
+
                     bool retrying = true;
 
                     while (retrying)
@@ -392,6 +476,49 @@ public class BackupOrchestrator : IBackupOrchestrator
                                     IsZipped = true,
                                     IsSplit = false,
                                     StagedSizeBytes = new FileInfo(zipPath).Length,
+                                    Version = fileVersion,
+                                });
+                            }
+                            else if (plan.Job.StagingMode == DiscStagingMode.InPlace)
+                            {
+                                // Burn-in-place: don't copy the file to temp. Instead
+                                // take a read lock on the ORIGINAL and hold it through
+                                // the burn, then point the burn item at the source.
+                                // FileShare.Read blocks writers (so the file can't grow,
+                                // change, or be deleted before it's burned) while still
+                                // letting the burner read it concurrently. Re-check the
+                                // size under the lock for the same growth-safety reason
+                                // as the copy path: capacity accounting must match the
+                                // bytes that actually land on the disc.
+                                string relativePath = GetRelativeStagingPath(file.FullPath);
+                                var lockStream = new FileStream(
+                                    file.FullPath, FileMode.Open, FileAccess.Read,
+                                    FileShare.Read, bufferSize: 4096, useAsync: false);
+                                long lockedSize = lockStream.Length;
+                                if (lockedSize != file.SizeBytes || lockedSize > remainingSpace)
+                                {
+                                    lockStream.Dispose();
+                                    pendingQueue.Enqueue(new ScannedFile
+                                    {
+                                        FullPath = file.FullPath,
+                                        SizeBytes = lockedSize,
+                                        LastWriteUtc = File.GetLastWriteTimeUtc(file.FullPath),
+                                    });
+                                    TryFillGapFromPending(
+                                        filesToProcess, pendingQueue, remainingSpace);
+                                    break;
+                                }
+
+                                heldLocks.Add(lockStream);
+                                stagedFiles.Add(new StagedFileInfo
+                                {
+                                    Source = file,
+                                    StagedPath = relativePath,
+                                    IsZipped = false,
+                                    IsSplit = false,
+                                    StagedSizeBytes = lockedSize,
+                                    HeldLock = lockStream,
+                                    Version = fileVersion,
                                 });
                             }
                             else
@@ -403,26 +530,53 @@ public class BackupOrchestrator : IBackupOrchestrator
                                 if (destDir is not null)
                                     Directory.CreateDirectory(destDir);
 
-                                // Open with FileShare.Read to acquire a read lock
-                                // that prevents writes while we copy.
+                                // Open with FileShare.Read FIRST to take a read lock
+                                // that blocks writers, THEN re-check the size while
+                                // holding it. This closes the window between the
+                                // pre-copy metadata check above and the copy itself:
+                                // once the lock is held the file can no longer grow, so
+                                // the bytes we stage — and the capacity accounting below
+                                // — are guaranteed to match what actually lands on the
+                                // disc. Without this, a file that grew after the pre-copy
+                                // check would be copied at its larger size but counted at
+                                // the planned size, and could overflow the disc.
                                 await using (var srcStream = new FileStream(
                                     file.FullPath, FileMode.Open, FileAccess.Read,
                                     FileShare.Read, bufferSize: 81920, useAsync: true))
-                                await using (var dstStream = new FileStream(
-                                    destPath, FileMode.Create, FileAccess.Write,
-                                    FileShare.None, bufferSize: 81920, useAsync: true))
                                 {
-                                    await srcStream.CopyToAsync(dstStream, ct);
-                                }
+                                    long lockedSize = srcStream.Length;
+                                    if (lockedSize != file.SizeBytes || lockedSize > remainingSpace)
+                                    {
+                                        // Changed since planning, or grew past the space
+                                        // left on this disc. Don't stage a stale/oversized
+                                        // copy — re-queue at the true (locked) size for a
+                                        // later disc and try to fill the gap it leaves.
+                                        pendingQueue.Enqueue(new ScannedFile
+                                        {
+                                            FullPath = file.FullPath,
+                                            SizeBytes = lockedSize,
+                                            LastWriteUtc = File.GetLastWriteTimeUtc(file.FullPath),
+                                        });
+                                        TryFillGapFromPending(
+                                            filesToProcess, pendingQueue, remainingSpace);
+                                        break;
+                                    }
 
-                                stagedFiles.Add(new StagedFileInfo
-                                {
-                                    Source = file,
-                                    StagedPath = relativePath,
-                                    IsZipped = false,
-                                    IsSplit = false,
-                                    StagedSizeBytes = file.SizeBytes,
-                                });
+                                    await using var dstStream = new FileStream(
+                                        destPath, FileMode.Create, FileAccess.Write,
+                                        FileShare.None, bufferSize: 81920, useAsync: true);
+                                    await srcStream.CopyToAsync(dstStream, ct);
+
+                                    stagedFiles.Add(new StagedFileInfo
+                                    {
+                                        Source = file,
+                                        StagedPath = relativePath,
+                                        IsZipped = false,
+                                        IsSplit = false,
+                                        StagedSizeBytes = lockedSize,
+                                        Version = fileVersion,
+                                    });
+                                }
                             }
                         }
                         catch (Exception ex)
@@ -504,6 +658,7 @@ public class BackupOrchestrator : IBackupOrchestrator
                                             IsZipped = true,
                                             IsSplit = false,
                                             StagedSizeBytes = new FileInfo(zipPath).Length,
+                                            Version = fileVersion,
                                         });
                                     }
                                     catch (Exception zipEx)
@@ -602,7 +757,16 @@ public class BackupOrchestrator : IBackupOrchestrator
                                 var stale = stagedFiles[j];
                                 stagedFiles.RemoveAt(j);
 
-                                // Clean up the stale staged file from disk.
+                                // Release the in-place read lock (if any) so the file
+                                // isn't held open after we drop it from this disc.
+                                if (stale.HeldLock is not null)
+                                {
+                                    heldLocks.Remove(stale.HeldLock);
+                                    try { stale.HeldLock.Dispose(); } catch { /* best effort */ }
+                                }
+
+                                // Clean up the stale staged file from disk (no-op for
+                                // in-place files, which were never copied to staging).
                                 string stalePath = Path.Combine(stagingDir, stale.StagedPath);
                                 try { if (File.Exists(stalePath)) File.Delete(stalePath); }
                                 catch { /* best effort */ }
@@ -638,10 +802,11 @@ public class BackupOrchestrator : IBackupOrchestrator
                 }
 
                 // Export catalog database to staging directory if requested.
+                string? catalogStagedPath = null;
                 if (plan.Job.IncludeCatalogOnDisc && discIndex == plan.DiscAllocations.Count - 1)
                 {
-                    string catalogDest = Path.Combine(stagingDir, "LithicBackup-Catalog.db");
-                    await _catalog.ExportDatabaseAsync(backupSetId, catalogDest, ct);
+                    catalogStagedPath = Path.Combine(stagingDir, "LithicBackup-Catalog.db");
+                    await _catalog.ExportDatabaseAsync(backupSetId, catalogStagedPath, ct);
                 }
 
                 // Burn.
@@ -651,7 +816,7 @@ public class BackupOrchestrator : IBackupOrchestrator
                         progress.Report(new BackupProgress
                         {
                             CurrentDisc = discSequence,
-                            TotalDiscs = plan.TotalDiscsRequired,
+                            TotalDiscs = Math.Max(plan.TotalDiscsRequired, discSequence),
                             CurrentFile = bp.CurrentFile,
                             BytesWrittenTotal = totalBytesWritten + bp.BytesWritten,
                             BytesTotalAll = plan.TotalBytes,
@@ -673,7 +838,33 @@ public class BackupOrchestrator : IBackupOrchestrator
                     VerifyAfterBurn = plan.Job.VerifyAfterBurn,
                 };
 
-                await _burner.BurnAsync(recorderId, stagingDir, burnOptions, burnProgress, ct);
+                // Build the burn item list. Plain files staged in-place point at
+                // their original (locked) source; everything else (zipped, split,
+                // software, catalog) points at its temp staging copy.
+                var burnItems = new List<BurnItem>(stagedFiles.Count);
+                foreach (var sf in stagedFiles)
+                {
+                    string src = sf.HeldLock is not null
+                        ? sf.Source.FullPath
+                        : Path.Combine(stagingDir, sf.StagedPath);
+                    burnItems.Add(new BurnItem(VersionedDiscPath(sf.StagedPath, sf.Version), src));
+                }
+                // Software payload and exported catalog always live under staging.
+                if (plan.Job.IncludeSoftwareOnDisc)
+                {
+                    string swDir = Path.Combine(stagingDir, "LithicBackup-Software");
+                    if (Directory.Exists(swDir))
+                    {
+                        foreach (var f in Directory.GetFiles(swDir, "*", SearchOption.AllDirectories))
+                            burnItems.Add(new BurnItem(Path.GetRelativePath(stagingDir, f), f));
+                    }
+                }
+                if (catalogStagedPath is not null)
+                    burnItems.Add(new BurnItem("LithicBackup-Catalog.db", catalogStagedPath));
+
+                await _burner.BurnAsync(recorderId, burnItems, burnOptions, burnProgress, ct);
+
+                long discBytesUsed = stagedFiles.Sum(sf => sf.StagedSizeBytes);
 
                 // Record this disc and its files in the catalog.
                 using var tx = await _catalog.BeginTransactionAsync(backupSetId, ct);
@@ -685,7 +876,7 @@ public class BackupOrchestrator : IBackupOrchestrator
                 {
                     discRecord = (await _catalog.GetDiscAsync(sessionDecision.ExistingDiscId.Value, ct))!;
                     discRecord.RewriteCount++;
-                    discRecord.BytesUsed = stagedFiles.Sum(sf => sf.StagedSizeBytes);
+                    discRecord.BytesUsed = discBytesUsed;
                     discRecord.LastWrittenUtc = DateTime.UtcNow;
                     discRecord.Status = BurnSessionStatus.Completed;
                     await _catalog.UpdateDiscAsync(discRecord, ct);
@@ -699,8 +890,8 @@ public class BackupOrchestrator : IBackupOrchestrator
                         SequenceNumber = discSequence,
                         MediaType = (await _burner.GetMediaInfoAsync(recorderId, ct)).MediaType,
                         FilesystemType = burnOptions.FilesystemType,
-                        Capacity = allocation.TotalBytes + allocation.FreeBytes,
-                        BytesUsed = allocation.TotalBytes,
+                        Capacity = discCapacity,
+                        BytesUsed = discBytesUsed,
                         IsMultisession = burnOptions.Multisession,
                         Status = BurnSessionStatus.Completed,
                         CreatedUtc = DateTime.UtcNow,
@@ -710,23 +901,63 @@ public class BackupOrchestrator : IBackupOrchestrator
 
                 foreach (var staged in stagedFiles)
                 {
+                    // --- Split-file chunk ---
+                    // Each chunk of a split file is staged individually and may
+                    // land on a different disc. The owning FileRecord is created
+                    // once (with the first chunk); every chunk — including those on
+                    // later discs — attaches to it.
+                    if (staged.Split is not null && staged.Chunk is not null)
+                    {
+                        var sc = staged.Split;
+                        if (sc.FileRecordId < 0)
+                        {
+                            int splitVersion = 1;
+                            if (versionInfo.TryGetValue(sc.Source.FullPath, out var svi))
+                                splitVersion = svi.MaxVersion + 1;
+                            // Use the snapshot's actual size (== sum of chunk
+                            // lengths), not the planned scan size, so the record's
+                            // SizeBytes matches the bytes actually written even if the
+                            // source grew between planning and the split.
+                            versionInfo[sc.Source.FullPath] = new FileVersionInfo(
+                                splitVersion, sc.Size, sc.Source.LastWriteUtc, false, false, sc.Hash);
+
+                            var splitRecord = await _catalog.CreateFileRecordAsync(new FileRecord
+                            {
+                                DiscId = discRecord.Id,
+                                SourcePath = sc.Source.FullPath,
+                                DiscPath = staged.Chunk.DiscFilename,
+                                SizeBytes = sc.Size,
+                                Hash = sc.Hash,
+                                IsZipped = false,
+                                IsSplit = true,
+                                Version = splitVersion,
+                                SourceLastWriteUtc = sc.Source.LastWriteUtc,
+                                BackedUpUtc = DateTime.UtcNow,
+                            }, ct);
+                            sc.FileRecordId = splitRecord.Id;
+                        }
+
+                        staged.Chunk.FileRecordId = sc.FileRecordId;
+                        staged.Chunk.DiscId = discRecord.Id;
+                        await _catalog.CreateFileChunkAsync(staged.Chunk, ct);
+                        continue;
+                    }
+
                     string hash = await ComputeFileHashAsync(staged.Source.FullPath, ct);
 
-                    // Determine version: increment from the max existing version
-                    // for this source path, or 1 if this is the first backup.
-                    int version = 1;
-                    if (versionInfo.TryGetValue(staged.Source.FullPath, out var vi))
-                        version = vi.MaxVersion + 1;
+                    // The version was fixed at staging time (see fileVersion) so the
+                    // recorded DiscPath matches the versioned path actually burned.
+                    int version = staged.Version;
                     // Update the lookup so subsequent files in this same run get
                     // the correct version (shouldn't happen, but be safe).
                     versionInfo[staged.Source.FullPath] = new FileVersionInfo(
                         version, staged.Source.SizeBytes, staged.Source.LastWriteUtc, false, false, hash);
 
-                    var fileRecord = await _catalog.CreateFileRecordAsync(new FileRecord
+                    await _catalog.CreateFileRecordAsync(new FileRecord
                     {
                         DiscId = discRecord.Id,
                         SourcePath = staged.Source.FullPath,
-                        DiscPath = staged.StagedPath,
+                        DiscPath = VersionedDiscPath(staged.StagedPath, staged.Version),
                         SizeBytes = staged.Source.SizeBytes,
                         Hash = hash,
                         IsZipped = staged.IsZipped,
@@ -735,17 +966,6 @@ public class BackupOrchestrator : IBackupOrchestrator
                         SourceLastWriteUtc = staged.Source.LastWriteUtc,
                         BackedUpUtc = DateTime.UtcNow,
                     }, ct);
-
-                    // Record chunks for split files.
-                    if (staged.IsSplit && staged.Chunks is not null)
-                    {
-                        foreach (var chunk in staged.Chunks)
-                        {
-                            chunk.FileRecordId = fileRecord.Id;
-                            chunk.DiscId = discRecord.Id;
-                            await _catalog.CreateFileChunkAsync(chunk, ct);
-                        }
-                    }
                 }
 
                 // Commit the catalog updates.
@@ -753,19 +973,32 @@ public class BackupOrchestrator : IBackupOrchestrator
                 tx.Dispose();
 
                 discsWritten++;
-                totalBytesWritten += allocation.TotalBytes;
+                totalBytesWritten += discBytesUsed;
             }
             finally
             {
-                // Clean up staging directory.
+                // Release any in-place read locks now that the burn (and catalog
+                // recording) are done, then clean up the staging directory.
+                foreach (var h in heldLocks)
+                {
+                    try { h.Dispose(); } catch { /* best effort */ }
+                }
                 try { Directory.Delete(stagingDir, true); } catch { }
             }
+
+            discIndex++;
         }
 
         } // end try (coordinator)
         finally
         {
             coordinator?.Dispose();
+
+            // Remove any spill snapshots taken for split files.
+            foreach (var spill in spillDirs)
+            {
+                try { if (Directory.Exists(spill)) Directory.Delete(spill, true); } catch { }
+            }
         }
 
         // Update the backup set's last backup timestamp.
@@ -913,7 +1146,13 @@ public class BackupOrchestrator : IBackupOrchestrator
                     })
                     : null;
 
-                await _burner.BurnAsync(recorderId, stagingDir, burnOptions, burnProgress, ct);
+                // Consolidation always copies files to temp staging, so every
+                // burn item reads from the staging directory.
+                var consolidateItems = Directory
+                    .GetFiles(stagingDir, "*", SearchOption.AllDirectories)
+                    .Select(f => new BurnItem(Path.GetRelativePath(stagingDir, f), f))
+                    .ToList();
+                await _burner.BurnAsync(recorderId, consolidateItems, burnOptions, burnProgress, ct);
 
                 // Record the new disc and files in the catalog.
                 using var tx = await _catalog.BeginTransactionAsync(backupSetId, ct);
@@ -1023,25 +1262,49 @@ public class BackupOrchestrator : IBackupOrchestrator
             LastWrittenUtc = DateTime.UtcNow,
         }, ct);
 
-        foreach (var (original, stagedPath, _) in staged)
+        foreach (var (original, stagedPath, stagedSize) in staged)
         {
             string hash = await ComputeFileHashAsync(original.SourcePath, ct);
+
+            // Re-read the live source's size/mtime: the file may have grown or
+            // shrunk since it was first backed up, so recording the original's
+            // stale size would leave the new record inconsistent with the bytes
+            // actually on the replacement disc (and fail later size checks).
+            var (freshSize, freshMtime) = FreshSourceMetadata(original, stagedSize);
 
             await _catalog.CreateFileRecordAsync(new FileRecord
             {
                 DiscId = newDisc.Id,
                 SourcePath = original.SourcePath,
                 DiscPath = stagedPath,
-                SizeBytes = original.SizeBytes,
+                SizeBytes = freshSize,
                 Hash = hash,
                 Version = original.Version,
-                SourceLastWriteUtc = original.SourceLastWriteUtc,
+                SourceLastWriteUtc = freshMtime,
                 BackedUpUtc = DateTime.UtcNow,
             }, ct);
         }
 
         tx.Complete();
         tx.Dispose();
+    }
+
+    /// <summary>
+    /// Current size and last-write time of a re-staged source file, falling back
+    /// to the record's stored values (and the staged byte count) if the live file
+    /// can't be inspected. Used by the disc-replacement paths so a file that grew
+    /// or shrank since its first backup is recorded with its true current size.
+    /// </summary>
+    private static (long Size, DateTime Mtime) FreshSourceMetadata(FileRecord original, long stagedSize)
+    {
+        try
+        {
+            var fi = new FileInfo(original.SourcePath);
+            if (fi.Exists)
+                return (fi.Length, fi.LastWriteTimeUtc);
+        }
+        catch { /* fall through to staged/stored values */ }
+        return (stagedSize, original.SourceLastWriteUtc);
     }
 
     // -------------------------------------------------------------------
@@ -1096,19 +1359,24 @@ public class BackupOrchestrator : IBackupOrchestrator
             LastWrittenUtc = DateTime.UtcNow,
         }, ct);
 
-        foreach (var (original, stagedPath, _) in staged)
+        foreach (var (original, stagedPath, stagedSize) in staged)
         {
             string hash = await ComputeFileHashAsync(original.SourcePath, ct);
+
+            // Record the live source's current size/mtime (it may have grown or
+            // shrunk since the first backup) so the repair disc's record matches
+            // the bytes actually written.
+            var (freshSize, freshMtime) = FreshSourceMetadata(original, stagedSize);
 
             await _catalog.CreateFileRecordAsync(new FileRecord
             {
                 DiscId = newDisc.Id,
                 SourcePath = original.SourcePath,
                 DiscPath = stagedPath,
-                SizeBytes = original.SizeBytes,
+                SizeBytes = freshSize,
                 Hash = hash,
                 Version = original.Version + 1,
-                SourceLastWriteUtc = original.SourceLastWriteUtc,
+                SourceLastWriteUtc = freshMtime,
                 BackedUpUtc = DateTime.UtcNow,
             }, ct);
 
@@ -1202,7 +1470,13 @@ public class BackupOrchestrator : IBackupOrchestrator
                 }))
                 : null;
 
-            await _burner.BurnAsync(recorderId, stagingDir, burnOptions, burnProgress, ct);
+            // Re-burn always copies files to temp staging, so every burn item
+            // reads from the staging directory.
+            var reburnItems = Directory
+                .GetFiles(stagingDir, "*", SearchOption.AllDirectories)
+                .Select(f => new BurnItem(Path.GetRelativePath(stagingDir, f), f))
+                .ToList();
+            await _burner.BurnAsync(recorderId, reburnItems, burnOptions, burnProgress, ct);
 
             return staged;
         }
@@ -1255,6 +1529,25 @@ public class BackupOrchestrator : IBackupOrchestrator
     }
 
     /// <summary>
+    /// Produce the on-disc path for a given file version. Version 1 keeps the
+    /// natural relative path; later versions insert a <c>.v{N}</c> tag before the
+    /// extension (e.g. <c>Users\foo\file.txt</c> → <c>Users\foo\file.v2.txt</c>).
+    /// This guarantees every version of a file occupies a distinct disc path, so
+    /// re-burning a changed file onto the same physical (multisession) disc neither
+    /// collides with the prior version (IMAPI's AddFile rejects duplicate paths)
+    /// nor shadows it at restore time.
+    /// </summary>
+    private static string VersionedDiscPath(string relativePath, int version)
+    {
+        if (version <= 1) return relativePath;
+        string dir = Path.GetDirectoryName(relativePath) ?? "";
+        string name = Path.GetFileNameWithoutExtension(relativePath);
+        string ext = Path.GetExtension(relativePath);
+        string versioned = $"{name}.v{version}{ext}";
+        return string.IsNullOrEmpty(dir) ? versioned : Path.Combine(dir, versioned);
+    }
+
+    /// <summary>
     /// Copy the running application's EXE directory to a subfolder in staging.
     /// </summary>
     private static void CopySoftwareToStaging(string stagingDir)
@@ -1292,7 +1585,13 @@ public class BackupOrchestrator : IBackupOrchestrator
     };
 
     /// <summary>
-    /// Intermediate record of a staged file, tracking zip/split status.
+    /// Intermediate record of a staged item, tracking zip/split status. A split
+    /// file is staged one chunk at a time: each <see cref="StagedFileInfo"/> with
+    /// a non-null <see cref="Split"/> represents a single chunk on the current
+    /// disc, and <see cref="Chunk"/> carries that chunk's metadata. All chunks of
+    /// the same file share one <see cref="SplitContext"/> so a single
+    /// <see cref="FileRecord"/> is created (on the first disc that holds a chunk)
+    /// and every chunk — even those burned to later discs — points back to it.
     /// </summary>
     private class StagedFileInfo
     {
@@ -1300,7 +1599,190 @@ public class BackupOrchestrator : IBackupOrchestrator
         public required string StagedPath { get; init; }
         public required bool IsZipped { get; init; }
         public required bool IsSplit { get; init; }
-        public IReadOnlyList<FileChunk>? Chunks { get; init; }
+        public SplitContext? Split { get; init; }
+        public FileChunk? Chunk { get; init; }
         public long StagedSizeBytes { get; init; }
+
+        /// <summary>
+        /// The version number of this file within the backup set (1 for the first
+        /// copy, incrementing each time a changed file is re-staged). Versions &gt; 1
+        /// are given a distinct on-disc path by <see cref="VersionedDiscPath"/> so
+        /// that re-burning a changed file to the same physical disc does not collide
+        /// with the prior version's path (IMAPI AddFile rejects duplicate paths) and
+        /// so restore does not shadow one version with another.
+        /// </summary>
+        public int Version { get; init; } = 1;
+
+        /// <summary>
+        /// For a plain file staged in-place (burn-in-place mode): the read lock
+        /// held on the original source for the duration of the burn. Null when the
+        /// file was copied to temp staging instead. When non-null, the burn item
+        /// reads from <see cref="Source"/>'s original path rather than a temp copy.
+        /// </summary>
+        public FileStream? HeldLock { get; init; }
+    }
+
+    /// <summary>
+    /// Shared state for a file being split across one or more discs. Created when
+    /// a file first needs splitting; carries the full-file hash (computed once from
+    /// a spill snapshot) and, once the first chunk is recorded, the id of the
+    /// owning <see cref="FileRecord"/> so later discs attach their chunks to it.
+    /// </summary>
+    private sealed class SplitContext
+    {
+        public required ScannedFile Source { get; init; }
+        public required string Hash { get; init; }
+        /// <summary>
+        /// Actual byte length of the spill snapshot the chunks are carved from
+        /// (captured under a read lock when the split began), so the owning
+        /// <see cref="FileRecord"/>'s size matches the sum of its chunk lengths
+        /// even if the live source grew between planning and the split.
+        /// </summary>
+        public required long Size { get; init; }
+        public long FileRecordId { get; set; } = -1;
+    }
+
+    /// <summary>
+    /// Progress of a split still being written out disc by disc. Bytes are read
+    /// from <see cref="SpillPath"/> (an immutable snapshot of the source taken when
+    /// the split began) so every chunk is consistent even if the live source
+    /// changes between discs.
+    /// </summary>
+    private sealed class SplitCarry
+    {
+        public required SplitContext Ctx { get; init; }
+        public required string SpillPath { get; init; }
+        public long Offset { get; set; }
+        public long Remaining { get; set; }
+        public int Sequence { get; set; }
+    }
+
+    /// <summary>
+    /// Snapshot a file that needs splitting into a private spill directory and
+    /// return a fresh <see cref="SplitCarry"/> positioned at its start. The
+    /// snapshot (rather than the live file) is the source for every chunk, so a
+    /// file that spans discs stays internally consistent even if the original
+    /// changes between discs.
+    /// </summary>
+    private async Task<SplitCarry> BeginSplitAsync(
+        ScannedFile file, List<string> spillDirs, CancellationToken ct)
+    {
+        string spillDir = Path.Combine(
+            Path.GetTempPath(), "LithicBackup", $"spill-{Guid.NewGuid():N}");
+        Directory.CreateDirectory(spillDir);
+        spillDirs.Add(spillDir);
+
+        string spillPath = Path.Combine(spillDir, "data");
+        await using (var src = new FileStream(
+            file.FullPath, FileMode.Open, FileAccess.Read, FileShare.Read,
+            bufferSize: 81920, useAsync: true))
+        await using (var dst = new FileStream(
+            spillPath, FileMode.Create, FileAccess.Write, FileShare.None,
+            bufferSize: 81920, useAsync: true))
+        {
+            await src.CopyToAsync(dst, ct);
+        }
+
+        long size = new FileInfo(spillPath).Length;
+        string hash = await ComputeFileHashAsync(spillPath, ct);
+
+        return new SplitCarry
+        {
+            Ctx = new SplitContext { Source = file, Hash = hash, Size = size },
+            SpillPath = spillPath,
+            Offset = 0,
+            Remaining = size,
+            Sequence = 0,
+        };
+    }
+
+    /// <summary>
+    /// Write as many of a split file's remaining chunks into the current disc's
+    /// staging directory as will fit, appending a <see cref="StagedFileInfo"/> per
+    /// chunk. Returns the still-unfinished carry (to continue on the next disc) or
+    /// <c>null</c> once the whole file has been written. Each chunk fills the disc's
+    /// remaining space, so the first chunk on a fresh disc takes a full disc's worth.
+    /// </summary>
+    private async Task<SplitCarry?> PlaceSplitChunksAsync(
+        SplitCarry? carry,
+        List<StagedFileInfo> stagedFiles,
+        string stagingDir,
+        long discCapacity,
+        CancellationToken ct)
+    {
+        if (carry is null)
+            return null;
+
+        long used = stagedFiles.Sum(sf => sf.StagedSizeBytes);
+
+        while (carry.Remaining > 0)
+        {
+            long space = discCapacity - used;
+            if (space <= 0)
+                return carry; // Disc full — finish this split on the next disc.
+
+            long len = Math.Min(space, carry.Remaining);
+            string chunkName = $"{carry.Ctx.Hash[..8]}.{carry.Sequence:D4}.discburn-split";
+            string chunkPath = Path.Combine(stagingDir, chunkName);
+
+            await WriteChunkAsync(carry.SpillPath, carry.Offset, len, chunkPath, ct);
+
+            var chunk = new FileChunk
+            {
+                Sequence = carry.Sequence,
+                Offset = carry.Offset,
+                Length = len,
+                DiscFilename = chunkName,
+            };
+
+            stagedFiles.Add(new StagedFileInfo
+            {
+                Source = carry.Ctx.Source,
+                StagedPath = chunkName,
+                IsZipped = false,
+                IsSplit = true,
+                Split = carry.Ctx,
+                Chunk = chunk,
+                StagedSizeBytes = len,
+            });
+
+            carry.Offset += len;
+            carry.Remaining -= len;
+            carry.Sequence++;
+            used += len;
+        }
+
+        return null; // Fully written.
+    }
+
+    /// <summary>
+    /// Copy <paramref name="length"/> bytes starting at <paramref name="offset"/>
+    /// from <paramref name="sourcePath"/> into a new file at <paramref name="destPath"/>.
+    /// Used to carve one disc-sized chunk out of a spill snapshot.
+    /// </summary>
+    private static async Task WriteChunkAsync(
+        string sourcePath, long offset, long length, string destPath, CancellationToken ct)
+    {
+        await using var src = new FileStream(
+            sourcePath, FileMode.Open, FileAccess.Read, FileShare.Read,
+            bufferSize: 81920, useAsync: true);
+        src.Seek(offset, SeekOrigin.Begin);
+
+        await using var dst = new FileStream(
+            destPath, FileMode.Create, FileAccess.Write, FileShare.None,
+            bufferSize: 81920, useAsync: true);
+
+        var buffer = new byte[81920];
+        long remaining = length;
+        while (remaining > 0)
+        {
+            ct.ThrowIfCancellationRequested();
+            int toRead = (int)Math.Min(buffer.Length, remaining);
+            int read = await src.ReadAsync(buffer.AsMemory(0, toRead), ct);
+            if (read == 0)
+                break;
+            await dst.WriteAsync(buffer.AsMemory(0, read), ct);
+            remaining -= read;
+        }
     }
 }

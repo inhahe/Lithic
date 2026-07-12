@@ -107,6 +107,41 @@
                   IsChecked="{Binding SuppressBackupSuggestions}"
                   Margin="0,0,0,4" />
 
+        <Border Height="1" Background="{StaticResource BorderBrush}"
+                Margin="0,20,0,16" />
+
+        <TextBlock Text="Disc staging"
+                   FontSize="15" FontWeight="SemiBold"
+                   Foreground="{StaticResource TextPrimaryBrush}" />
+        <TextBlock Text="How files are supplied to the burner when backing up to disc."
+                   Foreground="{StaticResource TextSecondaryBrush}"
+                   FontSize="11" TextWrapping="Wrap"
+                   Margin="0,4,0,12" />
+
+        <RadioButton x:Name="CopyToTempRadio" GroupName="StagingMode"
+                     IsChecked="{Binding StageToTemp}"
+                     Margin="0,0,0,4">
+            <StackPanel>
+                <TextBlock Text="Copy to a temporary folder first (recommended)"
+                           Foreground="{StaticResource TextPrimaryBrush}" FontSize="12" />
+                <TextBlock Text="Safest, but needs enough free temp space to hold a full disc's worth of data (up to ~100 GB for Blu-ray). Source files are only locked briefly while copied."
+                           Foreground="{StaticResource TextSecondaryBrush}"
+                           FontSize="11" TextWrapping="Wrap" Margin="0,2,0,0" />
+            </StackPanel>
+        </RadioButton>
+
+        <RadioButton x:Name="BurnInPlaceRadio" GroupName="StagingMode"
+                     IsChecked="{Binding BurnInPlace}"
+                     Margin="0,8,0,4">
+            <StackPanel>
+                <TextBlock Text="Burn directly from the source (no temporary copy)"
+                           Foreground="{StaticResource TextPrimaryBrush}" FontSize="12" />
+                <TextBlock Text="Avoids needing temp space for large media, but locks each source file for the whole burn so nothing else can modify it. Zipped and split files still use a temporary copy."
+                           Foreground="{StaticResource TextSecondaryBrush}"
+                           FontSize="11" TextWrapping="Wrap" Margin="0,2,0,0" />
+            </StackPanel>
+        </RadioButton>
+
         <!-- Buttons -->
         <StackPanel Orientation="Horizontal" HorizontalAlignment="Right"
                     Margin="0,20,0,0">

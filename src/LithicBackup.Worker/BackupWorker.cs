@@ -841,7 +841,7 @@ public sealed class BackupWorker : BackgroundService
             state.PendingMoves.Clear();
 
             var now = DateTime.UtcNow;
-            int relocated = 0, recopied = 0;
+            int relocated = 0, recopied = 0, freshNames = 0;
 
             foreach (var move in moves)
             {
@@ -855,21 +855,31 @@ public sealed class BackupWorker : BackgroundService
                     var outcome = await _directoryBackup.MoveTargetedAsync(
                         job, targetDir, move.OldPath, move.NewPath, move.IsDirectory, ct);
 
-                    if (outcome == TargetedMoveOutcome.Relocated)
+                    switch (outcome)
                     {
-                        relocated++;
-                    }
-                    else
-                    {
-                        // Couldn't relocate cleanly — back up the new side as fresh
-                        // files, then reconcile the now-vacated old path so its stale
-                        // record doesn't linger (a move's source departure is
-                        // unambiguous in the USN journal, so we act on it at once
-                        // rather than waiting for a full scan that never runs in
-                        // pure-continuous mode).
-                        recopied++;
-                        EnqueueForBackup(state, move.NewPath, move.IsDirectory, now);
-                        await MarkMovedOutAsync(set, move.OldPath, move.IsDirectory, ct);
+                        case TargetedMoveOutcome.Relocated:
+                            relocated++;
+                            break;
+
+                        case TargetedMoveOutcome.NothingToRelocate:
+                            // The old name was never backed up (the ubiquitous
+                            // atomic-save pattern: write foo.tmp, rename over foo).
+                            // There is no destination copy to move and no stale
+                            // record to reconcile — just back up the new name.
+                            freshNames++;
+                            EnqueueForBackup(state, move.NewPath, move.IsDirectory, now);
+                            break;
+
+                        default: // FellBack — tracked, but couldn't relocate cleanly.
+                            // Back up the new side as fresh files, then reconcile the
+                            // now-vacated old path so its stale record doesn't linger
+                            // (a move's source departure is unambiguous in the USN
+                            // journal, so we act on it at once rather than waiting for
+                            // a full scan that never runs in pure-continuous mode).
+                            recopied++;
+                            EnqueueForBackup(state, move.NewPath, move.IsDirectory, now);
+                            await MarkMovedOutAsync(set, move.OldPath, move.IsDirectory, ct);
+                            break;
                     }
                 }
                 else if (newIn)
@@ -891,10 +901,16 @@ public sealed class BackupWorker : BackgroundService
             {
                 state.LastRunUtc = DateTime.UtcNow;
                 _logger.LogInformation(
-                    "Continuous backup for \"{Name}\": relocated {Relocated} moved item(s); " +
-                    "{Recopied} could not be relocated and will be re-copied.",
+                    "Continuous backup for \"{Name}\": relocated {Relocated} moved item(s) in place; " +
+                    "{Recopied} tracked item(s) could not be relocated and will be re-copied.",
                     set.Name, relocated, recopied);
             }
+
+            if (freshNames > 0)
+                _logger.LogDebug(
+                    "Continuous backup for \"{Name}\": {Fresh} renamed item(s) had no prior backup " +
+                    "(new name backed up normally; typically atomic saves).",
+                    set.Name, freshNames);
         }
         catch (OperationCanceledException) when (ct.IsCancellationRequested)
         {
@@ -1053,6 +1069,8 @@ public sealed class BackupWorker : BackgroundService
     /// <summary>Build a <see cref="BackupJob"/> from a set's saved options.</summary>
     private static BackupJob BuildJob(BackupSet set, JobOptions opts, string targetDir)
     {
+        // Machine-global settings shared with the interactive app via settings.json.
+        var machineSettings = UserSettings.Load();
         return new BackupJob
         {
             BackupSetId = set.Id,
@@ -1078,9 +1096,10 @@ public sealed class BackupWorker : BackgroundService
             ExcludedExtensions = opts.ExcludedExtensions,
             RetentionTiers = opts.RetentionTiers,
             TierSets = opts.TierSets,
-            // Machine-global memory budget (shared with the interactive app via
-            // settings.json) so scheduled backups honor the same limit.
-            MemoryBudget = UserSettings.Load().MemoryBudget,
+            // Machine-global memory budget + disc staging mode so scheduled
+            // backups honor the same limits and burn-in-place preference.
+            MemoryBudget = machineSettings.MemoryBudget,
+            StagingMode = machineSettings.DiscStagingMode,
         };
     }
 

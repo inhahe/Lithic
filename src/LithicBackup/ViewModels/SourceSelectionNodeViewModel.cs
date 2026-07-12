@@ -69,6 +69,18 @@ public class SourceSelectionNodeViewModel : ViewModelBase
     /// selection survives until the user explicitly changes it.
     /// </summary>
     private List<Core.Models.SourceSelection>? _orphanedChildModels;
+    /// <summary>
+    /// Set when <see cref="ApplySelectionAsync"/> deferred restoring this
+    /// collapsed directory's child selections to keep the initial dialog open
+    /// fast (we only eagerly restore currently-visible/expanded subtrees).  The
+    /// saved subtree lives in <see cref="_restoredModel"/>; when the user later
+    /// expands this node, <see cref="LoadChildrenAsync"/> consumes this flag and
+    /// applies the saved child selections on top of the freshly-loaded children.
+    /// Until then, <see cref="ToModel"/>'s _restoredModel fallback keeps the save
+    /// lossless.
+    /// </summary>
+    private bool _pendingDeferredRestore;
+    private bool _isSelectionRestored;
     private long _size = -1;
     private int _fileCount = -1;
     /// <summary>
@@ -520,6 +532,23 @@ public class SourceSelectionNodeViewModel : ViewModelBase
     }
 
     /// <summary>
+    /// Whether this node's <see cref="IsSelected"/> value reflects its final,
+    /// intended state — i.e. it has been settled (restored from the saved model,
+    /// or derived at creation for a freshly enumerated child).  Bound by the
+    /// tree's Include checkbox visibility: the box stays hidden (space reserved)
+    /// until this is true, so the user never sees a column of default-unchecked
+    /// boxes flip to their real state.  Because each node reveals itself the
+    /// instant its own state settles — independent of its descendants' restore —
+    /// checkboxes appear top-down almost immediately instead of waiting for the
+    /// entire recursive restore (including deep filesystem enumeration) to finish.
+    /// </summary>
+    public bool IsSelectionRestored
+    {
+        get => _isSelectionRestored;
+        internal set => SetProperty(ref _isSelectionRestored, value);
+    }
+
+    /// <summary>
     /// Whether new subdirectories added in the future should be automatically included.
     /// Only meaningful for directories.
     /// </summary>
@@ -605,38 +634,41 @@ public class SourceSelectionNodeViewModel : ViewModelBase
         _autoIncludeNew = model.AutoIncludeNewSubdirectories;
         OnPropertyChanged(nameof(AutoIncludeNew));
 
+        // This node's own state is now settled — reveal its checkbox immediately,
+        // without waiting for its (possibly deep, slow-to-enumerate) descendants
+        // to finish restoring.  This is what makes checkboxes appear top-down.
+        IsSelectionRestored = true;
+
+        // Decide whether to restore this subtree's children eagerly now, or
+        // defer it until the user expands the node.  To keep the initial dialog
+        // open snappy we only eagerly walk currently-visible subtrees: the
+        // permanently-expanded virtual root (Parent is null) and any node the
+        // saved model had expanded.  Collapsed subtrees are deferred — their
+        // saved child selections are re-applied on first expand (see
+        // LoadChildrenAsync), and until then ToModel's _restoredModel fallback
+        // keeps the save lossless.
+        bool restoreChildrenNow = model.IsExpanded || Parent is null;
+
         // If this directory has child selections to restore, load children
         // and apply.  Suppress size computation during this phase — we're
         // restoring saved state, not responding to a user click.
         if (IsDirectory && model.Children.Count > 0)
         {
-            _suppressSizeComputation = true;
-            await EnsureChildrenLoadedAsync();
-            _suppressSizeComputation = false;
-
-            // Apply sibling subtrees concurrently — each child's
-            // filesystem enumeration runs on the thread pool, so
-            // siblings overlap instead of serialising.
-            var tasks = new List<Task>(model.Children.Count);
-            foreach (var childModel in model.Children)
+            if (restoreChildrenNow)
             {
-                var childNode = Children.FirstOrDefault(c =>
-                    string.Equals(c.Path, childModel.Path, StringComparison.OrdinalIgnoreCase));
-                if (childNode is not null)
-                {
-                    tasks.Add(childNode.ApplySelectionAsync(childModel));
-                }
-                else if (childModel.IsSelected != false)
-                {
-                    // The saved selection referenced a child that is no longer
-                    // on disk (renamed/moved/disconnected).  Preserve it so a
-                    // later save (ToModel) doesn't silently drop the selection;
-                    // if the path comes back under its original name it will be
-                    // backed up again.
-                    (_orphanedChildModels ??= []).Add(childModel);
-                }
+                _suppressSizeComputation = true;
+                await EnsureChildrenLoadedAsync();
+                _suppressSizeComputation = false;
+
+                await ApplyChildModelsAsync(model.Children);
             }
-            await Task.WhenAll(tasks);
+            else
+            {
+                // Defer: remember that this collapsed directory still owes a
+                // child-selection restore.  _restoredModel (set above) holds the
+                // saved subtree; LoadChildrenAsync re-applies it on first expand.
+                _pendingDeferredRestore = true;
+            }
         }
 
         // Restore expansion state from the saved model.  Children are
@@ -660,6 +692,67 @@ public class SourceSelectionNodeViewModel : ViewModelBase
             IsExpanded = model.IsExpanded;
             _isApplyingSelection = false;
         }
+    }
+
+    /// <summary>
+    /// Apply a set of saved child <see cref="Core.Models.SourceSelection"/>
+    /// models to this node's already-loaded children, recursing into each.
+    /// Saved children whose paths are no longer present on disk are preserved as
+    /// orphans (see <see cref="_orphanedChildModels"/>) so a later save doesn't
+    /// silently drop them.  Sibling subtrees are applied concurrently — each
+    /// child's filesystem enumeration runs on the thread pool, so siblings
+    /// overlap instead of serialising.
+    /// </summary>
+    private async Task ApplyChildModelsAsync(
+        IReadOnlyList<Core.Models.SourceSelection> childModels)
+    {
+        // Reveal every direct child's checkbox up front.  Children already carry
+        // their correct state: freshly enumerated ones inherited it at creation
+        // (CreateChildNode), and any that also appear in the saved model have it
+        // corrected synchronously by the ApplySelectionAsync calls below — all
+        // before the UI thread next renders — so no checkbox flashes a wrong
+        // value.  Doing this before recursing means a directory's own row and its
+        // immediate children appear without waiting for grandchildren to load.
+        foreach (var child in Children)
+            child.IsSelectionRestored = true;
+
+        var tasks = new List<Task>(childModels.Count);
+        foreach (var childModel in childModels)
+        {
+            var childNode = Children.FirstOrDefault(c =>
+                string.Equals(c.Path, childModel.Path, StringComparison.OrdinalIgnoreCase));
+            if (childNode is not null)
+            {
+                tasks.Add(childNode.ApplySelectionAsync(childModel));
+            }
+            else if (childModel.IsSelected != false)
+            {
+                // The saved selection referenced a child that is no longer
+                // on disk (renamed/moved/disconnected).  Preserve it so a
+                // later save (ToModel) doesn't silently drop the selection;
+                // if the path comes back under its original name it will be
+                // backed up again.
+                (_orphanedChildModels ??= []).Add(childModel);
+            }
+        }
+        await Task.WhenAll(tasks);
+    }
+
+    /// <summary>
+    /// Reveal this node's Include checkbox and those of all currently-loaded
+    /// descendants.  A safety net run once the restore finishes: it flips any
+    /// node the restore never touched (e.g. a drive present on the system but
+    /// absent from the saved model, or the old serialisation format's untouched
+    /// nodes) from hidden to visible.  Nodes reached by the restore already set
+    /// this eagerly, so this only affects the stragglers and never regresses a
+    /// value that's already correct.
+    /// </summary>
+    internal void RevealCheckboxesRecursive()
+    {
+        IsSelectionRestored = true;
+        if (_isLoaded)
+            foreach (var child in Children)
+                child.RevealCheckboxesRecursive();
     }
 
     /// <summary>
@@ -773,6 +866,16 @@ public class SourceSelectionNodeViewModel : ViewModelBase
             // sizes still need async computation the name sort is applied
             // now, and ComputePrioritySizesAsync re-sorts once sizes arrive.
             SortChildren();
+
+            // If this directory's saved child selections were deferred (it was
+            // collapsed during the initial restore), re-apply them now that the
+            // children exist.  This runs the first time the user expands the node.
+            if (_pendingDeferredRestore && _restoredModel is not null)
+            {
+                _pendingDeferredRestore = false;
+                await ApplyChildModelsAsync(_restoredModel.Children);
+                SortChildren();
+            }
 
             // Compute aggregate backup status for this directory.
             if (_getCatalogInfo?.Invoke() is not null)
@@ -933,6 +1036,11 @@ public class SourceSelectionNodeViewModel : ViewModelBase
             _fileCount = entry.FileCount,
             _filteredSize = entry.FilteredSize,
             _filteredFileCount = entry.FilteredFileCount,
+            // A freshly enumerated child's selection state is known synchronously
+            // here (inherited from this parent).  If it also appears in a saved
+            // model, ApplyChildModelsAsync corrects it before the next render, so
+            // its checkbox can be shown immediately without a wrong-state flash.
+            _isSelectionRestored = true,
         };
 
         // Determine backup status for files from the catalog.

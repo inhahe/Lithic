@@ -12,23 +12,26 @@ namespace LithicBackup.Infrastructure.Burning;
 /// truncated data (a bad blank, a dirty laser, a flaky drive).
 ///
 /// <para>
-/// The check is filesystem-agnostic: it walks the staging source tree, locates
-/// each file by relative path on the mounted disc, and compares SHA-256 hashes.
-/// A missing file, a size mismatch, or a hash mismatch is a verification
-/// failure. Any failures throw a <see cref="BurnException"/> summarising them.
+/// The check is filesystem-agnostic: for each burned item it locates the file by
+/// its disc-relative path on the mounted disc and compares SHA-256 hashes against
+/// the original source bytes. A missing file, a size mismatch, or a hash mismatch
+/// is a verification failure. Any failures throw a <see cref="BurnException"/>
+/// summarising them. Working from the item list (rather than walking the disc)
+/// means it verifies correctly whether the source was a temp staging copy or an
+/// in-place original held under a read lock.
 /// </para>
 /// </summary>
 internal static class BurnVerifier
 {
     /// <summary>
-    /// Verify that every file under <paramref name="sourceDirectory"/> exists on
-    /// the disc mounted at <paramref name="discRootPath"/> with identical content.
+    /// Verify that every file in <paramref name="items"/> exists on the disc
+    /// mounted at <paramref name="discRootPath"/> with identical content.
     /// </summary>
     /// <param name="totalBytes">Total burn size, used only for progress percentage.</param>
     /// <param name="stopwatch">Burn stopwatch, used only for elapsed reporting.</param>
     /// <exception cref="BurnException">Thrown if any file fails to verify.</exception>
     public static async Task VerifyAsync(
-        string sourceDirectory,
+        IReadOnlyList<BurnItem> items,
         string discRootPath,
         long totalBytes,
         Stopwatch stopwatch,
@@ -39,16 +42,16 @@ internal static class BurnVerifier
             throw new BurnException(
                 $"Verification failed: the burned disc is not readable at {discRootPath}.");
 
-        var sourceFiles = Directory.GetFiles(sourceDirectory, "*", SearchOption.AllDirectories);
         var failures = new List<string>();
         long bytesVerified = 0;
         long denom = totalBytes > 0 ? totalBytes : 1;
 
-        foreach (var sourcePath in sourceFiles)
+        foreach (var item in items)
         {
             ct.ThrowIfCancellationRequested();
 
-            string rel = Path.GetRelativePath(sourceDirectory, sourcePath);
+            string rel = item.DiscRelativePath;
+            string sourcePath = item.SourceAbsolutePath;
             string discPath = Path.Combine(discRootPath, rel);
             var sourceInfo = new FileInfo(sourcePath);
 
