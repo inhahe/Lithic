@@ -180,7 +180,7 @@ public class BackupReviewNodeViewModel : ViewModelBase
         }
     }
 
-    /// <summary>Human-readable selected size (e.g. "1.2 GB").</summary>
+    /// <summary>Selected size in raw bytes with thousands separators (e.g. "1,234,567").</summary>
     public string FormattedSize => FormatBytes(SelectedSizeBytes);
 
     /// <summary>File-count column text. Empty for individual files.</summary>
@@ -295,16 +295,7 @@ public class BackupReviewNodeViewModel : ViewModelBase
             child.ExpandAll();
     }
 
-    internal static string FormatBytes(long bytes)
-    {
-        string[] units = ["B", "KB", "MB", "GB", "TB"];
-        double size = bytes;
-        int unit = 0;
-        while (size >= 1024 && unit < units.Length - 1)
-        {
-            size /= 1024;
-            unit++;
-        }
-        return unit == 0 ? $"{bytes:N0} B" : $"{size:N1} {units[unit]}";
-    }
+    // Raw byte count with thousands separators and no unit suffix, per user
+    // preference for the review dialog (e.g. "1,234,567" rather than "1.2 MB").
+    internal static string FormatBytes(long bytes) => $"{bytes:N0}";
 }
