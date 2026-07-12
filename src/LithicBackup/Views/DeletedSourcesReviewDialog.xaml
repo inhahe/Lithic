@@ -1,0 +1,80 @@
+<Window x:Class="LithicBackup.Views.DeletedSourcesReviewDialog"
+        xmlns="http://schemas.microsoft.com/winfx/2006/xaml/presentation"
+        xmlns:x="http://schemas.microsoft.com/winfx/2006/xaml"
+        xmlns:vm="clr-namespace:LithicBackup.ViewModels"
+        Title="Remove Files No Longer in Sources"
+        Width="620" Height="480"
+        MinWidth="460" MinHeight="320"
+        WindowStartupLocation="CenterOwner"
+        ShowInTaskbar="False"
+        Style="{StaticResource MainWindowStyle}">
+
+    <Grid Margin="16">
+        <Grid.RowDefinitions>
+            <RowDefinition Height="Auto" />
+            <RowDefinition Height="*" />
+            <RowDefinition Height="Auto" />
+        </Grid.RowDefinitions>
+
+        <TextBlock Grid.Row="0"
+                   Text="{Binding HeaderText}"
+                   TextWrapping="Wrap"
+                   Foreground="{StaticResource TextSecondaryBrush}"
+                   FontSize="12" Margin="0,0,0,12" />
+
+        <Border Grid.Row="1"
+                BorderBrush="{StaticResource BorderBrush}"
+                BorderThickness="1" CornerRadius="4">
+            <TreeView ItemsSource="{Binding RootNodes}"
+                      BorderThickness="0"
+                      Background="Transparent"
+                      ScrollViewer.HorizontalScrollBarVisibility="Auto">
+                <TreeView.ItemContainerStyle>
+                    <Style TargetType="TreeViewItem">
+                        <Setter Property="IsExpanded" Value="{Binding IsExpanded, Mode=TwoWay}" />
+                    </Style>
+                </TreeView.ItemContainerStyle>
+                <TreeView.Resources>
+                    <HierarchicalDataTemplate DataType="{x:Type vm:PurgePreviewNode}"
+                                              ItemsSource="{Binding Children}">
+                        <Grid>
+                            <Grid.ColumnDefinitions>
+                                <ColumnDefinition Width="*" />
+                                <ColumnDefinition Width="Auto" />
+                            </Grid.ColumnDefinitions>
+                            <TextBlock Grid.Column="0" Text="{Binding Name}"
+                                       Foreground="{StaticResource TextPrimaryBrush}"
+                                       TextTrimming="CharacterEllipsis"
+                                       Margin="0,1,12,1">
+                                <TextBlock.Style>
+                                    <Style TargetType="TextBlock">
+                                        <Style.Triggers>
+                                            <DataTrigger Binding="{Binding IsDirectory}" Value="True">
+                                                <Setter Property="FontWeight" Value="SemiBold" />
+                                            </DataTrigger>
+                                        </Style.Triggers>
+                                    </Style>
+                                </TextBlock.Style>
+                            </TextBlock>
+                            <TextBlock Grid.Column="1" Text="{Binding SizeText}"
+                                       Foreground="{StaticResource TextDimBrush}"
+                                       HorizontalAlignment="Right"
+                                       Margin="0,1,4,1" />
+                        </Grid>
+                    </HierarchicalDataTemplate>
+                </TreeView.Resources>
+            </TreeView>
+        </Border>
+
+        <StackPanel Grid.Row="2" Orientation="Horizontal"
+                    HorizontalAlignment="Right" Margin="0,16,0,0">
+            <Button Content="Not now" Padding="16,8" Margin="0,0,8,0"
+                    Cursor="Hand" IsCancel="True"
+                    Click="NotNow_Click" />
+            <Button Style="{StaticResource PrimaryButton}"
+                    Content="Remove" Padding="16,8"
+                    Cursor="Hand" IsDefault="True"
+                    Click="Remove_Click" />
+        </StackPanel>
+    </Grid>
+</Window>

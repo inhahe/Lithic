@@ -419,6 +419,18 @@ public class MainViewModel : ViewModelBase
 
         var backupSet = SelectedBackupSet;
 
+        // Snapshot the source selection as it stands before any edit.  After the
+        // editor closes we diff this against the saved selection to offer to (a)
+        // purge destination copies of folders the user removed and (b) back up
+        // folders the user added.  GetSelections() builds a brand-new tree and
+        // reassigns the property, so holding the original list reference is a
+        // valid snapshot.  Gated on an actual save so a discarded edit prompts
+        // nothing (see savedThisSession below).
+        var originalSelections = backupSet.SourceSelections is { } os
+            ? os
+            : new List<Core.Models.SourceSelection>();
+        bool savedThisSession = false;
+
         // Show a wait cursor while loading — the dialog won't appear until ready.
         Mouse.OverrideCursor = Cursors.Wait;
 
@@ -478,6 +490,7 @@ public class MainViewModel : ViewModelBase
             SyncSettingsToJobOptions(backupSet, sourceSelection);
             backupSet.SourceSelections = sourceSelection.GetSelections();
             await Task.Run(() => _catalog.UpdateBackupSetAsync(backupSet));
+            savedThisSession = true;
         }
 
         // Register a pending save so settings are persisted on dialog close.
@@ -549,6 +562,13 @@ public class MainViewModel : ViewModelBase
             }
             _editorWindow = null;
             await LoadBackupSetsAsync();
+
+            // If the edit actually saved, reconcile the destination with the new
+            // source selection: offer to purge copies of removed folders and to
+            // back up newly added ones.  Skipped entirely when nothing was saved
+            // (e.g. the user discarded changes on close).
+            if (savedThisSession)
+                await ReconcileDestinationAfterEditAsync(backupSet, originalSelections);
         };
 
         // Save button: persist everything and show confirmation.
@@ -852,6 +872,234 @@ public class MainViewModel : ViewModelBase
             autoCheckCts = new CancellationTokenSource();
             await RunPlanCheckInEditorAsync(sourceSelection, backupSet, autoCheckCts.Token);
         }
+    }
+
+    // -------------------------------------------------------------------
+    // Post-edit destination reconcile: after a *saved* source edit, offer to
+    // purge destination copies of removed sources and back up added ones.
+    // -------------------------------------------------------------------
+
+    /// <summary>
+    /// After a backup set's sources are edited AND saved, diff the saved source
+    /// selection against the pre-edit snapshot and offer two independent,
+    /// orthogonal follow-ups:
+    /// <list type="bullet">
+    /// <item><b>Purge</b> — destination copies of files whose source path is no
+    /// longer covered are offered for immediate removal (all-or-nothing, via a
+    /// read-only review tree) so they don't linger until the next Cleanup.</item>
+    /// <item><b>Back up</b> — newly-covered source roots are offered for an
+    /// immediate incremental backup.</item>
+    /// </list>
+    /// Removal is detected file-by-file (a file included under the old selection
+    /// but not the new one), which correctly handles deselecting one child of a
+    /// fully-selected parent.  Addition is detected at the covering-root level so
+    /// a partial de-selection can never register as an addition.
+    /// </summary>
+    private async Task ReconcileDestinationAfterEditAsync(
+        BackupSet backupSet, IReadOnlyList<Core.Models.SourceSelection> originalSelections)
+    {
+        var newSelections = backupSet.SourceSelections
+            ?? new List<Core.Models.SourceSelection>();
+
+        List<FileRecord> removed;
+        List<string> addedRoots;
+
+        Mouse.OverrideCursor = Cursors.Wait;
+        try
+        {
+            (removed, addedRoots) = await Task.Run(() =>
+            {
+                var all = _catalog
+                    .GetAllFilesForBackupSetAsync(backupSet.Id)
+                    .GetAwaiter().GetResult();
+
+                // Removed: currently-active catalog files whose source path was
+                // covered before the edit but isn't covered any more.
+                var rem = all
+                    .Where(f => !f.IsDeleted
+                        && SourceSelection.IsPathIncluded(originalSelections, f.SourcePath)
+                        && !SourceSelection.IsPathIncluded(newSelections, f.SourcePath))
+                    .ToList();
+
+                // Added: new covering roots not already covered by an old root.
+                var oldRoots = SourceSelection.CollectSelectedRoots(originalSelections);
+                var newRoots = SourceSelection.CollectSelectedRoots(newSelections);
+                var added = newRoots
+                    .Where(r => !IsCoveredBy(oldRoots, r))
+                    .ToList();
+
+                return (rem, added);
+            });
+        }
+        finally
+        {
+            Mouse.OverrideCursor = null;
+        }
+
+        // Removal and addition are disjoint (a path can't be both dropped and
+        // newly covered), so both prompts may legitimately appear in sequence.
+        if (removed.Count > 0)
+            await PromptAndPurgeRemovedAsync(backupSet, removed);
+
+        if (addedRoots.Count > 0)
+            PromptAndBackupAdded(backupSet, addedRoots);
+    }
+
+    /// <summary>True when <paramref name="path"/> equals one of
+    /// <paramref name="roots"/> or lives underneath one of them.</summary>
+    private static bool IsCoveredBy(IEnumerable<string> roots, string path)
+    {
+        foreach (var root in roots)
+        {
+            if (string.Equals(root, path, StringComparison.OrdinalIgnoreCase))
+                return true;
+            var prefix = root.TrimEnd('\\') + "\\";
+            if (path.StartsWith(prefix, StringComparison.OrdinalIgnoreCase))
+                return true;
+        }
+        return false;
+    }
+
+    /// <summary>
+    /// Show the read-only removal-review tree for files dropped from the set's
+    /// sources; on confirmation, mark them deleted in the catalog and physically
+    /// delete their destination copies (reusing the vetted Cleanup purge path via
+    /// <see cref="Services.DestinationFilePurger"/>), then run a catalog reconcile
+    /// so references left stale by the deletions are repaired — exactly as the
+    /// manual Cleanup workflow does.
+    /// </summary>
+    private async Task PromptAndPurgeRemovedAsync(
+        BackupSet backupSet, List<FileRecord> removed)
+    {
+        // One review row per source path; size is the sum across its versions.
+        var byPath = removed
+            .GroupBy(f => f.SourcePath, StringComparer.OrdinalIgnoreCase)
+            .Select(g => (SourcePath: g.Key, SizeBytes: g.Sum(f => f.SizeBytes)))
+            .ToList();
+
+        var reviewVm = DeletedSourcesReviewViewModel.Build(byPath);
+        var dialog = new DeletedSourcesReviewDialog
+        {
+            Owner = Application.Current.MainWindow,
+            DataContext = reviewVm,
+        };
+
+        if (dialog.ShowDialog() != true)
+        {
+            StatusText = "Left removed-source files on the destination "
+                + "(remove later via Cleanup).";
+            return;
+        }
+
+        string? targetDir = backupSet.JobOptions?.TargetDirectory;
+        var sourcePaths = byPath.Select(p => p.SourcePath).ToList();
+        // Every version's destination file must be deleted, de-duplicated so a
+        // shared disc path is never deleted (or counted) twice.
+        var discPaths = new HashSet<string>(
+            removed.Select(f => f.DiscPath.Replace('/', '\\')),
+            StringComparer.OrdinalIgnoreCase);
+
+        Mouse.OverrideCursor = Cursors.Wait;
+        int catPurged = 0, filesDeleted = 0, delFailures = 0;
+        long bytesFreed = 0;
+        try
+        {
+            (catPurged, filesDeleted, delFailures, bytesFreed) = await Task.Run(() =>
+            {
+                // Catalog marks inside a single transaction (mirrors Cleanup).
+                var tx = _catalog.BeginTransactionAsync(backupSet.Id).GetAwaiter().GetResult();
+                int purged;
+                try
+                {
+                    purged = _catalog
+                        .MarkFilesDeletedBySourcePathsAsync(backupSet.Id, sourcePaths)
+                        .GetAwaiter().GetResult();
+                    tx.Complete();
+                }
+                finally
+                {
+                    tx.Dispose();
+                }
+
+                // Physical deletion outside the tx so file errors can't roll the
+                // catalog back.  Skipped entirely if no destination is set.
+                int fd = 0, ff = 0;
+                long bytes = 0;
+                if (targetDir is not null)
+                {
+                    var (d, f, b) = Services.DestinationFilePurger
+                        .DeleteFilesAndSweep(targetDir, discPaths, null);
+                    fd = d; ff = f; bytes = b;
+                }
+                return (purged, fd, ff, bytes);
+            });
+
+            // Repair any references left stale by the deletions (a plain copy
+            // that other rows referenced may now be gone), exactly as manual
+            // Cleanup's reconcile step does.
+            if (targetDir is not null)
+            {
+                var reconcile = new CatalogReconcileService(_catalog);
+                var report = await reconcile.AnalyzeAsync(backupSet.Id, targetDir);
+                if (report.HasChanges)
+                    await reconcile.ApplyAsync(backupSet.Id, report, targetDir);
+            }
+        }
+        catch (Exception ex)
+        {
+            StatusText = $"Failed to remove destination files: {ex.Message}";
+            return;
+        }
+        finally
+        {
+            Mouse.OverrideCursor = null;
+        }
+
+        var parts = new List<string>();
+        if (catPurged > 0)
+            parts.Add($"purged {catPurged:N0} catalog record{(catPurged == 1 ? "" : "s")}");
+        if (filesDeleted > 0)
+            parts.Add($"deleted {filesDeleted:N0} file{(filesDeleted == 1 ? "" : "s")} ({FormatBytes(bytesFreed)})");
+        if (delFailures > 0)
+            parts.Add($"{delFailures:N0} deletion failure{(delFailures == 1 ? "" : "s")}");
+        StatusText = parts.Count > 0
+            ? "Removed sources: " + string.Join(", ", parts) + "."
+            : "No destination files needed removal.";
+
+        await LoadBackupSetsAsync();
+    }
+
+    /// <summary>
+    /// Offer to run an immediate incremental backup for source roots added during
+    /// the edit.  Declining leaves them for the next scheduled or manual backup.
+    /// </summary>
+    private void PromptAndBackupAdded(BackupSet backupSet, List<string> addedRoots)
+    {
+        const int MaxListed = 12;
+        var listed = addedRoots.Take(MaxListed).Select(r => "  \u2022 " + r);
+        string more = addedRoots.Count > MaxListed
+            ? $"\n  \u2026 and {addedRoots.Count - MaxListed:N0} more"
+            : "";
+
+        var answer = MessageBox.Show(
+            $"You added {addedRoots.Count:N0} new source "
+            + $"location{(addedRoots.Count == 1 ? "" : "s")} to \"{backupSet.Name}\":\n\n"
+            + string.Join("\n", listed) + more
+            + "\n\nBack them up now?",
+            "Back Up Added Sources",
+            MessageBoxButton.YesNo,
+            MessageBoxImage.Question);
+
+        if (answer != MessageBoxResult.Yes)
+            return;
+
+        var row = BackupSets.FirstOrDefault(s => s.Id == backupSet.Id);
+        if (row is null)
+        {
+            StatusText = "Couldn't start backup — the set is no longer listed.";
+            return;
+        }
+        _ = RunIncrementalFlowAsync(row, forceReview: false);
     }
 
     // -------------------------------------------------------------------
