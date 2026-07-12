@@ -25,6 +25,7 @@ public class MainViewModel : ViewModelBase
     private readonly SimulatedDiscBurner? _simulatedBurner;
     private readonly FileHashCache? _fileHashCache;
     private readonly IDestinationResolver? _destinationResolver;
+    private readonly ISourceResolver? _sourceResolver;
     private readonly UserSettings _settings;
 
     private string _statusText = "Ready";
@@ -49,7 +50,8 @@ public class MainViewModel : ViewModelBase
         Services.TrayService? trayService = null,
         FileHashCache? fileHashCache = null,
         IDestinationResolver? destinationResolver = null,
-        UserSettings? settings = null)
+        UserSettings? settings = null,
+        ISourceResolver? sourceResolver = null)
     {
         _settings = settings ?? new UserSettings();
         _catalog = catalog;
@@ -62,6 +64,7 @@ public class MainViewModel : ViewModelBase
         _trayService = trayService;
         _fileHashCache = fileHashCache;
         _destinationResolver = destinationResolver;
+        _sourceResolver = sourceResolver;
         _switchableBurner = burner as SwitchableDiscBurner;
         _simulatedBurner = _switchableBurner?.Simulated;
 
@@ -139,6 +142,9 @@ public class MainViewModel : ViewModelBase
         SetBackupCommand = new RelayCommand(
             o => { if (o is BackupSetRowViewModel r) { SelectedBackupSet = r.Model; StartIncrementalFlow(r); } },
             o => o is BackupSetRowViewModel r && !r.IsRunning);
+        SetReviewCommand = new RelayCommand(
+            o => { if (o is BackupSetRowViewModel r) { SelectedBackupSet = r.Model; _ = RunIncrementalFlowAsync(r, forceReview: true); } },
+            o => o is BackupSetRowViewModel r && !r.IsRunning);
         SetModifyCommand = new RelayCommand(
             o => { if (o is BackupSetRowViewModel r) { SelectedBackupSet = r.Model; StartEditFlow(); } },
             o => o is BackupSetRowViewModel r && !r.IsRunning);
@@ -163,6 +169,9 @@ public class MainViewModel : ViewModelBase
         SetChangeDestCommand = new RelayCommand(
             o => { if (o is BackupSetRowViewModel r) { SelectedBackupSet = r.Model; _ = ChangeDestinationAsync(); } },
             o => o is BackupSetRowViewModel r && !r.IsRunning && r.Model.JobOptions?.TargetDirectory is not null);
+        SetRemapSourceDriveCommand = new RelayCommand(
+            o => { if (o is BackupSetRowViewModel r) { SelectedBackupSet = r.Model; _ = RemapSourceDriveAsync(); } },
+            o => o is BackupSetRowViewModel r && !r.IsRunning);
         SetExportCommand = new RelayCommand(
             o => { if (o is BackupSetRowViewModel r) { SelectedBackupSet = r.Model; _ = ExportBackupSetAsync(); } },
             o => o is BackupSetRowViewModel);
@@ -274,6 +283,7 @@ public class MainViewModel : ViewModelBase
     public ICommand SetCheckCommand { get; }
     public ICommand AbortCheckCommand { get; }
     public ICommand SetBackupCommand { get; }
+    public ICommand SetReviewCommand { get; }
     public ICommand SetModifyCommand { get; }
     public ICommand SetRestoreCommand { get; }
     public ICommand SetOrphanedDirsCommand { get; }
@@ -282,6 +292,7 @@ public class MainViewModel : ViewModelBase
     public ICommand SetLargestFilesCommand { get; }
     public ICommand SetCopyCommand { get; }
     public ICommand SetChangeDestCommand { get; }
+    public ICommand SetRemapSourceDriveCommand { get; }
     public ICommand SetExportCommand { get; }
     public ICommand SetDeleteCommand { get; }
 
@@ -914,6 +925,158 @@ public class MainViewModel : ViewModelBase
         catch (Exception ex)
         {
             StatusText = $"Failed to change destination: {ex.Message}";
+        }
+    }
+
+    // -------------------------------------------------------------------
+    // Remap source drive
+    // -------------------------------------------------------------------
+
+    /// <summary>
+    /// Remap a source drive letter in the catalog: the data that used to live on
+    /// one drive (e.g. <c>E:\</c>) now lives on another (e.g. <c>F:\</c>) with the
+    /// same directory structure. Rewrites the source drive letter in every
+    /// catalog record's <c>SourcePath</c> and in the set's own source
+    /// configuration, so future backups treat the already-backed-up files as
+    /// present instead of re-copying everything. The destination backup files are
+    /// deliberately not moved — they migrate naturally as source files change.
+    /// </summary>
+    private async Task RemapSourceDriveAsync()
+    {
+        if (SelectedBackupSet is null) return;
+        var backupSet = SelectedBackupSet;
+
+        // Collect the distinct source drive letters currently in the set.
+        var sourceDrives = new SortedSet<char>();
+        foreach (var root in backupSet.SourceRoots)
+            if (DriveLetterOf(root) is char c) sourceDrives.Add(c);
+        if (backupSet.SourceSelections is not null)
+            CollectSelectionDrives(backupSet.SourceSelections, sourceDrives);
+
+        if (sourceDrives.Count == 0)
+        {
+            MessageBox.Show(
+                "This backup set has no drive-letter source paths to remap.",
+                "Remap Source Drive", MessageBoxButton.OK, MessageBoxImage.Information);
+            return;
+        }
+
+        // Per-drive catalog record counts (for the preview) and the ready drives
+        // available as remap targets (any present drive that isn't already one of
+        // the set's own sources). The drive enumeration can be slow, so run it off
+        // the UI thread.
+        Dictionary<char, int> counts;
+        List<char> targetDrives;
+        try
+        {
+            counts = new Dictionary<char, int>();
+            foreach (var d in sourceDrives)
+                counts[d] = await _catalog.CountFilesUnderSourcePrefixAsync(backupSet.Id, $"{d}:\\");
+
+            targetDrives = await Task.Run(() =>
+                DriveInfo.GetDrives()
+                    .Where(dr => dr.IsReady && dr.DriveType != DriveType.CDRom)
+                    .Select(dr => char.ToUpperInvariant(dr.Name[0]))
+                    .Where(c => !sourceDrives.Contains(c))
+                    .Distinct()
+                    .OrderBy(c => c)
+                    .ToList());
+        }
+        catch (Exception ex)
+        {
+            StatusText = $"Failed to prepare source-drive remap: {ex.Message}";
+            return;
+        }
+
+        if (targetDrives.Count == 0)
+        {
+            MessageBox.Show(
+                "No other ready drive is available to remap to. Connect the drive " +
+                "that now holds the source data (with the same directory structure) " +
+                "and try again.",
+                "Remap Source Drive", MessageBoxButton.OK, MessageBoxImage.Information);
+            return;
+        }
+
+        var vm = new RemapSourceDriveViewModel(sourceDrives.ToList(), targetDrives, counts);
+        var dialog = new RemapSourceDriveDialog
+        {
+            Owner = Application.Current.MainWindow,
+            DataContext = vm,
+        };
+        if (dialog.ShowDialog() != true) return;
+
+        if (vm.SourceDriveLetter is not char oldDrive || vm.TargetDriveLetter is not char newDrive)
+            return;
+        if (oldDrive == newDrive) return;
+
+        var confirm = MessageBox.Show(
+            $"Remap source drive {oldDrive}: → {newDrive}: for \"{backupSet.Name}\"?\n\n" +
+            $"{counts.GetValueOrDefault(oldDrive):N0} catalog record(s) recorded under " +
+            $"{oldDrive}:\\ will be treated as living under {newDrive}:\\ going forward, so " +
+            "future backups won't re-copy files that already exist.\n\n" +
+            $"Use this only when the data that was on {oldDrive}: now lives on {newDrive}: " +
+            "with the same directory structure. The destination backup files are not moved.",
+            "Remap Source Drive", MessageBoxButton.YesNo, MessageBoxImage.Question);
+        if (confirm != MessageBoxResult.Yes) return;
+
+        try
+        {
+            Mouse.OverrideCursor = Cursors.Wait;
+            int updated = await _catalog.RemapSourcePathPrefixAsync(
+                backupSet.Id, $"{oldDrive}:\\", $"{newDrive}:\\");
+
+            // Mirror the change in the set's own source configuration so scans,
+            // watchers and future selections use the new drive too.
+            for (int i = 0; i < backupSet.SourceRoots.Count; i++)
+                backupSet.SourceRoots[i] = RemapDriveInPath(backupSet.SourceRoots[i], oldDrive, newDrive);
+            if (backupSet.SourceSelections is not null)
+                RemapDriveInSelections(backupSet.SourceSelections, oldDrive, newDrive);
+
+            await _catalog.UpdateBackupSetAsync(backupSet);
+            StatusText = $"Remapped source drive {oldDrive}: → {newDrive}: ({updated:N0} record(s) updated).";
+        }
+        catch (Exception ex)
+        {
+            StatusText = $"Failed to remap source drive: {ex.Message}";
+        }
+        finally
+        {
+            Mouse.OverrideCursor = null;
+        }
+    }
+
+    /// <summary>Uppercase drive letter of a path like <c>E:\foo</c>, or null.</summary>
+    private static char? DriveLetterOf(string path) =>
+        path.Length >= 2 && path[1] == ':' && char.IsLetter(path[0])
+            ? char.ToUpperInvariant(path[0])
+            : null;
+
+    /// <summary>Add every drive letter present in a selection subtree.</summary>
+    private static void CollectSelectionDrives(IEnumerable<SourceSelection> nodes, SortedSet<char> drives)
+    {
+        foreach (var n in nodes)
+        {
+            if (DriveLetterOf(n.Path) is char c) drives.Add(c);
+            if (n.Children.Count > 0) CollectSelectionDrives(n.Children, drives);
+        }
+    }
+
+    /// <summary>
+    /// Replace the drive letter of <paramref name="path"/> when it matches
+    /// <paramref name="oldDrive"/> (case-insensitive), preserving the rest.
+    /// </summary>
+    private static string RemapDriveInPath(string path, char oldDrive, char newDrive) =>
+        path.Length >= 2 && path[1] == ':' && char.ToUpperInvariant(path[0]) == oldDrive
+            ? newDrive + path[1..]
+            : path;
+
+    private static void RemapDriveInSelections(IEnumerable<SourceSelection> nodes, char oldDrive, char newDrive)
+    {
+        foreach (var n in nodes)
+        {
+            n.Path = RemapDriveInPath(n.Path, oldDrive, newDrive);
+            if (n.Children.Count > 0) RemapDriveInSelections(n.Children, oldDrive, newDrive);
         }
     }
 
@@ -1561,12 +1724,65 @@ public class MainViewModel : ViewModelBase
     }
 
     private async void StartIncrementalFlow(BackupSetRowViewModel row)
+        => await RunIncrementalFlowAsync(row, forceReview: false);
+
+    /// <summary>
+    /// Scan a set and start its backup.  When <paramref name="forceReview"/> is
+    /// true (or the destination lacks free space for the full delta), the
+    /// post-scan file-review dialog is shown first so the user can inspect and
+    /// deselect files before the backup runs.
+    /// </summary>
+    private async Task RunIncrementalFlowAsync(
+        BackupSetRowViewModel row, bool forceReview)
     {
         if (row.IsRunning)
             return;
 
         var backupSet = row.Model;
-        var opts = backupSet.JobOptions ?? new JobOptions();
+        backupSet.JobOptions ??= new JobOptions();
+        var opts = backupSet.JobOptions;
+
+        // Follow the set's source drives across any Windows drive-letter
+        // reassignment (rewriting source paths in place), and warn about — or,
+        // if nothing is reachable, abort on — source locations that aren't
+        // currently connected, instead of silently backing up nothing.
+        if (_sourceResolver is not null)
+        {
+            var sr = _sourceResolver.Resolve(backupSet);
+
+            if (sr.MetadataChanged)
+                await _catalog.UpdateBackupSetAsync(backupSet);
+
+            if (!sr.AnyAvailable)
+            {
+                MessageBox.Show(
+                    $"None of the source locations for \"{backupSet.Name}\" are currently available:\n\n"
+                    + string.Join("\n", sr.MissingSources)
+                    + "\n\nThe backup was not started. Reconnect the source drive(s) and try again.",
+                    "Sources unavailable", MessageBoxButton.OK, MessageBoxImage.Warning);
+                StatusText = $"Sources for \"{backupSet.Name}\" are not available.";
+                return;
+            }
+
+            if (sr.MissingSources.Count > 0)
+            {
+                var choice = MessageBox.Show(
+                    $"Some source locations for \"{backupSet.Name}\" are not currently available "
+                    + "and will be skipped:\n\n"
+                    + string.Join("\n", sr.MissingSources)
+                    + "\n\nContinue backing up the available sources?",
+                    "Some sources unavailable",
+                    MessageBoxButton.YesNo, MessageBoxImage.Warning);
+                if (choice != MessageBoxResult.Yes)
+                {
+                    StatusText = $"Backup of \"{backupSet.Name}\" cancelled \u2014 sources unavailable.";
+                    return;
+                }
+            }
+
+            if (sr.LetterChanges.Count > 0)
+                StatusText = $"Source drive(s) moved: {string.Join(", ", sr.LetterChanges)}. Updated automatically.";
+        }
 
         // Prefer the full saved selection tree; fall back to root-only reconstruction.
         List<SourceSelection> sources;
@@ -1703,6 +1919,60 @@ public class MainViewModel : ViewModelBase
 
                 StatusText = $"{totalFiles:N0} file(s) to back up ({FormatBytes(totalBytes)})";
 
+                // Determine whether to pause for the post-scan review dialog:
+                // always when explicitly requested, or automatically when the
+                // destination can't fit the full delta.
+                var (hasFreeInfo, freeBytes) = GetDestinationFreeSpace(job.TargetDirectory!);
+                bool insufficientSpace = hasFreeInfo && freeBytes < totalBytes;
+
+                if (forceReview || insufficientSpace)
+                {
+                    // Stop scan-progress callbacks from overwriting the review.
+                    scanning = false;
+
+                    var review = ShowBackupReviewDialog(
+                        backupSet.Name, diff, totalBytes, freeBytes, hasFreeInfo,
+                        triggeredByLowSpace: insufficientSpace);
+
+                    if (review is null)
+                    {
+                        // User cancelled the backup from the review dialog.
+                        row.Progress = null;
+                        row.IsRunning = false;
+                        row.LastResultIsError = insufficientSpace;
+                        row.LastResultText = insufficientSpace
+                            ? "Backup cancelled — not enough free space on the destination."
+                            : "Backup cancelled.";
+                        StatusText = insufficientSpace
+                            ? "Backup cancelled — not enough free space."
+                            : $"\"{backupSet.Name}\": backup cancelled.";
+                        return;
+                    }
+
+                    diff = review.Value.Diff;
+                    totalBytes = review.Value.TotalBytes;
+
+                    // Persist source removals if the user opted in.
+                    if (review.Value.RemovedPaths.Count > 0)
+                    {
+                        await PersistSourceRemovalsAsync(backupSet, review.Value.RemovedPaths);
+                        // Reflect the new exclusions in the running job so this
+                        // very run also honors them (belt-and-suspenders — the
+                        // diff is already filtered to the selected files).
+                        job.ExcludedExtensions = backupSet.JobOptions!.ExcludedExtensions;
+                    }
+
+                    int selectedFiles = diff.NewFiles.Count + diff.ChangedFiles.Count;
+                    if (selectedFiles == 0)
+                    {
+                        ShowNoOpCompletion(row,
+                            BuildNothingToBackUpMessage(diff.DeletedFiles.Count));
+                        return;
+                    }
+
+                    StatusText = $"{selectedFiles:N0} file(s) to back up ({FormatBytes(totalBytes)})";
+                }
+
                 plan = new BackupPlan
                 {
                     Job = job,
@@ -1712,10 +1982,21 @@ public class MainViewModel : ViewModelBase
                     TotalBytes = totalBytes,
                 };
 
-                // Check free space before starting.
+                // Final free-space gate — ALWAYS re-check, reading the
+                // destination's free space fresh right before writing and
+                // comparing it against the (possibly review-reduced) total.
+                // This is the re-check after the user deselects items in the
+                // review dialog: the earlier scan-time figure is stale once the
+                // selection changes, so confirm the trimmed set actually fits
+                // now. CheckFreeSpaceBeforeBackup only prompts when it still
+                // doesn't fit, and lets the user override with "Start anyway".
                 if (!CheckFreeSpaceBeforeBackup(job.TargetDirectory!, totalBytes))
                 {
+                    row.Progress = null;
                     row.IsRunning = false;
+                    row.LastResultIsError = true;
+                    row.LastResultText = "Backup cancelled — not enough free space on the destination.";
+                    StatusText = "Backup cancelled — not enough free space.";
                     return;
                 }
             }
@@ -1896,10 +2177,13 @@ public class MainViewModel : ViewModelBase
             }
         }
 
-        // Restore schedule.
-        if (opts.Schedule is { Enabled: true } sched)
+        // Restore schedule. Load all fields whenever a schedule exists (even if
+        // disabled) so the editor reflects the stored Mode/interval/debounce.
+        // Guarding on Enabled==true would drop the stored Mode and let the UI
+        // defaults (Off + Interval) silently overwrite it on the next save.
+        if (opts.Schedule is { } sched)
         {
-            vm.ScheduleEnabled = true;
+            vm.ScheduleEnabled = sched.Enabled;
             vm.ScheduleMode = sched.Mode;
             vm.ScheduleIntervalHours = sched.IntervalHours.ToString(
                 System.Globalization.CultureInfo.InvariantCulture);
@@ -2023,10 +2307,13 @@ public class MainViewModel : ViewModelBase
             vm.LoadTierSets(tierSets);
         }
 
-        // Schedule.
-        if (opts.Schedule is { Enabled: true } sched)
+        // Schedule. Load all fields whenever a schedule exists (even if
+        // disabled) so the editor reflects the stored Mode/interval/debounce.
+        // Guarding on Enabled==true would drop the stored Mode and let the UI
+        // defaults (Off + Interval) silently overwrite it on the next save.
+        if (opts.Schedule is { } sched)
         {
-            vm.ScheduleEnabled = true;
+            vm.ScheduleEnabled = sched.Enabled;
             vm.ScheduleMode = sched.Mode;
             vm.ScheduleIntervalHours = sched.IntervalHours.ToString(
                 System.Globalization.CultureInfo.InvariantCulture);
@@ -2256,6 +2543,118 @@ public class MainViewModel : ViewModelBase
     /// When space is insufficient a confirmation dialog lets the user
     /// continue anyway (partial backup) or cancel.
     /// </summary>
+    /// <summary>
+    /// Query the available free space on the drive hosting a directory-mode
+    /// destination.  Returns (false, 0) when the drive can't be inspected
+    /// (not ready, path error) so callers can skip the space-based prompts.
+    /// </summary>
+    private static (bool HasInfo, long FreeBytes) GetDestinationFreeSpace(string targetDirectory)
+    {
+        try
+        {
+            string pathRoot = System.IO.Path.GetPathRoot(targetDirectory) ?? targetDirectory;
+            var driveInfo = new System.IO.DriveInfo(pathRoot);
+            if (!driveInfo.IsReady)
+                return (false, 0);
+            return (true, driveInfo.AvailableFreeSpace);
+        }
+        catch
+        {
+            return (false, 0);
+        }
+    }
+
+    /// <summary>
+    /// The outcome of the post-scan review dialog: the (possibly filtered) diff
+    /// to back up, its total byte size, and glob exclusion patterns to persist
+    /// for any paths the user chose to remove from the set's sources.
+    /// </summary>
+    private readonly record struct BackupReviewOutcome(
+        BackupDiff Diff, long TotalBytes, List<string> RemovedPaths);
+
+    /// <summary>
+    /// Show the tristate post-scan review dialog modally.  Returns the filtered
+    /// backup (files the user left selected) plus any source-removal patterns,
+    /// or <c>null</c> if the user cancelled the backup.
+    /// </summary>
+    private BackupReviewOutcome? ShowBackupReviewDialog(
+        string setName, BackupDiff diff, long totalBytes,
+        long freeBytes, bool hasFreeInfo, bool triggeredByLowSpace)
+    {
+        var vm = new BackupReviewViewModel(
+            setName, diff, totalBytes, freeBytes, hasFreeInfo, triggeredByLowSpace);
+
+        var win = new Views.BackupSetEditorWindow
+        {
+            Owner = _editorWindow ?? Application.Current.MainWindow,
+            Title = $"Review Files \u2014 {setName}",
+        };
+
+        vm.ProceedRequested += () => { try { win.DialogResult = true; } catch { win.Close(); } };
+        vm.CancelRequested += () => { try { win.DialogResult = false; } catch { win.Close(); } };
+
+        win.SetEditorContent(vm);
+        win.ShowDialog();
+
+        if (!vm.Confirmed)
+            return null;
+
+        var selected = vm.SelectedFilePaths();
+
+        var filteredNew = diff.NewFiles.Where(f => selected.Contains(f.FullPath)).ToList();
+        var filteredChanged = diff.ChangedFiles.Where(f => selected.Contains(f.FullPath)).ToList();
+
+        long filteredBytes = 0;
+        foreach (var f in filteredNew) filteredBytes += f.SizeBytes;
+        foreach (var f in filteredChanged) filteredBytes += f.SizeBytes;
+
+        var filteredDiff = new BackupDiff
+        {
+            NewFiles = filteredNew,
+            ChangedFiles = filteredChanged,
+            DeletedFiles = diff.DeletedFiles,
+        };
+
+        var removed = new List<string>();
+        if (vm.RemoveDeselectedFromSources)
+        {
+            // Exclude ONLY the individual files the user actually saw and
+            // deselected in the review — never a "dir\*" glob for a deselected
+            // directory. The review lists only the current backup delta, so a
+            // directory glob could exclude source files that live in that
+            // directory but weren't shown here (already-backed-up / unchanged
+            // files). Per-file exclusions (a full path is honoured as an exact
+            // path pattern by DirectoryBackupService.BuildExclusionFilter)
+            // guarantee we only remove what the user looked at. To stop backing
+            // up a whole folder going forward, the user uses Modify, whose tree
+            // shows the folder's full contents.
+            foreach (var path in vm.DeselectedFiles())
+            {
+                if (!string.IsNullOrEmpty(path))
+                    removed.Add(path);
+            }
+        }
+
+        return new BackupReviewOutcome(filteredDiff, filteredBytes, removed);
+    }
+
+    /// <summary>
+    /// Add source-removal exclusion patterns to a set's job options and persist
+    /// them, so future backups also skip the paths the user deselected.
+    /// </summary>
+    private async Task PersistSourceRemovalsAsync(BackupSet set, List<string> patterns)
+    {
+        set.JobOptions ??= new JobOptions();
+        var excl = set.JobOptions.ExcludedExtensions;
+        foreach (var p in patterns)
+        {
+            if (!excl.Contains(p, StringComparer.OrdinalIgnoreCase))
+                excl.Add(p);
+        }
+        try { await Task.Run(() => _catalog.UpdateBackupSetAsync(set)); }
+        catch { /* best effort — the run still honours the filtered diff */ }
+    }
+
     private bool CheckFreeSpaceBeforeBackup(string targetDirectory, long requiredBytes)
     {
         try
@@ -2270,20 +2669,26 @@ public class MainViewModel : ViewModelBase
                 return true; // plenty of space
 
             string driveLetter = pathRoot.TrimEnd('\\');
-            var result = MessageBox.Show(
+            string message =
                 $"The target drive ({driveLetter}) only has {FormatBytes(freeSpace)} free, " +
                 $"but the backup needs {FormatBytes(requiredBytes)}.\n\n" +
                 $"The backup will run out of space and may be incomplete.\n\n" +
-                $"Start anyway?",
-                "Insufficient Disk Space",
-                MessageBoxButton.YesNo,
-                MessageBoxImage.Warning);
+                $"Start anyway?";
+
+            // Show the prompt owned by (and activated over) the main window.
+            // An ownerless MessageBox can open behind the app and never take
+            // focus, so the backup appears frozen on "Scanning…" while it
+            // silently waits for a click the user can't see.
+            var owner = _editorWindow ?? Application.Current.MainWindow;
+            owner?.Activate();
+            var result = owner is not null
+                ? MessageBox.Show(owner, message, "Insufficient Disk Space",
+                    MessageBoxButton.YesNo, MessageBoxImage.Warning)
+                : MessageBox.Show(message, "Insufficient Disk Space",
+                    MessageBoxButton.YesNo, MessageBoxImage.Warning);
 
             if (result != MessageBoxResult.Yes)
-            {
-                StatusText = "Backup cancelled — not enough free space.";
                 return false;
-            }
         }
         catch { /* can't check — let it proceed */ }
         return true;

@@ -5,6 +5,7 @@ using System.Windows.Threading;
 using LithicBackup.Core;
 using LithicBackup.Core.Interfaces;
 using LithicBackup.Core.Models;
+using LithicBackup.Services;
 
 namespace LithicBackup.ViewModels;
 
@@ -38,6 +39,13 @@ public class OrphanedDirectoriesViewModel : ViewModelBase
     private string _purgeStatusText = "";
     private string _lastCleanupResultText = "";
 
+    /// <summary>Catalog-vs-destination reconcile (flip stale filerefs, prune missing rows).</summary>
+    private readonly CatalogReconcileService _reconcile;
+    private bool _isReconciling;
+    private string _reconcileStatusText = "";
+    /// <summary>Dry-run result awaiting the user's "Apply" confirmation. Null until Analyze runs.</summary>
+    private ReconcileReport? _reconcileReport;
+
     /// <summary>Task that completes when initial data loading finishes.</summary>
     private readonly Task _loadTask;
 
@@ -48,6 +56,7 @@ public class OrphanedDirectoriesViewModel : ViewModelBase
         _catalog = catalog;
         _backupSet = backupSet;
         _targetDir = backupSet.JobOptions?.TargetDirectory;
+        _reconcile = new CatalogReconcileService(catalog);
 
         Items = [];
         Categories = [];
@@ -61,6 +70,13 @@ public class OrphanedDirectoriesViewModel : ViewModelBase
         SortByNameCommand = new RelayCommand(_ => ToggleSort(CleanupSortColumn.Name));
         SortByFilesCommand = new RelayCommand(_ => ToggleSort(CleanupSortColumn.Files));
         SortBySizeCommand = new RelayCommand(_ => ToggleSort(CleanupSortColumn.Size));
+        ReconcileAnalyzeCommand = new RelayCommand(
+            _ => _ = ReconcileAnalyzeAsync(),
+            _ => !IsLoading && !IsPurging && !IsReconciling && _targetDir is not null);
+        ReconcileApplyCommand = new RelayCommand(
+            _ => _ = ReconcileApplyAsync(),
+            _ => !IsLoading && !IsPurging && !IsReconciling
+                 && _targetDir is not null && _reconcileReport?.HasChanges == true);
         CloseCommand = new RelayCommand(_ => DoneRequested?.Invoke());
 
         _loadTask = LoadAsync();
@@ -246,12 +262,35 @@ public class OrphanedDirectoriesViewModel : ViewModelBase
 
     public bool HasLastCleanupResult => !string.IsNullOrEmpty(_lastCleanupResultText);
 
+    /// <summary>True while a reconcile analysis or apply is running.</summary>
+    public bool IsReconciling
+    {
+        get => _isReconciling;
+        set
+        {
+            if (SetProperty(ref _isReconciling, value))
+                CommandManager.InvalidateRequerySuggested();
+        }
+    }
+
+    /// <summary>
+    /// Live status / dry-run summary for the catalog reconcile tool. Shows the
+    /// pending flip/prune counts after Analyze, then progress during Apply.
+    /// </summary>
+    public string ReconcileStatusText
+    {
+        get => _reconcileStatusText;
+        set => SetProperty(ref _reconcileStatusText, value);
+    }
+
     public ICommand PurgeSelectedCommand { get; }
     public ICommand ScanExcludedCommand { get; }
     public ICommand ScanDestinationCommand { get; }
     public ICommand SortByNameCommand { get; }
     public ICommand SortByFilesCommand { get; }
     public ICommand SortBySizeCommand { get; }
+    public ICommand ReconcileAnalyzeCommand { get; }
+    public ICommand ReconcileApplyCommand { get; }
     public ICommand CloseCommand { get; }
 
     // ------------------------------------------------------------------
@@ -261,40 +300,45 @@ public class OrphanedDirectoriesViewModel : ViewModelBase
         IsLoading = true;
         SummaryText = "Loading catalogue...";
 
+        // A DispatcherTimer polls a thread-safe progress counter at the shared
+        // ProgressUpdateIntervalMs cadence so the user gets live feedback without
+        // cross-thread marshaling per file/row. Started BEFORE the catalog read
+        // so the (multi-second, synchronous) load also shows a running count.
+        var progress = new ClassifyProgress();
+        var timer = new DispatcherTimer
+        {
+            Interval = TimeSpan.FromMilliseconds(ProgressUpdateIntervalMs),
+        };
+        timer.Tick += (_, _) => SummaryText = FormatProgress(progress.Snapshot());
+        timer.Start();
+
         try
         {
-            // Loading the catalog itself is async I/O — do it on the calling
-            // thread which yields naturally.
-            var files = await _catalog.GetAllFilesForBackupSetAsync(_backupSet.Id);
-            _activeFiles = files.Where(f => !f.IsDeleted).ToList();
-            // Move all classification + tree construction off the UI thread.
-            // For large backup sets (hundreds of thousands of files) building
-            // VM trees on the UI thread freezes the app for many seconds.
-            // Trees can be safely constructed off-thread; only the final
-            // Categories.Add / Items.Add calls must marshal back to the UI.
-            //
-            // A DispatcherTimer polls the worker's progress counter at the
-            // shared ProgressUpdateIntervalMs cadence so the user gets live
-            // "(X of Y)" feedback without paying for cross-thread marshaling
-            // per file.
-            var progress = new ClassifyProgress();
-            var timer = new DispatcherTimer
-            {
-                Interval = TimeSpan.FromMilliseconds(ProgressUpdateIntervalMs),
-            };
-            timer.Tick += (_, _) =>
-            {
-                var snap = progress.Snapshot();
-                SummaryText = FormatProgress(snap);
-            };
-            timer.Start();
-
+            // Do the whole load + classify off the UI thread. The catalog read is
+            // a SYNCHRONOUS SQLite scan (ExecuteReader + row loop); for a large set
+            // it blocks its thread for many seconds, so running it on the awaiting
+            // UI thread would freeze the window. Task.Run keeps the UI responsive,
+            // rowProgress drives a live record count during the read, and the
+            // classification + tree construction (also heavy for hundreds of
+            // thousands of files) continues off-thread. Only the final
+            // Categories.Add / Items.Add marshal back to the UI.
             (List<OrphanedDirectoryItem> AllItems,
              List<OrphanedCategoryViewModel> Categories) classified;
             try
             {
                 classified = await Task.Run(() =>
-                    ClassifyAndBuild(progress));
+                {
+                    progress.SetPhase("Loading catalog from database", 0);
+                    var rowProgress = new SyncProgress<int>(progress.SetDone);
+                    var files = _catalog
+                        .GetAllFilesForBackupSetAsync(_backupSet.Id, CancellationToken.None, rowProgress)
+                        .GetAwaiter().GetResult();
+
+                    progress.SetPhase("Filtering active records", 0);
+                    _activeFiles = files.Where(f => !f.IsDeleted).ToList();
+
+                    return ClassifyAndBuild(progress);
+                });
             }
             finally
             {
@@ -1238,23 +1282,35 @@ public class OrphanedDirectoriesViewModel : ViewModelBase
         if (_activeFiles is null || _targetDir is null)
             return;
 
-        // Remove any prior destination-only items so re-scanning replaces
-        // (not duplicates) previous findings.
-        bool removedAny = false;
-        for (int i = Items.Count - 1; i >= 0; i--)
-        {
-            if (Items[i].Reason is OrphanedReason.UntrackedFile or OrphanedReason.CatalogDeleted)
-            {
-                Items.RemoveAt(i);
-                removedAny = true;
-            }
-        }
-
+        // Give immediate feedback the moment the button is pressed: flip the
+        // busy flag (greys the Scan button via CanExecute) and show a wait
+        // cursor.  The initialization below — clearing a potentially large
+        // Items collection and loading every catalog record — runs on the UI
+        // thread and can take a few seconds before the background walk starts,
+        // so without this the button stayed enabled and the cursor normal
+        // during that gap.
         IsScanningDestination = true;
         DestinationScanStatusText = "Scanning destination directory...";
+        Mouse.OverrideCursor = Cursors.Wait;
 
+        // Yield at Background priority so WPF actually renders the disabled
+        // button + wait cursor before we block the dispatcher clearing Items.
+        await Dispatcher.Yield(DispatcherPriority.Background);
+
+        bool removedAny = false;
         try
         {
+            // Remove any prior destination-only items so re-scanning replaces
+            // (not duplicates) previous findings.
+            for (int i = Items.Count - 1; i >= 0; i--)
+            {
+                if (Items[i].Reason is OrphanedReason.UntrackedFile or OrphanedReason.CatalogDeleted)
+                {
+                    Items.RemoveAt(i);
+                    removedAny = true;
+                }
+            }
+
             // Pull ALL records (including deleted) so we can detect the
             // CatalogDeleted category — _activeFiles excludes them by design.
             var allFiles = await _catalog.GetAllFilesForBackupSetAsync(_backupSet.Id);
@@ -1275,6 +1331,12 @@ public class OrphanedDirectoriesViewModel : ViewModelBase
 
             string targetDir = _targetDir;
             var progress = new Progress<string>(msg => DestinationScanStatusText = msg);
+
+            // Initialization is done; the walk below runs on a background
+            // thread with live progress text, so drop the wait cursor here —
+            // it only needed to cover the synchronous init gap above.  The
+            // button stays greyed (IsScanningDestination) for the whole walk.
+            Mouse.OverrideCursor = null;
 
             // Walk the destination on a background thread so the UI stays
             // responsive during multi-minute walks of large backups.
@@ -1347,6 +1409,7 @@ public class OrphanedDirectoriesViewModel : ViewModelBase
         finally
         {
             IsScanningDestination = false;
+            Mouse.OverrideCursor = null;
         }
     }
 
@@ -1461,7 +1524,23 @@ public class OrphanedDirectoriesViewModel : ViewModelBase
                         ? fileName
                         : relativeDir + "\\" + fileName;
 
-                    if (discPathLookup.TryGetValue(relativePath, out var records))
+                    // A catalog record's DiscPath for a deduplicated file carries
+                    // a ".fileref" / ".dedup" manifest suffix (e.g.
+                    // "D\AI\foo.zip.fileref"), while the manifest can later be
+                    // MATERIALISED back into a plain, suffix-less file on disk
+                    // ("D\AI\foo.zip") whose bytes ARE the referenced content
+                    // (DirectoryBackupService.MaterialiseFileRef removes the
+                    // manifest and writes the plain file).  So a plain on-disk
+                    // file must match not only an exact-path catalog record but
+                    // also a "<path>.fileref"/"<path>.dedup" record — otherwise
+                    // legitimate, catalog-referenced backup content is wrongly
+                    // reported as untracked, and "cleaning" it would delete real
+                    // backup data (and it reappears once the worker
+                    // re-materialises the reference).  Exact match wins; the
+                    // manifest-suffix fallbacks only fire for suffix-less files.
+                    if (discPathLookup.TryGetValue(relativePath, out var records)
+                        || discPathLookup.TryGetValue(relativePath + ".fileref", out records)
+                        || discPathLookup.TryGetValue(relativePath + ".dedup", out records))
                     {
                         bool hasActive = false;
                         for (int r = 0; r < records.Count; r++)
@@ -1744,6 +1823,19 @@ public class OrphanedDirectoriesViewModel : ViewModelBase
                             {
                                 var fi = new FileInfo(fullPath);
                                 long size = fi.Length;
+                                // Clear the read-only attribute before deleting:
+                                // FileInfo.Delete() throws UnauthorizedAccessException
+                                // on a read-only file, and a LOT of backed-up content
+                                // carries that flag — git object/pack files are always
+                                // read-only, as is anything copied from a read-only
+                                // source. Without this the delete fails silently (it's
+                                // caught below as a failure), the file survives on disk,
+                                // and the next "Scan Destination" re-reports it — the
+                                // exact "I cleaned them but they keep coming back"
+                                // symptom. (On the reference destination 920 of 940
+                                // catalog-deleted-still-on-disk files were read-only.)
+                                if (fi.IsReadOnly)
+                                    fi.IsReadOnly = false;
                                 fi.Delete();
                                 bytes += size;
                                 fDeleted++;
@@ -1839,6 +1931,117 @@ public class OrphanedDirectoriesViewModel : ViewModelBase
         }
     }
 
+    // ------------------------------------------------------------------
+    // Catalog reconcile (dry-run analyze, then explicit apply)
+    // ------------------------------------------------------------------
+
+    /// <summary>
+    /// Dry run: walk the catalog against the destination and report how many
+    /// stale <c>.fileref</c> rows would be flipped to plain and how many
+    /// active rows point at content that is missing. Mutates nothing; the
+    /// result is held for a subsequent <see cref="ReconcileApplyAsync"/>.
+    /// </summary>
+    private async Task ReconcileAnalyzeAsync()
+    {
+        if (_targetDir is null || IsReconciling || IsPurging)
+            return;
+
+        IsReconciling = true;
+        _reconcileReport = null;
+        ReconcileStatusText = "Analyzing catalog against destination...";
+
+        try
+        {
+            var progress = new Progress<string>(msg => ReconcileStatusText = msg);
+            var report = await Task.Run(() =>
+                _reconcile.AnalyzeAsync(_backupSet.Id, _targetDir, progress));
+
+            _reconcileReport = report;
+
+            long flipBytes = report.Flips.Sum(f => f.SizeBytes);
+            long pruneBytes = report.Prunes.Sum(p => p.SizeBytes);
+
+            if (!report.HasChanges)
+            {
+                ReconcileStatusText = report.TargetPresent
+                    ? $"Catalog is consistent — examined {report.RecordsExamined:N0} records, nothing to reconcile."
+                    : $"Destination not found or empty — examined {report.RecordsExamined:N0} records, "
+                      + "no stale references to flip (pruning of missing rows was skipped for safety).";
+            }
+            else
+            {
+                var parts = new List<string>();
+                if (report.Flips.Count > 0)
+                    parts.Add($"{report.Flips.Count:N0} stale reference{(report.Flips.Count == 1 ? "" : "s")} "
+                              + $"to flip to plain ({flipBytes:N0} bytes)");
+                if (report.Prunes.Count > 0)
+                    parts.Add($"{report.Prunes.Count:N0} missing row{(report.Prunes.Count == 1 ? "" : "s")} "
+                              + $"to prune ({pruneBytes:N0} bytes)");
+
+                string suffix = report.TargetPresent
+                    ? ""
+                    : " (destination absent/empty — prune skipped; only reference flips shown).";
+                ReconcileStatusText =
+                    $"Found {string.Join(" and ", parts)}. Review, then click Apply.{suffix}";
+            }
+        }
+        catch (Exception ex)
+        {
+            _reconcileReport = null;
+            ReconcileStatusText = $"Analysis failed: {ex.Message}";
+        }
+        finally
+        {
+            IsReconciling = false;
+        }
+    }
+
+    /// <summary>
+    /// Apply the changes from the last <see cref="ReconcileAnalyzeAsync"/>. Each
+    /// change is re-verified against the current destination before commit, so a
+    /// file reappearing or a drive reconnecting can only skip a change, never
+    /// destroy data.
+    /// </summary>
+    private async Task ReconcileApplyAsync()
+    {
+        var report = _reconcileReport;
+        if (_targetDir is null || report is null || !report.HasChanges || IsReconciling || IsPurging)
+            return;
+
+        IsReconciling = true;
+        ReconcileStatusText = "Applying reconcile...";
+
+        try
+        {
+            var progress = new Progress<string>(msg => ReconcileStatusText = msg);
+            var result = await Task.Run(() =>
+                _reconcile.ApplyAsync(_backupSet.Id, report, _targetDir, progress));
+
+            _reconcileReport = null;
+
+            var parts = new List<string>();
+            if (result.Flipped > 0)
+                parts.Add($"flipped {result.Flipped:N0} reference{(result.Flipped == 1 ? "" : "s")} to plain");
+            if (result.Pruned > 0)
+                parts.Add($"pruned {result.Pruned:N0} missing row{(result.Pruned == 1 ? "" : "s")}");
+            if (result.Skipped > 0)
+                parts.Add($"{result.Skipped:N0} skipped (changed since analysis)");
+
+            ReconcileStatusText = parts.Count == 0
+                ? "Reconcile applied — no changes were needed."
+                : $"Reconcile applied at {DateTime.Now:HH:mm:ss}: {string.Join(", ", parts)}. "
+                  + "Re-run Analyze to confirm the catalog is now clean.";
+        }
+        catch (Exception ex)
+        {
+            ReconcileStatusText = $"Apply failed: {ex.Message}";
+        }
+        finally
+        {
+            IsReconciling = false;
+        }
+    }
+
     /// <summary>
     /// Recursively delete empty subdirectories under <paramref name="dir"/>,
     /// preserving the shared <c>_blocks</c> and <c>_filestore</c> stores.
@@ -1865,23 +2068,11 @@ public class OrphanedDirectoriesViewModel : ViewModelBase
         }
     }
 
-    /// <summary>Compact size formatter for purge-summary strings.</summary>
-    private static string FormatSizeText(long bytes)
-    {
-        const long KB = 1024;
-        const long MB = 1024 * KB;
-        const long GB = 1024 * MB;
-        const long TB = 1024 * GB;
-
-        return bytes switch
-        {
-            >= TB => $"{bytes / (double)TB:F2} TB",
-            >= GB => $"{bytes / (double)GB:F2} GB",
-            >= MB => $"{bytes / (double)MB:F2} MB",
-            >= KB => $"{bytes / (double)KB:F1} KB",
-            _ => $"{bytes:N0} B",
-        };
-    }
+    /// <summary>
+    /// Size formatter for purge-summary strings. Reports a raw byte count (no
+    /// KB/MB/GB) so every size shown in the Cleanup view is consistent.
+    /// </summary>
+    private static string FormatSizeText(long bytes) => $"{bytes:N0} bytes";
 
     // ------------------------------------------------------------------
 
@@ -2057,9 +2248,25 @@ public class OrphanedDirectoriesViewModel : ViewModelBase
         if (string.IsNullOrEmpty(snap.Phase))
             return "Classifying...";
         if (snap.Total <= 0)
-            return $"{snap.Phase}...";
+            // Unknown total (e.g. the DB read): show the running count once we
+            // have one so the phase still visibly ticks rather than sitting on
+            // a static "...".
+            return snap.Done > 0 ? $"{snap.Phase} ({snap.Done:N0})..." : $"{snap.Phase}...";
         int done = Math.Min(snap.Done, snap.Total);
         return $"{snap.Phase} ({done:N0} of {snap.Total:N0})...";
+    }
+
+    /// <summary>
+    /// Minimal synchronous <see cref="IProgress{T}"/> that invokes its callback
+    /// on the reporting thread, unlike <see cref="Progress{T}"/> which marshals
+    /// through a captured <see cref="SynchronizationContext"/> (and, with none,
+    /// hops through the thread pool — reordering monotonic counts). The catalog
+    /// read already runs on a background thread and only bumps a thread-safe
+    /// counter, so a direct, in-order call is both cheaper and correct.
+    /// </summary>
+    private sealed class SyncProgress<T>(Action<T> handler) : IProgress<T>
+    {
+        public void Report(T value) => handler(value);
     }
 
     private static List<string> ParsePatterns(string input)
@@ -2104,6 +2311,22 @@ public enum OrphanedReason
     ExcessVersion,
 
     /// <summary>
+    /// Stray FileRecord pointing at a CURRENT disc location whose SourcePath
+    /// is shared by at least one other non-deleted record at the same kind
+    /// of location.  Almost always the result of running "Seed from
+    /// existing backup" more than once on the same destination before the
+    /// seed became idempotent — there's only one physical file on disk, so
+    /// the extra catalog rows are dead weight.  Cleaning these does NOT
+    /// touch the physical file.
+    ///
+    /// Purely catalog-derived (like the categories above): detected during the
+    /// initial catalog analysis, not the optional destination scan.  Ordered
+    /// here so its card groups with the other catalog-scan categories rather
+    /// than the destination-scan ones below.
+    /// </summary>
+    CatalogDuplicate,
+
+    /// <summary>
     /// File found in the backup destination directory that is not tracked by
     /// the catalog at all (e.g. leftover from a previous backup tool, or a
     /// file the catalog forgot about).  Discovered by the optional
@@ -2117,17 +2340,6 @@ public enum OrphanedReason
     /// optional "Scan destination filesystem" pass.
     /// </summary>
     CatalogDeleted,
-
-    /// <summary>
-    /// Stray FileRecord pointing at a CURRENT disc location whose SourcePath
-    /// is shared by at least one other non-deleted record at the same kind
-    /// of location.  Almost always the result of running "Seed from
-    /// existing backup" more than once on the same destination before the
-    /// seed became idempotent — there's only one physical file on disk, so
-    /// the extra catalog rows are dead weight.  Cleaning these does NOT
-    /// touch the physical file.
-    /// </summary>
-    CatalogDuplicate,
 }
 
 /// <summary>Column used to sort the cleanup-view tree(s).</summary>

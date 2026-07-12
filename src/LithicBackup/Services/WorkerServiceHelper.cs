@@ -131,6 +131,12 @@ internal static class WorkerServiceHelper
                 Arguments = $"{scVerb} {scArgs}",
                 Verb = "runas",
                 UseShellExecute = true,
+                // Elevation via the "runas" verb requires UseShellExecute = true,
+                // which ignores CreateNoWindow. Hiding the window instead keeps
+                // sc.exe's console from flashing on screen. (The UAC consent
+                // prompt is separate and still shown.)
+                WindowStyle = ProcessWindowStyle.Hidden,
+                CreateNoWindow = true,
             };
 
             using var proc = Process.Start(psi);

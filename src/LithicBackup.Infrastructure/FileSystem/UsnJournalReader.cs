@@ -13,6 +13,19 @@ namespace LithicBackup.Infrastructure.FileSystem;
 public readonly record struct UsnChange(string FullPath, uint Reason, bool IsDirectory);
 
 /// <summary>
+/// A file or directory that was renamed or moved <em>within the same volume</em>,
+/// detected by pairing the journal's <c>RENAME_OLD_NAME</c> and
+/// <c>RENAME_NEW_NAME</c> records — which share the item's File Reference Number
+/// because a same-volume rename/move does not change its MFT identity. A moved
+/// directory produces a single pair (its children are not re-journaled), so one
+/// move describes the relocation of an entire subtree.
+/// </summary>
+/// <param name="OldPath">Absolute path before the move.</param>
+/// <param name="NewPath">Absolute path after the move.</param>
+/// <param name="IsDirectory">Whether the moved item is a directory.</param>
+public readonly record struct UsnMove(string OldPath, string NewPath, bool IsDirectory);
+
+/// <summary>
 /// Reads change records from a single NTFS volume's USN change journal.
 /// </summary>
 /// <remarks>
@@ -118,11 +131,34 @@ public sealed class UsnJournalReader : IDisposable
     /// each to an absolute path. Returns the distinct set of changed items and
     /// the USN to resume from next time via <paramref name="nextUsn"/>.
     /// </summary>
-    public IReadOnlyList<UsnChange> ReadChanges(long startUsn, out long nextUsn, CancellationToken ct = default)
+    /// <param name="journalTruncated">
+    /// Set to <c>true</c> when <paramref name="startUsn"/> refers to a record that
+    /// has already been purged from the journal (the journal wrapped, so the
+    /// history between the saved cursor and now is gone). The caller cannot read
+    /// the gap incrementally and should reconcile with a full scan.
+    /// </param>
+    /// <param name="moves">
+    /// Same-volume renames/moves detected by pairing <c>RENAME_OLD_NAME</c> and
+    /// <c>RENAME_NEW_NAME</c> records that share a File Reference Number. These are
+    /// reported separately from <paramref name="journalTruncated"/> changes so the
+    /// backup can relocate the destination copy instead of re-copying it. A moved
+    /// item is <em>not</em> also present in the returned change list unless it was
+    /// additionally modified (e.g. content edited in the same window).
+    /// </param>
+    public IReadOnlyList<UsnChange> ReadChanges(
+        long startUsn, out long nextUsn, out bool journalTruncated,
+        out IReadOnlyList<UsnMove> moves, CancellationToken ct = default)
     {
+        journalTruncated = false;
+
         // Deduplicate by path — a single edit produces many records (extend,
         // overwrite, close, ...); we only care that the file changed.
         var byPath = new Dictionary<string, UsnChange>(StringComparer.OrdinalIgnoreCase);
+
+        // Accumulate rename halves keyed by the item's own File Reference Number.
+        // A same-volume rename/move emits RENAME_OLD_NAME (old parent + old name)
+        // and RENAME_NEW_NAME (new parent + new name) sharing this FRN.
+        var renameByFrn = new Dictionary<long, RenameAccum>();
 
         const int bufferSize = 64 * 1024;
         var buffer = new byte[bufferSize];
@@ -144,8 +180,13 @@ public sealed class UsnJournalReader : IDisposable
                     input, input.Length, buffer, buffer.Length,
                     out int bytesReturned, IntPtr.Zero))
             {
-                // On any read failure, stop and keep the cursor where it was so
-                // the caller does not skip changes; the next poll retries.
+                // ERROR_JOURNAL_ENTRY_DELETED means our start USN has been purged
+                // because the journal wrapped (records older than the retained
+                // window are gone). The gap can't be read incrementally — flag it
+                // so the caller reconciles with a full scan. Any other failure
+                // just stops, keeping the cursor so the next poll retries.
+                if (Marshal.GetLastWin32Error() == ERROR_JOURNAL_ENTRY_DELETED)
+                    journalTruncated = true;
                 break;
             }
 
@@ -168,6 +209,7 @@ public sealed class UsnJournalReader : IDisposable
                 short major = BitConverter.ToInt16(buffer, offset + 4);
                 if (major == 2)
                 {
+                    long ownFrn = BitConverter.ToInt64(buffer, offset + 8);
                     long parentFrn = BitConverter.ToInt64(buffer, offset + 16);
                     uint reason = BitConverter.ToUInt32(buffer, offset + 40);
                     uint attrs = BitConverter.ToUInt32(buffer, offset + 52);
@@ -183,12 +225,36 @@ public sealed class UsnJournalReader : IDisposable
                         if (parentDir is not null)
                         {
                             string full = Path.Combine(parentDir, fileName);
-                            // Last reason wins is fine; we OR so deletes/renames
-                            // are still visible if mixed with content changes.
-                            if (byPath.TryGetValue(full, out var existing))
-                                byPath[full] = existing with { Reason = existing.Reason | reason };
-                            else
-                                byPath[full] = new UsnChange(full, reason, isDir);
+
+                            // Route the rename halves into the FRN-keyed accumulator
+                            // so we can pair old→new. Everything else (or a rename
+                            // combined with a content change) still lands in byPath.
+                            if ((reason & USN_REASON_RENAME_OLD_NAME) != 0)
+                            {
+                                var accum = renameByFrn.TryGetValue(ownFrn, out var a) ? a : new RenameAccum { IsDir = isDir };
+                                accum.OldPath = full;
+                                accum.IsDir = isDir;
+                                renameByFrn[ownFrn] = accum;
+                            }
+                            if ((reason & USN_REASON_RENAME_NEW_NAME) != 0)
+                            {
+                                var accum = renameByFrn.TryGetValue(ownFrn, out var a) ? a : new RenameAccum { IsDir = isDir };
+                                accum.NewPath = full;
+                                accum.IsDir = isDir;
+                                accum.NewReason |= reason;
+                                renameByFrn[ownFrn] = accum;
+                            }
+
+                            // Content/create/delete changes (anything beyond the
+                            // rename+close bookkeeping) still count as a change.
+                            uint changeReason = reason & ~NonChangeMask;
+                            if (changeReason != 0)
+                            {
+                                if (byPath.TryGetValue(full, out var existing))
+                                    byPath[full] = existing with { Reason = existing.Reason | changeReason };
+                                else
+                                    byPath[full] = new UsnChange(full, changeReason, isDir);
+                            }
                         }
                     }
                 }
@@ -199,8 +265,44 @@ public sealed class UsnJournalReader : IDisposable
             cursor = batchNext;
         }
 
+        // Resolve accumulated rename halves into moves. Only a complete pair with
+        // both endpoints resolved is a true intra-volume move. A lone new-name
+        // half (old side purged/out of window) is treated as a fresh change at the
+        // new path so its content is still backed up; a lone old-name half means
+        // the item left our view (renamed to somewhere we couldn't resolve) and is
+        // handled by the deletion path elsewhere, so we drop it here.
+        List<UsnMove>? moveList = null;
+        foreach (var accum in renameByFrn.Values)
+        {
+            if (accum.OldPath is not null && accum.NewPath is not null)
+            {
+                if (string.Equals(accum.OldPath, accum.NewPath, StringComparison.OrdinalIgnoreCase))
+                    continue; // no-op rename (case-only handled by the FS itself)
+
+                (moveList ??= new List<UsnMove>()).Add(
+                    new UsnMove(accum.OldPath, accum.NewPath, accum.IsDir));
+            }
+            else if (accum.NewPath is not null)
+            {
+                // New name with no pairable old name — back it up as a change.
+                if (!byPath.ContainsKey(accum.NewPath))
+                    byPath[accum.NewPath] = new UsnChange(
+                        accum.NewPath, USN_REASON_RENAME_NEW_NAME, accum.IsDir);
+            }
+        }
+
         nextUsn = cursor;
+        moves = (IReadOnlyList<UsnMove>?)moveList ?? Array.Empty<UsnMove>();
         return byPath.Values.ToList();
+    }
+
+    /// <summary>Mutable accumulator that pairs the two halves of a rename by FRN.</summary>
+    private sealed class RenameAccum
+    {
+        public string? OldPath;
+        public string? NewPath;
+        public bool IsDir;
+        public uint NewReason;
     }
 
     /// <summary>
@@ -251,6 +353,15 @@ public sealed class UsnJournalReader : IDisposable
         return resolved;
     }
 
+    /// <summary>
+    /// Re-query the journal's live identity and next-USN position. Used to
+    /// re-seed the resume cursor to the journal's current end after it wrapped,
+    /// so live change detection resumes instead of endlessly re-reading a purged
+    /// start USN.
+    /// </summary>
+    public bool TryRefreshPosition(out long journalId, out long nextUsn)
+        => TryQueryJournal(_volume, out journalId, out nextUsn);
+
     private static bool TryQueryJournal(SafeFileHandle handle, out long journalId, out long nextUsn)
     {
         journalId = 0;
@@ -300,6 +411,22 @@ public sealed class UsnJournalReader : IDisposable
     private const uint FSCTL_QUERY_USN_JOURNAL = 0x000900f4;
     private const uint FSCTL_READ_USN_JOURNAL = 0x000900bb;
     private const uint FSCTL_CREATE_USN_JOURNAL = 0x000900e7;
+
+    /// <summary>The requested start USN has been purged from the journal (it wrapped).</summary>
+    private const int ERROR_JOURNAL_ENTRY_DELETED = 1181;
+
+    // USN_REASON_* flags relevant to move detection.
+    private const uint USN_REASON_RENAME_OLD_NAME = 0x00001000;
+    private const uint USN_REASON_RENAME_NEW_NAME = 0x00002000;
+    private const uint USN_REASON_CLOSE = 0x80000000;
+
+    /// <summary>
+    /// Reason bits that are pure bookkeeping and do not, on their own, mean the
+    /// item's <em>content</em> changed: the two rename halves (handled as moves)
+    /// and the trailing CLOSE that terminates every record sequence.
+    /// </summary>
+    private const uint NonChangeMask =
+        USN_REASON_RENAME_OLD_NAME | USN_REASON_RENAME_NEW_NAME | USN_REASON_CLOSE;
 
     [StructLayout(LayoutKind.Sequential)]
     private struct FILE_ID_DESCRIPTOR

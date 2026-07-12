@@ -8,6 +8,22 @@ using LithicBackup.Core.Models;
 namespace LithicBackup.Services;
 
 /// <summary>
+/// Result of a targeted relocation attempt (<see cref="DirectoryBackupService.MoveTargetedAsync"/>).
+/// </summary>
+public enum TargetedMoveOutcome
+{
+    /// <summary>The destination copy was renamed/moved in place and the catalog updated.</summary>
+    Relocated,
+
+    /// <summary>
+    /// Relocation was not safe/possible (special storage format, version history,
+    /// missing/locked destination copy). The caller should back up the new source
+    /// path as fresh files instead.
+    /// </summary>
+    FellBack,
+}
+
+/// <summary>
 /// Backs up files to a directory target with versioned file history.
 ///
 /// Layout on disk:
@@ -323,8 +339,19 @@ public class DirectoryBackupService
         // 6. Copy files.
         var failedFiles = new List<FailedFile>();
         long totalBytes = filesToBackup.Sum(f => f.SizeBytes);
+        // Physical bytes actually stored — drives the disc record's BytesUsed.
         long bytesWritten = 0;
+        // Progress numerator: planned bytes *dealt with* so far, whatever the
+        // outcome (written, deduped, unchanged, or skipped/failed). This is what
+        // the UI's "copied / total" reflects, so the bar keeps advancing to 100%
+        // instead of freezing whenever a run hits a long stretch of unchanged
+        // files or files that fail to copy (e.g. the disk filling up).
+        long bytesProcessed = 0;
         bool permanentSkipAll = false;
+        // Set when the destination runs out of space mid-run: rather than
+        // recording a "disk full" failure for every remaining file (which spams
+        // the failed/skipped list), stop the run cleanly after the first one.
+        bool diskFullAbort = false;
 
         // Track hashes + formats of successfully backed-up files for verification.
         var backedUp = job.VerifyAfterBackup
@@ -392,7 +419,7 @@ public class DirectoryBackupService
                     if (driveInfo.IsReady)
                     {
                         long freeSpace = driveInfo.AvailableFreeSpace;
-                        long bytesRemaining = totalBytes - bytesWritten;
+                        long bytesRemaining = totalBytes - bytesProcessed;
                         if (freeSpace < bytesRemaining)
                         {
                             lowSpaceWarned = true;
@@ -401,10 +428,10 @@ public class DirectoryBackupService
                                 StatusMessage = $"\u26A0 Low disk space: {FormatBytes(freeSpace)} free, " +
                                     $"{FormatBytes(bytesRemaining)} remaining to copy",
                                 CurrentFile = file.FullPath,
-                                BytesWrittenTotal = bytesWritten,
+                                BytesWrittenTotal = bytesProcessed,
                                 BytesTotalAll = totalBytes,
                                 OverallPercentage = totalBytes > 0
-                                    ? (double)bytesWritten / totalBytes * 100 : 0,
+                                    ? (double)bytesProcessed / totalBytes * 100 : 0,
                             });
                         }
                     }
@@ -417,10 +444,10 @@ public class DirectoryBackupService
                 CurrentDisc = 1,
                 TotalDiscs = 1,
                 CurrentFile = file.FullPath,
-                BytesWrittenTotal = bytesWritten,
+                BytesWrittenTotal = bytesProcessed,
                 BytesTotalAll = totalBytes,
                 OverallPercentage = totalBytes > 0
-                    ? (double)bytesWritten / totalBytes * 100
+                    ? (double)bytesProcessed / totalBytes * 100
                     : 0,
                 CurrentFileBytesWritten = 0,
                 CurrentFileTotalBytes = file.SizeBytes,
@@ -588,6 +615,10 @@ public class DirectoryBackupService
                         SourceLastWriteUtc = file.LastWriteUtc,
                         SizeBytes = contentSize,
                     };
+                    // Unchanged content writes nothing, but it's a planned file
+                    // now dealt with — advance the progress numerator so a run
+                    // over a large unchanged tree doesn't look frozen.
+                    bytesProcessed += file.SizeBytes;
                     break; // unchanged content — move on to the next file
                 }
 
@@ -601,12 +632,12 @@ public class DirectoryBackupService
                 DeduplicationRecipe? recipe = null;
 
                 // Build a throttled per-file progress callback for large files.
-                // Captures the current bytesWritten so intermediate reports show
-                // accurate overall progress too.
+                // Captures the current bytesProcessed so intermediate reports
+                // show accurate overall progress too.
                 Action<long>? fileProgress = null;
                 if (file.SizeBytes >= PerFileProgressThreshold && progress is not null)
                 {
-                    long capturedBytesWritten = bytesWritten;
+                    long capturedBytesProcessed = bytesProcessed;
                     long lastReportedAt = 0;
                     fileProgress = bytesCopied =>
                     {
@@ -619,10 +650,10 @@ public class DirectoryBackupService
                                 CurrentDisc = 1,
                                 TotalDiscs = 1,
                                 CurrentFile = file.FullPath,
-                                BytesWrittenTotal = capturedBytesWritten + bytesCopied,
+                                BytesWrittenTotal = capturedBytesProcessed + bytesCopied,
                                 BytesTotalAll = totalBytes,
                                 OverallPercentage = totalBytes > 0
-                                    ? (double)(capturedBytesWritten + bytesCopied) / totalBytes * 100
+                                    ? (double)(capturedBytesProcessed + bytesCopied) / totalBytes * 100
                                     : 0,
                                 CurrentFileBytesWritten = bytesCopied,
                                 CurrentFileTotalBytes = file.SizeBytes,
@@ -881,12 +912,43 @@ public class DirectoryBackupService
                     backedUp?.TryAdd(file.FullPath, (hash, isDeduped, isFileRef));
 
                 bytesWritten += file.SizeBytes;
+                bytesProcessed += file.SizeBytes;
                 batchCount++;
             }
             catch (OperationCanceledException) { throw; }
             catch (Exception ex)
             {
                 string errorDetail = DescribeFileError(ex, file.FullPath);
+                var category = BackupErrorClassifier.Classify(ex);
+
+                // Destination out of space: this isn't a per-file problem — every
+                // remaining file will fail the same way. Record this one failure,
+                // stop the run cleanly (preserving everything already committed),
+                // and let the user free space / deselect and run again, instead of
+                // filling the failed/skipped list with hundreds of identical
+                // "disk full" entries or prompting once per file.
+                if (category == BackupErrorCategory.DiskFull)
+                {
+                    failedFiles.Add(new FailedFile
+                    {
+                        Path = file.FullPath,
+                        Error = errorDetail,
+                        ActionTaken = BurnFailureAction.Abort,
+                    });
+                    bytesProcessed += file.SizeBytes;
+                    diskFullAbort = true;
+                    progress?.Report(new BackupProgress
+                    {
+                        StatusMessage = "Destination disk is full — stopping backup. "
+                            + "Free space or deselect files, then run again.",
+                        CurrentFile = file.FullPath,
+                        BytesWrittenTotal = bytesProcessed,
+                        BytesTotalAll = totalBytes,
+                        OverallPercentage = totalBytes > 0
+                            ? (double)bytesProcessed / totalBytes * 100 : 0,
+                    });
+                    break; // leave the retry loop; the for-loop breaks below
+                }
 
                 // If the user previously chose "Skip All", skip without
                 // prompting again.
@@ -898,6 +960,7 @@ public class DirectoryBackupService
                         Error = errorDetail,
                         ActionTaken = BurnFailureAction.Skip,
                     });
+                    bytesProcessed += file.SizeBytes;
                     continue;
                 }
 
@@ -906,8 +969,7 @@ public class DirectoryBackupService
                 FailureDecision decision;
                 try
                 {
-                    decision = await onFailure(
-                        file.FullPath, errorDetail, BackupErrorClassifier.Classify(ex));
+                    decision = await onFailure(file.FullPath, errorDetail, category);
                 }
                 catch
                 {
@@ -918,6 +980,7 @@ public class DirectoryBackupService
                         Error = errorDetail,
                         ActionTaken = BurnFailureAction.Skip,
                     });
+                    bytesProcessed += file.SizeBytes;
                     continue;
                 }
 
@@ -950,11 +1013,17 @@ public class DirectoryBackupService
                             Error = errorDetail,
                             ActionTaken = decision.Action,
                         });
+                        bytesProcessed += file.SizeBytes;
                         break;
                 }
 
             }
             } // while (fileRetrying)
+
+            // Destination filled up — stop processing further files. Whatever was
+            // committed is preserved; the next run picks up the rest.
+            if (diskFullAbort)
+                break;
 
             // Release this file's cached buffer (if any) now that it has been
             // written, freeing its memory back to the budget. Done here so the
@@ -981,14 +1050,16 @@ public class DirectoryBackupService
 
         // Report completion of file copying so the UI shows 100%
         // even when many small files all processed within one throttle
-        // window.
+        // window. (After a disk-full stop this reflects the partial run.)
         progress?.Report(new BackupProgress
         {
-            StatusMessage = "Finalizing...",
+            StatusMessage = diskFullAbort ? "Stopped — disk full." : "Finalizing...",
             CurrentFile = "",
-            BytesWrittenTotal = bytesWritten,
+            BytesWrittenTotal = bytesProcessed,
             BytesTotalAll = totalBytes,
-            OverallPercentage = 100,
+            OverallPercentage = diskFullAbort && totalBytes > 0
+                ? (double)bytesProcessed / totalBytes * 100
+                : 100,
         });
 
         // Final batch: update disc record and commit remaining records.
@@ -1026,7 +1097,7 @@ public class DirectoryBackupService
             progress?.Report(new BackupProgress
             {
                 StatusMessage = "Verifying backup...",
-                BytesWrittenTotal = bytesWritten,
+                BytesWrittenTotal = bytesProcessed,
                 BytesTotalAll = totalBytes,
                 OverallPercentage = 100,
             });
@@ -1044,7 +1115,7 @@ public class DirectoryBackupService
                 {
                     StatusMessage = $"Verifying backup ({verifiedCount:N0} / {backedUp.Count:N0})...",
                     CurrentFile = sourcePath,
-                    BytesWrittenTotal = bytesWritten,
+                    BytesWrittenTotal = bytesProcessed,
                     BytesTotalAll = totalBytes,
                     OverallPercentage = 100,
                 });
@@ -1161,7 +1232,7 @@ public class DirectoryBackupService
             progress?.Report(new BackupProgress
             {
                 StatusMessage = "Applying retention rules...",
-                BytesWrittenTotal = bytesWritten,
+                BytesWrittenTotal = bytesProcessed,
                 BytesTotalAll = totalBytes,
                 OverallPercentage = 100,
             });
@@ -1187,11 +1258,16 @@ public class DirectoryBackupService
                 {
                     ct.ThrowIfCancellationRequested();
 
-                    // Physically delete the .v{N} file (with .dedup/.fileref/no suffix)
-                    // from the _prev directory.
-                    string prevPath = GetPrevPath(
-                        targetDirectory, fileRecord.SourcePath,
-                        fileRecord.Version, fileRecord.IsDeduped, fileRecord.IsFileRef);
+                    // Physically delete the .v{N} file (with .dedup/.fileref/no
+                    // suffix) from the _prev directory.  Locate it via the
+                    // record's stored DiscPath — the authoritative on-disk
+                    // location — rather than reconstructing the path from
+                    // (SourcePath, Version, flags).  A reconstruction can diverge
+                    // from the real DiscPath for legacy/migrated rows, which would
+                    // point File.Delete at the wrong path: the bytes survive while
+                    // we still flip IsDeleted below, producing the
+                    // "catalog-deleted (still on disk)" inconsistency.
+                    string prevPath = Path.Combine(targetDirectory, fileRecord.DiscPath);
 
                     // Last-plain-copy guard. A plain _prev file holds the real
                     // bytes for its content hash, and file-level dedup .fileref
@@ -1250,14 +1326,27 @@ public class DirectoryBackupService
                         }
                     }
 
-                    if (File.Exists(prevPath))
+                    // Remove the physical file, then flip the catalog bit ONLY
+                    // once the bytes are confirmed gone.  If the delete fails
+                    // (file locked, ACL, transient IO), leave the record intact so
+                    // the catalog never claims a deletion that didn't happen — a
+                    // later retention pass retries.  This is the invariant that
+                    // prevents "catalog-deleted (still on disk)" records.
+                    try
                     {
-                        File.Delete(prevPath);
+                        ForceDeleteFile(prevPath);
+                    }
+                    catch (Exception ex) when (ex is IOException or UnauthorizedAccessException)
+                    {
+                        continue; // leave file + record consistent; retry next run
                     }
 
-                    // Mark as deleted in catalog.
-                    fileRecord.IsDeleted = true;
-                    await _catalog.UpdateFileRecordAsync(fileRecord, ct);
+                    // Mark as deleted in catalog only if the file is really gone.
+                    if (!File.Exists(prevPath))
+                    {
+                        fileRecord.IsDeleted = true;
+                        await _catalog.UpdateFileRecordAsync(fileRecord, ct);
+                    }
                 }
             }
             catch
@@ -1395,6 +1484,251 @@ public class DirectoryBackupService
         return await ExecuteAsync(
             job, targetDirectory, retentionTiers,
             progress: null, ct, precomputedDiff: diff);
+    }
+
+    /// <summary>
+    /// Relocate a file's or directory's existing destination copy to match a
+    /// same-volume source rename/move, instead of re-copying its bytes. Handles
+    /// every format a directory backup produces — plain copies, <c>.dedup</c> and
+    /// <c>.fileref</c> manifests (whose shared block store / content-by-hash isn't
+    /// affected by a rename), and the full <c>_prev</c> version history — by
+    /// renaming both the current subtree and the parallel <c>_prev</c> subtree and
+    /// updating every affected catalog record's paths in one transaction. A single
+    /// file relocates each of its versions' on-disk copies individually.
+    /// </summary>
+    /// <remarks>
+    /// Renames and moves are indistinguishable here (both are a same-volume
+    /// old-path→new-path pair) and are handled identically. Only split or zipped
+    /// records — which a directory backup never creates — force a fall-back, since
+    /// their bytes span discs / live inside an archive a plain rename can't move.
+    /// The physical rename happens before the catalog commits, so an interrupted
+    /// run fails safe toward a harmless re-copy rather than data loss.
+    /// </remarks>
+    /// <returns>
+    /// <see cref="TargetedMoveOutcome.Relocated"/> when the destination copy was
+    /// moved and the catalog updated; <see cref="TargetedMoveOutcome.FellBack"/>
+    /// when relocation was not safe/possible and the caller should back up the new
+    /// path as fresh files (leaving the old copy for the next full scan to prune).
+    /// </returns>
+    public async Task<TargetedMoveOutcome> MoveTargetedAsync(
+        BackupJob job,
+        string targetDirectory,
+        string oldPath,
+        string newPath,
+        bool isDirectory,
+        CancellationToken ct)
+    {
+        if (!job.BackupSetId.HasValue)
+            throw new ArgumentException("Targeted move requires an existing backup set.", nameof(job));
+
+        int setId = job.BackupSetId.Value;
+
+        var records = isDirectory
+            ? await _catalog.GetFileRecordsUnderDirectoryAsync(setId, oldPath, ct)
+            : await _catalog.GetFileRecordsByPathAsync(setId, oldPath, ct);
+
+        // Nothing tracked under the old path — treat the new side as fresh.
+        if (records.Count == 0)
+            return TargetedMoveOutcome.FellBack;
+
+        // Directory backups only ever produce plain / .dedup / .fileref records
+        // (IsSplit and IsZipped are always false — those are optical-media
+        // formats). A split file's bytes span discs and a zipped file lives inside
+        // an archive, neither of which a plain rename can relocate, so bail safely
+        // if one somehow appears.
+        if (records.Any(r => r.IsSplit || r.IsZipped))
+            return TargetedMoveOutcome.FellBack;
+
+        try
+        {
+            return isDirectory
+                ? await RelocateDirectoryAsync(setId, targetDirectory, oldPath, newPath, records, ct)
+                : await RelocateFileAsync(setId, targetDirectory, newPath, records, ct);
+        }
+        catch (OperationCanceledException) when (ct.IsCancellationRequested)
+        {
+            throw;
+        }
+        catch (Exception ex) when (ex is IOException or UnauthorizedAccessException)
+        {
+            // Destination busy/locked or a name collision — fall back to a re-copy
+            // rather than risk a half-applied relocation.
+            return TargetedMoveOutcome.FellBack;
+        }
+    }
+
+    /// <summary>
+    /// Relocate a moved/renamed directory: rename both the current subtree
+    /// (<c>{drive}\rel</c>) and the parallel history subtree
+    /// (<c>{drive}_prev\rel</c>) — same source volume, so the <c>{drive}</c> prefix
+    /// is unchanged — then repoint every affected catalog record (current and all
+    /// <c>_prev</c> versions, including <c>.dedup</c>/<c>.fileref</c> manifests) in
+    /// a single transaction. Physical renames happen first; if the catalog update
+    /// throws, they are reversed and the transaction rolls back.
+    /// </summary>
+    private async Task<TargetedMoveOutcome> RelocateDirectoryAsync(
+        int setId, string targetDirectory, string oldPath, string newPath,
+        IReadOnlyList<FileRecord> records, CancellationToken ct)
+    {
+        string drivePrefix = GetDrivePrefix(oldPath);
+        string oldRel = GetRelativePath(oldPath);
+        string newRel = GetRelativePath(newPath);
+
+        string oldCur = Path.Combine(targetDirectory, drivePrefix, oldRel);
+        string newCur = Path.Combine(targetDirectory, drivePrefix, newRel);
+        string oldPrev = Path.Combine(targetDirectory, drivePrefix + "_prev", oldRel);
+        string newPrev = Path.Combine(targetDirectory, drivePrefix + "_prev", newRel);
+
+        bool curMoved = false, prevMoved = false;
+        try
+        {
+            if (Directory.Exists(oldCur))
+            {
+                EnsureParentDirectory(newCur);
+                Directory.Move(oldCur, newCur);
+                curMoved = true;
+            }
+            if (Directory.Exists(oldPrev))
+            {
+                EnsureParentDirectory(newPrev);
+                Directory.Move(oldPrev, newPrev);
+                prevMoved = true;
+            }
+
+            // Nothing physically present under the old path — let the caller
+            // re-copy the new path as fresh files.
+            if (!curMoved && !prevMoved)
+                return TargetedMoveOutcome.FellBack;
+
+            using var tx = await _catalog.BeginTransactionAsync(setId, ct);
+            foreach (var rec in records)
+            {
+                ct.ThrowIfCancellationRequested();
+                string newSource = RemapPathPrefix(rec.SourcePath, oldPath, newPath);
+                rec.DiscPath = RemapDiscPath(rec, newSource);
+                rec.SourcePath = newSource;
+                await _catalog.UpdateFileRecordAsync(rec, ct);
+            }
+            tx.Complete();
+            return TargetedMoveOutcome.Relocated;
+        }
+        catch
+        {
+            // Reverse whatever we physically moved so the destination tree matches
+            // the (rolled-back) catalog, then fall back to a re-copy.
+            if (prevMoved) TryMoveDirectoryBack(newPrev, oldPrev);
+            if (curMoved) TryMoveDirectoryBack(newCur, oldCur);
+            throw;
+        }
+    }
+
+    /// <summary>
+    /// Relocate a moved/renamed single file: rename each of its on-disk versions
+    /// (the current copy plus every <c>_prev</c> version, in whatever format —
+    /// plain, <c>.dedup</c>, <c>.fileref</c>) and repoint their catalog records in
+    /// one transaction. Physical renames happen first and are reversed if the
+    /// catalog update throws.
+    /// </summary>
+    private async Task<TargetedMoveOutcome> RelocateFileAsync(
+        int setId, string targetDirectory, string newPath,
+        IReadOnlyList<FileRecord> records, CancellationToken ct)
+    {
+        // (newAbs -> oldAbs) pairs we can undo on failure.
+        var undo = new List<(string From, string To)>();
+        try
+        {
+            foreach (var rec in records)
+            {
+                string oldAbs = Path.Combine(targetDirectory, rec.DiscPath);
+                string newAbs = Path.Combine(targetDirectory, RemapDiscPath(rec, newPath));
+                if (!File.Exists(oldAbs))
+                    continue;
+
+                EnsureParentDirectory(newAbs);
+                File.Move(oldAbs, newAbs, overwrite: false);
+                undo.Add((newAbs, oldAbs));
+            }
+
+            // Nothing physically present — let the caller re-copy from the new source.
+            if (undo.Count == 0)
+                return TargetedMoveOutcome.FellBack;
+
+            using var tx = await _catalog.BeginTransactionAsync(setId, ct);
+            foreach (var rec in records)
+            {
+                ct.ThrowIfCancellationRequested();
+                rec.DiscPath = RemapDiscPath(rec, newPath);
+                rec.SourcePath = newPath;
+                await _catalog.UpdateFileRecordAsync(rec, ct);
+            }
+            tx.Complete();
+            return TargetedMoveOutcome.Relocated;
+        }
+        catch
+        {
+            foreach (var (from, to) in undo)
+            {
+                try { if (File.Exists(from)) File.Move(from, to, overwrite: false); }
+                catch { /* best effort */ }
+            }
+            throw;
+        }
+    }
+
+    /// <summary>
+    /// Recompute a record's disc-relative path for its new source path, preserving
+    /// whether it is the current version or a <c>_prev</c> version and its storage
+    /// format (<c>.dedup</c>/<c>.fileref</c>). The current on-disk location is read
+    /// from <paramref name="rec"/>.DiscPath, so call this before mutating it.
+    /// </summary>
+    private static string RemapDiscPath(FileRecord rec, string newSourcePath)
+    {
+        return IsPrevDiscPath(rec.DiscPath)
+            ? GetPrevDiscPath(newSourcePath, rec.Version, rec.IsDeduped, rec.IsFileRef)
+            : GetCurrentDiscPath(newSourcePath, rec.IsDeduped, rec.IsFileRef);
+    }
+
+    /// <summary>
+    /// True when a disc-relative path sits under a history tree — its first path
+    /// segment (the drive folder) ends with <c>_prev</c>.
+    /// </summary>
+    private static bool IsPrevDiscPath(string discPath)
+    {
+        int sep = discPath.IndexOf('\\');
+        return sep > 0
+            && discPath.AsSpan(0, sep).EndsWith("_prev", StringComparison.OrdinalIgnoreCase);
+    }
+
+    private static void EnsureParentDirectory(string path)
+    {
+        string? parent = Path.GetDirectoryName(path);
+        if (parent is not null)
+            Directory.CreateDirectory(parent);
+    }
+
+    private static void TryMoveDirectoryBack(string from, string to)
+    {
+        try { if (Directory.Exists(from)) Directory.Move(from, to); }
+        catch { /* best effort */ }
+    }
+
+    /// <summary>
+    /// Replace an <paramref name="oldPrefix"/> path prefix on <paramref name="path"/>
+    /// with <paramref name="newPrefix"/>, respecting directory boundaries. When
+    /// <paramref name="path"/> equals <paramref name="oldPrefix"/> exactly (the
+    /// moved item itself), it maps to <paramref name="newPrefix"/>.
+    /// </summary>
+    private static string RemapPathPrefix(string path, string oldPrefix, string newPrefix)
+    {
+        if (string.Equals(path, oldPrefix, StringComparison.OrdinalIgnoreCase))
+            return newPrefix;
+
+        string trimmedOld = oldPrefix.TrimEnd('\\');
+        string trimmedNew = newPrefix.TrimEnd('\\');
+        if (path.StartsWith(trimmedOld + "\\", StringComparison.OrdinalIgnoreCase))
+            return trimmedNew + path[trimmedOld.Length..];
+
+        return path; // not under the prefix — leave untouched
     }
 
     // -------------------------------------------------------------------
@@ -1821,14 +2155,19 @@ public class DirectoryBackupService
                 Directory.CreateDirectory(dir);
 
             // Write the real bytes into the reference's location (suffix-less).
+            // File.Copy preserves the source's attributes, so strip read-only
+            // afterwards — otherwise read-only source content (git objects, etc.)
+            // leaves a read-only file on the destination that later resists
+            // retention/cleanup deletion.
             File.Copy(sourceBytesPath, plainAbsPath, overwrite: true);
+            ClearReadOnly(plainAbsPath);
 
             // Remove the now-redundant .fileref manifest (it differs from the
             // plain path only by the ".fileref" suffix).
             if (!string.Equals(refAbsPath, plainAbsPath, StringComparison.OrdinalIgnoreCase)
                 && File.Exists(refAbsPath))
             {
-                File.Delete(refAbsPath);
+                ForceDeleteFile(refAbsPath);
             }
 
             // Flip the catalog record to a plain copy at its new path.
@@ -1847,6 +2186,45 @@ public class DirectoryBackupService
         => discPath.EndsWith(".fileref", StringComparison.OrdinalIgnoreCase)
             ? discPath[..^".fileref".Length]
             : discPath;
+
+    /// <summary>
+    /// Delete a file we own on the destination, first clearing its read-only
+    /// attribute. Plain <see cref="File.Delete(string)"/> throws
+    /// <see cref="UnauthorizedAccessException"/> on a read-only file, and a LOT
+    /// of backed-up content carries that flag (git object/pack files are always
+    /// read-only, as is anything copied from a read-only source). Without this,
+    /// retention and manifest cleanup silently fail on read-only files and leave
+    /// stale bytes on disk that the cleanup UI then re-reports forever.
+    /// </summary>
+    private static void ForceDeleteFile(string path)
+    {
+        var fi = new FileInfo(path);
+        if (fi.Exists)
+        {
+            if (fi.IsReadOnly)
+                fi.IsReadOnly = false;
+            fi.Delete();
+        }
+    }
+
+    /// <summary>
+    /// Clear the read-only attribute on a file we just wrote to the destination.
+    /// <see cref="File.Copy(string,string,bool)"/> preserves the source's
+    /// attributes, so copying read-only source content (e.g. git objects) leaves
+    /// read-only files on the destination that later resist deletion. Every file
+    /// under our control on the destination must stay writable so retention and
+    /// cleanup can manage it.
+    /// </summary>
+    private static void ClearReadOnly(string path)
+    {
+        try
+        {
+            var fi = new FileInfo(path);
+            if (fi.Exists && fi.IsReadOnly)
+                fi.IsReadOnly = false;
+        }
+        catch { /* best effort — a stuck attribute must not fail the backup */ }
+    }
 
     /// <summary>
     /// Resolve a content hash to the absolute path of an active plain copy of

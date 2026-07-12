@@ -10,6 +10,13 @@ using LithicBackup.Worker;
 // during host build/startup is recorded to C:\ProgramData\LithicBackup\logs.
 CrashLogger.Initialize("worker");
 
+// Register Windows Error Reporting local dumps for BOTH executables. The
+// service runs as LocalSystem, so unlike the (unelevated) GUI it can write the
+// HKLM keys — a single successful registration here covers native crashes of
+// the GUI too. Catches the access-violation / corrupted-state faults that the
+// managed CrashLogger cannot.
+NativeCrashDumps.TryEnableLocalDumps();
+
 var builder = Host.CreateDefaultBuilder(args)
     .UseWindowsService(options =>
     {
@@ -34,6 +41,7 @@ var builder = Host.CreateDefaultBuilder(args)
         services.AddSingleton<IFileScanner, FileScanner>();
         services.AddSingleton<IVolumeResolver, Win32VolumeResolver>();
         services.AddSingleton<IDestinationResolver, DestinationResolver>();
+        services.AddSingleton<ISourceResolver, SourceResolver>();
         services.AddSingleton<IDeduplicationEngine, BlockDeduplicationEngine>();
         services.AddSingleton<VersionRetentionService>();
         services.AddSingleton<DirectoryBackupService>();

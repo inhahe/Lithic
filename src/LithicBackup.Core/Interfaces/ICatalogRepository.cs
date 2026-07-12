@@ -56,8 +56,12 @@ public interface ICatalogRepository : IDisposable
     /// Caution: for large backup sets this can load hundreds of thousands of
     /// FileRecord objects into memory. Prefer <see cref="GetLatestVersionInfoAsync"/>
     /// when only version/format metadata is needed.
+    /// <paramref name="rowProgress"/>, if supplied, is reported periodically with
+    /// the running count of records read so a caller can show live progress on a
+    /// large set (the read itself is synchronous and can take many seconds).
     /// </summary>
-    Task<IReadOnlyList<FileRecord>> GetAllFilesForBackupSetAsync(int backupSetId, CancellationToken ct = default);
+    Task<IReadOnlyList<FileRecord>> GetAllFilesForBackupSetAsync(
+        int backupSetId, CancellationToken ct = default, IProgress<int>? rowProgress = null);
 
     /// <summary>
     /// Get lightweight version info for the latest version of each file in a
@@ -77,6 +81,22 @@ public interface ICatalogRepository : IDisposable
     /// Used for on-demand lookup when updating a specific record's DiscPath.
     /// </summary>
     Task<FileRecord?> GetFileRecordByPathAndVersionAsync(int backupSetId, string sourcePath, int version, CancellationToken ct = default);
+
+    /// <summary>
+    /// All catalog records (every version, including deleted history) for one
+    /// exact source path in a set, ordered by version. Used to relocate a file's
+    /// destination copy when its source is renamed/moved, and to decide whether
+    /// relocation is safe (a single plain version) or must fall back to a re-copy.
+    /// </summary>
+    Task<IReadOnlyList<FileRecord>> GetFileRecordsByPathAsync(int backupSetId, string sourcePath, CancellationToken ct = default);
+
+    /// <summary>
+    /// All catalog records (every version, including deleted history) whose
+    /// SourcePath is the given directory or lies under it. Used to relocate an
+    /// entire subtree's destination copies when a source directory is
+    /// renamed/moved, and to gate whether that relocation is safe.
+    /// </summary>
+    Task<IReadOnlyList<FileRecord>> GetFileRecordsUnderDirectoryAsync(int backupSetId, string directoryPrefix, CancellationToken ct = default);
 
     /// <summary>
     /// Distinct content hashes in a backup set that have at least one active
@@ -151,6 +171,30 @@ public interface ICatalogRepository : IDisposable
     /// or are now excluded by glob patterns.
     /// </summary>
     Task<int> MarkFilesDeletedBySourcePathsAsync(int backupSetId, IEnumerable<string> sourcePaths, CancellationToken ct = default);
+
+    // --- Source drive remap ---
+
+    /// <summary>
+    /// Count catalog file records (all versions, including deleted history)
+    /// whose <see cref="FileRecord.SourcePath"/> is at or under
+    /// <paramref name="sourcePrefix"/> (typically a drive root like
+    /// <c>"E:\"</c>).  Used to preview how many records a source-drive remap
+    /// would affect before committing to it.
+    /// </summary>
+    Task<int> CountFilesUnderSourcePrefixAsync(int backupSetId, string sourcePrefix, CancellationToken ct = default);
+
+    /// <summary>
+    /// Rewrite the leading <paramref name="oldPrefix"/> of every catalog file
+    /// record's <see cref="FileRecord.SourcePath"/> in the set to
+    /// <paramref name="newPrefix"/>.  Used to remap a source drive letter (e.g.
+    /// the data that used to live on <c>E:\</c> now lives on <c>F:\</c> with the
+    /// same tree) so future backups treat existing files as already backed up
+    /// instead of re-copying everything.  Only <c>SourcePath</c> changes; the
+    /// destination-relative <see cref="FileRecord.DiscPath"/> and the physical
+    /// destination files are deliberately left untouched (they migrate naturally
+    /// as files change).  Returns the number of records updated.
+    /// </summary>
+    Task<int> RemapSourcePathPrefixAsync(int backupSetId, string oldPrefix, string newPrefix, CancellationToken ct = default);
 
     // --- Cross-set search ---
 

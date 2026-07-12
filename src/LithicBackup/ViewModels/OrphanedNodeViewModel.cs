@@ -197,22 +197,8 @@ public class OrphanedNodeViewModel : ViewModelBase
 
     // ---------------------------------------------------------------
 
-    private static string FormatBytes(long bytes)
-    {
-        const long KB = 1024;
-        const long MB = 1024 * KB;
-        const long GB = 1024 * MB;
-        const long TB = 1024 * GB;
-
-        return bytes switch
-        {
-            >= TB => $"{bytes / (double)TB:F2} TB",
-            >= GB => $"{bytes / (double)GB:F2} GB",
-            >= MB => $"{bytes / (double)MB:F2} MB",
-            >= KB => $"{bytes / (double)KB:F1} KB",
-            _ => $"{bytes:N0} B",
-        };
-    }
+    // Sizes in the Cleanup view are shown as a raw byte count (no KB/MB/GB).
+    private static string FormatBytes(long bytes) => $"{bytes:N0}";
 }
 
 /// <summary>
@@ -360,20 +346,6 @@ public class OrphanedCategoryViewModel : ViewModelBase
             WireCheckNotifications(child);
     }
 
-    private static string FormatBytes(long bytes)
-    {
-        const long KB = 1024;
-        const long MB = 1024 * KB;
-        const long GB = 1024 * MB;
-        const long TB = 1024 * GB;
-
-        return bytes switch
-        {
-            >= TB => $"{bytes / (double)TB:F2} TB",
-            >= GB => $"{bytes / (double)GB:F2} GB",
-            >= MB => $"{bytes / (double)MB:F2} MB",
-            >= KB => $"{bytes / (double)KB:F1} KB",
-            _ => $"{bytes:N0} B",
-        };
-    }
+    // Sizes in the Cleanup view are shown as a raw byte count (no KB/MB/GB).
+    private static string FormatBytes(long bytes) => $"{bytes:N0}";
 }

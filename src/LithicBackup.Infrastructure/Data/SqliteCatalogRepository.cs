@@ -400,8 +400,8 @@ public class SqliteCatalogRepository : ICatalogRepository
         return await GetSet(setId.Value).GetFilesOnDiscAsync(discId, ct).ConfigureAwait(false);
     }
 
-    public Task<IReadOnlyList<FileRecord>> GetAllFilesForBackupSetAsync(int backupSetId, CancellationToken ct = default)
-        => GetSet(backupSetId).GetAllFilesForBackupSetAsync(backupSetId, ct);
+    public Task<IReadOnlyList<FileRecord>> GetAllFilesForBackupSetAsync(int backupSetId, CancellationToken ct = default, IProgress<int>? rowProgress = null)
+        => GetSet(backupSetId).GetAllFilesForBackupSetAsync(backupSetId, ct, rowProgress);
 
     public Task<Dictionary<string, FileVersionInfo>> GetLatestVersionInfoAsync(int backupSetId, CancellationToken ct = default)
         => GetSet(backupSetId).GetLatestVersionInfoAsync(backupSetId, ct);
@@ -411,6 +411,12 @@ public class SqliteCatalogRepository : ICatalogRepository
 
     public Task<FileRecord?> GetFileRecordByPathAndVersionAsync(int backupSetId, string sourcePath, int version, CancellationToken ct = default)
         => GetSet(backupSetId).GetFileRecordByPathAndVersionAsync(backupSetId, sourcePath, version, ct);
+
+    public Task<IReadOnlyList<FileRecord>> GetFileRecordsByPathAsync(int backupSetId, string sourcePath, CancellationToken ct = default)
+        => GetSet(backupSetId).GetFileRecordsByPathAsync(backupSetId, sourcePath, ct);
+
+    public Task<IReadOnlyList<FileRecord>> GetFileRecordsUnderDirectoryAsync(int backupSetId, string directoryPrefix, CancellationToken ct = default)
+        => GetSet(backupSetId).GetFileRecordsUnderDirectoryAsync(backupSetId, directoryPrefix, ct);
 
     public Task<HashSet<string>> GetActivePlainHashesAsync(int backupSetId, CancellationToken ct = default)
         => GetSet(backupSetId).GetActivePlainHashesAsync(backupSetId, ct);
@@ -429,6 +435,12 @@ public class SqliteCatalogRepository : ICatalogRepository
 
     public Task<int> MarkFilesDeletedBySourcePathsAsync(int backupSetId, IEnumerable<string> sourcePaths, CancellationToken ct = default)
         => GetSet(backupSetId).MarkFilesDeletedBySourcePathsAsync(backupSetId, sourcePaths, ct);
+
+    public Task<int> CountFilesUnderSourcePrefixAsync(int backupSetId, string sourcePrefix, CancellationToken ct = default)
+        => GetSet(backupSetId).CountFilesUnderSourcePrefixAsync(backupSetId, sourcePrefix, ct);
+
+    public Task<int> RemapSourcePathPrefixAsync(int backupSetId, string oldPrefix, string newPrefix, CancellationToken ct = default)
+        => GetSet(backupSetId).RemapSourcePathPrefixAsync(backupSetId, oldPrefix, newPrefix, ct);
 
     // ---------------------------------------------------------------
     // File chunks (routed)

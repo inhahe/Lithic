@@ -1,5 +1,188 @@
 # LithicBackup — Known Issues & Tech Debt
 
+## FIXED: Cleanup "cleaned but reappears" — read-only files silently fail deletion (2026-07-12)
+
+**Status:** Fixed 2026-07-12 in `OrphanedDirectoriesViewModel.PurgeSelected`
+(cleanup UI) and `DirectoryBackupService` (retention + fileref materialisation).
+
+**Symptom (user report):** In the Cleanup view, "Scan Destination Filesystem"
+listed "untracked files" and "catalog-deleted (still on disk)" entries; the user
+selected all and cleaned them, re-scanned, and the exact same entries came back —
+"the same bug it already had that you thought you fixed."
+
+**Root cause (forensically confirmed on the LIVE catalog + destination):**
+`FileInfo.Delete()` / `File.Delete()` throw `UnauthorizedAccessException` on a
+**read-only** file. A large fraction of backed-up content is read-only: git
+object/pack files are always read-only, and anything copied with `File.Copy`
+inherits the source's read-only attribute. The cleanup purge's physical-delete
+loop caught the exception, counted it as a soft failure, and moved on — so the
+file survived on disk and the next scan re-reported it, forever. On the live
+destination, **920 of 940** "catalog-deleted (still on disk)" files were
+read-only. That is the actual "cleaned but keeps coming back" bug.
+
+**Where the read-only files came from:** `DirectoryBackupService`'s primary
+content write streams into a fresh temp file (never read-only), but
+`TryPromoteFileRefToPlainAsync` used `File.Copy(sourceBytesPath, plainAbsPath,
+overwrite:true)`, which **preserves** the source read-only flag — planting
+read-only plain files on the destination. Retention's `File.Delete(prevPath)` and
+the fileref-manifest `File.Delete(refAbsPath)` then threw on those files and (for
+retention) left them behind on every pass.
+
+**Fix (both symptom and source):**
+- `OrphanedDirectoriesViewModel` purge phase-2: clear `fi.IsReadOnly` before
+  `fi.Delete()`.
+- `DirectoryBackupService`: added `ForceDeleteFile` (clears read-only then
+  deletes) used at the retention delete and fileref-manifest delete; added
+  `ClearReadOnly` called right after the `File.Copy` in
+  `TryPromoteFileRefToPlainAsync` so newly-materialised plain files are writable.
+
+**Correction to an earlier (2026-07-12) diagnosis in this file:** an initial pass
+claimed "298,688 of 834,035 untracked hits" and a "stale catalog out of sync"
+condition. Those numbers came from the **abandoned legacy** catalog at
+`C:\Users\<user>\AppData\Local\LithicBackup\catalog.db` (dated 2026-06-09), not the
+live catalog. The live catalog is the per-set DB at
+`C:\ProgramData\LithicBackup\sets\set-4.db` (current, consistent with the
+destination): 833,981 of 834,035 files are correctly tracked. The catalog is NOT
+stale — the timestamp confusion was reading the wrong file (see
+`CatalogLocation.cs`, LocalApplicationData → CommonApplicationData migration).
+
+## FIXED (defensive): Cleanup could mislabel materialised `.fileref`/`.dedup` content as "Untracked" (2026-07-12)
+
+**Status:** Fixed 2026-07-12 in `OrphanedDirectoriesViewModel.WalkDestination`
+(commit dd6584a). Correct and worth keeping, but low-impact on live data (it
+reclassifies **1** file on the live set, not the hundreds of thousands the
+original write-up implied).
+
+**Root cause:** A deduplicated file's catalog `DiscPath` carries a manifest suffix
+(`…lama-cleaner-main.zip.fileref`), but the manifest can be **materialised** back
+into a plain, suffix-less file whose bytes *are* the referenced content.
+`WalkDestination` keyed `discPathLookup` only by the raw catalog `DiscPath`, so a
+plain on-disk file wouldn't match its `.fileref`/`.dedup` record and could be
+reported as untracked — risking "cleanup" of live backup content.
+
+**Fix:** In `WalkDestination`, when a disk file's exact relative path isn't in the
+catalog, also try `<path>.fileref` and `<path>.dedup` before declaring it
+untracked. Exact match still wins; the fallbacks only fire for plain suffix-less
+files, so genuine untracked files are unaffected.
+
+**Actual data repair (2026-07-12):** the stale rows themselves are now repairable
+via the **Reconcile Catalog with Destination** tool in the Cleanup view
+(`CatalogReconcileService`). It flips `IsFileRef=1` rows whose stripped path holds
+a hash-matching plain file back to plain (`IsFileRef=0`, stripped `DiscPath`) and
+prunes active rows whose content is missing. It is dry-run first (Analyze → Apply)
+and never prunes when the destination is absent/empty. This is the "separate
+reconcile pass" the earlier write-up said would be needed.
+
+## OPEN (related): disc-burn staging copies inherit source read-only
+
+`BackupOrchestrator` File.Copy sites (lines ~883, ~1018, ~1139) copy source files
+into the disc-burn staging dir and, like the fileref path, preserve the source's
+read-only attribute. This is the disc-backup path (not the directory-backup path
+the user hit), so it wasn't fixed in the 2026-07-12 pass. If staging cleanup or
+retention there ever fails on read-only files, apply the same `ClearReadOnly` /
+`ForceDeleteFile` treatment.
+
+## FIXED: Cleanup "Clean Selected" never persisted for RemovedFromSources / DeletedFromDisk (2026-07-11)
+
+**Status:** Fixed 2026-07-11 in `SqliteSetDatabase.cs`. Root cause was a SQL
+`LIKE ... ESCAPE '\'` bug; two methods were affected.
+
+**Symptom (user report):** After running "Clean Selected" in the Cleanup view and
+re-scanning, all the same entries reappeared in the "deleted from disk"
+(`DeletedFromDisk`) and "not in source selection" (`RemovedFromSources`) sections.
+The cleanup appeared to do nothing that stuck.
+
+**Root cause:** Those two categories route through the purge's `else` branch →
+`ICatalogRepository.MarkFilesDeletedByDirectoryAsync(setId, DirectoryPath)`, whose
+SQL is `... AND (SourcePath LIKE $prefix ESCAPE '\' OR SourcePath = $exact)`.
+The prefix is a Windows source path (e.g. `D:\some\dir\%`). Because `\` is declared
+as the LIKE escape character and the code escaped `[`, `%`, `_` **but not the
+backslash itself**, every path-separator `\` in the pattern was treated as an escape
+char and swallowed the next character. The pattern matched **zero** rows, so
+`UPDATE Files SET IsDeleted = 1` affected nothing. The transaction committed cleanly
+(no error), the in-memory `_activeFiles` list was trimmed, and disk files were
+deleted — but the catalog rows stayed `IsDeleted = 0`. On the next scan, `_activeFiles`
+reloaded from the catalog and the still-active rows re-surfaced. Verified empirically:
+`'D:\some\dir\file.txt' LIKE 'D:\some\dir\%' ESCAPE '\'` → **0**; doubling the
+backslashes → **1**.
+
+**Second method with the identical bug:** `GetFileRecordsUnderDirectoryAsync` used the
+same broken escape chain. Its only caller is `DirectoryBackupService.MoveTargetedAsync`
+for **directory** moves — so a renamed/moved watched folder always got back 0 records,
+always returned `FellBack`, and re-copied the entire subtree as fresh files (leaving the
+old copy to be pruned later) instead of taking the fast `Directory.Move` relocate path.
+Fixed as part of the same change.
+
+**Fix:** Prepend `.Replace("\\", "\\\\")` (escape the escape char first, before adding
+the `\[` `\%` `\_` escapes) in both `MarkFilesDeletedByDirectoryAsync` and
+`GetFileRecordsUnderDirectoryAsync`, mirroring the already-correct `SearchAsync`. The
+`SourcePath = $exact` fallback only ever matched the directory row itself, never the
+files under it, which is why it didn't mask the bug.
+
+**Note on existing data:** Catalog rows for previously-"cleaned" RemovedFromSources /
+DeletedFromDisk entries whose disk files were already deleted are now
+"catalog-deleted (still... actually gone)" — i.e. `IsDeleted = 0` rows whose bytes are
+gone. Re-running Clean Selected on them now correctly flips `IsDeleted` (the disk-delete
+pass simply finds nothing to delete). No separate reconcile needed.
+
+## "Catalog-deleted (still on disk)" `_prev .v1` records + retention hardening (2026-07-11)
+
+**Status:** Code hardened 2026-07-11 (retention now confirms physical removal
+before flipping `IsDeleted`). Existing residue in old catalogs remains until a
+cleanup/reconcile pass runs. A separate user-config finding (below) is NOT a bug.
+
+**Symptom (user report):** The Cleanup view listed many "catalog-deleted (still on
+disk)" entries, most of them `*.v1` files under `c_prev` / `d_prev`. The concern:
+(1) Lithic marks files deleted in the catalog without physically deleting them, and
+(2) previous-version files were being deleted despite a "keep versions" intent.
+
+**Forensic findings (reference catalog `%LocalAppData%\LithicBackup\catalog.db`,
+set 4 — note this copy is stale, dated 2026-06-09):**
+- 609,474 `IsDeleted=1` rows total; only **2,792 are under `_prev`** (2,783
+  `D_prev`, 9 `C_prev`), and **every one is Version 1** — a lone prev version per
+  path, timestamps clustered on 2026-05-19.
+- Current retention **cannot** produce a lone-prev-v1 deletion:
+  `VersionRetentionService.ComputeRetentionAsync` only considers `_prev`-path
+  versions, protects `newestId`, and trims only when a tier's prev-version count
+  exceeds `MaxVersions`. With a single prev version, nothing is ever selected.
+- Therefore these 2,792 are **residue from the May 19 re-seed bloat event** (old
+  code, before the seed idempotency guard — see the catalog-bloat entry below),
+  not from current retention.
+
+**Root-cause bug that was hardened (the "thinks it deleted but didn't" invariant):**
+`DirectoryBackupService.ExecuteAsync` retention section previously (a) reconstructed
+the version file path via `GetPrevPath(SourcePath, Version, flags)` instead of using
+the record's authoritative stored `DiscPath`, and (b) set `fileRecord.IsDeleted =
+true` **unconditionally** after a `File.Exists`-guarded delete. If the reconstructed
+path diverged from the real `DiscPath` (legacy/migrated rows) or the delete threw,
+the bytes survived while the record was still marked deleted → exactly the
+"catalog-deleted (still on disk)" state. **Fix:** locate the file via
+`Path.Combine(targetDirectory, fileRecord.DiscPath)`, wrap the delete in a
+try/catch that `continue`s (leaving record + file consistent) on IO/ACL failure,
+and flip `IsDeleted` only when `!File.Exists(prevPath)` confirms the bytes are gone.
+Also added a warning doc-comment to the dead `VersionRetentionService.ApplyRetentionAsync`
+(no callers) noting it marks `IsDeleted` without any physical delete and must not be
+wired into the backup path as-is.
+
+**NOT a bug — user tier-config finding (worth surfacing to the user):** Set 4's
+`JobOptions.TierSets` were: **Default = `{MaxAge:null, MaxVersions:1}` (keep only 1
+version, all ages)**; "None" = no versioning for build/output dirs; "Custom 1" =
+`{<10d: all, <365d: 10, older: 3}` matched to code/doc extensions + `d:\visual
+studio projects\*`. So the "keep for a long time" policy applies **only** to Custom
+1's files; everything else (e.g. `D:\mp3\...`, most of `C:\`) falls through to
+Default and keeps just 1 version. The user believed their policy kept all prev
+versions for 365 days — it does not. (Even Custom 1 keeps 10 versions in the
+10–365d band, not "all".) If the intent is to keep more history broadly, the
+**Default tier set** must be changed.
+
+**Residue cleanup (existing catalogs):** the hardened code prevents recurrence but
+does not retroactively repair the 2,792 rows. On the live J: destination most of
+those physical `.v1` files are already gone (the records are then correctly
+deleted). Where a `.v1` file genuinely still exists and the user wants to keep it,
+the record should be un-deleted (`IsDeleted=0`) rather than physically purged — do
+NOT run the Cleanup "catalog-deleted (still on disk)" purge on prev versions the
+user intends to retain, as that physically removes them.
+
 ## Catalog bloat: duplicate `Files` rows from repeated seed/import runs
 
 **Status:** Data residue in existing catalogs. Root cause in old code; current code
@@ -264,3 +447,175 @@ itself. **Needs validation on real optical hardware** before relying on it; cons
 more robust remount (volume-arrival notification instead of fixed polling) and special
 handling for open multisession discs (which may only be readable after the session is
 closed).
+
+## Fixed: schedule editor silently reverted On/Continuous to Off/Interval
+
+**Status:** Fixed 2026-07-11 in `MainViewModel.RestoreSourceSettings` and
+`MainViewModel.RestoreJobOptions`.
+
+**Symptom:** A backup set configured with schedule Enabled=On + Mode=Continuous
+would later show up as Off + Interval, silently disabling continuous backup (the
+Worker only watches sets whose schedule is Enabled AND Mode==Continuous).
+
+**Root cause:** Both restore methods guarded schedule loading on
+`opts.Schedule is { Enabled: true }` and then hardcoded `vm.ScheduleEnabled = true`.
+When a set was stored as `{Enabled:false, Mode:Continuous}` (which the active save
+path `SyncSettingsToJobOptions` produces whenever the enable checkbox is off — it
+sets `opts.Schedule.Enabled = false` in place but preserves Mode on disk), the next
+editor open skipped the restore entirely and fell back to the ViewModel field
+defaults (`_scheduleEnabled=false`, `_scheduleMode=Interval`). The stored Continuous
+Mode was hidden, and a subsequent enable+save wrote the default Interval over it —
+permanent Mode loss.
+
+**Fix:** Restore now matches `opts.Schedule is { } sched` (any non-null schedule)
+and sets `vm.ScheduleEnabled = sched.Enabled`, always loading Mode/interval/debounce
+so the editor reflects the true stored config regardless of Enabled.
+
+**Not the cause (ruled out during investigation):**
+- DB/JSON round-trip is fine — `JsonSerializer.Serialize` with no options writes all
+  properties (System.Text.Json does NOT omit defaults unless `DefaultIgnoreCondition`
+  is set), so `Enabled`/`Mode` persist correctly in `sets`/master DB JobOptions JSON.
+
+## Continuous backup misses changes when the USN journal wraps during downtime (2026-07-11)
+
+**Status:** FIXED 2026-07-11. Continuous mode now detects a lost-continuity journal
+(wrap or recreation during downtime) and self-heals by running a full reconciling
+backup, then re-seeding the cursor to the journal's current end. See "Fix" below.
+
+**Fix:** `UsnJournalReader.ReadChanges` now reports an `out bool journalTruncated`,
+set when `FSCTL_READ_USN_JOURNAL` fails with `ERROR_JOURNAL_ENTRY_DELETED` (1181) —
+i.e. the saved start USN was purged. A new `UsnJournalReader.TryRefreshPosition`
+re-queries the live `NextUsn`. In `BackupWorker.ReadVolumeChangesAsync`, the old
+combined "cursor null OR JournalId mismatch → reset to now, return no changes" branch
+was split: a truly first-seen volume (`cursor is null`) still just seeds forward
+quietly, but a **JournalId mismatch on an existing cursor** (journal recreated) and a
+**truncation during read** (journal wrapped) both re-seed the cursor to the current
+end AND return a `Truncated` signal. `CheckContinuousAsync` collects the truncated
+drives, flags every continuous set watching them (`SetState.NeedsReconcile`), and runs
+a full `RunFullBackupAsync` reconcile (which now returns `bool` so the flag is cleared
+only when the scan actually runs — it retries on later polls if the backup lock is
+busy or the destination is offline). The debounce pass skips reconcile-pending sets.
+Net: no more silently-stuck cursor and no more missed downtime changes.
+
+**Scenario:** A set is on `ScheduleMode.Continuous`. The Worker (or whole machine) is
+off for a while, or the source volume sees heavy churn while off. On restart, a
+brand-new directory / new files added during the gap should be backed up.
+
+**Normal path (works):** Continuous mode is driven by the NTFS USN change journal,
+which NTFS keeps writing to whether or not Lithic runs. `BackupWorker.ReadVolumeChangesAsync`
+(BackupWorker.cs:326) loads the per-volume cursor from the `UsnCursors` catalog table,
+and as long as the `JournalId` still matches (line 349) it reads **every** record since
+that cursor via `UsnJournalReader.ReadChanges` (UsnJournalReader.cs:121) — full catch-up.
+New files under the new directory get enqueued (the directory-creation record itself is
+skipped at BackupWorker.cs:279 `if (change.IsDirectory) continue;`, but the file
+create/write records inside it are picked up), matched by `PathBelongsToSet` (honoring
+`AutoIncludeNewSubdirectories`, default true), debounced, and backed up through the same
+`DirectoryBackupService.ExecuteTargetedAsync` incremental machinery. So the new directory
+**is** backed up in the typical case.
+
+**The bug (journal wrap):** The USN journal has a fixed max size; NTFS purges the oldest
+records once it fills. After a long gap or heavy churn, the saved cursor USN can already
+be purged. Then `FSCTL_READ_USN_JOURNAL` fails and `ReadChanges` just `break`s
+(UsnJournalReader.cs:147-150), returning **empty** with `nextUsn == startUsn`, so
+`ReadVolumeChangesAsync` does **not** advance/save the cursor (line 375). A wrap does
+**not** change the `JournalId`, so the "reset to current end" branch (line 349) never
+fires either. Net effect: the cursor stays stuck on the purged USN and every future poll
+silently reads nothing — continuous detection for that volume is **permanently stuck**
+until the journal is deleted+recreated (new JournalId), which then resets to "now" and
+skips the gap anyway. The gap's changes (including the new directory) are lost to
+continuous mode. It's also **silent** — the failing `DeviceIoControl` doesn't throw, so
+`ReadVolumeChangesAsync`'s catch/log path (line 367) isn't even hit.
+
+**No fallback:** Continuous sets get no periodic full rescan — `CheckSchedulesAsync`
+maps `ScheduleMode.Continuous` to `_ => false` (BackupWorker.cs:218). So nothing walks
+the source tree to close the gap. The only recovery today is a **manual backup** (full
+`PlanAsync` scan) from the GUI, which would pick up the new directory.
+
+**Proper fix:** (1) Detect the purged-cursor case — check the read failure for
+`ERROR_JOURNAL_ENTRY_DELETED` (and/or compare the saved cursor against the journal's
+`FirstUsn`/lowest valid USN from `FSCTL_QUERY_USN_JOURNAL`). When the cursor is behind
+the journal's start, treat it like a journal reset. (2) On that reset, don't silently
+skip — trigger a one-off **full incremental backup** (`RunFullBackupAsync`) to
+reconcile the source against the catalog, then re-seed the cursor to the current
+`NextUsn`. That makes continuous mode self-healing across any downtime/wrap. Optionally
+also run a periodic safety-net full scan for continuous sets (e.g. daily) so a stuck
+journal can't hide indefinitely.
+
+## Tech debt: dead schedule-wipe landmine in SaveBackupSetAsync
+
+**Status:** Dead code (no callers), low priority. Landmine if re-wired.
+
+`MainViewModel.ShowJobConfig` has zero callers, so its `PlanCompleted` handler and
+`SaveBackupSetAsync` (which rebuilds `JobOptions` from scratch and sets
+`Schedule = jobConfig.BuildSchedule()`) are unreachable. `BuildSchedule()` returns
+**null** when `ScheduleEnabled` is false, so if this path were ever reconnected it
+would wipe a stored schedule to null (→ reverts to Off/Interval on reload) whenever
+the job-config checkbox happened to be off. This is inconsistent with the active save
+path `SyncSettingsToJobOptions`, which preserves the existing schedule object.
+
+**Proper fix if revived:** either delete `ShowJobConfig`/`SaveBackupSetAsync`/
+`BuildSchedule` if truly unused, or make the save path preserve/merge the existing
+`Schedule` instead of overwriting it with a possibly-null rebuild.
+
+## Move/rename relocation — Phase 2 shipped: special formats, history & per-file granularity (2026-07-11)
+
+**Status:** Phase 2 IMPLEMENTED 2026-07-11. `MoveTargetedAsync` now relocates
+`.dedup`/`.fileref` manifests and the full `{drive}_prev` version history in place,
+per-file within a directory, inside a single catalog transaction — closing the
+Phase 1 fallbacks below. Only genuinely un-relocatable formats (split/zipped, which
+directory backups never produce) still fall back. One residual caveat remains for
+**catalog-free** restore only (see "Residual caveat").
+
+**What Phase 1 did (history):** `UsnJournalReader.ReadChanges` captures each record's own
+File Reference Number (offset 8) and pairs `RENAME_OLD_NAME`/`RENAME_NEW_NAME` records
+sharing that FRN into `UsnMove(OldPath, NewPath, IsDirectory)` intents. A same-volume
+directory move emits a single pair on the directory's own FRN (children are **not**
+re-journaled), so one move relocates a whole subtree. `BackupWorker.CheckContinuousAsync`
+routes moves to every set either endpoint touches (`SetState.PendingMoves`) and applies
+them each poll via `RunMovesAsync` (under the backup lock, requeued while the destination
+is offline). Phase 1 only relocated a single plain current version; any `.dedup`,
+`.fileref`, split, zipped, or `{drive}_prev` history forced a whole-folder `FellBack`
+re-copy.
+
+**What Phase 2 does:** `MoveTargetedAsync` fetches all versions
+(`GetFileRecordsByPathAsync` / `GetFileRecordsUnderDirectoryAsync` — both current and
+every `_prev` version, including `.dedup`/`.fileref` manifests and `IsDeleted`
+tombstones), bails to `FellBack` only if any record is `IsSplit`/`IsZipped` (never true
+for directory backups), then delegates to:
+- `RelocateDirectoryAsync`: `Directory.Move`s **both** the current subtree
+  (`{drive}\rel`) and the parallel history subtree (`{drive}_prev\rel`) — same source
+  volume, so the `{drive}` prefix is unchanged — then, in one `BeginTransactionAsync`,
+  repoints every record's `SourcePath` (via `RemapPathPrefix`) and `DiscPath` (via
+  `RemapDiscPath`, which preserves current-vs-`_prev` and the `.dedup`/`.fileref` suffix).
+- `RelocateFileAsync`: `File.Move`s each on-disk version (current + every `_prev`, any
+  format) and repoints all records in one transaction.
+- `RemapDiscPath` / `IsPrevDiscPath`: recompute a record's disc path for its new source,
+  detecting `_prev` by testing whether the first path segment ends in `_prev`.
+
+`.dedup`/`.fileref` manifests are just small files in the current/history trees — moving
+the manifest and updating its `DiscPath` is sufficient; the shared content-addressed
+`_blocks/`/`_filestore/` bytes never move and restore resolves them by **Hash**, so a
+path change can't break block/file-dedup content resolution. **Atomicity:** all physical
+moves happen *before* the catalog commits; if the transaction throws, the physical moves
+are reversed (`TryMoveDirectoryBack` / `File.Move` undo list) and the transaction rolls
+back. An interrupted run therefore fails safe toward a harmless re-copy, never a
+half-applied relocation. Renames are covered identically (a rename and a move are the
+same USN old→new FRN pair — no separate code path).
+
+**Residual caveat (catalog-free restore only):** a `.fileref` manifest carries internal
+self-describing `SourcePath` and `ContentPath` fields (the latter a *hint* to where the
+anchor bytes live). These are **not** rewritten during a move. The primary restore/verify
+path resolves filerefs by **Hash** through the catalog, so it is unaffected. Only the
+catalog-free restore/inspection tools (which read `ContentPath` directly) can see a stale
+pointer after a move relocates either the fileref or its plain anchor. Proper fix if this
+ever matters: rewrite the moved `.fileref` manifests' internal `SourcePath`/`ContentPath`
+JSON during relocation, and reuse the existing `UpdateFileRefContentPathsAsync` reverse
+lookup to repoint any fileref whose anchor moved out from under it. Deferred as a separate
+catalog-free-restore fidelity concern, not part of the move feature's primary correctness.
+
+**Not handled (by design, matches existing continuous-delete behavior):** an item moved
+**out** of a set's scope (e.g. to the Recycle Bin or another location outside the
+selection) is not marked deleted immediately — its removal is reconciled by the next full
+scan. Pure continuous mode has no periodic full rescan (see the journal-wrap issue
+above), so out-of-scope move-deletes rely on a manual/scheduled full run, same as
+in-place deletes.

@@ -25,3 +25,16 @@ orchestrator2.log
 
 # Tool metadata
 .orchestrator_history
+
+# Python caches
+__pycache__/
+*.pyc
+
+# Test scratch / generated data
+_newfmt_catalog/
+_restore_newfmt/
+test_out/
+test_out_new/
+test_source/
+test_source_orig/
+test_source_reference/

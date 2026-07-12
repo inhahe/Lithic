@@ -52,6 +52,16 @@ public class JobOptions
     /// </summary>
     public string? DestinationSubpath { get; set; }
 
+    /// <summary>
+    /// Stable volume-GUID identities for the set's source drives, so sources
+    /// follow their drives across drive-letter reassignments (the source
+    /// analogue of <see cref="DestinationVolumeId"/>). One entry per distinct
+    /// source drive, keyed by its last-known drive letter. Empty for sets
+    /// created before the feature; backfilled on the first run where each
+    /// source drive is present.
+    /// </summary>
+    public List<SourceVolumeMapping> SourceVolumeMappings { get; set; } = [];
+
     public bool CreateSubdirectory { get; set; }
     public string? SubdirectoryName { get; set; }
     public List<string> ExcludedExtensions { get; set; } = [];

@@ -23,6 +23,9 @@
                 <DataTemplate DataType="{x:Type vm:LargestFilesViewModel}">
                     <views:LargestFilesView />
                 </DataTemplate>
+                <DataTemplate DataType="{x:Type vm:BackupReviewViewModel}">
+                    <views:BackupReviewView />
+                </DataTemplate>
             </ContentControl.Resources>
         </ContentControl>
     </Border>

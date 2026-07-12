@@ -150,6 +150,9 @@
                                                                                     <MenuItem Header="Backup"
                                                                                               Command="{Binding PlacementTarget.Tag.SetBackupCommand, RelativeSource={RelativeSource AncestorType=ContextMenu}}"
                                                                                               CommandParameter="{Binding}" />
+                                                                                    <MenuItem Header="Review Files &amp; Back Up..."
+                                                                                              Command="{Binding PlacementTarget.Tag.SetReviewCommand, RelativeSource={RelativeSource AncestorType=ContextMenu}}"
+                                                                                              CommandParameter="{Binding}" />
                                                                                     <MenuItem Header="Restore"
                                                                                               Command="{Binding PlacementTarget.Tag.SetRestoreCommand, RelativeSource={RelativeSource AncestorType=ContextMenu}}"
                                                                                               CommandParameter="{Binding}" />
@@ -175,6 +178,9 @@
                                                                                               CommandParameter="{Binding}" />
                                                                                     <MenuItem Header="Change Destination..."
                                                                                               Command="{Binding PlacementTarget.Tag.SetChangeDestCommand, RelativeSource={RelativeSource AncestorType=ContextMenu}}"
+                                                                                              CommandParameter="{Binding}" />
+                                                                                    <MenuItem Header="Remap Source Drive..."
+                                                                                              Command="{Binding PlacementTarget.Tag.SetRemapSourceDriveCommand, RelativeSource={RelativeSource AncestorType=ContextMenu}}"
                                                                                               CommandParameter="{Binding}" />
                                                                                     <MenuItem Header="Export..."
                                                                                               Command="{Binding PlacementTarget.Tag.SetExportCommand, RelativeSource={RelativeSource AncestorType=ContextMenu}}"
@@ -230,29 +236,43 @@
                                                                                     <!-- Running status (visible only while this set is running) -->
                                                                                     <StackPanel Visibility="{Binding IsRunning, Converter={StaticResource BoolToVis}}">
 
-                                                                                        <!-- Scanning phase (no Progress panel yet) -->
+                                                                                        <!-- Scanning phase (no Progress panel yet). FallbackValue guards
+                                                                                             against the inverted binding resolving truthy against a null
+                                                                                             DataContext during list virtualization, which would leak the
+                                                                                             scan text into the burn phase as a stray blank/duplicate line. -->
                                                                                         <TextBlock Text="{Binding RunningStatusText}"
                                                                                                    FontSize="11"
                                                                                                    Foreground="{StaticResource TextSecondaryBrush}"
                                                                                                    Margin="0,2,0,0"
                                                                                                    Visibility="{Binding HasProgress,
                                                                                                                 Converter={StaticResource BoolToVis},
-                                                                                                                ConverterParameter=Invert}" />
+                                                                                                                ConverterParameter=Invert,
+                                                                                                                FallbackValue=Collapsed}" />
 
-                                                                                        <!-- Burn/copy phase (Progress panel available) -->
-                                                                                        <StackPanel Visibility="{Binding HasProgress, Converter={StaticResource BoolToVis}}"
-                                                                                                    DataContext="{Binding Progress}">
-                                                                                            <!-- Status text -->
+                                                                                        <!-- Burn/copy phase (Progress panel available).
+                                                                                             The Visibility MUST stay on an element whose DataContext is
+                                                                                             still the ROW VM. Putting Visibility and
+                                                                                             DataContext="{Binding Progress}" on the SAME element makes the
+                                                                                             Visibility binding resolve against Progress (or null during the
+                                                                                             scan): HasProgress can't be found, so Visibility silently
+                                                                                             defaults to Visible and this whole burn panel bleeds into the
+                                                                                             scan phase — empty bar, blank stats, phantom failed list, extra
+                                                                                             vertical space. So bind HasProgress on the OUTER element (row
+                                                                                             context) and only switch DataContext to Progress on the INNER. -->
+                                                                                        <StackPanel Visibility="{Binding HasProgress, Converter={StaticResource BoolToVis}}">
+                                                                                          <StackPanel DataContext="{Binding Progress}">
+                                                                                            <!-- Status text (collapsed when empty so it reserves no blank line) -->
                                                                                             <TextBlock Text="{Binding StatusText}"
                                                                                                        FontSize="11"
                                                                                                        Foreground="{StaticResource TextSecondaryBrush}"
-                                                                                                       Margin="0,2,0,0" />
+                                                                                                       Margin="0,2,0,0"
+                                                                                                       Visibility="{Binding StatusText, Converter={StaticResource NonEmptyVis}}" />
 
                                                                                             <!-- Live progress (hidden once burn/copy finishes) -->
                                                                                             <StackPanel Visibility="{Binding IsBurning, Converter={StaticResource BoolToVis}}">
-                                                                                                <!-- Disc progress (disc burns only) -->
+                                                                                                <!-- Disc progress (multi-disc optical burns only) -->
                                                                                                 <DockPanel Margin="0,3,0,0" HorizontalAlignment="Left" Width="300"
-                                                                                                           Visibility="{Binding IsDirectoryMode, Converter={StaticResource BoolToVis}, ConverterParameter=Invert}">
+                                                                                                           Visibility="{Binding ShowDiscProgress, Converter={StaticResource BoolToVis}, FallbackValue=Collapsed}">
                                                                                                     <TextBlock DockPanel.Dock="Left"
                                                                                                                VerticalAlignment="Center" Margin="0,0,8,0"
                                                                                                                Foreground="{StaticResource TextSecondaryBrush}" FontSize="10">
@@ -270,7 +290,7 @@
                                                                                                 </DockPanel>
 
                                                                                                 <!-- Overall progress bar -->
-                                                                                                <Grid Margin="0,3,0,0" HorizontalAlignment="Left" Width="300">
+                                                                                                <Grid HorizontalAlignment="Left" Width="300">
                                                                                                     <ProgressBar Minimum="0" Maximum="100"
                                                                                                                  Value="{Binding OverallPercentage, Mode=OneWay}"
                                                                                                                  Height="14"
@@ -284,14 +304,16 @@
                                                                                                         </TextBlock.Text>
                                                                                                     </TextBlock>
                                                                                                 </Grid>
-                                                                                                <!-- Current file + stats -->
+                                                                                                <!-- Current file (collapsed when idle, e.g. during the scan) -->
                                                                                                 <TextBlock Foreground="{StaticResource TextDimBrush}"
-                                                                                                           FontSize="10" Margin="0,2,0,0"
-                                                                                                           TextTrimming="CharacterEllipsis">
-                                                                                                    <Run Text="{Binding CurrentFile, Mode=OneWay}" />
-                                                                                                </TextBlock>
+                                                                                                           FontSize="10" Margin="0,3,0,0"
+                                                                                                           TextTrimming="CharacterEllipsis"
+                                                                                                           Text="{Binding CurrentFile, Mode=OneWay}"
+                                                                                                           Visibility="{Binding CurrentFile, Converter={StaticResource NonEmptyVis}}" />
+                                                                                                <!-- Byte/time stats (collapsed until real copy figures arrive) -->
                                                                                                 <TextBlock Foreground="{StaticResource TextDimBrush}"
-                                                                                                           FontSize="10" Margin="0,1,0,0">
+                                                                                                           FontSize="10" Margin="0,3,0,0"
+                                                                                                           Visibility="{Binding BytesWrittenText, Converter={StaticResource NonEmptyVis}}">
                                                                                                     <Run Text="{Binding BytesWrittenText, Mode=OneWay}" />
                                                                                                     <Run Text="  ·  " />
                                                                                                     <Run Text="{Binding ElapsedText, Mode=OneWay}" />
@@ -348,8 +370,8 @@
                                                                                             <Border Visibility="{Binding HasFailedFiles, Converter={StaticResource BoolToVis}}"
                                                                                                     BorderBrush="{StaticResource BorderBrush}"
                                                                                                     BorderThickness="1" CornerRadius="4"
-                                                                                                    HorizontalAlignment="Left" Width="300"
-                                                                                                    Margin="0,6,0,0" MaxHeight="120">
+                                                                                                    HorizontalAlignment="Stretch"
+                                                                                                    Margin="0,3,0,0" MaxHeight="220">
                                                                                                 <DockPanel>
                                                                                                     <DockPanel DockPanel.Dock="Top" Margin="8,4,8,2">
                                                                                                         <TextBlock FontWeight="SemiBold" FontSize="11"
@@ -361,7 +383,10 @@
                                                                                                             <Button Content="Copy" Command="{Binding CopyFailedFilesCommand}"
                                                                                                                     Padding="6,2" Margin="0,0,4,0" Cursor="Hand" FontSize="10" />
                                                                                                             <Button Content="Export..." Command="{Binding ExportFailedFilesCommand}"
-                                                                                                                    Padding="6,2" Cursor="Hand" FontSize="10" />
+                                                                                                                    Padding="6,2" Margin="0,0,4,0" Cursor="Hand" FontSize="10" />
+                                                                                                            <Button Content="Dismiss" Command="{Binding DismissFailedFilesCommand}"
+                                                                                                                    Padding="6,2" Cursor="Hand" FontSize="10"
+                                                                                                                    ToolTip="Hide this failed/skipped list" />
                                                                                                         </StackPanel>
                                                                                                     </DockPanel>
                                                                                                     <ScrollViewer VerticalScrollBarVisibility="Auto"
@@ -388,6 +413,7 @@
                                                                                                     </ScrollViewer>
                                                                                                 </DockPanel>
                                                                                             </Border>
+                                                                                          </StackPanel>
                                                                                         </StackPanel>
                                                                                     </StackPanel>
                                                                                 </StackPanel>

@@ -25,6 +25,7 @@ public sealed class BackupWorker : BackgroundService
     private readonly ICatalogRepository _catalog;
     private readonly DirectoryBackupService _directoryBackup;
     private readonly IDestinationResolver _destinationResolver;
+    private readonly ISourceResolver _sourceResolver;
 
     /// <summary>How often we reload backup sets, check schedules, and read journals.</summary>
     private static readonly TimeSpan PollInterval = TimeSpan.FromSeconds(30);
@@ -53,12 +54,14 @@ public sealed class BackupWorker : BackgroundService
         ILogger<BackupWorker> logger,
         ICatalogRepository catalog,
         DirectoryBackupService directoryBackup,
-        IDestinationResolver destinationResolver)
+        IDestinationResolver destinationResolver,
+        ISourceResolver sourceResolver)
     {
         _logger = logger;
         _catalog = catalog;
         _directoryBackup = directoryBackup;
         _destinationResolver = destinationResolver;
+        _sourceResolver = sourceResolver;
     }
 
     /// <summary>
@@ -91,6 +94,45 @@ public sealed class BackupWorker : BackgroundService
         }
 
         return resolution.LivePath;
+    }
+
+    /// <summary>
+    /// Follow the set's source drives across any drive-letter reassignment
+    /// (rewriting source paths and persisting the change), and report source
+    /// availability.  Returns <c>false</c> when no configured source location is
+    /// currently reachable (the caller should skip the run rather than back up
+    /// nothing).  Partially-missing sources are logged and the run proceeds.
+    /// </summary>
+    private async Task<bool> ResolveSourcesAsync(BackupSet set, CancellationToken ct)
+    {
+        var resolution = _sourceResolver.Resolve(set);
+
+        if (resolution.MetadataChanged)
+            await _catalog.UpdateBackupSetAsync(set, ct);
+
+        if (resolution.LetterChanges.Count > 0)
+        {
+            _logger.LogInformation(
+                "Source drive(s) for \"{Name}\" moved: {Changes}. Updated automatically.",
+                set.Name, string.Join(", ", resolution.LetterChanges));
+        }
+
+        if (!resolution.AnyAvailable)
+        {
+            _logger.LogWarning(
+                "Skipping backup for \"{Name}\": no source location is currently available ({Missing}).",
+                set.Name, string.Join(", ", resolution.MissingSources));
+            return false;
+        }
+
+        if (resolution.MissingSources.Count > 0)
+        {
+            _logger.LogWarning(
+                "Some source locations for \"{Name}\" are not available and will be skipped: {Missing}.",
+                set.Name, string.Join(", ", resolution.MissingSources));
+        }
+
+        return true;
     }
 
     // ------------------------------------------------------------------
@@ -269,11 +311,16 @@ public sealed class BackupWorker : BackgroundService
             .Distinct()
             .ToList();
 
+        var truncatedDrives = new HashSet<char>();
+
         foreach (var drive in driveLetters)
         {
             ct.ThrowIfCancellationRequested();
 
-            var changes = await ReadVolumeChangesAsync(drive, ct);
+            var (changes, moves, truncated) = await ReadVolumeChangesAsync(drive, ct);
+            if (truncated)
+                truncatedDrives.Add(drive);
+
             foreach (var change in changes)
             {
                 if (change.IsDirectory)
@@ -290,13 +337,88 @@ public sealed class BackupWorker : BackgroundService
                     }
                 }
             }
+
+            // Route same-volume relocations to every set either endpoint touches.
+            // The apply step (RunMovesAsync) decides, with catalog access, whether
+            // to relocate (both endpoints in the set), delete (item left the set),
+            // or back up fresh (item entered the set). Preserve journal order.
+            foreach (var move in moves)
+            {
+                foreach (var state in continuousSets)
+                {
+                    bool oldIn = PathBelongsToSet(state.BackupSet, move.OldPath);
+                    bool newIn = PathBelongsToSet(state.BackupSet, move.NewPath);
+                    if (oldIn || newIn)
+                        state.PendingMoves.Add(move);
+                }
+            }
         }
 
-        // 2. Per-file debounce: back up files that have been quiet for the
+        // 2. If a watched volume's journal lost continuity (it wrapped or was
+        //    recreated while the service was down), the incremental USN stream
+        //    skipped everything that changed in the gap — those records are gone
+        //    from the journal and can't be read here. Flag each affected set for
+        //    a full reconciling scan so nothing is silently missed.
+        if (truncatedDrives.Count > 0)
+        {
+            foreach (var state in continuousSets)
+            {
+                if (state.NeedsReconcile)
+                    continue;
+
+                bool affected = state.WatchRoots
+                    .Select(GetDriveLetter)
+                    .Any(truncatedDrives.Contains);
+
+                if (affected)
+                {
+                    state.NeedsReconcile = true;
+                    _logger.LogWarning(
+                        "USN journal continuity lost on a source volume for \"{Name}\" " +
+                        "(journal wrapped or was recreated during downtime). Running a full " +
+                        "reconciling backup to capture changes missed while the service was off.",
+                        state.BackupSet.Name);
+                }
+            }
+        }
+
+        // 3. Reconcile flagged sets with a full scan. A full scan supersedes any
+        //    queued per-file deltas for that set. The flag is cleared only once
+        //    the scan actually runs, so it retries on later polls if a backup is
+        //    already in progress or the destination is offline.
+        foreach (var state in continuousSets)
+        {
+            if (!state.NeedsReconcile)
+                continue;
+
+            if (await RunFullBackupAsync(state, ct))
+            {
+                state.NeedsReconcile = false;
+                state.Pending.Clear();
+                // A full scan reconciles the destination against the live source
+                // tree, so any queued relocations are already accounted for.
+                state.PendingMoves.Clear();
+            }
+        }
+
+        // 3b. Apply pending relocations. Moves are discrete, atomic events (no
+        //     debounce): relocate the destination copy in place rather than
+        //     re-copying. Applied before the per-file debounce so a moved-and-
+        //     edited file relocates first, then its content update copies to the
+        //     new path.
+        foreach (var state in continuousSets)
+        {
+            if (state.NeedsReconcile || state.PendingMoves.Count == 0)
+                continue;
+
+            await RunMovesAsync(state, ct);
+        }
+
+        // 4. Per-file debounce: back up files that have been quiet for the
         //    debounce window, or that have been pending past the max-wait cap.
         foreach (var state in continuousSets)
         {
-            if (state.Pending.Count == 0)
+            if (state.NeedsReconcile || state.Pending.Count == 0)
                 continue;
 
             var schedule = state.BackupSet.JobOptions!.Schedule!;
@@ -323,7 +445,8 @@ public sealed class BackupWorker : BackgroundService
     /// and persisting the cursor. Opens (and, if necessary, creates) the
     /// journal on first use; returns empty when the volume has no usable journal.
     /// </summary>
-    private async Task<IReadOnlyList<UsnChange>> ReadVolumeChangesAsync(char drive, CancellationToken ct)
+    private async Task<(IReadOnlyList<UsnChange> Changes, IReadOnlyList<UsnMove> Moves, bool Truncated)> ReadVolumeChangesAsync(
+        char drive, CancellationToken ct)
     {
         if (!_journalReaders.TryGetValue(drive, out var reader))
         {
@@ -338,27 +461,40 @@ public sealed class BackupWorker : BackgroundService
         }
 
         if (reader is null)
-            return [];
+            return ([], [], false);
 
         var volumeId = reader.VolumeId;
         var cursor = await _catalog.GetUsnCursorAsync(volumeId, ct);
 
-        // First run for this volume, or the journal was re-created: start from
-        // the current end so we don't replay the entire journal as "changes".
-        // Initial file state is captured by the scheduled/manual full backup.
-        if (cursor is null || cursor.Value.JournalId != reader.JournalId)
+        // First time we've tracked this volume: seed the cursor to the current
+        // end and watch forward. The set's initial full backup captures the
+        // baseline, so there is no prior gap to reconcile here.
+        if (cursor is null)
         {
             await _catalog.SaveUsnCursorAsync(
                 new UsnCursor(volumeId, reader.JournalId, reader.CurrentNextUsn, DateTime.UtcNow), ct);
-            return [];
+            return ([], [], false);
+        }
+
+        // The journal was deleted and recreated since we last read it (e.g. a
+        // very long outage, or `fsutil usn deletejournal`). Our saved position is
+        // meaningless against the new journal and the intervening changes are gone
+        // from it — re-seed to the current end and reconcile with a full scan.
+        if (cursor.Value.JournalId != reader.JournalId)
+        {
+            await _catalog.SaveUsnCursorAsync(
+                new UsnCursor(volumeId, reader.JournalId, reader.CurrentNextUsn, DateTime.UtcNow), ct);
+            return ([], [], true);
         }
 
         long startUsn = cursor.Value.NextUsn;
         IReadOnlyList<UsnChange> changes;
+        IReadOnlyList<UsnMove> moves;
         long nextUsn;
+        bool truncated;
         try
         {
-            changes = reader.ReadChanges(startUsn, out nextUsn, ct);
+            changes = reader.ReadChanges(startUsn, out nextUsn, out truncated, out moves, ct);
         }
         catch (OperationCanceledException) when (ct.IsCancellationRequested)
         {
@@ -369,7 +505,22 @@ public sealed class BackupWorker : BackgroundService
             _logger.LogWarning(ex, "Failed reading USN journal on {Drive}: — will reopen next poll.", drive);
             reader.Dispose();
             _journalReaders.Remove(drive);
-            return [];
+            return ([], [], false);
+        }
+
+        if (truncated)
+        {
+            // Our saved cursor points before the journal's retained window: the
+            // records that changed while we were down have been purged (the
+            // journal wrapped). Re-seed the cursor to the journal's current end so
+            // live detection resumes instead of failing forever, and tell the
+            // caller to reconcile the missed gap with a full scan.
+            long resumeUsn = reader.TryRefreshPosition(out _, out long liveNext)
+                ? liveNext
+                : reader.CurrentNextUsn;
+            await _catalog.SaveUsnCursorAsync(
+                new UsnCursor(volumeId, reader.JournalId, resumeUsn, DateTime.UtcNow), ct);
+            return ([], [], true);
         }
 
         if (nextUsn != startUsn)
@@ -378,7 +529,7 @@ public sealed class BackupWorker : BackgroundService
                 new UsnCursor(volumeId, reader.JournalId, nextUsn, DateTime.UtcNow), ct);
         }
 
-        return changes;
+        return (changes, moves, false);
     }
 
     /// <summary>
@@ -485,14 +636,134 @@ public sealed class BackupWorker : BackgroundService
         }
     }
 
-    /// <summary>Run a full scan-and-backup (scheduled interval/daily runs).</summary>
-    private async Task RunFullBackupAsync(SetState state, CancellationToken ct)
+    /// <summary>
+    /// Apply this set's queued same-volume relocations: rename the destination
+    /// copy in place instead of re-copying. Requeues (leaves the moves pending)
+    /// if another backup holds the lock or the destination is offline. Items that
+    /// cannot be cleanly relocated (special storage formats, version history, or
+    /// items that entered the set) fall back to a normal backup of the new path.
+    /// </summary>
+    private async Task RunMovesAsync(SetState state, CancellationToken ct)
+    {
+        if (!await _backupLock.WaitAsync(0, ct))
+            return; // another backup in progress — moves stay queued for next poll
+
+        try
+        {
+            var set = state.BackupSet;
+            var opts = set.JobOptions!;
+            var targetDir = await ResolveDestinationAsync(set, opts, ct);
+            if (targetDir is null)
+                return; // destination not connected — moves stay queued
+
+            var job = BuildJob(set, opts, targetDir);
+
+            // Snapshot and clear now that we hold the lock and a live destination;
+            // anything we can't relocate is re-enqueued for the copy path below.
+            var moves = state.PendingMoves.ToList();
+            state.PendingMoves.Clear();
+
+            var now = DateTime.UtcNow;
+            int relocated = 0, recopied = 0;
+
+            foreach (var move in moves)
+            {
+                ct.ThrowIfCancellationRequested();
+
+                bool oldIn = PathBelongsToSet(set, move.OldPath);
+                bool newIn = PathBelongsToSet(set, move.NewPath);
+
+                if (oldIn && newIn)
+                {
+                    var outcome = await _directoryBackup.MoveTargetedAsync(
+                        job, targetDir, move.OldPath, move.NewPath, move.IsDirectory, ct);
+
+                    if (outcome == TargetedMoveOutcome.Relocated)
+                    {
+                        relocated++;
+                    }
+                    else
+                    {
+                        // Couldn't relocate cleanly — back up the new side as fresh
+                        // files. The stale old-path copy is pruned by the next full
+                        // scan, matching how continuous deletes are reconciled.
+                        recopied++;
+                        EnqueueForBackup(state, move.NewPath, move.IsDirectory, now);
+                    }
+                }
+                else if (newIn)
+                {
+                    // Entered the set from outside — back up the new side as fresh.
+                    EnqueueForBackup(state, move.NewPath, move.IsDirectory, now);
+                }
+                // else oldIn-only: the item left the set. Its removal is reconciled
+                // by the next full scan, consistent with continuous delete handling.
+            }
+
+            if (relocated > 0 || recopied > 0)
+            {
+                state.LastRunUtc = DateTime.UtcNow;
+                _logger.LogInformation(
+                    "Continuous backup for \"{Name}\": relocated {Relocated} moved item(s); " +
+                    "{Recopied} could not be relocated and will be re-copied.",
+                    set.Name, relocated, recopied);
+            }
+        }
+        catch (OperationCanceledException) when (ct.IsCancellationRequested)
+        {
+            _logger.LogInformation("Continuous relocation for \"{Name}\" cancelled.", state.BackupSet.Name);
+        }
+        catch (Exception ex)
+        {
+            _logger.LogError(ex, "Continuous relocation failed for \"{Name}\".", state.BackupSet.Name);
+        }
+        finally
+        {
+            _backupLock.Release();
+        }
+    }
+
+    /// <summary>
+    /// Queue a path for a normal continuous backup. For a directory, enqueues
+    /// every file beneath it; for a file, enqueues the file itself.
+    /// </summary>
+    private static void EnqueueForBackup(SetState state, string path, bool isDirectory, DateTime now)
+    {
+        if (isDirectory)
+        {
+            IEnumerable<string> files;
+            try
+            {
+                files = Directory.EnumerateFiles(path, "*", SearchOption.AllDirectories);
+            }
+            catch (Exception ex) when (ex is IOException or UnauthorizedAccessException or DirectoryNotFoundException)
+            {
+                return;
+            }
+
+            foreach (var f in files)
+                state.Pending[f] = state.Pending.TryGetValue(f, out var t) ? (t.First, now) : (now, now);
+        }
+        else
+        {
+            state.Pending[path] = state.Pending.TryGetValue(path, out var t) ? (t.First, now) : (now, now);
+        }
+    }
+
+    /// <summary>
+    /// Run a full scan-and-backup (scheduled interval/daily runs, and continuous
+    /// reconciliation after a journal gap). Returns <c>true</c> when the scan
+    /// actually ran to completion, or <c>false</c> when it was skipped because a
+    /// backup was already in progress or the destination was not connected (so a
+    /// caller that needs the run to happen can retry later).
+    /// </summary>
+    private async Task<bool> RunFullBackupAsync(SetState state, CancellationToken ct)
     {
         if (!await _backupLock.WaitAsync(0, ct))
         {
             _logger.LogInformation(
                 "Skipping backup for \"{Name}\" — another backup is in progress.", state.BackupSet.Name);
-            return;
+            return false;
         }
 
         try
@@ -501,7 +772,10 @@ public sealed class BackupWorker : BackgroundService
             var opts = set.JobOptions!;
             var targetDir = await ResolveDestinationAsync(set, opts, ct);
             if (targetDir is null)
-                return; // Destination not connected; retry on the next scheduled run.
+                return false; // Destination not connected; retry on a later run.
+
+            if (!await ResolveSourcesAsync(set, ct))
+                return false; // No source available; retry on a later run.
 
             _logger.LogInformation("Starting backup for \"{Name}\" → {Target}", set.Name, targetDir);
 
@@ -513,7 +787,7 @@ public sealed class BackupWorker : BackgroundService
             {
                 _logger.LogInformation("Nothing to back up for \"{Name}\".", set.Name);
                 state.LastRunUtc = DateTime.UtcNow;
-                return;
+                return true;
             }
 
             _logger.LogInformation(
@@ -545,14 +819,18 @@ public sealed class BackupWorker : BackgroundService
                 foreach (var f in result.FailedFiles.Take(10))
                     _logger.LogWarning("  Failed: {Path} — {Error}", f.Path, f.Error);
             }
+
+            return true;
         }
         catch (OperationCanceledException) when (ct.IsCancellationRequested)
         {
             _logger.LogInformation("Backup for \"{Name}\" cancelled.", state.BackupSet.Name);
+            return false;
         }
         catch (Exception ex)
         {
             _logger.LogError(ex, "Backup failed for \"{Name}\".", state.BackupSet.Name);
+            return false;
         }
         finally
         {
@@ -615,5 +893,23 @@ public sealed class BackupWorker : BackgroundService
         /// </summary>
         public Dictionary<string, (DateTime First, DateTime Last)> Pending { get; } =
             new(StringComparer.OrdinalIgnoreCase);
+
+        /// <summary>
+        /// Pending same-volume relocations (renames/moves) detected from the USN
+        /// journal, in journal order. Each entry relocates the destination copy
+        /// instead of re-copying the source. Applied (and cleared) once the
+        /// destination is reachable and no other backup holds the lock; requeued
+        /// otherwise. Order matters — a later change may depend on an earlier
+        /// relocation's new path.
+        /// </summary>
+        public List<UsnMove> PendingMoves { get; } = new();
+
+        /// <summary>
+        /// True when a watched source volume's USN journal lost continuity (it
+        /// wrapped or was recreated during downtime), so this set needs a full
+        /// reconciling scan to catch changes the incremental journal stream
+        /// missed. Cleared once that scan runs.
+        /// </summary>
+        public bool NeedsReconcile { get; set; }
     }
 }

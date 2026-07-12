@@ -45,6 +45,16 @@ public partial class App : Application
         // even a failure during startup is recorded. Writes full stack traces +
         // environment context to C:\ProgramData\LithicBackup\logs.
         CrashLogger.Initialize("gui");
+
+        // Best-effort: register Windows Error Reporting local dumps so native
+        // crashes (access violations, corrupted-state faults, COM/interop
+        // crashes) that the managed handlers below can't catch still leave a
+        // .dmp under C:\ProgramData\LithicBackup\logs\dumps. Writing the keys
+        // needs admin, so this typically no-ops for the unelevated GUI and is
+        // instead performed by the LocalSystem service; it's attempted here too
+        // in case the GUI is ever run elevated.
+        NativeCrashDumps.TryEnableLocalDumps();
+
         DispatcherUnhandledException += (_, args) =>
         {
             CrashLogger.LogFatal(args.Exception, "Dispatcher.UnhandledException");
@@ -147,6 +157,7 @@ public partial class App : Application
         // their destination drive across Windows drive-letter reassignments.
         IVolumeResolver volumeResolver = new Win32VolumeResolver();
         IDestinationResolver destinationResolver = new DestinationResolver(volumeResolver);
+        ISourceResolver sourceResolver = new SourceResolver(volumeResolver);
 
         // --test-mode: enable the testing features (simulated burner + the
         // non-functional directory stub mode). The features are not engaged just
@@ -209,7 +220,7 @@ public partial class App : Application
         var mainViewModel = new MainViewModel(
             _catalog, burner, scanner, orchestrator, restoreService, catalogFreeRestoreService,
             directoryBackupService, _trayService,
-            fileHashCache, destinationResolver, _settings);
+            fileHashCache, destinationResolver, _settings, sourceResolver);
         var mainWindow = new MainWindow { DataContext = mainViewModel };
 
         // --- System tray icon ---
@@ -239,6 +250,12 @@ public partial class App : Application
         MainWindow = mainWindow;
         mainWindow.Show();
         splash.Close();
+
+        // Closing the splash doesn't reliably transfer foreground activation to
+        // the newly shown main window, so it can come up behind other windows.
+        // Force it to the front with the same activation dance (Activate + brief
+        // Topmost toggle) the tray "Open" path uses.
+        ShowMainWindow();
 
         // Start background monitoring if there are existing backup sets.
         _ = StartBackgroundMonitoringAsync();

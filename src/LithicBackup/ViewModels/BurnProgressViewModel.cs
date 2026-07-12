@@ -60,8 +60,22 @@ public class BurnProgressViewModel : ViewModelBase
     public int TotalDiscs
     {
         get => _totalDiscs;
-        set => SetProperty(ref _totalDiscs, value);
+        set
+        {
+            if (SetProperty(ref _totalDiscs, value))
+                OnPropertyChanged(nameof(ShowDiscProgress));
+        }
     }
+
+    /// <summary>
+    /// Whether to show the separate per-disc progress bar. This is only
+    /// meaningful for an optical burn that actually spans more than one disc:
+    /// for a single-disc burn the per-disc bar just duplicates the overall bar,
+    /// and for a directory backup it has no meaning at all. Gating on
+    /// <see cref="TotalDiscs"/> &gt; 1 (which defaults to 0) also prevents the
+    /// bar from flashing on at initiation before real disc counts arrive.
+    /// </summary>
+    public bool ShowDiscProgress => IsBurning && !IsDirectoryMode && TotalDiscs > 1;
 
     public string CurrentFile
     {
@@ -108,7 +122,11 @@ public class BurnProgressViewModel : ViewModelBase
     public bool IsBurning
     {
         get => _isBurning;
-        set => SetProperty(ref _isBurning, value);
+        set
+        {
+            if (SetProperty(ref _isBurning, value))
+                OnPropertyChanged(nameof(ShowDiscProgress));
+        }
     }
 
     public bool IsComplete
@@ -133,7 +151,11 @@ public class BurnProgressViewModel : ViewModelBase
     public bool IsDirectoryMode
     {
         get => _isDirectoryMode;
-        set => SetProperty(ref _isDirectoryMode, value);
+        set
+        {
+            if (SetProperty(ref _isDirectoryMode, value))
+                OnPropertyChanged(nameof(ShowDiscProgress));
+        }
     }
 
     /// <summary>Progress percentage for the current file (0-100).</summary>
@@ -173,6 +195,8 @@ public class BurnProgressViewModel : ViewModelBase
         _ => CopyFailedFilesToClipboard(), _ => HasFailedFiles);
     public ICommand ExportFailedFilesCommand => new RelayCommand(
         _ => ExportFailedFilesToFile(), _ => HasFailedFiles);
+    public ICommand DismissFailedFilesCommand => new RelayCommand(
+        _ => DismissFailedFiles(), _ => HasFailedFiles);
 
     private void Cancel()
     {
@@ -356,6 +380,13 @@ public class BurnProgressViewModel : ViewModelBase
     private void CopyFailedFilesToClipboard()
     {
         Clipboard.SetText(FormatFailedFilesList());
+    }
+
+    /// <summary>Clear the failed/skipped list so its widget disappears.</summary>
+    private void DismissFailedFiles()
+    {
+        FailedFiles.Clear();
+        OnPropertyChanged(nameof(HasFailedFiles));
     }
 
     private void ExportFailedFilesToFile()

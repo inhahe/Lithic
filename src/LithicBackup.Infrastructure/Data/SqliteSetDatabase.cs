@@ -388,7 +388,7 @@ internal sealed class SqliteSetDatabase : IDisposable
         return list;
     }
 
-    public async Task<IReadOnlyList<FileRecord>> GetAllFilesForBackupSetAsync(int backupSetId, CancellationToken ct = default)
+    public async Task<IReadOnlyList<FileRecord>> GetAllFilesForBackupSetAsync(int backupSetId, CancellationToken ct = default, IProgress<int>? rowProgress = null)
     {
         ct.ThrowIfCancellationRequested();
         using var _ = await LockAsync(ct).ConfigureAwait(false);
@@ -405,7 +405,15 @@ internal sealed class SqliteSetDatabase : IDisposable
         var list = new List<FileRecord>();
         using var r = cmd.ExecuteReader();
         while (r.Read())
+        {
             list.Add(ReadFile(r));
+            // Reporting every few thousand rows keeps a large-set load (which can
+            // read hundreds of thousands of rows over many seconds) from looking
+            // like a hang, without paying callback overhead per row.
+            if (rowProgress is not null && list.Count % 5000 == 0)
+                rowProgress.Report(list.Count);
+        }
+        rowProgress?.Report(list.Count);
         return list;
     }
 
@@ -490,6 +498,65 @@ internal sealed class SqliteSetDatabase : IDisposable
 
         using var r = cmd.ExecuteReader();
         return r.Read() ? ReadFile(r) : null;
+    }
+
+    public async Task<IReadOnlyList<FileRecord>> GetFileRecordsByPathAsync(int backupSetId, string sourcePath, CancellationToken ct = default)
+    {
+        ct.ThrowIfCancellationRequested();
+        using var _ = await LockAsync(ct).ConfigureAwait(false);
+
+        using var cmd = _connection.CreateCommand();
+        cmd.CommandText = """
+            SELECT f.* FROM Files f
+            INNER JOIN Discs d ON f.DiscId = d.Id
+            WHERE d.BackupSetId = $setId
+              AND f.SourcePath = $path
+            ORDER BY f.Version
+            """;
+        cmd.Parameters.AddWithValue("$setId", backupSetId);
+        cmd.Parameters.AddWithValue("$path", sourcePath);
+
+        var list = new List<FileRecord>();
+        using var r = cmd.ExecuteReader();
+        while (r.Read())
+            list.Add(ReadFile(r));
+        return list;
+    }
+
+    public async Task<IReadOnlyList<FileRecord>> GetFileRecordsUnderDirectoryAsync(int backupSetId, string directoryPrefix, CancellationToken ct = default)
+    {
+        ct.ThrowIfCancellationRequested();
+        using var _ = await LockAsync(ct).ConfigureAwait(false);
+
+        var prefix = directoryPrefix.TrimEnd('\\') + "\\";
+        // Escape the escape character (backslash) FIRST — Windows source paths
+        // are full of separators, and under ESCAPE '\' every un-doubled '\'
+        // would swallow the following character, so an un-escaped prefix like
+        // "D:\some\dir\%" matches NOTHING.  Order matters: doubling backslashes
+        // after adding the "\[", "\%", "\_" escapes would corrupt those.
+        var escaped = prefix
+            .Replace("\\", "\\\\")
+            .Replace("[", "\\[")
+            .Replace("%", "\\%")
+            .Replace("_", "\\_");
+
+        using var cmd = _connection.CreateCommand();
+        cmd.CommandText = """
+            SELECT f.* FROM Files f
+            INNER JOIN Discs d ON f.DiscId = d.Id
+            WHERE d.BackupSetId = $setId
+              AND (f.SourcePath LIKE $prefix ESCAPE '\' OR f.SourcePath = $exact)
+            ORDER BY f.SourcePath, f.Version
+            """;
+        cmd.Parameters.AddWithValue("$setId", backupSetId);
+        cmd.Parameters.AddWithValue("$prefix", escaped + "%");
+        cmd.Parameters.AddWithValue("$exact", directoryPrefix);
+
+        var list = new List<FileRecord>();
+        using var r = cmd.ExecuteReader();
+        while (r.Read())
+            list.Add(ReadFile(r));
+        return list;
     }
 
     public async Task<HashSet<string>> GetActivePlainHashesAsync(int backupSetId, CancellationToken ct = default)
@@ -611,7 +678,16 @@ internal sealed class SqliteSetDatabase : IDisposable
               AND (SourcePath LIKE $prefix ESCAPE '\' OR SourcePath = $exact)
             """;
         cmd.Parameters.AddWithValue("$setId", backupSetId);
-        var escaped = prefix.Replace("[", "\\[").Replace("%", "\\%").Replace("_", "\\_");
+        // Escape the escape character (backslash) FIRST — Windows source paths
+        // are full of separators, and under ESCAPE '\' every un-doubled '\'
+        // would swallow the following character, so an un-escaped prefix like
+        // "D:\some\dir\%" matches NOTHING.  Order matters: doubling backslashes
+        // after adding the "\[", "\%", "\_" escapes would corrupt those.
+        var escaped = prefix
+            .Replace("\\", "\\\\")
+            .Replace("[", "\\[")
+            .Replace("%", "\\%")
+            .Replace("_", "\\_");
         cmd.Parameters.AddWithValue("$prefix", escaped + "%");
         cmd.Parameters.AddWithValue("$exact", directoryPrefix);
         return cmd.ExecuteNonQuery();
@@ -642,6 +718,66 @@ internal sealed class SqliteSetDatabase : IDisposable
         }
         return totalRows;
     }
+
+    public async Task<int> CountFilesUnderSourcePrefixAsync(
+        int backupSetId, string sourcePrefix, CancellationToken ct = default)
+    {
+        ct.ThrowIfCancellationRequested();
+        using var _ = await LockAsync(ct).ConfigureAwait(false);
+
+        var prefix = sourcePrefix.TrimEnd('\\') + "\\";
+
+        using var cmd = _connection.CreateCommand();
+        cmd.CommandText = """
+            SELECT COUNT(*) FROM Files
+            WHERE DiscId IN (SELECT Id FROM Discs WHERE BackupSetId = $setId)
+              AND SourcePath LIKE $prefix ESCAPE '\'
+            """;
+        cmd.Parameters.AddWithValue("$setId", backupSetId);
+        cmd.Parameters.AddWithValue("$prefix", EscapeLikePrefix(prefix) + "%");
+        return Convert.ToInt32(cmd.ExecuteScalar());
+    }
+
+    public async Task<int> RemapSourcePathPrefixAsync(
+        int backupSetId, string oldPrefix, string newPrefix, CancellationToken ct = default)
+    {
+        ct.ThrowIfCancellationRequested();
+        using var _ = await LockAsync(ct).ConfigureAwait(false);
+
+        // Normalise both prefixes to a trailing separator so we replace whole
+        // path segments only (a bare "E:" won't accidentally match "E:foo").
+        var oldP = oldPrefix.TrimEnd('\\') + "\\";
+        var newP = newPrefix.TrimEnd('\\') + "\\";
+
+        using var cmd = _connection.CreateCommand();
+        // Replace only the leading prefix: keep the tail after it verbatim.
+        // SUBSTR is 1-based, so start at oldP.Length + 1.
+        cmd.CommandText = """
+            UPDATE Files
+            SET SourcePath = $new || SUBSTR(SourcePath, $prefixLen + 1)
+            WHERE DiscId IN (SELECT Id FROM Discs WHERE BackupSetId = $setId)
+              AND SourcePath LIKE $prefix ESCAPE '\'
+            """;
+        cmd.Parameters.AddWithValue("$setId", backupSetId);
+        cmd.Parameters.AddWithValue("$new", newP);
+        cmd.Parameters.AddWithValue("$prefixLen", oldP.Length);
+        cmd.Parameters.AddWithValue("$prefix", EscapeLikePrefix(oldP) + "%");
+        return cmd.ExecuteNonQuery();
+    }
+
+    /// <summary>
+    /// Escape a literal path prefix for use in a <c>LIKE ... ESCAPE '\'</c>
+    /// pattern.  The escape character (backslash) must be doubled FIRST — Windows
+    /// paths are full of separators and under <c>ESCAPE '\'</c> every un-doubled
+    /// backslash would swallow the next character.  Then the LIKE wildcards
+    /// (<c>[</c>, <c>%</c>, <c>_</c>) are escaped.  Order matters: doubling
+    /// backslashes after adding those escapes would corrupt them.
+    /// </summary>
+    private static string EscapeLikePrefix(string prefix) => prefix
+        .Replace("\\", "\\\\")
+        .Replace("[", "\\[")
+        .Replace("%", "\\%")
+        .Replace("_", "\\_");
 
     private static FileRecord ReadFile(SqliteDataReader r) => new()
     {
