@@ -56,8 +56,12 @@ public interface ICatalogRepository : IDisposable
     /// Caution: for large backup sets this can load hundreds of thousands of
     /// FileRecord objects into memory. Prefer <see cref="GetLatestVersionInfoAsync"/>
     /// when only version/format metadata is needed.
+    /// <paramref name="rowProgress"/>, if supplied, is reported periodically with
+    /// the running count of records read so a caller can show live progress on a
+    /// large set (the read itself is synchronous and can take many seconds).
     /// </summary>
-    Task<IReadOnlyList<FileRecord>> GetAllFilesForBackupSetAsync(int backupSetId, CancellationToken ct = default);
+    Task<IReadOnlyList<FileRecord>> GetAllFilesForBackupSetAsync(
+        int backupSetId, CancellationToken ct = default, IProgress<int>? rowProgress = null);
 
     /// <summary>
     /// Get lightweight version info for the latest version of each file in a

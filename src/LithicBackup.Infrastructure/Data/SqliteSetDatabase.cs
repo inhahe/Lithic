@@ -388,7 +388,7 @@ internal sealed class SqliteSetDatabase : IDisposable
         return list;
     }
 
-    public async Task<IReadOnlyList<FileRecord>> GetAllFilesForBackupSetAsync(int backupSetId, CancellationToken ct = default)
+    public async Task<IReadOnlyList<FileRecord>> GetAllFilesForBackupSetAsync(int backupSetId, CancellationToken ct = default, IProgress<int>? rowProgress = null)
     {
         ct.ThrowIfCancellationRequested();
         using var _ = await LockAsync(ct).ConfigureAwait(false);
@@ -405,7 +405,15 @@ internal sealed class SqliteSetDatabase : IDisposable
         var list = new List<FileRecord>();
         using var r = cmd.ExecuteReader();
         while (r.Read())
+        {
             list.Add(ReadFile(r));
+            // Reporting every few thousand rows keeps a large-set load (which can
+            // read hundreds of thousands of rows over many seconds) from looking
+            // like a hang, without paying callback overhead per row.
+            if (rowProgress is not null && list.Count % 5000 == 0)
+                rowProgress.Report(list.Count);
+        }
+        rowProgress?.Report(list.Count);
         return list;
     }
 

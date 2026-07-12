@@ -400,8 +400,8 @@ public class SqliteCatalogRepository : ICatalogRepository
         return await GetSet(setId.Value).GetFilesOnDiscAsync(discId, ct).ConfigureAwait(false);
     }
 
-    public Task<IReadOnlyList<FileRecord>> GetAllFilesForBackupSetAsync(int backupSetId, CancellationToken ct = default)
-        => GetSet(backupSetId).GetAllFilesForBackupSetAsync(backupSetId, ct);
+    public Task<IReadOnlyList<FileRecord>> GetAllFilesForBackupSetAsync(int backupSetId, CancellationToken ct = default, IProgress<int>? rowProgress = null)
+        => GetSet(backupSetId).GetAllFilesForBackupSetAsync(backupSetId, ct, rowProgress);
 
     public Task<Dictionary<string, FileVersionInfo>> GetLatestVersionInfoAsync(int backupSetId, CancellationToken ct = default)
         => GetSet(backupSetId).GetLatestVersionInfoAsync(backupSetId, ct);

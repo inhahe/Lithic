@@ -300,40 +300,45 @@ public class OrphanedDirectoriesViewModel : ViewModelBase
         IsLoading = true;
         SummaryText = "Loading catalogue...";
 
+        // A DispatcherTimer polls a thread-safe progress counter at the shared
+        // ProgressUpdateIntervalMs cadence so the user gets live feedback without
+        // cross-thread marshaling per file/row. Started BEFORE the catalog read
+        // so the (multi-second, synchronous) load also shows a running count.
+        var progress = new ClassifyProgress();
+        var timer = new DispatcherTimer
+        {
+            Interval = TimeSpan.FromMilliseconds(ProgressUpdateIntervalMs),
+        };
+        timer.Tick += (_, _) => SummaryText = FormatProgress(progress.Snapshot());
+        timer.Start();
+
         try
         {
-            // Loading the catalog itself is async I/O — do it on the calling
-            // thread which yields naturally.
-            var files = await _catalog.GetAllFilesForBackupSetAsync(_backupSet.Id);
-            _activeFiles = files.Where(f => !f.IsDeleted).ToList();
-            // Move all classification + tree construction off the UI thread.
-            // For large backup sets (hundreds of thousands of files) building
-            // VM trees on the UI thread freezes the app for many seconds.
-            // Trees can be safely constructed off-thread; only the final
-            // Categories.Add / Items.Add calls must marshal back to the UI.
-            //
-            // A DispatcherTimer polls the worker's progress counter at the
-            // shared ProgressUpdateIntervalMs cadence so the user gets live
-            // "(X of Y)" feedback without paying for cross-thread marshaling
-            // per file.
-            var progress = new ClassifyProgress();
-            var timer = new DispatcherTimer
-            {
-                Interval = TimeSpan.FromMilliseconds(ProgressUpdateIntervalMs),
-            };
-            timer.Tick += (_, _) =>
-            {
-                var snap = progress.Snapshot();
-                SummaryText = FormatProgress(snap);
-            };
-            timer.Start();
-
+            // Do the whole load + classify off the UI thread. The catalog read is
+            // a SYNCHRONOUS SQLite scan (ExecuteReader + row loop); for a large set
+            // it blocks its thread for many seconds, so running it on the awaiting
+            // UI thread would freeze the window. Task.Run keeps the UI responsive,
+            // rowProgress drives a live record count during the read, and the
+            // classification + tree construction (also heavy for hundreds of
+            // thousands of files) continues off-thread. Only the final
+            // Categories.Add / Items.Add marshal back to the UI.
             (List<OrphanedDirectoryItem> AllItems,
              List<OrphanedCategoryViewModel> Categories) classified;
             try
             {
                 classified = await Task.Run(() =>
-                    ClassifyAndBuild(progress));
+                {
+                    progress.SetPhase("Loading catalog from database", 0);
+                    var rowProgress = new SyncProgress<int>(progress.SetDone);
+                    var files = _catalog
+                        .GetAllFilesForBackupSetAsync(_backupSet.Id, CancellationToken.None, rowProgress)
+                        .GetAwaiter().GetResult();
+
+                    progress.SetPhase("Filtering active records", 0);
+                    _activeFiles = files.Where(f => !f.IsDeleted).ToList();
+
+                    return ClassifyAndBuild(progress);
+                });
             }
             finally
             {
@@ -2243,9 +2248,25 @@ public class OrphanedDirectoriesViewModel : ViewModelBase
         if (string.IsNullOrEmpty(snap.Phase))
             return "Classifying...";
         if (snap.Total <= 0)
-            return $"{snap.Phase}...";
+            // Unknown total (e.g. the DB read): show the running count once we
+            // have one so the phase still visibly ticks rather than sitting on
+            // a static "...".
+            return snap.Done > 0 ? $"{snap.Phase} ({snap.Done:N0})..." : $"{snap.Phase}...";
         int done = Math.Min(snap.Done, snap.Total);
         return $"{snap.Phase} ({done:N0} of {snap.Total:N0})...";
+    }
+
+    /// <summary>
+    /// Minimal synchronous <see cref="IProgress{T}"/> that invokes its callback
+    /// on the reporting thread, unlike <see cref="Progress{T}"/> which marshals
+    /// through a captured <see cref="SynchronizationContext"/> (and, with none,
+    /// hops through the thread pool — reordering monotonic counts). The catalog
+    /// read already runs on a background thread and only bumps a thread-safe
+    /// counter, so a direct, in-order call is both cheaper and correct.
+    /// </summary>
+    private sealed class SyncProgress<T>(Action<T> handler) : IProgress<T>
+    {
+        public void Report(T value) => handler(value);
     }
 
     private static List<string> ParsePatterns(string input)
