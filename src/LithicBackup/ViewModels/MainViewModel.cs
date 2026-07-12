@@ -3499,28 +3499,24 @@ public class MainViewModel : ViewModelBase
     // Flow 4: Cleanup (orphaned catalog records + optional destination scan)
     // -------------------------------------------------------------------
 
-    private async void StartOrphanedDirsFlow()
+    private void StartOrphanedDirsFlow()
     {
         if (SelectedBackupSet is null)
             return;
 
-        // Catalog load + classification can take several seconds on large
-        // backup sets.  Show a wait cursor for the entire load so the user
-        // gets immediate feedback that the click landed; the view itself is
-        // displayed right away so the in-progress phase counters are visible.
-        Mouse.OverrideCursor = Cursors.Wait;
-        try
-        {
-            var vm = new OrphanedDirectoriesViewModel(_catalog, SelectedBackupSet);
-            vm.DoneRequested += GoHome;
-            CurrentView = vm;
-            StatusText = "Review files and directories that can be cleaned up.";
-            await vm.WaitForLoadAsync();
-        }
-        finally
-        {
-            Mouse.OverrideCursor = null;
-        }
+        // The catalog load + classification can take several seconds on large
+        // backup sets, but it runs on a background thread inside the view model
+        // (see OrphanedDirectoriesViewModel.LoadAsync).  The view is switched in
+        // synchronously below and surfaces its own live progress via SummaryText
+        // ("Loading catalogue...", then a running record count), so the app stays
+        // fully responsive throughout.  We deliberately do NOT set a global wait
+        // cursor here: it would falsely signal "busy/unresponsive", and because
+        // the load outlives this method it would also linger as a busy pointer if
+        // the user navigated away before the load finished.
+        var vm = new OrphanedDirectoriesViewModel(_catalog, SelectedBackupSet);
+        vm.DoneRequested += GoHome;
+        CurrentView = vm;
+        StatusText = "Review files and directories that can be cleaned up.";
     }
 
     // -------------------------------------------------------------------
