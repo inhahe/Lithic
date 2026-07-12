@@ -90,18 +90,26 @@
                       Account="LocalSystem"
                       Vital="no" />
 
-      <!-- Start on install (don't fail the install if start is slow). -->
+      <!--
+        Stop the running Worker on BOTH install and uninstall, and wait for it
+        to fully stop.  The "install" half is what matters for upgrades/reinstalls:
+        the elevated installer stops the service itself (via SCM) before touching
+        files, so its exe is never locked.  Without this the Restart Manager sees
+        the worker holding its own .exe, can't gracefully close a service, and
+        falls back to the "unable to automatically close all requested
+        applications" dialog.  Remove happens only on uninstall.
+      -->
+      <ServiceControl Id="WorkerServiceStopRemove"
+                      Name="Lithic Backup"
+                      Stop="both"
+                      Remove="uninstall"
+                      Wait="yes" />
+
+      <!-- Start (or restart) on install, after the stop above has completed. -->
       <ServiceControl Id="WorkerServiceStart"
                       Name="Lithic Backup"
                       Start="install"
                       Wait="no" />
-
-      <!-- Stop and remove on uninstall (wait so files aren't locked). -->
-      <ServiceControl Id="WorkerServiceStopRemove"
-                      Name="Lithic Backup"
-                      Stop="uninstall"
-                      Remove="uninstall"
-                      Wait="yes" />
     </Component>
 
     <!-- Start Menu shortcut for the GUI. -->
