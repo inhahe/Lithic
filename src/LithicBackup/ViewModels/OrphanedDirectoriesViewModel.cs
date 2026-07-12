@@ -2104,6 +2104,22 @@ public enum OrphanedReason
     ExcessVersion,
 
     /// <summary>
+    /// Stray FileRecord pointing at a CURRENT disc location whose SourcePath
+    /// is shared by at least one other non-deleted record at the same kind
+    /// of location.  Almost always the result of running "Seed from
+    /// existing backup" more than once on the same destination before the
+    /// seed became idempotent — there's only one physical file on disk, so
+    /// the extra catalog rows are dead weight.  Cleaning these does NOT
+    /// touch the physical file.
+    ///
+    /// Purely catalog-derived (like the categories above): detected during the
+    /// initial catalog analysis, not the optional destination scan.  Ordered
+    /// here so its card groups with the other catalog-scan categories rather
+    /// than the destination-scan ones below.
+    /// </summary>
+    CatalogDuplicate,
+
+    /// <summary>
     /// File found in the backup destination directory that is not tracked by
     /// the catalog at all (e.g. leftover from a previous backup tool, or a
     /// file the catalog forgot about).  Discovered by the optional
@@ -2117,17 +2133,6 @@ public enum OrphanedReason
     /// optional "Scan destination filesystem" pass.
     /// </summary>
     CatalogDeleted,
-
-    /// <summary>
-    /// Stray FileRecord pointing at a CURRENT disc location whose SourcePath
-    /// is shared by at least one other non-deleted record at the same kind
-    /// of location.  Almost always the result of running "Seed from
-    /// existing backup" more than once on the same destination before the
-    /// seed became idempotent — there's only one physical file on disk, so
-    /// the extra catalog rows are dead weight.  Cleaning these does NOT
-    /// touch the physical file.
-    /// </summary>
-    CatalogDuplicate,
 }
 
 /// <summary>Column used to sort the cleanup-view tree(s).</summary>
