@@ -25,6 +25,7 @@ public sealed class BackupWorker : BackgroundService
     private readonly ICatalogRepository _catalog;
     private readonly DirectoryBackupService _directoryBackup;
     private readonly IDestinationResolver _destinationResolver;
+    private readonly ISourceResolver _sourceResolver;
 
     /// <summary>How often we reload backup sets, check schedules, and read journals.</summary>
     private static readonly TimeSpan PollInterval = TimeSpan.FromSeconds(30);
@@ -53,12 +54,14 @@ public sealed class BackupWorker : BackgroundService
         ILogger<BackupWorker> logger,
         ICatalogRepository catalog,
         DirectoryBackupService directoryBackup,
-        IDestinationResolver destinationResolver)
+        IDestinationResolver destinationResolver,
+        ISourceResolver sourceResolver)
     {
         _logger = logger;
         _catalog = catalog;
         _directoryBackup = directoryBackup;
         _destinationResolver = destinationResolver;
+        _sourceResolver = sourceResolver;
     }
 
     /// <summary>
@@ -91,6 +94,45 @@ public sealed class BackupWorker : BackgroundService
         }
 
         return resolution.LivePath;
+    }
+
+    /// <summary>
+    /// Follow the set's source drives across any drive-letter reassignment
+    /// (rewriting source paths and persisting the change), and report source
+    /// availability.  Returns <c>false</c> when no configured source location is
+    /// currently reachable (the caller should skip the run rather than back up
+    /// nothing).  Partially-missing sources are logged and the run proceeds.
+    /// </summary>
+    private async Task<bool> ResolveSourcesAsync(BackupSet set, CancellationToken ct)
+    {
+        var resolution = _sourceResolver.Resolve(set);
+
+        if (resolution.MetadataChanged)
+            await _catalog.UpdateBackupSetAsync(set, ct);
+
+        if (resolution.LetterChanges.Count > 0)
+        {
+            _logger.LogInformation(
+                "Source drive(s) for \"{Name}\" moved: {Changes}. Updated automatically.",
+                set.Name, string.Join(", ", resolution.LetterChanges));
+        }
+
+        if (!resolution.AnyAvailable)
+        {
+            _logger.LogWarning(
+                "Skipping backup for \"{Name}\": no source location is currently available ({Missing}).",
+                set.Name, string.Join(", ", resolution.MissingSources));
+            return false;
+        }
+
+        if (resolution.MissingSources.Count > 0)
+        {
+            _logger.LogWarning(
+                "Some source locations for \"{Name}\" are not available and will be skipped: {Missing}.",
+                set.Name, string.Join(", ", resolution.MissingSources));
+        }
+
+        return true;
     }
 
     // ------------------------------------------------------------------
@@ -731,6 +773,9 @@ public sealed class BackupWorker : BackgroundService
             var targetDir = await ResolveDestinationAsync(set, opts, ct);
             if (targetDir is null)
                 return false; // Destination not connected; retry on a later run.
+
+            if (!await ResolveSourcesAsync(set, ct))
+                return false; // No source available; retry on a later run.
 
             _logger.LogInformation("Starting backup for \"{Name}\" → {Target}", set.Name, targetDir);
 

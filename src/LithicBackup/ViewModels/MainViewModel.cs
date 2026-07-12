@@ -25,6 +25,7 @@ public class MainViewModel : ViewModelBase
     private readonly SimulatedDiscBurner? _simulatedBurner;
     private readonly FileHashCache? _fileHashCache;
     private readonly IDestinationResolver? _destinationResolver;
+    private readonly ISourceResolver? _sourceResolver;
     private readonly UserSettings _settings;
 
     private string _statusText = "Ready";
@@ -49,7 +50,8 @@ public class MainViewModel : ViewModelBase
         Services.TrayService? trayService = null,
         FileHashCache? fileHashCache = null,
         IDestinationResolver? destinationResolver = null,
-        UserSettings? settings = null)
+        UserSettings? settings = null,
+        ISourceResolver? sourceResolver = null)
     {
         _settings = settings ?? new UserSettings();
         _catalog = catalog;
@@ -62,6 +64,7 @@ public class MainViewModel : ViewModelBase
         _trayService = trayService;
         _fileHashCache = fileHashCache;
         _destinationResolver = destinationResolver;
+        _sourceResolver = sourceResolver;
         _switchableBurner = burner as SwitchableDiscBurner;
         _simulatedBurner = _switchableBurner?.Simulated;
 
@@ -1736,7 +1739,50 @@ public class MainViewModel : ViewModelBase
             return;
 
         var backupSet = row.Model;
-        var opts = backupSet.JobOptions ?? new JobOptions();
+        backupSet.JobOptions ??= new JobOptions();
+        var opts = backupSet.JobOptions;
+
+        // Follow the set's source drives across any Windows drive-letter
+        // reassignment (rewriting source paths in place), and warn about — or,
+        // if nothing is reachable, abort on — source locations that aren't
+        // currently connected, instead of silently backing up nothing.
+        if (_sourceResolver is not null)
+        {
+            var sr = _sourceResolver.Resolve(backupSet);
+
+            if (sr.MetadataChanged)
+                await _catalog.UpdateBackupSetAsync(backupSet);
+
+            if (!sr.AnyAvailable)
+            {
+                MessageBox.Show(
+                    $"None of the source locations for \"{backupSet.Name}\" are currently available:\n\n"
+                    + string.Join("\n", sr.MissingSources)
+                    + "\n\nThe backup was not started. Reconnect the source drive(s) and try again.",
+                    "Sources unavailable", MessageBoxButton.OK, MessageBoxImage.Warning);
+                StatusText = $"Sources for \"{backupSet.Name}\" are not available.";
+                return;
+            }
+
+            if (sr.MissingSources.Count > 0)
+            {
+                var choice = MessageBox.Show(
+                    $"Some source locations for \"{backupSet.Name}\" are not currently available "
+                    + "and will be skipped:\n\n"
+                    + string.Join("\n", sr.MissingSources)
+                    + "\n\nContinue backing up the available sources?",
+                    "Some sources unavailable",
+                    MessageBoxButton.YesNo, MessageBoxImage.Warning);
+                if (choice != MessageBoxResult.Yes)
+                {
+                    StatusText = $"Backup of \"{backupSet.Name}\" cancelled \u2014 sources unavailable.";
+                    return;
+                }
+            }
+
+            if (sr.LetterChanges.Count > 0)
+                StatusText = $"Source drive(s) moved: {string.Join(", ", sr.LetterChanges)}. Updated automatically.";
+        }
 
         // Prefer the full saved selection tree; fall back to root-only reconstruction.
         List<SourceSelection> sources;

@@ -41,6 +41,7 @@ var builder = Host.CreateDefaultBuilder(args)
         services.AddSingleton<IFileScanner, FileScanner>();
         services.AddSingleton<IVolumeResolver, Win32VolumeResolver>();
         services.AddSingleton<IDestinationResolver, DestinationResolver>();
+        services.AddSingleton<ISourceResolver, SourceResolver>();
         services.AddSingleton<IDeduplicationEngine, BlockDeduplicationEngine>();
         services.AddSingleton<VersionRetentionService>();
         services.AddSingleton<DirectoryBackupService>();

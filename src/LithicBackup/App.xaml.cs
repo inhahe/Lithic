@@ -157,6 +157,7 @@ public partial class App : Application
         // their destination drive across Windows drive-letter reassignments.
         IVolumeResolver volumeResolver = new Win32VolumeResolver();
         IDestinationResolver destinationResolver = new DestinationResolver(volumeResolver);
+        ISourceResolver sourceResolver = new SourceResolver(volumeResolver);
 
         // --test-mode: enable the testing features (simulated burner + the
         // non-functional directory stub mode). The features are not engaged just
@@ -219,7 +220,7 @@ public partial class App : Application
         var mainViewModel = new MainViewModel(
             _catalog, burner, scanner, orchestrator, restoreService, catalogFreeRestoreService,
             directoryBackupService, _trayService,
-            fileHashCache, destinationResolver, _settings);
+            fileHashCache, destinationResolver, _settings, sourceResolver);
         var mainWindow = new MainWindow { DataContext = mainViewModel };
 
         // --- System tray icon ---
