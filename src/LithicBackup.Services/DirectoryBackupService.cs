@@ -1203,11 +1203,16 @@ public class DirectoryBackupService
                 {
                     ct.ThrowIfCancellationRequested();
 
-                    // Physically delete the .v{N} file (with .dedup/.fileref/no suffix)
-                    // from the _prev directory.
-                    string prevPath = GetPrevPath(
-                        targetDirectory, fileRecord.SourcePath,
-                        fileRecord.Version, fileRecord.IsDeduped, fileRecord.IsFileRef);
+                    // Physically delete the .v{N} file (with .dedup/.fileref/no
+                    // suffix) from the _prev directory.  Locate it via the
+                    // record's stored DiscPath — the authoritative on-disk
+                    // location — rather than reconstructing the path from
+                    // (SourcePath, Version, flags).  A reconstruction can diverge
+                    // from the real DiscPath for legacy/migrated rows, which would
+                    // point File.Delete at the wrong path: the bytes survive while
+                    // we still flip IsDeleted below, producing the
+                    // "catalog-deleted (still on disk)" inconsistency.
+                    string prevPath = Path.Combine(targetDirectory, fileRecord.DiscPath);
 
                     // Last-plain-copy guard. A plain _prev file holds the real
                     // bytes for its content hash, and file-level dedup .fileref
@@ -1266,14 +1271,28 @@ public class DirectoryBackupService
                         }
                     }
 
-                    if (File.Exists(prevPath))
+                    // Remove the physical file, then flip the catalog bit ONLY
+                    // once the bytes are confirmed gone.  If the delete fails
+                    // (file locked, ACL, transient IO), leave the record intact so
+                    // the catalog never claims a deletion that didn't happen — a
+                    // later retention pass retries.  This is the invariant that
+                    // prevents "catalog-deleted (still on disk)" records.
+                    try
                     {
-                        File.Delete(prevPath);
+                        if (File.Exists(prevPath))
+                            File.Delete(prevPath);
+                    }
+                    catch (Exception ex) when (ex is IOException or UnauthorizedAccessException)
+                    {
+                        continue; // leave file + record consistent; retry next run
                     }
 
-                    // Mark as deleted in catalog.
-                    fileRecord.IsDeleted = true;
-                    await _catalog.UpdateFileRecordAsync(fileRecord, ct);
+                    // Mark as deleted in catalog only if the file is really gone.
+                    if (!File.Exists(prevPath))
+                    {
+                        fileRecord.IsDeleted = true;
+                        await _catalog.UpdateFileRecordAsync(fileRecord, ct);
+                    }
                 }
             }
             catch

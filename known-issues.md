@@ -1,5 +1,63 @@
 # LithicBackup — Known Issues & Tech Debt
 
+## "Catalog-deleted (still on disk)" `_prev .v1` records + retention hardening (2026-07-11)
+
+**Status:** Code hardened 2026-07-11 (retention now confirms physical removal
+before flipping `IsDeleted`). Existing residue in old catalogs remains until a
+cleanup/reconcile pass runs. A separate user-config finding (below) is NOT a bug.
+
+**Symptom (user report):** The Cleanup view listed many "catalog-deleted (still on
+disk)" entries, most of them `*.v1` files under `c_prev` / `d_prev`. The concern:
+(1) Lithic marks files deleted in the catalog without physically deleting them, and
+(2) previous-version files were being deleted despite a "keep versions" intent.
+
+**Forensic findings (reference catalog `%LocalAppData%\LithicBackup\catalog.db`,
+set 4 — note this copy is stale, dated 2026-06-09):**
+- 609,474 `IsDeleted=1` rows total; only **2,792 are under `_prev`** (2,783
+  `D_prev`, 9 `C_prev`), and **every one is Version 1** — a lone prev version per
+  path, timestamps clustered on 2026-05-19.
+- Current retention **cannot** produce a lone-prev-v1 deletion:
+  `VersionRetentionService.ComputeRetentionAsync` only considers `_prev`-path
+  versions, protects `newestId`, and trims only when a tier's prev-version count
+  exceeds `MaxVersions`. With a single prev version, nothing is ever selected.
+- Therefore these 2,792 are **residue from the May 19 re-seed bloat event** (old
+  code, before the seed idempotency guard — see the catalog-bloat entry below),
+  not from current retention.
+
+**Root-cause bug that was hardened (the "thinks it deleted but didn't" invariant):**
+`DirectoryBackupService.ExecuteAsync` retention section previously (a) reconstructed
+the version file path via `GetPrevPath(SourcePath, Version, flags)` instead of using
+the record's authoritative stored `DiscPath`, and (b) set `fileRecord.IsDeleted =
+true` **unconditionally** after a `File.Exists`-guarded delete. If the reconstructed
+path diverged from the real `DiscPath` (legacy/migrated rows) or the delete threw,
+the bytes survived while the record was still marked deleted → exactly the
+"catalog-deleted (still on disk)" state. **Fix:** locate the file via
+`Path.Combine(targetDirectory, fileRecord.DiscPath)`, wrap the delete in a
+try/catch that `continue`s (leaving record + file consistent) on IO/ACL failure,
+and flip `IsDeleted` only when `!File.Exists(prevPath)` confirms the bytes are gone.
+Also added a warning doc-comment to the dead `VersionRetentionService.ApplyRetentionAsync`
+(no callers) noting it marks `IsDeleted` without any physical delete and must not be
+wired into the backup path as-is.
+
+**NOT a bug — user tier-config finding (worth surfacing to the user):** Set 4's
+`JobOptions.TierSets` were: **Default = `{MaxAge:null, MaxVersions:1}` (keep only 1
+version, all ages)**; "None" = no versioning for build/output dirs; "Custom 1" =
+`{<10d: all, <365d: 10, older: 3}` matched to code/doc extensions + `d:\visual
+studio projects\*`. So the "keep for a long time" policy applies **only** to Custom
+1's files; everything else (e.g. `D:\mp3\...`, most of `C:\`) falls through to
+Default and keeps just 1 version. The user believed their policy kept all prev
+versions for 365 days — it does not. (Even Custom 1 keeps 10 versions in the
+10–365d band, not "all".) If the intent is to keep more history broadly, the
+**Default tier set** must be changed.
+
+**Residue cleanup (existing catalogs):** the hardened code prevents recurrence but
+does not retroactively repair the 2,792 rows. On the live J: destination most of
+those physical `.v1` files are already gone (the records are then correctly
+deleted). Where a `.v1` file genuinely still exists and the user wants to keep it,
+the record should be un-deleted (`IsDeleted=0`) rather than physically purged — do
+NOT run the Cleanup "catalog-deleted (still on disk)" purge on prev versions the
+user intends to retain, as that physically removes them.
+
 ## Catalog bloat: duplicate `Files` rows from repeated seed/import runs
 
 **Status:** Data residue in existing catalogs. Root cause in old code; current code

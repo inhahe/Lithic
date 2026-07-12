@@ -147,6 +147,19 @@ public class VersionRetentionService : IVersionRetentionService
     /// <summary>
     /// Apply retention and mark the identified files as deleted in the catalog.
     /// </summary>
+    /// <remarks>
+    /// WARNING: this only flips the catalog <c>IsDeleted</c> bit — it does NOT
+    /// physically remove the version file from the destination.  Wiring this into
+    /// the backup path as-is would recreate the "catalog-deleted (still on disk)"
+    /// inconsistency (records marked deleted while their bytes linger).  It has no
+    /// callers today; the live backup path uses
+    /// <see cref="ComputeRetentionAsync(int, Func{string, IReadOnlyList{VersionRetentionTier}}, CancellationToken)"/>
+    /// and performs the physical delete itself (see
+    /// <c>DirectoryBackupService.ExecuteAsync</c>, retention section), flipping
+    /// <c>IsDeleted</c> only after the file is confirmed gone.  If this method is
+    /// ever revived, it must delete the physical file first and mark the record
+    /// deleted only on confirmed removal.
+    /// </remarks>
     public async Task ApplyRetentionAsync(
         int backupSetId,
         IReadOnlyList<VersionRetentionTier> tiers,
