@@ -360,6 +360,9 @@ public sealed class BackupWorker : BackgroundService
 
         var truncatedDrives = new HashSet<char>();
 
+        // [rename-trace] Running totals for the once-per-poll summary below.
+        int traceTotalChanges = 0, traceTotalMoves = 0;
+
         foreach (var drive in driveLetters)
         {
             ct.ThrowIfCancellationRequested();
@@ -367,6 +370,19 @@ public sealed class BackupWorker : BackgroundService
             var (changes, moves, truncated) = await ReadVolumeChangesAsync(drive, ct);
             if (truncated)
                 truncatedDrives.Add(drive);
+
+            traceTotalChanges += changes.Count;
+            traceTotalMoves += moves.Count;
+
+            // [rename-trace] step 1: what the USN journal actually reported for
+            // this volume. If a directory rename doesn't show up here, detection
+            // (not propagation) is the problem.
+            if (moves.Count > 0)
+                _logger.LogInformation(
+                    "[rename-trace] step 1: USN journal on {Drive}: reported {Count} move(s): {Moves}",
+                    drive, moves.Count,
+                    string.Join(" | ", moves.Select(m =>
+                        $"{(m.IsDirectory ? "DIR" : "file")} '{m.OldPath}' -> '{m.NewPath}'")));
 
             foreach (var change in changes)
             {
@@ -396,10 +412,28 @@ public sealed class BackupWorker : BackgroundService
                     bool oldIn = PathBelongsToSet(state.BackupSet, move.OldPath);
                     bool newIn = PathBelongsToSet(state.BackupSet, move.NewPath);
                     if (oldIn || newIn)
+                    {
                         state.PendingMoves.Add(move);
+                        // [rename-trace] step 2: this move was matched to a set and
+                        // queued for the apply step.
+                        _logger.LogInformation(
+                            "[rename-trace] step 2: queued move '{Old}' -> '{New}' (isDir={IsDir}) " +
+                            "for set \"{Name}\" (oldIn={OldIn}, newIn={NewIn})",
+                            move.OldPath, move.NewPath, move.IsDirectory,
+                            state.BackupSet.Name, oldIn, newIn);
+                    }
                 }
             }
         }
+
+        // [rename-trace] Once-per-poll heartbeat so you can confirm the continuous
+        // loop is actually running (~every 30s) and see whether anything was
+        // detected. If you rename a directory and never see a move counted here,
+        // the change never reached the worker.
+        _logger.LogInformation(
+            "[rename-trace] continuous poll: {Sets} set(s), {Drives} drive(s) read, " +
+            "{Changes} file change(s), {Moves} move(s) detected",
+            continuousSets.Count, driveLetters.Count, traceTotalChanges, traceTotalMoves);
 
         // 1b. Fallback for volumes without a usable USN journal (non-NTFS): drive
         //     them with a FileSystemWatcher instead. A watcher only sees live
@@ -823,7 +857,14 @@ public sealed class BackupWorker : BackgroundService
     private async Task RunMovesAsync(SetState state, CancellationToken ct)
     {
         if (!await _backupLock.WaitAsync(0, ct))
+        {
+            // [rename-trace] step 3: another backup holds the lock — moves wait.
+            _logger.LogInformation(
+                "[rename-trace] step 3: RunMovesAsync for \"{Name}\" skipped — another backup " +
+                "in progress; {Count} move(s) stay queued for next poll.",
+                state.BackupSet.Name, state.PendingMoves.Count);
             return; // another backup in progress — moves stay queued for next poll
+        }
 
         try
         {
@@ -831,7 +872,14 @@ public sealed class BackupWorker : BackgroundService
             var opts = set.JobOptions!;
             var targetDir = await ResolveDestinationAsync(set, opts, ct);
             if (targetDir is null)
+            {
+                // [rename-trace] step 3: destination offline — moves wait.
+                _logger.LogInformation(
+                    "[rename-trace] step 3: RunMovesAsync for \"{Name}\" skipped — destination " +
+                    "not connected; {Count} move(s) stay queued.",
+                    set.Name, state.PendingMoves.Count);
                 return; // destination not connected — moves stay queued
+            }
 
             var job = BuildJob(set, opts, targetDir);
 
@@ -839,6 +887,13 @@ public sealed class BackupWorker : BackgroundService
             // anything we can't relocate is re-enqueued for the copy path below.
             var moves = state.PendingMoves.ToList();
             state.PendingMoves.Clear();
+
+            // [rename-trace] step 3: we hold the lock and have a live destination —
+            // about to apply the queued moves.
+            _logger.LogInformation(
+                "[rename-trace] step 3: RunMovesAsync for \"{Name}\": applying {Count} move(s); " +
+                "destination='{Dest}'.",
+                set.Name, moves.Count, targetDir);
 
             var now = DateTime.UtcNow;
             int relocated = 0, recopied = 0, freshNames = 0;
@@ -852,8 +907,22 @@ public sealed class BackupWorker : BackgroundService
 
                 if (oldIn && newIn)
                 {
+                    // [rename-trace] step 4: both endpoints are in the set — this
+                    // is an in-place relocation. The trace callback surfaces the
+                    // physical destination paths computed inside the service.
+                    _logger.LogInformation(
+                        "[rename-trace] step 4: relocating in place '{Old}' -> '{New}' " +
+                        "(isDir={IsDir}) for \"{Name}\".",
+                        move.OldPath, move.NewPath, move.IsDirectory, set.Name);
+
                     var outcome = await _directoryBackup.MoveTargetedAsync(
-                        job, targetDir, move.OldPath, move.NewPath, move.IsDirectory, ct);
+                        job, targetDir, move.OldPath, move.NewPath, move.IsDirectory, ct,
+                        trace: msg => _logger.LogInformation("[rename-trace] step 5: {Msg}", msg));
+
+                    // [rename-trace] step 6: the service's verdict for this move.
+                    _logger.LogInformation(
+                        "[rename-trace] step 6: '{Old}' -> '{New}' => {Outcome}.",
+                        move.OldPath, move.NewPath, outcome);
 
                     switch (outcome)
                     {
@@ -885,6 +954,10 @@ public sealed class BackupWorker : BackgroundService
                 else if (newIn)
                 {
                     // Entered the set from outside — back up the new side as fresh.
+                    _logger.LogInformation(
+                        "[rename-trace] step 4: '{New}' entered the set (old path not covered) — " +
+                        "backing up as fresh, no in-place relocation.",
+                        move.NewPath);
                     EnqueueForBackup(state, move.NewPath, move.IsDirectory, now);
                 }
                 else
@@ -893,6 +966,10 @@ public sealed class BackupWorker : BackgroundService
                     // identically to a deletion — soft-delete its catalog record(s) so
                     // version history is retained until the user's next cleanup purges
                     // them. The moved item is NOT relocated on the destination.
+                    _logger.LogInformation(
+                        "[rename-trace] step 4: '{Old}' moved OUT of the set (new path not covered) — " +
+                        "marking removed, destination copy left as-is.",
+                        move.OldPath);
                     await MarkMovedOutAsync(set, move.OldPath, move.IsDirectory, ct);
                 }
             }
