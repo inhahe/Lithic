@@ -979,7 +979,11 @@ public class BackupOrchestrator : IBackupOrchestrator
     // ReplaceDiscAsync
     // -------------------------------------------------------------------
 
-    public async Task ReplaceDiscAsync(int badDiscId, string recorderId, CancellationToken ct = default)
+    public Task ReplaceDiscAsync(int badDiscId, string recorderId, CancellationToken ct = default) =>
+        ReplaceDiscAsync(badDiscId, recorderId, progress: null, ct);
+
+    public async Task ReplaceDiscAsync(
+        int badDiscId, string recorderId, IProgress<BackupProgress>? progress, CancellationToken ct = default)
     {
         // 1. Mark the disc as bad.
         await _catalog.MarkDiscAsBadAsync(badDiscId, ct);
@@ -992,19 +996,166 @@ public class BackupOrchestrator : IBackupOrchestrator
         if (filesToReplace.Count == 0)
             return;
 
-        // 3. Stage files from their original source paths.
+        // 3. Stage from live sources + burn a fresh disc (shared with the
+        //    per-file repair path below).
+        var staged = await StageFilesForReburnAsync(
+            filesToReplace, badDisc.BackupSetId, recorderId, badDisc.FilesystemType, progress, ct);
+        if (staged is null)
+            return;
+
+        // 4. Record the new disc + file records. The whole disc was replaced, so
+        //    the new records carry the same version (this is a fresh copy of the
+        //    same content, not a new backup generation).
+        using var tx = await _catalog.BeginTransactionAsync(badDisc.BackupSetId, ct);
+
+        var newDisc = await _catalog.CreateDiscAsync(new DiscRecord
+        {
+            BackupSetId = badDisc.BackupSetId,
+            Label = $"{badDisc.Label}-Replacement",
+            SequenceNumber = badDisc.SequenceNumber,
+            MediaType = (await _burner.GetMediaInfoAsync(recorderId, ct)).MediaType,
+            FilesystemType = badDisc.FilesystemType,
+            Capacity = badDisc.Capacity,
+            BytesUsed = staged.Sum(s => s.StagedSize),
+            IsMultisession = false,
+            Status = BurnSessionStatus.Completed,
+            CreatedUtc = DateTime.UtcNow,
+            LastWrittenUtc = DateTime.UtcNow,
+        }, ct);
+
+        foreach (var (original, stagedPath, _) in staged)
+        {
+            string hash = await ComputeFileHashAsync(original.SourcePath, ct);
+
+            await _catalog.CreateFileRecordAsync(new FileRecord
+            {
+                DiscId = newDisc.Id,
+                SourcePath = original.SourcePath,
+                DiscPath = stagedPath,
+                SizeBytes = original.SizeBytes,
+                Hash = hash,
+                Version = original.Version,
+                SourceLastWriteUtc = original.SourceLastWriteUtc,
+                BackedUpUtc = DateTime.UtcNow,
+            }, ct);
+        }
+
+        tx.Complete();
+        tx.Dispose();
+    }
+
+    // -------------------------------------------------------------------
+    // ReplaceDiscFilesAsync (repair only the files that failed a disc test)
+    // -------------------------------------------------------------------
+
+    public async Task<int> ReplaceDiscFilesAsync(
+        int discId,
+        IReadOnlyCollection<long> fileRecordIds,
+        string recorderId,
+        IProgress<BackupProgress>? progress = null,
+        CancellationToken ct = default)
+    {
+        if (fileRecordIds.Count == 0)
+            return 0;
+
+        var disc = await _catalog.GetDiscAsync(discId, ct)
+            ?? throw new InvalidOperationException($"Disc {discId} not found.");
+
+        var idSet = fileRecordIds.ToHashSet();
+        var filesToReplace = (await _catalog.GetFilesOnDiscAsync(discId, ct))
+            .Where(f => idSet.Contains(f.Id) && !f.IsDeleted)
+            .ToList();
+        if (filesToReplace.Count == 0)
+            return 0;
+
+        // Stage from live sources + burn a fresh supplementary disc.
+        var staged = await StageFilesForReburnAsync(
+            filesToReplace, disc.BackupSetId, recorderId, disc.FilesystemType, progress, ct);
+        if (staged is null)
+            return 0;
+
+        // The repaired files go onto a new disc appended after the last one in
+        // the set; the old disc keeps its still-good files.
+        var discs = await _catalog.GetDiscsForBackupSetAsync(disc.BackupSetId, ct);
+        int nextSeq = (discs.Count == 0 ? 0 : discs.Max(d => d.SequenceNumber)) + 1;
+
+        using var tx = await _catalog.BeginTransactionAsync(disc.BackupSetId, ct);
+
+        var newDisc = await _catalog.CreateDiscAsync(new DiscRecord
+        {
+            BackupSetId = disc.BackupSetId,
+            Label = $"{disc.Label}-Repair",
+            SequenceNumber = nextSeq,
+            MediaType = (await _burner.GetMediaInfoAsync(recorderId, ct)).MediaType,
+            FilesystemType = disc.FilesystemType,
+            Capacity = disc.Capacity,
+            BytesUsed = staged.Sum(s => s.StagedSize),
+            IsMultisession = false,
+            Status = BurnSessionStatus.Completed,
+            CreatedUtc = DateTime.UtcNow,
+            LastWrittenUtc = DateTime.UtcNow,
+        }, ct);
+
+        foreach (var (original, stagedPath, _) in staged)
+        {
+            string hash = await ComputeFileHashAsync(original.SourcePath, ct);
+
+            await _catalog.CreateFileRecordAsync(new FileRecord
+            {
+                DiscId = newDisc.Id,
+                SourcePath = original.SourcePath,
+                DiscPath = stagedPath,
+                SizeBytes = original.SizeBytes,
+                Hash = hash,
+                Version = original.Version + 1,
+                SourceLastWriteUtc = original.SourceLastWriteUtc,
+                BackedUpUtc = DateTime.UtcNow,
+            }, ct);
+
+            // Supersede the failed original so restore resolves to the fresh copy
+            // on the repair disc rather than the corrupt/missing one.
+            original.IsDeleted = true;
+            await _catalog.UpdateFileRecordAsync(original, ct);
+        }
+
+        tx.Complete();
+        tx.Dispose();
+        return staged.Count;
+    }
+
+    /// <summary>
+    /// Stage each of <paramref name="files"/> from its live <see cref="FileRecord.SourcePath"/>
+    /// into a temp folder and burn them to a fresh single-session disc via
+    /// <paramref name="recorderId"/> (with post-burn verification). Files whose
+    /// source no longer exists on disk are skipped. Returns the staged
+    /// (original record, disc-relative path, staged byte size) tuples, or
+    /// <c>null</c> if nothing could be staged. The staging folder is always
+    /// cleaned up; callers compute catalog hashes from the live source, not the
+    /// staged copy, so the folder is safe to delete before records are written.
+    /// </summary>
+    private async Task<List<(FileRecord Original, string StagedPath, long StagedSize)>?>
+        StageFilesForReburnAsync(
+            IReadOnlyList<FileRecord> files,
+            int backupSetId,
+            string recorderId,
+            FilesystemType filesystemType,
+            IProgress<BackupProgress>? progress,
+            CancellationToken ct)
+    {
         string stagingDir = Path.Combine(
-            Path.GetTempPath(), "LithicBackup", $"replace-disc-{badDiscId}");
+            Path.GetTempPath(), "LithicBackup", $"reburn-{backupSetId}-{Guid.NewGuid():N}");
         if (Directory.Exists(stagingDir))
             Directory.Delete(stagingDir, true);
         Directory.CreateDirectory(stagingDir);
 
         try
         {
-            var stagedFiles = new List<(FileRecord Original, string StagedPath)>();
-            foreach (var fileRecord in filesToReplace)
+            var staged = new List<(FileRecord Original, string StagedPath, long StagedSize)>();
+            int idx = 0;
+            foreach (var fileRecord in files)
             {
                 ct.ThrowIfCancellationRequested();
+                idx++;
 
                 if (!File.Exists(fileRecord.SourcePath))
                     continue; // Source file no longer available.
@@ -1016,60 +1167,44 @@ public class BackupOrchestrator : IBackupOrchestrator
                     Directory.CreateDirectory(destDir);
 
                 File.Copy(fileRecord.SourcePath, destPath, overwrite: true);
-                stagedFiles.Add((fileRecord, relativePath));
+                staged.Add((fileRecord, relativePath, new FileInfo(destPath).Length));
+
+                progress?.Report(new BackupProgress
+                {
+                    CurrentDisc = 1,
+                    TotalDiscs = 1,
+                    CurrentFile = $"Staging: {Path.GetFileName(fileRecord.SourcePath)}",
+                    StatusMessage = "Staging files for re-burn...",
+                    OverallPercentage = files.Count > 0 ? (double)idx / files.Count * 50 : 0,
+                });
             }
 
-            if (stagedFiles.Count == 0)
-                return;
+            if (staged.Count == 0)
+                return null;
 
-            // 4. Burn to a new disc.
             var burnOptions = new BurnOptions
             {
-                FilesystemType = badDisc.FilesystemType,
+                FilesystemType = filesystemType,
                 Multisession = false,
                 VerifyAfterBurn = true,
             };
 
-            await _burner.BurnAsync(recorderId, stagingDir, burnOptions, progress: null, ct);
-
-            // 5. Update the catalog: create new disc, new file records.
-            using var tx = await _catalog.BeginTransactionAsync(badDisc.BackupSetId, ct);
-
-            var newDisc = await _catalog.CreateDiscAsync(new DiscRecord
-            {
-                BackupSetId = badDisc.BackupSetId,
-                Label = $"{badDisc.Label}-Replacement",
-                SequenceNumber = badDisc.SequenceNumber,
-                MediaType = (await _burner.GetMediaInfoAsync(recorderId, ct)).MediaType,
-                FilesystemType = burnOptions.FilesystemType,
-                Capacity = badDisc.Capacity,
-                BytesUsed = stagedFiles.Sum(sf =>
-                    new FileInfo(Path.Combine(stagingDir, sf.StagedPath)).Length),
-                IsMultisession = false,
-                Status = BurnSessionStatus.Completed,
-                CreatedUtc = DateTime.UtcNow,
-                LastWrittenUtc = DateTime.UtcNow,
-            }, ct);
-
-            foreach (var (original, stagedPath) in stagedFiles)
-            {
-                string hash = await ComputeFileHashAsync(original.SourcePath, ct);
-
-                await _catalog.CreateFileRecordAsync(new FileRecord
+            var burnProgress = progress is not null
+                ? new Progress<BurnProgress>(bp => progress.Report(new BackupProgress
                 {
-                    DiscId = newDisc.Id,
-                    SourcePath = original.SourcePath,
-                    DiscPath = stagedPath,
-                    SizeBytes = original.SizeBytes,
-                    Hash = hash,
-                    Version = original.Version,
-                    SourceLastWriteUtc = original.SourceLastWriteUtc,
-                    BackedUpUtc = DateTime.UtcNow,
-                }, ct);
-            }
+                    CurrentDisc = 1,
+                    TotalDiscs = 1,
+                    CurrentFile = bp.CurrentFile,
+                    BytesWrittenTotal = bp.BytesWritten,
+                    BytesTotalAll = bp.TotalBytes,
+                    OverallPercentage = 50 + bp.Percentage / 2,
+                    DiscBurnProgress = bp,
+                }))
+                : null;
 
-            tx.Complete();
-            tx.Dispose();
+            await _burner.BurnAsync(recorderId, stagingDir, burnOptions, burnProgress, ct);
+
+            return staged;
         }
         finally
         {

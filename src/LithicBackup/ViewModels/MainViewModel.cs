@@ -160,6 +160,10 @@ public class MainViewModel : ViewModelBase
         SetVerifyIntegrityCommand = new RelayCommand(
             o => { if (o is BackupSetRowViewModel r) { SelectedBackupSet = r.Model; StartVerifyIntegrityFlow(); } },
             o => o is BackupSetRowViewModel r && !r.IsRunning);
+        SetTestDiscCommand = new RelayCommand(
+            o => { if (o is BackupSetRowViewModel r) { SelectedBackupSet = r.Model; StartTestDiscFlow(); } },
+            o => o is BackupSetRowViewModel r && !r.IsRunning
+                 && string.IsNullOrWhiteSpace(r.Model.JobOptions?.TargetDirectory));
         SetLargestFilesCommand = new RelayCommand(
             o => { if (o is BackupSetRowViewModel r) { SelectedBackupSet = r.Model; StartLargestFilesFlow(); } },
             o => o is BackupSetRowViewModel r && !r.IsRunning);
@@ -289,6 +293,7 @@ public class MainViewModel : ViewModelBase
     public ICommand SetOrphanedDirsCommand { get; }
     public ICommand SetCoverageCommand { get; }
     public ICommand SetVerifyIntegrityCommand { get; }
+    public ICommand SetTestDiscCommand { get; }
     public ICommand SetLargestFilesCommand { get; }
     public ICommand SetCopyCommand { get; }
     public ICommand SetChangeDestCommand { get; }
@@ -3399,6 +3404,22 @@ public class MainViewModel : ViewModelBase
 
         CurrentView = vm;
         StatusText = $"Verifying backup integrity for \"{SelectedBackupSet.Name}\".";
+    }
+
+    // -------------------------------------------------------------------
+    // Flow 6c: Test Disc (integrity-test one optical disc + re-burn repairs)
+    // -------------------------------------------------------------------
+
+    private void StartTestDiscFlow()
+    {
+        if (SelectedBackupSet is null) return;
+
+        var vm = new TestDiscViewModel(
+            _catalog, _restoreService, _orchestrator, _burner, SelectedBackupSet);
+        vm.DoneRequested += GoHome;
+
+        CurrentView = vm;
+        StatusText = $"Test a backup disc from \"{SelectedBackupSet.Name}\".";
     }
 
     // -------------------------------------------------------------------

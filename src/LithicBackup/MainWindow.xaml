@@ -72,6 +72,9 @@
                         <DataTemplate DataType="{x:Type vm:VerifyIntegrityViewModel}">
                             <views:VerifyIntegrityView />
                         </DataTemplate>
+                        <DataTemplate DataType="{x:Type vm:TestDiscViewModel}">
+                            <views:TestDiscView />
+                        </DataTemplate>
                         <DataTemplate DataType="{x:Type vm:LargestFilesViewModel}">
                             <views:LargestFilesView />
                         </DataTemplate>
@@ -168,6 +171,9 @@
                                                                                               CommandParameter="{Binding}" />
                                                                                     <MenuItem Header="Verify Integrity"
                                                                                               Command="{Binding PlacementTarget.Tag.SetVerifyIntegrityCommand, RelativeSource={RelativeSource AncestorType=ContextMenu}}"
+                                                                                              CommandParameter="{Binding}" />
+                                                                                    <MenuItem Header="Test Disc..."
+                                                                                              Command="{Binding PlacementTarget.Tag.SetTestDiscCommand, RelativeSource={RelativeSource AncestorType=ContextMenu}}"
                                                                                               CommandParameter="{Binding}" />
                                                                                     <MenuItem Header="Largest Files"
                                                                                               Command="{Binding PlacementTarget.Tag.SetLargestFilesCommand, RelativeSource={RelativeSource AncestorType=ContextMenu}}"

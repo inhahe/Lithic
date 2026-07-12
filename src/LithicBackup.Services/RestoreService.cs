@@ -1,4 +1,5 @@
 using System.IO.Compression;
+using System.Security.Cryptography;
 using System.Text.Json;
 using LithicBackup.Core.Interfaces;
 using LithicBackup.Core.Models;
@@ -216,6 +217,289 @@ public class RestoreService : IRestoreService
             BytesRestored = bytesCompleted,
             Errors = errors,
         };
+    }
+
+    /// <summary>
+    /// Integrity-test one already-burned disc against the catalog. See
+    /// <see cref="IRestoreService.VerifyDiscAsync"/>.
+    /// </summary>
+    public async Task<DiscVerifyResult> VerifyDiscAsync(
+        int discId,
+        string discRoot,
+        bool verifyContents = false,
+        IProgress<RestoreProgress>? progress = null,
+        CancellationToken ct = default)
+    {
+        var disc = await _catalog.GetDiscAsync(discId, ct)
+            ?? throw new InvalidOperationException($"Disc {discId} not found in the catalog.");
+
+        if (string.IsNullOrWhiteSpace(discRoot) || !Directory.Exists(discRoot))
+            throw new DirectoryNotFoundException(
+                $"The disc is not readable at '{discRoot}'. Insert the disc and try again.");
+
+        string blockStore = Path.Combine(discRoot, "_blocks");
+
+        var files = (await _catalog.GetFilesOnDiscAsync(discId, ct))
+            .Where(f => !f.IsDeleted)
+            .ToList();
+
+        int total = files.Count;
+        int checkedCount = 0;
+        long bytesChecked = 0;
+        long totalBytes = files.Sum(f => f.SizeBytes);
+        var issues = new List<DiscFileIssue>();
+
+        foreach (var record in files)
+        {
+            ct.ThrowIfCancellationRequested();
+            checkedCount++;
+            bytesChecked += record.SizeBytes;
+
+            progress?.Report(new RestoreProgress
+            {
+                CurrentFile = record.SourcePath,
+                FilesCompleted = checkedCount,
+                TotalFiles = total,
+                BytesCompleted = bytesChecked,
+                TotalBytes = totalBytes,
+                Percentage = totalBytes > 0 ? (double)bytesChecked / totalBytes * 100 : 0,
+            });
+
+            IReadOnlyList<FileChunk> chunks = record.IsSplit
+                ? await _catalog.GetChunksForFileAsync(discId, record.Id, ct)
+                : [];
+
+            var issue = await CheckDiscFileAsync(
+                disc.BackupSetId, record, chunks, discRoot, blockStore, verifyContents, ct);
+            if (issue is not null)
+                issues.Add(issue);
+        }
+
+        var failedIds = issues
+            .Where(i => i.Kind != DiscFileIssueKind.UnresolvedReference)
+            .Select(i => i.FileRecordId)
+            .Distinct()
+            .ToList();
+
+        return new DiscVerifyResult
+        {
+            FilesChecked = checkedCount,
+            BytesChecked = bytesChecked,
+            ContentsVerified = verifyContents,
+            Cancelled = ct.IsCancellationRequested,
+            Issues = issues,
+            FailedFileRecordIds = failedIds,
+        };
+    }
+
+    /// <summary>
+    /// Check one catalog file record against its stored representation on the
+    /// mounted disc. Returns a <see cref="DiscFileIssue"/> describing the first
+    /// problem found, or <c>null</c> when the file verifies cleanly.
+    /// </summary>
+    private async Task<DiscFileIssue?> CheckDiscFileAsync(
+        int backupSetId,
+        FileRecord record,
+        IReadOnlyList<FileChunk> chunks,
+        string discRoot,
+        string blockStore,
+        bool verifyContents,
+        CancellationToken ct)
+    {
+        DiscFileIssue Issue(DiscFileIssueKind kind, string detail) => new()
+        {
+            FileRecordId = record.Id,
+            SourcePath = record.SourcePath,
+            DiscPath = record.DiscPath,
+            SizeBytes = record.SizeBytes,
+            Kind = kind,
+            Detail = detail,
+        };
+
+        try
+        {
+            // --- Split across chunk files -------------------------------------
+            if (record.IsSplit)
+            {
+                if (chunks.Count == 0)
+                    return Issue(DiscFileIssueKind.Missing, "No chunk records for split file.");
+
+                long chunkTotal = 0;
+                foreach (var chunk in chunks.OrderBy(c => c.Sequence))
+                {
+                    string p = Path.Combine(discRoot, chunk.DiscFilename);
+                    if (!File.Exists(p))
+                        return Issue(DiscFileIssueKind.Missing, $"Missing chunk: {chunk.DiscFilename}");
+                    chunkTotal += new FileInfo(p).Length;
+                }
+                if (chunkTotal != record.SizeBytes)
+                    return Issue(DiscFileIssueKind.SizeMismatch,
+                        $"Chunks total {chunkTotal:N0} B, expected {record.SizeBytes:N0} B.");
+
+                if (verifyContents && !HashEquals(await HashSplitAsync(chunks, discRoot, ct), record.Hash))
+                    return Issue(DiscFileIssueKind.ContentMismatch,
+                        "Reassembled content does not match the catalog hash.");
+                return null;
+            }
+
+            // --- File-level dedup reference (.fileref) ------------------------
+            if (record.IsFileRef)
+            {
+                bool ptrExists = File.Exists(Path.Combine(discRoot, record.DiscPath));
+
+                var candidates = await _catalog.GetActiveRecordsByHashAsync(backupSetId, record.Hash, ct);
+                var plain = candidates.FirstOrDefault(r =>
+                    !r.IsFileRef && !r.IsDeduped
+                    && File.Exists(Path.Combine(discRoot, r.DiscPath)));
+
+                if (plain is null)
+                    return Issue(DiscFileIssueKind.UnresolvedReference,
+                        ptrExists
+                            ? "Backing copy is on another disc; not verified from this disc."
+                            : "Reference pointer missing and backing copy is on another disc.");
+
+                string plainPath = Path.Combine(discRoot, plain.DiscPath);
+                long len = new FileInfo(plainPath).Length;
+                if (len != record.SizeBytes)
+                    return Issue(DiscFileIssueKind.SizeMismatch,
+                        $"Backing copy {len:N0} B, expected {record.SizeBytes:N0} B.");
+
+                if (verifyContents && !HashEquals(await HashFileAsync(plainPath, ct), record.Hash))
+                    return Issue(DiscFileIssueKind.ContentMismatch,
+                        "Backing copy content does not match the catalog hash.");
+                return null;
+            }
+
+            // --- Block-level dedup (.dedup manifest + _blocks) ----------------
+            if (record.IsDeduped)
+            {
+                string manifestPath = Path.Combine(discRoot, record.DiscPath);
+                if (!File.Exists(manifestPath))
+                    return Issue(DiscFileIssueKind.Missing, "Missing dedup manifest.");
+
+                DedupManifest? manifest;
+                try
+                {
+                    manifest = JsonSerializer.Deserialize<DedupManifest>(
+                        await File.ReadAllTextAsync(manifestPath, ct));
+                }
+                catch
+                {
+                    return Issue(DiscFileIssueKind.Unreadable, "Dedup manifest is unreadable.");
+                }
+                if (manifest is null)
+                    return Issue(DiscFileIssueKind.Unreadable, "Dedup manifest is empty/invalid.");
+
+                foreach (string bh in manifest.BlockHashes)
+                {
+                    if (!File.Exists(Path.Combine(blockStore, bh + ".blk")))
+                        return Issue(DiscFileIssueKind.Missing, $"Missing block: {bh}.blk");
+                }
+
+                if (verifyContents && !HashEquals(await HashDedupAsync(manifest, blockStore, ct), record.Hash))
+                    return Issue(DiscFileIssueKind.ContentMismatch,
+                        "Reassembled content does not match the catalog hash.");
+                return null;
+            }
+
+            // --- Zipped -------------------------------------------------------
+            if (record.IsZipped)
+            {
+                string zipPath = Path.Combine(discRoot, record.DiscPath);
+                if (!File.Exists(zipPath))
+                    return Issue(DiscFileIssueKind.Missing, "Missing zip archive.");
+
+                if (verifyContents)
+                {
+                    string h;
+                    try { h = await HashZipEntryAsync(zipPath, ct); }
+                    catch { return Issue(DiscFileIssueKind.Unreadable, "Zip archive could not be read."); }
+                    if (!HashEquals(h, record.Hash))
+                        return Issue(DiscFileIssueKind.ContentMismatch,
+                            "Unzipped content does not match the catalog hash.");
+                }
+                return null;
+            }
+
+            // --- Plain copy ---------------------------------------------------
+            string plainFile = Path.Combine(discRoot, record.DiscPath);
+            if (!File.Exists(plainFile))
+                return Issue(DiscFileIssueKind.Missing, "Missing on disc.");
+
+            long plainLen = new FileInfo(plainFile).Length;
+            if (plainLen != record.SizeBytes)
+                return Issue(DiscFileIssueKind.SizeMismatch,
+                    $"Disc copy {plainLen:N0} B, expected {record.SizeBytes:N0} B.");
+
+            if (verifyContents && !HashEquals(await HashFileAsync(plainFile, ct), record.Hash))
+                return Issue(DiscFileIssueKind.ContentMismatch,
+                    "Disc copy content does not match the catalog hash.");
+            return null;
+        }
+        catch (OperationCanceledException)
+        {
+            throw;
+        }
+        catch (IOException ex)
+        {
+            return Issue(DiscFileIssueKind.Unreadable, ex.Message);
+        }
+        catch (UnauthorizedAccessException ex)
+        {
+            return Issue(DiscFileIssueKind.Unreadable, ex.Message);
+        }
+    }
+
+    private static bool HashEquals(string a, string b) =>
+        string.Equals(a, b, StringComparison.OrdinalIgnoreCase);
+
+    private static async Task<string> HashFileAsync(string path, CancellationToken ct)
+    {
+        await using var s = new FileStream(
+            path, FileMode.Open, FileAccess.Read, FileShare.Read, 1 << 20, useAsync: true);
+        return Convert.ToHexString(await SHA256.HashDataAsync(s, ct)).ToLowerInvariant();
+    }
+
+    private static async Task<string> HashStreamsAsync(
+        IEnumerable<string> filePaths, CancellationToken ct)
+    {
+        using var hash = IncrementalHash.CreateHash(HashAlgorithmName.SHA256);
+        var buffer = new byte[1 << 20];
+        foreach (var path in filePaths)
+        {
+            ct.ThrowIfCancellationRequested();
+            await using var s = new FileStream(
+                path, FileMode.Open, FileAccess.Read, FileShare.Read, buffer.Length, useAsync: true);
+            int read;
+            while ((read = await s.ReadAsync(buffer, ct)) > 0)
+                hash.AppendData(buffer, 0, read);
+        }
+        return Convert.ToHexString(hash.GetHashAndReset()).ToLowerInvariant();
+    }
+
+    private static Task<string> HashSplitAsync(
+        IReadOnlyList<FileChunk> chunks, string discRoot, CancellationToken ct) =>
+        HashStreamsAsync(
+            chunks.OrderBy(c => c.Sequence).Select(c => Path.Combine(discRoot, c.DiscFilename)), ct);
+
+    private static Task<string> HashDedupAsync(
+        DedupManifest manifest, string blockStore, CancellationToken ct) =>
+        HashStreamsAsync(
+            manifest.BlockHashes.Select(bh => Path.Combine(blockStore, bh + ".blk")), ct);
+
+    private static async Task<string> HashZipEntryAsync(string zipPath, CancellationToken ct)
+    {
+        using var archive = ZipFile.OpenRead(zipPath);
+        if (archive.Entries.Count == 0)
+            throw new InvalidOperationException("Zip archive is empty.");
+
+        using var hash = IncrementalHash.CreateHash(HashAlgorithmName.SHA256);
+        var buffer = new byte[1 << 20];
+        await using var s = archive.Entries[0].Open();
+        int read;
+        while ((read = await s.ReadAsync(buffer, ct)) > 0)
+            hash.AppendData(buffer, 0, read);
+        return Convert.ToHexString(hash.GetHashAndReset()).ToLowerInvariant();
     }
 
     /// <summary>

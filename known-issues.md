@@ -423,6 +423,43 @@ it deletes the catalog row + reclaims the anchor, so duplicates don't outlive th
 content. The separate test-artifact directories should also be excluded from the i:
 source set so they stop being backed up at all.
 
+## Test Disc feature: re-burn repairs untested on real optical hardware (2026-07-12)
+
+**Status:** Implemented but only exercised against the simulated burner / directory
+paths. The read-back test (`RestoreService.VerifyDiscAsync`) works over any mounted
+volume, but the two re-burn repairs go through `Imapi2DiscBurner.BurnAsync` and need
+validation with a real burner + media.
+
+**What shipped:** A new per-set right-click action **Test Disc** (optical sets only —
+gated on `JobOptions.TargetDirectory` being null/empty) integrity-tests one burned
+disc against the catalog and, on failure, offers two repairs:
+- `TestDiscViewModel` → `IRestoreService.VerifyDiscAsync(discId, discRoot,
+  verifyContents)` reads every non-deleted catalog record on the disc, confirms
+  presence + size, and (opt-in) re-hashes SHA-256; understands plain/zipped/split/
+  `.dedup`/`.fileref` forms (mirrors the restore reader). `.fileref` whose backing
+  plain copy is on another disc is reported as `UnresolvedReference`, not a failure.
+- **Re-burn whole disc** → `IBackupOrchestrator.ReplaceDiscAsync(discId, recorderId,
+  progress)` — re-stages every file the disc held from the live source and burns a
+  fresh replacement disc.
+- **Re-burn affected files** → `IBackupOrchestrator.ReplaceDiscFilesAsync(discId,
+  failedFileRecordIds, recorderId, progress)` — re-burns only the failed files onto a
+  new supplementary disc (Version+1 records, old records marked `IsDeleted` so restore
+  resolves to the fresh copies).
+
+**Caveats to validate on hardware:**
+1. **Recorder ↔ drive mapping is best-effort.** The VM auto-detects the *reading*
+   drive by volume label (`DriveInfo`), but the *burning* recorder is taken as
+   `IDiscBurner.GetRecorderIds()[0]`. On a multi-burner machine the fresh disc could
+   be burned in a different drive than the one tested. Proper fix: map the selected
+   `DriveInfo` root to its IMAPI2 recorder id (e.g. via `MediaInfo.RecorderName` /
+   device path) and pass the matching recorder.
+2. **Both repairs read from the live source files.** A source file that no longer
+   exists on disk is silently skipped (whole-disc) or reported as "0 re-burned"
+   (affected-files) — recovery from another good disc is not automated. This is by
+   design but should be surfaced more clearly once tested.
+3. Post-burn read-back reuses the same IMAPI2 remount path flagged in the entry
+   below, so its hardware caveats apply here too.
+
 ## Post-burn verification disc reload is best-effort / hardware-dependent (2026-06-13)
 
 **Status:** Implemented but untested on real hardware (no burner with media available
