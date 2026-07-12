@@ -31,6 +31,16 @@ public class SimulatedDiscBurner : IDiscBurner
     /// <summary>Simulated disc capacity in bytes.  Default = DVD-R (4.7 GB).</summary>
     public long DiscCapacityBytes { get; set; } = 4_700_000_000L;
 
+    /// <summary>
+    /// If set, the disc's <em>real</em> writable capacity — smaller than the
+    /// <see cref="DiscCapacityBytes"/> it reports via <see cref="GetMediaInfoAsync"/>.
+    /// Simulates media that over-reports its size: planning trusts the reported
+    /// capacity and fits the data, but the burn runs out of room and fails with an
+    /// <see cref="IOException"/> once cumulative written bytes exceed this value.
+    /// Null means the disc holds exactly what it reports.
+    /// </summary>
+    public long? ActualCapacityBytes { get; set; }
+
     /// <summary>Simulated media type reported by <see cref="GetMediaInfoAsync"/>.</summary>
     public MediaType SimulatedMediaType { get; set; } = MediaType.DVD;
 
@@ -177,6 +187,7 @@ public class SimulatedDiscBurner : IDiscBurner
         double bytesPerSecond = 1_350_000.0 * SpeedMultiplier;
         var sw = Stopwatch.StartNew();
         long bytesWritten = 0;
+        long committedBytes = 0; // bytes accounted against ActualCapacityBytes
         var manifest = new List<DiscFileEntry>();
 
         foreach (var (fullPath, relativePath, fileSize) in fileInfos)
@@ -197,6 +208,17 @@ public class SimulatedDiscBurner : IDiscBurner
                 throw new IOException(
                     $"Simulated write error on file: {Path.GetFileName(fullPath)}");
             }
+
+            // Over-reported capacity: the disc claimed more room than it actually
+            // has, so we run out of space partway through the burn.
+            if (ActualCapacityBytes.HasValue
+                && committedBytes + fileSize > ActualCapacityBytes.Value)
+            {
+                throw new IOException(
+                    $"Simulated out of disc space: the media over-reported its capacity " +
+                    $"({committedBytes + fileSize} bytes needed, only {ActualCapacityBytes.Value} available).");
+            }
+            committedBytes += fileSize;
 
             // Always hash the source (reads from the user's drive, costs no
             // shelf space) so the manifest records accurate per-file hashes.

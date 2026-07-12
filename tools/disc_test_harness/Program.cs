@@ -112,9 +112,10 @@ await runner.Run("verify-disc-integrity", async ws =>
     // Content-verify every disc in the set against the catalog.
     var discs = await ws.Catalog.GetDiscsForBackupSetAsync(ws.BackupSetId);
     ws.Assert(discs.Count >= 1, "expected at least one disc recorded");
+    var labelToRoot = await ws.BuildLabelToRootAsync(burner);
     foreach (var disc in discs)
     {
-        string discRoot = ws.DiscRootForLabel(burner, disc.Label);
+        string discRoot = labelToRoot[disc.Label];
         var restore = new RestoreService(ws.Catalog);
         var vr = await restore.VerifyDiscAsync(disc.Id, discRoot, verifyContents: true);
         ws.Assert(vr.Success, $"disc {disc.Label} failed integrity: {string.Join("; ", vr.Issues.Select(i => $"{i.SourcePath}:{i.Kind}"))}");
@@ -129,7 +130,7 @@ await runner.Run("fail-no-recorder", async ws =>
 {
     var srcs = ws.MakeTree(("x.txt", 1_000));
     // No recorder => ExecuteAsync returns Success=false (does not throw).
-    var (_, result) = await ws.Backup(srcs, configure: b => b.SimulateNoRecorder = true, expectThrow: false);
+    var (_, result) = await ws.Backup(srcs, configure: b => b.SimulateNoRecorder = true);
     ws.Assert(!result.Success, "expected Success=false when no recorder present");
 });
 
@@ -192,6 +193,171 @@ await runner.Run("metadata-only-restore-cannot-reconstruct", async ws =>
     var r = await ws.RestoreAndVerify(burner, srcs);
     ws.Assert(r.Mismatches == srcs.Count,
         $"expected all {srcs.Count} restores to mismatch (stubs), but {srcs.Count - r.Mismatches} matched");
+});
+
+// ------------------------------------------------------------------
+// ISO-incompatibility -> proactive zip (no user prompts)
+// ------------------------------------------------------------------
+
+await runner.Run("iso-incompatible-path-forces-zip", async ws =>
+{
+    // Lowercase filenames are illegal under ISO 9660 Level 1 (uppercase-only).
+    // With ZipMode.IncompatibleOnly the orchestrator must proactively zip them
+    // BEFORE any failure path, so the burn succeeds, every record is stored
+    // zipped, and the failure callback is never invoked.
+    var srcs = ws.MakeTree(("dir/lower.txt", 40_000), ("dir/other.dat", 60_000));
+    int prompts = 0;
+    var (burner, result) = await ws.Backup(srcs,
+        filesystemType: FilesystemType.ISO9660,
+        zipMode: ZipMode.IncompatibleOnly,
+        onFailure: (_, _, _) => { prompts++; return Task.FromResult(new FailureDecision { Action = BurnFailureAction.Skip }); });
+
+    ws.Assert(result.Success, "backup should succeed by zipping incompatible files");
+    ws.Assert(prompts == 0, $"failure callback should never fire for proactive zip, fired {prompts}x");
+
+    var records = await ws.AllFileRecords();
+    ws.Assert(records.Count == srcs.Count, $"expected {srcs.Count} records, got {records.Count}");
+    ws.Assert(records.All(f => f.IsZipped), "every incompatible file should be stored zipped");
+
+    var r = await ws.RestoreAndVerify(burner, srcs);
+    ws.Assert(r.Mismatches == 0, $"{r.Mismatches} restored file(s) had wrong content");
+    ws.Assert(r.Restored == srcs.Count, $"restored {r.Restored}/{srcs.Count} files");
+});
+
+await runner.Run("many-incompatible-files-no-repeat-prompt", async ws =>
+{
+    // A whole volume of ISO-incompatible files must NOT force the user to answer
+    // a prompt over and over: proactive zipping means zero callbacks regardless
+    // of how many files are incompatible.
+    var spec = Enumerable.Range(0, 40)
+        .Select(i => ($"vol/file{i}.txt", 2_000 + i))
+        .ToArray();
+    var srcs = ws.MakeTree(spec);
+    int prompts = 0;
+    var (burner, result) = await ws.Backup(srcs,
+        filesystemType: FilesystemType.ISO9660,
+        zipMode: ZipMode.IncompatibleOnly,
+        onFailure: (_, _, _) => { prompts++; return Task.FromResult(new FailureDecision { Action = BurnFailureAction.Skip }); });
+
+    ws.Assert(result.Success, "backup of many incompatible files should succeed");
+    ws.Assert(prompts == 0, $"expected 0 prompts for {srcs.Count} incompatible files, got {prompts}");
+
+    var records = await ws.AllFileRecords();
+    ws.Assert(records.All(f => f.IsZipped), "every file should be zipped");
+    var r = await ws.RestoreAndVerify(burner, srcs);
+    ws.Assert(r.Mismatches == 0, $"{r.Mismatches} restored file(s) had wrong content");
+});
+
+// ------------------------------------------------------------------
+// Disc-fault repair: re-burn failed files onto a fresh disc
+// ------------------------------------------------------------------
+
+await runner.Run("replace-disc-files-repair", async ws =>
+{
+    // Simulate finding a fault in some files on a burned disc, then repairing
+    // just those files onto a new supplementary disc via ReplaceDiscFilesAsync.
+    var srcs = ws.MakeTree(("r/a.bin", 40_000), ("r/b.bin", 50_000), ("r/c.bin", 30_000));
+    var (burner, result) = await ws.Backup(srcs);
+    ws.Assert(result.Success, "initial backup should succeed");
+
+    var disc = (await ws.Catalog.GetDiscsForBackupSetAsync(ws.BackupSetId)).Single();
+    var files = await ws.Catalog.GetFilesOnDiscAsync(disc.Id);
+    var badIds = files.Where(f => f.SourcePath.EndsWith("a.bin") || f.SourcePath.EndsWith("b.bin"))
+        .Select(f => f.Id).ToList();
+
+    // Re-burn on the SAME burner so the shelf's session counter continues.
+    var orch = ws.BuildOrchestrator(burner);
+    int reburned = await orch.ReplaceDiscFilesAsync(disc.Id, badIds, Workspace.RecorderId);
+    ws.Assert(reburned == badIds.Count, $"expected {badIds.Count} files re-burned, got {reburned}");
+
+    var discs = await ws.Catalog.GetDiscsForBackupSetAsync(ws.BackupSetId);
+    ws.Assert(discs.Any(d => d.Label.EndsWith("-Repair")), "expected a new -Repair disc");
+
+    // Originals for the repaired files must be superseded (IsDeleted) so restore
+    // resolves to the fresh copies; the untouched file stays live.
+    var after = await ws.Catalog.GetFilesOnDiscAsync(disc.Id);
+    ws.Assert(after.Where(f => badIds.Contains(f.Id)).All(f => f.IsDeleted),
+        "repaired originals should be marked deleted");
+    ws.Assert(after.Single(f => f.SourcePath.EndsWith("c.bin")).IsDeleted == false,
+        "untouched file should remain live");
+
+    var r = await ws.RestoreAndVerify(burner, srcs);
+    ws.Assert(r.Mismatches == 0, $"{r.Mismatches} restored file(s) had wrong content");
+    ws.Assert(r.Restored == srcs.Count, $"restored {r.Restored}/{srcs.Count} files");
+});
+
+await runner.Run("replace-disc-files-source-deleted", async ws =>
+{
+    // If a source file has since been deleted, the repair must skip it gracefully
+    // (no crash), leave its original record intact, and report it wasn't re-burned.
+    var srcs = ws.MakeTree(("d/keep.bin", 40_000), ("d/gone.bin", 40_000));
+    var (burner, result) = await ws.Backup(srcs);
+    ws.Assert(result.Success, "initial backup should succeed");
+
+    var disc = (await ws.Catalog.GetDiscsForBackupSetAsync(ws.BackupSetId)).Single();
+    var files = await ws.Catalog.GetFilesOnDiscAsync(disc.Id);
+    var goneRec = files.Single(f => f.SourcePath.EndsWith("gone.bin"));
+
+    // Delete the live source, then try to repair it.
+    File.Delete(goneRec.SourcePath);
+
+    var orch = ws.BuildOrchestrator(burner);
+    int reburned = await orch.ReplaceDiscFilesAsync(disc.Id, new[] { goneRec.Id }, Workspace.RecorderId);
+    ws.Assert(reburned == 0, $"expected 0 re-burned (source deleted), got {reburned}");
+
+    var after = await ws.Catalog.GetFilesOnDiscAsync(disc.Id);
+    ws.Assert(after.Single(f => f.Id == goneRec.Id).IsDeleted == false,
+        "deleted-source original must stay live (nothing replaced it)");
+    ws.Assert(!(await ws.Catalog.GetDiscsForBackupSetAsync(ws.BackupSetId)).Any(d => d.Label.EndsWith("-Repair")),
+        "no repair disc should be created when nothing could be staged");
+});
+
+await runner.Run("replace-disc-files-source-grown", async ws =>
+{
+    // If a source file has grown since backup, the repair disc must capture the
+    // NEW bytes and record the NEW size (regression guard for the stale-size bug).
+    byte[] original = TestRunner.Gen(7, 40_000);
+    byte[] grown = TestRunner.Gen(8, 90_000);
+    var srcs = ws.MakeTreeBytes(("g/data.bin", original));
+    var (burner, result) = await ws.Backup(srcs);
+    ws.Assert(result.Success, "initial backup should succeed");
+
+    var disc = (await ws.Catalog.GetDiscsForBackupSetAsync(ws.BackupSetId)).Single();
+    var rec = (await ws.Catalog.GetFilesOnDiscAsync(disc.Id)).Single();
+
+    // Grow the live source, then repair.
+    File.WriteAllBytes(rec.SourcePath, grown);
+
+    var orch = ws.BuildOrchestrator(burner);
+    int reburned = await orch.ReplaceDiscFilesAsync(disc.Id, new[] { rec.Id }, Workspace.RecorderId);
+    ws.Assert(reburned == 1, $"expected 1 file re-burned, got {reburned}");
+
+    // The new record on the repair disc must carry the grown size, not the stale one.
+    var repairDisc = (await ws.Catalog.GetDiscsForBackupSetAsync(ws.BackupSetId))
+        .Single(d => d.Label.EndsWith("-Repair"));
+    var newRec = (await ws.Catalog.GetFilesOnDiscAsync(repairDisc.Id)).Single();
+    ws.Assert(newRec.SizeBytes == grown.Length,
+        $"repair record size should be grown size {grown.Length}, got {newRec.SizeBytes}");
+
+    // Restore must yield the grown content (the version actually on the repair disc).
+    var expected = new Dictionary<string, byte[]> { [srcs[0]] = grown };
+    var r = await ws.RestoreAndVerify(burner, srcs, expected);
+    ws.Assert(r.Mismatches == 0, $"{r.Mismatches} restored file(s) had wrong content");
+});
+
+// ------------------------------------------------------------------
+// Media that over-reports its capacity -> data won't fit -> burn fails
+// ------------------------------------------------------------------
+
+await runner.Run("disc-over-reports-capacity", async ws =>
+{
+    // Plan thinks everything fits on one 200 KB disc, but the media's REAL
+    // writable capacity is only 100 KB, so the burn must fail partway through.
+    var srcs = ws.MakeTree(("o/a.bin", 60_000), ("o/b.bin", 60_000), ("o/c.bin", 30_000));
+    var ex = await ws.ExpectThrow(() => ws.Backup(srcs,
+        capacityBytes: 200_000,
+        configure: b => b.ActualCapacityBytes = 100_000));
+    ws.Assert(ex is IOException, $"expected IOException from over-reported media, got {ex?.GetType().Name ?? "none"}");
 });
 
 return runner.Report();
@@ -331,6 +497,8 @@ sealed class Workspace : IDisposable
     /// lookup) and the result. When <paramref name="expectThrow"/> is false the
     /// caller expects a non-throwing outcome (e.g. Success=false).
     /// </summary>
+    public const string RecorderId = "SIM_RECORDER_0";
+
     public async Task<(SimulatedDiscBurner Burner, BackupResult Result)> Backup(
         List<string> sources,
         long? capacityBytes = 4_700_000_000L,
@@ -338,10 +506,12 @@ sealed class Workspace : IDisposable
         bool fileDedup = false,
         ZipMode zipMode = ZipMode.None,
         bool allowSplitting = false,
-        Action<SimulatedDiscBurner>? configure = null,
-        bool expectThrow = true)
+        FilesystemType filesystemType = FilesystemType.UDF,
+        FailureCallback? onFailure = null,
+        SimulatedDiscBurner? burner = null,
+        Action<SimulatedDiscBurner>? configure = null)
     {
-        var burner = NewBurner(configure);
+        burner ??= NewBurner(configure);
 
         var set = await Catalog.CreateBackupSetAsync(new BackupSet
         {
@@ -367,6 +537,7 @@ sealed class Workspace : IDisposable
             EnableDeduplication = false,
             ZipMode = zipMode,
             AllowFileSplitting = allowSplitting,
+            FilesystemType = filesystemType,
             VerifyAfterBurn = true,
             CapacityOverrideBytes = useCapacityOverride ? capacityBytes : null,
         };
@@ -375,12 +546,12 @@ sealed class Workspace : IDisposable
         Console.WriteLine($"  [plan] cap={job.CapacityOverrideBytes} allocs={plan.DiscAllocations.Count} " +
             $"totBytes={plan.TotalBytes} newFiles={plan.Diff.NewFiles.Count} " +
             $"allocSizes=[{string.Join(",", plan.DiscAllocations.Select(a => a.TotalBytes))}]");
-        var result = await orchestrator.ExecuteAsync(plan, progress: null, onFailure: null,
+        var result = await orchestrator.ExecuteAsync(plan, progress: null, onFailure: onFailure,
             ct: CancellationToken.None);
         return (burner, result);
     }
 
-    private BackupOrchestrator BuildOrchestrator(IDiscBurner burner)
+    public BackupOrchestrator BuildOrchestrator(IDiscBurner burner)
     {
         var scanner = new FileScanner(Catalog);
         var packer = new BinPacker();
@@ -393,11 +564,31 @@ sealed class Workspace : IDisposable
 
     // -- restore + verify --------------------------------------------
 
-    public string DiscRootForLabel(SimulatedDiscBurner burner, string label)
+    /// <summary>
+    /// Map each catalog disc label to its shelf directory. The simulated burner
+    /// writes the k-th successful burn to shelf <c>disc-k</c>, and catalog disc
+    /// records are created in that same burn order, so ordering the set's discs by
+    /// Id and assigning shelf numbers 1..n is robust even for re-burn/repair discs
+    /// whose labels don't encode their shelf number.
+    /// </summary>
+    /// <summary>Every file record across all discs in the current backup set.</summary>
+    public async Task<List<FileRecord>> AllFileRecords()
     {
-        // Label "Disc-003" => disc number 3 => shelf disc-3 for the sole recorder.
-        int n = int.Parse(new string(label.Where(char.IsDigit).ToArray()));
-        return burner.GetDiscPath("SIM_RECORDER_0", n);
+        var discs = await Catalog.GetDiscsForBackupSetAsync(BackupSetId);
+        var all = new List<FileRecord>();
+        foreach (var d in discs)
+            all.AddRange(await Catalog.GetFilesOnDiscAsync(d.Id));
+        return all;
+    }
+
+    public async Task<Dictionary<string, string>> BuildLabelToRootAsync(SimulatedDiscBurner burner)
+    {
+        var discs = (await Catalog.GetDiscsForBackupSetAsync(BackupSetId))
+            .OrderBy(d => d.Id).ToList();
+        var map = new Dictionary<string, string>(StringComparer.OrdinalIgnoreCase);
+        for (int i = 0; i < discs.Count; i++)
+            map[discs[i].Label] = burner.GetDiscPath(RecorderId, i + 1);
+        return map;
     }
 
     /// <summary>
@@ -418,12 +609,22 @@ sealed class Workspace : IDisposable
         return worst;
     }
 
+    /// <summary>
+    /// Restore the whole set and compare each source file to its restored copy by
+    /// SHA-256. <paramref name="expectedContentByRel"/> optionally overrides the
+    /// bytes a given source path (relative-to-drive) should restore to — used when
+    /// the live source has changed (e.g. grown) since backup and we want to compare
+    /// against the version actually captured on disc rather than the current file.
+    /// </summary>
     public async Task<(int Restored, int Mismatches)> RestoreAndVerify(
-        SimulatedDiscBurner burner, List<string> sources)
+        SimulatedDiscBurner burner, List<string> sources,
+        IReadOnlyDictionary<string, byte[]>? expectedContentByPath = null)
     {
+        var labelToRoot = await BuildLabelToRootAsync(burner);
         var restore = new RestoreService(Catalog)
         {
-            DiscInsertCallback = label => Task.FromResult<string?>(DiscRootForLabel(burner, label)),
+            DiscInsertCallback = label => Task.FromResult(
+                labelToRoot.TryGetValue(label, out var root) ? root : null),
         };
 
         var restorable = await restore.GetRestorableFilesAsync(BackupSetId);
@@ -440,10 +641,23 @@ sealed class Workspace : IDisposable
         foreach (var src in sources)
         {
             string restored = Path.Combine(_restoreDir, RelToDriveRoot(src));
-            if (!File.Exists(restored) || !HashEquals(src, restored))
-                mismatches++;
+            if (!File.Exists(restored)) { mismatches++; continue; }
+
+            bool ok = expectedContentByPath is not null
+                      && expectedContentByPath.TryGetValue(src, out var expected)
+                ? HashEqualsBytes(restored, expected)
+                : HashEquals(src, restored);
+            if (!ok) mismatches++;
         }
         return (result.FilesRestored, mismatches);
+    }
+
+    private static bool HashEqualsBytes(string filePath, byte[] expected)
+    {
+        using var sha = SHA256.Create();
+        byte[] hf;
+        using (var s = File.OpenRead(filePath)) hf = sha.ComputeHash(s);
+        return hf.SequenceEqual(sha.ComputeHash(expected));
     }
 
     private static string DriveKey(string path) =>

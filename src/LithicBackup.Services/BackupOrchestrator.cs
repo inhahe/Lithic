@@ -1023,25 +1023,49 @@ public class BackupOrchestrator : IBackupOrchestrator
             LastWrittenUtc = DateTime.UtcNow,
         }, ct);
 
-        foreach (var (original, stagedPath, _) in staged)
+        foreach (var (original, stagedPath, stagedSize) in staged)
         {
             string hash = await ComputeFileHashAsync(original.SourcePath, ct);
+
+            // Re-read the live source's size/mtime: the file may have grown or
+            // shrunk since it was first backed up, so recording the original's
+            // stale size would leave the new record inconsistent with the bytes
+            // actually on the replacement disc (and fail later size checks).
+            var (freshSize, freshMtime) = FreshSourceMetadata(original, stagedSize);
 
             await _catalog.CreateFileRecordAsync(new FileRecord
             {
                 DiscId = newDisc.Id,
                 SourcePath = original.SourcePath,
                 DiscPath = stagedPath,
-                SizeBytes = original.SizeBytes,
+                SizeBytes = freshSize,
                 Hash = hash,
                 Version = original.Version,
-                SourceLastWriteUtc = original.SourceLastWriteUtc,
+                SourceLastWriteUtc = freshMtime,
                 BackedUpUtc = DateTime.UtcNow,
             }, ct);
         }
 
         tx.Complete();
         tx.Dispose();
+    }
+
+    /// <summary>
+    /// Current size and last-write time of a re-staged source file, falling back
+    /// to the record's stored values (and the staged byte count) if the live file
+    /// can't be inspected. Used by the disc-replacement paths so a file that grew
+    /// or shrank since its first backup is recorded with its true current size.
+    /// </summary>
+    private static (long Size, DateTime Mtime) FreshSourceMetadata(FileRecord original, long stagedSize)
+    {
+        try
+        {
+            var fi = new FileInfo(original.SourcePath);
+            if (fi.Exists)
+                return (fi.Length, fi.LastWriteTimeUtc);
+        }
+        catch { /* fall through to staged/stored values */ }
+        return (stagedSize, original.SourceLastWriteUtc);
     }
 
     // -------------------------------------------------------------------
@@ -1096,19 +1120,24 @@ public class BackupOrchestrator : IBackupOrchestrator
             LastWrittenUtc = DateTime.UtcNow,
         }, ct);
 
-        foreach (var (original, stagedPath, _) in staged)
+        foreach (var (original, stagedPath, stagedSize) in staged)
         {
             string hash = await ComputeFileHashAsync(original.SourcePath, ct);
+
+            // Record the live source's current size/mtime (it may have grown or
+            // shrunk since the first backup) so the repair disc's record matches
+            // the bytes actually written.
+            var (freshSize, freshMtime) = FreshSourceMetadata(original, stagedSize);
 
             await _catalog.CreateFileRecordAsync(new FileRecord
             {
                 DiscId = newDisc.Id,
                 SourcePath = original.SourcePath,
                 DiscPath = stagedPath,
-                SizeBytes = original.SizeBytes,
+                SizeBytes = freshSize,
                 Hash = hash,
                 Version = original.Version + 1,
-                SourceLastWriteUtc = original.SourceLastWriteUtc,
+                SourceLastWriteUtc = freshMtime,
                 BackedUpUtc = DateTime.UtcNow,
             }, ct);
 
