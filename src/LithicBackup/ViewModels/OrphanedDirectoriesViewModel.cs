@@ -1779,6 +1779,19 @@ public class OrphanedDirectoriesViewModel : ViewModelBase
                             {
                                 var fi = new FileInfo(fullPath);
                                 long size = fi.Length;
+                                // Clear the read-only attribute before deleting:
+                                // FileInfo.Delete() throws UnauthorizedAccessException
+                                // on a read-only file, and a LOT of backed-up content
+                                // carries that flag — git object/pack files are always
+                                // read-only, as is anything copied from a read-only
+                                // source. Without this the delete fails silently (it's
+                                // caught below as a failure), the file survives on disk,
+                                // and the next "Scan Destination" re-reports it — the
+                                // exact "I cleaned them but they keep coming back"
+                                // symptom. (On the reference destination 920 of 940
+                                // catalog-deleted-still-on-disk files were read-only.)
+                                if (fi.IsReadOnly)
+                                    fi.IsReadOnly = false;
                                 fi.Delete();
                                 bytes += size;
                                 fDeleted++;

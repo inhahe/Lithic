@@ -1334,8 +1334,7 @@ public class DirectoryBackupService
                     // prevents "catalog-deleted (still on disk)" records.
                     try
                     {
-                        if (File.Exists(prevPath))
-                            File.Delete(prevPath);
+                        ForceDeleteFile(prevPath);
                     }
                     catch (Exception ex) when (ex is IOException or UnauthorizedAccessException)
                     {
@@ -2156,14 +2155,19 @@ public class DirectoryBackupService
                 Directory.CreateDirectory(dir);
 
             // Write the real bytes into the reference's location (suffix-less).
+            // File.Copy preserves the source's attributes, so strip read-only
+            // afterwards — otherwise read-only source content (git objects, etc.)
+            // leaves a read-only file on the destination that later resists
+            // retention/cleanup deletion.
             File.Copy(sourceBytesPath, plainAbsPath, overwrite: true);
+            ClearReadOnly(plainAbsPath);
 
             // Remove the now-redundant .fileref manifest (it differs from the
             // plain path only by the ".fileref" suffix).
             if (!string.Equals(refAbsPath, plainAbsPath, StringComparison.OrdinalIgnoreCase)
                 && File.Exists(refAbsPath))
             {
-                File.Delete(refAbsPath);
+                ForceDeleteFile(refAbsPath);
             }
 
             // Flip the catalog record to a plain copy at its new path.
@@ -2182,6 +2186,45 @@ public class DirectoryBackupService
         => discPath.EndsWith(".fileref", StringComparison.OrdinalIgnoreCase)
             ? discPath[..^".fileref".Length]
             : discPath;
+
+    /// <summary>
+    /// Delete a file we own on the destination, first clearing its read-only
+    /// attribute. Plain <see cref="File.Delete(string)"/> throws
+    /// <see cref="UnauthorizedAccessException"/> on a read-only file, and a LOT
+    /// of backed-up content carries that flag (git object/pack files are always
+    /// read-only, as is anything copied from a read-only source). Without this,
+    /// retention and manifest cleanup silently fail on read-only files and leave
+    /// stale bytes on disk that the cleanup UI then re-reports forever.
+    /// </summary>
+    private static void ForceDeleteFile(string path)
+    {
+        var fi = new FileInfo(path);
+        if (fi.Exists)
+        {
+            if (fi.IsReadOnly)
+                fi.IsReadOnly = false;
+            fi.Delete();
+        }
+    }
+
+    /// <summary>
+    /// Clear the read-only attribute on a file we just wrote to the destination.
+    /// <see cref="File.Copy(string,string,bool)"/> preserves the source's
+    /// attributes, so copying read-only source content (e.g. git objects) leaves
+    /// read-only files on the destination that later resist deletion. Every file
+    /// under our control on the destination must stay writable so retention and
+    /// cleanup can manage it.
+    /// </summary>
+    private static void ClearReadOnly(string path)
+    {
+        try
+        {
+            var fi = new FileInfo(path);
+            if (fi.Exists && fi.IsReadOnly)
+                fi.IsReadOnly = false;
+        }
+        catch { /* best effort — a stuck attribute must not fail the backup */ }
+    }
 
     /// <summary>
     /// Resolve a content hash to the absolute path of an active plain copy of

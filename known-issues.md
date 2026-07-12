@@ -1,49 +1,78 @@
 # LithicBackup — Known Issues & Tech Debt
 
-## FIXED: Cleanup mislabels materialised `.fileref`/`.dedup` content as "Untracked" (2026-07-12)
+## FIXED: Cleanup "cleaned but reappears" — read-only files silently fail deletion (2026-07-12)
 
-**Status:** Fixed 2026-07-12 in `OrphanedDirectoriesViewModel.WalkDestination`.
+**Status:** Fixed 2026-07-12 in `OrphanedDirectoriesViewModel.PurgeSelected`
+(cleanup UI) and `DirectoryBackupService` (retention + fileref materialisation).
 
 **Symptom (user report):** In the Cleanup view, "Scan Destination Filesystem"
-listed a huge number of "untracked files" (and some "catalog-deleted (still on
-disk)"); the user cleaned them all, re-scanned, and the same entries came back —
+listed "untracked files" and "catalog-deleted (still on disk)" entries; the user
+selected all and cleaned them, re-scanned, and the exact same entries came back —
 "the same bug it already had that you thought you fixed."
 
-**Root cause (forensically confirmed on the live catalog + `J:\...` destination):**
-A deduplicated file's catalog `DiscPath` carries a manifest suffix —
-`D\AI\lama-cleaner\lama-cleaner-main.zip.fileref` — but the manifest can later be
-**materialised** back into a plain, suffix-less file on disk
-(`D\AI\lama-cleaner\lama-cleaner-main.zip`) whose bytes *are* the referenced
-content. `WalkDestination` built its `discPathLookup` keyed only by the raw
-catalog `DiscPath`, so a plain on-disk file never matched its `.fileref`/`.dedup`
-record and was reported as **untracked**. Verified: the plain
-`lama-cleaner-main.zip` (SHA-256 `b81ec7…`, 5,036,126 B) is byte-identical to the
-content its **active** (`IsDeleted=0`) catalog record `…zip.fileref` references.
-So the tool was flagging real, catalog-referenced backup content as untracked —
-"cleaning" it would **delete live backup data**, and it reappears the next time the
-worker re-materialises the reference. On the reference catalog (set 4, dated
-2026-06-09) **298,688** of 834,035 "untracked" hits were exactly this case.
+**Root cause (forensically confirmed on the LIVE catalog + destination):**
+`FileInfo.Delete()` / `File.Delete()` throw `UnauthorizedAccessException` on a
+**read-only** file. A large fraction of backed-up content is read-only: git
+object/pack files are always read-only, and anything copied with `File.Copy`
+inherits the source's read-only attribute. The cleanup purge's physical-delete
+loop caught the exception, counted it as a soft failure, and moved on — so the
+file survived on disk and the next scan re-reported it, forever. On the live
+destination, **920 of 940** "catalog-deleted (still on disk)" files were
+read-only. That is the actual "cleaned but keeps coming back" bug.
 
-**Why the residue exists:** the current materialiser
-(`DirectoryBackupService.TryPromoteFileRefToPlainAsync`) correctly writes the plain
-file, deletes the manifest, **and flips the catalog record** (`IsFileRef=false`,
-`DiscPath=<stripped>`). These mismatched rows are residue from an **older build**
-that wrote the plain bytes but didn't update the record (same pre-idempotency-guard
-era as the catalog-bloat entry below). Current code does not reproduce them.
+**Where the read-only files came from:** `DirectoryBackupService`'s primary
+content write streams into a fresh temp file (never read-only), but
+`TryPromoteFileRefToPlainAsync` used `File.Copy(sourceBytesPath, plainAbsPath,
+overwrite:true)`, which **preserves** the source read-only flag — planting
+read-only plain files on the destination. Retention's `File.Delete(prevPath)` and
+the fileref-manifest `File.Delete(refAbsPath)` then threw on those files and (for
+retention) left them behind on every pass.
+
+**Fix (both symptom and source):**
+- `OrphanedDirectoriesViewModel` purge phase-2: clear `fi.IsReadOnly` before
+  `fi.Delete()`.
+- `DirectoryBackupService`: added `ForceDeleteFile` (clears read-only then
+  deletes) used at the retention delete and fileref-manifest delete; added
+  `ClearReadOnly` called right after the `File.Copy` in
+  `TryPromoteFileRefToPlainAsync` so newly-materialised plain files are writable.
+
+**Correction to an earlier (2026-07-12) diagnosis in this file:** an initial pass
+claimed "298,688 of 834,035 untracked hits" and a "stale catalog out of sync"
+condition. Those numbers came from the **abandoned legacy** catalog at
+`C:\Users\<user>\AppData\Local\LithicBackup\catalog.db` (dated 2026-06-09), not the
+live catalog. The live catalog is the per-set DB at
+`C:\ProgramData\LithicBackup\sets\set-4.db` (current, consistent with the
+destination): 833,981 of 834,035 files are correctly tracked. The catalog is NOT
+stale — the timestamp confusion was reading the wrong file (see
+`CatalogLocation.cs`, LocalApplicationData → CommonApplicationData migration).
+
+## FIXED (defensive): Cleanup could mislabel materialised `.fileref`/`.dedup` content as "Untracked" (2026-07-12)
+
+**Status:** Fixed 2026-07-12 in `OrphanedDirectoriesViewModel.WalkDestination`
+(commit dd6584a). Correct and worth keeping, but low-impact on live data (it
+reclassifies **1** file on the live set, not the hundreds of thousands the
+original write-up implied).
+
+**Root cause:** A deduplicated file's catalog `DiscPath` carries a manifest suffix
+(`…lama-cleaner-main.zip.fileref`), but the manifest can be **materialised** back
+into a plain, suffix-less file whose bytes *are* the referenced content.
+`WalkDestination` keyed `discPathLookup` only by the raw catalog `DiscPath`, so a
+plain on-disk file wouldn't match its `.fileref`/`.dedup` record and could be
+reported as untracked — risking "cleanup" of live backup content.
 
 **Fix:** In `WalkDestination`, when a disk file's exact relative path isn't in the
-catalog, also try `<path>.fileref` and `<path>.dedup` before declaring it untracked.
-Exact match still wins; the suffix fallbacks only fire for plain, suffix-less files,
-so genuine untracked files are unaffected. A plain file that matches an all-deleted
-`.fileref` record now correctly lands in "catalog-deleted (still on disk)" and its
-own suffix-less path is what gets physically deleted.
+catalog, also try `<path>.fileref` and `<path>.dedup` before declaring it
+untracked. Exact match still wins; the fallbacks only fire for plain suffix-less
+files, so genuine untracked files are unaffected.
 
-**Remaining data residue (not repaired by this fix):** existing catalogs still hold
-`IsFileRef=1` rows whose on-disk form is plain (or missing entirely — 20/20 random
-active fileref samples on the reference set had no on-disk file at all). The scan
-fix stops the *cleanup* tool from misclassifying the plain ones; a separate
-reconcile pass would be needed to flip the stale rows to plain / prune the truly
-missing ones. Do NOT auto-purge these — the plain bytes are live backup content.
+## OPEN (related): disc-burn staging copies inherit source read-only
+
+`BackupOrchestrator` File.Copy sites (lines ~883, ~1018, ~1139) copy source files
+into the disc-burn staging dir and, like the fileref path, preserve the source's
+read-only attribute. This is the disc-backup path (not the directory-backup path
+the user hit), so it wasn't fixed in the 2026-07-12 pass. If staging cleanup or
+retention there ever fails on read-only files, apply the same `ClearReadOnly` /
+`ForceDeleteFile` treatment.
 
 ## FIXED: Cleanup "Clean Selected" never persisted for RemovedFromSources / DeletedFromDisk (2026-07-11)
 
