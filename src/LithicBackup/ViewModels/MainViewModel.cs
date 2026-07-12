@@ -923,6 +923,17 @@ public class MainViewModel : ViewModelBase
         var newSelections = backupSet.SourceSelections
             ?? new List<Core.Models.SourceSelection>();
 
+        // Fast path: if the source selection is unchanged from when the dialog
+        // opened, there is nothing to reconcile — no folders were dropped or
+        // added. Skip the expensive GetAllFilesForBackupSetAsync scan (which can
+        // load ~1M rows and stall the UI for several seconds) that would
+        // otherwise run on EVERY dialog close, since close auto-saves and thus
+        // always sets savedThisSession. The comparison uses the same JSON
+        // serialization the catalog persists with, so it is conservative: any
+        // real change produces different JSON and still runs the full reconcile.
+        if (SelectionsEquivalent(originalSelections, newSelections))
+            return;
+
         List<FileRecord> removed;
         List<string> addedRoots;
 
@@ -965,6 +976,29 @@ public class MainViewModel : ViewModelBase
 
         if (addedRoots.Count > 0)
             await PromptAndBackupAddedAsync(backupSet, addedRoots, originalSelections, newSelections);
+    }
+
+    /// <summary>
+    /// Conservative structural equality for two source-selection trees, used to
+    /// decide whether a dialog edit actually changed the selection. Compares the
+    /// same JSON form the catalog persists with (<see cref="SqliteCatalogRepository"/>
+    /// serializes <c>SourceSelections</c> with a plain <c>JsonSerializer.Serialize</c>),
+    /// so identical trees compare equal and any real change compares unequal.
+    /// </summary>
+    private static bool SelectionsEquivalent(
+        IReadOnlyList<Core.Models.SourceSelection> a,
+        IReadOnlyList<Core.Models.SourceSelection> b)
+    {
+        try
+        {
+            return JsonSerializer.Serialize(a) == JsonSerializer.Serialize(b);
+        }
+        catch
+        {
+            // If serialization ever fails, fall back to running the reconcile
+            // (correctness over the optimisation).
+            return false;
+        }
     }
 
     /// <summary>True when <paramref name="path"/> equals one of

@@ -1,5 +1,36 @@
 # LithicBackup — Known Issues & Tech Debt
 
+## FIXED: Modify dialog close stalled the UI with a ~10s wait cursor (2026-07-12)
+
+**Status:** Fixed 2026-07-12 in `MainViewModel.ReconcileDestinationAfterEditAsync`.
+
+**Symptom (user report):** After closing the Modify (backup-set editor) dialog, the
+main window showed the busy/wait cursor for ~10 seconds, even when nothing was
+changed in the dialog.
+
+**Root cause:** Closing the dialog always auto-saves (`_pendingSettingsSave` →
+`SaveAllAsync`), which sets `savedThisSession = true`, so the post-close
+`ReconcileDestinationAfterEditAsync` ran on *every* close. That method
+unconditionally called `GetAllFilesForBackupSetAsync`, loading the set's entire file
+table (≈1M rows for large sets) on a background thread with `Mouse.OverrideCursor =
+Wait`, just to diff which source folders were dropped/added — work that is pointless
+when the selection didn't change.
+
+**Fix:** Added a conservative fast-path at the top of the reconcile: if the source
+selection is unchanged from when the dialog opened (`SelectionsEquivalent`, comparing
+the same `JsonSerializer.Serialize` form the catalog persists with), return
+immediately without loading any file records. Any genuine selection change serializes
+differently and still runs the full reconcile, so purge/backup prompts for
+dropped/added folders are unaffected. Gating on the JSON diff (rather than
+`HasUnsavedChanges`) is correct for both the auto-save-on-close and explicit-Save-then-close
+paths, since `HasUnsavedChanges` resets after an explicit save.
+
+**Related latent concern (not fixed, low risk):** auto-save on close calls
+`sourceSelection.GetSelections()`. Selection restore is deferred to a post-show async
+pass; closing the dialog before that completes could in principle save a partial/empty
+selection. Not observed and out of scope for this fix, but worth guarding (e.g. block
+auto-save until restore has completed) if it ever surfaces.
+
 ## FIXED: Cleanup "cleaned but reappears" — read-only files silently fail deletion (2026-07-12)
 
 **Status:** Fixed 2026-07-12 in `OrphanedDirectoriesViewModel.PurgeSelected`
