@@ -1,5 +1,43 @@
 # LithicBackup — Known Issues & Tech Debt
 
+## ADDED: Continuous-mode fallback for non-NTFS source volumes (2026-07-12)
+
+**Status:** Implemented 2026-07-12 in `BackupWorker`, `FileSystemMonitorImpl`, and
+`IFileSystemMonitor`.
+
+**What changed:** Continuous mode previously only worked on NTFS (it is driven by the
+USN change journal; `UsnJournalReader.TryOpen` returns null for non-NTFS/inaccessible
+volumes, which used to silently disable continuous detection for that volume). Non-NTFS
+source volumes (exFAT, FAT32, network shares) now fall back to a `FileSystemWatcher`.
+
+**Design:**
+- `BackupWorker` owns a single `FileSystemMonitorImpl _fsMonitor` watching every non-NTFS
+  watch root across all continuous sets (`MaintainFallbackWatchers`). Watcher events arrive
+  on thread-pool threads and are buffered into `ConcurrentQueue`s, then drained on the poll
+  thread (`DrainFallbackChanges`) into the same per-set `Pending` debounce map the USN path
+  feeds — so `Pending` mutation stays single-threaded and the downstream targeted-backup
+  pipeline is shared.
+- **Restart reconciliation:** a watcher only sees live changes, so any (re)start of the
+  watcher — including the first poll after a process restart (roots go empty→populated) —
+  flags the affected sets `NeedsReconcile`, triggering a full timestamp/size scan
+  (`RunFullBackupAsync` → `FileScanner.ComputeDiffAsync`, which compares size + LastWrite,
+  no hashing) to catch anything changed while the watcher wasn't running.
+- **Buffer overflow:** `FileSystemMonitorImpl` now sets `InternalBufferSize = 64 KB` (max)
+  and raises a new `IFileSystemMonitor.Overflow` event on any watcher `Error`
+  (InternalBufferOverflowException = too many changes at once, some dropped). The worker
+  maps the overflowed root to affected sets and flags `NeedsReconcile` — a whole-tree
+  rescan rather than trusting the now-incomplete per-file event list.
+- Directory Created/Renamed events are expanded to their files (a bulk move-in may not fire
+  per-file events); a plain directory Changed is ignored (the child's own event covers it).
+
+**Known limitations of the fallback (inherent, acceptable):**
+- Non-NTFS deletions are only reconciled on the next full scan (restart/overflow/schedule),
+  same as the pre-existing NTFS "plain single-file deletes aren't reconciled in
+  pure-continuous mode" open item further down — `ExecuteTargetedAsync` skips missing paths.
+- A watcher restart (triggered when the set of non-NTFS watch roots changes, e.g. a set is
+  edited) drops whatever was buffered; that is covered by the reconcile-on-(re)start flag,
+  at the cost of an extra full timestamp/size scan on those sets.
+
 ## FIXED: Service panel could get stuck on "starting…/stopping…" with all buttons greyed (2026-07-12)
 
 **Status:** Fixed 2026-07-12 in `MainViewModel.RefreshServiceStatus` /
