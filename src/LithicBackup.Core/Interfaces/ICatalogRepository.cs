@@ -168,6 +168,30 @@ public interface ICatalogRepository : IDisposable
     /// </summary>
     Task<int> MarkFilesDeletedBySourcePathsAsync(int backupSetId, IEnumerable<string> sourcePaths, CancellationToken ct = default);
 
+    // --- Source drive remap ---
+
+    /// <summary>
+    /// Count catalog file records (all versions, including deleted history)
+    /// whose <see cref="FileRecord.SourcePath"/> is at or under
+    /// <paramref name="sourcePrefix"/> (typically a drive root like
+    /// <c>"E:\"</c>).  Used to preview how many records a source-drive remap
+    /// would affect before committing to it.
+    /// </summary>
+    Task<int> CountFilesUnderSourcePrefixAsync(int backupSetId, string sourcePrefix, CancellationToken ct = default);
+
+    /// <summary>
+    /// Rewrite the leading <paramref name="oldPrefix"/> of every catalog file
+    /// record's <see cref="FileRecord.SourcePath"/> in the set to
+    /// <paramref name="newPrefix"/>.  Used to remap a source drive letter (e.g.
+    /// the data that used to live on <c>E:\</c> now lives on <c>F:\</c> with the
+    /// same tree) so future backups treat existing files as already backed up
+    /// instead of re-copying everything.  Only <c>SourcePath</c> changes; the
+    /// destination-relative <see cref="FileRecord.DiscPath"/> and the physical
+    /// destination files are deliberately left untouched (they migrate naturally
+    /// as files change).  Returns the number of records updated.
+    /// </summary>
+    Task<int> RemapSourcePathPrefixAsync(int backupSetId, string oldPrefix, string newPrefix, CancellationToken ct = default);
+
     // --- Cross-set search ---
 
     /// <summary>

@@ -1,0 +1,49 @@
+<Window x:Class="LithicBackup.Views.RemapSourceDriveDialog"
+        xmlns="http://schemas.microsoft.com/winfx/2006/xaml/presentation"
+        xmlns:x="http://schemas.microsoft.com/winfx/2006/xaml"
+        Title="Remap Source Drive"
+        Width="460" SizeToContent="Height"
+        WindowStartupLocation="CenterOwner"
+        ResizeMode="NoResize"
+        ShowInTaskbar="False"
+        Style="{StaticResource MainWindowStyle}">
+
+    <StackPanel Margin="16">
+        <TextBlock TextWrapping="Wrap"
+                   Foreground="{StaticResource TextSecondaryBrush}"
+                   FontSize="11" Margin="0,0,0,16"
+                   Text="Point this set's catalog at a different drive that holds the same directory structure. Future backups will treat the already-backed-up files as present instead of re-copying everything. The destination backup files are not moved." />
+
+        <TextBlock Text="Remap from drive:"
+                   Foreground="{StaticResource TextSecondaryBrush}"
+                   FontSize="11" Margin="0,0,0,4" />
+        <ComboBox ItemsSource="{Binding SourceDriveItems}"
+                  SelectedItem="{Binding SelectedSourceDrive}"
+                  Padding="6,4" Margin="0,0,0,16" />
+
+        <TextBlock Text="To drive:"
+                   Foreground="{StaticResource TextSecondaryBrush}"
+                   FontSize="11" Margin="0,0,0,4" />
+        <ComboBox ItemsSource="{Binding TargetDriveItems}"
+                  SelectedItem="{Binding SelectedTargetDrive}"
+                  Padding="6,4" Margin="0,0,0,12" />
+
+        <TextBlock Text="{Binding PreviewText}"
+                   Foreground="{StaticResource TextDimBrush}"
+                   FontSize="11" FontStyle="Italic"
+                   TextWrapping="Wrap"
+                   Margin="0,0,0,4" />
+
+        <!-- Buttons -->
+        <StackPanel Orientation="Horizontal" HorizontalAlignment="Right"
+                    Margin="0,16,0,0">
+            <Button Content="Cancel" Padding="16,8" Margin="0,0,8,0"
+                    Cursor="Hand" IsCancel="True"
+                    Click="Cancel_Click" />
+            <Button Style="{StaticResource PrimaryButton}"
+                    Content="Remap" Padding="16,8"
+                    Cursor="Hand" IsDefault="True"
+                    Click="OK_Click" />
+        </StackPanel>
+    </StackPanel>
+</Window>

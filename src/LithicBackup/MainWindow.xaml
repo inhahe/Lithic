@@ -179,6 +179,9 @@
                                                                                     <MenuItem Header="Change Destination..."
                                                                                               Command="{Binding PlacementTarget.Tag.SetChangeDestCommand, RelativeSource={RelativeSource AncestorType=ContextMenu}}"
                                                                                               CommandParameter="{Binding}" />
+                                                                                    <MenuItem Header="Remap Source Drive..."
+                                                                                              Command="{Binding PlacementTarget.Tag.SetRemapSourceDriveCommand, RelativeSource={RelativeSource AncestorType=ContextMenu}}"
+                                                                                              CommandParameter="{Binding}" />
                                                                                     <MenuItem Header="Export..."
                                                                                               Command="{Binding PlacementTarget.Tag.SetExportCommand, RelativeSource={RelativeSource AncestorType=ContextMenu}}"
                                                                                               CommandParameter="{Binding}" />

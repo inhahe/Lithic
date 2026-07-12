@@ -166,6 +166,9 @@ public class MainViewModel : ViewModelBase
         SetChangeDestCommand = new RelayCommand(
             o => { if (o is BackupSetRowViewModel r) { SelectedBackupSet = r.Model; _ = ChangeDestinationAsync(); } },
             o => o is BackupSetRowViewModel r && !r.IsRunning && r.Model.JobOptions?.TargetDirectory is not null);
+        SetRemapSourceDriveCommand = new RelayCommand(
+            o => { if (o is BackupSetRowViewModel r) { SelectedBackupSet = r.Model; _ = RemapSourceDriveAsync(); } },
+            o => o is BackupSetRowViewModel r && !r.IsRunning);
         SetExportCommand = new RelayCommand(
             o => { if (o is BackupSetRowViewModel r) { SelectedBackupSet = r.Model; _ = ExportBackupSetAsync(); } },
             o => o is BackupSetRowViewModel);
@@ -286,6 +289,7 @@ public class MainViewModel : ViewModelBase
     public ICommand SetLargestFilesCommand { get; }
     public ICommand SetCopyCommand { get; }
     public ICommand SetChangeDestCommand { get; }
+    public ICommand SetRemapSourceDriveCommand { get; }
     public ICommand SetExportCommand { get; }
     public ICommand SetDeleteCommand { get; }
 
@@ -918,6 +922,158 @@ public class MainViewModel : ViewModelBase
         catch (Exception ex)
         {
             StatusText = $"Failed to change destination: {ex.Message}";
+        }
+    }
+
+    // -------------------------------------------------------------------
+    // Remap source drive
+    // -------------------------------------------------------------------
+
+    /// <summary>
+    /// Remap a source drive letter in the catalog: the data that used to live on
+    /// one drive (e.g. <c>E:\</c>) now lives on another (e.g. <c>F:\</c>) with the
+    /// same directory structure. Rewrites the source drive letter in every
+    /// catalog record's <c>SourcePath</c> and in the set's own source
+    /// configuration, so future backups treat the already-backed-up files as
+    /// present instead of re-copying everything. The destination backup files are
+    /// deliberately not moved — they migrate naturally as source files change.
+    /// </summary>
+    private async Task RemapSourceDriveAsync()
+    {
+        if (SelectedBackupSet is null) return;
+        var backupSet = SelectedBackupSet;
+
+        // Collect the distinct source drive letters currently in the set.
+        var sourceDrives = new SortedSet<char>();
+        foreach (var root in backupSet.SourceRoots)
+            if (DriveLetterOf(root) is char c) sourceDrives.Add(c);
+        if (backupSet.SourceSelections is not null)
+            CollectSelectionDrives(backupSet.SourceSelections, sourceDrives);
+
+        if (sourceDrives.Count == 0)
+        {
+            MessageBox.Show(
+                "This backup set has no drive-letter source paths to remap.",
+                "Remap Source Drive", MessageBoxButton.OK, MessageBoxImage.Information);
+            return;
+        }
+
+        // Per-drive catalog record counts (for the preview) and the ready drives
+        // available as remap targets (any present drive that isn't already one of
+        // the set's own sources). The drive enumeration can be slow, so run it off
+        // the UI thread.
+        Dictionary<char, int> counts;
+        List<char> targetDrives;
+        try
+        {
+            counts = new Dictionary<char, int>();
+            foreach (var d in sourceDrives)
+                counts[d] = await _catalog.CountFilesUnderSourcePrefixAsync(backupSet.Id, $"{d}:\\");
+
+            targetDrives = await Task.Run(() =>
+                DriveInfo.GetDrives()
+                    .Where(dr => dr.IsReady && dr.DriveType != DriveType.CDRom)
+                    .Select(dr => char.ToUpperInvariant(dr.Name[0]))
+                    .Where(c => !sourceDrives.Contains(c))
+                    .Distinct()
+                    .OrderBy(c => c)
+                    .ToList());
+        }
+        catch (Exception ex)
+        {
+            StatusText = $"Failed to prepare source-drive remap: {ex.Message}";
+            return;
+        }
+
+        if (targetDrives.Count == 0)
+        {
+            MessageBox.Show(
+                "No other ready drive is available to remap to. Connect the drive " +
+                "that now holds the source data (with the same directory structure) " +
+                "and try again.",
+                "Remap Source Drive", MessageBoxButton.OK, MessageBoxImage.Information);
+            return;
+        }
+
+        var vm = new RemapSourceDriveViewModel(sourceDrives.ToList(), targetDrives, counts);
+        var dialog = new RemapSourceDriveDialog
+        {
+            Owner = Application.Current.MainWindow,
+            DataContext = vm,
+        };
+        if (dialog.ShowDialog() != true) return;
+
+        if (vm.SourceDriveLetter is not char oldDrive || vm.TargetDriveLetter is not char newDrive)
+            return;
+        if (oldDrive == newDrive) return;
+
+        var confirm = MessageBox.Show(
+            $"Remap source drive {oldDrive}: → {newDrive}: for \"{backupSet.Name}\"?\n\n" +
+            $"{counts.GetValueOrDefault(oldDrive):N0} catalog record(s) recorded under " +
+            $"{oldDrive}:\\ will be treated as living under {newDrive}:\\ going forward, so " +
+            "future backups won't re-copy files that already exist.\n\n" +
+            $"Use this only when the data that was on {oldDrive}: now lives on {newDrive}: " +
+            "with the same directory structure. The destination backup files are not moved.",
+            "Remap Source Drive", MessageBoxButton.YesNo, MessageBoxImage.Question);
+        if (confirm != MessageBoxResult.Yes) return;
+
+        try
+        {
+            Mouse.OverrideCursor = Cursors.Wait;
+            int updated = await _catalog.RemapSourcePathPrefixAsync(
+                backupSet.Id, $"{oldDrive}:\\", $"{newDrive}:\\");
+
+            // Mirror the change in the set's own source configuration so scans,
+            // watchers and future selections use the new drive too.
+            for (int i = 0; i < backupSet.SourceRoots.Count; i++)
+                backupSet.SourceRoots[i] = RemapDriveInPath(backupSet.SourceRoots[i], oldDrive, newDrive);
+            if (backupSet.SourceSelections is not null)
+                RemapDriveInSelections(backupSet.SourceSelections, oldDrive, newDrive);
+
+            await _catalog.UpdateBackupSetAsync(backupSet);
+            StatusText = $"Remapped source drive {oldDrive}: → {newDrive}: ({updated:N0} record(s) updated).";
+        }
+        catch (Exception ex)
+        {
+            StatusText = $"Failed to remap source drive: {ex.Message}";
+        }
+        finally
+        {
+            Mouse.OverrideCursor = null;
+        }
+    }
+
+    /// <summary>Uppercase drive letter of a path like <c>E:\foo</c>, or null.</summary>
+    private static char? DriveLetterOf(string path) =>
+        path.Length >= 2 && path[1] == ':' && char.IsLetter(path[0])
+            ? char.ToUpperInvariant(path[0])
+            : null;
+
+    /// <summary>Add every drive letter present in a selection subtree.</summary>
+    private static void CollectSelectionDrives(IEnumerable<SourceSelection> nodes, SortedSet<char> drives)
+    {
+        foreach (var n in nodes)
+        {
+            if (DriveLetterOf(n.Path) is char c) drives.Add(c);
+            if (n.Children.Count > 0) CollectSelectionDrives(n.Children, drives);
+        }
+    }
+
+    /// <summary>
+    /// Replace the drive letter of <paramref name="path"/> when it matches
+    /// <paramref name="oldDrive"/> (case-insensitive), preserving the rest.
+    /// </summary>
+    private static string RemapDriveInPath(string path, char oldDrive, char newDrive) =>
+        path.Length >= 2 && path[1] == ':' && char.ToUpperInvariant(path[0]) == oldDrive
+            ? newDrive + path[1..]
+            : path;
+
+    private static void RemapDriveInSelections(IEnumerable<SourceSelection> nodes, char oldDrive, char newDrive)
+    {
+        foreach (var n in nodes)
+        {
+            n.Path = RemapDriveInPath(n.Path, oldDrive, newDrive);
+            if (n.Children.Count > 0) RemapDriveInSelections(n.Children, oldDrive, newDrive);
         }
     }
 

@@ -436,6 +436,12 @@ public class SqliteCatalogRepository : ICatalogRepository
     public Task<int> MarkFilesDeletedBySourcePathsAsync(int backupSetId, IEnumerable<string> sourcePaths, CancellationToken ct = default)
         => GetSet(backupSetId).MarkFilesDeletedBySourcePathsAsync(backupSetId, sourcePaths, ct);
 
+    public Task<int> CountFilesUnderSourcePrefixAsync(int backupSetId, string sourcePrefix, CancellationToken ct = default)
+        => GetSet(backupSetId).CountFilesUnderSourcePrefixAsync(backupSetId, sourcePrefix, ct);
+
+    public Task<int> RemapSourcePathPrefixAsync(int backupSetId, string oldPrefix, string newPrefix, CancellationToken ct = default)
+        => GetSet(backupSetId).RemapSourcePathPrefixAsync(backupSetId, oldPrefix, newPrefix, ct);
+
     // ---------------------------------------------------------------
     // File chunks (routed)
     // ---------------------------------------------------------------

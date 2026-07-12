@@ -711,6 +711,66 @@ internal sealed class SqliteSetDatabase : IDisposable
         return totalRows;
     }
 
+    public async Task<int> CountFilesUnderSourcePrefixAsync(
+        int backupSetId, string sourcePrefix, CancellationToken ct = default)
+    {
+        ct.ThrowIfCancellationRequested();
+        using var _ = await LockAsync(ct).ConfigureAwait(false);
+
+        var prefix = sourcePrefix.TrimEnd('\\') + "\\";
+
+        using var cmd = _connection.CreateCommand();
+        cmd.CommandText = """
+            SELECT COUNT(*) FROM Files
+            WHERE DiscId IN (SELECT Id FROM Discs WHERE BackupSetId = $setId)
+              AND SourcePath LIKE $prefix ESCAPE '\'
+            """;
+        cmd.Parameters.AddWithValue("$setId", backupSetId);
+        cmd.Parameters.AddWithValue("$prefix", EscapeLikePrefix(prefix) + "%");
+        return Convert.ToInt32(cmd.ExecuteScalar());
+    }
+
+    public async Task<int> RemapSourcePathPrefixAsync(
+        int backupSetId, string oldPrefix, string newPrefix, CancellationToken ct = default)
+    {
+        ct.ThrowIfCancellationRequested();
+        using var _ = await LockAsync(ct).ConfigureAwait(false);
+
+        // Normalise both prefixes to a trailing separator so we replace whole
+        // path segments only (a bare "E:" won't accidentally match "E:foo").
+        var oldP = oldPrefix.TrimEnd('\\') + "\\";
+        var newP = newPrefix.TrimEnd('\\') + "\\";
+
+        using var cmd = _connection.CreateCommand();
+        // Replace only the leading prefix: keep the tail after it verbatim.
+        // SUBSTR is 1-based, so start at oldP.Length + 1.
+        cmd.CommandText = """
+            UPDATE Files
+            SET SourcePath = $new || SUBSTR(SourcePath, $prefixLen + 1)
+            WHERE DiscId IN (SELECT Id FROM Discs WHERE BackupSetId = $setId)
+              AND SourcePath LIKE $prefix ESCAPE '\'
+            """;
+        cmd.Parameters.AddWithValue("$setId", backupSetId);
+        cmd.Parameters.AddWithValue("$new", newP);
+        cmd.Parameters.AddWithValue("$prefixLen", oldP.Length);
+        cmd.Parameters.AddWithValue("$prefix", EscapeLikePrefix(oldP) + "%");
+        return cmd.ExecuteNonQuery();
+    }
+
+    /// <summary>
+    /// Escape a literal path prefix for use in a <c>LIKE ... ESCAPE '\'</c>
+    /// pattern.  The escape character (backslash) must be doubled FIRST — Windows
+    /// paths are full of separators and under <c>ESCAPE '\'</c> every un-doubled
+    /// backslash would swallow the next character.  Then the LIKE wildcards
+    /// (<c>[</c>, <c>%</c>, <c>_</c>) are escaped.  Order matters: doubling
+    /// backslashes after adding those escapes would corrupt them.
+    /// </summary>
+    private static string EscapeLikePrefix(string prefix) => prefix
+        .Replace("\\", "\\\\")
+        .Replace("[", "\\[")
+        .Replace("%", "\\%")
+        .Replace("_", "\\_");
+
     private static FileRecord ReadFile(SqliteDataReader r) => new()
     {
         Id = r.GetInt64(r.GetOrdinal("Id")),
