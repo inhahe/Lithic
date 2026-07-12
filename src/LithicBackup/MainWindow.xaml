@@ -249,9 +249,18 @@
                                                                                                                 ConverterParameter=Invert,
                                                                                                                 FallbackValue=Collapsed}" />
 
-                                                                                        <!-- Burn/copy phase (Progress panel available) -->
-                                                                                        <StackPanel Visibility="{Binding HasProgress, Converter={StaticResource BoolToVis}}"
-                                                                                                    DataContext="{Binding Progress}">
+                                                                                        <!-- Burn/copy phase (Progress panel available).
+                                                                                             The Visibility MUST stay on an element whose DataContext is
+                                                                                             still the ROW VM. Putting Visibility and
+                                                                                             DataContext="{Binding Progress}" on the SAME element makes the
+                                                                                             Visibility binding resolve against Progress (or null during the
+                                                                                             scan): HasProgress can't be found, so Visibility silently
+                                                                                             defaults to Visible and this whole burn panel bleeds into the
+                                                                                             scan phase — empty bar, blank stats, phantom failed list, extra
+                                                                                             vertical space. So bind HasProgress on the OUTER element (row
+                                                                                             context) and only switch DataContext to Progress on the INNER. -->
+                                                                                        <StackPanel Visibility="{Binding HasProgress, Converter={StaticResource BoolToVis}}">
+                                                                                          <StackPanel DataContext="{Binding Progress}">
                                                                                             <!-- Status text (collapsed when empty so it reserves no blank line) -->
                                                                                             <TextBlock Text="{Binding StatusText}"
                                                                                                        FontSize="11"
@@ -404,6 +413,7 @@
                                                                                                     </ScrollViewer>
                                                                                                 </DockPanel>
                                                                                             </Border>
+                                                                                          </StackPanel>
                                                                                         </StackPanel>
                                                                                     </StackPanel>
                                                                                 </StackPanel>
