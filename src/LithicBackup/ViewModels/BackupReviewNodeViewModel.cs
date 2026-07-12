@@ -95,16 +95,9 @@ public class BackupReviewNodeViewModel : ViewModelBase
             if (_suppressPropagation)
                 return;
 
-            // Propagate down: set every child to the same definite state.
+            // Propagate down: set the entire subtree to the same definite state.
             if (value.HasValue && IsDirectory)
-            {
-                foreach (var child in Children)
-                {
-                    child._suppressPropagation = true;
-                    child.IsSelected = value;
-                    child._suppressPropagation = false;
-                }
-            }
+                SetSubtree(value.Value);
 
             // Propagate up: recompute the parent's tristate.
             Parent?.UpdateFromChildren();
@@ -131,6 +124,32 @@ public class BackupReviewNodeViewModel : ViewModelBase
         _suppressPropagation = false;
 
         Parent?.UpdateFromChildren();
+    }
+
+    /// <summary>
+    /// Recursively force every descendant to a definite selected state,
+    /// bypassing the per-node setter so children don't each re-propagate up.
+    /// Raises the change notifications needed to refresh each descendant's
+    /// checkbox and its size/count columns.
+    /// </summary>
+    private void SetSubtree(bool selected)
+    {
+        foreach (var child in Children)
+        {
+            if (child._isSelected != selected)
+            {
+                child._isSelected = selected;
+                child.OnPropertyChanged(nameof(IsSelected));
+            }
+
+            // Recurse before notifying so aggregated values reflect descendants.
+            child.SetSubtree(selected);
+
+            child.OnPropertyChanged(nameof(SelectedSizeBytes));
+            child.OnPropertyChanged(nameof(SelectedFileCount));
+            child.OnPropertyChanged(nameof(FormattedSize));
+            child.OnPropertyChanged(nameof(FormattedFileCount));
+        }
     }
 
     /// <summary>Sum of the sizes of all <em>selected</em> descendant files.</summary>
