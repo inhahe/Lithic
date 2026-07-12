@@ -1238,23 +1238,35 @@ public class OrphanedDirectoriesViewModel : ViewModelBase
         if (_activeFiles is null || _targetDir is null)
             return;
 
-        // Remove any prior destination-only items so re-scanning replaces
-        // (not duplicates) previous findings.
-        bool removedAny = false;
-        for (int i = Items.Count - 1; i >= 0; i--)
-        {
-            if (Items[i].Reason is OrphanedReason.UntrackedFile or OrphanedReason.CatalogDeleted)
-            {
-                Items.RemoveAt(i);
-                removedAny = true;
-            }
-        }
-
+        // Give immediate feedback the moment the button is pressed: flip the
+        // busy flag (greys the Scan button via CanExecute) and show a wait
+        // cursor.  The initialization below — clearing a potentially large
+        // Items collection and loading every catalog record — runs on the UI
+        // thread and can take a few seconds before the background walk starts,
+        // so without this the button stayed enabled and the cursor normal
+        // during that gap.
         IsScanningDestination = true;
         DestinationScanStatusText = "Scanning destination directory...";
+        Mouse.OverrideCursor = Cursors.Wait;
 
+        // Yield at Background priority so WPF actually renders the disabled
+        // button + wait cursor before we block the dispatcher clearing Items.
+        await Dispatcher.Yield(DispatcherPriority.Background);
+
+        bool removedAny = false;
         try
         {
+            // Remove any prior destination-only items so re-scanning replaces
+            // (not duplicates) previous findings.
+            for (int i = Items.Count - 1; i >= 0; i--)
+            {
+                if (Items[i].Reason is OrphanedReason.UntrackedFile or OrphanedReason.CatalogDeleted)
+                {
+                    Items.RemoveAt(i);
+                    removedAny = true;
+                }
+            }
+
             // Pull ALL records (including deleted) so we can detect the
             // CatalogDeleted category — _activeFiles excludes them by design.
             var allFiles = await _catalog.GetAllFilesForBackupSetAsync(_backupSet.Id);
@@ -1275,6 +1287,12 @@ public class OrphanedDirectoriesViewModel : ViewModelBase
 
             string targetDir = _targetDir;
             var progress = new Progress<string>(msg => DestinationScanStatusText = msg);
+
+            // Initialization is done; the walk below runs on a background
+            // thread with live progress text, so drop the wait cursor here —
+            // it only needed to cover the synchronous init gap above.  The
+            // button stays greyed (IsScanningDestination) for the whole walk.
+            Mouse.OverrideCursor = null;
 
             // Walk the destination on a background thread so the UI stays
             // responsive during multi-minute walks of large backups.
@@ -1347,6 +1365,7 @@ public class OrphanedDirectoriesViewModel : ViewModelBase
         finally
         {
             IsScanningDestination = false;
+            Mouse.OverrideCursor = null;
         }
     }
 
