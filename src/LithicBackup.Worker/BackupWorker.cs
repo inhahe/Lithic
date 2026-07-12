@@ -685,10 +685,14 @@ public sealed class BackupWorker : BackgroundService
                     else
                     {
                         // Couldn't relocate cleanly — back up the new side as fresh
-                        // files. The stale old-path copy is pruned by the next full
-                        // scan, matching how continuous deletes are reconciled.
+                        // files, then reconcile the now-vacated old path so its stale
+                        // record doesn't linger (a move's source departure is
+                        // unambiguous in the USN journal, so we act on it at once
+                        // rather than waiting for a full scan that never runs in
+                        // pure-continuous mode).
                         recopied++;
                         EnqueueForBackup(state, move.NewPath, move.IsDirectory, now);
+                        await MarkMovedOutAsync(set, move.OldPath, move.IsDirectory, ct);
                     }
                 }
                 else if (newIn)
@@ -696,8 +700,14 @@ public sealed class BackupWorker : BackgroundService
                     // Entered the set from outside — back up the new side as fresh.
                     EnqueueForBackup(state, move.NewPath, move.IsDirectory, now);
                 }
-                // else oldIn-only: the item left the set. Its removal is reconciled
-                // by the next full scan, consistent with continuous delete handling.
+                else
+                {
+                    // oldIn-only: the item moved out of the set's selection. Treat it
+                    // identically to a deletion — soft-delete its catalog record(s) so
+                    // version history is retained until the user's next cleanup purges
+                    // them. The moved item is NOT relocated on the destination.
+                    await MarkMovedOutAsync(set, move.OldPath, move.IsDirectory, ct);
+                }
             }
 
             if (relocated > 0 || recopied > 0)
@@ -747,6 +757,31 @@ public sealed class BackupWorker : BackgroundService
         else
         {
             state.Pending[path] = state.Pending.TryGetValue(path, out var t) ? (t.First, now) : (now, now);
+        }
+    }
+
+    /// <summary>
+    /// Reconcile a source path that has left the set — either moved to a location
+    /// outside the selection, or vacated by a within-set move that had to be
+    /// re-copied rather than relocated. The catalog record(s) are soft-deleted,
+    /// exactly as a full-scan deletion would mark them: version history (and the
+    /// destination copy) is retained until the user's next cleanup purges it. The
+    /// destination is never touched here.
+    /// </summary>
+    private async Task MarkMovedOutAsync(BackupSet set, string oldPath, bool isDirectory, CancellationToken ct)
+    {
+        try
+        {
+            if (isDirectory)
+                await _catalog.MarkFilesDeletedByDirectoryAsync(set.Id, oldPath, ct);
+            else
+                await _catalog.MarkFilesDeletedBySourcePathsAsync(set.Id, new[] { oldPath }, ct);
+        }
+        catch (Exception ex)
+        {
+            _logger.LogWarning(ex,
+                "Continuous backup for \"{Name}\": failed to reconcile moved-out path \"{Path}\".",
+                set.Name, oldPath);
         }
     }
 

@@ -650,9 +650,26 @@ JSON during relocation, and reuse the existing `UpdateFileRefContentPathsAsync` 
 lookup to repoint any fileref whose anchor moved out from under it. Deferred as a separate
 catalog-free-restore fidelity concern, not part of the move feature's primary correctness.
 
-**Not handled (by design, matches existing continuous-delete behavior):** an item moved
-**out** of a set's scope (e.g. to the Recycle Bin or another location outside the
-selection) is not marked deleted immediately — its removal is reconciled by the next full
-scan. Pure continuous mode has no periodic full rescan (see the journal-wrap issue
-above), so out-of-scope move-deletes rely on a manual/scheduled full run, same as
-in-place deletes.
+**Out-of-scope moves — now reconciled promptly (2026-07-12):** an item moved **out**
+of a set's scope (to the Recycle Bin or any location outside the selection) is now
+treated identically to a deletion, at once. `RunMovesAsync`'s `oldIn && !newIn`
+branch (and the within-set recopy fallback that vacates the old path) calls
+`MarkMovedOutAsync`, which soft-deletes the old path's catalog record(s)
+(`MarkFilesDeletedByDirectoryAsync` for a directory, `MarkFilesDeletedBySourcePathsAsync`
+for a file). This is safe to do immediately because a move is unambiguous in the USN
+journal (an explicit old→new FRN pair), unlike a bare delete which can be atomic-save
+churn. The moved item is **not** relocated on the destination — its destination copy
+and version history are retained until the user's next Cleanup purges them, exactly
+like a deleted file. Design decision (user, 2026-07-12): "moved-out files should be
+treated identically with deleted files … they shouldn't be retained in the catalog
+after the user does the next cleanup."
+
+**Still open — plain single-file deletes aren't reconciled in pure-continuous mode:**
+A bare source *delete* (not a move) in continuous mode is still deferred: `ExecuteTargetedAsync`
+skips missing paths (`continue`), relying on a full scan that never runs in pure-continuous
+mode. Cleanup's `DeletedFromDisk` only surfaces a record when its whole parent directory is
+gone, so an individual deleted file whose parent survives lingers as an active row until a
+scheduled/manual full run. This is intentionally NOT acted on promptly (a bare delete can be
+transient atomic-save churn, unlike an explicit move). Proper fix if it ever bites: debounce
+delete records and reconcile them after a quiet window, or add the periodic safety-net full
+scan for continuous sets noted in the journal-wrap entry above.
