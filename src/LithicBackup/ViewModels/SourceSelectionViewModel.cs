@@ -4,6 +4,7 @@ using System.IO;
 using System.Security.Cryptography;
 using System.Windows;
 using System.Windows.Input;
+using System.Windows.Threading;
 using LithicBackup.Core;
 using LithicBackup.Core.Interfaces;
 using LithicBackup.Core.Models;
@@ -77,6 +78,36 @@ public class SourceSelectionViewModel : ViewModelBase
     private bool _isAnalyzingDedup;
     private string _dedupAnalysisResult = "";
     private CancellationTokenSource? _dedupCts;
+
+    /// <summary>
+    /// Nodes whose checkbox was toggled but whose (potentially expensive)
+    /// propagation + size-aggregation work has been deferred off the click's
+    /// synchronous path.  Drained by <see cref="SettlePendingSelections"/> at
+    /// Background priority so the clicked checkbox repaints first.
+    /// </summary>
+    private readonly HashSet<SourceSelectionNodeViewModel> _pendingSelectionNodes = [];
+    /// <summary>True once a settle pass has been scheduled but not yet run.</summary>
+    private bool _selectionSettleScheduled;
+    /// <summary>
+    /// Completes when the currently-pending settle pass finishes.  Save awaits
+    /// this (with a busy cursor) so it never persists a half-propagated tree.
+    /// Null when nothing is pending.
+    /// </summary>
+    private TaskCompletionSource? _selectionSettleTcs;
+
+    /// <summary>
+    /// Raised just before a deferred selection-settle pass runs its
+    /// propagation/aggregation work.  The view uses this to snapshot the tree's
+    /// scroll offset so it can restore it after the pass — the propagation can
+    /// trigger a layout re-measure that would otherwise nudge the scroll.
+    /// </summary>
+    public event Action? SelectionSettleStarting;
+
+    /// <summary>
+    /// Raised right after a deferred selection-settle pass completes.  The view
+    /// restores the scroll offset captured on <see cref="SelectionSettleStarting"/>.
+    /// </summary>
+    public event Action? SelectionSettleCompleted;
 
     /// <summary>Fired when the user clicks "Next" with a valid selection.</summary>
     public event Action<List<SourceSelection>>? NextRequested;
@@ -954,16 +985,118 @@ public class SourceSelectionViewModel : ViewModelBase
     /// </summary>
     public SourceSelectionNodeViewModel? RootNode { get; private set; }
 
+    /// <summary>
+    /// Aggregate handler fired once per settle pass (not once per node): refresh
+    /// the has-selection flag and selected-size totals, invalidate the stale
+    /// size-calculation result, and notify external listeners.
+    /// </summary>
+    private void HandleSelectionChanged()
+    {
+        RefreshHasSelection();
+        RefreshSelectedSize();
+        SizeCalculationResult = "";
+        SelectionChanged?.Invoke();
+    }
+
+    /// <summary>
+    /// Called from a node's <see cref="SourceSelectionNodeViewModel.IsSelected"/>
+    /// setter to defer the expensive propagation/aggregation work off the click's
+    /// synchronous path.  Records the node, marks the set dirty synchronously (so
+    /// the Save button enables immediately even before the pass runs), and
+    /// schedules a single coalesced settle pass at Background priority — which
+    /// runs only after the clicked checkbox has had a chance to repaint.
+    /// </summary>
+    private void RequestSelectionSettle(SourceSelectionNodeViewModel node)
+    {
+        _pendingSelectionNodes.Add(node);
+
+        // Mark dirty right away.  The heavy aggregation is deferred, but the
+        // fact that *something* changed is known now, so the Save button should
+        // enable without waiting for the settle pass.
+        if (!string.IsNullOrEmpty(_saveStatusText))
+            SaveStatusText = "";
+        if (!_needsSave)
+        {
+            _needsSave = true;
+            CommandManager.InvalidateRequerySuggested();
+        }
+
+        if (_selectionSettleScheduled)
+            return;
+
+        _selectionSettleScheduled = true;
+        _selectionSettleTcs ??= new TaskCompletionSource(
+            TaskCreationOptions.RunContinuationsAsynchronously);
+
+        var dispatcher = Application.Current?.Dispatcher;
+        if (dispatcher is null)
+        {
+            // No dispatcher (tests) — settle inline.
+            SettlePendingSelections();
+            return;
+        }
+
+        dispatcher.BeginInvoke(DispatcherPriority.Background,
+            new Action(SettlePendingSelections));
+    }
+
+    /// <summary>
+    /// Drain the pending-selection set: propagate each toggled node's state to
+    /// its children/ancestors, then raise the aggregate notification once.
+    /// Completes the settle TCS so a waiting Save can proceed.
+    /// </summary>
+    private void SettlePendingSelections()
+    {
+        _selectionSettleScheduled = false;
+
+        if (_pendingSelectionNodes.Count > 0)
+        {
+            // Snapshot so re-entrant toggles during propagation queue a fresh
+            // pass rather than mutating the set we're iterating.
+            var nodes = _pendingSelectionNodes.ToList();
+            _pendingSelectionNodes.Clear();
+
+            // Let the view snapshot the scroll offset: propagation can trigger a
+            // layout re-measure that would otherwise nudge the tree's scroll.
+            SelectionSettleStarting?.Invoke();
+
+            foreach (var node in nodes)
+                node.PropagateSelection();
+
+            HandleSelectionChanged();
+
+            SelectionSettleCompleted?.Invoke();
+        }
+
+        var tcs = _selectionSettleTcs;
+        _selectionSettleTcs = null;
+        tcs?.TrySetResult();
+    }
+
+    /// <summary>
+    /// A task that completes when all pending selection work has settled.  If
+    /// nothing is pending, returns a completed task.  Save awaits this so it
+    /// never persists a half-propagated tree.
+    /// </summary>
+    private Task WaitForSelectionSettledAsync()
+    {
+        if (!_selectionSettleScheduled && _pendingSelectionNodes.Count == 0)
+            return Task.CompletedTask;
+        return (_selectionSettleTcs ??= new TaskCompletionSource(
+            TaskCreationOptions.RunContinuationsAsynchronously)).Task;
+    }
+
     private void LoadDriveRoots()
     {
         // Create a virtual "All Drives" root node.
         var root = new SourceSelectionNodeViewModel(
             "", true, null,
             () => ShowSizes, () => (_sortColumn, _sortAscending), _scheduler,
-            () => { RefreshHasSelection(); RefreshSelectedSize(); SizeCalculationResult = ""; SelectionChanged?.Invoke(); },
+            HandleSelectionChanged,
             () => ShowSelectedSizesOnly,
             _catalogInfo,
-            getExcludeFilter: () => GetExcludeFilter());
+            getExcludeFilter: () => GetExcludeFilter(),
+            requestSelectionSettle: RequestSelectionSettle);
         RootNode = root;
 
         // Mark as loaded BEFORE setting IsExpanded — otherwise the
@@ -1251,6 +1384,23 @@ public class SourceSelectionViewModel : ViewModelBase
 
     private async void OnSave()
     {
+        // A checkbox toggle defers its propagation/aggregation work to a
+        // Background-priority settle pass.  If one is still pending, wait for
+        // it (with a busy cursor) so we never serialise a half-propagated tree.
+        var pending = WaitForSelectionSettledAsync();
+        if (!pending.IsCompleted)
+        {
+            Mouse.OverrideCursor = Cursors.Wait;
+            try
+            {
+                await pending;
+            }
+            finally
+            {
+                Mouse.OverrideCursor = null;
+            }
+        }
+
         if (SaveRequested is not null)
             await SaveRequested.Invoke();
 

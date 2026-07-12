@@ -75,6 +75,14 @@ public class SourceSelectionNodeViewModel : ViewModelBase
     private readonly Func<bool>? _getShowSelectedOnly;
     private readonly Func<Func<string, bool>?>? _getExcludeFilter;
     private readonly Action? _onSelectionChanged;
+    /// <summary>
+    /// When set, a checkbox toggle defers its (potentially expensive)
+    /// propagation + size-aggregation work to the owning viewmodel, which
+    /// coalesces requests and runs them off the click's synchronous path so
+    /// the clicked checkbox repaints immediately.  Null (e.g. in tests) means
+    /// the work runs inline via <see cref="SettleSelection"/>.
+    /// </summary>
+    private readonly Action<SourceSelectionNodeViewModel>? _requestSelectionSettle;
     private readonly Dictionary<string, FileVersionInfo>? _catalogInfo;
 
     public SourceSelectionNodeViewModel(
@@ -84,7 +92,8 @@ public class SourceSelectionNodeViewModel : ViewModelBase
         SizeComputeScheduler? scheduler = null, Action? onSelectionChanged = null,
         Func<bool>? getShowSelectedOnly = null,
         Dictionary<string, FileVersionInfo>? catalogInfo = null,
-        Func<Func<string, bool>?>? getExcludeFilter = null)
+        Func<Func<string, bool>?>? getExcludeFilter = null,
+        Action<SourceSelectionNodeViewModel>? requestSelectionSettle = null)
     {
         Path = path;
         Name = System.IO.Path.GetFileName(path);
@@ -98,6 +107,7 @@ public class SourceSelectionNodeViewModel : ViewModelBase
         _onSelectionChanged = onSelectionChanged ?? parent?._onSelectionChanged;
         _getShowSelectedOnly = getShowSelectedOnly ?? parent?._getShowSelectedOnly;
         _getExcludeFilter = getExcludeFilter ?? parent?._getExcludeFilter;
+        _requestSelectionSettle = requestSelectionSettle ?? parent?._requestSelectionSettle;
         _catalogInfo = catalogInfo ?? parent?._catalogInfo;
         Depth = parent is null ? 0 : parent.Depth + 1;
         Children = [];
@@ -441,23 +451,56 @@ public class SourceSelectionNodeViewModel : ViewModelBase
             if (_suppressPropagation)
                 return;
 
-            // Propagate down: set all children to the same definite state.
-            if (value.HasValue && IsDirectory && _isLoaded)
-            {
-                foreach (var child in Children)
-                {
-                    child._suppressPropagation = true;
-                    child.IsSelected = value;
-                    child._suppressPropagation = false;
-                }
-            }
-
-            // Propagate up: recalculate parent's tristate.
-            Parent?.UpdateFromChildren();
-
-            // Notify the SourceSelectionViewModel so it can refresh the selected size.
-            _onSelectionChanged?.Invoke();
+            // The clicked checkbox's own visual state is already updated
+            // (OnPropertyChanged above).  Defer the rest — pushing the state
+            // down to loaded children, recomputing ancestor tristates, and the
+            // whole-tree size aggregation — so the checkbox can repaint before
+            // that (potentially multi-second) work runs.  The owning viewmodel
+            // coalesces requests and runs them at Background priority; Save
+            // waits for the pending pass.  With no viewmodel wired (tests) we
+            // fall back to running it inline.
+            if (_requestSelectionSettle is not null)
+                _requestSelectionSettle(this);
+            else
+                SettleSelection();
         }
+    }
+
+    /// <summary>
+    /// Push this node's current selection state down to loaded children and
+    /// recompute ancestor tristates.  Split out of the <see cref="IsSelected"/>
+    /// setter so the owning viewmodel can run it off the click's synchronous
+    /// path (letting the clicked checkbox repaint first).  Does NOT raise the
+    /// selection-changed aggregate — the caller does that once per coalesced
+    /// batch (see <see cref="SettleSelection"/> and the viewmodel's settle pass).
+    /// </summary>
+    internal void PropagateSelection()
+    {
+        var value = _isSelected;
+
+        // Propagate down: set all loaded children to the same definite state.
+        if (value.HasValue && IsDirectory && _isLoaded)
+        {
+            foreach (var child in Children)
+            {
+                child._suppressPropagation = true;
+                child.IsSelected = value;
+                child._suppressPropagation = false;
+            }
+        }
+
+        // Propagate up: recalculate parent's tristate.
+        Parent?.UpdateFromChildren();
+    }
+
+    /// <summary>
+    /// Inline fallback used when no viewmodel settle delegate is wired:
+    /// propagate the selection and raise the aggregate notification.
+    /// </summary>
+    internal void SettleSelection()
+    {
+        PropagateSelection();
+        _onSelectionChanged?.Invoke();
     }
 
     /// <summary>
