@@ -485,8 +485,9 @@ public class MainViewModel : ViewModelBase
         RestoreSourceSettings(sourceSelection, backupSet.JobOptions);
 
         // Selection restore and size computation are deferred to after the
-        // dialog is visible (see PostShowInitAsync below).  The view shows a
-        // "Restoring selections..." overlay while this runs.
+        // dialog is visible (see Phase 3 / PostShowInitAsync below).  The tree's
+        // include checkboxes stay hidden until the restore completes so the user
+        // never sees a column of unchecked boxes (IsApplyingSelections above).
         CancellationTokenSource? autoCheckCts = null;
         bool planCheckReady = false;
 
@@ -896,27 +897,14 @@ public class MainViewModel : ViewModelBase
         sourceSelection.IsApplyingSelections = true;
         try
         {
-            // Load the (potentially huge) catalog version dictionary now, on a
-            // background thread, and hand it to the VM BEFORE restoring selections
-            // so the restored subtrees stamp their backup-status badges directly.
-            var catalogInfo = await Task.Run(() =>
-            {
-                try { return _catalog.GetLatestVersionInfoAsync(backupSet.Id).GetAwaiter().GetResult(); }
-                catch { return null as Dictionary<string, Core.Models.FileVersionInfo>; }
-            });
-            sourceSelection.SetCatalogInfo(catalogInfo);
-
-            // Show catalog summary so the user knows files are already tracked
-            // (e.g. from a previous seed or backup).
-            if (catalogInfo is { Count: > 0 })
-            {
-                long totalBytes = 0;
-                foreach (var fvi in catalogInfo.Values)
-                    totalBytes += fvi.SizeBytes;
-                sourceSelection.SeedResult =
-                    $"{catalogInfo.Count:N0} files ({FormatBytes(totalBytes)}) in catalog.";
-            }
-
+            // Restore the checkboxes FIRST, without waiting on the catalog.
+            // Selection state comes entirely from the saved model; the catalog
+            // dictionary (potentially ~1M rows, several seconds to query) is only
+            // needed for backup-status badges and is loaded in the background
+            // afterwards (PostShowInitAsync). Restore also only loads the
+            // currently-expanded subtrees — collapsed folders restore their
+            // sub-selection lazily when expanded (see ApplySelectionAsync). Both
+            // of these keep the "checkboxes hidden" window as short as possible.
             if (backupSet.SourceSelections is { Count: > 0 })
                 await sourceSelection.ApplySelectionsAsync(backupSet.SourceSelections);
 
@@ -946,6 +934,29 @@ public class MainViewModel : ViewModelBase
 
         async Task PostShowInitAsync()
         {
+            // Now that the tree is visible and interactive, load the big catalog
+            // dictionary on a background thread and stamp backup-status badges on
+            // the already-loaded (visible) nodes. Collapsed folders pick up their
+            // badges when expanded, since new child nodes read the shared catalog
+            // getter (which SetCatalogInfo populates here).
+            var catalogInfo = await Task.Run(() =>
+            {
+                try { return _catalog.GetLatestVersionInfoAsync(backupSet.Id).GetAwaiter().GetResult(); }
+                catch { return null as Dictionary<string, Core.Models.FileVersionInfo>; }
+            });
+            sourceSelection.SetCatalogInfo(catalogInfo);
+
+            // Show catalog summary so the user knows files are already tracked
+            // (e.g. from a previous seed or backup).
+            if (catalogInfo is { Count: > 0 })
+            {
+                long totalBytes = 0;
+                foreach (var fvi in catalogInfo.Values)
+                    totalBytes += fvi.SizeBytes;
+                sourceSelection.SeedResult =
+                    $"{catalogInfo.Count:N0} files ({FormatBytes(totalBytes)}) in catalog.";
+            }
+
             await sourceSelection.ComputeAllUnknownSizesAsync();
             planCheckReady = true;
             autoCheckCts = new CancellationTokenSource();

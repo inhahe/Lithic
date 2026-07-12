@@ -69,6 +69,17 @@ public class SourceSelectionNodeViewModel : ViewModelBase
     /// selection survives until the user explicitly changes it.
     /// </summary>
     private List<Core.Models.SourceSelection>? _orphanedChildModels;
+    /// <summary>
+    /// Set when <see cref="ApplySelectionAsync"/> deferred restoring this
+    /// collapsed directory's child selections to keep the initial dialog open
+    /// fast (we only eagerly restore currently-visible/expanded subtrees).  The
+    /// saved subtree lives in <see cref="_restoredModel"/>; when the user later
+    /// expands this node, <see cref="LoadChildrenAsync"/> consumes this flag and
+    /// applies the saved child selections on top of the freshly-loaded children.
+    /// Until then, <see cref="ToModel"/>'s _restoredModel fallback keeps the save
+    /// lossless.
+    /// </summary>
+    private bool _pendingDeferredRestore;
     private long _size = -1;
     private int _fileCount = -1;
     /// <summary>
@@ -605,38 +616,36 @@ public class SourceSelectionNodeViewModel : ViewModelBase
         _autoIncludeNew = model.AutoIncludeNewSubdirectories;
         OnPropertyChanged(nameof(AutoIncludeNew));
 
+        // Decide whether to restore this subtree's children eagerly now, or
+        // defer it until the user expands the node.  To keep the initial dialog
+        // open snappy we only eagerly walk currently-visible subtrees: the
+        // permanently-expanded virtual root (Parent is null) and any node the
+        // saved model had expanded.  Collapsed subtrees are deferred — their
+        // saved child selections are re-applied on first expand (see
+        // LoadChildrenAsync), and until then ToModel's _restoredModel fallback
+        // keeps the save lossless.
+        bool restoreChildrenNow = model.IsExpanded || Parent is null;
+
         // If this directory has child selections to restore, load children
         // and apply.  Suppress size computation during this phase — we're
         // restoring saved state, not responding to a user click.
         if (IsDirectory && model.Children.Count > 0)
         {
-            _suppressSizeComputation = true;
-            await EnsureChildrenLoadedAsync();
-            _suppressSizeComputation = false;
-
-            // Apply sibling subtrees concurrently — each child's
-            // filesystem enumeration runs on the thread pool, so
-            // siblings overlap instead of serialising.
-            var tasks = new List<Task>(model.Children.Count);
-            foreach (var childModel in model.Children)
+            if (restoreChildrenNow)
             {
-                var childNode = Children.FirstOrDefault(c =>
-                    string.Equals(c.Path, childModel.Path, StringComparison.OrdinalIgnoreCase));
-                if (childNode is not null)
-                {
-                    tasks.Add(childNode.ApplySelectionAsync(childModel));
-                }
-                else if (childModel.IsSelected != false)
-                {
-                    // The saved selection referenced a child that is no longer
-                    // on disk (renamed/moved/disconnected).  Preserve it so a
-                    // later save (ToModel) doesn't silently drop the selection;
-                    // if the path comes back under its original name it will be
-                    // backed up again.
-                    (_orphanedChildModels ??= []).Add(childModel);
-                }
+                _suppressSizeComputation = true;
+                await EnsureChildrenLoadedAsync();
+                _suppressSizeComputation = false;
+
+                await ApplyChildModelsAsync(model.Children);
             }
-            await Task.WhenAll(tasks);
+            else
+            {
+                // Defer: remember that this collapsed directory still owes a
+                // child-selection restore.  _restoredModel (set above) holds the
+                // saved subtree; LoadChildrenAsync re-applies it on first expand.
+                _pendingDeferredRestore = true;
+            }
         }
 
         // Restore expansion state from the saved model.  Children are
@@ -660,6 +669,40 @@ public class SourceSelectionNodeViewModel : ViewModelBase
             IsExpanded = model.IsExpanded;
             _isApplyingSelection = false;
         }
+    }
+
+    /// <summary>
+    /// Apply a set of saved child <see cref="Core.Models.SourceSelection"/>
+    /// models to this node's already-loaded children, recursing into each.
+    /// Saved children whose paths are no longer present on disk are preserved as
+    /// orphans (see <see cref="_orphanedChildModels"/>) so a later save doesn't
+    /// silently drop them.  Sibling subtrees are applied concurrently — each
+    /// child's filesystem enumeration runs on the thread pool, so siblings
+    /// overlap instead of serialising.
+    /// </summary>
+    private async Task ApplyChildModelsAsync(
+        IReadOnlyList<Core.Models.SourceSelection> childModels)
+    {
+        var tasks = new List<Task>(childModels.Count);
+        foreach (var childModel in childModels)
+        {
+            var childNode = Children.FirstOrDefault(c =>
+                string.Equals(c.Path, childModel.Path, StringComparison.OrdinalIgnoreCase));
+            if (childNode is not null)
+            {
+                tasks.Add(childNode.ApplySelectionAsync(childModel));
+            }
+            else if (childModel.IsSelected != false)
+            {
+                // The saved selection referenced a child that is no longer
+                // on disk (renamed/moved/disconnected).  Preserve it so a
+                // later save (ToModel) doesn't silently drop the selection;
+                // if the path comes back under its original name it will be
+                // backed up again.
+                (_orphanedChildModels ??= []).Add(childModel);
+            }
+        }
+        await Task.WhenAll(tasks);
     }
 
     /// <summary>
@@ -773,6 +816,16 @@ public class SourceSelectionNodeViewModel : ViewModelBase
             // sizes still need async computation the name sort is applied
             // now, and ComputePrioritySizesAsync re-sorts once sizes arrive.
             SortChildren();
+
+            // If this directory's saved child selections were deferred (it was
+            // collapsed during the initial restore), re-apply them now that the
+            // children exist.  This runs the first time the user expands the node.
+            if (_pendingDeferredRestore && _restoredModel is not null)
+            {
+                _pendingDeferredRestore = false;
+                await ApplyChildModelsAsync(_restoredModel.Children);
+                SortChildren();
+            }
 
             // Compute aggregate backup status for this directory.
             if (_getCatalogInfo?.Invoke() is not null)
