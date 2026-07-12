@@ -168,13 +168,78 @@ public class BackupReviewNodeViewModel : ViewModelBase
     public string FormattedFileCount
         => IsDirectory ? $"{SelectedFileCount:N0}" : string.Empty;
 
-    /// <summary>Status label ("New"/"Changed") for file rows; empty for directories.</summary>
-    public string StatusText => Status switch
+    /// <summary>
+    /// Total size in bytes of every delta file under this node, regardless of
+    /// selection.  Used as a stable sort key (unlike <see cref="SelectedSizeBytes"/>,
+    /// which changes as the user toggles checkboxes).
+    /// </summary>
+    public long TotalSizeBytes
     {
-        ReviewFileStatus.New => "New",
-        ReviewFileStatus.Changed => "Changed",
-        _ => string.Empty,
-    };
+        get
+        {
+            if (!IsDirectory)
+                return OwnSizeBytes;
+            long total = 0;
+            foreach (var child in Children)
+                total += child.TotalSizeBytes;
+            return total;
+        }
+    }
+
+    /// <summary>Total count of delta files under this node, regardless of selection.</summary>
+    public int TotalFileCount
+    {
+        get
+        {
+            if (!IsDirectory)
+                return 1;
+            int total = 0;
+            foreach (var child in Children)
+                total += child.TotalFileCount;
+            return total;
+        }
+    }
+
+    /// <summary>
+    /// Status label for the row.  File rows show their own "New"/"Changed".
+    /// Directory rows aggregate their descendants: "New" (all new), "Changed"
+    /// (all changed), or "Mixed" (both present).
+    /// </summary>
+    public string StatusText
+    {
+        get
+        {
+            if (!IsDirectory)
+                return Status switch
+                {
+                    ReviewFileStatus.New => "New",
+                    ReviewFileStatus.Changed => "Changed",
+                    _ => string.Empty,
+                };
+
+            var (anyNew, anyChanged) = AggregateStatus();
+            if (anyNew && anyChanged) return "Mixed";
+            if (anyNew) return "New";
+            if (anyChanged) return "Changed";
+            return string.Empty;
+        }
+    }
+
+    /// <summary>Walk descendants to determine which statuses are present.</summary>
+    private (bool anyNew, bool anyChanged) AggregateStatus()
+    {
+        if (!IsDirectory)
+            return (Status == ReviewFileStatus.New, Status == ReviewFileStatus.Changed);
+
+        bool anyNew = false, anyChanged = false;
+        foreach (var child in Children)
+        {
+            var (cn, cc) = child.AggregateStatus();
+            anyNew |= cn;
+            anyChanged |= cc;
+        }
+        return (anyNew, anyChanged);
+    }
 
     private void RefreshSizeSelfAndAncestors()
     {

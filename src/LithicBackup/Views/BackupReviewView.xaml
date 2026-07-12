@@ -116,11 +116,19 @@
                                                VerticalAlignment="Center" HorizontalAlignment="Center" />
                                 </Border>
                                 <Border Grid.Column="1"
+                                        Background="Transparent" Cursor="Hand"
+                                        ToolTip="Sort by name"
                                         BorderBrush="{StaticResource BorderBrush}"
                                         BorderThickness="0,0,1,1"
                                         Padding="4,6">
-                                    <TextBlock Text="Name" FontSize="11"
-                                               Foreground="{StaticResource TextSecondaryBrush}" />
+                                    <Border.InputBindings>
+                                        <MouseBinding MouseAction="LeftClick"
+                                                      Command="{Binding SortByNameCommand}" />
+                                    </Border.InputBindings>
+                                    <TextBlock FontSize="11"
+                                               Foreground="{StaticResource TextSecondaryBrush}">
+                                        <Run Text="Name" /><Run Text="{Binding NameSortIndicator, Mode=OneWay}" />
+                                    </TextBlock>
                                 </Border>
                                 <Border Grid.Column="2"
                                         BorderBrush="{StaticResource BorderBrush}"
@@ -130,20 +138,36 @@
                                                Foreground="{StaticResource TextSecondaryBrush}" />
                                 </Border>
                                 <Border Grid.Column="3"
+                                        Background="Transparent" Cursor="Hand"
+                                        ToolTip="Sort by file count"
                                         BorderBrush="{StaticResource BorderBrush}"
                                         BorderThickness="0,0,1,1"
                                         Padding="8,6">
-                                    <TextBlock Text="Files" FontSize="11"
+                                    <Border.InputBindings>
+                                        <MouseBinding MouseAction="LeftClick"
+                                                      Command="{Binding SortByFilesCommand}" />
+                                    </Border.InputBindings>
+                                    <TextBlock FontSize="11"
                                                Foreground="{StaticResource TextSecondaryBrush}"
-                                               TextAlignment="Right" />
+                                               TextAlignment="Right">
+                                        <Run Text="Files" /><Run Text="{Binding FilesSortIndicator, Mode=OneWay}" />
+                                    </TextBlock>
                                 </Border>
                                 <Border Grid.Column="4"
+                                        Background="Transparent" Cursor="Hand"
+                                        ToolTip="Sort by size"
                                         BorderBrush="{StaticResource BorderBrush}"
                                         BorderThickness="0,0,0,1"
                                         Padding="8,6">
-                                    <TextBlock Text="Size" FontSize="11"
+                                    <Border.InputBindings>
+                                        <MouseBinding MouseAction="LeftClick"
+                                                      Command="{Binding SortBySizeCommand}" />
+                                    </Border.InputBindings>
+                                    <TextBlock FontSize="11"
                                                Foreground="{StaticResource TextSecondaryBrush}"
-                                               TextAlignment="Right" />
+                                               TextAlignment="Right">
+                                        <Run Text="Size" /><Run Text="{Binding SizeSortIndicator, Mode=OneWay}" />
+                                    </TextBlock>
                                 </Border>
                             </Grid>
 

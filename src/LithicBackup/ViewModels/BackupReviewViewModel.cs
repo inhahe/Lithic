@@ -7,6 +7,14 @@ using Brushes = System.Windows.Media.Brushes;
 
 namespace LithicBackup.ViewModels;
 
+/// <summary>Which column the review tree is sorted by.</summary>
+public enum ReviewSortColumn
+{
+    Name,
+    Files,
+    Size,
+}
+
 /// <summary>
 /// Post-scan review dialog: shows the files that will actually be backed up
 /// (the incremental delta) in a tristate treeview, with per-directory/file
@@ -19,6 +27,10 @@ public class BackupReviewViewModel : ViewModelBase
     private readonly long _freeBytes;
     private readonly bool _hasFreeSpaceInfo;
     private bool _removeDeselectedFromSources;
+
+    // Sort state — defaults to largest-first by size.
+    private ReviewSortColumn _sortColumn = ReviewSortColumn.Size;
+    private bool _sortDescending = true;
 
     /// <summary>Fired when the user confirms the (possibly filtered) backup.</summary>
     public event Action? ProceedRequested;
@@ -69,6 +81,13 @@ public class BackupReviewViewModel : ViewModelBase
             foreach (var root in Roots)
                 CollapseRecursive(root);
         });
+
+        SortByNameCommand = new RelayCommand(_ => ToggleSort(ReviewSortColumn.Name));
+        SortByFilesCommand = new RelayCommand(_ => ToggleSort(ReviewSortColumn.Files));
+        SortBySizeCommand = new RelayCommand(_ => ToggleSort(ReviewSortColumn.Size));
+
+        // Apply the default sort (size, largest first).
+        ApplySort();
     }
 
     // --- Properties ---
@@ -159,6 +178,19 @@ public class BackupReviewViewModel : ViewModelBase
     public ICommand DeselectAllCommand { get; }
     public ICommand ExpandAllCommand { get; }
     public ICommand CollapseAllCommand { get; }
+    public ICommand SortByNameCommand { get; }
+    public ICommand SortByFilesCommand { get; }
+    public ICommand SortBySizeCommand { get; }
+
+    // --- Sort indicators (arrow suffixes for the active column header) ---
+
+    public string NameSortIndicator => SortIndicator(ReviewSortColumn.Name);
+    public string FilesSortIndicator => SortIndicator(ReviewSortColumn.Files);
+    public string SizeSortIndicator => SortIndicator(ReviewSortColumn.Size);
+
+    private string SortIndicator(ReviewSortColumn column)
+        => _sortColumn != column ? string.Empty
+            : _sortDescending ? " \u25BC" : " \u25B2";
 
     // --- Results (read after Confirmed) ---
 
@@ -310,22 +342,77 @@ public class BackupReviewViewModel : ViewModelBase
             dirNode.Children.Add(fileNode);
         }
 
-        // Sort children: directories first, then files, both by name.
-        foreach (var node in dirNodes.Values)
-            SortChildren(node);
-
-        roots.Sort((a, b) => string.Compare(a.Name, b.Name, StringComparison.OrdinalIgnoreCase));
+        // Ordering is applied afterwards by ApplySort() using the current
+        // sort column/direction (default: size, largest first).
         return roots;
     }
 
-    private static void SortChildren(BackupReviewNodeViewModel node)
+    // --- Sorting ---
+
+    private void ToggleSort(ReviewSortColumn column)
     {
-        var sorted = node.Children
-            .OrderByDescending(c => c.IsDirectory)
-            .ThenBy(c => c.Name, StringComparer.OrdinalIgnoreCase)
-            .ToList();
+        if (_sortColumn == column)
+        {
+            _sortDescending = !_sortDescending;
+        }
+        else
+        {
+            _sortColumn = column;
+            // Name defaults to A→Z; size/files default to largest-first.
+            _sortDescending = column != ReviewSortColumn.Name;
+        }
+
+        ApplySort();
+        OnPropertyChanged(nameof(NameSortIndicator));
+        OnPropertyChanged(nameof(FilesSortIndicator));
+        OnPropertyChanged(nameof(SizeSortIndicator));
+    }
+
+    private void ApplySort()
+    {
+        var sortedRoots = OrderNodes(Roots).ToList();
+        Roots.Clear();
+        foreach (var root in sortedRoots)
+        {
+            Roots.Add(root);
+            SortChildrenRecursive(root);
+        }
+    }
+
+    private void SortChildrenRecursive(BackupReviewNodeViewModel node)
+    {
+        if (node.Children.Count == 0)
+            return;
+
+        var sorted = OrderNodes(node.Children).ToList();
         node.Children.Clear();
-        foreach (var c in sorted)
-            node.Children.Add(c);
+        foreach (var child in sorted)
+        {
+            node.Children.Add(child);
+            SortChildrenRecursive(child);
+        }
+    }
+
+    private IEnumerable<BackupReviewNodeViewModel> OrderNodes(
+        IEnumerable<BackupReviewNodeViewModel> nodes)
+    {
+        IOrderedEnumerable<BackupReviewNodeViewModel> ordered = _sortColumn switch
+        {
+            ReviewSortColumn.Size => _sortDescending
+                ? nodes.OrderByDescending(n => n.TotalSizeBytes)
+                : nodes.OrderBy(n => n.TotalSizeBytes),
+            ReviewSortColumn.Files => _sortDescending
+                ? nodes.OrderByDescending(n => n.TotalFileCount)
+                : nodes.OrderBy(n => n.TotalFileCount),
+            // Name: keep directories grouped ahead of files, then alphabetical.
+            _ => _sortDescending
+                ? nodes.OrderByDescending(n => n.IsDirectory)
+                       .ThenByDescending(n => n.Name, StringComparer.OrdinalIgnoreCase)
+                : nodes.OrderByDescending(n => n.IsDirectory)
+                       .ThenBy(n => n.Name, StringComparer.OrdinalIgnoreCase),
+        };
+
+        // Stable tiebreaker so equal sizes/counts stay alphabetical.
+        return ordered.ThenBy(n => n.Name, StringComparer.OrdinalIgnoreCase);
     }
 }
