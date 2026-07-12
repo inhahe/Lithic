@@ -59,28 +59,45 @@ foreach ($exe in @("LithicBackup.exe", "LithicBackup.Worker.exe")) {
     if (-not (Test-Path (Join-Path $publish $exe))) { throw "Expected $exe missing from publish output." }
 }
 
-# --- 2. Ensure the WiX tool + UI extension are available -----------------------
+# --- 2. Ensure the WiX tool + required extensions are available ----------------
 if (-not (Get-Command wix -ErrorAction SilentlyContinue)) {
     Write-Host "Installing WiX dotnet tool..." -ForegroundColor Yellow
     dotnet tool install --global wix
     if ($LASTEXITCODE -ne 0) { throw "Failed to install the wix tool." }
 }
 
-# Add the required extensions globally if they aren't already registered.
+# Extensions must match the wix tool's version exactly.  Adding an extension
+# without a version pulls the LATEST from NuGet (e.g. 7.x), which fails to load
+# against a v5 tool with WIX6101 ("Could not find expected package root folder
+# wixext5").  So discover the tool's own version and pin every extension to it.
+$wixVer = (& wix --version 2>$null | Select-Object -First 1)
+if ($wixVer) { $wixVer = ($wixVer -split '\+')[0].Trim() }   # strip build metadata
+
+function Ensure-WixExtension {
+    param([string] $Name)
+
+    $exts   = (& wix extension list -g) 2>$null
+    $wanted = if ($wixVer) { "$Name $wixVer" } else { $Name }
+    if ($exts -match [regex]::Escape($wanted)) { return }   # correct version already present
+
+    # A wrong-version copy would shadow the pinned add, so remove it first.
+    if ($exts -match [regex]::Escape($Name)) {
+        Write-Host "Removing mismatched $Name..." -ForegroundColor Yellow
+        & wix extension remove -g $Name 2>$null | Out-Null
+    }
+
+    $spec = if ($wixVer) { "$Name/$wixVer" } else { $Name }
+    Write-Host "Adding $spec..." -ForegroundColor Yellow
+    & wix extension add -g $spec
+    if ($LASTEXITCODE -ne 0) { throw "Failed to add $spec." }
+}
+
+# Required extensions:
 #   * UI   — the classic install wizard (WixUI_InstallDir).
 #   * Util — the WixShellExec custom action behind the "Launch Lithic Backup"
 #            checkbox on the exit dialog (Wix4UtilCA_X64 / WixShellExec).
-$exts = (& wix extension list -g) 2>$null
-if ($exts -notmatch "WixToolset.UI.wixext") {
-    Write-Host "Adding WiX UI extension..." -ForegroundColor Yellow
-    wix extension add -g WixToolset.UI.wixext
-    if ($LASTEXITCODE -ne 0) { throw "Failed to add WixToolset.UI.wixext." }
-}
-if ($exts -notmatch "WixToolset.Util.wixext") {
-    Write-Host "Adding WiX Util extension..." -ForegroundColor Yellow
-    wix extension add -g WixToolset.Util.wixext
-    if ($LASTEXITCODE -ne 0) { throw "Failed to add WixToolset.Util.wixext." }
-}
+Ensure-WixExtension "WixToolset.UI.wixext"
+Ensure-WixExtension "WixToolset.Util.wixext"
 
 # --- 3. Compile the MSI -------------------------------------------------------
 $msi = Join-Path $here ("LithicBackup-{0}-x64.msi" -f $Version)
