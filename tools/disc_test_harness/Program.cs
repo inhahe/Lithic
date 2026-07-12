@@ -403,6 +403,66 @@ await runner.Run("file-grows-between-plan-and-burn", async ws =>
     ws.Assert(r.Restored == srcs.Count, $"restored {r.Restored}/{srcs.Count} files");
 });
 
+// ------------------------------------------------------------------
+// Burn-in-place: plain files burned directly from source (no temp copy)
+// ------------------------------------------------------------------
+
+await runner.Run("burn-in-place-basic", async ws =>
+{
+    // Several plain files spanning two discs, burned in-place (no temp copy).
+    // The burn must read straight from the source under a held read lock, and
+    // restore must reproduce every file byte-for-byte.
+    var srcs = ws.MakeTree(
+        ("p/a.bin", 120_000), ("p/b.bin", 120_000),
+        ("p/c.bin", 120_000), ("p/d.bin", 120_000));
+    var (burner, result) = await ws.Backup(srcs,
+        capacityBytes: 300_000,
+        stagingMode: DiscStagingMode.InPlace);
+
+    ws.Assert(result.Success, "in-place backup should succeed");
+
+    var discs = await ws.Catalog.GetDiscsForBackupSetAsync(ws.BackupSetId);
+    ws.Assert(discs.Count >= 2, $"4x120KB over 300KB discs should need >=2 discs, got {discs.Count}");
+
+    long overflow = ws.MaxDiscOverflowBytes(burner, 300_000);
+    ws.Assert(overflow == 0, $"a disc overflowed capacity by {overflow} bytes");
+
+    var r = await ws.RestoreAndVerify(burner, srcs);
+    ws.Assert(r.Mismatches == 0, $"{r.Mismatches} restored file(s) had wrong content");
+    ws.Assert(r.Restored == srcs.Count, $"restored {r.Restored}/{srcs.Count} files");
+});
+
+await runner.Run("burn-in-place-growth-safe", async ws =>
+{
+    // The growth-safety guarantee must also hold in burn-in-place mode: a file
+    // that grows after planning is re-checked under the read lock taken at
+    // staging time, re-queued at its true size, and bumped to a later disc so
+    // no disc overflows. Restore yields the grown content read from the source.
+    var srcs = ws.MakeTree(("g/a.bin", 80_000), ("g/b.bin", 80_000), ("g/c.bin", 80_000));
+    string grownPath = srcs[0];
+    var grown = TestRunner.Gen(4242, 250_000);
+    var (burner, result) = await ws.Backup(srcs,
+        capacityBytes: 300_000,
+        stagingMode: DiscStagingMode.InPlace,
+        betweenPlanAndExecute: () => { File.WriteAllBytes(grownPath, grown); return Task.CompletedTask; });
+
+    ws.Assert(result.Success, "in-place backup should succeed despite the file growing");
+
+    var discs = await ws.Catalog.GetDiscsForBackupSetAsync(ws.BackupSetId);
+    ws.Assert(discs.Count >= 2, $"grown file should have been bumped to a 2nd disc, got {discs.Count}");
+
+    long overflow = ws.MaxDiscOverflowBytes(burner, 300_000);
+    ws.Assert(overflow == 0, $"a disc overflowed capacity by {overflow} bytes");
+
+    var records = await ws.AllFileRecords();
+    var rec = records.First(r => r.SourcePath == grownPath && !r.IsDeleted);
+    ws.Assert(rec.SizeBytes == grown.Length,
+        $"recorded size {rec.SizeBytes} should equal grown size {grown.Length}");
+
+    var r = await ws.RestoreAndVerify(burner, srcs);
+    ws.Assert(r.Mismatches == 0, $"{r.Mismatches} restored file(s) had wrong content");
+});
+
 return runner.Report();
 
 // ======================================================================
@@ -553,7 +613,8 @@ sealed class Workspace : IDisposable
         FailureCallback? onFailure = null,
         SimulatedDiscBurner? burner = null,
         Action<SimulatedDiscBurner>? configure = null,
-        Func<Task>? betweenPlanAndExecute = null)
+        Func<Task>? betweenPlanAndExecute = null,
+        DiscStagingMode stagingMode = DiscStagingMode.TemporaryCopy)
     {
         burner ??= NewBurner(configure);
 
@@ -584,6 +645,7 @@ sealed class Workspace : IDisposable
             FilesystemType = filesystemType,
             VerifyAfterBurn = true,
             CapacityOverrideBytes = useCapacityOverride ? capacityBytes : null,
+            StagingMode = stagingMode,
         };
 
         var plan = await orchestrator.PlanAsync(job);

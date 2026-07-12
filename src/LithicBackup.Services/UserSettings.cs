@@ -26,6 +26,15 @@ public class UserSettings
     /// </summary>
     public MemoryBudgetOptions MemoryBudget { get; set; } = new();
 
+    /// <summary>
+    /// How plain files are supplied to the disc burner. <see cref="DiscStagingMode.TemporaryCopy"/>
+    /// (default) copies each file to temp before burning; <see cref="DiscStagingMode.InPlace"/>
+    /// burns directly from the source under a held read lock (no temp copy),
+    /// which avoids needing temp space for large media but locks source files
+    /// for the duration of the burn. Applies to all disc backups.
+    /// </summary>
+    public DiscStagingMode DiscStagingMode { get; set; } = DiscStagingMode.TemporaryCopy;
+
     public static UserSettings Load()
     {
         try

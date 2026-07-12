@@ -63,6 +63,14 @@ public class BackupJob
     /// <summary>Whether to verify data after burning.</summary>
     public bool VerifyAfterBurn { get; set; } = true;
 
+    /// <summary>
+    /// How plain files are supplied to the burner. This is a machine/runtime
+    /// preference stamped onto the job from global user settings (like
+    /// <see cref="MemoryBudget"/>), not persisted per-set. Defaults to
+    /// <see cref="DiscStagingMode.TemporaryCopy"/>.
+    /// </summary>
+    public DiscStagingMode StagingMode { get; set; } = DiscStagingMode.TemporaryCopy;
+
     /// <summary>Whether to verify files after a directory backup completes.</summary>
     public bool VerifyAfterBackup { get; set; }
 

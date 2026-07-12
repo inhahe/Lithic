@@ -14,12 +14,14 @@ public interface IDiscBurner
     Task<MediaInfo> GetMediaInfoAsync(string recorderId, CancellationToken ct = default);
 
     /// <summary>
-    /// Burn files to disc. <paramref name="sourceDirectory"/> is a staging directory
-    /// whose contents are written to the disc image.
+    /// Burn a set of files to disc. Each <see cref="BurnItem"/> maps a path as it
+    /// should appear on the disc to the absolute path of the source bytes to read.
+    /// The source may be a temporary staging copy or, in burn-in-place mode, the
+    /// original file held under a read lock for the duration of the burn.
     /// </summary>
     Task BurnAsync(
         string recorderId,
-        string sourceDirectory,
+        IReadOnlyList<BurnItem> items,
         BurnOptions options,
         IProgress<BurnProgress>? progress = null,
         CancellationToken ct = default);
@@ -30,6 +32,20 @@ public interface IDiscBurner
     /// <summary>Check whether the recorder supports multisession with the current media.</summary>
     Task<bool> CanMultisessionAsync(string recorderId, CancellationToken ct = default);
 }
+
+/// <summary>
+/// One file to be written to a disc.
+/// </summary>
+/// <param name="DiscRelativePath">
+/// The file's path as it should appear on the burned disc (relative to the disc
+/// root, e.g. <c>"C\Users\me\photo.jpg"</c>).
+/// </param>
+/// <param name="SourceAbsolutePath">
+/// Absolute path of the bytes to read for this file. Either a temporary staging
+/// copy or, in burn-in-place mode, the original source file (held under a read
+/// lock by the caller so it cannot change before the burn completes).
+/// </param>
+public sealed record BurnItem(string DiscRelativePath, string SourceAbsolutePath);
 
 /// <summary>Information about the currently inserted media.</summary>
 public class MediaInfo

@@ -153,25 +153,21 @@ public class SimulatedDiscBurner : IDiscBurner
 
     public async Task BurnAsync(
         string recorderId,
-        string sourceDirectory,
+        IReadOnlyList<BurnItem> items,
         BurnOptions options,
         IProgress<BurnProgress>? progress = null,
         CancellationToken ct = default)
     {
         var state = GetRecorderState(recorderId);
 
-        // Enumerate the staging directory to get real file names and sizes.
-        var files = Directory.Exists(sourceDirectory)
-            ? Directory.GetFiles(sourceDirectory, "*", SearchOption.AllDirectories)
-            : [];
-
+        // Read each item's real name and size from its source path (a temp
+        // staging copy or an in-place original held under a read lock).
         long totalBytes = 0;
         var fileInfos = new List<(string FullPath, string RelativePath, long Size)>();
-        foreach (var f in files)
+        foreach (var item in items)
         {
-            var fi = new FileInfo(f);
-            string rel = Path.GetRelativePath(sourceDirectory, f);
-            fileInfos.Add((f, rel, fi.Length));
+            var fi = new FileInfo(item.SourceAbsolutePath);
+            fileInfos.Add((item.SourceAbsolutePath, item.DiscRelativePath, fi.Length));
             totalBytes += fi.Length;
         }
 
@@ -348,7 +344,7 @@ public class SimulatedDiscBurner : IDiscBurner
             if (StoreFileContents)
             {
                 await BurnVerifier.VerifyAsync(
-                    sourceDirectory, discDir, totalBytes, sw, progress, ct);
+                    items, discDir, totalBytes, sw, progress, ct);
             }
         }
 

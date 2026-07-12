@@ -1,5 +1,45 @@
 # LithicBackup — Known Issues & Tech Debt
 
+## FEATURE: Burn-in-place disc staging mode (no full temp copy) (2026-07-12)
+
+**What:** Disc backups can now burn plain files directly from their original
+location instead of copying every file to a temp staging directory first. This
+removes the biggest temp-space cost — previously a full disc's worth of data (up
+to ~100 GB for a Blu-ray) had to be duplicated on the temp volume before the
+burn. Selectable in **Settings → Disc staging**; default remains *copy to temp*
+(`DiscStagingMode.TemporaryCopy`) so behaviour is unchanged unless the user opts
+into *burn in place* (`DiscStagingMode.InPlace`).
+
+**How it works:** The burn contract changed from "burn everything under this one
+staging directory" to an explicit item list — `IDiscBurner.BurnAsync` now takes
+`IReadOnlyList<BurnItem>` where each `BurnItem(DiscRelativePath, SourceAbsolutePath)`
+maps a disc path to the bytes to read. In `TemporaryCopy` mode every item's source
+is a temp copy (unchanged behaviour). In `InPlace` mode plain files' items point at
+the *original* source path, and `BackupOrchestrator.ExecuteAsync` holds a
+`FileShare.Read` lock (`StagedFileInfo.HeldLock`) on each such file from the moment
+its size is validated until after the burn and catalog recording complete (released
+in the per-disc `finally`). `FileShare.Read` blocks writers, so the file cannot grow,
+change, or be deleted mid-burn, while still letting the burner read it concurrently.
+Zipped and split files always stage to temp because their on-disc bytes differ from
+the source; the software payload and exported catalog also live under temp.
+
+- **Growth safety preserved:** the in-place path re-checks the file's length under
+  the held lock (same as the copy path) and re-queues/bumps a grown file to a later
+  disc rather than overflowing. Covered by harness test `burn-in-place-growth-safe`.
+- **IMAPI path (hardware-untested):** `Imapi2DiscBurner.BurnAsync` was rewritten from
+  `root.AddTree(stagingDir)` to per-item `root.AddFile(discRelativePath, stream)`,
+  where `stream` is an `IStream` opened over the source via `SHCreateStreamOnFileEx`
+  (read + deny-write). This mirrors the tested simulated path but, like all IMAPI2
+  code here, has not been run against real hardware.
+- **Config placement:** stored on global `UserSettings.DiscStagingMode` (machine-wide,
+  like `MemoryBudget`) and stamped onto `BackupJob.StagingMode` when the job is built
+  (MainViewModel + BackupWorker). Not persisted per backup set.
+- **Tests:** `burn-in-place-basic` (multi-disc, byte-exact restore, no overflow) and
+  `burn-in-place-growth-safe`. Full matrix 22/22.
+
+The split-file spill snapshot (below) still copies each *oversized* file to temp even
+in `InPlace` mode — that transient cost is unchanged and remains logged as tech debt.
+
 ## FIXED: Bin-packer crammed every file onto disc 1 (multi-disc spanning broken) (2026-07-12)
 
 **Status:** Fixed 2026-07-12 in `BinPacker`.

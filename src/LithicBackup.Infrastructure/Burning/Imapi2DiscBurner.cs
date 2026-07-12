@@ -148,15 +148,22 @@ public class Imapi2DiscBurner : IDiscBurner
 
     public Task BurnAsync(
         string recorderId,
-        string sourceDirectory,
+        IReadOnlyList<BurnItem> items,
         BurnOptions options,
         IProgress<BurnProgress>? progress = null,
         CancellationToken ct = default)
     {
         ct.ThrowIfCancellationRequested();
 
-        if (!Directory.Exists(sourceDirectory))
-            throw new ArgumentException($"Source directory does not exist: {sourceDirectory}");
+        if (items.Count == 0)
+            throw new ArgumentException("No files to burn.", nameof(items));
+
+        foreach (var item in items)
+        {
+            if (!File.Exists(item.SourceAbsolutePath))
+                throw new ArgumentException(
+                    $"Burn source file does not exist: {item.SourceAbsolutePath}");
+        }
 
         return StaThread.RunAsync(() =>
         {
@@ -176,9 +183,24 @@ public class Imapi2DiscBurner : IDiscBurner
             catch (COMException) { /* Some devices don't support this; image will be
                                       validated at burn time instead. */ }
 
-            // Add all files from the staging directory.
+            // Add each file individually by its disc-relative path, reading its
+            // bytes from an IStream over the source. AddFile creates any missing
+            // intermediate directories. Unlike the old AddTree(stagingDir) call,
+            // this lets sources live in different locations — a temp staging copy
+            // for zipped/split files and the original (locked) file for burn-in-
+            // place — so no single staging directory is required.
             dynamic root = fsi.Root;
-            root.AddTree(sourceDirectory, false);
+            var addedStreams = new List<IStream>(items.Count);
+            foreach (var item in items)
+            {
+                ct.ThrowIfCancellationRequested();
+                var stream = SHCreateStreamOnFileEx(
+                    item.SourceAbsolutePath,
+                    STGM_READ | STGM_SHARE_DENY_WRITE,
+                    0, false, null);
+                addedStreams.Add(stream);
+                root.AddFile(item.DiscRelativePath, stream);
+            }
 
             // Create the result image (IStream).
             ct.ThrowIfCancellationRequested();
@@ -230,12 +252,19 @@ public class Imapi2DiscBurner : IDiscBurner
                 {
                     try { connectionPoint.Unadvise(cookie); } catch { }
                 }
+
+                // Release the per-file source streams now that the burn has read
+                // them (IMAPI reads them lazily while writing the image stream).
+                foreach (var s in addedStreams)
+                {
+                    try { Marshal.ReleaseComObject(s); } catch { }
+                }
             }
 
             // 6. Optional post-burn read-back verification.
             if (options.VerifyAfterBurn)
             {
-                VerifyBurnedDisc(recorder, sourceDirectory, totalBytes, stopwatch, progress, ct);
+                VerifyBurnedDisc(recorder, items, totalBytes, stopwatch, progress, ct);
             }
 
             // 7. Report final progress.
@@ -261,7 +290,7 @@ public class Imapi2DiscBurner : IDiscBurner
     /// </summary>
     private static void VerifyBurnedDisc(
         dynamic recorder,
-        string sourceDirectory,
+        IReadOnlyList<BurnItem> items,
         long totalBytes,
         Stopwatch stopwatch,
         IProgress<BurnProgress>? progress,
@@ -307,10 +336,26 @@ public class Imapi2DiscBurner : IDiscBurner
 
         // Block on the async verifier — we're already on a dedicated STA thread.
         BurnVerifier
-            .VerifyAsync(sourceDirectory, volumeRoot, totalBytes, stopwatch, progress, ct)
+            .VerifyAsync(items, volumeRoot, totalBytes, stopwatch, progress, ct)
             .GetAwaiter()
             .GetResult();
     }
+
+    // -------------------------------------------------------------------
+    // Native interop for burn-in-place: open a read-only, deny-write IStream
+    // directly over a source file so IMAPI can read it during the burn.
+    // -------------------------------------------------------------------
+
+    private const uint STGM_READ = 0x00000000;
+    private const uint STGM_SHARE_DENY_WRITE = 0x00000020;
+
+    [DllImport("shlwapi.dll", CharSet = CharSet.Unicode, ExactSpelling = true, PreserveSig = false)]
+    private static extern IStream SHCreateStreamOnFileEx(
+        string pszFile,
+        uint grfMode,
+        uint dwAttributes,
+        [MarshalAs(UnmanagedType.Bool)] bool fCreate,
+        IStream? pstmTemplate);
 
     /// <summary>
     /// Return the first mounted volume path (e.g. <c>"E:\"</c>) for the disc in

@@ -1851,6 +1851,7 @@ public class MainViewModel : ViewModelBase
             RetentionTiers = opts.RetentionTiers,
             TierSets = opts.TierSets,
             MemoryBudget = _settings.MemoryBudget,
+            StagingMode = _settings.DiscStagingMode,
         };
 
         bool isDir = job.TargetDirectory is not null;
@@ -2144,6 +2145,7 @@ public class MainViewModel : ViewModelBase
             RetentionTiers = opts.RetentionTiers,
             TierSets = opts.TierSets,
             MemoryBudget = _settings.MemoryBudget,
+            StagingMode = _settings.DiscStagingMode,
         };
 
         bool isDir = job.TargetDirectory is not null;
@@ -2402,6 +2404,7 @@ public class MainViewModel : ViewModelBase
             RetentionTiers = opts.RetentionTiers,
             TierSets = opts.TierSets,
             MemoryBudget = _settings.MemoryBudget,
+            StagingMode = _settings.DiscStagingMode,
         };
 
         bool isDir = job.TargetDirectory is not null;

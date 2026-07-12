@@ -253,6 +253,11 @@ public class BackupOrchestrator : IBackupOrchestrator
                 Directory.Delete(stagingDir, true);
             Directory.CreateDirectory(stagingDir);
 
+            // Read locks held on in-place (uncopied) source files. Kept open from
+            // size-validation through the burn so the files can't change, then
+            // released in the finally below. Empty in TemporaryCopy mode.
+            var heldLocks = new List<FileStream>();
+
             try
             {
                 // Copy files to staging, recording which ones succeed.
@@ -446,6 +451,47 @@ public class BackupOrchestrator : IBackupOrchestrator
                                     IsZipped = true,
                                     IsSplit = false,
                                     StagedSizeBytes = new FileInfo(zipPath).Length,
+                                });
+                            }
+                            else if (plan.Job.StagingMode == DiscStagingMode.InPlace)
+                            {
+                                // Burn-in-place: don't copy the file to temp. Instead
+                                // take a read lock on the ORIGINAL and hold it through
+                                // the burn, then point the burn item at the source.
+                                // FileShare.Read blocks writers (so the file can't grow,
+                                // change, or be deleted before it's burned) while still
+                                // letting the burner read it concurrently. Re-check the
+                                // size under the lock for the same growth-safety reason
+                                // as the copy path: capacity accounting must match the
+                                // bytes that actually land on the disc.
+                                string relativePath = GetRelativeStagingPath(file.FullPath);
+                                var lockStream = new FileStream(
+                                    file.FullPath, FileMode.Open, FileAccess.Read,
+                                    FileShare.Read, bufferSize: 4096, useAsync: false);
+                                long lockedSize = lockStream.Length;
+                                if (lockedSize != file.SizeBytes || lockedSize > remainingSpace)
+                                {
+                                    lockStream.Dispose();
+                                    pendingQueue.Enqueue(new ScannedFile
+                                    {
+                                        FullPath = file.FullPath,
+                                        SizeBytes = lockedSize,
+                                        LastWriteUtc = File.GetLastWriteTimeUtc(file.FullPath),
+                                    });
+                                    TryFillGapFromPending(
+                                        filesToProcess, pendingQueue, remainingSpace);
+                                    break;
+                                }
+
+                                heldLocks.Add(lockStream);
+                                stagedFiles.Add(new StagedFileInfo
+                                {
+                                    Source = file,
+                                    StagedPath = relativePath,
+                                    IsZipped = false,
+                                    IsSplit = false,
+                                    StagedSizeBytes = lockedSize,
+                                    HeldLock = lockStream,
                                 });
                             }
                             else
@@ -682,7 +728,16 @@ public class BackupOrchestrator : IBackupOrchestrator
                                 var stale = stagedFiles[j];
                                 stagedFiles.RemoveAt(j);
 
-                                // Clean up the stale staged file from disk.
+                                // Release the in-place read lock (if any) so the file
+                                // isn't held open after we drop it from this disc.
+                                if (stale.HeldLock is not null)
+                                {
+                                    heldLocks.Remove(stale.HeldLock);
+                                    try { stale.HeldLock.Dispose(); } catch { /* best effort */ }
+                                }
+
+                                // Clean up the stale staged file from disk (no-op for
+                                // in-place files, which were never copied to staging).
                                 string stalePath = Path.Combine(stagingDir, stale.StagedPath);
                                 try { if (File.Exists(stalePath)) File.Delete(stalePath); }
                                 catch { /* best effort */ }
@@ -718,10 +773,11 @@ public class BackupOrchestrator : IBackupOrchestrator
                 }
 
                 // Export catalog database to staging directory if requested.
+                string? catalogStagedPath = null;
                 if (plan.Job.IncludeCatalogOnDisc && discIndex == plan.DiscAllocations.Count - 1)
                 {
-                    string catalogDest = Path.Combine(stagingDir, "LithicBackup-Catalog.db");
-                    await _catalog.ExportDatabaseAsync(backupSetId, catalogDest, ct);
+                    catalogStagedPath = Path.Combine(stagingDir, "LithicBackup-Catalog.db");
+                    await _catalog.ExportDatabaseAsync(backupSetId, catalogStagedPath, ct);
                 }
 
                 // Burn.
@@ -753,7 +809,31 @@ public class BackupOrchestrator : IBackupOrchestrator
                     VerifyAfterBurn = plan.Job.VerifyAfterBurn,
                 };
 
-                await _burner.BurnAsync(recorderId, stagingDir, burnOptions, burnProgress, ct);
+                // Build the burn item list. Plain files staged in-place point at
+                // their original (locked) source; everything else (zipped, split,
+                // software, catalog) points at its temp staging copy.
+                var burnItems = new List<BurnItem>(stagedFiles.Count);
+                foreach (var sf in stagedFiles)
+                {
+                    string src = sf.HeldLock is not null
+                        ? sf.Source.FullPath
+                        : Path.Combine(stagingDir, sf.StagedPath);
+                    burnItems.Add(new BurnItem(sf.StagedPath, src));
+                }
+                // Software payload and exported catalog always live under staging.
+                if (plan.Job.IncludeSoftwareOnDisc)
+                {
+                    string swDir = Path.Combine(stagingDir, "LithicBackup-Software");
+                    if (Directory.Exists(swDir))
+                    {
+                        foreach (var f in Directory.GetFiles(swDir, "*", SearchOption.AllDirectories))
+                            burnItems.Add(new BurnItem(Path.GetRelativePath(stagingDir, f), f));
+                    }
+                }
+                if (catalogStagedPath is not null)
+                    burnItems.Add(new BurnItem("LithicBackup-Catalog.db", catalogStagedPath));
+
+                await _burner.BurnAsync(recorderId, burnItems, burnOptions, burnProgress, ct);
 
                 long discBytesUsed = stagedFiles.Sum(sf => sf.StagedSizeBytes);
 
@@ -870,7 +950,12 @@ public class BackupOrchestrator : IBackupOrchestrator
             }
             finally
             {
-                // Clean up staging directory.
+                // Release any in-place read locks now that the burn (and catalog
+                // recording) are done, then clean up the staging directory.
+                foreach (var h in heldLocks)
+                {
+                    try { h.Dispose(); } catch { /* best effort */ }
+                }
                 try { Directory.Delete(stagingDir, true); } catch { }
             }
 
@@ -1034,7 +1119,13 @@ public class BackupOrchestrator : IBackupOrchestrator
                     })
                     : null;
 
-                await _burner.BurnAsync(recorderId, stagingDir, burnOptions, burnProgress, ct);
+                // Consolidation always copies files to temp staging, so every
+                // burn item reads from the staging directory.
+                var consolidateItems = Directory
+                    .GetFiles(stagingDir, "*", SearchOption.AllDirectories)
+                    .Select(f => new BurnItem(Path.GetRelativePath(stagingDir, f), f))
+                    .ToList();
+                await _burner.BurnAsync(recorderId, consolidateItems, burnOptions, burnProgress, ct);
 
                 // Record the new disc and files in the catalog.
                 using var tx = await _catalog.BeginTransactionAsync(backupSetId, ct);
@@ -1352,7 +1443,13 @@ public class BackupOrchestrator : IBackupOrchestrator
                 }))
                 : null;
 
-            await _burner.BurnAsync(recorderId, stagingDir, burnOptions, burnProgress, ct);
+            // Re-burn always copies files to temp staging, so every burn item
+            // reads from the staging directory.
+            var reburnItems = Directory
+                .GetFiles(stagingDir, "*", SearchOption.AllDirectories)
+                .Select(f => new BurnItem(Path.GetRelativePath(stagingDir, f), f))
+                .ToList();
+            await _burner.BurnAsync(recorderId, reburnItems, burnOptions, burnProgress, ct);
 
             return staged;
         }
@@ -1459,6 +1556,14 @@ public class BackupOrchestrator : IBackupOrchestrator
         public SplitContext? Split { get; init; }
         public FileChunk? Chunk { get; init; }
         public long StagedSizeBytes { get; init; }
+
+        /// <summary>
+        /// For a plain file staged in-place (burn-in-place mode): the read lock
+        /// held on the original source for the duration of the burn. Null when the
+        /// file was copied to temp staging instead. When non-null, the burn item
+        /// reads from <see cref="Source"/>'s original path rather than a temp copy.
+        /// </summary>
+        public FileStream? HeldLock { get; init; }
     }
 
     /// <summary>

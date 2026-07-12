@@ -1069,6 +1069,8 @@ public sealed class BackupWorker : BackgroundService
     /// <summary>Build a <see cref="BackupJob"/> from a set's saved options.</summary>
     private static BackupJob BuildJob(BackupSet set, JobOptions opts, string targetDir)
     {
+        // Machine-global settings shared with the interactive app via settings.json.
+        var machineSettings = UserSettings.Load();
         return new BackupJob
         {
             BackupSetId = set.Id,
@@ -1094,9 +1096,10 @@ public sealed class BackupWorker : BackgroundService
             ExcludedExtensions = opts.ExcludedExtensions,
             RetentionTiers = opts.RetentionTiers,
             TierSets = opts.TierSets,
-            // Machine-global memory budget (shared with the interactive app via
-            // settings.json) so scheduled backups honor the same limit.
-            MemoryBudget = UserSettings.Load().MemoryBudget,
+            // Machine-global memory budget + disc staging mode so scheduled
+            // backups honor the same limits and burn-in-place preference.
+            MemoryBudget = machineSettings.MemoryBudget,
+            StagingMode = machineSettings.DiscStagingMode,
         };
     }
 
