@@ -1913,23 +1913,11 @@ public class OrphanedDirectoriesViewModel : ViewModelBase
         }
     }
 
-    /// <summary>Compact size formatter for purge-summary strings.</summary>
-    private static string FormatSizeText(long bytes)
-    {
-        const long KB = 1024;
-        const long MB = 1024 * KB;
-        const long GB = 1024 * MB;
-        const long TB = 1024 * GB;
-
-        return bytes switch
-        {
-            >= TB => $"{bytes / (double)TB:F2} TB",
-            >= GB => $"{bytes / (double)GB:F2} GB",
-            >= MB => $"{bytes / (double)MB:F2} MB",
-            >= KB => $"{bytes / (double)KB:F1} KB",
-            _ => $"{bytes:N0} B",
-        };
-    }
+    /// <summary>
+    /// Size formatter for purge-summary strings. Reports a raw byte count (no
+    /// KB/MB/GB) so every size shown in the Cleanup view is consistent.
+    /// </summary>
+    private static string FormatSizeText(long bytes) => $"{bytes:N0} bytes";
 
     // ------------------------------------------------------------------
 
