@@ -23,6 +23,15 @@
     <Color x:Key="TextSecondaryColor">#64748B</Color>
     <Color x:Key="TextDimColor">#94A3B8</Color>
 
+    <!-- Control surfaces (secondary buttons, dropdowns) -->
+    <Color x:Key="ControlFillColor">#F1F5F9</Color>
+    <Color x:Key="ControlFillHoverColor">#E2E8F0</Color>
+    <Color x:Key="ControlTextColor">#334155</Color>
+
+    <!-- Danger (destructive actions: Stop / Uninstall) -->
+    <Color x:Key="DangerTintColor">#FEE2E2</Color>
+    <Color x:Key="DangerDarkColor">#B91C1C</Color>
+
     <!-- Brushes -->
     <SolidColorBrush x:Key="PrimaryBrush" Color="{StaticResource PrimaryColor}" />
     <SolidColorBrush x:Key="PrimaryDarkBrush" Color="{StaticResource PrimaryDarkColor}" />
@@ -38,5 +47,10 @@
     <SolidColorBrush x:Key="TextPrimaryBrush" Color="{StaticResource TextPrimaryColor}" />
     <SolidColorBrush x:Key="TextSecondaryBrush" Color="{StaticResource TextSecondaryColor}" />
     <SolidColorBrush x:Key="TextDimBrush" Color="{StaticResource TextDimColor}" />
+    <SolidColorBrush x:Key="ControlFillBrush" Color="{StaticResource ControlFillColor}" />
+    <SolidColorBrush x:Key="ControlFillHoverBrush" Color="{StaticResource ControlFillHoverColor}" />
+    <SolidColorBrush x:Key="ControlTextBrush" Color="{StaticResource ControlTextColor}" />
+    <SolidColorBrush x:Key="DangerTintBrush" Color="{StaticResource DangerTintColor}" />
+    <SolidColorBrush x:Key="DangerDarkBrush" Color="{StaticResource DangerDarkColor}" />
 
 </ResourceDictionary>
