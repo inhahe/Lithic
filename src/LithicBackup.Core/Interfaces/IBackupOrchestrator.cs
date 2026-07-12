@@ -55,6 +55,29 @@ public interface IBackupOrchestrator
     /// Replace a bad disc: stage its files and burn them to a new disc.
     /// </summary>
     Task ReplaceDiscAsync(int badDiscId, string recorderId, CancellationToken ct = default);
+
+    /// <summary>
+    /// Replace a bad disc with progress reporting: mark it bad, re-stage every
+    /// file it held from the live source, burn a fresh disc, and record the new
+    /// disc + files in the catalog.
+    /// </summary>
+    Task ReplaceDiscAsync(int badDiscId, string recorderId, IProgress<BackupProgress>? progress, CancellationToken ct = default);
+
+    /// <summary>
+    /// Re-burn only the given file records (identified by catalog id) from one
+    /// disc onto a new supplementary disc, then mark the old records superseded
+    /// so restore resolves to the fresh copies. The original disc and its
+    /// still-good files are left untouched. Used to repair just the files that
+    /// failed a disc integrity test without discarding the whole disc.
+    /// Returns the number of files actually re-burned (source files that no
+    /// longer exist on disk are skipped).
+    /// </summary>
+    Task<int> ReplaceDiscFilesAsync(
+        int discId,
+        IReadOnlyCollection<long> fileRecordIds,
+        string recorderId,
+        IProgress<BackupProgress>? progress = null,
+        CancellationToken ct = default);
 }
 
 /// <summary>The computed plan for a backup operation.</summary>

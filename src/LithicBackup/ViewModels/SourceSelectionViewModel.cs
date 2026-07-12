@@ -772,7 +772,7 @@ public class SourceSelectionViewModel : ViewModelBase
     public bool IsApplyingSelections
     {
         get => _isApplyingSelections;
-        private set => SetProperty(ref _isApplyingSelections, value);
+        internal set => SetProperty(ref _isApplyingSelections, value);
     }
 
     /// <summary>
@@ -1094,7 +1094,7 @@ public class SourceSelectionViewModel : ViewModelBase
             () => ShowSizes, () => (_sortColumn, _sortAscending), _scheduler,
             HandleSelectionChanged,
             () => ShowSelectedSizesOnly,
-            _catalogInfo,
+            () => _catalogInfo,
             getExcludeFilter: () => GetExcludeFilter(),
             requestSelectionSettle: RequestSelectionSettle);
         RootNode = root;
@@ -1110,7 +1110,7 @@ public class SourceSelectionViewModel : ViewModelBase
             foreach (var dd in _preloadedDrives)
             {
                 var node = new SourceSelectionNodeViewModel(
-                    dd.RootPath, true, root, catalogInfo: _catalogInfo);
+                    dd.RootPath, true, root, getCatalogInfo: () => _catalogInfo);
                 if (dd.UsedSize >= 0) node.Size = dd.UsedSize;
                 root.Children.Add(node);
             }
@@ -1124,7 +1124,7 @@ public class SourceSelectionViewModel : ViewModelBase
                 if (drive.DriveType == DriveType.CDRom) continue;
                 var node = new SourceSelectionNodeViewModel(
                     drive.RootDirectory.FullName, true, root,
-                    catalogInfo: _catalogInfo);
+                    getCatalogInfo: () => _catalogInfo);
                 try { node.Size = drive.TotalSize - drive.AvailableFreeSpace; }
                 catch { }
                 root.Children.Add(node);
@@ -1188,13 +1188,30 @@ public class SourceSelectionViewModel : ViewModelBase
     {
         var node = new SourceSelectionNodeViewModel(
             path, true, RootNode!,
-            catalogInfo: _catalogInfo)
+            getCatalogInfo: () => _catalogInfo)
         {
             IsSelected = isSelected,
         };
         RootNode!.Children.Add(node);
         RefreshHasSelection();
         return node;
+    }
+
+    /// <summary>
+    /// Supply the catalog version dictionary after construction.  The editor
+    /// window opens before this large (~1M-entry) query completes, so nodes read
+    /// the catalog through a shared getter; setting it here makes the data
+    /// available to all future lazy loads and re-stamps backup status on any
+    /// subtree that was already built.
+    /// </summary>
+    internal void SetCatalogInfo(Dictionary<string, FileVersionInfo>? catalogInfo)
+    {
+        _catalogInfo = catalogInfo;
+        if (catalogInfo is null)
+            return;
+
+        foreach (var root in Roots)
+            root.RefreshBackupStatusRecursive();
     }
 
     internal async Task ComputeAllUnknownSizesAsync()

@@ -1,0 +1,30 @@
+<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 256 256" width="256" height="256">
+  <!--
+    LithicBackup production app icon — refined "monolith" (candidate #1).
+    The stone is scaled up vs. the gallery original so the subject fills more
+    of the frame and stays legible at 16/24 px (taskbar / tray / title bar).
+  -->
+  <defs>
+    <linearGradient id="bg" x1="0" y1="0" x2="0" y2="1">
+      <stop offset="0" stop-color="#3B82F6"/>
+      <stop offset="1" stop-color="#1D4ED8"/>
+    </linearGradient>
+    <linearGradient id="stone" x1="0" y1="0" x2="1" y2="0">
+      <stop offset="0" stop-color="#F1F5F9"/>
+      <stop offset="1" stop-color="#CBD5E1"/>
+    </linearGradient>
+  </defs>
+  <rect x="8" y="8" width="240" height="240" rx="56" fill="url(#bg)"/>
+  <!-- monolith artwork, scaled ~1.18x about the frame centre -->
+  <g transform="translate(128 130) scale(1.18) translate(-128 -130)">
+    <!-- ground shadow -->
+    <ellipse cx="128" cy="206" rx="60" ry="12" fill="#0F172A" opacity="0.22"/>
+    <!-- monolith front face -->
+    <path d="M96 62 L150 56 L160 200 L88 204 Z" fill="url(#stone)"/>
+    <!-- right shaded face for depth -->
+    <path d="M150 56 L168 70 L176 190 L160 200 Z" fill="#94A3B8"/>
+    <!-- engraved data bands -->
+    <rect x="100" y="120" width="52" height="8" rx="4" fill="#2563EB" opacity="0.55" transform="rotate(-2 126 124)"/>
+    <rect x="100" y="140" width="40" height="8" rx="4" fill="#2563EB" opacity="0.35" transform="rotate(-2 120 144)"/>
+  </g>
+</svg>

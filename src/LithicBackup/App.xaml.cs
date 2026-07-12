@@ -261,11 +261,34 @@ public partial class App : Application
         _ = StartBackgroundMonitoringAsync();
     }
 
+    /// <summary>
+    /// Load the app's monolith icon (packed <c>Assets\LithicBackup.ico</c>) at
+    /// the system small-icon size for the tray, falling back to the generic
+    /// application icon if the resource can't be read.
+    /// </summary>
+    private static System.Drawing.Icon LoadTrayIcon()
+    {
+        try
+        {
+            var uri = new Uri("pack://application:,,,/Assets/LithicBackup.ico");
+            if (System.Windows.Application.GetResourceStream(uri)?.Stream is { } stream)
+            {
+                using (stream)
+                    return new System.Drawing.Icon(stream, WinForms.SystemInformation.SmallIconSize);
+            }
+        }
+        catch
+        {
+            // Fall through to the system default below.
+        }
+        return System.Drawing.SystemIcons.Application;
+    }
+
     private void SetupNotifyIcon(Window mainWindow)
     {
         _notifyIcon = new WinForms.NotifyIcon
         {
-            Icon = System.Drawing.SystemIcons.Application,
+            Icon = LoadTrayIcon(),
             Text = "LithicBackup \u2014 Incremental Backup",
             Visible = true,
         };

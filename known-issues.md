@@ -1,5 +1,36 @@
 # LithicBackup — Known Issues & Tech Debt
 
+## FIXED: Modify dialog close stalled the UI with a ~10s wait cursor (2026-07-12)
+
+**Status:** Fixed 2026-07-12 in `MainViewModel.ReconcileDestinationAfterEditAsync`.
+
+**Symptom (user report):** After closing the Modify (backup-set editor) dialog, the
+main window showed the busy/wait cursor for ~10 seconds, even when nothing was
+changed in the dialog.
+
+**Root cause:** Closing the dialog always auto-saves (`_pendingSettingsSave` →
+`SaveAllAsync`), which sets `savedThisSession = true`, so the post-close
+`ReconcileDestinationAfterEditAsync` ran on *every* close. That method
+unconditionally called `GetAllFilesForBackupSetAsync`, loading the set's entire file
+table (≈1M rows for large sets) on a background thread with `Mouse.OverrideCursor =
+Wait`, just to diff which source folders were dropped/added — work that is pointless
+when the selection didn't change.
+
+**Fix:** Added a conservative fast-path at the top of the reconcile: if the source
+selection is unchanged from when the dialog opened (`SelectionsEquivalent`, comparing
+the same `JsonSerializer.Serialize` form the catalog persists with), return
+immediately without loading any file records. Any genuine selection change serializes
+differently and still runs the full reconcile, so purge/backup prompts for
+dropped/added folders are unaffected. Gating on the JSON diff (rather than
+`HasUnsavedChanges`) is correct for both the auto-save-on-close and explicit-Save-then-close
+paths, since `HasUnsavedChanges` resets after an explicit save.
+
+**Related latent concern (not fixed, low risk):** auto-save on close calls
+`sourceSelection.GetSelections()`. Selection restore is deferred to a post-show async
+pass; closing the dialog before that completes could in principle save a partial/empty
+selection. Not observed and out of scope for this fix, but worth guarding (e.g. block
+auto-save until restore has completed) if it ever surfaces.
+
 ## FIXED: Cleanup "cleaned but reappears" — read-only files silently fail deletion (2026-07-12)
 
 **Status:** Fixed 2026-07-12 in `OrphanedDirectoriesViewModel.PurgeSelected`
@@ -423,6 +454,43 @@ it deletes the catalog row + reclaims the anchor, so duplicates don't outlive th
 content. The separate test-artifact directories should also be excluded from the i:
 source set so they stop being backed up at all.
 
+## Test Disc feature: re-burn repairs untested on real optical hardware (2026-07-12)
+
+**Status:** Implemented but only exercised against the simulated burner / directory
+paths. The read-back test (`RestoreService.VerifyDiscAsync`) works over any mounted
+volume, but the two re-burn repairs go through `Imapi2DiscBurner.BurnAsync` and need
+validation with a real burner + media.
+
+**What shipped:** A new per-set right-click action **Test Disc** (optical sets only —
+gated on `JobOptions.TargetDirectory` being null/empty) integrity-tests one burned
+disc against the catalog and, on failure, offers two repairs:
+- `TestDiscViewModel` → `IRestoreService.VerifyDiscAsync(discId, discRoot,
+  verifyContents)` reads every non-deleted catalog record on the disc, confirms
+  presence + size, and (opt-in) re-hashes SHA-256; understands plain/zipped/split/
+  `.dedup`/`.fileref` forms (mirrors the restore reader). `.fileref` whose backing
+  plain copy is on another disc is reported as `UnresolvedReference`, not a failure.
+- **Re-burn whole disc** → `IBackupOrchestrator.ReplaceDiscAsync(discId, recorderId,
+  progress)` — re-stages every file the disc held from the live source and burns a
+  fresh replacement disc.
+- **Re-burn affected files** → `IBackupOrchestrator.ReplaceDiscFilesAsync(discId,
+  failedFileRecordIds, recorderId, progress)` — re-burns only the failed files onto a
+  new supplementary disc (Version+1 records, old records marked `IsDeleted` so restore
+  resolves to the fresh copies).
+
+**Caveats to validate on hardware:**
+1. **Recorder ↔ drive mapping is best-effort.** The VM auto-detects the *reading*
+   drive by volume label (`DriveInfo`), but the *burning* recorder is taken as
+   `IDiscBurner.GetRecorderIds()[0]`. On a multi-burner machine the fresh disc could
+   be burned in a different drive than the one tested. Proper fix: map the selected
+   `DriveInfo` root to its IMAPI2 recorder id (e.g. via `MediaInfo.RecorderName` /
+   device path) and pass the matching recorder.
+2. **Both repairs read from the live source files.** A source file that no longer
+   exists on disk is silently skipped (whole-disc) or reported as "0 re-burned"
+   (affected-files) — recovery from another good disc is not automated. This is by
+   design but should be surfaced more clearly once tested.
+3. Post-burn read-back reuses the same IMAPI2 remount path flagged in the entry
+   below, so its hardware caveats apply here too.
+
 ## Post-burn verification disc reload is best-effort / hardware-dependent (2026-06-13)
 
 **Status:** Implemented but untested on real hardware (no burner with media available
@@ -613,9 +681,26 @@ JSON during relocation, and reuse the existing `UpdateFileRefContentPathsAsync` 
 lookup to repoint any fileref whose anchor moved out from under it. Deferred as a separate
 catalog-free-restore fidelity concern, not part of the move feature's primary correctness.
 
-**Not handled (by design, matches existing continuous-delete behavior):** an item moved
-**out** of a set's scope (e.g. to the Recycle Bin or another location outside the
-selection) is not marked deleted immediately — its removal is reconciled by the next full
-scan. Pure continuous mode has no periodic full rescan (see the journal-wrap issue
-above), so out-of-scope move-deletes rely on a manual/scheduled full run, same as
-in-place deletes.
+**Out-of-scope moves — now reconciled promptly (2026-07-12):** an item moved **out**
+of a set's scope (to the Recycle Bin or any location outside the selection) is now
+treated identically to a deletion, at once. `RunMovesAsync`'s `oldIn && !newIn`
+branch (and the within-set recopy fallback that vacates the old path) calls
+`MarkMovedOutAsync`, which soft-deletes the old path's catalog record(s)
+(`MarkFilesDeletedByDirectoryAsync` for a directory, `MarkFilesDeletedBySourcePathsAsync`
+for a file). This is safe to do immediately because a move is unambiguous in the USN
+journal (an explicit old→new FRN pair), unlike a bare delete which can be atomic-save
+churn. The moved item is **not** relocated on the destination — its destination copy
+and version history are retained until the user's next Cleanup purges them, exactly
+like a deleted file. Design decision (user, 2026-07-12): "moved-out files should be
+treated identically with deleted files … they shouldn't be retained in the catalog
+after the user does the next cleanup."
+
+**Still open — plain single-file deletes aren't reconciled in pure-continuous mode:**
+A bare source *delete* (not a move) in continuous mode is still deferred: `ExecuteTargetedAsync`
+skips missing paths (`continue`), relying on a full scan that never runs in pure-continuous
+mode. Cleanup's `DeletedFromDisk` only surfaces a record when its whole parent directory is
+gone, so an individual deleted file whose parent survives lingers as an active row until a
+scheduled/manual full run. This is intentionally NOT acted on promptly (a bare delete can be
+transient atomic-save churn, unlike an explicit move). Proper fix if it ever bites: debounce
+delete records and reconcile them after a quiet window, or add the periodic safety-net full
+scan for continuous sets noted in the journal-wrap entry above.

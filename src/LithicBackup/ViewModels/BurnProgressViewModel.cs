@@ -336,7 +336,8 @@ public class BurnProgressViewModel : ViewModelBase
 
     public void CompleteBurn(
         bool success, string message, string detail = "",
-        IReadOnlyList<FailedFile>? failedFiles = null)
+        IReadOnlyList<FailedFile>? failedFiles = null,
+        bool cancelled = false)
     {
         PauseEvent.Set();
         IsPaused = false;
@@ -346,7 +347,11 @@ public class BurnProgressViewModel : ViewModelBase
         ElapsedText = FormatTimeSpan(_stopwatch.Elapsed);
         RemainingText = "00:00";
         string verb = IsDirectoryMode ? "Backup" : "Burn";
-        if (success && (failedFiles is null or { Count: 0 }))
+        if (cancelled)
+            // A user-initiated abort is not a failure — say so plainly rather
+            // than surfacing the internal "Cancelled by user." as an error.
+            StatusText = $"{verb} cancelled.";
+        else if (success && (failedFiles is null or { Count: 0 }))
             StatusText = $"{verb} completed.";
         else if (failedFiles is { Count: > 0 })
             StatusText = $"{verb} completed with errors — {failedFiles.Count:N0} file(s) skipped or failed.";
@@ -364,6 +369,15 @@ public class BurnProgressViewModel : ViewModelBase
 
         _cts?.Dispose();
         _cts = null;
+
+        // The Dismiss / failed-file action buttons gate on IsComplete and
+        // HasFailedFiles, but RelayCommand only re-evaluates CanExecute when
+        // CommandManager raises RequerySuggested. Setting IsComplete makes the
+        // Dismiss button visible via its binding, yet its enabled state stays
+        // stale until the next stray input event — so it first renders disabled
+        // (grey) and a click is swallowed while it re-queries, then works on the
+        // second click. Force the requery now so it appears enabled immediately.
+        CommandManager.InvalidateRequerySuggested();
     }
 
     private string FormatFailedFilesList()

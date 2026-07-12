@@ -1,0 +1,58 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<title>LithicBackup — icon candidates</title>
+<style>
+  body { font-family: Segoe UI, system-ui, sans-serif; background:#0f172a; color:#e2e8f0; margin:0; padding:32px; }
+  h1 { font-weight:600; font-size:20px; margin:0 0 4px; }
+  p.sub { color:#94a3b8; margin:0 0 28px; }
+  .grid { display:grid; grid-template-columns:repeat(auto-fill,minmax(240px,1fr)); gap:24px; }
+  .card { background:#1e293b; border:1px solid #334155; border-radius:14px; padding:18px; }
+  .name { font-size:13px; color:#cbd5e1; margin-bottom:14px; font-weight:600; }
+  .big { display:flex; justify-content:center; margin-bottom:16px; }
+  .big img { width:160px; height:160px; }
+  /* checkerboard behind small sizes to reveal transparency */
+  .sizes { display:flex; align-items:flex-end; gap:18px; }
+  .sizes .cell { text-align:center; }
+  .sizes img { display:block; image-rendering:auto; background:
+      linear-gradient(45deg,#334155 25%,transparent 25%),
+      linear-gradient(-45deg,#334155 25%,transparent 25%),
+      linear-gradient(45deg,transparent 75%,#334155 75%),
+      linear-gradient(-45deg,transparent 75%,#334155 75%);
+      background-size:10px 10px; background-position:0 0,0 5px,5px -5px,-5px 0; border-radius:4px; }
+  .sizes label { font-size:11px; color:#64748b; }
+  .s16 { width:16px;height:16px } .s24{width:24px;height:24px} .s32{width:32px;height:32px} .s48{width:48px;height:48px}
+</style>
+</head>
+<body>
+  <h1>LithicBackup — icon candidates</h1>
+  <p class="sub">Six directions. Each shown large plus at real taskbar/tray sizes (16/24/32/48 px) so you can judge how it reads when small. Pick one (or mix ideas) and I'll refine it and build the multi-resolution .ico.</p>
+  <div class="grid" id="grid"></div>
+  <script>
+    const icons = [
+      ["01-monolith.svg",   "1 · Monolith (standing stone)"],
+      ["02-strata-disc.svg","2 · Strata + disc hole"],
+      ["03-disc.svg",       "3 · Optical disc"],
+      ["04-shield-strata.svg","4 · Stone shield + check"],
+      ["05-gem.svg",        "5 · Faceted obsidian gem"],
+      ["06-monogram-L.svg", "6 · Block-stone “L” monogram"],
+      ["07-monolith-verified.svg", "7 · Monolith + carved verified check (hybrid)"],
+    ];
+    const grid = document.getElementById('grid');
+    for (const [file,name] of icons) {
+      grid.insertAdjacentHTML('beforeend', `
+        <div class="card">
+          <div class="name">${name}</div>
+          <div class="big"><img src="${file}"></div>
+          <div class="sizes">
+            <div class="cell"><img class="s16" src="${file}"><label>16</label></div>
+            <div class="cell"><img class="s24" src="${file}"><label>24</label></div>
+            <div class="cell"><img class="s32" src="${file}"><label>32</label></div>
+            <div class="cell"><img class="s48" src="${file}"><label>48</label></div>
+          </div>
+        </div>`);
+    }
+  </script>
+</body>
+</html>

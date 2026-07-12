@@ -1785,7 +1785,9 @@ public class OrphanedDirectoriesViewModel : ViewModelBase
                 }
 
                 // -- 2. Physical file deletion (outside the catalog tx so
-                //       failures don't roll the catalog back). --
+                //       failures don't roll the catalog back).  Shared with the
+                //       post-edit "remove deleted sources" flow via
+                //       DestinationFilePurger so both behave identically. --
                 if (targetDir is not null)
                 {
                     // Collect every disc path to delete, deduplicated so a
@@ -1796,70 +1798,12 @@ public class OrphanedDirectoriesViewModel : ViewModelBase
                                  .SelectMany(w => w.DiscFilePaths!),
                         StringComparer.OrdinalIgnoreCase);
 
-                    // Reset the throttle clock so the first disk-delete
-                    // report fires immediately rather than waiting on
-                    // whatever fraction of the interval is left over from
-                    // the catalog phase.
-                    lastProgressMs = progressSw.ElapsedMilliseconds - ProgressUpdateIntervalMs;
-
-                    int idx = 0;
-                    int total = allDiscPaths.Count;
-                    foreach (var discRel in allDiscPaths)
-                    {
-                        idx++;
-                        long nowMs = progressSw.ElapsedMilliseconds;
-                        if (nowMs - lastProgressMs >= ProgressUpdateIntervalMs
-                            || idx == total)
-                        {
-                            lastProgressMs = nowMs;
-                            ((IProgress<string>)progress).Report(
-                                $"Deleting files {idx:N0}/{total:N0}: {Path.GetFileName(discRel)}");
-                        }
-
-                        string fullPath = Path.Combine(targetDir, discRel);
-                        try
-                        {
-                            if (File.Exists(fullPath))
-                            {
-                                var fi = new FileInfo(fullPath);
-                                long size = fi.Length;
-                                // Clear the read-only attribute before deleting:
-                                // FileInfo.Delete() throws UnauthorizedAccessException
-                                // on a read-only file, and a LOT of backed-up content
-                                // carries that flag — git object/pack files are always
-                                // read-only, as is anything copied from a read-only
-                                // source. Without this the delete fails silently (it's
-                                // caught below as a failure), the file survives on disk,
-                                // and the next "Scan Destination" re-reports it — the
-                                // exact "I cleaned them but they keep coming back"
-                                // symptom. (On the reference destination 920 of 940
-                                // catalog-deleted-still-on-disk files were read-only.)
-                                if (fi.IsReadOnly)
-                                    fi.IsReadOnly = false;
-                                fi.Delete();
-                                bytes += size;
-                                fDeleted++;
-                            }
-                        }
-                        catch
-                        {
-                            // Permission / locked-file errors — count and skip.
-                            fFailed++;
-                        }
-                    }
-
-                    // Sweep empty subdirectories so the destination doesn't
-                    // accumulate hollow trees after large purges.
-                    ((IProgress<string>)progress).Report("Cleaning up empty directories...");
-                    try
-                    {
-                        foreach (var subDir in new DirectoryInfo(targetDir).EnumerateDirectories())
-                            CleanEmptyDirectories(subDir);
-                    }
-                    catch
-                    {
-                        // Best-effort — don't fail the whole purge over this.
-                    }
+                    var (deleted, delFailed, delBytes) =
+                        Services.DestinationFilePurger.DeleteFilesAndSweep(
+                            targetDir, allDiscPaths, progress);
+                    fDeleted += deleted;
+                    fFailed += delFailed;
+                    bytes += delBytes;
                 }
 
                 // -- 3. Drop the purged files from the in-memory active-file
@@ -2042,31 +1986,6 @@ public class OrphanedDirectoriesViewModel : ViewModelBase
         }
     }
 
-    /// <summary>
-    /// Recursively delete empty subdirectories under <paramref name="dir"/>,
-    /// preserving the shared <c>_blocks</c> and <c>_filestore</c> stores.
-    /// Permission errors and similar are swallowed — this is a sweep-pass,
-    /// not a critical operation.
-    /// </summary>
-    private static void CleanEmptyDirectories(DirectoryInfo dir)
-    {
-        try
-        {
-            if (dir.Name.Equals("_blocks", StringComparison.OrdinalIgnoreCase) ||
-                dir.Name.Equals("_filestore", StringComparison.OrdinalIgnoreCase))
-                return;
-
-            foreach (var subDir in dir.EnumerateDirectories())
-                CleanEmptyDirectories(subDir);
-
-            if (!dir.EnumerateFileSystemInfos().Any())
-                dir.Delete();
-        }
-        catch
-        {
-            // Permission errors etc. — skip.
-        }
-    }
 
     /// <summary>
     /// Size formatter for purge-summary strings. Reports a raw byte count (no

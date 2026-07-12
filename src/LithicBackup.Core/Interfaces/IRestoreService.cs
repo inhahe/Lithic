@@ -24,6 +24,88 @@ public interface IRestoreService
         IReadOnlyDictionary<string, string> driveDestinations,
         IProgress<RestoreProgress>? progress = null,
         CancellationToken ct = default);
+
+    /// <summary>
+    /// Integrity-test one already-burned disc against the catalog: confirm every
+    /// non-deleted file recorded on the disc is physically present on the mounted
+    /// media with the expected size, and — when <paramref name="verifyContents"/>
+    /// is <c>true</c> — that its stored representation still reconstructs to the
+    /// SHA-256 recorded in the catalog (catching bit-rot / a decaying disc).
+    /// <para>
+    /// <paramref name="discRoot"/> is the mounted volume root of the inserted disc
+    /// (e.g. <c>"E:\"</c>). The check understands every on-disc storage form —
+    /// plain, zipped, split, <c>.dedup</c> (block store), and <c>.fileref</c>
+    /// (file-level dedup) — mirroring the restore reader. A <c>.fileref</c> whose
+    /// backing plain copy lives on a different disc cannot be content-verified from
+    /// this disc alone and is reported as an unresolved (cross-disc) reference
+    /// rather than a hard failure.
+    /// </para>
+    /// </summary>
+    Task<DiscVerifyResult> VerifyDiscAsync(
+        int discId,
+        string discRoot,
+        bool verifyContents = false,
+        IProgress<RestoreProgress>? progress = null,
+        CancellationToken ct = default);
+}
+
+/// <summary>The kind of problem found for one file during a disc integrity test.</summary>
+public enum DiscFileIssueKind
+{
+    /// <summary>The file's stored data (or a chunk/block/manifest it needs) is missing on the disc.</summary>
+    Missing,
+
+    /// <summary>The stored file is present but the wrong size.</summary>
+    SizeMismatch,
+
+    /// <summary>The stored bytes no longer match the catalog's SHA-256 (corruption / bit-rot).</summary>
+    ContentMismatch,
+
+    /// <summary>The stored file exists but could not be read back (I/O error).</summary>
+    Unreadable,
+
+    /// <summary>A <c>.fileref</c> whose backing plain copy is not on this disc — cannot verify content here.</summary>
+    UnresolvedReference,
+}
+
+/// <summary>One file that failed a disc integrity test.</summary>
+public class DiscFileIssue
+{
+    /// <summary>Catalog id of the failing file record (used to re-burn just this file).</summary>
+    public long FileRecordId { get; init; }
+
+    public string SourcePath { get; init; } = string.Empty;
+    public string DiscPath { get; init; } = string.Empty;
+    public long SizeBytes { get; init; }
+    public DiscFileIssueKind Kind { get; init; }
+    public string Detail { get; init; } = string.Empty;
+}
+
+/// <summary>Outcome of a single disc integrity test.</summary>
+public class DiscVerifyResult
+{
+    /// <summary>True when no failures were found.</summary>
+    public bool Success => Issues.Count == 0;
+
+    /// <summary>Number of catalog file records checked on the disc.</summary>
+    public int FilesChecked { get; init; }
+
+    /// <summary>Bytes of source data represented by the checked files.</summary>
+    public long BytesChecked { get; init; }
+
+    /// <summary>True when this run read stored data back and re-hashed it.</summary>
+    public bool ContentsVerified { get; init; }
+
+    /// <summary>True when the run was cancelled before finishing.</summary>
+    public bool Cancelled { get; init; }
+
+    public IReadOnlyList<DiscFileIssue> Issues { get; init; } = [];
+
+    /// <summary>
+    /// Distinct catalog ids of the failing files that can be re-burned (excludes
+    /// unresolved cross-disc references, which aren't a defect of this disc).
+    /// </summary>
+    public IReadOnlyList<long> FailedFileRecordIds { get; init; } = [];
 }
 
 /// <summary>

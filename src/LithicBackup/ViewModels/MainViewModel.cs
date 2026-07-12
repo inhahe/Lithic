@@ -160,6 +160,10 @@ public class MainViewModel : ViewModelBase
         SetVerifyIntegrityCommand = new RelayCommand(
             o => { if (o is BackupSetRowViewModel r) { SelectedBackupSet = r.Model; StartVerifyIntegrityFlow(); } },
             o => o is BackupSetRowViewModel r && !r.IsRunning);
+        SetTestDiscCommand = new RelayCommand(
+            o => { if (o is BackupSetRowViewModel r) { SelectedBackupSet = r.Model; StartTestDiscFlow(); } },
+            o => o is BackupSetRowViewModel r && !r.IsRunning
+                 && string.IsNullOrWhiteSpace(r.Model.JobOptions?.TargetDirectory));
         SetLargestFilesCommand = new RelayCommand(
             o => { if (o is BackupSetRowViewModel r) { SelectedBackupSet = r.Model; StartLargestFilesFlow(); } },
             o => o is BackupSetRowViewModel r && !r.IsRunning);
@@ -289,6 +293,7 @@ public class MainViewModel : ViewModelBase
     public ICommand SetOrphanedDirsCommand { get; }
     public ICommand SetCoverageCommand { get; }
     public ICommand SetVerifyIntegrityCommand { get; }
+    public ICommand SetTestDiscCommand { get; }
     public ICommand SetLargestFilesCommand { get; }
     public ICommand SetCopyCommand { get; }
     public ICommand SetChangeDestCommand { get; }
@@ -419,6 +424,18 @@ public class MainViewModel : ViewModelBase
 
         var backupSet = SelectedBackupSet;
 
+        // Snapshot the source selection as it stands before any edit.  After the
+        // editor closes we diff this against the saved selection to offer to (a)
+        // purge destination copies of folders the user removed and (b) back up
+        // folders the user added.  GetSelections() builds a brand-new tree and
+        // reassigns the property, so holding the original list reference is a
+        // valid snapshot.  Gated on an actual save so a discarded edit prompts
+        // nothing (see savedThisSession below).
+        var originalSelections = backupSet.SourceSelections is { } os
+            ? os
+            : new List<Core.Models.SourceSelection>();
+        bool savedThisSession = false;
+
         // Show a wait cursor while loading — the dialog won't appear until ready.
         Mouse.OverrideCursor = Cursors.Wait;
 
@@ -426,22 +443,16 @@ public class MainViewModel : ViewModelBase
         // Phase 1: async data loading (dialog not yet visible)
         // ---------------------------------------------------------------
 
-        // Kick off the two slow I/O operations in parallel on the thread pool:
-        // 1. Catalog query (synchronous SQL under the hood)
-        // 2. Drive enumeration (DriveInfo.GetDrives + TotalSize — slow for network drives)
-        var catalogTask = Task.Run(() =>
-        {
-            try { return _catalog.GetLatestVersionInfoAsync(backupSet.Id).GetAwaiter().GetResult(); }
-            catch { return null as Dictionary<string, Core.Models.FileVersionInfo>; }
-        });
-        var drivesTask = Task.Run(() => SourceSelectionViewModel.EnumerateDrives());
+        // Enumerate drives (DriveInfo.GetDrives + TotalSize — can be slow for
+        // network drives) on the thread pool.  The catalog version query is
+        // deliberately NOT loaded here: for large sets it returns ~1M rows and
+        // takes several seconds, which would delay the window appearing.  It is
+        // loaded in Phase 3 (below), after the dialog is already visible, and
+        // applied to the tree via SetCatalogInfo — so the window opens
+        // immediately and backup-status badges fill in a moment later.
+        var drives = await Task.Run(() => SourceSelectionViewModel.EnumerateDrives());
 
-        await Task.WhenAll(catalogTask, drivesTask);
-
-        var catalogInfo = catalogTask.Result;
-        var drives = drivesTask.Result;
-
-        var sourceSelection = new SourceSelectionViewModel(catalogInfo, drives,
+        var sourceSelection = new SourceSelectionViewModel(catalogInfo: null, drives,
             fileHashCache: _fileHashCache, scanner: _scanner);
         sourceSelection.IsEditMode = true;
 
@@ -461,23 +472,13 @@ public class MainViewModel : ViewModelBase
             sourceSelection.HasSelection = true;
         sourceSelection.ShowLargestFiles = true;
 
-        // Show catalog summary so the user knows files are already tracked
-        // (e.g. from a previous seed or backup).
-        if (catalogInfo is { Count: > 0 })
-        {
-            long totalBytes = 0;
-            foreach (var fvi in catalogInfo.Values)
-                totalBytes += fvi.SizeBytes;
-            sourceSelection.SeedResult =
-                $"{catalogInfo.Count:N0} files ({FormatBytes(totalBytes)}) in catalog.";
-        }
-
         // Helper: sync all VM settings into the BackupSet and write to DB.
         async Task SaveAllAsync()
         {
             SyncSettingsToJobOptions(backupSet, sourceSelection);
             backupSet.SourceSelections = sourceSelection.GetSelections();
             await Task.Run(() => _catalog.UpdateBackupSetAsync(backupSet));
+            savedThisSession = true;
         }
 
         // Register a pending save so settings are persisted on dialog close.
@@ -549,6 +550,13 @@ public class MainViewModel : ViewModelBase
             }
             _editorWindow = null;
             await LoadBackupSetsAsync();
+
+            // If the edit actually saved, reconcile the destination with the new
+            // source selection: offer to purge copies of removed folders and to
+            // back up newly added ones.  Skipped entirely when nothing was saved
+            // (e.g. the user discarded changes on close).
+            if (savedThisSession)
+                await ReconcileDestinationAfterEditAsync(backupSet, originalSelections);
         };
 
         // Save button: persist everything and show confirmation.
@@ -820,28 +828,60 @@ public class MainViewModel : ViewModelBase
         StatusText = $"Editing backup set \"{backupSet.Name}\".";
 
         // ---------------------------------------------------------------
-        // Phase 3: restore selections and compute sizes (dialog visible)
+        // Phase 3: load catalog, restore selections, compute sizes (dialog visible)
         // ---------------------------------------------------------------
         // The view shows a "Restoring selections..." overlay (bound to
         // IsApplyingSelections) while this runs.  This avoids blocking
         // the UI for seconds before the window appears.
 
-        if (backupSet.SourceSelections is { Count: > 0 })
-            await sourceSelection.ApplySelectionsAsync(backupSet.SourceSelections);
-
-        // Selections are now restored — re-sort so size-based ordering uses
-        // the correct effective sizes (during initial load, children had
-        // IsSelected = false so GetEffectiveSize returned -1 for everything).
-        if (sourceSelection.CurrentSortColumn == SortColumn.Size)
+        // Show the "Restoring selections..." overlay for the whole restore span
+        // (catalog load + selection restore) so the visible-but-empty tree isn't
+        // shown mid-population.
+        sourceSelection.IsApplyingSelections = true;
+        try
         {
-            foreach (var root in sourceSelection.Roots)
-                root.SortChildren();
-        }
+            // Load the (potentially huge) catalog version dictionary now, on a
+            // background thread, and hand it to the VM BEFORE restoring selections
+            // so the restored subtrees stamp their backup-status badges directly.
+            var catalogInfo = await Task.Run(() =>
+            {
+                try { return _catalog.GetLatestVersionInfoAsync(backupSet.Id).GetAwaiter().GetResult(); }
+                catch { return null as Dictionary<string, Core.Models.FileVersionInfo>; }
+            });
+            sourceSelection.SetCatalogInfo(catalogInfo);
 
-        // For existing sets, mark clean AFTER selections are restored so
-        // the restore itself doesn't count as a user change.
-        if (_unsavedNewSetId is null)
-            sourceSelection.MarkClean();
+            // Show catalog summary so the user knows files are already tracked
+            // (e.g. from a previous seed or backup).
+            if (catalogInfo is { Count: > 0 })
+            {
+                long totalBytes = 0;
+                foreach (var fvi in catalogInfo.Values)
+                    totalBytes += fvi.SizeBytes;
+                sourceSelection.SeedResult =
+                    $"{catalogInfo.Count:N0} files ({FormatBytes(totalBytes)}) in catalog.";
+            }
+
+            if (backupSet.SourceSelections is { Count: > 0 })
+                await sourceSelection.ApplySelectionsAsync(backupSet.SourceSelections);
+
+            // Selections are now restored — re-sort so size-based ordering uses
+            // the correct effective sizes (during initial load, children had
+            // IsSelected = false so GetEffectiveSize returned -1 for everything).
+            if (sourceSelection.CurrentSortColumn == SortColumn.Size)
+            {
+                foreach (var root in sourceSelection.Roots)
+                    root.SortChildren();
+            }
+
+            // For existing sets, mark clean AFTER selections are restored so
+            // the restore itself doesn't count as a user change.
+            if (_unsavedNewSetId is null)
+                sourceSelection.MarkClean();
+        }
+        finally
+        {
+            sourceSelection.IsApplyingSelections = false;
+        }
 
         _ = PostShowInitAsync();
 
@@ -851,6 +891,356 @@ public class MainViewModel : ViewModelBase
             planCheckReady = true;
             autoCheckCts = new CancellationTokenSource();
             await RunPlanCheckInEditorAsync(sourceSelection, backupSet, autoCheckCts.Token);
+        }
+    }
+
+    // -------------------------------------------------------------------
+    // Post-edit destination reconcile: after a *saved* source edit, offer to
+    // purge destination copies of removed sources and back up added ones.
+    // -------------------------------------------------------------------
+
+    /// <summary>
+    /// After a backup set's sources are edited AND saved, diff the saved source
+    /// selection against the pre-edit snapshot and offer two independent,
+    /// orthogonal follow-ups:
+    /// <list type="bullet">
+    /// <item><b>Purge</b> — destination copies of files whose source path is no
+    /// longer covered are offered for immediate removal (all-or-nothing, via a
+    /// read-only review tree) so they don't linger until the next Cleanup.</item>
+    /// <item><b>Back up</b> — files under newly-covered source roots are shown in
+    /// a read-only preview tree and offered for an immediate incremental backup.</item>
+    /// </list>
+    /// Removal is detected file-by-file (a file included under the old selection
+    /// but not the new one), which correctly handles deselecting one child of a
+    /// fully-selected parent.  Addition is first gated at the covering-root level
+    /// (so a partial de-selection can never register as an addition), then the
+    /// preview enumerates those roots and keeps only files the new selection
+    /// covers but the old one didn't.
+    /// </summary>
+    private async Task ReconcileDestinationAfterEditAsync(
+        BackupSet backupSet, IReadOnlyList<Core.Models.SourceSelection> originalSelections)
+    {
+        var newSelections = backupSet.SourceSelections
+            ?? new List<Core.Models.SourceSelection>();
+
+        // Fast path: if the source selection is unchanged from when the dialog
+        // opened, there is nothing to reconcile — no folders were dropped or
+        // added. Skip the expensive GetAllFilesForBackupSetAsync scan (which can
+        // load ~1M rows and stall the UI for several seconds) that would
+        // otherwise run on EVERY dialog close, since close auto-saves and thus
+        // always sets savedThisSession. The comparison uses the same JSON
+        // serialization the catalog persists with, so it is conservative: any
+        // real change produces different JSON and still runs the full reconcile.
+        if (SelectionsEquivalent(originalSelections, newSelections))
+            return;
+
+        List<FileRecord> removed;
+        List<string> addedRoots;
+
+        Mouse.OverrideCursor = Cursors.Wait;
+        try
+        {
+            (removed, addedRoots) = await Task.Run(() =>
+            {
+                var all = _catalog
+                    .GetAllFilesForBackupSetAsync(backupSet.Id)
+                    .GetAwaiter().GetResult();
+
+                // Removed: currently-active catalog files whose source path was
+                // covered before the edit but isn't covered any more.
+                var rem = all
+                    .Where(f => !f.IsDeleted
+                        && SourceSelection.IsPathIncluded(originalSelections, f.SourcePath)
+                        && !SourceSelection.IsPathIncluded(newSelections, f.SourcePath))
+                    .ToList();
+
+                // Added: new covering roots not already covered by an old root.
+                var oldRoots = SourceSelection.CollectSelectedRoots(originalSelections);
+                var newRoots = SourceSelection.CollectSelectedRoots(newSelections);
+                var added = newRoots
+                    .Where(r => !IsCoveredBy(oldRoots, r))
+                    .ToList();
+
+                return (rem, added);
+            });
+        }
+        finally
+        {
+            Mouse.OverrideCursor = null;
+        }
+
+        // Removal and addition are disjoint (a path can't be both dropped and
+        // newly covered), so both prompts may legitimately appear in sequence.
+        if (removed.Count > 0)
+            await PromptAndPurgeRemovedAsync(backupSet, removed);
+
+        if (addedRoots.Count > 0)
+            await PromptAndBackupAddedAsync(backupSet, addedRoots, originalSelections, newSelections);
+    }
+
+    /// <summary>
+    /// Conservative structural equality for two source-selection trees, used to
+    /// decide whether a dialog edit actually changed the selection. Compares the
+    /// same JSON form the catalog persists with (<see cref="SqliteCatalogRepository"/>
+    /// serializes <c>SourceSelections</c> with a plain <c>JsonSerializer.Serialize</c>),
+    /// so identical trees compare equal and any real change compares unequal.
+    /// </summary>
+    private static bool SelectionsEquivalent(
+        IReadOnlyList<Core.Models.SourceSelection> a,
+        IReadOnlyList<Core.Models.SourceSelection> b)
+    {
+        try
+        {
+            return JsonSerializer.Serialize(a) == JsonSerializer.Serialize(b);
+        }
+        catch
+        {
+            // If serialization ever fails, fall back to running the reconcile
+            // (correctness over the optimisation).
+            return false;
+        }
+    }
+
+    /// <summary>True when <paramref name="path"/> equals one of
+    /// <paramref name="roots"/> or lives underneath one of them.</summary>
+    private static bool IsCoveredBy(IEnumerable<string> roots, string path)
+    {
+        foreach (var root in roots)
+        {
+            if (string.Equals(root, path, StringComparison.OrdinalIgnoreCase))
+                return true;
+            var prefix = root.TrimEnd('\\') + "\\";
+            if (path.StartsWith(prefix, StringComparison.OrdinalIgnoreCase))
+                return true;
+        }
+        return false;
+    }
+
+    /// <summary>
+    /// Show the read-only removal-review tree for files dropped from the set's
+    /// sources; on confirmation, mark them deleted in the catalog and physically
+    /// delete their destination copies (reusing the vetted Cleanup purge path via
+    /// <see cref="Services.DestinationFilePurger"/>), then run a catalog reconcile
+    /// so references left stale by the deletions are repaired — exactly as the
+    /// manual Cleanup workflow does.
+    /// </summary>
+    private async Task PromptAndPurgeRemovedAsync(
+        BackupSet backupSet, List<FileRecord> removed)
+    {
+        // One review row per source path; size is the sum across its versions.
+        var byPath = removed
+            .GroupBy(f => f.SourcePath, StringComparer.OrdinalIgnoreCase)
+            .Select(g => (SourcePath: g.Key, SizeBytes: g.Sum(f => f.SizeBytes)))
+            .ToList();
+
+        var reviewVm = ReviewTreeViewModel.ForRemoval(byPath);
+        var dialog = new ReviewTreeDialog
+        {
+            Owner = Application.Current.MainWindow,
+            DataContext = reviewVm,
+        };
+
+        if (dialog.ShowDialog() != true)
+        {
+            StatusText = "Left removed-source files on the destination "
+                + "(remove later via Cleanup).";
+            return;
+        }
+
+        string? targetDir = backupSet.JobOptions?.TargetDirectory;
+        var sourcePaths = byPath.Select(p => p.SourcePath).ToList();
+        // Every version's destination file must be deleted, de-duplicated so a
+        // shared disc path is never deleted (or counted) twice.
+        var discPaths = new HashSet<string>(
+            removed.Select(f => f.DiscPath.Replace('/', '\\')),
+            StringComparer.OrdinalIgnoreCase);
+
+        Mouse.OverrideCursor = Cursors.Wait;
+        int catPurged = 0, filesDeleted = 0, delFailures = 0;
+        long bytesFreed = 0;
+        try
+        {
+            (catPurged, filesDeleted, delFailures, bytesFreed) = await Task.Run(() =>
+            {
+                // Catalog marks inside a single transaction (mirrors Cleanup).
+                var tx = _catalog.BeginTransactionAsync(backupSet.Id).GetAwaiter().GetResult();
+                int purged;
+                try
+                {
+                    purged = _catalog
+                        .MarkFilesDeletedBySourcePathsAsync(backupSet.Id, sourcePaths)
+                        .GetAwaiter().GetResult();
+                    tx.Complete();
+                }
+                finally
+                {
+                    tx.Dispose();
+                }
+
+                // Physical deletion outside the tx so file errors can't roll the
+                // catalog back.  Skipped entirely if no destination is set.
+                int fd = 0, ff = 0;
+                long bytes = 0;
+                if (targetDir is not null)
+                {
+                    var (d, f, b) = Services.DestinationFilePurger
+                        .DeleteFilesAndSweep(targetDir, discPaths, null);
+                    fd = d; ff = f; bytes = b;
+                }
+                return (purged, fd, ff, bytes);
+            });
+
+            // Repair any references left stale by the deletions (a plain copy
+            // that other rows referenced may now be gone), exactly as manual
+            // Cleanup's reconcile step does.
+            if (targetDir is not null)
+            {
+                var reconcile = new CatalogReconcileService(_catalog);
+                var report = await reconcile.AnalyzeAsync(backupSet.Id, targetDir);
+                if (report.HasChanges)
+                    await reconcile.ApplyAsync(backupSet.Id, report, targetDir);
+            }
+        }
+        catch (Exception ex)
+        {
+            StatusText = $"Failed to remove destination files: {ex.Message}";
+            return;
+        }
+        finally
+        {
+            Mouse.OverrideCursor = null;
+        }
+
+        var parts = new List<string>();
+        if (catPurged > 0)
+            parts.Add($"purged {catPurged:N0} catalog record{(catPurged == 1 ? "" : "s")}");
+        if (filesDeleted > 0)
+            parts.Add($"deleted {filesDeleted:N0} file{(filesDeleted == 1 ? "" : "s")} ({FormatBytes(bytesFreed)})");
+        if (delFailures > 0)
+            parts.Add($"{delFailures:N0} deletion failure{(delFailures == 1 ? "" : "s")}");
+        StatusText = parts.Count > 0
+            ? "Removed sources: " + string.Join(", ", parts) + "."
+            : "No destination files needed removal.";
+
+        await LoadBackupSetsAsync();
+    }
+
+    /// <summary>
+    /// Show a read-only, sortable preview tree of the files newly covered by the
+    /// set's sources (enumerated from disk under the added roots, filtered to the
+    /// files the new selection covers but the old one didn't).  On confirmation,
+    /// kick off an immediate incremental backup; declining leaves them for the
+    /// next scheduled or manual backup.
+    /// </summary>
+    private async Task PromptAndBackupAddedAsync(
+        BackupSet backupSet,
+        List<string> addedRoots,
+        IReadOnlyList<Core.Models.SourceSelection> originalSelections,
+        IReadOnlyList<Core.Models.SourceSelection> newSelections)
+    {
+        List<(string SourcePath, long SizeBytes)> addedFiles;
+
+        Mouse.OverrideCursor = Cursors.Wait;
+        try
+        {
+            addedFiles = await Task.Run(() =>
+            {
+                // Walk the added roots on disk and keep only files the new
+                // selection covers but the old one didn't — the exact inverse of
+                // the removal diff, so partial (de)selections are respected.
+                var result = new List<(string, long)>();
+                foreach (var (path, size) in EnumerateFilesUnderRoots(addedRoots))
+                {
+                    if (SourceSelection.IsPathIncluded(newSelections, path)
+                        && !SourceSelection.IsPathIncluded(originalSelections, path))
+                        result.Add((path, size));
+                }
+                return result;
+            });
+        }
+        finally
+        {
+            Mouse.OverrideCursor = null;
+        }
+
+        // Nothing newly covered actually exists on disk (e.g. empty folders were
+        // added) — there's nothing to preview or back up right now.
+        if (addedFiles.Count == 0)
+            return;
+
+        var reviewVm = ReviewTreeViewModel.ForAdditions(addedFiles);
+        var dialog = new ReviewTreeDialog
+        {
+            Owner = Application.Current.MainWindow,
+            DataContext = reviewVm,
+        };
+
+        if (dialog.ShowDialog() != true)
+            return;
+
+        var row = BackupSets.FirstOrDefault(s => s.Id == backupSet.Id);
+        if (row is null)
+        {
+            StatusText = "Couldn't start backup — the set is no longer listed.";
+            return;
+        }
+        _ = RunIncrementalFlowAsync(row, forceReview: false);
+    }
+
+    /// <summary>
+    /// Recursively enumerate the files (with sizes) under a set of directory
+    /// roots, skipping reparse points to avoid symlink loops and swallowing
+    /// per-directory access errors so one unreadable folder can't abort the walk.
+    /// </summary>
+    private static IEnumerable<(string Path, long Size)> EnumerateFilesUnderRoots(
+        IEnumerable<string> roots)
+    {
+        var visited = new HashSet<string>(StringComparer.OrdinalIgnoreCase);
+        var stack = new Stack<string>();
+        foreach (var r in roots)
+        {
+            // A "root" is always a directory (CollectSelectedRoots maps a selected
+            // file to its containing directory), but guard for a stray file path.
+            if (File.Exists(r))
+            {
+                long fsize = 0;
+                try { fsize = new FileInfo(r).Length; } catch { }
+                yield return (r, fsize);
+            }
+            else if (visited.Add(r))
+            {
+                stack.Push(r);
+            }
+        }
+
+        while (stack.Count > 0)
+        {
+            var dir = stack.Pop();
+
+            IEnumerable<string> subdirs = Array.Empty<string>();
+            try { subdirs = Directory.EnumerateDirectories(dir); }
+            catch { /* unreadable — skip */ }
+            foreach (var sd in subdirs)
+            {
+                try
+                {
+                    if ((File.GetAttributes(sd) & FileAttributes.ReparsePoint) != 0)
+                        continue; // don't follow junctions/symlinks
+                }
+                catch { continue; }
+                if (visited.Add(sd))
+                    stack.Push(sd);
+            }
+
+            IEnumerable<string> files = Array.Empty<string>();
+            try { files = Directory.EnumerateFiles(dir); }
+            catch { /* unreadable — skip */ }
+            foreach (var f in files)
+            {
+                long size = 0;
+                try { size = new FileInfo(f).Length; } catch { }
+                yield return (f, size);
+            }
         }
     }
 
@@ -2849,8 +3239,14 @@ public class MainViewModel : ViewModelBase
         }
         catch (OperationCanceledException)
         {
-            progressVm.CompleteBurn(false, "Cancelled by user.");
+            progressVm.CompleteBurn(false, "Cancelled by user.", cancelled: true);
             StatusText = "Backup cancelled.";
+            // A user abort with no failed files leaves nothing to review, so
+            // finalize straight to the row's persistent result line instead of
+            // parking a Dismiss button over an empty panel. If files did fail
+            // before the abort, keep the panel up so that list stays available.
+            if (!progressVm.HasFailedFiles)
+                progressVm.RequestDone();
         }
         catch (Exception ex)
         {
@@ -2910,8 +3306,14 @@ public class MainViewModel : ViewModelBase
         }
         catch (OperationCanceledException)
         {
-            progressVm.CompleteBurn(false, "Cancelled by user.");
+            progressVm.CompleteBurn(false, "Cancelled by user.", cancelled: true);
             StatusText = "Directory backup cancelled.";
+            // A user abort with no failed files leaves nothing to review, so
+            // finalize straight to the row's persistent result line instead of
+            // parking a Dismiss button over an empty panel. If files did fail
+            // before the abort, keep the panel up so that list stays available.
+            if (!progressVm.HasFailedFiles)
+                progressVm.RequestDone();
         }
         catch (Exception ex)
         {
@@ -3036,6 +3438,22 @@ public class MainViewModel : ViewModelBase
 
         CurrentView = vm;
         StatusText = $"Verifying backup integrity for \"{SelectedBackupSet.Name}\".";
+    }
+
+    // -------------------------------------------------------------------
+    // Flow 6c: Test Disc (integrity-test one optical disc + re-burn repairs)
+    // -------------------------------------------------------------------
+
+    private void StartTestDiscFlow()
+    {
+        if (SelectedBackupSet is null) return;
+
+        var vm = new TestDiscViewModel(
+            _catalog, _restoreService, _orchestrator, _burner, SelectedBackupSet);
+        vm.DoneRequested += GoHome;
+
+        CurrentView = vm;
+        StatusText = $"Test a backup disc from \"{SelectedBackupSet.Name}\".";
     }
 
     // -------------------------------------------------------------------
