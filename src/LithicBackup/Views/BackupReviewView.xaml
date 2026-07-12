@@ -131,11 +131,19 @@
                                     </TextBlock>
                                 </Border>
                                 <Border Grid.Column="2"
+                                        Background="Transparent" Cursor="Hand"
+                                        ToolTip="Sort by status"
                                         BorderBrush="{StaticResource BorderBrush}"
                                         BorderThickness="0,0,1,1"
                                         Padding="8,6">
-                                    <TextBlock Text="Status" FontSize="11"
-                                               Foreground="{StaticResource TextSecondaryBrush}" />
+                                    <Border.InputBindings>
+                                        <MouseBinding MouseAction="LeftClick"
+                                                      Command="{Binding SortByStatusCommand}" />
+                                    </Border.InputBindings>
+                                    <TextBlock FontSize="11"
+                                               Foreground="{StaticResource TextSecondaryBrush}">
+                                        <Run Text="Status" /><Run Text="{Binding StatusSortIndicator, Mode=OneWay}" />
+                                    </TextBlock>
                                 </Border>
                                 <Border Grid.Column="3"
                                         Background="Transparent" Cursor="Hand"

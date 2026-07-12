@@ -225,6 +225,18 @@ public class BackupReviewNodeViewModel : ViewModelBase
         }
     }
 
+    /// <summary>
+    /// Stable sort key for the Status column: New (0) → Changed (1) →
+    /// Mixed (2) → none (3).
+    /// </summary>
+    public int StatusSortKey => StatusText switch
+    {
+        "New" => 0,
+        "Changed" => 1,
+        "Mixed" => 2,
+        _ => 3,
+    };
+
     /// <summary>Walk descendants to determine which statuses are present.</summary>
     private (bool anyNew, bool anyChanged) AggregateStatus()
     {

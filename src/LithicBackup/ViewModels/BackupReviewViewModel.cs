@@ -11,6 +11,7 @@ namespace LithicBackup.ViewModels;
 public enum ReviewSortColumn
 {
     Name,
+    Status,
     Files,
     Size,
 }
@@ -83,6 +84,7 @@ public class BackupReviewViewModel : ViewModelBase
         });
 
         SortByNameCommand = new RelayCommand(_ => ToggleSort(ReviewSortColumn.Name));
+        SortByStatusCommand = new RelayCommand(_ => ToggleSort(ReviewSortColumn.Status));
         SortByFilesCommand = new RelayCommand(_ => ToggleSort(ReviewSortColumn.Files));
         SortBySizeCommand = new RelayCommand(_ => ToggleSort(ReviewSortColumn.Size));
 
@@ -179,12 +181,14 @@ public class BackupReviewViewModel : ViewModelBase
     public ICommand ExpandAllCommand { get; }
     public ICommand CollapseAllCommand { get; }
     public ICommand SortByNameCommand { get; }
+    public ICommand SortByStatusCommand { get; }
     public ICommand SortByFilesCommand { get; }
     public ICommand SortBySizeCommand { get; }
 
     // --- Sort indicators (arrow suffixes for the active column header) ---
 
     public string NameSortIndicator => SortIndicator(ReviewSortColumn.Name);
+    public string StatusSortIndicator => SortIndicator(ReviewSortColumn.Status);
     public string FilesSortIndicator => SortIndicator(ReviewSortColumn.Files);
     public string SizeSortIndicator => SortIndicator(ReviewSortColumn.Size);
 
@@ -358,12 +362,14 @@ public class BackupReviewViewModel : ViewModelBase
         else
         {
             _sortColumn = column;
-            // Name defaults to A→Z; size/files default to largest-first.
-            _sortDescending = column != ReviewSortColumn.Name;
+            // Size/files default to largest-first; name/status ascend
+            // (A→Z, New→Changed→Mixed).
+            _sortDescending = column is ReviewSortColumn.Size or ReviewSortColumn.Files;
         }
 
         ApplySort();
         OnPropertyChanged(nameof(NameSortIndicator));
+        OnPropertyChanged(nameof(StatusSortIndicator));
         OnPropertyChanged(nameof(FilesSortIndicator));
         OnPropertyChanged(nameof(SizeSortIndicator));
     }
@@ -404,6 +410,9 @@ public class BackupReviewViewModel : ViewModelBase
             ReviewSortColumn.Files => _sortDescending
                 ? nodes.OrderByDescending(n => n.TotalFileCount)
                 : nodes.OrderBy(n => n.TotalFileCount),
+            ReviewSortColumn.Status => _sortDescending
+                ? nodes.OrderByDescending(n => n.StatusSortKey)
+                : nodes.OrderBy(n => n.StatusSortKey),
             // Name: keep directories grouped ahead of files, then alphabetical.
             _ => _sortDescending
                 ? nodes.OrderByDescending(n => n.IsDirectory)
