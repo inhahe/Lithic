@@ -289,8 +289,13 @@ public class BackupOrchestrator : IBackupOrchestrator
                 if (allocation is not null)
                     filesToProcess.AddRange(allocation.Files);
 
-                foreach (var file in filesToProcess)
+                // Index-based loop (not foreach): TryFillGapFromPending appends a
+                // replacement file to filesToProcess when the current one is skipped
+                // or re-queued, and those appended files must themselves be processed.
+                // A foreach would throw because the list is modified mid-iteration.
+                for (int fileIndex = 0; fileIndex < filesToProcess.Count; fileIndex++)
                 {
+                    var file = filesToProcess[fileIndex];
                     ct.ThrowIfCancellationRequested();
 
                     // --- Live change detection ---
@@ -452,26 +457,52 @@ public class BackupOrchestrator : IBackupOrchestrator
                                 if (destDir is not null)
                                     Directory.CreateDirectory(destDir);
 
-                                // Open with FileShare.Read to acquire a read lock
-                                // that prevents writes while we copy.
+                                // Open with FileShare.Read FIRST to take a read lock
+                                // that blocks writers, THEN re-check the size while
+                                // holding it. This closes the window between the
+                                // pre-copy metadata check above and the copy itself:
+                                // once the lock is held the file can no longer grow, so
+                                // the bytes we stage — and the capacity accounting below
+                                // — are guaranteed to match what actually lands on the
+                                // disc. Without this, a file that grew after the pre-copy
+                                // check would be copied at its larger size but counted at
+                                // the planned size, and could overflow the disc.
                                 await using (var srcStream = new FileStream(
                                     file.FullPath, FileMode.Open, FileAccess.Read,
                                     FileShare.Read, bufferSize: 81920, useAsync: true))
-                                await using (var dstStream = new FileStream(
-                                    destPath, FileMode.Create, FileAccess.Write,
-                                    FileShare.None, bufferSize: 81920, useAsync: true))
                                 {
-                                    await srcStream.CopyToAsync(dstStream, ct);
-                                }
+                                    long lockedSize = srcStream.Length;
+                                    if (lockedSize != file.SizeBytes || lockedSize > remainingSpace)
+                                    {
+                                        // Changed since planning, or grew past the space
+                                        // left on this disc. Don't stage a stale/oversized
+                                        // copy — re-queue at the true (locked) size for a
+                                        // later disc and try to fill the gap it leaves.
+                                        pendingQueue.Enqueue(new ScannedFile
+                                        {
+                                            FullPath = file.FullPath,
+                                            SizeBytes = lockedSize,
+                                            LastWriteUtc = File.GetLastWriteTimeUtc(file.FullPath),
+                                        });
+                                        TryFillGapFromPending(
+                                            filesToProcess, pendingQueue, remainingSpace);
+                                        break;
+                                    }
 
-                                stagedFiles.Add(new StagedFileInfo
-                                {
-                                    Source = file,
-                                    StagedPath = relativePath,
-                                    IsZipped = false,
-                                    IsSplit = false,
-                                    StagedSizeBytes = file.SizeBytes,
-                                });
+                                    await using var dstStream = new FileStream(
+                                        destPath, FileMode.Create, FileAccess.Write,
+                                        FileShare.None, bufferSize: 81920, useAsync: true);
+                                    await srcStream.CopyToAsync(dstStream, ct);
+
+                                    stagedFiles.Add(new StagedFileInfo
+                                    {
+                                        Source = file,
+                                        StagedPath = relativePath,
+                                        IsZipped = false,
+                                        IsSplit = false,
+                                        StagedSizeBytes = lockedSize,
+                                    });
+                                }
                             }
                         }
                         catch (Exception ex)
@@ -774,15 +805,19 @@ public class BackupOrchestrator : IBackupOrchestrator
                             int splitVersion = 1;
                             if (versionInfo.TryGetValue(sc.Source.FullPath, out var svi))
                                 splitVersion = svi.MaxVersion + 1;
+                            // Use the snapshot's actual size (== sum of chunk
+                            // lengths), not the planned scan size, so the record's
+                            // SizeBytes matches the bytes actually written even if the
+                            // source grew between planning and the split.
                             versionInfo[sc.Source.FullPath] = new FileVersionInfo(
-                                splitVersion, sc.Source.SizeBytes, sc.Source.LastWriteUtc, false, false, sc.Hash);
+                                splitVersion, sc.Size, sc.Source.LastWriteUtc, false, false, sc.Hash);
 
                             var splitRecord = await _catalog.CreateFileRecordAsync(new FileRecord
                             {
                                 DiscId = discRecord.Id,
                                 SourcePath = sc.Source.FullPath,
                                 DiscPath = staged.Chunk.DiscFilename,
-                                SizeBytes = sc.Source.SizeBytes,
+                                SizeBytes = sc.Size,
                                 Hash = sc.Hash,
                                 IsZipped = false,
                                 IsSplit = true,
@@ -1436,6 +1471,13 @@ public class BackupOrchestrator : IBackupOrchestrator
     {
         public required ScannedFile Source { get; init; }
         public required string Hash { get; init; }
+        /// <summary>
+        /// Actual byte length of the spill snapshot the chunks are carved from
+        /// (captured under a read lock when the split began), so the owning
+        /// <see cref="FileRecord"/>'s size matches the sum of its chunk lengths
+        /// even if the live source grew between planning and the split.
+        /// </summary>
+        public required long Size { get; init; }
         public long FileRecordId { get; set; } = -1;
     }
 
@@ -1485,7 +1527,7 @@ public class BackupOrchestrator : IBackupOrchestrator
 
         return new SplitCarry
         {
-            Ctx = new SplitContext { Source = file, Hash = hash },
+            Ctx = new SplitContext { Source = file, Hash = hash, Size = size },
             SpillPath = spillPath,
             Offset = 0,
             Remaining = size,

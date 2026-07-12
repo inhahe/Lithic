@@ -73,6 +73,42 @@ one-shot streamed hash, guarded against mid-burn source mutation (size/mtime rec
 avoiding the snapshot — the snapshot is currently the simplest way to guarantee
 consistency across a multi-disc, possibly multi-hour burn.
 
+## FIXED: File that grows between plan and burn could overflow a disc (2026-07-12)
+
+**Status:** Fixed 2026-07-12 in `BackupOrchestrator.ExecuteAsync`. Verified by
+`tools/disc_test_harness` (`file-grows-between-plan-and-burn`).
+
+**Symptom:** The plan bin-packs to each file's scanned size, but staging happens
+later. If a file grew between planning and staging, the plain-copy path recorded the
+staged item at the *planned* size (`StagedSizeBytes = file.SizeBytes`) while copying
+the file's larger current content. The per-disc capacity accounting then undercounted,
+so a grown file could push a disc over its real capacity. Split files had a related
+metadata inconsistency: the `FileRecord.SizeBytes` used the planned scan size while
+the chunks were carved from a fresh snapshot of the (possibly larger) live file.
+
+**Root cause (two parts):**
+1. `StagedSizeBytes = file.SizeBytes` used the planned size, not the bytes actually
+   copied. There was also a TOCTOU gap between the pre-copy metadata check and the
+   copy: the file could grow in between and be copied larger than checked.
+2. A latent bug in the same loop: `TryFillGapFromPending` appends a replacement file
+   to `filesToProcess`, but the loop was a `foreach` over that same list — modifying a
+   `List<T>` mid-`foreach` throws `InvalidOperationException`. This never fired only
+   because no test previously triggered a mid-staging skip/re-queue during a normal
+   plan+execute.
+
+**Fix:**
+- The plain-copy path now opens the source with `FileShare.Read` (a read lock that
+  blocks writers) **first**, then re-checks the size *under the lock*. Once locked the
+  file cannot grow, so the staged bytes and the capacity accounting are guaranteed
+  consistent. If the locked size differs from the plan or no longer fits the space left
+  on the disc, the file is re-queued at its true size for a later disc (and the gap it
+  leaves is filled from the pending queue). `StagedSizeBytes` is set to the locked size.
+- Split files carry the snapshot's actual byte length (`SplitContext.Size`, captured
+  under the read lock in `BeginSplitAsync`) and the split `FileRecord.SizeBytes` uses
+  it, so the record matches the sum of its chunk lengths.
+- The staging loop is now an index-based `for` loop so gap-fill appends are both
+  tolerated and processed.
+
 ## OPEN (minor): disc that over-reports capacity fails the burn instead of re-planning (2026-07-12)
 
 **Status:** Behaves safely (fails loud, no corruption) but not gracefully. Covered by

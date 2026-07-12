@@ -368,6 +368,41 @@ await runner.Run("disc-over-reports-capacity", async ws =>
     ws.Assert(ex is IOException, $"expected IOException from over-reported media, got {ex?.GetType().Name ?? "none"}");
 });
 
+await runner.Run("file-grows-between-plan-and-burn", async ws =>
+{
+    // A file grows AFTER the plan is fixed but BEFORE staging. The burn must not
+    // stage a stale (too-small) size and overflow the disc: the grown file is
+    // re-detected, re-queued at its true size, and bumped to the next disc. The
+    // restore must yield the GROWN content (staging reads the current bytes under
+    // a read lock), and no disc may exceed its capacity.
+    var srcs = ws.MakeTree(("g/a.bin", 80_000), ("g/b.bin", 80_000), ("g/c.bin", 80_000));
+    string grownPath = srcs[0];
+    var grown = TestRunner.Gen(9999, 250_000);
+    var (burner, result) = await ws.Backup(srcs,
+        capacityBytes: 300_000,
+        betweenPlanAndExecute: () => { File.WriteAllBytes(grownPath, grown); return Task.CompletedTask; });
+
+    ws.Assert(result.Success, "backup should succeed despite the file growing");
+
+    var discs = await ws.Catalog.GetDiscsForBackupSetAsync(ws.BackupSetId);
+    ws.Assert(discs.Count >= 2, $"grown file should have been bumped to a 2nd disc, got {discs.Count}");
+
+    long overflow = ws.MaxDiscOverflowBytes(burner, 300_000);
+    ws.Assert(overflow == 0, $"a disc overflowed capacity by {overflow} bytes");
+
+    // The catalog must record the grown file at its TRUE (grown) size, not the plan.
+    var records = await ws.AllFileRecords();
+    var rec = records.First(r => r.SourcePath == grownPath && !r.IsDeleted);
+    ws.Assert(rec.SizeBytes == grown.Length,
+        $"recorded size {rec.SizeBytes} should equal grown size {grown.Length}");
+
+    // Restore must reproduce the grown content (RestoreAndVerify compares to the
+    // current source, which is now the grown file).
+    var r = await ws.RestoreAndVerify(burner, srcs);
+    ws.Assert(r.Mismatches == 0, $"{r.Mismatches} restored file(s) had wrong content");
+    ws.Assert(r.Restored == srcs.Count, $"restored {r.Restored}/{srcs.Count} files");
+});
+
 return runner.Report();
 
 // ======================================================================
@@ -517,7 +552,8 @@ sealed class Workspace : IDisposable
         FilesystemType filesystemType = FilesystemType.UDF,
         FailureCallback? onFailure = null,
         SimulatedDiscBurner? burner = null,
-        Action<SimulatedDiscBurner>? configure = null)
+        Action<SimulatedDiscBurner>? configure = null,
+        Func<Task>? betweenPlanAndExecute = null)
     {
         burner ??= NewBurner(configure);
 
@@ -554,6 +590,10 @@ sealed class Workspace : IDisposable
         Console.WriteLine($"  [plan] cap={job.CapacityOverrideBytes} allocs={plan.DiscAllocations.Count} " +
             $"totBytes={plan.TotalBytes} newFiles={plan.Diff.NewFiles.Count} " +
             $"allocSizes=[{string.Join(",", plan.DiscAllocations.Select(a => a.TotalBytes))}]");
+        // Optional hook to mutate the source tree AFTER the plan is fixed but BEFORE
+        // execution/staging — used to test files that grow between plan and burn.
+        if (betweenPlanAndExecute is not null)
+            await betweenPlanAndExecute();
         var result = await orchestrator.ExecuteAsync(plan, progress: null, onFailure: onFailure,
             ct: CancellationToken.None);
         return (burner, result);
