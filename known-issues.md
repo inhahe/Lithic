@@ -1,5 +1,53 @@
 # LithicBackup — Known Issues & Tech Debt
 
+## FIXED: Multisession append lost earlier sessions' files on real hardware (2026-07-12)
+
+**Symptom (hardware):** An incremental (multisession) backup that *appended* a new
+session to a disc that already had data would, on real IMAPI2 hardware, mount
+showing **only the newest session's files**. Files written in earlier sessions
+became invisible on the volume and therefore unrestorable — a silent data-loss
+bug for anyone relying on incremental disc backups. The decision logic
+(`DiscSessionStrategy`) and the `SimulatedDiscBurner` handled multisession fine;
+the gap was entirely in the real burner and in cross-run disc labelling.
+
+**Two root causes, both fixed:**
+
+1. **No file-system import in the IMAPI2 burn.** `Imapi2DiscBurner.BurnAsync` built
+   a *fresh* standalone `MsftFileSystemImage` on every burn — it never set
+   `fsi.MultisessionInterfaces` or called `fsi.ImportFileSystem()`, so an appended
+   session's directory tree did not carry forward the earlier sessions' entries.
+   **Fix:** `format2Data` is now created up front so its `MultisessionInterfaces`
+   can be read before the image is built; when `options.Multisession` and the media
+   is non-blank, the burner sets `fsi.MultisessionInterfaces` and calls
+   `fsi.ImportFileSystem()` (the standard IMAPI2 append pattern) so the new session
+   is the union of all prior sessions. **Hardware-untested** — validated by code
+   review only, like the rest of the IMAPI2 path. The simulator can't exercise the
+   IMAPI union directly (it models each session as its own disc surface), so the
+   real-hardware `ImportFileSystem` call remains the one unverified link.
+
+2. **Disc labels/sequence numbers reset every run → collisions.**
+   `BackupOrchestrator.ExecuteAsync` computed `discSequence = discIndex + 1`, so
+   *every* run's first disc was `Disc-001`. A second run to the same set produced a
+   second `Disc-001` record; restore maps a disc *label* to a physical volume, so
+   the collision made the second session's files unresolvable even in simulation.
+   **Fix:** the run now seeds `sequenceBase` from the set's existing max
+   `SequenceNumber` and numbers this run's discs from there, so labels are unique
+   across runs (`Disc-001`, then `Disc-002`, …). This also fixes restore for any
+   multi-run backup, not just multisession.
+
+**Test:** `tools/disc_test_harness` case `multisession-append-restores-both-sessions`
+runs two backups to the same set/burner, asserts the append produces a second disc
+record with a unique label, and restores files from **both** sessions byte-for-byte.
+Full matrix 23/23.
+
+**Remaining nuance (not a bug, logged for awareness):** with unique labels, the two
+sessions of one *physical* multisession disc are recorded as two logical disc
+records (`Disc-001`, `Disc-002`). On real hardware both live on the same platter, so
+restore may prompt "insert Disc-002" when the disc is already in the drive; the
+files are still present (the imported union) so restore succeeds. A future
+improvement could give restore a physical-disc identity so it doesn't re-prompt for
+a disc that's already loaded.
+
 ## FEATURE: Burn-in-place disc staging mode (no full temp copy) (2026-07-12)
 
 **What:** Disc backups can now burn plain files directly from their original
@@ -35,7 +83,7 @@ the source; the software payload and exported catalog also live under temp.
   like `MemoryBudget`) and stamped onto `BackupJob.StagingMode` when the job is built
   (MainViewModel + BackupWorker). Not persisted per backup set.
 - **Tests:** `burn-in-place-basic` (multi-disc, byte-exact restore, no overflow) and
-  `burn-in-place-growth-safe`. Full matrix 22/22.
+  `burn-in-place-growth-safe`. Full matrix 23/23.
 
 The split-file spill snapshot (below) still copies each *oversized* file to temp even
 in `InPlace` mode — that transient cost is unchanged and remains logged as tech debt.

@@ -145,6 +145,15 @@ public class BackupOrchestrator : IBackupOrchestrator
         int discsWritten = 0;
         long totalBytesWritten = 0;
 
+        // Continue disc numbering from any discs already recorded for this set so
+        // an incremental (multisession) run doesn't reuse "Disc-001" and collide
+        // with an earlier run's disc. Each run's discs get fresh, unique sequence
+        // numbers/labels within the set.
+        var existingDiscsForSet = await _catalog.GetDiscsForBackupSetAsync(backupSetId, ct);
+        int sequenceBase = existingDiscsForSet.Count > 0
+            ? existingDiscsForSet.Max(d => d.SequenceNumber)
+            : 0;
+
         // Build a lookup of max existing version per source path so we can
         // increment version numbers for changed files.  Uses a lightweight
         // SQL aggregate query instead of loading all FileRecord objects.
@@ -223,7 +232,7 @@ public class BackupOrchestrator : IBackupOrchestrator
                 ? allocation.TotalBytes + allocation.FreeBytes
                 : lastCapacity;
             lastCapacity = discCapacityForDisc;
-            int discSequence = discIndex + 1;
+            int discSequence = sequenceBase + discIndex + 1;
 
             // Per-disc "skip all" decision resets at each new disc.
             BurnFailureAction? discSkip = null;

@@ -463,6 +463,56 @@ await runner.Run("burn-in-place-growth-safe", async ws =>
     ws.Assert(r.Mismatches == 0, $"{r.Mismatches} restored file(s) had wrong content");
 });
 
+// ------------------------------------------------------------------
+// Multisession: append a second run onto an existing disc
+// ------------------------------------------------------------------
+
+await runner.Run("multisession-append-restores-both-sessions", async ws =>
+{
+    // Two backup runs to the SAME set on the SAME (non-blank, room-to-spare) disc.
+    // The second run must APPEND via multisession — a new disc record with a fresh,
+    // non-colliding label — and restore must reproduce files from BOTH sessions.
+    // This exercises the multisession orchestration end to end: the session
+    // decision, cross-run disc numbering, and per-session restore. (The IMAPI2
+    // ImportFileSystem step that makes this work on real hardware is exercised only
+    // by code review; the simulator models each session as its own disc surface.)
+    var burner = ws.NewBurner();
+
+    // --- Session 1: two files onto a blank disc. ---
+    var first = ws.MakeTree(("s1/a.bin", 60_000), ("s1/b.bin", 40_000));
+    var (_, r1) = await ws.Backup(first, burner: burner);
+    ws.Assert(r1.Success, "first backup should succeed");
+    int setId = ws.BackupSetId;
+    var discs1 = await ws.Catalog.GetDiscsForBackupSetAsync(setId);
+    ws.Assert(discs1.Count == 1, $"expected 1 disc after session 1, got {discs1.Count}");
+
+    // --- Session 2: incremental run to the SAME set/burner appends via multisession. ---
+    var second = ws.MakeTree(("s2/c.bin", 50_000), ("s2/d.bin", 30_000));
+    var (_, r2) = await ws.Backup(second, burner: burner, existingSetId: setId);
+    ws.Assert(r2.Success, "second (append) backup should succeed");
+
+    var discs = (await ws.Catalog.GetDiscsForBackupSetAsync(setId)).OrderBy(d => d.Id).ToList();
+    ws.Assert(discs.Count == 2, $"expected 2 disc records (one per session), got {discs.Count}");
+
+    // The append run must record only its two new files on the new session's disc.
+    var session2Files = await ws.Catalog.GetFilesOnDiscAsync(discs[1].Id);
+    ws.Assert(session2Files.Count == 2, $"append run should record 2 new files, got {session2Files.Count}");
+
+    // Cross-run disc labels must be unique. Regression guard: discSequence used to
+    // reset to 1 every run, so each run's first disc collided on "Disc-001", which
+    // made the second session's files unrestorable (the label mapped to one disc).
+    ws.Assert(discs.Select(d => d.Label).Distinct().Count() == discs.Count,
+        $"disc labels collided across sessions: [{string.Join(",", discs.Select(d => d.Label))}]");
+
+    // Restore the whole set: files from BOTH sessions must return byte-for-byte.
+    var all = new List<string>();
+    all.AddRange(first);
+    all.AddRange(second);
+    var r = await ws.RestoreAndVerify(burner, all);
+    ws.Assert(r.Mismatches == 0, $"{r.Mismatches} restored file(s) had wrong content");
+    ws.Assert(r.Restored == all.Count, $"restored {r.Restored}/{all.Count} files");
+});
+
 return runner.Report();
 
 // ======================================================================
@@ -614,23 +664,34 @@ sealed class Workspace : IDisposable
         SimulatedDiscBurner? burner = null,
         Action<SimulatedDiscBurner>? configure = null,
         Func<Task>? betweenPlanAndExecute = null,
-        DiscStagingMode stagingMode = DiscStagingMode.TemporaryCopy)
+        DiscStagingMode stagingMode = DiscStagingMode.TemporaryCopy,
+        int? existingSetId = null)
     {
         burner ??= NewBurner(configure);
 
-        var set = await Catalog.CreateBackupSetAsync(new BackupSet
+        // Reuse an existing set (for incremental / multisession runs) or create a
+        // fresh one. Reusing keeps the catalog history so the scanner diffs the new
+        // source tree against what's already backed up and only stages new files.
+        if (existingSetId is int reuse)
         {
-            Name = "harness-set",
-            SourceRoots = new List<string> { _sourceDir },
-            CreatedUtc = DateTime.UtcNow,
-        });
-        BackupSetId = set.Id;
+            BackupSetId = reuse;
+        }
+        else
+        {
+            var set = await Catalog.CreateBackupSetAsync(new BackupSet
+            {
+                Name = "harness-set",
+                SourceRoots = new List<string> { _sourceDir },
+                CreatedUtc = DateTime.UtcNow,
+            });
+            BackupSetId = set.Id;
+        }
 
         var orchestrator = BuildOrchestrator(burner);
 
         var job = new BackupJob
         {
-            BackupSetId = set.Id,
+            BackupSetId = BackupSetId,
             Sources = sources.Select(s => new SourceSelection
             {
                 Path = s,

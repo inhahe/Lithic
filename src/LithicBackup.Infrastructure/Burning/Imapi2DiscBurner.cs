@@ -173,7 +173,15 @@ public class Imapi2DiscBurner : IDiscBurner
             dynamic recorder = new MsftDiscRecorder2();
             recorder.InitializeDiscRecorder(recorderId);
 
-            // 2. Build the file system image.
+            // 2. Set up the disc writer up front so we can query the media's
+            //    multisession interfaces before building the image (needed to
+            //    import a prior session below).
+            dynamic format2Data = new MsftDiscFormat2Data();
+            format2Data.Recorder = (object)recorder;
+            format2Data.ClientName = "LithicBackup";
+            format2Data.ForceMediaToBeClosed = !options.Multisession;
+
+            // 3. Build the file system image.
             dynamic fsi = new MsftFileSystemImage();
             fsi.FileSystemsToCreate = (int)MapFsiFileSystems(options.FilesystemType);
             fsi.VolumeName = "DISCBURN";
@@ -182,6 +190,36 @@ public class Imapi2DiscBurner : IDiscBurner
             try { fsi.SetMaxMediaBlocksFromDevice((object)recorder); }
             catch (COMException) { /* Some devices don't support this; image will be
                                       validated at burn time instead. */ }
+
+            // Multisession append: import the existing file system so the new
+            // session carries forward every earlier session's directory entries.
+            // Without this the freshly written session mounts showing ONLY its own
+            // files, so files from earlier sessions become invisible on the volume
+            // and unrestorable. This is the standard IMAPI2 multisession pattern
+            // (set MultisessionInterfaces, then ImportFileSystem on non-blank
+            // media). NOTE: hardware-untested — validated only by code review; the
+            // simulated-burner path exercises the orchestration around it.
+            if (options.Multisession)
+            {
+                try
+                {
+                    object? msInterfaces = format2Data.MultisessionInterfaces;
+                    if (msInterfaces is not null)
+                        fsi.MultisessionInterfaces = msInterfaces;
+
+                    bool blank;
+                    try { blank = (bool)format2Data.MediaPhysicallyBlank; }
+                    catch { blank = false; }
+
+                    // Only import when there's an existing session to carry forward.
+                    if (!blank && msInterfaces is not null)
+                        fsi.ImportFileSystem();
+                }
+                catch (COMException)
+                {
+                    // Blank media or nothing to import — start a fresh image.
+                }
+            }
 
             // Add each file individually by its disc-relative path, reading its
             // bytes from an IStream over the source. AddFile creates any missing
@@ -208,17 +246,11 @@ public class Imapi2DiscBurner : IDiscBurner
             dynamic imageStream = resultImage.ImageStream;
             long totalBytes = (long)(int)resultImage.TotalBlocks * (int)resultImage.BlockSize;
 
-            // 3. Set up the disc writer.
-            dynamic format2Data = new MsftDiscFormat2Data();
-            format2Data.Recorder = (object)recorder;
-            format2Data.ClientName = "LithicBackup";
-            format2Data.ForceMediaToBeClosed = !options.Multisession;
-
-            // Set write speed (-1 = max speed in IMAPI2).
+            // 5. Configure write speed (recorder already assigned above; -1 = max).
             try { format2Data.SetWriteSpeed(-1, false); }
             catch (COMException) { /* Device may not support speed control. */ }
 
-            // 4. Hook up progress events via IConnectionPointContainer.
+            // 6. Hook up progress events via IConnectionPointContainer.
             IConnectionPoint? connectionPoint = null;
             int cookie = 0;
             BurnDataEventSink? eventSink = null;
@@ -235,7 +267,7 @@ public class Imapi2DiscBurner : IDiscBurner
                     connectionPoint.Advise(eventSink, out cookie);
                 }
 
-                // 5. Burn.
+                // 7. Burn.
                 ct.ThrowIfCancellationRequested();
                 format2Data.Write((object)imageStream);
             }
@@ -261,13 +293,13 @@ public class Imapi2DiscBurner : IDiscBurner
                 }
             }
 
-            // 6. Optional post-burn read-back verification.
+            // 8. Optional post-burn read-back verification.
             if (options.VerifyAfterBurn)
             {
                 VerifyBurnedDisc(recorder, items, totalBytes, stopwatch, progress, ct);
             }
 
-            // 7. Report final progress.
+            // 9. Report final progress.
             stopwatch.Stop();
             progress?.Report(new BurnProgress
             {
