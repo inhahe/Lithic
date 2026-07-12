@@ -475,53 +475,61 @@ path `SyncSettingsToJobOptions`, which preserves the existing schedule object.
 `BuildSchedule` if truly unused, or make the save path preserve/merge the existing
 `Schedule` instead of overwriting it with a possibly-null rebuild.
 
-## Move/rename relocation — Phase 1 shipped; Phase 2 (special formats & history) pending (2026-07-11)
+## Move/rename relocation — Phase 2 shipped: special formats, history & per-file granularity (2026-07-11)
 
-**Status:** Phase 1 IMPLEMENTED 2026-07-11. Continuous backup now detects same-volume
-renames/moves from the USN journal and relocates the destination copy in place instead
-of re-copying, for the common case. Phase 2 (below) is the remaining follow-up.
+**Status:** Phase 2 IMPLEMENTED 2026-07-11. `MoveTargetedAsync` now relocates
+`.dedup`/`.fileref` manifests and the full `{drive}_prev` version history in place,
+per-file within a directory, inside a single catalog transaction — closing the
+Phase 1 fallbacks below. Only genuinely un-relocatable formats (split/zipped, which
+directory backups never produce) still fall back. One residual caveat remains for
+**catalog-free** restore only (see "Residual caveat").
 
-**What Phase 1 does:** `UsnJournalReader.ReadChanges` now captures each record's own
+**What Phase 1 did (history):** `UsnJournalReader.ReadChanges` captures each record's own
 File Reference Number (offset 8) and pairs `RENAME_OLD_NAME`/`RENAME_NEW_NAME` records
-sharing that FRN into `UsnMove(OldPath, NewPath, IsDirectory)` intents (returned via a
-new `out IReadOnlyList<UsnMove> moves`). Because a same-volume directory move emits a
-single pair on the directory's own FRN (its children are **not** re-journaled), one move
-relocates a whole subtree. `BackupWorker.CheckContinuousAsync` routes moves to every set
-either endpoint touches (`SetState.PendingMoves`) and applies them each poll via
-`RunMovesAsync` (under the backup lock, requeued while the destination is offline).
-`DirectoryBackupService.MoveTargetedAsync` renames the destination copy
-(`File.Move`/`Directory.Move`) and rewrites the affected catalog records' `SourcePath` +
-`DiscPath`, returning `TargetedMoveOutcome.Relocated` or `FellBack`.
+sharing that FRN into `UsnMove(OldPath, NewPath, IsDirectory)` intents. A same-volume
+directory move emits a single pair on the directory's own FRN (children are **not**
+re-journaled), so one move relocates a whole subtree. `BackupWorker.CheckContinuousAsync`
+routes moves to every set either endpoint touches (`SetState.PendingMoves`) and applies
+them each poll via `RunMovesAsync` (under the backup lock, requeued while the destination
+is offline). Phase 1 only relocated a single plain current version; any `.dedup`,
+`.fileref`, split, zipped, or `{drive}_prev` history forced a whole-folder `FellBack`
+re-copy.
 
-**Phase 1 fallback (intentional, correct-but-suboptimal):** relocation is only attempted
-when **every** affected catalog record is a single plain current version. If any record
-is `.dedup` (block store), `.fileref` (file-level dedup), split, zipped, or has version
-history in the `{drive}_prev` tree, `MoveTargetedAsync` returns `FellBack` and the worker
-re-copies the new path as fresh files (`EnqueueForBackup`), leaving the stale old-path
-copy for the next full scan to prune. This is correct (no data loss) but re-copies bytes
-that a relocation could have moved. A directory falls back **as a whole** if *any* file
-under it is a special format — so one deduped file in a large moved folder currently
-forces re-copying the entire folder.
+**What Phase 2 does:** `MoveTargetedAsync` fetches all versions
+(`GetFileRecordsByPathAsync` / `GetFileRecordsUnderDirectoryAsync` — both current and
+every `_prev` version, including `.dedup`/`.fileref` manifests and `IsDeleted`
+tombstones), bails to `FellBack` only if any record is `IsSplit`/`IsZipped` (never true
+for directory backups), then delegates to:
+- `RelocateDirectoryAsync`: `Directory.Move`s **both** the current subtree
+  (`{drive}\rel`) and the parallel history subtree (`{drive}_prev\rel`) — same source
+  volume, so the `{drive}` prefix is unchanged — then, in one `BeginTransactionAsync`,
+  repoints every record's `SourcePath` (via `RemapPathPrefix`) and `DiscPath` (via
+  `RemapDiscPath`, which preserves current-vs-`_prev` and the `.dedup`/`.fileref` suffix).
+- `RelocateFileAsync`: `File.Move`s each on-disk version (current + every `_prev`, any
+  format) and repoints all records in one transaction.
+- `RemapDiscPath` / `IsPrevDiscPath`: recompute a record's disc path for its new source,
+  detecting `_prev` by testing whether the first path segment ends in `_prev`.
 
-**Phase 2 (TODO) — relocate special formats and history in place:**
-1. **`.dedup`/`.fileref` current copies:** these are small manifests under
-   `{drive}/relative.{dedup,fileref}`. A rename can move the manifest and rewrite its
-   `DiscPath`; the shared `_blocks/` store and hash-keyed content pointers are unaffected
-   by a path change, so this should be a manifest move + catalog update (watch the
-   `.fileref` `ContentPath` hint — verify whether it stores an absolute/relative path
-   that must be repointed).
-2. **Version history (`{drive}_prev/relative.v{n}[.suffix]`):** relocate the `_prev`
-   subtree alongside the current tree so old versions keep resolving by the new
-   `SourcePath`. Needs to move both `{drive}/relDir` and `{drive}_prev/relDir` and rewrite
-   every version record.
-3. **Per-file directory relocation:** instead of all-or-nothing per directory, relocate
-   the plain files individually and fall back only the special-format ones, so a single
-   deduped file doesn't force re-copying a whole moved folder.
-4. **Atomicity:** `MoveTargetedAsync` currently moves on disk then updates catalog rows
-   one by one (with a single-file rollback-move on catalog failure). For multi-record
-   directory moves there's a small window where a mid-loop failure leaves the catalog
-   partially rewritten until the next full scan reconciles. Consider wrapping the record
-   updates in a catalog transaction (`BeginTransactionAsync`).
+`.dedup`/`.fileref` manifests are just small files in the current/history trees — moving
+the manifest and updating its `DiscPath` is sufficient; the shared content-addressed
+`_blocks/`/`_filestore/` bytes never move and restore resolves them by **Hash**, so a
+path change can't break block/file-dedup content resolution. **Atomicity:** all physical
+moves happen *before* the catalog commits; if the transaction throws, the physical moves
+are reversed (`TryMoveDirectoryBack` / `File.Move` undo list) and the transaction rolls
+back. An interrupted run therefore fails safe toward a harmless re-copy, never a
+half-applied relocation. Renames are covered identically (a rename and a move are the
+same USN old→new FRN pair — no separate code path).
+
+**Residual caveat (catalog-free restore only):** a `.fileref` manifest carries internal
+self-describing `SourcePath` and `ContentPath` fields (the latter a *hint* to where the
+anchor bytes live). These are **not** rewritten during a move. The primary restore/verify
+path resolves filerefs by **Hash** through the catalog, so it is unaffected. Only the
+catalog-free restore/inspection tools (which read `ContentPath` directly) can see a stale
+pointer after a move relocates either the fileref or its plain anchor. Proper fix if this
+ever matters: rewrite the moved `.fileref` manifests' internal `SourcePath`/`ContentPath`
+JSON during relocation, and reuse the existing `UpdateFileRefContentPathsAsync` reverse
+lookup to repoint any fileref whose anchor moved out from under it. Deferred as a separate
+catalog-free-restore fidelity concern, not part of the move feature's primary correctness.
 
 **Not handled (by design, matches existing continuous-delete behavior):** an item moved
 **out** of a set's scope (e.g. to the Recycle Bin or another location outside the

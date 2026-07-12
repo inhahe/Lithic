@@ -1489,14 +1489,22 @@ public class DirectoryBackupService
 
     /// <summary>
     /// Relocate a file's or directory's existing destination copy to match a
-    /// same-volume source rename/move, instead of re-copying its bytes. Only
-    /// applies when every affected catalog record is a single plain current
-    /// version (no <c>.dedup</c>/<c>.fileref</c>/split/zip formats and no version
-    /// history) — those live in the shared block store or the <c>_prev</c> history
-    /// tree and cannot be moved with a simple rename, so the caller must fall back
-    /// to a re-copy. A moved directory relocates its whole current subtree with a
-    /// single <see cref="Directory.Move"/>.
+    /// same-volume source rename/move, instead of re-copying its bytes. Handles
+    /// every format a directory backup produces — plain copies, <c>.dedup</c> and
+    /// <c>.fileref</c> manifests (whose shared block store / content-by-hash isn't
+    /// affected by a rename), and the full <c>_prev</c> version history — by
+    /// renaming both the current subtree and the parallel <c>_prev</c> subtree and
+    /// updating every affected catalog record's paths in one transaction. A single
+    /// file relocates each of its versions' on-disk copies individually.
     /// </summary>
+    /// <remarks>
+    /// Renames and moves are indistinguishable here (both are a same-volume
+    /// old-path→new-path pair) and are handled identically. Only split or zipped
+    /// records — which a directory backup never creates — force a fall-back, since
+    /// their bytes span discs / live inside an archive a plain rename can't move.
+    /// The physical rename happens before the catalog commits, so an interrupted
+    /// run fails safe toward a harmless re-copy rather than data loss.
+    /// </remarks>
     /// <returns>
     /// <see cref="TargetedMoveOutcome.Relocated"/> when the destination copy was
     /// moved and the catalog updated; <see cref="TargetedMoveOutcome.FellBack"/>
@@ -1524,82 +1532,19 @@ public class DirectoryBackupService
         if (records.Count == 0)
             return TargetedMoveOutcome.FellBack;
 
-        // Phase 1 relocates only plain, single-version copies. Any special format
-        // (block-dedup manifest, file-level reference, split, zip) or any file
-        // with more than one catalog version lives partly in the shared block
-        // store or the _prev history tree, which a plain rename cannot relocate.
-        var byPathVersions = records
-            .GroupBy(r => r.SourcePath, StringComparer.OrdinalIgnoreCase);
-        foreach (var grp in byPathVersions)
-        {
-            if (grp.Count() > 1)
-                return TargetedMoveOutcome.FellBack;
-            var rec = grp.First();
-            if (rec.IsDeduped || rec.IsFileRef || rec.IsSplit || rec.IsZipped || rec.IsDeleted)
-                return TargetedMoveOutcome.FellBack;
-        }
+        // Directory backups only ever produce plain / .dedup / .fileref records
+        // (IsSplit and IsZipped are always false — those are optical-media
+        // formats). A split file's bytes span discs and a zipped file lives inside
+        // an archive, neither of which a plain rename can relocate, so bail safely
+        // if one somehow appears.
+        if (records.Any(r => r.IsSplit || r.IsZipped))
+            return TargetedMoveOutcome.FellBack;
 
         try
         {
-            if (isDirectory)
-            {
-                string oldDir = Path.Combine(
-                    targetDirectory, GetDrivePrefix(oldPath), GetRelativePath(oldPath));
-                string newDir = Path.Combine(
-                    targetDirectory, GetDrivePrefix(newPath), GetRelativePath(newPath));
-
-                if (!Directory.Exists(oldDir))
-                    return TargetedMoveOutcome.FellBack;
-
-                string? newParent = Path.GetDirectoryName(newDir);
-                if (newParent is not null)
-                    Directory.CreateDirectory(newParent);
-
-                // A same-volume rename of the whole current subtree in one move —
-                // children are relocated implicitly, mirroring the source move.
-                Directory.Move(oldDir, newDir);
-
-                foreach (var rec in records)
-                {
-                    ct.ThrowIfCancellationRequested();
-                    string newSource = RemapPathPrefix(rec.SourcePath, oldPath, newPath);
-                    rec.SourcePath = newSource;
-                    rec.DiscPath = GetCurrentDiscPath(newSource, rec.IsDeduped, rec.IsFileRef);
-                    await _catalog.UpdateFileRecordAsync(rec, ct);
-                }
-            }
-            else
-            {
-                var rec = records[0];
-                string oldAbs = GetCurrentPath(targetDirectory, oldPath, false, false);
-                string newAbs = GetCurrentPath(targetDirectory, newPath, false, false);
-
-                if (!File.Exists(oldAbs))
-                    return TargetedMoveOutcome.FellBack;
-
-                string? newParent = Path.GetDirectoryName(newAbs);
-                if (newParent is not null)
-                    Directory.CreateDirectory(newParent);
-
-                File.Move(oldAbs, newAbs, overwrite: false);
-
-                try
-                {
-                    rec.SourcePath = newPath;
-                    rec.DiscPath = GetCurrentDiscPath(newPath, false, false);
-                    await _catalog.UpdateFileRecordAsync(rec, ct);
-                }
-                catch
-                {
-                    // Catalog update failed after the on-disk move — roll the file
-                    // back so the record and its bytes stay consistent, then let the
-                    // caller re-copy from the new source path.
-                    try { File.Move(newAbs, oldAbs, overwrite: false); } catch { /* best effort */ }
-                    throw;
-                }
-            }
-
-            return TargetedMoveOutcome.Relocated;
+            return isDirectory
+                ? await RelocateDirectoryAsync(setId, targetDirectory, oldPath, newPath, records, ct)
+                : await RelocateFileAsync(setId, targetDirectory, newPath, records, ct);
         }
         catch (OperationCanceledException) when (ct.IsCancellationRequested)
         {
@@ -1611,6 +1556,161 @@ public class DirectoryBackupService
             // rather than risk a half-applied relocation.
             return TargetedMoveOutcome.FellBack;
         }
+    }
+
+    /// <summary>
+    /// Relocate a moved/renamed directory: rename both the current subtree
+    /// (<c>{drive}\rel</c>) and the parallel history subtree
+    /// (<c>{drive}_prev\rel</c>) — same source volume, so the <c>{drive}</c> prefix
+    /// is unchanged — then repoint every affected catalog record (current and all
+    /// <c>_prev</c> versions, including <c>.dedup</c>/<c>.fileref</c> manifests) in
+    /// a single transaction. Physical renames happen first; if the catalog update
+    /// throws, they are reversed and the transaction rolls back.
+    /// </summary>
+    private async Task<TargetedMoveOutcome> RelocateDirectoryAsync(
+        int setId, string targetDirectory, string oldPath, string newPath,
+        IReadOnlyList<FileRecord> records, CancellationToken ct)
+    {
+        string drivePrefix = GetDrivePrefix(oldPath);
+        string oldRel = GetRelativePath(oldPath);
+        string newRel = GetRelativePath(newPath);
+
+        string oldCur = Path.Combine(targetDirectory, drivePrefix, oldRel);
+        string newCur = Path.Combine(targetDirectory, drivePrefix, newRel);
+        string oldPrev = Path.Combine(targetDirectory, drivePrefix + "_prev", oldRel);
+        string newPrev = Path.Combine(targetDirectory, drivePrefix + "_prev", newRel);
+
+        bool curMoved = false, prevMoved = false;
+        try
+        {
+            if (Directory.Exists(oldCur))
+            {
+                EnsureParentDirectory(newCur);
+                Directory.Move(oldCur, newCur);
+                curMoved = true;
+            }
+            if (Directory.Exists(oldPrev))
+            {
+                EnsureParentDirectory(newPrev);
+                Directory.Move(oldPrev, newPrev);
+                prevMoved = true;
+            }
+
+            // Nothing physically present under the old path — let the caller
+            // re-copy the new path as fresh files.
+            if (!curMoved && !prevMoved)
+                return TargetedMoveOutcome.FellBack;
+
+            using var tx = await _catalog.BeginTransactionAsync(setId, ct);
+            foreach (var rec in records)
+            {
+                ct.ThrowIfCancellationRequested();
+                string newSource = RemapPathPrefix(rec.SourcePath, oldPath, newPath);
+                rec.DiscPath = RemapDiscPath(rec, newSource);
+                rec.SourcePath = newSource;
+                await _catalog.UpdateFileRecordAsync(rec, ct);
+            }
+            tx.Complete();
+            return TargetedMoveOutcome.Relocated;
+        }
+        catch
+        {
+            // Reverse whatever we physically moved so the destination tree matches
+            // the (rolled-back) catalog, then fall back to a re-copy.
+            if (prevMoved) TryMoveDirectoryBack(newPrev, oldPrev);
+            if (curMoved) TryMoveDirectoryBack(newCur, oldCur);
+            throw;
+        }
+    }
+
+    /// <summary>
+    /// Relocate a moved/renamed single file: rename each of its on-disk versions
+    /// (the current copy plus every <c>_prev</c> version, in whatever format —
+    /// plain, <c>.dedup</c>, <c>.fileref</c>) and repoint their catalog records in
+    /// one transaction. Physical renames happen first and are reversed if the
+    /// catalog update throws.
+    /// </summary>
+    private async Task<TargetedMoveOutcome> RelocateFileAsync(
+        int setId, string targetDirectory, string newPath,
+        IReadOnlyList<FileRecord> records, CancellationToken ct)
+    {
+        // (newAbs -> oldAbs) pairs we can undo on failure.
+        var undo = new List<(string From, string To)>();
+        try
+        {
+            foreach (var rec in records)
+            {
+                string oldAbs = Path.Combine(targetDirectory, rec.DiscPath);
+                string newAbs = Path.Combine(targetDirectory, RemapDiscPath(rec, newPath));
+                if (!File.Exists(oldAbs))
+                    continue;
+
+                EnsureParentDirectory(newAbs);
+                File.Move(oldAbs, newAbs, overwrite: false);
+                undo.Add((newAbs, oldAbs));
+            }
+
+            // Nothing physically present — let the caller re-copy from the new source.
+            if (undo.Count == 0)
+                return TargetedMoveOutcome.FellBack;
+
+            using var tx = await _catalog.BeginTransactionAsync(setId, ct);
+            foreach (var rec in records)
+            {
+                ct.ThrowIfCancellationRequested();
+                rec.DiscPath = RemapDiscPath(rec, newPath);
+                rec.SourcePath = newPath;
+                await _catalog.UpdateFileRecordAsync(rec, ct);
+            }
+            tx.Complete();
+            return TargetedMoveOutcome.Relocated;
+        }
+        catch
+        {
+            foreach (var (from, to) in undo)
+            {
+                try { if (File.Exists(from)) File.Move(from, to, overwrite: false); }
+                catch { /* best effort */ }
+            }
+            throw;
+        }
+    }
+
+    /// <summary>
+    /// Recompute a record's disc-relative path for its new source path, preserving
+    /// whether it is the current version or a <c>_prev</c> version and its storage
+    /// format (<c>.dedup</c>/<c>.fileref</c>). The current on-disk location is read
+    /// from <paramref name="rec"/>.DiscPath, so call this before mutating it.
+    /// </summary>
+    private static string RemapDiscPath(FileRecord rec, string newSourcePath)
+    {
+        return IsPrevDiscPath(rec.DiscPath)
+            ? GetPrevDiscPath(newSourcePath, rec.Version, rec.IsDeduped, rec.IsFileRef)
+            : GetCurrentDiscPath(newSourcePath, rec.IsDeduped, rec.IsFileRef);
+    }
+
+    /// <summary>
+    /// True when a disc-relative path sits under a history tree — its first path
+    /// segment (the drive folder) ends with <c>_prev</c>.
+    /// </summary>
+    private static bool IsPrevDiscPath(string discPath)
+    {
+        int sep = discPath.IndexOf('\\');
+        return sep > 0
+            && discPath.AsSpan(0, sep).EndsWith("_prev", StringComparison.OrdinalIgnoreCase);
+    }
+
+    private static void EnsureParentDirectory(string path)
+    {
+        string? parent = Path.GetDirectoryName(path);
+        if (parent is not null)
+            Directory.CreateDirectory(parent);
+    }
+
+    private static void TryMoveDirectoryBack(string from, string to)
+    {
+        try { if (Directory.Exists(from)) Directory.Move(from, to); }
+        catch { /* best effort */ }
     }
 
     /// <summary>
