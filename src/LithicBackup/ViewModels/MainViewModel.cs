@@ -436,6 +436,18 @@ public class MainViewModel : ViewModelBase
             : new List<Core.Models.SourceSelection>();
         bool savedThisSession = false;
 
+        // Completes once the deferred selection restore (Phase 3, below) has
+        // finished.  The restore runs asynchronously AFTER the dialog is shown,
+        // during which GetSelections() would return a partial/empty tree.  Every
+        // path that persists the selection (SaveAllAsync — used by both the Save
+        // button and the auto-save-on-close — plus the Seed and Largest-Files
+        // handlers) awaits this first, so a fast close or click can never write a
+        // half-restored tree over the real saved sources.  It is completed
+        // unconditionally in Phase 3's finally, so new sets (which have nothing
+        // to restore) and error paths still release any waiter.
+        var selectionRestored = new TaskCompletionSource(
+            TaskCreationOptions.RunContinuationsAsynchronously);
+
         // Show a wait cursor while loading — the dialog won't appear until ready.
         Mouse.OverrideCursor = Cursors.Wait;
 
@@ -475,6 +487,11 @@ public class MainViewModel : ViewModelBase
         // Helper: sync all VM settings into the BackupSet and write to DB.
         async Task SaveAllAsync()
         {
+            // Never read GetSelections() from a still-restoring tree — wait for
+            // the deferred restore to finish so we persist the real selection,
+            // not a partial/empty snapshot.  Completes instantly once restore is
+            // done (or immediately for new sets).
+            await selectionRestored.Task;
             SyncSettingsToJobOptions(backupSet, sourceSelection);
             backupSet.SourceSelections = sourceSelection.GetSelections();
             await Task.Run(() => _catalog.UpdateBackupSetAsync(backupSet));
@@ -587,7 +604,9 @@ public class MainViewModel : ViewModelBase
         // catalog so future incremental backups only copy new/changed files.
         sourceSelection.SeedFromExistingRequested += async () =>
         {
-            // Sync and save current settings first.
+            // Sync and save current settings first (after the deferred restore
+            // has finished, so GetSelections() reflects the real selection).
+            await selectionRestored.Task;
             SyncSettingsToJobOptions(backupSet, sourceSelection);
             backupSet.SourceSelections = sourceSelection.GetSelections();
             await Task.Run(() => _catalog.UpdateBackupSetAsync(backupSet));
@@ -767,6 +786,8 @@ public class MainViewModel : ViewModelBase
             }
 
             // Flush any pending debounced save so the scan sees current state.
+            // Wait for the deferred restore first so we don't flush a partial tree.
+            await selectionRestored.Task;
             saveDebounce?.Cancel();
             SyncSettingsToJobOptions(backupSet, sourceSelection);
             backupSet.SourceSelections = sourceSelection.GetSelections();
@@ -794,6 +815,7 @@ public class MainViewModel : ViewModelBase
             {
                 try
                 {
+                    await selectionRestored.Task;
                     SyncSettingsToJobOptions(backupSet, sourceSelection);
                     backupSet.SourceSelections = sourceSelection.GetSelections();
                     await Task.Run(() => _catalog.UpdateBackupSetAsync(backupSet));
@@ -882,6 +904,9 @@ public class MainViewModel : ViewModelBase
         finally
         {
             sourceSelection.IsApplyingSelections = false;
+            // Release any save/seed/largest-files path that was waiting for the
+            // restore to finish (including an auto-save queued by a fast close).
+            selectionRestored.TrySetResult();
         }
 
         _ = PostShowInitAsync();

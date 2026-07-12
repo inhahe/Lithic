@@ -41,11 +41,19 @@ empty path (the virtual "All Drives" root, e.g. "deselect all") reverts to the f
 empty recorded set (only cosmetic/expansion or auto-include-new edits, which never drop
 an already-backed-up file) skips catalog reads entirely.
 
-**Related latent concern (not fixed, low risk):** auto-save on close calls
+**Related concern (now fixed 2026-07-12):** auto-save on close calls
 `sourceSelection.GetSelections()`. Selection restore is deferred to a post-show async
-pass; closing the dialog before that completes could in principle save a partial/empty
-selection. Not observed and out of scope for this fix, but worth guarding (e.g. block
-auto-save until restore has completed) if it ever surfaces.
+pass (Phase 3 in `StartEditFlow`), during which `GetSelections()` returns a
+partial/empty tree — so closing the dialog (or clicking Save/Seed/Largest-Files) before
+restore completed could save a truncated selection over the real saved sources.
+**Fix:** `StartEditFlow` now holds a `TaskCompletionSource selectionRestored`, completed
+in Phase 3's `finally` (so it also releases for new sets and error paths). Every path
+that persists the selection — `SaveAllAsync` (used by both the Save button and the
+auto-save-on-close), the Seed handler, and both Largest-Files save points — `await`s it
+before reading `GetSelections()`, so a fast close simply waits for the (unchanged)
+restore to finish and then writes the correct tree. The debounced `SelectionChanged`
+auto-save was already gated on `IsApplyingSelections`, which flips in lockstep with the
+new signal.
 
 ## FIXED: Cleanup "cleaned but reappears" — read-only files silently fail deletion (2026-07-12)
 
