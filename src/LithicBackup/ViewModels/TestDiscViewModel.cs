@@ -33,7 +33,7 @@ public class TestDiscViewModel : ViewModelBase
     private DiscOption? _selectedDisc;
     private OpticalDriveOption? _selectedDrive;
 
-    private bool _verifyContents;
+    private bool _verifyContents = true;
     private bool _isTesting;
     private bool _isRemediating;
     private bool _testCompleted;
@@ -133,9 +133,10 @@ public class TestDiscViewModel : ViewModelBase
     }
 
     /// <summary>
-    /// When set, the test reads every stored file/block back and re-hashes it
-    /// (SHA-256), catching silent corruption / bit-rot. When clear (the default)
-    /// the test is the fast existence + size check.
+    /// When set (the default), the test reads every stored file/block back and
+    /// re-hashes it (SHA-256), catching silent corruption / bit-rot — which
+    /// typically strikes in the middle of a file's data, invisible to an
+    /// existence + size check. Clear it for the fast existence + size only test.
     /// </summary>
     public bool VerifyContents
     {
