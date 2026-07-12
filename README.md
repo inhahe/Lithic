@@ -183,7 +183,7 @@ LithicBackup.sln
 
 Run the **Lithic Backup MSI installer** (`LithicBackup-<version>-x64.msi`). It:
 
-- installs the app to `C:\Program Files\LithicBackup` (self-contained — no
+- installs the app to `C:\Program Files\Lithic Backup` (self-contained — no
   separate .NET runtime needed on the target machine),
 - adds a **Start Menu** shortcut, so Lithic Backup shows up like any other app,
 - installs and starts the **Lithic Backup Worker** Windows service automatically,

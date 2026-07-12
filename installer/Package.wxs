@@ -3,7 +3,7 @@
   LithicBackup installer (WiX Toolset v4+ / built with the `wix` dotnet tool).
 
   Produces a per-machine MSI that:
-    * installs the self-contained GUI + Worker into "Program Files\LithicBackup"
+    * installs the self-contained GUI + Worker into "Program Files\Lithic Backup"
       (no .NET runtime prerequisite — the publish output is self-contained),
     * installs and starts the "Lithic Backup" Windows service (the Worker), so the
       background backup engine is ready out of the box,
@@ -37,7 +37,7 @@
 
     <!-- Install location: 64-bit Program Files. -->
     <StandardDirectory Id="ProgramFiles64Folder">
-      <Directory Id="INSTALLFOLDER" Name="LithicBackup" />
+      <Directory Id="INSTALLFOLDER" Name="Lithic Backup" />
     </StandardDirectory>
 
     <!-- Start Menu folder for the app shortcut. -->
