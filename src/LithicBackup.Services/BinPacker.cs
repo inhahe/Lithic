@@ -26,17 +26,22 @@ public class BinPacker : IBinPacker
 
         // Sort largest first
         var sorted = files.OrderByDescending(f => f.SizeBytes).ToList();
-        var allocations = new List<DiscAllocation>();
+
+        // Working bins track their running usage as files are added, so first-fit
+        // sees each bin's REMAINING space. (DiscAllocation.FreeBytes is init-only
+        // and cannot be decremented in place, so packing state is kept here and the
+        // immutable allocations are built at the end.)
+        var bins = new List<Bin>();
 
         foreach (var file in sorted)
         {
-            // Find first disc with enough room
-            DiscAllocation? target = null;
-            foreach (var alloc in allocations)
+            // Find the first disc that still has room for this file.
+            Bin? target = null;
+            foreach (var bin in bins)
             {
-                if (alloc.FreeBytes >= file.SizeBytes)
+                if (bin.Free >= file.SizeBytes)
                 {
-                    target = alloc;
+                    target = bin;
                     break;
                 }
             }
@@ -44,37 +49,34 @@ public class BinPacker : IBinPacker
             if (target is null)
             {
                 // Need a new disc — use the per-disc capacity or repeat the last one.
-                int discIndex = allocations.Count;
+                int discIndex = bins.Count;
                 long capacity = discIndex < discCapacities.Count
                     ? discCapacities[discIndex]
                     : discCapacities[^1];
 
-                target = new DiscAllocation
-                {
-                    DiscSequence = allocations.Count + 1,
-                    Files = [],
-                    TotalBytes = 0,
-                    FreeBytes = capacity,
-                };
-                allocations.Add(target);
+                target = new Bin { Capacity = capacity };
+                bins.Add(target);
             }
 
             target.Files.Add(file);
+            target.Used += file.SizeBytes;
         }
 
-        // Rebuild with correct totals
-        return allocations.Select((a, i) =>
+        return bins.Select((b, i) => new DiscAllocation
         {
-            long total = a.Files.Sum(f => f.SizeBytes);
-            int capIndex = i < discCapacities.Count ? i : discCapacities.Count - 1;
-            long capacity = discCapacities[capIndex];
-            return new DiscAllocation
-            {
-                DiscSequence = i + 1,
-                Files = a.Files,
-                TotalBytes = total,
-                FreeBytes = capacity - total,
-            };
+            DiscSequence = i + 1,
+            Files = b.Files,
+            TotalBytes = b.Used,
+            FreeBytes = b.Capacity - b.Used,
         }).ToList();
+    }
+
+    /// <summary>Mutable packing state for one disc while allocating files.</summary>
+    private sealed class Bin
+    {
+        public List<ScannedFile> Files { get; } = [];
+        public long Capacity { get; init; }
+        public long Used { get; set; }
+        public long Free => Capacity - Used;
     }
 }

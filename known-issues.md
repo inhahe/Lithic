@@ -1,5 +1,54 @@
 # LithicBackup — Known Issues & Tech Debt
 
+## FIXED: Bin-packer crammed every file onto disc 1 (multi-disc spanning broken) (2026-07-12)
+
+**Status:** Fixed 2026-07-12 in `BinPacker`.
+
+**Symptom:** A disc backup whose data exceeds a single disc's capacity did not span
+multiple discs — the planner allocated *every* file that individually fit onto the
+first disc. On simulated media this went unnoticed (the `SimulatedDiscBurner` writes
+to a shelf and doesn't enforce capacity), but a real IMAPI burn would overflow /
+fail on disc 1. Found by the new headless disc-test harness
+(`tools/disc_test_harness`): 5×80 KB files with a 200 KB disc produced 1 allocation
+(400 KB) instead of 3.
+
+**Root cause:** `DiscAllocation.FreeBytes` is `init`-only. `BinPacker`'s first-fit
+loop checked `alloc.FreeBytes >= file.SizeBytes` but never decremented `FreeBytes`
+as it added files (it couldn't — the property is immutable), so every existing bin
+always reported its *full* capacity as free. Result: the first bin "fit" everything.
+
+**Fix:** `BinPacker` now packs into a mutable private `Bin` working type that tracks
+running `Used`/`Free`, and builds the immutable `DiscAllocation` list at the end.
+First-fit-decreasing now sees each bin's true remaining space and opens new discs
+when needed. Verified by the harness `happy-multi-disc-span` case (now 3 discs).
+
+## OPEN: Oversized file split into chunks does not span physical discs (2026-07-12)
+
+**Status:** Open — found 2026-07-12 by `tools/disc_test_harness` (`happy-file-splitting`).
+
+**Symptom:** A single file larger than one disc's capacity is split into
+disc-sized chunks, but *all* the chunks are staged to the **same** disc and burned
+together — so the file never spans multiple physical discs. In the harness a
+300 KB file with a 150 KB disc produced two 150 KB `.discburn-split` chunks both on
+`disc-1` (300 KB on a 150 KB disc). Restore still reassembles correctly in
+simulation because both chunks are co-located, but on real media disc 1 would
+overflow. The harness surfaces this as a non-fatal `[known-issue]` overflow
+diagnostic rather than a hard failure.
+
+**Root cause:** the bin-packer allocates a whole `ScannedFile` to a single bin, and
+`BackupOrchestrator.ExecuteAsync`'s per-disc staging loop calls
+`_fileSplitter.SplitAsync(file, stagingDir, chunkSize, ct)` writing *every* chunk
+into that one disc's staging directory (`BackupOrchestrator.cs` ~line 318-346).
+Nothing distributes the chunks across the plan's discs.
+
+**Proper fix (larger refactor):** split oversized files at *plan* time into
+chunk-sized virtual units and bin-pack those across discs, or have the staging loop
+push overflow chunks onto subsequent discs and record each chunk's disc in the
+catalog (`FileChunk` → disc mapping). Restore already reads chunks per-disc via
+`DiscInsertCallback`, so the catalog/restore side can likely support cross-disc
+chunks once the planner/executor place them correctly. Needs care around the
+plan/execute contract and chunk-record disc references.
+
 ## FIXED: Auto-include-new ignored on partially-selected directories (2026-07-12)
 
 **Status:** Fixed 2026-07-12 in `SourceSelection`, `FileScanner`, and
