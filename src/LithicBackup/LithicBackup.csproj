@@ -9,7 +9,14 @@
     <ImplicitUsings>enable</ImplicitUsings>
     <UseWPF>true</UseWPF>
     <UseWindowsForms>true</UseWindowsForms>
+    <ApplicationIcon>Assets\LithicBackup.ico</ApplicationIcon>
   </PropertyGroup>
+
+  <!-- Ship the icon as a resource too, so the window title bar and the tray
+       NotifyIcon can load it via pack URI / resource stream. -->
+  <ItemGroup>
+    <Resource Include="Assets\LithicBackup.ico" />
+  </ItemGroup>
 
   <!-- Remove the implicit WinForms global usings that conflict with WPF -->
   <ItemGroup>

@@ -1,0 +1,32 @@
+<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 256 256" width="256" height="256">
+  <defs>
+    <linearGradient id="bg7" x1="0" y1="0" x2="0" y2="1">
+      <stop offset="0" stop-color="#3B82F6"/>
+      <stop offset="1" stop-color="#1D4ED8"/>
+    </linearGradient>
+    <linearGradient id="stone7" x1="0" y1="0" x2="1" y2="0">
+      <stop offset="0" stop-color="#F1F5F9"/>
+      <stop offset="1" stop-color="#CBD5E1"/>
+    </linearGradient>
+  </defs>
+  <rect x="8" y="8" width="240" height="240" rx="56" fill="url(#bg7)"/>
+  <!-- ground shadow -->
+  <ellipse cx="128" cy="206" rx="60" ry="12" fill="#0F172A" opacity="0.22"/>
+  <!-- monolith front face -->
+  <path d="M96 62 L150 56 L160 200 L88 204 Z" fill="url(#stone7)"/>
+  <!-- right shaded face for depth -->
+  <path d="M150 56 L168 70 L176 190 L160 200 Z" fill="#94A3B8"/>
+  <!-- engraved verified check, carved into the stone -->
+  <g transform="rotate(-2 126 132)">
+    <!-- incised shadow just below/left for a chiselled look -->
+    <path d="M104 134 l16 18 l30 -42" fill="none" stroke="#334155" stroke-width="16"
+          stroke-linecap="round" stroke-linejoin="round" opacity="0.18"
+          transform="translate(2 3)"/>
+    <!-- the check itself, in the accent green -->
+    <path d="M104 134 l16 18 l30 -42" fill="none" stroke="#059669" stroke-width="14"
+          stroke-linecap="round" stroke-linejoin="round"/>
+  </g>
+  <!-- one faint data/strata band below for engraved texture -->
+  <rect x="102" y="174" width="42" height="7" rx="3.5" fill="#2563EB" opacity="0.3"
+        transform="rotate(-2 123 177)"/>
+</svg>

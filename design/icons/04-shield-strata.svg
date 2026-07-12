@@ -1,0 +1,22 @@
+<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 256 256" width="256" height="256">
+  <defs>
+    <linearGradient id="bg4" x1="0" y1="0" x2="0" y2="1">
+      <stop offset="0" stop-color="#3B82F6"/>
+      <stop offset="1" stop-color="#1D4ED8"/>
+    </linearGradient>
+    <clipPath id="shieldClip">
+      <path d="M128 48 L188 72 V132 C188 172 160 198 128 210 C96 198 68 172 68 132 V72 Z"/>
+    </clipPath>
+  </defs>
+  <rect x="8" y="8" width="240" height="240" rx="56" fill="url(#bg4)"/>
+  <!-- shield body -->
+  <path d="M128 48 L188 72 V132 C188 172 160 198 128 210 C96 198 68 172 68 132 V72 Z" fill="#F1F5F9"/>
+  <!-- stone strata bands inside shield -->
+  <g clip-path="url(#shieldClip)">
+    <rect x="60" y="96"  width="136" height="18" fill="#CBD5E1"/>
+    <rect x="60" y="128" width="136" height="18" fill="#94A3B8"/>
+    <rect x="60" y="160" width="136" height="18" fill="#64748B"/>
+  </g>
+  <!-- verified check -->
+  <path d="M104 132 l16 16 l32 -36" fill="none" stroke="#059669" stroke-width="14" stroke-linecap="round" stroke-linejoin="round"/>
+</svg>

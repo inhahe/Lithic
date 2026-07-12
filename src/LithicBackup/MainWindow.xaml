@@ -10,6 +10,7 @@
         Style="{StaticResource MainWindowStyle}"
         Title="Lithic Backup" Height="1000" Width="1500"
         MinHeight="480" MinWidth="700"
+        Icon="/Assets/LithicBackup.ico"
         WindowStartupLocation="CenterScreen">
 
     <DockPanel>
