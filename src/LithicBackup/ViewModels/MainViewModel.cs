@@ -516,36 +516,48 @@ public class MainViewModel : ViewModelBase
         };
         _editorWindow = dialog;
 
-        // Prompt before closing if there are unsaved changes.
-        // For new sets: "Discard?"  For existing sets: "Save before closing?"
+        // Prompt before closing if there are unsaved changes.  A "save before
+        // closing?" prompt (Yes / No / Cancel) is used for both new and existing
+        // sets — it's more intuitive and safer than a "discard it?" prompt,
+        // because the safe action (keep the work by saving) lines up with the
+        // default Yes rather than being buried behind a "No".
+        //   Yes    → save and close
+        //   No     → close without saving (existing: skip auto-save; new: discard
+        //            the temporary catalog record)
+        //   Cancel → stay open
         dialog.Closing += (_, e) =>
         {
             if (!sourceSelection.HasUnsavedChanges)
                 return;
 
-            if (_unsavedNewSetId is not null)
-            {
-                var result = MessageBox.Show(
-                    "This backup set hasn't been saved yet.\n\nDiscard it?",
-                    "Unsaved Backup Set",
-                    MessageBoxButton.YesNo,
-                    MessageBoxImage.Question);
+            bool isNewSet = _unsavedNewSetId is not null;
 
-                if (result != MessageBoxResult.Yes)
-                    e.Cancel = true;
+            var result = MessageBox.Show(
+                isNewSet
+                    ? "This backup set hasn't been saved yet.\n\nSave it before closing?"
+                    : "You have unsaved changes.\n\nSave before closing?",
+                isNewSet ? "Unsaved Backup Set" : "Unsaved Changes",
+                MessageBoxButton.YesNoCancel,
+                MessageBoxImage.Question);
+
+            if (result == MessageBoxResult.Cancel)
+            {
+                e.Cancel = true;
             }
-            else
+            else if (result == MessageBoxResult.Yes)
             {
-                var result = MessageBox.Show(
-                    "You have unsaved changes.\n\nSave before closing?",
-                    "Unsaved Changes",
-                    MessageBoxButton.YesNoCancel,
-                    MessageBoxImage.Question);
-
-                if (result == MessageBoxResult.Cancel)
-                    e.Cancel = true;
-                else if (result == MessageBoxResult.No)
-                    _pendingSettingsSave = null; // skip auto-save
+                // Save on close.  For a new set, clear the "unsaved new" marker so
+                // the Closed handler persists it (via _pendingSettingsSave) instead
+                // of deleting the temporary catalog record.
+                _unsavedNewSetId = null;
+            }
+            else // No — close without saving.
+            {
+                // Existing set: skip the auto-save.  New set: leave
+                // _unsavedNewSetId set so the Closed handler discards the
+                // temporary record.
+                if (!isNewSet)
+                    _pendingSettingsSave = null;
             }
         };
 
@@ -565,8 +577,19 @@ public class MainViewModel : ViewModelBase
             }
             else if (_pendingSettingsSave is not null)
             {
-                // Existing set — save all settings on close.
-                await _pendingSettingsSave();
+                // Save all settings on close — the user chose "Save" at the
+                // close prompt (existing set, or a new set they kept).  Guard the
+                // save: this is an async-void event handler, so an unhandled
+                // exception here would tear down the app.  On failure savedThisSession
+                // stays false, so the reconcile below is correctly skipped.
+                try
+                {
+                    await _pendingSettingsSave();
+                }
+                catch (Exception ex)
+                {
+                    StatusText = $"Failed to save on close: {ex.Message}";
+                }
                 _pendingSettingsSave = null;
             }
             _editorWindow = null;
