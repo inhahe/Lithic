@@ -887,13 +887,15 @@ public class MainViewModel : ViewModelBase
     /// <item><b>Purge</b> — destination copies of files whose source path is no
     /// longer covered are offered for immediate removal (all-or-nothing, via a
     /// read-only review tree) so they don't linger until the next Cleanup.</item>
-    /// <item><b>Back up</b> — newly-covered source roots are offered for an
-    /// immediate incremental backup.</item>
+    /// <item><b>Back up</b> — files under newly-covered source roots are shown in
+    /// a read-only preview tree and offered for an immediate incremental backup.</item>
     /// </list>
     /// Removal is detected file-by-file (a file included under the old selection
     /// but not the new one), which correctly handles deselecting one child of a
-    /// fully-selected parent.  Addition is detected at the covering-root level so
-    /// a partial de-selection can never register as an addition.
+    /// fully-selected parent.  Addition is first gated at the covering-root level
+    /// (so a partial de-selection can never register as an addition), then the
+    /// preview enumerates those roots and keeps only files the new selection
+    /// covers but the old one didn't.
     /// </summary>
     private async Task ReconcileDestinationAfterEditAsync(
         BackupSet backupSet, IReadOnlyList<Core.Models.SourceSelection> originalSelections)
@@ -942,7 +944,7 @@ public class MainViewModel : ViewModelBase
             await PromptAndPurgeRemovedAsync(backupSet, removed);
 
         if (addedRoots.Count > 0)
-            PromptAndBackupAdded(backupSet, addedRoots);
+            await PromptAndBackupAddedAsync(backupSet, addedRoots, originalSelections, newSelections);
     }
 
     /// <summary>True when <paramref name="path"/> equals one of
@@ -977,8 +979,8 @@ public class MainViewModel : ViewModelBase
             .Select(g => (SourcePath: g.Key, SizeBytes: g.Sum(f => f.SizeBytes)))
             .ToList();
 
-        var reviewVm = DeletedSourcesReviewViewModel.Build(byPath);
-        var dialog = new DeletedSourcesReviewDialog
+        var reviewVm = ReviewTreeViewModel.ForRemoval(byPath);
+        var dialog = new ReviewTreeDialog
         {
             Owner = Application.Current.MainWindow,
             DataContext = reviewVm,
@@ -1070,27 +1072,56 @@ public class MainViewModel : ViewModelBase
     }
 
     /// <summary>
-    /// Offer to run an immediate incremental backup for source roots added during
-    /// the edit.  Declining leaves them for the next scheduled or manual backup.
+    /// Show a read-only, sortable preview tree of the files newly covered by the
+    /// set's sources (enumerated from disk under the added roots, filtered to the
+    /// files the new selection covers but the old one didn't).  On confirmation,
+    /// kick off an immediate incremental backup; declining leaves them for the
+    /// next scheduled or manual backup.
     /// </summary>
-    private void PromptAndBackupAdded(BackupSet backupSet, List<string> addedRoots)
+    private async Task PromptAndBackupAddedAsync(
+        BackupSet backupSet,
+        List<string> addedRoots,
+        IReadOnlyList<Core.Models.SourceSelection> originalSelections,
+        IReadOnlyList<Core.Models.SourceSelection> newSelections)
     {
-        const int MaxListed = 12;
-        var listed = addedRoots.Take(MaxListed).Select(r => "  \u2022 " + r);
-        string more = addedRoots.Count > MaxListed
-            ? $"\n  \u2026 and {addedRoots.Count - MaxListed:N0} more"
-            : "";
+        List<(string SourcePath, long SizeBytes)> addedFiles;
 
-        var answer = MessageBox.Show(
-            $"You added {addedRoots.Count:N0} new source "
-            + $"location{(addedRoots.Count == 1 ? "" : "s")} to \"{backupSet.Name}\":\n\n"
-            + string.Join("\n", listed) + more
-            + "\n\nBack them up now?",
-            "Back Up Added Sources",
-            MessageBoxButton.YesNo,
-            MessageBoxImage.Question);
+        Mouse.OverrideCursor = Cursors.Wait;
+        try
+        {
+            addedFiles = await Task.Run(() =>
+            {
+                // Walk the added roots on disk and keep only files the new
+                // selection covers but the old one didn't — the exact inverse of
+                // the removal diff, so partial (de)selections are respected.
+                var result = new List<(string, long)>();
+                foreach (var (path, size) in EnumerateFilesUnderRoots(addedRoots))
+                {
+                    if (SourceSelection.IsPathIncluded(newSelections, path)
+                        && !SourceSelection.IsPathIncluded(originalSelections, path))
+                        result.Add((path, size));
+                }
+                return result;
+            });
+        }
+        finally
+        {
+            Mouse.OverrideCursor = null;
+        }
 
-        if (answer != MessageBoxResult.Yes)
+        // Nothing newly covered actually exists on disk (e.g. empty folders were
+        // added) — there's nothing to preview or back up right now.
+        if (addedFiles.Count == 0)
+            return;
+
+        var reviewVm = ReviewTreeViewModel.ForAdditions(addedFiles);
+        var dialog = new ReviewTreeDialog
+        {
+            Owner = Application.Current.MainWindow,
+            DataContext = reviewVm,
+        };
+
+        if (dialog.ShowDialog() != true)
             return;
 
         var row = BackupSets.FirstOrDefault(s => s.Id == backupSet.Id);
@@ -1100,6 +1131,63 @@ public class MainViewModel : ViewModelBase
             return;
         }
         _ = RunIncrementalFlowAsync(row, forceReview: false);
+    }
+
+    /// <summary>
+    /// Recursively enumerate the files (with sizes) under a set of directory
+    /// roots, skipping reparse points to avoid symlink loops and swallowing
+    /// per-directory access errors so one unreadable folder can't abort the walk.
+    /// </summary>
+    private static IEnumerable<(string Path, long Size)> EnumerateFilesUnderRoots(
+        IEnumerable<string> roots)
+    {
+        var visited = new HashSet<string>(StringComparer.OrdinalIgnoreCase);
+        var stack = new Stack<string>();
+        foreach (var r in roots)
+        {
+            // A "root" is always a directory (CollectSelectedRoots maps a selected
+            // file to its containing directory), but guard for a stray file path.
+            if (File.Exists(r))
+            {
+                long fsize = 0;
+                try { fsize = new FileInfo(r).Length; } catch { }
+                yield return (r, fsize);
+            }
+            else if (visited.Add(r))
+            {
+                stack.Push(r);
+            }
+        }
+
+        while (stack.Count > 0)
+        {
+            var dir = stack.Pop();
+
+            IEnumerable<string> subdirs = Array.Empty<string>();
+            try { subdirs = Directory.EnumerateDirectories(dir); }
+            catch { /* unreadable — skip */ }
+            foreach (var sd in subdirs)
+            {
+                try
+                {
+                    if ((File.GetAttributes(sd) & FileAttributes.ReparsePoint) != 0)
+                        continue; // don't follow junctions/symlinks
+                }
+                catch { continue; }
+                if (visited.Add(sd))
+                    stack.Push(sd);
+            }
+
+            IEnumerable<string> files = Array.Empty<string>();
+            try { files = Directory.EnumerateFiles(dir); }
+            catch { /* unreadable — skip */ }
+            foreach (var f in files)
+            {
+                long size = 0;
+                try { size = new FileInfo(f).Length; } catch { }
+                yield return (f, size);
+            }
+        }
     }
 
     // -------------------------------------------------------------------
