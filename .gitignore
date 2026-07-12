@@ -38,3 +38,8 @@ test_out_new/
 test_source/
 test_source_orig/
 test_source_reference/
+
+# Installer build artifacts (publish staging + generated MSI/PDB/wixpdb)
+installer/publish/
+installer/*.msi
+installer/*.wixpdb

@@ -1,0 +1,126 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<!--
+  LithicBackup installer (WiX Toolset v4+ / built with the `wix` dotnet tool).
+
+  Produces a per-machine MSI that:
+    * installs the self-contained GUI + Worker into "Program Files\LithicBackup"
+      (no .NET runtime prerequisite — the publish output is self-contained),
+    * installs and starts the "LithicBackup" Windows service (the Worker), so the
+      background backup engine is ready out of the box,
+    * adds a Start Menu shortcut for the GUI, and
+    * registers a normal Add/Remove Programs uninstaller that stops + removes the
+      service and deletes all installed files.
+
+  Build inputs live in .\publish (populated by build-installer.ps1 via
+  `dotnet publish`).  Version is passed in with `-d Version=x.y.z`.
+-->
+<Wix xmlns="http://wixtoolset.org/schemas/v4/wxs">
+
+  <?define Version = "$(var.Version)" ?>
+
+  <Package
+      Name="LithicBackup"
+      Manufacturer="Lithic"
+      Version="$(Version)"
+      UpgradeCode="7BC4E6C1-51A6-4D2C-9936-20C21DC77254"
+      Scope="perMachine"
+      Compressed="yes">
+
+    <!-- Block same/older reinstalls with a clear message; allow upgrades. -->
+    <MajorUpgrade DowngradeErrorMessage="A newer version of LithicBackup is already installed." />
+
+    <MediaTemplate EmbedCab="yes" />
+
+    <Icon Id="AppIcon" SourceFile="publish\LithicBackup.exe" />
+    <Property Id="ARPPRODUCTICON" Value="AppIcon" />
+    <Property Id="ARPHELPLINK" Value="https://github.com/" />
+
+    <!-- Install location: 64-bit Program Files. -->
+    <StandardDirectory Id="ProgramFiles64Folder">
+      <Directory Id="INSTALLFOLDER" Name="LithicBackup" />
+    </StandardDirectory>
+
+    <!-- Start Menu folder for the app shortcut. -->
+    <StandardDirectory Id="ProgramMenuFolder">
+      <Directory Id="AppShortcutFolder" Name="LithicBackup" />
+    </StandardDirectory>
+
+    <!--
+      Bulk-harvest every published file EXCEPT the Worker executable, which is
+      installed by its own component (below) so a ServiceInstall can be attached.
+    -->
+    <ComponentGroup Id="AppFiles" Directory="INSTALLFOLDER">
+      <Files Include="publish\**">
+        <Exclude Files="publish\LithicBackup.Worker.exe" />
+      </Files>
+    </ComponentGroup>
+
+    <!--
+      The Worker executable + the Windows service it backs.  The service runs as
+      LocalSystem (matching the app's own sc.exe install) so it shares the
+      ProgramData catalog with the interactive GUI.  Started on install; stopped
+      and removed on uninstall.
+    -->
+    <Component Id="WorkerService"
+               Directory="INSTALLFOLDER"
+               Guid="DD535A49-6F70-48E7-926D-7149ED93F0A0"
+               Bitness="always64">
+      <File Id="WorkerExe" Source="publish\LithicBackup.Worker.exe" KeyPath="yes" />
+
+      <ServiceInstall Id="WorkerServiceInstall"
+                      Name="LithicBackup"
+                      DisplayName="LithicBackup Worker"
+                      Description="Runs scheduled and on-demand LithicBackup backups in the background."
+                      Type="ownProcess"
+                      Start="auto"
+                      ErrorControl="normal"
+                      Account="LocalSystem"
+                      Vital="no" />
+
+      <!-- Start on install (don't fail the install if start is slow). -->
+      <ServiceControl Id="WorkerServiceStart"
+                      Name="LithicBackup"
+                      Start="install"
+                      Wait="no" />
+
+      <!-- Stop and remove on uninstall (wait so files aren't locked). -->
+      <ServiceControl Id="WorkerServiceStopRemove"
+                      Name="LithicBackup"
+                      Stop="uninstall"
+                      Remove="uninstall"
+                      Wait="yes" />
+    </Component>
+
+    <!-- Start Menu shortcut for the GUI. -->
+    <Component Id="AppShortcut"
+               Directory="AppShortcutFolder"
+               Guid="C96CEDA6-142F-4896-904C-34EA8C8466B1"
+               Bitness="always64">
+      <Shortcut Id="StartMenuShortcut"
+                Name="LithicBackup"
+                Description="Disc and directory backup"
+                Target="[INSTALLFOLDER]LithicBackup.exe"
+                WorkingDirectory="INSTALLFOLDER" />
+      <RemoveFolder Id="RemoveAppShortcutFolder" Directory="AppShortcutFolder" On="uninstall" />
+      <RegistryValue Root="HKCU"
+                     Key="Software\Lithic\LithicBackup"
+                     Name="installed"
+                     Type="integer"
+                     Value="1"
+                     KeyPath="yes" />
+    </Component>
+
+    <Feature Id="Main" Title="LithicBackup" Level="1">
+      <ComponentGroupRef Id="AppFiles" />
+      <ComponentRef Id="WorkerService" />
+      <ComponentRef Id="AppShortcut" />
+    </Feature>
+
+    <!-- Classic install wizard with directory chooser + license page. -->
+    <ui:WixUI xmlns:ui="http://wixtoolset.org/schemas/v4/wxs/ui"
+              Id="WixUI_InstallDir"
+              InstallDirectory="INSTALLFOLDER" />
+    <WixVariable Id="WixUILicenseRtf" Value="License.rtf" />
+
+  </Package>
+</Wix>

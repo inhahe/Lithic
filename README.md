@@ -178,17 +178,55 @@ LithicBackup.sln
 └── LithicBackup.Worker          Windows Service for automated backups
 ```
 
+## Installation
+
+Run the **LithicBackup MSI installer** (`LithicBackup-<version>-x64.msi`). It:
+
+- installs the app to `C:\Program Files\LithicBackup` (self-contained — no
+  separate .NET runtime needed on the target machine),
+- adds a **Start Menu** shortcut, so LithicBackup shows up like any other app,
+- installs and starts the **LithicBackup Worker** Windows service automatically,
+  so scheduled/continuous backups work out of the box, and
+- registers a normal **Add or Remove Programs** entry that stops and removes the
+  service and deletes all files on uninstall.
+
+Because it installs a service, the installer requests administrator elevation.
+
+> The Worker service can still be installed/started/stopped from within the GUI
+> (see *Scheduled and Continuous Backups*) — the installer just does it for you
+> up front. If you previously installed the service manually from the GUI,
+> remove it there (or with `sc delete LithicBackup`) before running the MSI so
+> the installer can manage its own copy.
+
 ## Requirements
 
-- Windows 10 or later
-- .NET 8.0
+- Windows 10 or later (64-bit)
 - Optical drive (for disc backups only)
 
+The MSI is self-contained, so end users do **not** need the .NET runtime
+installed. Building from source requires the .NET 8.0 SDK.
+
 ## Building
+
+Build the apps:
 
 ```
 dotnet build LithicBackup.sln
 ```
+
+### Building the installer
+
+The MSI is built with the [WiX Toolset](https://wixtoolset.org/) v5 (invoked via
+the `wix` dotnet tool). The build script publishes both executables self-contained
+and compiles the MSI:
+
+```
+powershell -ExecutionPolicy Bypass -File installer\build-installer.ps1 -Version 1.0.0
+```
+
+It installs the `wix` tool and the WiX UI extension on first run if they're
+missing, then writes `installer\LithicBackup-<version>-x64.msi`. The WiX source
+lives in `installer\Package.wxs`.
 
 ## License
 
