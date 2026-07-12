@@ -354,7 +354,18 @@
                         <ComboBox ItemsSource="{Binding TierSets}"
                                   SelectedItem="{Binding SelectedTierSet}"
                                   DisplayMemberPath="Name"
-                                  Padding="4,3" MinWidth="120" />
+                                  Padding="4,3" MinWidth="120"
+                                  ToolTipService.ShowDuration="30000">
+                            <ComboBox.ToolTip>
+                                <TextBlock MaxWidth="360" TextWrapping="Wrap">
+                                    Picks which tier set to view and edit below — <Run FontWeight="SemiBold">not</Run> which one is &quot;active.&quot;
+                                    All tier sets are always in effect: at backup time each file is assigned to the first
+                                    tier set whose file patterns match its path, and any file matched by none falls back
+                                    to <Run FontStyle="Italic">Default</Run>. This dropdown only chooses which set's tiers and
+                                    patterns you're editing.
+                                </TextBlock>
+                            </ComboBox.ToolTip>
+                        </ComboBox>
                         <Button Content="+ New" Command="{Binding AddTierSetCommand}"
                                 Padding="8,4" Margin="6,0,0,0" Cursor="Hand" FontSize="11"
                                 ToolTip="Create a new custom tier set" />
