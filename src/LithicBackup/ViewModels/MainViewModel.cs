@@ -438,22 +438,16 @@ public class MainViewModel : ViewModelBase
         // Phase 1: async data loading (dialog not yet visible)
         // ---------------------------------------------------------------
 
-        // Kick off the two slow I/O operations in parallel on the thread pool:
-        // 1. Catalog query (synchronous SQL under the hood)
-        // 2. Drive enumeration (DriveInfo.GetDrives + TotalSize — slow for network drives)
-        var catalogTask = Task.Run(() =>
-        {
-            try { return _catalog.GetLatestVersionInfoAsync(backupSet.Id).GetAwaiter().GetResult(); }
-            catch { return null as Dictionary<string, Core.Models.FileVersionInfo>; }
-        });
-        var drivesTask = Task.Run(() => SourceSelectionViewModel.EnumerateDrives());
+        // Enumerate drives (DriveInfo.GetDrives + TotalSize — can be slow for
+        // network drives) on the thread pool.  The catalog version query is
+        // deliberately NOT loaded here: for large sets it returns ~1M rows and
+        // takes several seconds, which would delay the window appearing.  It is
+        // loaded in Phase 3 (below), after the dialog is already visible, and
+        // applied to the tree via SetCatalogInfo — so the window opens
+        // immediately and backup-status badges fill in a moment later.
+        var drives = await Task.Run(() => SourceSelectionViewModel.EnumerateDrives());
 
-        await Task.WhenAll(catalogTask, drivesTask);
-
-        var catalogInfo = catalogTask.Result;
-        var drives = drivesTask.Result;
-
-        var sourceSelection = new SourceSelectionViewModel(catalogInfo, drives,
+        var sourceSelection = new SourceSelectionViewModel(catalogInfo: null, drives,
             fileHashCache: _fileHashCache, scanner: _scanner);
         sourceSelection.IsEditMode = true;
 
@@ -472,17 +466,6 @@ public class MainViewModel : ViewModelBase
         if (backupSet.SourceSelections is { Count: > 0 } || backupSet.SourceRoots.Count > 0)
             sourceSelection.HasSelection = true;
         sourceSelection.ShowLargestFiles = true;
-
-        // Show catalog summary so the user knows files are already tracked
-        // (e.g. from a previous seed or backup).
-        if (catalogInfo is { Count: > 0 })
-        {
-            long totalBytes = 0;
-            foreach (var fvi in catalogInfo.Values)
-                totalBytes += fvi.SizeBytes;
-            sourceSelection.SeedResult =
-                $"{catalogInfo.Count:N0} files ({FormatBytes(totalBytes)}) in catalog.";
-        }
 
         // Helper: sync all VM settings into the BackupSet and write to DB.
         async Task SaveAllAsync()
@@ -840,28 +823,60 @@ public class MainViewModel : ViewModelBase
         StatusText = $"Editing backup set \"{backupSet.Name}\".";
 
         // ---------------------------------------------------------------
-        // Phase 3: restore selections and compute sizes (dialog visible)
+        // Phase 3: load catalog, restore selections, compute sizes (dialog visible)
         // ---------------------------------------------------------------
         // The view shows a "Restoring selections..." overlay (bound to
         // IsApplyingSelections) while this runs.  This avoids blocking
         // the UI for seconds before the window appears.
 
-        if (backupSet.SourceSelections is { Count: > 0 })
-            await sourceSelection.ApplySelectionsAsync(backupSet.SourceSelections);
-
-        // Selections are now restored — re-sort so size-based ordering uses
-        // the correct effective sizes (during initial load, children had
-        // IsSelected = false so GetEffectiveSize returned -1 for everything).
-        if (sourceSelection.CurrentSortColumn == SortColumn.Size)
+        // Show the "Restoring selections..." overlay for the whole restore span
+        // (catalog load + selection restore) so the visible-but-empty tree isn't
+        // shown mid-population.
+        sourceSelection.IsApplyingSelections = true;
+        try
         {
-            foreach (var root in sourceSelection.Roots)
-                root.SortChildren();
-        }
+            // Load the (potentially huge) catalog version dictionary now, on a
+            // background thread, and hand it to the VM BEFORE restoring selections
+            // so the restored subtrees stamp their backup-status badges directly.
+            var catalogInfo = await Task.Run(() =>
+            {
+                try { return _catalog.GetLatestVersionInfoAsync(backupSet.Id).GetAwaiter().GetResult(); }
+                catch { return null as Dictionary<string, Core.Models.FileVersionInfo>; }
+            });
+            sourceSelection.SetCatalogInfo(catalogInfo);
 
-        // For existing sets, mark clean AFTER selections are restored so
-        // the restore itself doesn't count as a user change.
-        if (_unsavedNewSetId is null)
-            sourceSelection.MarkClean();
+            // Show catalog summary so the user knows files are already tracked
+            // (e.g. from a previous seed or backup).
+            if (catalogInfo is { Count: > 0 })
+            {
+                long totalBytes = 0;
+                foreach (var fvi in catalogInfo.Values)
+                    totalBytes += fvi.SizeBytes;
+                sourceSelection.SeedResult =
+                    $"{catalogInfo.Count:N0} files ({FormatBytes(totalBytes)}) in catalog.";
+            }
+
+            if (backupSet.SourceSelections is { Count: > 0 })
+                await sourceSelection.ApplySelectionsAsync(backupSet.SourceSelections);
+
+            // Selections are now restored — re-sort so size-based ordering uses
+            // the correct effective sizes (during initial load, children had
+            // IsSelected = false so GetEffectiveSize returned -1 for everything).
+            if (sourceSelection.CurrentSortColumn == SortColumn.Size)
+            {
+                foreach (var root in sourceSelection.Roots)
+                    root.SortChildren();
+            }
+
+            // For existing sets, mark clean AFTER selections are restored so
+            // the restore itself doesn't count as a user change.
+            if (_unsavedNewSetId is null)
+                sourceSelection.MarkClean();
+        }
+        finally
+        {
+            sourceSelection.IsApplyingSelections = false;
+        }
 
         _ = PostShowInitAsync();
 

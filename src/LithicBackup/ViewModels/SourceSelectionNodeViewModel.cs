@@ -93,7 +93,13 @@ public class SourceSelectionNodeViewModel : ViewModelBase
     /// the work runs inline via <see cref="SettleSelection"/>.
     /// </summary>
     private readonly Action<SourceSelectionNodeViewModel>? _requestSelectionSettle;
-    private readonly Dictionary<string, FileVersionInfo>? _catalogInfo;
+    // Catalog data is provided via a getter rather than a captured value so it
+    // can arrive AFTER the tree is built.  The full catalog dictionary can hold
+    // ~1M entries and take several seconds to query, so it is loaded in the
+    // background after the editor window is already visible (see
+    // MainViewModel.StartEditFlow / SourceSelectionViewModel.SetCatalogInfo);
+    // nodes read the shared reference lazily so late arrival is transparent.
+    private readonly Func<Dictionary<string, FileVersionInfo>?>? _getCatalogInfo;
 
     public SourceSelectionNodeViewModel(
         string path, bool isDirectory, SourceSelectionNodeViewModel? parent,
@@ -101,7 +107,7 @@ public class SourceSelectionNodeViewModel : ViewModelBase
         Func<(SortColumn Column, bool Ascending)>? getSortMode = null,
         SizeComputeScheduler? scheduler = null, Action? onSelectionChanged = null,
         Func<bool>? getShowSelectedOnly = null,
-        Dictionary<string, FileVersionInfo>? catalogInfo = null,
+        Func<Dictionary<string, FileVersionInfo>?>? getCatalogInfo = null,
         Func<Func<string, bool>?>? getExcludeFilter = null,
         Action<SourceSelectionNodeViewModel>? requestSelectionSettle = null)
     {
@@ -118,7 +124,7 @@ public class SourceSelectionNodeViewModel : ViewModelBase
         _getShowSelectedOnly = getShowSelectedOnly ?? parent?._getShowSelectedOnly;
         _getExcludeFilter = getExcludeFilter ?? parent?._getExcludeFilter;
         _requestSelectionSettle = requestSelectionSettle ?? parent?._requestSelectionSettle;
-        _catalogInfo = catalogInfo ?? parent?._catalogInfo;
+        _getCatalogInfo = getCatalogInfo ?? parent?._getCatalogInfo;
         Depth = parent is null ? 0 : parent.Depth + 1;
         Children = [];
         ToggleExpandCommand = new RelayCommand(_ =>
@@ -769,7 +775,7 @@ public class SourceSelectionNodeViewModel : ViewModelBase
             SortChildren();
 
             // Compute aggregate backup status for this directory.
-            if (_catalogInfo is not null)
+            if (_getCatalogInfo?.Invoke() is not null)
                 UpdateDirectoryBackupStatus();
 
             // Phase 2: submit directory children that still need size
@@ -932,9 +938,10 @@ public class SourceSelectionNodeViewModel : ViewModelBase
         // Determine backup status for files from the catalog.
         // Only for selected files — unselected files aren't part of the
         // backup, so showing "not backed up" would be misleading.
-        if (!entry.IsDirectory && _catalogInfo is not null && child._isSelected != false)
+        var catalog = _getCatalogInfo?.Invoke();
+        if (!entry.IsDirectory && catalog is not null && child._isSelected != false)
         {
-            if (_catalogInfo.TryGetValue(entry.FullName, out var info))
+            if (catalog.TryGetValue(entry.FullName, out var info))
             {
                 child._backupStatus = (entry.Size != info.SizeBytes ||
                     File.GetLastWriteTimeUtc(entry.FullName) > info.SourceLastWriteUtc)
@@ -1028,7 +1035,7 @@ public class SourceSelectionNodeViewModel : ViewModelBase
             Children.ReplaceAll(merged);
             SortChildren();
 
-            if (_catalogInfo is not null)
+            if (_getCatalogInfo?.Invoke() is not null)
                 UpdateDirectoryBackupStatus();
 
             // A removed child could flip this node's tristate (e.g. the only
@@ -1557,6 +1564,43 @@ public class SourceSelectionNodeViewModel : ViewModelBase
     /// <summary>
     /// Compute aggregate backup status for a directory from its loaded children.
     /// </summary>
+    /// <summary>
+    /// Re-stamp backup status across this already-loaded subtree.  Used when the
+    /// catalog dictionary is loaded lazily (after the tree is built) so nodes
+    /// created before it arrived pick up their BackedUp/Changed/NotBackedUp
+    /// badges.  Only walks nodes that are already loaded — collapsed directories
+    /// stamp themselves when expanded (their children read the shared catalog
+    /// getter at that point).
+    /// </summary>
+    internal void RefreshBackupStatusRecursive()
+    {
+        var catalog = _getCatalogInfo?.Invoke();
+        if (catalog is null)
+            return;
+
+        foreach (var child in Children)
+        {
+            if (child.IsDirectory)
+            {
+                if (child._isLoaded)
+                    child.RefreshBackupStatusRecursive();
+            }
+            else if (child._isSelected != false)
+            {
+                child.BackupStatus =
+                    catalog.TryGetValue(child.Path, out var info)
+                        ? (child._size != info.SizeBytes ||
+                           File.GetLastWriteTimeUtc(child.Path) > info.SourceLastWriteUtc)
+                            ? BackupStatus.Changed
+                            : BackupStatus.BackedUp
+                        : BackupStatus.NotBackedUp;
+            }
+        }
+
+        if (IsDirectory && _isLoaded && Children.Count > 0)
+            UpdateDirectoryBackupStatus();
+    }
+
     private void UpdateDirectoryBackupStatus()
     {
         if (!IsDirectory || !_isLoaded || Children.Count == 0)
