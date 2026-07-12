@@ -439,6 +439,22 @@ public class BackupOrchestrator : IBackupOrchestrator
                         shouldZip = !_zipHandler.IsPathCompatible(file.FullPath, filesystemType);
                     }
 
+                    // Resolve this file's version now (from the pre-run max) so its
+                    // disc path can be made version-unique BEFORE the burn writes it.
+                    // A file re-backed-up after changing gets version > 1; on a
+                    // multisession append that lands on the SAME physical disc as an
+                    // earlier version, a shared disc path would (a) collide in IMAPI's
+                    // AddFile after ImportFileSystem imports the earlier session, and
+                    // (b) let the newer session shadow the older file so the earlier
+                    // version could no longer be read back. Encoding the version into
+                    // the disc path (see VersionedDiscPath) keeps every version at a
+                    // distinct path, so both problems disappear. versionInfo still
+                    // holds the pre-run max here (it's mutated only at record time),
+                    // so this matches the version assigned when the record is written.
+                    int fileVersion = versionInfo.TryGetValue(file.FullPath, out var fvi)
+                        ? fvi.MaxVersion + 1
+                        : 1;
+
                     bool retrying = true;
 
                     while (retrying)
@@ -460,6 +476,7 @@ public class BackupOrchestrator : IBackupOrchestrator
                                     IsZipped = true,
                                     IsSplit = false,
                                     StagedSizeBytes = new FileInfo(zipPath).Length,
+                                    Version = fileVersion,
                                 });
                             }
                             else if (plan.Job.StagingMode == DiscStagingMode.InPlace)
@@ -501,6 +518,7 @@ public class BackupOrchestrator : IBackupOrchestrator
                                     IsSplit = false,
                                     StagedSizeBytes = lockedSize,
                                     HeldLock = lockStream,
+                                    Version = fileVersion,
                                 });
                             }
                             else
@@ -556,6 +574,7 @@ public class BackupOrchestrator : IBackupOrchestrator
                                         IsZipped = false,
                                         IsSplit = false,
                                         StagedSizeBytes = lockedSize,
+                                        Version = fileVersion,
                                     });
                                 }
                             }
@@ -639,6 +658,7 @@ public class BackupOrchestrator : IBackupOrchestrator
                                             IsZipped = true,
                                             IsSplit = false,
                                             StagedSizeBytes = new FileInfo(zipPath).Length,
+                                            Version = fileVersion,
                                         });
                                     }
                                     catch (Exception zipEx)
@@ -827,7 +847,7 @@ public class BackupOrchestrator : IBackupOrchestrator
                     string src = sf.HeldLock is not null
                         ? sf.Source.FullPath
                         : Path.Combine(stagingDir, sf.StagedPath);
-                    burnItems.Add(new BurnItem(sf.StagedPath, src));
+                    burnItems.Add(new BurnItem(VersionedDiscPath(sf.StagedPath, sf.Version), src));
                 }
                 // Software payload and exported catalog always live under staging.
                 if (plan.Job.IncludeSoftwareOnDisc)
@@ -925,11 +945,9 @@ public class BackupOrchestrator : IBackupOrchestrator
 
                     string hash = await ComputeFileHashAsync(staged.Source.FullPath, ct);
 
-                    // Determine version: increment from the max existing version
-                    // for this source path, or 1 if this is the first backup.
-                    int version = 1;
-                    if (versionInfo.TryGetValue(staged.Source.FullPath, out var vi))
-                        version = vi.MaxVersion + 1;
+                    // The version was fixed at staging time (see fileVersion) so the
+                    // recorded DiscPath matches the versioned path actually burned.
+                    int version = staged.Version;
                     // Update the lookup so subsequent files in this same run get
                     // the correct version (shouldn't happen, but be safe).
                     versionInfo[staged.Source.FullPath] = new FileVersionInfo(
@@ -939,7 +957,7 @@ public class BackupOrchestrator : IBackupOrchestrator
                     {
                         DiscId = discRecord.Id,
                         SourcePath = staged.Source.FullPath,
-                        DiscPath = staged.StagedPath,
+                        DiscPath = VersionedDiscPath(staged.StagedPath, staged.Version),
                         SizeBytes = staged.Source.SizeBytes,
                         Hash = hash,
                         IsZipped = staged.IsZipped,
@@ -1511,6 +1529,25 @@ public class BackupOrchestrator : IBackupOrchestrator
     }
 
     /// <summary>
+    /// Produce the on-disc path for a given file version. Version 1 keeps the
+    /// natural relative path; later versions insert a <c>.v{N}</c> tag before the
+    /// extension (e.g. <c>Users\foo\file.txt</c> → <c>Users\foo\file.v2.txt</c>).
+    /// This guarantees every version of a file occupies a distinct disc path, so
+    /// re-burning a changed file onto the same physical (multisession) disc neither
+    /// collides with the prior version (IMAPI's AddFile rejects duplicate paths)
+    /// nor shadows it at restore time.
+    /// </summary>
+    private static string VersionedDiscPath(string relativePath, int version)
+    {
+        if (version <= 1) return relativePath;
+        string dir = Path.GetDirectoryName(relativePath) ?? "";
+        string name = Path.GetFileNameWithoutExtension(relativePath);
+        string ext = Path.GetExtension(relativePath);
+        string versioned = $"{name}.v{version}{ext}";
+        return string.IsNullOrEmpty(dir) ? versioned : Path.Combine(dir, versioned);
+    }
+
+    /// <summary>
     /// Copy the running application's EXE directory to a subfolder in staging.
     /// </summary>
     private static void CopySoftwareToStaging(string stagingDir)
@@ -1565,6 +1602,16 @@ public class BackupOrchestrator : IBackupOrchestrator
         public SplitContext? Split { get; init; }
         public FileChunk? Chunk { get; init; }
         public long StagedSizeBytes { get; init; }
+
+        /// <summary>
+        /// The version number of this file within the backup set (1 for the first
+        /// copy, incrementing each time a changed file is re-staged). Versions &gt; 1
+        /// are given a distinct on-disc path by <see cref="VersionedDiscPath"/> so
+        /// that re-burning a changed file to the same physical disc does not collide
+        /// with the prior version's path (IMAPI AddFile rejects duplicate paths) and
+        /// so restore does not shadow one version with another.
+        /// </summary>
+        public int Version { get; init; } = 1;
 
         /// <summary>
         /// For a plain file staged in-place (burn-in-place mode): the read lock

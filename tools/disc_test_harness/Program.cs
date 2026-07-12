@@ -513,6 +513,47 @@ await runner.Run("multisession-append-restores-both-sessions", async ws =>
     ws.Assert(r.Restored == all.Count, $"restored {r.Restored}/{all.Count} files");
 });
 
+await runner.Run("changed-file-reburn-gets-distinct-disc-path", async ws =>
+{
+    // A file that CHANGES between two backup runs to the same set is re-staged as
+    // a new version. On a multisession append that lands on the SAME physical disc
+    // as the earlier version, both versions would otherwise map to the same disc
+    // path — which (a) collides in IMAPI's AddFile after ImportFileSystem imports
+    // the earlier session and (b) lets the newer file shadow the older at restore.
+    // The fix gives version > 1 a distinct on-disc path (VersionedDiscPath). This
+    // test asserts the invariant that makes that safe: every version of a source
+    // path occupies a DISTINCT DiscPath, and restore reproduces the latest content.
+    var burner = ws.NewBurner();
+
+    // --- Run 1: original content. ---
+    var v1 = ws.MakeTree(("docs/report.txt", 50_000));
+    var (_, r1) = await ws.Backup(v1, burner: burner);
+    ws.Assert(r1.Success, "first backup should succeed");
+    int setId = ws.BackupSetId;
+
+    // --- Change the file in place, then run 2 (incremental append). ---
+    var v2Content = TestRunner.Gen(9999, 70_000);
+    ws.MakeTreeBytes(("docs/report.txt", v2Content)); // overwrites same source path
+    var (_, r2) = await ws.Backup(v1, burner: burner, existingSetId: setId);
+    ws.Assert(r2.Success, "second (changed-file) backup should succeed");
+
+    // Two records for the same source path: versions 1 and 2 with DISTINCT DiscPaths.
+    var records = (await ws.AllFileRecords())
+        .Where(r => r.SourcePath.EndsWith("report.txt", StringComparison.OrdinalIgnoreCase))
+        .OrderBy(r => r.Version).ToList();
+    ws.Assert(records.Count == 2, $"expected 2 versions of the changed file, got {records.Count}");
+    ws.Assert(records.Select(r => r.Version).SequenceEqual(new[] { 1, 2 }),
+        $"expected versions [1,2], got [{string.Join(",", records.Select(r => r.Version))}]");
+    ws.Assert(records.Select(r => r.DiscPath).Distinct().Count() == 2,
+        $"versions must occupy distinct disc paths, got [{string.Join(",", records.Select(r => r.DiscPath))}]");
+    ws.Assert(records[1].DiscPath.Contains(".v2", StringComparison.OrdinalIgnoreCase),
+        $"version 2 disc path should carry a .v2 tag, got '{records[1].DiscPath}'");
+
+    // Restore the whole set: the current (v2) source must return byte-for-byte.
+    var r = await ws.RestoreAndVerify(burner, v1);
+    ws.Assert(r.Mismatches == 0, $"{r.Mismatches} restored file(s) had wrong content");
+});
+
 return runner.Report();
 
 // ======================================================================

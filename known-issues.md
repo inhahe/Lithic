@@ -1,5 +1,38 @@
 # LithicBackup — Known Issues & Tech Debt
 
+## FIXED: Changed file re-burned to the same multisession disc collided/shadowed (2026-07-12)
+
+**Symptom (hardware edge case, follow-on from the multisession fix below):** once
+multisession append works, a file that *changed* between two runs to the same set
+is re-staged as a new version (v2). If that append lands on the **same physical
+disc** as the earlier version, both versions map to the *same* on-disc path (the
+disc path was just the drive-relative source path). After `ImportFileSystem()`
+imports the earlier session, IMAPI's `AddFile` **rejects the duplicate path**
+(burn fails); and even where it didn't, the newer entry would **shadow** the older
+one so the earlier version could no longer be read back. This affects only the
+`ExecuteAsync` disc pipeline — splits (unique chunk names), repair/re-burn discs
+(fresh discs), and consolidation (latest-only) don't collide.
+
+**Fix — version-unique disc paths.** The file's version is now resolved at *staging*
+time (`fileVersion = versionInfo[path].MaxVersion + 1`, computable because
+`versionInfo` is only mutated at record time) and carried on `StagedFileInfo.Version`.
+A new helper `VersionedDiscPath(relativePath, version)` leaves v1 at its natural
+path and inserts a `.v{N}` tag before the extension for later versions
+(`docs\report.txt` → `docs\report.v2.txt`). Both the `BurnItem` written to disc and
+the recorded `FileRecord.DiscPath` use this versioned path, so every version of a
+source file occupies a **distinct** disc path — eliminating both the `AddFile`
+collision and the restore shadowing. Restore is unaffected by design: it reads bytes
+from `DiscPath` on the platter and writes to the destination derived from
+`SourcePath`, so a `.v2`-tagged file still restores to the original location.
+
+**Test:** `tools/disc_test_harness` case `changed-file-reburn-gets-distinct-disc-path`
+backs up a file, changes it in place, backs up again to the same set, and asserts two
+records (versions 1 and 2) with **distinct** disc paths (v2 carrying a `.v2` tag),
+then restores the latest content byte-for-byte. Full matrix 24/24. (The simulator
+models each session as its own disc surface, so it can't exhibit the single-volume
+`AddFile` collision directly; the distinct-DiscPath invariant is what makes the
+real-hardware union safe, and that invariant is what the test pins down.)
+
 ## FIXED: Multisession append lost earlier sessions' files on real hardware (2026-07-12)
 
 **Symptom (hardware):** An incremental (multisession) backup that *appended* a new
@@ -38,7 +71,7 @@ the gap was entirely in the real burner and in cross-run disc labelling.
 **Test:** `tools/disc_test_harness` case `multisession-append-restores-both-sessions`
 runs two backups to the same set/burner, asserts the append produces a second disc
 record with a unique label, and restores files from **both** sessions byte-for-byte.
-Full matrix 23/23.
+Full matrix 24/24.
 
 **Remaining nuance (not a bug, logged for awareness):** with unique labels, the two
 sessions of one *physical* multisession disc are recorded as two logical disc
