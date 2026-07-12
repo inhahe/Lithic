@@ -1480,7 +1480,23 @@ public class OrphanedDirectoriesViewModel : ViewModelBase
                         ? fileName
                         : relativeDir + "\\" + fileName;
 
-                    if (discPathLookup.TryGetValue(relativePath, out var records))
+                    // A catalog record's DiscPath for a deduplicated file carries
+                    // a ".fileref" / ".dedup" manifest suffix (e.g.
+                    // "D\AI\foo.zip.fileref"), while the manifest can later be
+                    // MATERIALISED back into a plain, suffix-less file on disk
+                    // ("D\AI\foo.zip") whose bytes ARE the referenced content
+                    // (DirectoryBackupService.MaterialiseFileRef removes the
+                    // manifest and writes the plain file).  So a plain on-disk
+                    // file must match not only an exact-path catalog record but
+                    // also a "<path>.fileref"/"<path>.dedup" record — otherwise
+                    // legitimate, catalog-referenced backup content is wrongly
+                    // reported as untracked, and "cleaning" it would delete real
+                    // backup data (and it reappears once the worker
+                    // re-materialises the reference).  Exact match wins; the
+                    // manifest-suffix fallbacks only fire for suffix-less files.
+                    if (discPathLookup.TryGetValue(relativePath, out var records)
+                        || discPathLookup.TryGetValue(relativePath + ".fileref", out records)
+                        || discPathLookup.TryGetValue(relativePath + ".dedup", out records))
                     {
                         bool hasActive = false;
                         for (int r = 0; r < records.Count; r++)

@@ -1,5 +1,50 @@
 # LithicBackup — Known Issues & Tech Debt
 
+## FIXED: Cleanup mislabels materialised `.fileref`/`.dedup` content as "Untracked" (2026-07-12)
+
+**Status:** Fixed 2026-07-12 in `OrphanedDirectoriesViewModel.WalkDestination`.
+
+**Symptom (user report):** In the Cleanup view, "Scan Destination Filesystem"
+listed a huge number of "untracked files" (and some "catalog-deleted (still on
+disk)"); the user cleaned them all, re-scanned, and the same entries came back —
+"the same bug it already had that you thought you fixed."
+
+**Root cause (forensically confirmed on the live catalog + `J:\...` destination):**
+A deduplicated file's catalog `DiscPath` carries a manifest suffix —
+`D\AI\lama-cleaner\lama-cleaner-main.zip.fileref` — but the manifest can later be
+**materialised** back into a plain, suffix-less file on disk
+(`D\AI\lama-cleaner\lama-cleaner-main.zip`) whose bytes *are* the referenced
+content. `WalkDestination` built its `discPathLookup` keyed only by the raw
+catalog `DiscPath`, so a plain on-disk file never matched its `.fileref`/`.dedup`
+record and was reported as **untracked**. Verified: the plain
+`lama-cleaner-main.zip` (SHA-256 `b81ec7…`, 5,036,126 B) is byte-identical to the
+content its **active** (`IsDeleted=0`) catalog record `…zip.fileref` references.
+So the tool was flagging real, catalog-referenced backup content as untracked —
+"cleaning" it would **delete live backup data**, and it reappears the next time the
+worker re-materialises the reference. On the reference catalog (set 4, dated
+2026-06-09) **298,688** of 834,035 "untracked" hits were exactly this case.
+
+**Why the residue exists:** the current materialiser
+(`DirectoryBackupService.TryPromoteFileRefToPlainAsync`) correctly writes the plain
+file, deletes the manifest, **and flips the catalog record** (`IsFileRef=false`,
+`DiscPath=<stripped>`). These mismatched rows are residue from an **older build**
+that wrote the plain bytes but didn't update the record (same pre-idempotency-guard
+era as the catalog-bloat entry below). Current code does not reproduce them.
+
+**Fix:** In `WalkDestination`, when a disk file's exact relative path isn't in the
+catalog, also try `<path>.fileref` and `<path>.dedup` before declaring it untracked.
+Exact match still wins; the suffix fallbacks only fire for plain, suffix-less files,
+so genuine untracked files are unaffected. A plain file that matches an all-deleted
+`.fileref` record now correctly lands in "catalog-deleted (still on disk)" and its
+own suffix-less path is what gets physically deleted.
+
+**Remaining data residue (not repaired by this fix):** existing catalogs still hold
+`IsFileRef=1` rows whose on-disk form is plain (or missing entirely — 20/20 random
+active fileref samples on the reference set had no on-disk file at all). The scan
+fix stops the *cleanup* tool from misclassifying the plain ones; a separate
+reconcile pass would be needed to flip the stale rows to plain / prune the truly
+missing ones. Do NOT auto-purge these — the plain bytes are live backup content.
+
 ## FIXED: Cleanup "Clean Selected" never persisted for RemovedFromSources / DeletedFromDisk (2026-07-11)
 
 **Status:** Fixed 2026-07-11 in `SqliteSetDatabase.cs`. Root cause was a SQL
