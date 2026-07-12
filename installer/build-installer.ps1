@@ -66,12 +66,20 @@ if (-not (Get-Command wix -ErrorAction SilentlyContinue)) {
     if ($LASTEXITCODE -ne 0) { throw "Failed to install the wix tool." }
 }
 
-# Add the UI extension globally if it isn't already registered.
+# Add the required extensions globally if they aren't already registered.
+#   * UI   — the classic install wizard (WixUI_InstallDir).
+#   * Util — the WixShellExec custom action behind the "Launch Lithic Backup"
+#            checkbox on the exit dialog (Wix4UtilCA_X64 / WixShellExec).
 $exts = (& wix extension list -g) 2>$null
 if ($exts -notmatch "WixToolset.UI.wixext") {
     Write-Host "Adding WiX UI extension..." -ForegroundColor Yellow
     wix extension add -g WixToolset.UI.wixext
     if ($LASTEXITCODE -ne 0) { throw "Failed to add WixToolset.UI.wixext." }
+}
+if ($exts -notmatch "WixToolset.Util.wixext") {
+    Write-Host "Adding WiX Util extension..." -ForegroundColor Yellow
+    wix extension add -g WixToolset.Util.wixext
+    if ($LASTEXITCODE -ne 0) { throw "Failed to add WixToolset.Util.wixext." }
 }
 
 # --- 3. Compile the MSI -------------------------------------------------------
@@ -83,6 +91,7 @@ try {
     wix build "Package.wxs" `
         -d "Version=$Version" `
         -ext WixToolset.UI.wixext `
+        -ext WixToolset.Util.wixext `
         -arch x64 `
         -o $msi
     if ($LASTEXITCODE -ne 0) { throw "wix build failed." }

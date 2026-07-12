@@ -92,7 +92,7 @@ internal static class WorkerServiceHelper
     /// </summary>
     public static bool Install(string workerExePath)
     {
-        return RunElevated("create", $"{ServiceName} binPath=\"{workerExePath}\" start=auto DisplayName=\"LithicBackup Worker\"");
+        return RunElevated("create", $"{ServiceName} binPath=\"{workerExePath}\" start=auto DisplayName=\"Lithic Backup Worker\"");
     }
 
     /// <summary>
