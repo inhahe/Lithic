@@ -45,6 +45,16 @@ public partial class App : Application
         // even a failure during startup is recorded. Writes full stack traces +
         // environment context to C:\ProgramData\LithicBackup\logs.
         CrashLogger.Initialize("gui");
+
+        // Best-effort: register Windows Error Reporting local dumps so native
+        // crashes (access violations, corrupted-state faults, COM/interop
+        // crashes) that the managed handlers below can't catch still leave a
+        // .dmp under C:\ProgramData\LithicBackup\logs\dumps. Writing the keys
+        // needs admin, so this typically no-ops for the unelevated GUI and is
+        // instead performed by the LocalSystem service; it's attempted here too
+        // in case the GUI is ever run elevated.
+        NativeCrashDumps.TryEnableLocalDumps();
+
         DispatcherUnhandledException += (_, args) =>
         {
             CrashLogger.LogFatal(args.Exception, "Dispatcher.UnhandledException");

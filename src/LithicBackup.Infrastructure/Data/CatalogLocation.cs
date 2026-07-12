@@ -79,6 +79,27 @@ public static class CatalogLocation
     }
 
     /// <summary>
+    /// Returns the shared directory where Windows Error Reporting writes native
+    /// crash dumps (<c>.dmp</c>) for the GUI and service. Lives under
+    /// <c>C:\ProgramData\LithicBackup\logs\dumps</c>, ACL-widened so a dump
+    /// produced by SYSTEM (service) is still readable by the interactive user.
+    /// See <see cref="Diagnostics.NativeCrashDumps"/> for the WER registration.
+    /// </summary>
+    public static string DumpsDirectory()
+    {
+        var dumpsDir = Path.Combine(
+            Environment.GetFolderPath(Environment.SpecialFolder.CommonApplicationData),
+            AppFolderName,
+            "logs",
+            "dumps");
+
+        Directory.CreateDirectory(dumpsDir);
+        TryGrantSharedAccess(dumpsDir);
+
+        return dumpsDir;
+    }
+
+    /// <summary>
     /// Grant the built-in Users group full control of the shared directory, with
     /// inheritance so the database file (and its <c>-wal</c>/<c>-shm</c> sidecars)
     /// are writable no matter which account created them. Without this, a file
