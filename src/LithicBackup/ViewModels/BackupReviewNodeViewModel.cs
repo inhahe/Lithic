@@ -79,27 +79,62 @@ public class BackupReviewNodeViewModel : ViewModelBase
     }
 
     /// <summary>
-    /// Tristate: true = will be backed up, false = excluded, null = partial.
+    /// Tristate selection. For files: true = will be backed up, false =
+    /// excluded (null is unused). For directories: true = every listed child
+    /// selected, null = some or all listed children deselected. A directory is
+    /// never false — see the setter for why (the tree lists only the delta, so
+    /// a fully-unchecked folder would wrongly imply the whole folder is dropped).
     /// </summary>
     public bool? IsSelected
     {
         get => _isSelected;
         set
         {
-            if (_isSelected == value)
-                return;
-
-            _isSelected = value;
-            OnPropertyChanged();
-
+            // Internal recompute (from UpdateFromChildren): store the value
+            // verbatim without re-propagating.
             if (_suppressPropagation)
+            {
+                if (_isSelected == value)
+                    return;
+                _isSelected = value;
+                OnPropertyChanged();
                 return;
+            }
 
-            // Propagate down: set the entire subtree to the same definite state.
-            if (value.HasValue && IsDirectory)
-                SetSubtree(value.Value);
+            // User-driven toggle (checkbox / Select All / Deselect All). The
+            // checkbox is two-state, so an incoming value means "select
+            // everything listed under me" (true) or "deselect everything listed
+            // under me" (false).
+            bool selectAll = value == true;
 
-            // Propagate up: recompute the parent's tristate.
+            if (IsDirectory)
+            {
+                // Push the definite state down to every listed descendant...
+                SetSubtree(selectAll);
+
+                // ...but a directory itself must NEVER display fully unchecked.
+                // This review tree lists only the current backup delta, so an
+                // "empty" folder checkbox would wrongly imply the entire source
+                // folder is being dropped. Show checked only when everything
+                // listed is selected; otherwise indeterminate (half-checked) to
+                // signal "only the listed files below are affected, not the
+                // whole folder".
+                bool? shown = selectAll ? true : (bool?)null;
+                if (_isSelected != shown)
+                {
+                    _isSelected = shown;
+                    OnPropertyChanged();
+                }
+            }
+            else
+            {
+                if (_isSelected == selectAll)
+                    return;
+                _isSelected = selectAll;
+                OnPropertyChanged();
+            }
+
+            // Propagate up: recompute each ancestor's tristate.
             Parent?.UpdateFromChildren();
 
             // Sizes/counts changed for this node and every ancestor.
@@ -117,10 +152,14 @@ public class BackupReviewNodeViewModel : ViewModelBase
             return;
 
         bool allSelected = Children.All(c => c.IsSelected == true);
-        bool allDeselected = Children.All(c => c.IsSelected == false);
 
         _suppressPropagation = true;
-        IsSelected = allSelected ? true : allDeselected ? false : null;
+        // A directory is checked only when every listed child is selected;
+        // otherwise indeterminate. It never reads as fully unchecked (see the
+        // IsSelected setter) because the tree lists only the delta, not the
+        // folder's full contents — a fully-unchecked folder would misleadingly
+        // suggest the whole folder is being removed.
+        IsSelected = allSelected ? true : (bool?)null;
         _suppressPropagation = false;
 
         Parent?.UpdateFromChildren();
@@ -136,9 +175,16 @@ public class BackupReviewNodeViewModel : ViewModelBase
     {
         foreach (var child in Children)
         {
-            if (child._isSelected != selected)
+            // Files take the definite state; sub-directories follow the same
+            // "never fully unchecked" rule as their parent, so a deselected
+            // sub-directory reads as indeterminate rather than empty.
+            bool? childState = selected
+                ? true
+                : (child.IsDirectory ? (bool?)null : false);
+
+            if (child._isSelected != childState)
             {
-                child._isSelected = selected;
+                child._isSelected = childState;
                 child.OnPropertyChanged(nameof(IsSelected));
             }
 
