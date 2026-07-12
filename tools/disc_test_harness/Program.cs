@@ -84,11 +84,11 @@ await runner.Run("happy-zip-all", async ws =>
 
 await runner.Run("happy-file-splitting", async ws =>
 {
-    // One file bigger than a single disc => split into chunks and reassembled on
-    // restore. NOTE: today the chunks all land on ONE disc (see known-issues.md:
-    // "Oversized file split into chunks does not span physical discs"); this case
-    // verifies the split/reassemble round-trip is byte-correct, and additionally
-    // flags the capacity overflow so the harness keeps the limitation visible.
+    // One file bigger than a single disc => split into chunks that SPAN multiple
+    // physical discs and are reassembled byte-exact on restore. This verifies both
+    // the split/reassemble round-trip and that chunks genuinely land on >=2 discs
+    // (the fix for known-issues.md: "Oversized file split into chunks does not span
+    // physical discs").
     var srcs = ws.MakeTree(("big/huge.bin", 300_000), ("big/small.txt", 5_000));
     var (burner, result) = await ws.Backup(srcs, capacityBytes: 150_000, allowSplitting: true);
     ws.Assert(result.Success, "backup should succeed");
@@ -96,11 +96,19 @@ await runner.Run("happy-file-splitting", async ws =>
     ws.Assert(r.Mismatches == 0, $"{r.Mismatches} restored file(s) had wrong content");
     ws.Assert(r.Restored == srcs.Count, $"restored {r.Restored}/{srcs.Count} files");
 
-    // Diagnostic (non-fatal): report any disc whose staged bytes exceed capacity.
+    // The oversized file must be split and its chunks must span >=2 distinct discs.
+    var records = await ws.AllFileRecords();
+    var splitRec = records.FirstOrDefault(f => f.IsSplit && f.SourcePath.EndsWith("huge.bin"));
+    ws.Assert(splitRec is not null, "expected huge.bin to be recorded as a split file");
+    var discs = await ws.Catalog.GetDiscsForBackupSetAsync(ws.BackupSetId);
+    var chunks = await ws.Catalog.GetChunksForFileAsync(discs[0].Id, splitRec!.Id);
+    ws.Assert(chunks.Count >= 2, $"expected >=2 chunks, got {chunks.Count}");
+    int distinctDiscs = chunks.Select(c => c.DiscId).Distinct().Count();
+    ws.Assert(distinctDiscs >= 2, $"expected chunks to span >=2 discs, spanned {distinctDiscs}");
+
+    // No disc may overflow its capacity now that chunks span discs.
     long overflow = ws.MaxDiscOverflowBytes(burner, 150_000);
-    if (overflow > 0)
-        Console.WriteLine($"  [known-issue] a disc overflowed capacity by {overflow} bytes " +
-            "(oversized-file chunks did not span discs)");
+    ws.Assert(overflow == 0, $"a disc overflowed capacity by {overflow} bytes");
 });
 
 await runner.Run("verify-disc-integrity", async ws =>
@@ -556,10 +564,9 @@ sealed class Workspace : IDisposable
         var scanner = new FileScanner(Catalog);
         var packer = new BinPacker();
         var zipHandler = new ZipHandler();
-        var fileSplitter = new FileSplitter();
         var sessionStrategy = new DiscSessionStrategy(burner, Catalog);
         return new BackupOrchestrator(Catalog, burner, scanner, packer, zipHandler,
-            fileSplitter, sessionStrategy, fileSystemMonitor: null);
+            sessionStrategy, fileSystemMonitor: null);
     }
 
     // -- restore + verify --------------------------------------------

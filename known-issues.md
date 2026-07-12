@@ -22,32 +22,75 @@ running `Used`/`Free`, and builds the immutable `DiscAllocation` list at the end
 First-fit-decreasing now sees each bin's true remaining space and opens new discs
 when needed. Verified by the harness `happy-multi-disc-span` case (now 3 discs).
 
-## OPEN: Oversized file split into chunks does not span physical discs (2026-07-12)
+## FIXED: Oversized file split into chunks does not span physical discs (2026-07-12)
 
-**Status:** Open — found 2026-07-12 by `tools/disc_test_harness` (`happy-file-splitting`).
+**Status:** Fixed 2026-07-12 in `BackupOrchestrator.ExecuteAsync` +
+`RestoreService`. Verified by `tools/disc_test_harness` (`happy-file-splitting`,
+which now asserts chunks land on ≥2 distinct discs with zero disc overflow and a
+byte-exact restore).
 
-**Symptom:** A single file larger than one disc's capacity is split into
-disc-sized chunks, but *all* the chunks are staged to the **same** disc and burned
-together — so the file never spans multiple physical discs. In the harness a
+**Symptom (before fix):** A single file larger than one disc's capacity was split
+into disc-sized chunks, but *all* the chunks were staged to the **same** disc and
+burned together — so the file never spanned multiple physical discs. In the harness a
 300 KB file with a 150 KB disc produced two 150 KB `.discburn-split` chunks both on
-`disc-1` (300 KB on a 150 KB disc). Restore still reassembles correctly in
-simulation because both chunks are co-located, but on real media disc 1 would
-overflow. The harness surfaces this as a non-fatal `[known-issue]` overflow
-diagnostic rather than a hard failure.
+`disc-1` (300 KB on a 150 KB disc). Restore still reassembled correctly in
+simulation because both chunks were co-located, but on real media disc 1 would
+overflow.
 
-**Root cause:** the bin-packer allocates a whole `ScannedFile` to a single bin, and
-`BackupOrchestrator.ExecuteAsync`'s per-disc staging loop calls
-`_fileSplitter.SplitAsync(file, stagingDir, chunkSize, ct)` writing *every* chunk
-into that one disc's staging directory (`BackupOrchestrator.cs` ~line 318-346).
-Nothing distributes the chunks across the plan's discs.
+**Root cause:** the per-disc staging loop called
+`_fileSplitter.SplitAsync(file, stagingDir, chunkSize, ct)`, writing *every* chunk
+into that one disc's staging directory. Nothing distributed the chunks across the
+plan's discs, and each chunk was recorded against a single disc.
 
-**Proper fix (larger refactor):** split oversized files at *plan* time into
-chunk-sized virtual units and bin-pack those across discs, or have the staging loop
-push overflow chunks onto subsequent discs and record each chunk's disc in the
-catalog (`FileChunk` → disc mapping). Restore already reads chunks per-disc via
-`DiscInsertCallback`, so the catalog/restore side can likely support cross-disc
-chunks once the planner/executor place them correctly. Needs care around the
-plan/execute contract and chunk-record disc references.
+**Fix:** `ExecuteAsync`'s staging loop was rewritten around a `SplitCarry`/overflow
+model. When a file can't fit the remaining space on the current disc (and splitting
+is allowed, or the file exceeds a whole disc), `BeginSplitAsync` snapshots it to a
+spill file and `PlaceSplitChunksAsync` writes as many disc-sized chunks as fit onto
+the current disc, carrying the remainder to subsequent discs across loop iterations
+(the loop now continues while a carry or overflow list is non-empty, opening fresh
+discs as needed). One shared `FileRecord` is created for the split file and each
+`FileChunk` records its own `DiscId`/`Offset`/`Length`. Files that simply don't fit
+the remaining space (but fit a whole disc) now go to an `overflowFiles` list for the
+next disc instead of overflowing the current one — a latent overflow bug fixed in the
+same pass. Spill directories are cleaned up in a `finally`.
+`RestoreService.RestoreSplitFilesAsync` reassembles across discs: it pre-sizes each
+destination, groups chunks by `DiscId`, mounts each disc once via
+`DiscInsertCallback`, and writes each chunk at its `chunk.Offset`. The catalog layer
+already returned all chunks for a file record regardless of disc
+(`GetChunksForFileAsync`), so no schema change was needed. The old
+`FileSplitter`/`IFileSplitter` (which chunked a whole file into one directory) was
+now fully unused and was deleted along with the orchestrator's dead `_fileSplitter`
+dependency.
+
+**Tech debt (transient disk cost):** `BeginSplitAsync` snapshots the entire oversized
+file to a spill file (`%TEMP%\LithicBackup\spill-*/data`) before carving chunks, so
+the split is taken from a stable, self-consistent byte source and the SHA-256 is
+computed once. The cost is up to one extra full copy of the file on the temp volume
+for the duration of the burn (cleaned up in `finally`). For a genuinely huge file
+(e.g. 100 GB across several BluRays) that transient doubling could be significant.
+Proper fix if it ever bites: chunk directly from the source with offset seeks and a
+one-shot streamed hash, guarded against mid-burn source mutation (size/mtime recheck),
+avoiding the snapshot — the snapshot is currently the simplest way to guarantee
+consistency across a multi-disc, possibly multi-hour burn.
+
+## OPEN (minor): disc that over-reports capacity fails the burn instead of re-planning (2026-07-12)
+
+**Status:** Behaves safely (fails loud, no corruption) but not gracefully. Covered by
+`tools/disc_test_harness` (`disc-over-reports-capacity`).
+
+**Symptom:** When media physically holds less than `GetMediaInfoAsync` reported (a
+disc that over-states its size), the plan bin-packs to the reported capacity and the
+burn only discovers the shortfall mid-write. `SimulatedDiscBurner` (with the
+`ActualCapacityBytes` test knob) and a real burner both throw `IOException` once the
+committed bytes exceed the true capacity — the backup aborts with an error rather than
+silently truncating. That is the correct fail-safe.
+
+**Not-yet-done (graceful path):** ideally the executor would catch the
+capacity-exceeded failure, re-plan the remainder of that disc's files (plus anything
+already staged for it) onto a fresh disc at the observed smaller capacity, and
+continue — instead of aborting the whole run. This needs a re-plan/resume hook in
+`ExecuteAsync` and a way to feed the observed actual capacity back into the packer.
+Deferred; the safe-abort behavior is acceptable in the meantime.
 
 ## FIXED: Auto-include-new ignored on partially-selected directories (2026-07-12)
 

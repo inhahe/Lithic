@@ -172,7 +172,6 @@ public partial class App : Application
         var scanner = new FileScanner(_catalog);
         var packer = new BinPacker();
         var zipHandler = new ZipHandler();
-        var fileSplitter = new FileSplitter();
         var sessionStrategy = new DiscSessionStrategy(burner, _catalog);
 
         // Block-level deduplication engine. Deduplicates directly against the
@@ -189,7 +188,7 @@ public partial class App : Application
 
         var orchestrator = new BackupOrchestrator(
             _catalog, burner, scanner, packer,
-            zipHandler, fileSplitter, sessionStrategy,
+            zipHandler, sessionStrategy,
             fileSystemMonitor: burnMonitor);
 
         // Restore service.

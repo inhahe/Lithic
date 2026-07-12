@@ -71,8 +71,12 @@ public class RestoreService : IRestoreService
         IProgress<RestoreProgress>? progress = null,
         CancellationToken ct = default)
     {
-        // Group files by disc ID for efficient disc-at-a-time processing.
+        // Split files may have chunks on several discs, so they can't be restored
+        // within a single disc's pass; handle them separately below. Everything
+        // else is grouped by disc for efficient disc-at-a-time processing.
+        var splitFiles = files.Where(f => f.Record.IsSplit).ToList();
         var byDisc = files
+            .Where(f => !f.Record.IsSplit)
             .GroupBy(f => f.Disc.Id)
             .OrderBy(g => g.Key)
             .ToList();
@@ -165,13 +169,7 @@ public class RestoreService : IRestoreService
                     if (destDir is not null)
                         Directory.CreateDirectory(destDir);
 
-                    if (record.IsSplit)
-                    {
-                        // Reassemble split file from chunks.
-                        await ReassembleSplitFileAsync(
-                            restorableFile.Chunks, discRoot, destPath, ct);
-                    }
-                    else if (record.IsZipped)
+                    if (record.IsZipped)
                     {
                         // Unzip the file.
                         await UnzipFileAsync(
@@ -208,6 +206,20 @@ public class RestoreService : IRestoreService
                     errors.Add($"Failed to restore '{record.SourcePath}': {ex.Message}");
                 }
             }
+        }
+
+        // --- Split files (chunks possibly spanning multiple discs) ---
+        // Each chunk carries its absolute byte offset, so chunks can be written in
+        // any order into the destination file. We process disc-by-disc (mounting
+        // each disc once) and seek to each chunk's offset, which lets a single
+        // large file be reassembled from pieces on different physical discs.
+        if (splitFiles.Count > 0)
+        {
+            var (splitDone, splitBytes) = await RestoreSplitFilesAsync(
+                splitFiles, driveDestinations, errors,
+                filesCompleted, totalFiles, bytesCompleted, totalBytes, progress, ct);
+            filesCompleted += splitDone;
+            bytesCompleted += splitBytes;
         }
 
         return new RestoreResult
@@ -503,36 +515,149 @@ public class RestoreService : IRestoreService
     }
 
     /// <summary>
-    /// Reassemble a split file from its chunks on disc.
+    /// Reassemble every split file from its chunks, which may live on different
+    /// discs. Chunks are grouped by disc so each disc is mounted at most once; each
+    /// chunk is written at its recorded byte offset, so cross-disc files reassemble
+    /// correctly regardless of the order discs are inserted. Returns the number of
+    /// split files fully restored and their total bytes.
     /// </summary>
-    private static async Task ReassembleSplitFileAsync(
-        IReadOnlyList<FileChunk> chunks,
-        string discRoot,
-        string destPath,
+    private async Task<(int Files, long Bytes)> RestoreSplitFilesAsync(
+        IReadOnlyList<RestorableFile> splitFiles,
+        IReadOnlyDictionary<string, string> driveDestinations,
+        List<string> errors,
+        int filesCompletedSoFar,
+        int totalFiles,
+        long bytesCompletedSoFar,
+        long totalBytes,
+        IProgress<RestoreProgress>? progress,
         CancellationToken ct)
     {
-        var orderedChunks = chunks.OrderBy(c => c.Sequence).ToList();
+        // Resolve every chunk's disc label so we can request it by insertion.
+        var setId = splitFiles[0].Disc.BackupSetId;
+        var discById = (await _catalog.GetDiscsForBackupSetAsync(setId, ct))
+            .ToDictionary(d => d.Id);
 
-        await using var destStream = new FileStream(
-            destPath, FileMode.Create, FileAccess.Write, FileShare.None,
-            bufferSize: 81920, useAsync: true);
+        // Map each split file to its destination path, truncating/pre-sizing the
+        // destination so offset writes land correctly with no stale trailing data.
+        var destByRecordId = new Dictionary<long, string>();
+        var failedRecordIds = new HashSet<long>();
+        // Chunks grouped by the disc they live on: discId -> (destPath, chunk).
+        var chunksByDisc = new Dictionary<int, List<(string DestPath, FileChunk Chunk)>>();
 
-        foreach (var chunk in orderedChunks)
+        foreach (var sf in splitFiles)
+        {
+            var record = sf.Record;
+            var (driveKey, relative) = SplitSourcePath(record.SourcePath);
+            if (!driveDestinations.TryGetValue(driveKey, out var destRoot)
+                || string.IsNullOrWhiteSpace(destRoot))
+            {
+                errors.Add($"No destination set for drive '{driveKey}:' — skipping '{record.SourcePath}'.");
+                failedRecordIds.Add(record.Id);
+                continue;
+            }
+
+            string destPath = Path.Combine(destRoot, relative);
+            try
+            {
+                string? destDir = Path.GetDirectoryName(destPath);
+                if (destDir is not null)
+                    Directory.CreateDirectory(destDir);
+                await using var fs = new FileStream(
+                    destPath, FileMode.Create, FileAccess.Write, FileShare.None);
+                fs.SetLength(record.SizeBytes);
+            }
+            catch (Exception ex)
+            {
+                errors.Add($"Failed to prepare '{record.SourcePath}': {ex.Message}");
+                failedRecordIds.Add(record.Id);
+                continue;
+            }
+
+            destByRecordId[record.Id] = destPath;
+            foreach (var chunk in sf.Chunks)
+            {
+                if (!chunksByDisc.TryGetValue(chunk.DiscId, out var list))
+                    chunksByDisc[chunk.DiscId] = list = new List<(string, FileChunk)>();
+                list.Add((destPath, chunk));
+            }
+        }
+
+        // Track which record each chunk belongs to so we can null out counts for
+        // files that lose any chunk.
+        var recordIdByDest = destByRecordId.ToDictionary(kv => kv.Value, kv => kv.Key);
+
+        foreach (var (discId, placements) in chunksByDisc.OrderBy(kv => kv.Key))
         {
             ct.ThrowIfCancellationRequested();
 
-            string chunkPath = Path.Combine(discRoot, chunk.DiscFilename);
+            if (!discById.TryGetValue(discId, out var chunkDisc))
+            {
+                errors.Add($"Chunk references unknown disc id {discId}.");
+                foreach (var (destPath, _) in placements)
+                    if (recordIdByDest.TryGetValue(destPath, out var rid)) failedRecordIds.Add(rid);
+                continue;
+            }
 
-            if (!File.Exists(chunkPath))
-                throw new FileNotFoundException(
-                    $"Chunk file not found: {chunkPath}", chunkPath);
+            progress?.Report(new RestoreProgress
+            {
+                CurrentFile = $"Please insert disc: {chunkDisc.Label}",
+                FilesCompleted = filesCompletedSoFar,
+                TotalFiles = totalFiles,
+                BytesCompleted = bytesCompletedSoFar,
+                TotalBytes = totalBytes,
+                Percentage = totalBytes > 0 ? (double)bytesCompletedSoFar / totalBytes * 100 : 0,
+                RequiredDiscId = chunkDisc.Id,
+                RequiredDiscLabel = chunkDisc.Label,
+            });
 
-            await using var chunkStream = new FileStream(
-                chunkPath, FileMode.Open, FileAccess.Read, FileShare.Read,
-                bufferSize: 81920, useAsync: true);
+            string? discRoot = DiscInsertCallback is not null
+                ? await DiscInsertCallback(chunkDisc.Label)
+                : FindDiscRoot(chunkDisc.Label);
+            if (discRoot is null)
+            {
+                errors.Add($"Could not mount disc '{chunkDisc.Label}' holding split-file chunks.");
+                foreach (var (destPath, _) in placements)
+                    if (recordIdByDest.TryGetValue(destPath, out var rid)) failedRecordIds.Add(rid);
+                continue;
+            }
 
-            await chunkStream.CopyToAsync(destStream, ct);
+            foreach (var (destPath, chunk) in placements)
+            {
+                ct.ThrowIfCancellationRequested();
+                string chunkPath = Path.Combine(discRoot, chunk.DiscFilename);
+                try
+                {
+                    if (!File.Exists(chunkPath))
+                        throw new FileNotFoundException($"Chunk file not found: {chunkPath}", chunkPath);
+
+                    await using var chunkStream = new FileStream(
+                        chunkPath, FileMode.Open, FileAccess.Read, FileShare.Read,
+                        bufferSize: 81920, useAsync: true);
+                    await using var destStream = new FileStream(
+                        destPath, FileMode.Open, FileAccess.Write, FileShare.ReadWrite,
+                        bufferSize: 81920, useAsync: true);
+                    destStream.Seek(chunk.Offset, SeekOrigin.Begin);
+                    await chunkStream.CopyToAsync(destStream, ct);
+                }
+                catch (Exception ex)
+                {
+                    errors.Add($"Failed to restore chunk {chunk.Sequence} from '{chunkDisc.Label}': {ex.Message}");
+                    if (recordIdByDest.TryGetValue(destPath, out var rid)) failedRecordIds.Add(rid);
+                }
+            }
         }
+
+        int filesRestored = 0;
+        long bytesRestored = 0;
+        foreach (var sf in splitFiles)
+        {
+            if (destByRecordId.ContainsKey(sf.Record.Id) && !failedRecordIds.Contains(sf.Record.Id))
+            {
+                filesRestored++;
+                bytesRestored += sf.Record.SizeBytes;
+            }
+        }
+        return (filesRestored, bytesRestored);
     }
 
     /// <summary>
