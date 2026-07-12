@@ -5,6 +5,7 @@ using System.Windows.Threading;
 using LithicBackup.Core;
 using LithicBackup.Core.Interfaces;
 using LithicBackup.Core.Models;
+using LithicBackup.Services;
 
 namespace LithicBackup.ViewModels;
 
@@ -38,6 +39,13 @@ public class OrphanedDirectoriesViewModel : ViewModelBase
     private string _purgeStatusText = "";
     private string _lastCleanupResultText = "";
 
+    /// <summary>Catalog-vs-destination reconcile (flip stale filerefs, prune missing rows).</summary>
+    private readonly CatalogReconcileService _reconcile;
+    private bool _isReconciling;
+    private string _reconcileStatusText = "";
+    /// <summary>Dry-run result awaiting the user's "Apply" confirmation. Null until Analyze runs.</summary>
+    private ReconcileReport? _reconcileReport;
+
     /// <summary>Task that completes when initial data loading finishes.</summary>
     private readonly Task _loadTask;
 
@@ -48,6 +56,7 @@ public class OrphanedDirectoriesViewModel : ViewModelBase
         _catalog = catalog;
         _backupSet = backupSet;
         _targetDir = backupSet.JobOptions?.TargetDirectory;
+        _reconcile = new CatalogReconcileService(catalog);
 
         Items = [];
         Categories = [];
@@ -61,6 +70,13 @@ public class OrphanedDirectoriesViewModel : ViewModelBase
         SortByNameCommand = new RelayCommand(_ => ToggleSort(CleanupSortColumn.Name));
         SortByFilesCommand = new RelayCommand(_ => ToggleSort(CleanupSortColumn.Files));
         SortBySizeCommand = new RelayCommand(_ => ToggleSort(CleanupSortColumn.Size));
+        ReconcileAnalyzeCommand = new RelayCommand(
+            _ => _ = ReconcileAnalyzeAsync(),
+            _ => !IsLoading && !IsPurging && !IsReconciling && _targetDir is not null);
+        ReconcileApplyCommand = new RelayCommand(
+            _ => _ = ReconcileApplyAsync(),
+            _ => !IsLoading && !IsPurging && !IsReconciling
+                 && _targetDir is not null && _reconcileReport?.HasChanges == true);
         CloseCommand = new RelayCommand(_ => DoneRequested?.Invoke());
 
         _loadTask = LoadAsync();
@@ -246,12 +262,35 @@ public class OrphanedDirectoriesViewModel : ViewModelBase
 
     public bool HasLastCleanupResult => !string.IsNullOrEmpty(_lastCleanupResultText);
 
+    /// <summary>True while a reconcile analysis or apply is running.</summary>
+    public bool IsReconciling
+    {
+        get => _isReconciling;
+        set
+        {
+            if (SetProperty(ref _isReconciling, value))
+                CommandManager.InvalidateRequerySuggested();
+        }
+    }
+
+    /// <summary>
+    /// Live status / dry-run summary for the catalog reconcile tool. Shows the
+    /// pending flip/prune counts after Analyze, then progress during Apply.
+    /// </summary>
+    public string ReconcileStatusText
+    {
+        get => _reconcileStatusText;
+        set => SetProperty(ref _reconcileStatusText, value);
+    }
+
     public ICommand PurgeSelectedCommand { get; }
     public ICommand ScanExcludedCommand { get; }
     public ICommand ScanDestinationCommand { get; }
     public ICommand SortByNameCommand { get; }
     public ICommand SortByFilesCommand { get; }
     public ICommand SortBySizeCommand { get; }
+    public ICommand ReconcileAnalyzeCommand { get; }
+    public ICommand ReconcileApplyCommand { get; }
     public ICommand CloseCommand { get; }
 
     // ------------------------------------------------------------------
@@ -1884,6 +1923,117 @@ public class OrphanedDirectoriesViewModel : ViewModelBase
         {
             PurgeStatusText = "";
             IsPurging = false;
+        }
+    }
+
+    // ------------------------------------------------------------------
+    // Catalog reconcile (dry-run analyze, then explicit apply)
+    // ------------------------------------------------------------------
+
+    /// <summary>
+    /// Dry run: walk the catalog against the destination and report how many
+    /// stale <c>.fileref</c> rows would be flipped to plain and how many
+    /// active rows point at content that is missing. Mutates nothing; the
+    /// result is held for a subsequent <see cref="ReconcileApplyAsync"/>.
+    /// </summary>
+    private async Task ReconcileAnalyzeAsync()
+    {
+        if (_targetDir is null || IsReconciling || IsPurging)
+            return;
+
+        IsReconciling = true;
+        _reconcileReport = null;
+        ReconcileStatusText = "Analyzing catalog against destination...";
+
+        try
+        {
+            var progress = new Progress<string>(msg => ReconcileStatusText = msg);
+            var report = await Task.Run(() =>
+                _reconcile.AnalyzeAsync(_backupSet.Id, _targetDir, progress));
+
+            _reconcileReport = report;
+
+            long flipBytes = report.Flips.Sum(f => f.SizeBytes);
+            long pruneBytes = report.Prunes.Sum(p => p.SizeBytes);
+
+            if (!report.HasChanges)
+            {
+                ReconcileStatusText = report.TargetPresent
+                    ? $"Catalog is consistent — examined {report.RecordsExamined:N0} records, nothing to reconcile."
+                    : $"Destination not found or empty — examined {report.RecordsExamined:N0} records, "
+                      + "no stale references to flip (pruning of missing rows was skipped for safety).";
+            }
+            else
+            {
+                var parts = new List<string>();
+                if (report.Flips.Count > 0)
+                    parts.Add($"{report.Flips.Count:N0} stale reference{(report.Flips.Count == 1 ? "" : "s")} "
+                              + $"to flip to plain ({flipBytes:N0} bytes)");
+                if (report.Prunes.Count > 0)
+                    parts.Add($"{report.Prunes.Count:N0} missing row{(report.Prunes.Count == 1 ? "" : "s")} "
+                              + $"to prune ({pruneBytes:N0} bytes)");
+
+                string suffix = report.TargetPresent
+                    ? ""
+                    : " (destination absent/empty — prune skipped; only reference flips shown).";
+                ReconcileStatusText =
+                    $"Found {string.Join(" and ", parts)}. Review, then click Apply.{suffix}";
+            }
+        }
+        catch (Exception ex)
+        {
+            _reconcileReport = null;
+            ReconcileStatusText = $"Analysis failed: {ex.Message}";
+        }
+        finally
+        {
+            IsReconciling = false;
+        }
+    }
+
+    /// <summary>
+    /// Apply the changes from the last <see cref="ReconcileAnalyzeAsync"/>. Each
+    /// change is re-verified against the current destination before commit, so a
+    /// file reappearing or a drive reconnecting can only skip a change, never
+    /// destroy data.
+    /// </summary>
+    private async Task ReconcileApplyAsync()
+    {
+        var report = _reconcileReport;
+        if (_targetDir is null || report is null || !report.HasChanges || IsReconciling || IsPurging)
+            return;
+
+        IsReconciling = true;
+        ReconcileStatusText = "Applying reconcile...";
+
+        try
+        {
+            var progress = new Progress<string>(msg => ReconcileStatusText = msg);
+            var result = await Task.Run(() =>
+                _reconcile.ApplyAsync(_backupSet.Id, report, _targetDir, progress));
+
+            _reconcileReport = null;
+
+            var parts = new List<string>();
+            if (result.Flipped > 0)
+                parts.Add($"flipped {result.Flipped:N0} reference{(result.Flipped == 1 ? "" : "s")} to plain");
+            if (result.Pruned > 0)
+                parts.Add($"pruned {result.Pruned:N0} missing row{(result.Pruned == 1 ? "" : "s")}");
+            if (result.Skipped > 0)
+                parts.Add($"{result.Skipped:N0} skipped (changed since analysis)");
+
+            ReconcileStatusText = parts.Count == 0
+                ? "Reconcile applied — no changes were needed."
+                : $"Reconcile applied at {DateTime.Now:HH:mm:ss}: {string.Join(", ", parts)}. "
+                  + "Re-run Analyze to confirm the catalog is now clean.";
+        }
+        catch (Exception ex)
+        {
+            ReconcileStatusText = $"Apply failed: {ex.Message}";
+        }
+        finally
+        {
+            IsReconciling = false;
         }
     }
 

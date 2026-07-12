@@ -65,6 +65,14 @@ catalog, also try `<path>.fileref` and `<path>.dedup` before declaring it
 untracked. Exact match still wins; the fallbacks only fire for plain suffix-less
 files, so genuine untracked files are unaffected.
 
+**Actual data repair (2026-07-12):** the stale rows themselves are now repairable
+via the **Reconcile Catalog with Destination** tool in the Cleanup view
+(`CatalogReconcileService`). It flips `IsFileRef=1` rows whose stripped path holds
+a hash-matching plain file back to plain (`IsFileRef=0`, stripped `DiscPath`) and
+prunes active rows whose content is missing. It is dry-run first (Analyze → Apply)
+and never prunes when the destination is absent/empty. This is the "separate
+reconcile pass" the earlier write-up said would be needed.
+
 ## OPEN (related): disc-burn staging copies inherit source read-only
 
 `BackupOrchestrator` File.Copy sites (lines ~883, ~1018, ~1139) copy source files
