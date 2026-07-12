@@ -1,5 +1,31 @@
 # LithicBackup — Known Issues & Tech Debt
 
+## FIXED: Service panel could get stuck on "starting…/stopping…" with all buttons greyed (2026-07-12)
+
+**Status:** Fixed 2026-07-12 in `MainViewModel.RefreshServiceStatus` /
+`PollWhileServicePendingAsync`.
+
+**Symptom (user report):** After uninstalling the Worker service, running the MSI
+installer, and reopening the GUI, the Worker-service panel showed "Worker service
+stopping…" indefinitely with Install/Start/Stop/Uninstall all disabled. The service was
+actually fine (`sc query` showed RUNNING); the GUI just never left the stale reading.
+
+**Root cause:** `START_PENDING`/`STOP_PENDING` satisfy none of the `CanInstall/
+CanUninstall/CanStart/CanStop` gates, so all four buttons disable while pending. The SCM
+is only re-queried on demand — at startup, on a button action (via
+`WaitForServiceReadyAsync`, 5 s), or when navigating home — so a status read that landed
+on a pending transition (a reinstall in progress, or a snapshot inherited by a long-lived
+GUI instance) stuck there with no path back: pending disables the buttons, and disabled
+buttons can't trigger the refresh that would clear pending.
+
+**Fix:** `RefreshServiceStatus` now spawns a background watchdog
+(`PollWhileServicePendingAsync`) whenever it observes a pending state and no poll is
+already running; the watchdog re-queries every second (up to 60 s) until the state
+settles, then lets the normal `Can*` notifications re-enable the buttons.
+`WaitForServiceReadyAsync` shares the same `_servicePollActive` guard so an action's poll
+and the watchdog never stack, and hands off to the watchdog if it times out while still
+pending.
+
 ## FIXED: Modify dialog close stalled the UI with a ~10s wait cursor (2026-07-12)
 
 **Status:** Fixed 2026-07-12 in `MainViewModel.ReconcileDestinationAfterEditAsync`.

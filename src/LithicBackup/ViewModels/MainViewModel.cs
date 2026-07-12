@@ -34,6 +34,10 @@ public class MainViewModel : ViewModelBase
     private ViewModelBase? _currentView;
     private BackupSet? _selectedBackupSet;
     private string _serviceStatusText = "";
+    /// <summary>True while a background poll is watching a transient service
+    /// state (START_PENDING/STOP_PENDING) so refreshes don't stack multiple
+    /// polling loops.  See <see cref="PollWhileServicePendingAsync"/>.</summary>
+    private bool _servicePollActive;
     private BackupSetEditorWindow? _editorWindow;
     private Window? _largestFilesWindow;
     private Func<Task>? _pendingSettingsSave;
@@ -3716,24 +3720,78 @@ public class MainViewModel : ViewModelBase
         OnPropertyChanged(nameof(CanUninstallService));
         OnPropertyChanged(nameof(CanStartService));
         OnPropertyChanged(nameof(CanStopService));
+
+        // Self-heal from a transient pending state.  START_PENDING/STOP_PENDING
+        // disable every service button (none of the Can* gates accept a pending
+        // state), and nothing else re-queries the SCM on its own — so a status
+        // read that happens to land on a pending transition (e.g. right after an
+        // install/reinstall, or a stale snapshot inherited at startup) would
+        // otherwise leave the panel stuck on "starting..."/"stopping..." with all
+        // buttons greyed until the user restarts the app.  Kick off a background
+        // poll (unless one is already running, including an action's
+        // WaitForServiceReadyAsync) that keeps refreshing until the state
+        // settles.
+        if (ServiceStatus is ServiceState.StartPending or ServiceState.StopPending
+            && !_servicePollActive)
+            _ = PollWhileServicePendingAsync();
+    }
+
+    /// <summary>
+    /// Background watchdog that re-queries the service every second while it is
+    /// in a transient pending state, so the panel recovers on its own once the
+    /// transition finishes (or the generous timeout expires).  Guarded by
+    /// <see cref="_servicePollActive"/> so only one loop runs at a time and the
+    /// per-iteration <see cref="RefreshServiceStatus"/> call can't re-spawn it.
+    /// </summary>
+    private async Task PollWhileServicePendingAsync(int timeoutMs = 60000)
+    {
+        _servicePollActive = true;
+        try
+        {
+            var sw = System.Diagnostics.Stopwatch.StartNew();
+            while (sw.ElapsedMilliseconds < timeoutMs)
+            {
+                await Task.Delay(1000);
+                RefreshServiceStatus();
+                if (ServiceStatus is not ServiceState.StartPending
+                    and not ServiceState.StopPending)
+                    return;
+            }
+        }
+        finally
+        {
+            _servicePollActive = false;
+        }
     }
 
     /// <summary>
     /// Poll until the service leaves a pending state or the timeout expires.
-    /// Keeps the UI updated while waiting.
+    /// Keeps the UI updated while waiting.  Holds the poll guard so it doesn't
+    /// race the background watchdog; if it times out while still pending, the
+    /// final refresh (guard released) hands off to that watchdog.
     /// </summary>
     private async Task WaitForServiceReadyAsync(int timeoutMs = 5000)
     {
-        var sw = System.Diagnostics.Stopwatch.StartNew();
-        while (sw.ElapsedMilliseconds < timeoutMs)
+        _servicePollActive = true;
+        try
         {
-            RefreshServiceStatus();
-            if (ServiceStatus is not ServiceState.StartPending
-                and not ServiceState.StopPending)
-                return;
+            var sw = System.Diagnostics.Stopwatch.StartNew();
+            while (sw.ElapsedMilliseconds < timeoutMs)
+            {
+                RefreshServiceStatus();
+                if (ServiceStatus is not ServiceState.StartPending
+                    and not ServiceState.StopPending)
+                    return;
 
-            await Task.Delay(500);
+                await Task.Delay(500);
+            }
         }
+        finally
+        {
+            _servicePollActive = false;
+        }
+        // Timed out.  Refresh once more with the guard released so that, if the
+        // service is still mid-transition, the self-healing watchdog takes over.
         RefreshServiceStatus();
     }
 
