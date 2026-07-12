@@ -521,7 +521,16 @@ internal sealed class SqliteSetDatabase : IDisposable
         using var _ = await LockAsync(ct).ConfigureAwait(false);
 
         var prefix = directoryPrefix.TrimEnd('\\') + "\\";
-        var escaped = prefix.Replace("[", "\\[").Replace("%", "\\%").Replace("_", "\\_");
+        // Escape the escape character (backslash) FIRST — Windows source paths
+        // are full of separators, and under ESCAPE '\' every un-doubled '\'
+        // would swallow the following character, so an un-escaped prefix like
+        // "D:\some\dir\%" matches NOTHING.  Order matters: doubling backslashes
+        // after adding the "\[", "\%", "\_" escapes would corrupt those.
+        var escaped = prefix
+            .Replace("\\", "\\\\")
+            .Replace("[", "\\[")
+            .Replace("%", "\\%")
+            .Replace("_", "\\_");
 
         using var cmd = _connection.CreateCommand();
         cmd.CommandText = """
@@ -661,7 +670,16 @@ internal sealed class SqliteSetDatabase : IDisposable
               AND (SourcePath LIKE $prefix ESCAPE '\' OR SourcePath = $exact)
             """;
         cmd.Parameters.AddWithValue("$setId", backupSetId);
-        var escaped = prefix.Replace("[", "\\[").Replace("%", "\\%").Replace("_", "\\_");
+        // Escape the escape character (backslash) FIRST — Windows source paths
+        // are full of separators, and under ESCAPE '\' every un-doubled '\'
+        // would swallow the following character, so an un-escaped prefix like
+        // "D:\some\dir\%" matches NOTHING.  Order matters: doubling backslashes
+        // after adding the "\[", "\%", "\_" escapes would corrupt those.
+        var escaped = prefix
+            .Replace("\\", "\\\\")
+            .Replace("[", "\\[")
+            .Replace("%", "\\%")
+            .Replace("_", "\\_");
         cmd.Parameters.AddWithValue("$prefix", escaped + "%");
         cmd.Parameters.AddWithValue("$exact", directoryPrefix);
         return cmd.ExecuteNonQuery();

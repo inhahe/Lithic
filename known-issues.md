@@ -1,5 +1,48 @@
 # LithicBackup — Known Issues & Tech Debt
 
+## FIXED: Cleanup "Clean Selected" never persisted for RemovedFromSources / DeletedFromDisk (2026-07-11)
+
+**Status:** Fixed 2026-07-11 in `SqliteSetDatabase.cs`. Root cause was a SQL
+`LIKE ... ESCAPE '\'` bug; two methods were affected.
+
+**Symptom (user report):** After running "Clean Selected" in the Cleanup view and
+re-scanning, all the same entries reappeared in the "deleted from disk"
+(`DeletedFromDisk`) and "not in source selection" (`RemovedFromSources`) sections.
+The cleanup appeared to do nothing that stuck.
+
+**Root cause:** Those two categories route through the purge's `else` branch →
+`ICatalogRepository.MarkFilesDeletedByDirectoryAsync(setId, DirectoryPath)`, whose
+SQL is `... AND (SourcePath LIKE $prefix ESCAPE '\' OR SourcePath = $exact)`.
+The prefix is a Windows source path (e.g. `D:\some\dir\%`). Because `\` is declared
+as the LIKE escape character and the code escaped `[`, `%`, `_` **but not the
+backslash itself**, every path-separator `\` in the pattern was treated as an escape
+char and swallowed the next character. The pattern matched **zero** rows, so
+`UPDATE Files SET IsDeleted = 1` affected nothing. The transaction committed cleanly
+(no error), the in-memory `_activeFiles` list was trimmed, and disk files were
+deleted — but the catalog rows stayed `IsDeleted = 0`. On the next scan, `_activeFiles`
+reloaded from the catalog and the still-active rows re-surfaced. Verified empirically:
+`'D:\some\dir\file.txt' LIKE 'D:\some\dir\%' ESCAPE '\'` → **0**; doubling the
+backslashes → **1**.
+
+**Second method with the identical bug:** `GetFileRecordsUnderDirectoryAsync` used the
+same broken escape chain. Its only caller is `DirectoryBackupService.MoveTargetedAsync`
+for **directory** moves — so a renamed/moved watched folder always got back 0 records,
+always returned `FellBack`, and re-copied the entire subtree as fresh files (leaving the
+old copy to be pruned later) instead of taking the fast `Directory.Move` relocate path.
+Fixed as part of the same change.
+
+**Fix:** Prepend `.Replace("\\", "\\\\")` (escape the escape char first, before adding
+the `\[` `\%` `\_` escapes) in both `MarkFilesDeletedByDirectoryAsync` and
+`GetFileRecordsUnderDirectoryAsync`, mirroring the already-correct `SearchAsync`. The
+`SourcePath = $exact` fallback only ever matched the directory row itself, never the
+files under it, which is why it didn't mask the bug.
+
+**Note on existing data:** Catalog rows for previously-"cleaned" RemovedFromSources /
+DeletedFromDisk entries whose disk files were already deleted are now
+"catalog-deleted (still... actually gone)" — i.e. `IsDeleted = 0` rows whose bytes are
+gone. Re-running Clean Selected on them now correctly flips `IsDeleted` (the disk-delete
+pass simply finds nothing to delete). No separate reconcile needed.
+
 ## "Catalog-deleted (still on disk)" `_prev .v1` records + retention hardening (2026-07-11)
 
 **Status:** Code hardened 2026-07-11 (retention now confirms physical removal
