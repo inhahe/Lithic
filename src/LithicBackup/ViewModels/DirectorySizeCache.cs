@@ -31,6 +31,7 @@ public sealed class DirectorySizeCache : IDisposable
     private readonly Dictionary<string, CacheEntry> _cache;
     private readonly HashSet<string> _dirtyPaths;
     private readonly string _dbPath;
+    private bool _loaded;
 
     public DirectorySizeCache()
     {
@@ -42,6 +43,32 @@ public sealed class DirectorySizeCache : IDisposable
 
         _cache = new Dictionary<string, CacheEntry>(StringComparer.OrdinalIgnoreCase);
         _dirtyPaths = new HashSet<string>(StringComparer.OrdinalIgnoreCase);
+
+        // Load the persisted cache lazily on a background thread.  A fresh
+        // cache is constructed on the UI thread every time a backup-set editor
+        // opens, and the on-disk DB can hold hundreds of thousands of rows —
+        // reading it synchronously here blocked the editor from appearing for
+        // several seconds.  All real cache operations run on background scan
+        // threads and self-trigger EnsureLoaded under the lock, so deferring
+        // the load costs nothing but removes the UI-thread stall.
+        _ = Task.Run(() =>
+        {
+            lock (_lock)
+                EnsureLoaded();
+        });
+    }
+
+    /// <summary>
+    /// Ensure the on-disk cache has been read into memory.  The caller MUST
+    /// hold <see cref="_lock"/>.  Runs the (potentially slow) SQLite load
+    /// exactly once; every cache read/write funnels through here first so a
+    /// caller that races the background preload just performs the load itself.
+    /// </summary>
+    private void EnsureLoaded()
+    {
+        if (_loaded)
+            return;
+        _loaded = true;
         LoadFromDisk();
     }
 
@@ -53,6 +80,7 @@ public sealed class DirectorySizeCache : IDisposable
     {
         lock (_lock)
         {
+            EnsureLoaded();
             if (_cache.TryGetValue(path, out var entry))
                 return (entry.DirectFileSize, entry.DirectFileCount, entry.DirLastWriteUtc);
         }
@@ -68,6 +96,7 @@ public sealed class DirectorySizeCache : IDisposable
     {
         lock (_lock)
         {
+            EnsureLoaded();
             if (_cache.TryGetValue(path, out var entry) && entry.RecursiveSize >= 0)
                 return (entry.RecursiveSize, entry.RecursiveFileCount);
         }
@@ -84,6 +113,7 @@ public sealed class DirectorySizeCache : IDisposable
     {
         lock (_lock)
         {
+            EnsureLoaded();
             if (_cache.TryGetValue(path, out var entry)
                 && entry.FilteredRecursiveSize >= 0
                 && entry.FilteredFilterSignature == filterSignature)
@@ -102,6 +132,7 @@ public sealed class DirectorySizeCache : IDisposable
     {
         lock (_lock)
         {
+            EnsureLoaded();
             if (_cache.TryGetValue(path, out var existing))
             {
                 // Preserve existing recursive totals when only updating direct sizes.
@@ -133,6 +164,7 @@ public sealed class DirectorySizeCache : IDisposable
     {
         lock (_lock)
         {
+            EnsureLoaded();
             if (_cache.TryGetValue(path, out var existing))
             {
                 _cache[path] = existing with
@@ -159,6 +191,7 @@ public sealed class DirectorySizeCache : IDisposable
     {
         lock (_lock)
         {
+            EnsureLoaded();
             if (_cache.TryGetValue(path, out var existing))
             {
                 _cache[path] = existing with
