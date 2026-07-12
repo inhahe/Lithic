@@ -361,8 +361,8 @@
                                                                                             <Border Visibility="{Binding HasFailedFiles, Converter={StaticResource BoolToVis}}"
                                                                                                     BorderBrush="{StaticResource BorderBrush}"
                                                                                                     BorderThickness="1" CornerRadius="4"
-                                                                                                    HorizontalAlignment="Left" Width="300"
-                                                                                                    Margin="0,3,0,0" MaxHeight="120">
+                                                                                                    HorizontalAlignment="Stretch"
+                                                                                                    Margin="0,3,0,0" MaxHeight="220">
                                                                                                 <DockPanel>
                                                                                                     <DockPanel DockPanel.Dock="Top" Margin="8,4,8,2">
                                                                                                         <TextBlock FontWeight="SemiBold" FontSize="11"
