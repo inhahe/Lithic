@@ -86,6 +86,18 @@ public class SourceSelectionViewModel : ViewModelBase
     /// Background priority so the clicked checkbox repaints first.
     /// </summary>
     private readonly HashSet<SourceSelectionNodeViewModel> _pendingSelectionNodes = [];
+    /// <summary>
+    /// The full path of every node whose checkbox the user toggled during this
+    /// editing session.  Recorded in <see cref="RequestSelectionSettle"/>, which
+    /// receives only user-clicked nodes (propagation to children/ancestors is
+    /// suppressed before it reaches the setter's settle call).  Used by the
+    /// post-edit reconcile to query the catalog for ONLY the changed subtrees
+    /// instead of loading the entire (potentially ~1M-row) file table: every
+    /// file whose inclusion changed sits under one of these toggled nodes, so
+    /// scoping catalog reads to them is both correct and far cheaper.
+    /// </summary>
+    private readonly HashSet<string> _changedSelectionPaths =
+        new(StringComparer.OrdinalIgnoreCase);
     /// <summary>True once a settle pass has been scheduled but not yet run.</summary>
     private bool _selectionSettleScheduled;
     /// <summary>
@@ -868,6 +880,13 @@ public class SourceSelectionViewModel : ViewModelBase
     public bool HasUnsavedChanges => _needsSave;
 
     /// <summary>
+    /// Paths of every node the user toggled this session.  The post-edit
+    /// reconcile uses these to scope its catalog reads to just the changed
+    /// subtrees.  A snapshot is returned so callers can iterate safely.
+    /// </summary>
+    public IReadOnlyCollection<string> ChangedSelectionPaths => _changedSelectionPaths.ToList();
+
+    /// <summary>
     /// Mark the current state as clean (just saved or freshly loaded).
     /// Disables the Save button until the user makes further changes.
     /// </summary>
@@ -1009,6 +1028,12 @@ public class SourceSelectionViewModel : ViewModelBase
     private void RequestSelectionSettle(SourceSelectionNodeViewModel node)
     {
         _pendingSelectionNodes.Add(node);
+
+        // Record the toggled path so the post-edit reconcile can scope its
+        // catalog reads to just the changed subtrees.  This setter fires only
+        // for the node the user actually clicked (propagation to descendants is
+        // suppressed before it reaches here), so the set stays minimal.
+        _changedSelectionPaths.Add(node.Path);
 
         // Mark dirty right away.  The heavy aggregation is deferred, but the
         // fact that *something* changed is known now, so the Save button should

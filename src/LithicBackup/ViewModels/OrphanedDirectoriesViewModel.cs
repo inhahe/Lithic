@@ -46,9 +46,6 @@ public class OrphanedDirectoriesViewModel : ViewModelBase
     /// <summary>Dry-run result awaiting the user's "Apply" confirmation. Null until Analyze runs.</summary>
     private ReconcileReport? _reconcileReport;
 
-    /// <summary>Task that completes when initial data loading finishes.</summary>
-    private readonly Task _loadTask;
-
     public event Action? DoneRequested;
 
     public OrphanedDirectoriesViewModel(ICatalogRepository catalog, BackupSet backupSet)
@@ -79,7 +76,10 @@ public class OrphanedDirectoriesViewModel : ViewModelBase
                  && _targetDir is not null && _reconcileReport?.HasChanges == true);
         CloseCommand = new RelayCommand(_ => DoneRequested?.Invoke());
 
-        _loadTask = LoadAsync();
+        // Fire-and-forget the initial load; it runs its heavy work on a
+        // background thread and drives the view's own progress (SummaryText /
+        // IsLoading), so nothing needs to await it.
+        _ = LoadAsync();
     }
 
     // ------------------------------------------------------------------
@@ -127,12 +127,6 @@ public class OrphanedDirectoriesViewModel : ViewModelBase
         foreach (var category in Categories)
             category.ApplySort(_sortColumn, _sortAscending);
     }
-
-    /// <summary>
-    /// Await initial data loading. Used by callers that want to show a wait
-    /// cursor until the view is ready (e.g. <see cref="MainViewModel"/>).
-    /// </summary>
-    internal Task WaitForLoadAsync() => _loadTask;
 
     /// <summary>
     /// Flat list of every <see cref="OrphanedDirectoryItem"/> across all

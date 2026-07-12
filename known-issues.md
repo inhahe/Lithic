@@ -1,5 +1,69 @@
 # LithicBackup — Known Issues & Tech Debt
 
+## ADDED: Continuous-mode fallback for non-NTFS source volumes (2026-07-12)
+
+**Status:** Implemented 2026-07-12 in `BackupWorker`, `FileSystemMonitorImpl`, and
+`IFileSystemMonitor`.
+
+**What changed:** Continuous mode previously only worked on NTFS (it is driven by the
+USN change journal; `UsnJournalReader.TryOpen` returns null for non-NTFS/inaccessible
+volumes, which used to silently disable continuous detection for that volume). Non-NTFS
+source volumes (exFAT, FAT32, network shares) now fall back to a `FileSystemWatcher`.
+
+**Design:**
+- `BackupWorker` owns a single `FileSystemMonitorImpl _fsMonitor` watching every non-NTFS
+  watch root across all continuous sets (`MaintainFallbackWatchers`). Watcher events arrive
+  on thread-pool threads and are buffered into `ConcurrentQueue`s, then drained on the poll
+  thread (`DrainFallbackChanges`) into the same per-set `Pending` debounce map the USN path
+  feeds — so `Pending` mutation stays single-threaded and the downstream targeted-backup
+  pipeline is shared.
+- **Restart reconciliation:** a watcher only sees live changes, so any (re)start of the
+  watcher — including the first poll after a process restart (roots go empty→populated) —
+  flags the affected sets `NeedsReconcile`, triggering a full timestamp/size scan
+  (`RunFullBackupAsync` → `FileScanner.ComputeDiffAsync`, which compares size + LastWrite,
+  no hashing) to catch anything changed while the watcher wasn't running.
+- **Buffer overflow:** `FileSystemMonitorImpl` now sets `InternalBufferSize = 64 KB` (max)
+  and raises a new `IFileSystemMonitor.Overflow` event on any watcher `Error`
+  (InternalBufferOverflowException = too many changes at once, some dropped). The worker
+  maps the overflowed root to affected sets and flags `NeedsReconcile` — a whole-tree
+  rescan rather than trusting the now-incomplete per-file event list.
+- Directory Created/Renamed events are expanded to their files (a bulk move-in may not fire
+  per-file events); a plain directory Changed is ignored (the child's own event covers it).
+
+**Known limitations of the fallback (inherent, acceptable):**
+- Non-NTFS deletions are only reconciled on the next full scan (restart/overflow/schedule),
+  same as the pre-existing NTFS "plain single-file deletes aren't reconciled in
+  pure-continuous mode" open item further down — `ExecuteTargetedAsync` skips missing paths.
+- A watcher restart (triggered when the set of non-NTFS watch roots changes, e.g. a set is
+  edited) drops whatever was buffered; that is covered by the reconcile-on-(re)start flag,
+  at the cost of an extra full timestamp/size scan on those sets.
+
+## FIXED: Service panel could get stuck on "starting…/stopping…" with all buttons greyed (2026-07-12)
+
+**Status:** Fixed 2026-07-12 in `MainViewModel.RefreshServiceStatus` /
+`PollWhileServicePendingAsync`.
+
+**Symptom (user report):** After uninstalling the Worker service, running the MSI
+installer, and reopening the GUI, the Worker-service panel showed "Worker service
+stopping…" indefinitely with Install/Start/Stop/Uninstall all disabled. The service was
+actually fine (`sc query` showed RUNNING); the GUI just never left the stale reading.
+
+**Root cause:** `START_PENDING`/`STOP_PENDING` satisfy none of the `CanInstall/
+CanUninstall/CanStart/CanStop` gates, so all four buttons disable while pending. The SCM
+is only re-queried on demand — at startup, on a button action (via
+`WaitForServiceReadyAsync`, 5 s), or when navigating home — so a status read that landed
+on a pending transition (a reinstall in progress, or a snapshot inherited by a long-lived
+GUI instance) stuck there with no path back: pending disables the buttons, and disabled
+buttons can't trigger the refresh that would clear pending.
+
+**Fix:** `RefreshServiceStatus` now spawns a background watchdog
+(`PollWhileServicePendingAsync`) whenever it observes a pending state and no poll is
+already running; the watchdog re-queries every second (up to 60 s) until the state
+settles, then lets the normal `Can*` notifications re-enable the buttons.
+`WaitForServiceReadyAsync` shares the same `_servicePollActive` guard so an action's poll
+and the watchdog never stack, and hands off to the watchdog if it times out while still
+pending.
+
 ## FIXED: Modify dialog close stalled the UI with a ~10s wait cursor (2026-07-12)
 
 **Status:** Fixed 2026-07-12 in `MainViewModel.ReconcileDestinationAfterEditAsync`.
@@ -16,20 +80,44 @@ table (≈1M rows for large sets) on a background thread with `Mouse.OverrideCur
 Wait`, just to diff which source folders were dropped/added — work that is pointless
 when the selection didn't change.
 
-**Fix:** Added a conservative fast-path at the top of the reconcile: if the source
-selection is unchanged from when the dialog opened (`SelectionsEquivalent`, comparing
-the same `JsonSerializer.Serialize` form the catalog persists with), return
-immediately without loading any file records. Any genuine selection change serializes
-differently and still runs the full reconcile, so purge/backup prompts for
-dropped/added folders are unaffected. Gating on the JSON diff (rather than
-`HasUnsavedChanges`) is correct for both the auto-save-on-close and explicit-Save-then-close
-paths, since `HasUnsavedChanges` resets after an explicit save.
+**Fix (part 1 — unchanged selection):** Added a conservative fast-path at the top of
+the reconcile: if the source selection is unchanged from when the dialog opened
+(`SelectionsEquivalent`, comparing the same `JsonSerializer.Serialize` form the catalog
+persists with), return immediately without loading any file records. Any genuine
+selection change serializes differently and still runs the reconcile below, so
+purge/backup prompts for dropped/added folders are unaffected. Gating on the JSON diff
+(rather than `HasUnsavedChanges`) is correct for both the auto-save-on-close and
+explicit-Save-then-close paths, since `HasUnsavedChanges` resets after an explicit save.
 
-**Related latent concern (not fixed, low risk):** auto-save on close calls
+**Fix (part 2 — changed selection, targeted reconcile):** Even when the selection *did*
+change, the reconcile no longer loads the whole file table. `SourceSelectionViewModel`
+now records the path of every node the user toggles this session (in
+`RequestSelectionSettle`, which fires only for user-clicked nodes — propagation to
+children/ancestors is suppressed before it reaches the settle call) and exposes them as
+`ChangedSelectionPaths`. `ComputeRemovedFilesTargeted` queries only those subtrees via
+`GetFileRecordsUnderDirectoryAsync` (which matches a path and all its descendants,
+working for both file and directory nodes), keeping records that were included before
+the edit and excluded after. This is correct because a file's inclusion can only change
+if the user toggled that file or one of its ancestor directories — so every removed
+file sits at or under a recorded path. Two fallbacks preserve correctness: a recorded
+empty path (the virtual "All Drives" root, e.g. "deselect all") reverts to the full
+`GetAllFilesForBackupSetAsync` scan since a whole-tree change can't be localised; and an
+empty recorded set (only cosmetic/expansion or auto-include-new edits, which never drop
+an already-backed-up file) skips catalog reads entirely.
+
+**Related concern (now fixed 2026-07-12):** auto-save on close calls
 `sourceSelection.GetSelections()`. Selection restore is deferred to a post-show async
-pass; closing the dialog before that completes could in principle save a partial/empty
-selection. Not observed and out of scope for this fix, but worth guarding (e.g. block
-auto-save until restore has completed) if it ever surfaces.
+pass (Phase 3 in `StartEditFlow`), during which `GetSelections()` returns a
+partial/empty tree — so closing the dialog (or clicking Save/Seed/Largest-Files) before
+restore completed could save a truncated selection over the real saved sources.
+**Fix:** `StartEditFlow` now holds a `TaskCompletionSource selectionRestored`, completed
+in Phase 3's `finally` (so it also releases for new sets and error paths). Every path
+that persists the selection — `SaveAllAsync` (used by both the Save button and the
+auto-save-on-close), the Seed handler, and both Largest-Files save points — `await`s it
+before reading `GetSelections()`, so a fast close simply waits for the (unchanged)
+restore to finish and then writes the correct tree. The debounced `SelectionChanged`
+auto-save was already gated on `IsApplyingSelections`, which flips in lockstep with the
+new signal.
 
 ## FIXED: Cleanup "cleaned but reappears" — read-only files silently fail deletion (2026-07-12)
 

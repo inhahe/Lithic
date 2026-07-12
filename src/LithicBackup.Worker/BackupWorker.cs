@@ -11,13 +11,21 @@ namespace LithicBackup.Worker;
 /// changes, executing directory backups automatically.
 /// </summary>
 /// <remarks>
-/// Continuous-mode sets are driven by the NTFS USN change journal rather than
-/// <see cref="FileSystemWatcher"/>: the journal never drops events, records
-/// changes that happened while the service was offline, and lets us version
-/// exactly the files that changed instead of rescanning whole drives. Each poll
-/// reads new journal records per volume, routes the changed paths to the sets
-/// that include them, debounces each file individually, then batches the
-/// "ready" files into a single targeted backup per set.
+/// Continuous-mode sets on NTFS volumes are driven by the USN change journal: it
+/// never drops events, records changes that happened while the service was
+/// offline, and lets us version exactly the files that changed instead of
+/// rescanning whole drives. Each poll reads new journal records per volume, routes
+/// the changed paths to the sets that include them, debounces each file
+/// individually, then batches the "ready" files into a single targeted backup per
+/// set.
+///
+/// Volumes without a usable journal (non-NTFS or inaccessible) fall back to a
+/// <see cref="FileSystemWatcher"/>. Unlike the journal that fallback is not
+/// persistent — it only observes changes while the service runs — so its sets are
+/// reconciled with a full timestamp/size scan whenever watching (re)starts
+/// (covering process restart) and whenever the watcher's buffer overflows (its
+/// change list is then incomplete). Live watcher events otherwise feed the same
+/// per-file debounce → targeted-backup pipeline as the journal.
 /// </remarks>
 public sealed class BackupWorker : BackgroundService
 {
@@ -43,9 +51,42 @@ public sealed class BackupWorker : BackgroundService
     /// <summary>
     /// Per-volume USN journal readers, opened lazily. A null value means the
     /// volume has no usable journal (non-NTFS or inaccessible) — cached so we
-    /// don't retry it on every poll.
+    /// don't retry it on every poll. Volumes with a null reader use the
+    /// <see cref="_fsMonitor"/> fallback instead.
     /// </summary>
     private readonly Dictionary<char, UsnJournalReader?> _journalReaders = new();
+
+    /// <summary>
+    /// FileSystemWatcher-based fallback for volumes without a usable USN journal
+    /// (non-NTFS or inaccessible). Unlike the journal it is not persistent — it
+    /// only sees changes while the service runs, so its sets are reconciled with a
+    /// full timestamp/size scan whenever watching (re)starts (covering process
+    /// restart) and whenever its buffer overflows. Watches every non-NTFS watch
+    /// root across all continuous sets at once.
+    /// </summary>
+    private readonly FileSystemMonitorImpl _fsMonitor = new();
+
+    /// <summary>
+    /// Changes pushed by <see cref="_fsMonitor"/> from watcher threads, drained on
+    /// the poll thread into each set's <c>Pending</c> map (mirroring the USN path).
+    /// A queue keeps all <c>Pending</c> mutation single-threaded. The change type
+    /// is kept so a newly created/renamed directory (a possible bulk move-in) can
+    /// be expanded to its files, while a mere directory-timestamp change is ignored.
+    /// </summary>
+    private readonly ConcurrentQueue<(string Path, FileChangeType Type)> _fswChanges = new();
+
+    /// <summary>
+    /// Watch roots whose <see cref="_fsMonitor"/> buffer overflowed (change list
+    /// incomplete). Drained on the poll thread to flag affected sets for a full
+    /// reconciling scan.
+    /// </summary>
+    private readonly ConcurrentQueue<string> _fswOverflows = new();
+
+    /// <summary>
+    /// Roots the <see cref="_fsMonitor"/> is currently watching, kept sorted so we
+    /// only restart the watcher (and reconcile) when the set actually changes.
+    /// </summary>
+    private List<string> _fswRoots = new();
 
     /// <summary>Only one backup runs at a time.</summary>
     private readonly SemaphoreSlim _backupLock = new(1, 1);
@@ -62,6 +103,11 @@ public sealed class BackupWorker : BackgroundService
         _directoryBackup = directoryBackup;
         _destinationResolver = destinationResolver;
         _sourceResolver = sourceResolver;
+
+        // Watcher events arrive on thread-pool threads; buffer them and let the
+        // poll loop route them, so per-set state stays single-threaded.
+        _fsMonitor.FileChanged += (_, e) => _fswChanges.Enqueue((e.FullPath, e.ChangeType));
+        _fsMonitor.Overflow += (_, e) => _fswOverflows.Enqueue(e.Root);
     }
 
     /// <summary>
@@ -168,6 +214,7 @@ public sealed class BackupWorker : BackgroundService
             foreach (var reader in _journalReaders.Values)
                 reader?.Dispose();
             _journalReaders.Clear();
+            _fsMonitor.Dispose();
             _logger.LogInformation("LithicBackup Worker stopped.");
         }
     }
@@ -354,6 +401,14 @@ public sealed class BackupWorker : BackgroundService
             }
         }
 
+        // 1b. Fallback for volumes without a usable USN journal (non-NTFS): drive
+        //     them with a FileSystemWatcher instead. A watcher only sees live
+        //     changes, not offline ones, so watch every non-NTFS watch root and
+        //     reconcile with a full timestamp/size scan whenever watching
+        //     (re)starts or its buffer overflows.
+        MaintainFallbackWatchers(continuousSets);
+        DrainFallbackChanges(continuousSets, now);
+
         // 2. If a watched volume's journal lost continuity (it wrapped or was
         //    recreated while the service was down), the incremental USN stream
         //    skipped everything that changed in the gap — those records are gone
@@ -441,12 +496,12 @@ public sealed class BackupWorker : BackgroundService
     }
 
     /// <summary>
-    /// Read new change records for a volume since the saved cursor, advancing
-    /// and persisting the cursor. Opens (and, if necessary, creates) the
-    /// journal on first use; returns empty when the volume has no usable journal.
+    /// Get the USN journal reader for a drive, opening it once and caching the
+    /// result (including a null result, meaning the volume has no usable journal —
+    /// non-NTFS or inaccessible — and must use the FileSystemWatcher fallback).
+    /// Callable only from the poll thread.
     /// </summary>
-    private async Task<(IReadOnlyList<UsnChange> Changes, IReadOnlyList<UsnMove> Moves, bool Truncated)> ReadVolumeChangesAsync(
-        char drive, CancellationToken ct)
+    private UsnJournalReader? GetJournalReader(char drive)
     {
         if (!_journalReaders.TryGetValue(drive, out var reader))
         {
@@ -455,11 +510,24 @@ public sealed class BackupWorker : BackgroundService
             if (reader is null)
             {
                 _logger.LogInformation(
-                    "USN journal unavailable on {Drive}: — continuous detection disabled for this volume.",
+                    "USN journal unavailable on {Drive}: — using file-system watcher fallback " +
+                    "for this volume (live changes only; reconciled by full scan on restart).",
                     drive);
             }
         }
 
+        return reader;
+    }
+
+    /// <summary>
+    /// Read new change records for a volume since the saved cursor, advancing
+    /// and persisting the cursor. Opens (and, if necessary, creates) the
+    /// journal on first use; returns empty when the volume has no usable journal.
+    /// </summary>
+    private async Task<(IReadOnlyList<UsnChange> Changes, IReadOnlyList<UsnMove> Moves, bool Truncated)> ReadVolumeChangesAsync(
+        char drive, CancellationToken ct)
+    {
+        var reader = GetJournalReader(drive);
         if (reader is null)
             return ([], [], false);
 
@@ -530,6 +598,115 @@ public sealed class BackupWorker : BackgroundService
         }
 
         return (changes, moves, false);
+    }
+
+    /// <summary>
+    /// Whether a watch root lives on a volume that has no usable USN journal and
+    /// therefore relies on the FileSystemWatcher fallback. Callable only from the
+    /// poll thread (touches the journal-reader cache).
+    /// </summary>
+    private bool UsesFallbackVolume(string root)
+    {
+        var drive = GetDriveLetter(root);
+        return drive != '\0' && GetJournalReader(drive) is null;
+    }
+
+    /// <summary>
+    /// Point the fallback FileSystemWatcher at the current set of non-NTFS watch
+    /// roots across all continuous sets, restarting it only when that set actually
+    /// changes. Any (re)start — including the first one after a process restart,
+    /// when the watcher wasn't running at all — flags every affected set for a full
+    /// reconciling scan, since a watcher cannot see changes made while it wasn't
+    /// watching and a restart drops whatever was buffered.
+    /// </summary>
+    private void MaintainFallbackWatchers(IReadOnlyList<SetState> continuousSets)
+    {
+        var fallbackRoots = continuousSets
+            .SelectMany(s => s.WatchRoots)
+            .Where(UsesFallbackVolume)
+            .Distinct(StringComparer.OrdinalIgnoreCase)
+            .OrderBy(r => r, StringComparer.OrdinalIgnoreCase)
+            .ToList();
+
+        if (fallbackRoots.SequenceEqual(_fswRoots, StringComparer.OrdinalIgnoreCase))
+            return;
+
+        _fsMonitor.Start(fallbackRoots);
+        _fswRoots = fallbackRoots;
+
+        foreach (var state in continuousSets)
+        {
+            if (!state.NeedsReconcile && state.WatchRoots.Any(UsesFallbackVolume))
+            {
+                state.NeedsReconcile = true;
+                _logger.LogInformation(
+                    "Watching \"{Name}\" via file-system watcher fallback; running a full " +
+                    "reconciling backup to capture any changes made while it wasn't watching.",
+                    state.BackupSet.Name);
+            }
+        }
+    }
+
+    /// <summary>
+    /// Drain buffered FileSystemWatcher events into per-set pending state, mirroring
+    /// how the USN path routes journal changes. Per-file changes go into the debounce
+    /// map; a newly created/renamed directory is expanded to its files (a bulk
+    /// move-in may not fire per-file events); an overflow flags the affected sets for
+    /// a full reconciling scan because their change list is incomplete.
+    /// </summary>
+    private void DrainFallbackChanges(IReadOnlyList<SetState> continuousSets, DateTime now)
+    {
+        while (_fswChanges.TryDequeue(out var change))
+        {
+            var (changedPath, changeType) = change;
+
+            foreach (var state in continuousSets)
+            {
+                if (!PathBelongsToSet(state.BackupSet, changedPath))
+                    continue;
+
+                if (Directory.Exists(changedPath))
+                {
+                    // Only a new/renamed directory needs whole-subtree enumeration.
+                    // A plain Changed on a directory is just its child list or
+                    // timestamp updating — the child's own event covers the real
+                    // change — so skip it to avoid re-walking the tree on every write.
+                    if (changeType is FileChangeType.Created or FileChangeType.Renamed)
+                        EnqueueForBackup(state, changedPath, isDirectory: true, now);
+                }
+                else
+                {
+                    state.Pending[changedPath] =
+                        state.Pending.TryGetValue(changedPath, out var t) ? (t.First, now) : (now, now);
+                }
+            }
+        }
+
+        if (_fswOverflows.IsEmpty)
+            return;
+
+        var overflowRoots = new List<string>();
+        while (_fswOverflows.TryDequeue(out var root))
+            overflowRoots.Add(root);
+
+        foreach (var state in continuousSets)
+        {
+            if (state.NeedsReconcile)
+                continue;
+
+            bool affected = state.WatchRoots.Any(w =>
+                overflowRoots.Any(r => IsUnderRoot(w, r) || IsUnderRoot(r, w)));
+
+            if (affected)
+            {
+                state.NeedsReconcile = true;
+                _logger.LogWarning(
+                    "File-system watcher buffer overflowed for a source volume of \"{Name}\" " +
+                    "(too many changes at once to enumerate). Running a full reconciling backup " +
+                    "to capture the changes that were dropped.",
+                    state.BackupSet.Name);
+            }
+        }
     }
 
     /// <summary>

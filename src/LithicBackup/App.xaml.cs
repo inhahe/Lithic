@@ -61,11 +61,11 @@ public partial class App : Application
             try
             {
                 MessageBox.Show(
-                    "LithicBackup hit an unexpected error and may be in an unstable state.\n\n" +
+                    "Lithic Backup hit an unexpected error and may be in an unstable state.\n\n" +
                     "A crash report has been written to:\n" +
                     CatalogLocation.LogsDirectory() + "\n\n" +
                     args.Exception.Message,
-                    "LithicBackup \u2014 Unexpected Error",
+                    "Lithic Backup \u2014 Unexpected Error",
                     MessageBoxButton.OK,
                     MessageBoxImage.Error);
             }
@@ -87,11 +87,11 @@ public partial class App : Application
             try
             {
                 MessageBox.Show(
-                    "LithicBackup failed to start.\n\n" +
+                    "Lithic Backup failed to start.\n\n" +
                     "A crash report has been written to:\n" +
                     CatalogLocation.LogsDirectory() + "\n\n" +
                     ex.Message,
-                    "LithicBackup \u2014 Startup Failed",
+                    "Lithic Backup \u2014 Startup Failed",
                     MessageBoxButton.OK,
                     MessageBoxImage.Error);
             }
@@ -236,7 +236,7 @@ public partial class App : Application
             {
                 _notifyIcon?.ShowBalloonTip(
                     5000,
-                    "LithicBackup \u2014 Backup Suggested",
+                    "Lithic Backup \u2014 Backup Suggested",
                     reason + "\n\nClick to stop future reminders. You can re-enable them from the tray icon\u2019s right-click menu.",
                     WinForms.ToolTipIcon.Info);
             });
@@ -289,12 +289,12 @@ public partial class App : Application
         _notifyIcon = new WinForms.NotifyIcon
         {
             Icon = LoadTrayIcon(),
-            Text = "LithicBackup \u2014 Incremental Backup",
+            Text = "Lithic Backup \u2014 Incremental Backup",
             Visible = true,
         };
 
         var contextMenu = new WinForms.ContextMenuStrip();
-        contextMenu.Items.Add("Open LithicBackup", null, (_, _) => ShowMainWindow());
+        contextMenu.Items.Add("Open Lithic Backup", null, (_, _) => ShowMainWindow());
 
         var remindersItem = new WinForms.ToolStripMenuItem("Backup reminders")
         {
@@ -356,7 +356,7 @@ public partial class App : Application
         MainWindow?.Hide();
         _notifyIcon?.ShowBalloonTip(
             1500,
-            "LithicBackup",
+            "Lithic Backup",
             "Minimized to tray. Background monitoring continues.",
             WinForms.ToolTipIcon.Info);
     }

@@ -10,7 +10,12 @@ namespace LithicBackup.Services;
 /// </summary>
 internal static class WorkerServiceHelper
 {
-    public const string ServiceName = "LithicBackup";
+    // The SCM service name.  It contains a space, so every sc.exe invocation
+    // below must pass it quoted (see QuotedName).
+    public const string ServiceName = "Lithic Backup";
+
+    // The service name wrapped in double quotes for sc.exe command lines.
+    private static string QuotedName => $"\"{ServiceName}\"";
 
     /// <summary>
     /// Find the Worker executable. Looks next to the running app first
@@ -55,7 +60,7 @@ internal static class WorkerServiceHelper
             var psi = new ProcessStartInfo
             {
                 FileName = "sc.exe",
-                Arguments = $"query {ServiceName}",
+                Arguments = $"query {QuotedName}",
                 RedirectStandardOutput = true,
                 UseShellExecute = false,
                 CreateNoWindow = true,
@@ -92,7 +97,7 @@ internal static class WorkerServiceHelper
     /// </summary>
     public static bool Install(string workerExePath)
     {
-        return RunElevated("create", $"{ServiceName} binPath=\"{workerExePath}\" start=auto DisplayName=\"LithicBackup Worker\"");
+        return RunElevated("create", $"{QuotedName} binPath=\"{workerExePath}\" start=auto DisplayName=\"Lithic Backup Worker\"");
     }
 
     /// <summary>
@@ -101,8 +106,8 @@ internal static class WorkerServiceHelper
     public static bool Uninstall()
     {
         // Stop first (ignore failure if already stopped).
-        RunElevated("stop", ServiceName);
-        return RunElevated("delete", ServiceName);
+        RunElevated("stop", QuotedName);
+        return RunElevated("delete", QuotedName);
     }
 
     /// <summary>
@@ -110,7 +115,7 @@ internal static class WorkerServiceHelper
     /// </summary>
     public static bool Start()
     {
-        return RunElevated("start", ServiceName);
+        return RunElevated("start", QuotedName);
     }
 
     /// <summary>
@@ -118,7 +123,7 @@ internal static class WorkerServiceHelper
     /// </summary>
     public static bool Stop()
     {
-        return RunElevated("stop", ServiceName);
+        return RunElevated("stop", QuotedName);
     }
 
     private static bool RunElevated(string scVerb, string scArgs)

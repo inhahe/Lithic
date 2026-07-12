@@ -34,6 +34,10 @@ public class MainViewModel : ViewModelBase
     private ViewModelBase? _currentView;
     private BackupSet? _selectedBackupSet;
     private string _serviceStatusText = "";
+    /// <summary>True while a background poll is watching a transient service
+    /// state (START_PENDING/STOP_PENDING) so refreshes don't stack multiple
+    /// polling loops.  See <see cref="PollWhileServicePendingAsync"/>.</summary>
+    private bool _servicePollActive;
     private BackupSetEditorWindow? _editorWindow;
     private Window? _largestFilesWindow;
     private Func<Task>? _pendingSettingsSave;
@@ -436,6 +440,18 @@ public class MainViewModel : ViewModelBase
             : new List<Core.Models.SourceSelection>();
         bool savedThisSession = false;
 
+        // Completes once the deferred selection restore (Phase 3, below) has
+        // finished.  The restore runs asynchronously AFTER the dialog is shown,
+        // during which GetSelections() would return a partial/empty tree.  Every
+        // path that persists the selection (SaveAllAsync — used by both the Save
+        // button and the auto-save-on-close — plus the Seed and Largest-Files
+        // handlers) awaits this first, so a fast close or click can never write a
+        // half-restored tree over the real saved sources.  It is completed
+        // unconditionally in Phase 3's finally, so new sets (which have nothing
+        // to restore) and error paths still release any waiter.
+        var selectionRestored = new TaskCompletionSource(
+            TaskCreationOptions.RunContinuationsAsynchronously);
+
         // Show a wait cursor while loading — the dialog won't appear until ready.
         Mouse.OverrideCursor = Cursors.Wait;
 
@@ -475,6 +491,11 @@ public class MainViewModel : ViewModelBase
         // Helper: sync all VM settings into the BackupSet and write to DB.
         async Task SaveAllAsync()
         {
+            // Never read GetSelections() from a still-restoring tree — wait for
+            // the deferred restore to finish so we persist the real selection,
+            // not a partial/empty snapshot.  Completes instantly once restore is
+            // done (or immediately for new sets).
+            await selectionRestored.Task;
             SyncSettingsToJobOptions(backupSet, sourceSelection);
             backupSet.SourceSelections = sourceSelection.GetSelections();
             await Task.Run(() => _catalog.UpdateBackupSetAsync(backupSet));
@@ -495,36 +516,48 @@ public class MainViewModel : ViewModelBase
         };
         _editorWindow = dialog;
 
-        // Prompt before closing if there are unsaved changes.
-        // For new sets: "Discard?"  For existing sets: "Save before closing?"
+        // Prompt before closing if there are unsaved changes.  A "save before
+        // closing?" prompt (Yes / No / Cancel) is used for both new and existing
+        // sets — it's more intuitive and safer than a "discard it?" prompt,
+        // because the safe action (keep the work by saving) lines up with the
+        // default Yes rather than being buried behind a "No".
+        //   Yes    → save and close
+        //   No     → close without saving (existing: skip auto-save; new: discard
+        //            the temporary catalog record)
+        //   Cancel → stay open
         dialog.Closing += (_, e) =>
         {
             if (!sourceSelection.HasUnsavedChanges)
                 return;
 
-            if (_unsavedNewSetId is not null)
-            {
-                var result = MessageBox.Show(
-                    "This backup set hasn't been saved yet.\n\nDiscard it?",
-                    "Unsaved Backup Set",
-                    MessageBoxButton.YesNo,
-                    MessageBoxImage.Question);
+            bool isNewSet = _unsavedNewSetId is not null;
 
-                if (result != MessageBoxResult.Yes)
-                    e.Cancel = true;
+            var result = MessageBox.Show(
+                isNewSet
+                    ? "This backup set hasn't been saved yet.\n\nSave it before closing?"
+                    : "You have unsaved changes.\n\nSave before closing?",
+                isNewSet ? "Unsaved Backup Set" : "Unsaved Changes",
+                MessageBoxButton.YesNoCancel,
+                MessageBoxImage.Question);
+
+            if (result == MessageBoxResult.Cancel)
+            {
+                e.Cancel = true;
             }
-            else
+            else if (result == MessageBoxResult.Yes)
             {
-                var result = MessageBox.Show(
-                    "You have unsaved changes.\n\nSave before closing?",
-                    "Unsaved Changes",
-                    MessageBoxButton.YesNoCancel,
-                    MessageBoxImage.Question);
-
-                if (result == MessageBoxResult.Cancel)
-                    e.Cancel = true;
-                else if (result == MessageBoxResult.No)
-                    _pendingSettingsSave = null; // skip auto-save
+                // Save on close.  For a new set, clear the "unsaved new" marker so
+                // the Closed handler persists it (via _pendingSettingsSave) instead
+                // of deleting the temporary catalog record.
+                _unsavedNewSetId = null;
+            }
+            else // No — close without saving.
+            {
+                // Existing set: skip the auto-save.  New set: leave
+                // _unsavedNewSetId set so the Closed handler discards the
+                // temporary record.
+                if (!isNewSet)
+                    _pendingSettingsSave = null;
             }
         };
 
@@ -544,8 +577,19 @@ public class MainViewModel : ViewModelBase
             }
             else if (_pendingSettingsSave is not null)
             {
-                // Existing set — save all settings on close.
-                await _pendingSettingsSave();
+                // Save all settings on close — the user chose "Save" at the
+                // close prompt (existing set, or a new set they kept).  Guard the
+                // save: this is an async-void event handler, so an unhandled
+                // exception here would tear down the app.  On failure savedThisSession
+                // stays false, so the reconcile below is correctly skipped.
+                try
+                {
+                    await _pendingSettingsSave();
+                }
+                catch (Exception ex)
+                {
+                    StatusText = $"Failed to save on close: {ex.Message}";
+                }
                 _pendingSettingsSave = null;
             }
             _editorWindow = null;
@@ -556,7 +600,8 @@ public class MainViewModel : ViewModelBase
             // back up newly added ones.  Skipped entirely when nothing was saved
             // (e.g. the user discarded changes on close).
             if (savedThisSession)
-                await ReconcileDestinationAfterEditAsync(backupSet, originalSelections);
+                await ReconcileDestinationAfterEditAsync(
+                    backupSet, originalSelections, sourceSelection.ChangedSelectionPaths);
         };
 
         // Save button: persist everything and show confirmation.
@@ -586,7 +631,9 @@ public class MainViewModel : ViewModelBase
         // catalog so future incremental backups only copy new/changed files.
         sourceSelection.SeedFromExistingRequested += async () =>
         {
-            // Sync and save current settings first.
+            // Sync and save current settings first (after the deferred restore
+            // has finished, so GetSelections() reflects the real selection).
+            await selectionRestored.Task;
             SyncSettingsToJobOptions(backupSet, sourceSelection);
             backupSet.SourceSelections = sourceSelection.GetSelections();
             await Task.Run(() => _catalog.UpdateBackupSetAsync(backupSet));
@@ -766,6 +813,8 @@ public class MainViewModel : ViewModelBase
             }
 
             // Flush any pending debounced save so the scan sees current state.
+            // Wait for the deferred restore first so we don't flush a partial tree.
+            await selectionRestored.Task;
             saveDebounce?.Cancel();
             SyncSettingsToJobOptions(backupSet, sourceSelection);
             backupSet.SourceSelections = sourceSelection.GetSelections();
@@ -793,6 +842,7 @@ public class MainViewModel : ViewModelBase
             {
                 try
                 {
+                    await selectionRestored.Task;
                     SyncSettingsToJobOptions(backupSet, sourceSelection);
                     backupSet.SourceSelections = sourceSelection.GetSelections();
                     await Task.Run(() => _catalog.UpdateBackupSetAsync(backupSet));
@@ -881,6 +931,9 @@ public class MainViewModel : ViewModelBase
         finally
         {
             sourceSelection.IsApplyingSelections = false;
+            // Release any save/seed/largest-files path that was waiting for the
+            // restore to finish (including an auto-save queued by a fast close).
+            selectionRestored.TrySetResult();
         }
 
         _ = PostShowInitAsync();
@@ -918,19 +971,20 @@ public class MainViewModel : ViewModelBase
     /// covers but the old one didn't.
     /// </summary>
     private async Task ReconcileDestinationAfterEditAsync(
-        BackupSet backupSet, IReadOnlyList<Core.Models.SourceSelection> originalSelections)
+        BackupSet backupSet,
+        IReadOnlyList<Core.Models.SourceSelection> originalSelections,
+        IReadOnlyCollection<string> changedPaths)
     {
         var newSelections = backupSet.SourceSelections
             ?? new List<Core.Models.SourceSelection>();
 
         // Fast path: if the source selection is unchanged from when the dialog
         // opened, there is nothing to reconcile — no folders were dropped or
-        // added. Skip the expensive GetAllFilesForBackupSetAsync scan (which can
-        // load ~1M rows and stall the UI for several seconds) that would
-        // otherwise run on EVERY dialog close, since close auto-saves and thus
-        // always sets savedThisSession. The comparison uses the same JSON
-        // serialization the catalog persists with, so it is conservative: any
-        // real change produces different JSON and still runs the full reconcile.
+        // added. Skip all catalog work that would otherwise run on EVERY dialog
+        // close, since close auto-saves and thus always sets savedThisSession.
+        // The comparison uses the same JSON serialization the catalog persists
+        // with, so it is conservative: any real change produces different JSON
+        // and still runs the reconcile below.
         if (SelectionsEquivalent(originalSelections, newSelections))
             return;
 
@@ -942,17 +996,16 @@ public class MainViewModel : ViewModelBase
         {
             (removed, addedRoots) = await Task.Run(() =>
             {
-                var all = _catalog
-                    .GetAllFilesForBackupSetAsync(backupSet.Id)
-                    .GetAwaiter().GetResult();
-
                 // Removed: currently-active catalog files whose source path was
-                // covered before the edit but isn't covered any more.
-                var rem = all
-                    .Where(f => !f.IsDeleted
-                        && SourceSelection.IsPathIncluded(originalSelections, f.SourcePath)
-                        && !SourceSelection.IsPathIncluded(newSelections, f.SourcePath))
-                    .ToList();
+                // covered before the edit but isn't covered any more.  Rather
+                // than load the whole (potentially ~1M-row) file table, query
+                // only the subtrees the user actually toggled this session: every
+                // file whose inclusion changed sits at or under one of those
+                // toggled nodes (a removal can only be caused by unchecking that
+                // node or an ancestor of it), so scoping the reads to them is
+                // both correct and far cheaper.
+                var rem = ComputeRemovedFilesTargeted(
+                    backupSet.Id, originalSelections, newSelections, changedPaths);
 
                 // Added: new covering roots not already covered by an old root.
                 var oldRoots = SourceSelection.CollectSelectedRoots(originalSelections);
@@ -999,6 +1052,107 @@ public class MainViewModel : ViewModelBase
             // (correctness over the optimisation).
             return false;
         }
+    }
+
+    /// <summary>
+    /// Find the catalog files dropped by an edit, reading ONLY the subtrees the
+    /// user toggled this session instead of the whole file table.  Correct
+    /// because a file's inclusion can only change if the user toggled that file
+    /// or one of its ancestor directories, so every removed file sits at or
+    /// under one of <paramref name="changedPaths"/>.  Each candidate is kept only
+    /// when it was included before the edit and is excluded now, so over-scoping
+    /// (e.g. a toggled folder that also gained files) never yields false
+    /// removals.
+    /// </summary>
+    private List<FileRecord> ComputeRemovedFilesTargeted(
+        int backupSetId,
+        IReadOnlyList<Core.Models.SourceSelection> originalSelections,
+        IReadOnlyList<Core.Models.SourceSelection> newSelections,
+        IReadOnlyCollection<string> changedPaths)
+    {
+        // A bulk toggle can record the virtual "All Drives" root (empty path),
+        // which covers everything — e.g. "deselect all".  There is no cheaper
+        // way to reconcile a whole-tree change than scanning every backed-up
+        // file, so fall back to the full load in that (rare) case.
+        if (changedPaths.Any(string.IsNullOrEmpty))
+            return ComputeRemovedFilesFull(backupSetId, originalSelections, newSelections);
+
+        // No checkbox was toggled, yet the JSON diff flagged a change — so the
+        // edit was purely cosmetic (expansion state) or an auto-include-new
+        // toggle.  Neither drops an already-backed-up file: existing children of
+        // a directory are always materialised as explicit selections, so
+        // auto-include only governs FUTURE entries, and expansion state is
+        // display-only.  Nothing can have been removed, so skip all catalog
+        // reads.
+        if (changedPaths.Count == 0)
+            return new List<FileRecord>();
+
+        // Collapse to a minimal set so overlapping subtrees are queried once.
+        var roots = MinimizePaths(changedPaths);
+
+        var seen = new HashSet<long>();
+        var removed = new List<FileRecord>();
+        foreach (var path in roots)
+        {
+            // Matches the path itself and every descendant, so it works whether
+            // the toggled node was a file or a directory.
+            var records = _catalog
+                .GetFileRecordsUnderDirectoryAsync(backupSetId, path)
+                .GetAwaiter().GetResult();
+
+            foreach (var f in records)
+            {
+                if (f.IsDeleted || !seen.Add(f.Id))
+                    continue;
+                if (SourceSelection.IsPathIncluded(originalSelections, f.SourcePath)
+                    && !SourceSelection.IsPathIncluded(newSelections, f.SourcePath))
+                    removed.Add(f);
+            }
+        }
+        return removed;
+    }
+
+    /// <summary>
+    /// Whole-table fallback for <see cref="ComputeRemovedFilesTargeted"/> used
+    /// when the change can't be localised (e.g. a bulk deselect-all).  Loads
+    /// every catalog file and keeps those covered before the edit but not after.
+    /// </summary>
+    private List<FileRecord> ComputeRemovedFilesFull(
+        int backupSetId,
+        IReadOnlyList<Core.Models.SourceSelection> originalSelections,
+        IReadOnlyList<Core.Models.SourceSelection> newSelections)
+    {
+        var all = _catalog
+            .GetAllFilesForBackupSetAsync(backupSetId)
+            .GetAwaiter().GetResult();
+
+        return all
+            .Where(f => !f.IsDeleted
+                && SourceSelection.IsPathIncluded(originalSelections, f.SourcePath)
+                && !SourceSelection.IsPathIncluded(newSelections, f.SourcePath))
+            .ToList();
+    }
+
+    /// <summary>
+    /// Reduce a set of paths to the minimal covering set: drop any path that
+    /// equals or lies under another path in the set, so a subtree isn't queried
+    /// twice (once for a parent and again for a child).
+    /// </summary>
+    private static List<string> MinimizePaths(IEnumerable<string> paths)
+    {
+        var distinct = paths
+            .Where(p => !string.IsNullOrEmpty(p))
+            .Distinct(StringComparer.OrdinalIgnoreCase)
+            .OrderBy(p => p.Length)
+            .ToList();
+
+        var minimal = new List<string>();
+        foreach (var path in distinct)
+        {
+            if (!IsCoveredBy(minimal, path))
+                minimal.Add(path);
+        }
+        return minimal;
     }
 
     /// <summary>True when <paramref name="path"/> equals one of
@@ -3345,28 +3499,24 @@ public class MainViewModel : ViewModelBase
     // Flow 4: Cleanup (orphaned catalog records + optional destination scan)
     // -------------------------------------------------------------------
 
-    private async void StartOrphanedDirsFlow()
+    private void StartOrphanedDirsFlow()
     {
         if (SelectedBackupSet is null)
             return;
 
-        // Catalog load + classification can take several seconds on large
-        // backup sets.  Show a wait cursor for the entire load so the user
-        // gets immediate feedback that the click landed; the view itself is
-        // displayed right away so the in-progress phase counters are visible.
-        Mouse.OverrideCursor = Cursors.Wait;
-        try
-        {
-            var vm = new OrphanedDirectoriesViewModel(_catalog, SelectedBackupSet);
-            vm.DoneRequested += GoHome;
-            CurrentView = vm;
-            StatusText = "Review files and directories that can be cleaned up.";
-            await vm.WaitForLoadAsync();
-        }
-        finally
-        {
-            Mouse.OverrideCursor = null;
-        }
+        // The catalog load + classification can take several seconds on large
+        // backup sets, but it runs on a background thread inside the view model
+        // (see OrphanedDirectoriesViewModel.LoadAsync).  The view is switched in
+        // synchronously below and surfaces its own live progress via SummaryText
+        // ("Loading catalogue...", then a running record count), so the app stays
+        // fully responsive throughout.  We deliberately do NOT set a global wait
+        // cursor here: it would falsely signal "busy/unresponsive", and because
+        // the load outlives this method it would also linger as a busy pointer if
+        // the user navigated away before the load finished.
+        var vm = new OrphanedDirectoriesViewModel(_catalog, SelectedBackupSet);
+        vm.DoneRequested += GoHome;
+        CurrentView = vm;
+        StatusText = "Review files and directories that can be cleaned up.";
     }
 
     // -------------------------------------------------------------------
@@ -3589,24 +3739,78 @@ public class MainViewModel : ViewModelBase
         OnPropertyChanged(nameof(CanUninstallService));
         OnPropertyChanged(nameof(CanStartService));
         OnPropertyChanged(nameof(CanStopService));
+
+        // Self-heal from a transient pending state.  START_PENDING/STOP_PENDING
+        // disable every service button (none of the Can* gates accept a pending
+        // state), and nothing else re-queries the SCM on its own — so a status
+        // read that happens to land on a pending transition (e.g. right after an
+        // install/reinstall, or a stale snapshot inherited at startup) would
+        // otherwise leave the panel stuck on "starting..."/"stopping..." with all
+        // buttons greyed until the user restarts the app.  Kick off a background
+        // poll (unless one is already running, including an action's
+        // WaitForServiceReadyAsync) that keeps refreshing until the state
+        // settles.
+        if (ServiceStatus is ServiceState.StartPending or ServiceState.StopPending
+            && !_servicePollActive)
+            _ = PollWhileServicePendingAsync();
+    }
+
+    /// <summary>
+    /// Background watchdog that re-queries the service every second while it is
+    /// in a transient pending state, so the panel recovers on its own once the
+    /// transition finishes (or the generous timeout expires).  Guarded by
+    /// <see cref="_servicePollActive"/> so only one loop runs at a time and the
+    /// per-iteration <see cref="RefreshServiceStatus"/> call can't re-spawn it.
+    /// </summary>
+    private async Task PollWhileServicePendingAsync(int timeoutMs = 60000)
+    {
+        _servicePollActive = true;
+        try
+        {
+            var sw = System.Diagnostics.Stopwatch.StartNew();
+            while (sw.ElapsedMilliseconds < timeoutMs)
+            {
+                await Task.Delay(1000);
+                RefreshServiceStatus();
+                if (ServiceStatus is not ServiceState.StartPending
+                    and not ServiceState.StopPending)
+                    return;
+            }
+        }
+        finally
+        {
+            _servicePollActive = false;
+        }
     }
 
     /// <summary>
     /// Poll until the service leaves a pending state or the timeout expires.
-    /// Keeps the UI updated while waiting.
+    /// Keeps the UI updated while waiting.  Holds the poll guard so it doesn't
+    /// race the background watchdog; if it times out while still pending, the
+    /// final refresh (guard released) hands off to that watchdog.
     /// </summary>
     private async Task WaitForServiceReadyAsync(int timeoutMs = 5000)
     {
-        var sw = System.Diagnostics.Stopwatch.StartNew();
-        while (sw.ElapsedMilliseconds < timeoutMs)
+        _servicePollActive = true;
+        try
         {
-            RefreshServiceStatus();
-            if (ServiceStatus is not ServiceState.StartPending
-                and not ServiceState.StopPending)
-                return;
+            var sw = System.Diagnostics.Stopwatch.StartNew();
+            while (sw.ElapsedMilliseconds < timeoutMs)
+            {
+                RefreshServiceStatus();
+                if (ServiceStatus is not ServiceState.StartPending
+                    and not ServiceState.StopPending)
+                    return;
 
-            await Task.Delay(500);
+                await Task.Delay(500);
+            }
         }
+        finally
+        {
+            _servicePollActive = false;
+        }
+        // Timed out.  Refresh once more with the guard released so that, if the
+        // service is still mid-transition, the self-healing watchdog takes over.
         RefreshServiceStatus();
     }
 

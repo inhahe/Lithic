@@ -3,9 +3,9 @@
   LithicBackup installer (WiX Toolset v4+ / built with the `wix` dotnet tool).
 
   Produces a per-machine MSI that:
-    * installs the self-contained GUI + Worker into "Program Files\LithicBackup"
+    * installs the self-contained GUI + Worker into "Program Files\Lithic Backup"
       (no .NET runtime prerequisite — the publish output is self-contained),
-    * installs and starts the "LithicBackup" Windows service (the Worker), so the
+    * installs and starts the "Lithic Backup" Windows service (the Worker), so the
       background backup engine is ready out of the box,
     * adds a Start Menu shortcut for the GUI, and
     * registers a normal Add/Remove Programs uninstaller that stops + removes the
@@ -19,7 +19,7 @@
   <?define Version = "$(var.Version)" ?>
 
   <Package
-      Name="LithicBackup"
+      Name="Lithic Backup"
       Manufacturer="Lithic"
       Version="$(Version)"
       UpgradeCode="7BC4E6C1-51A6-4D2C-9936-20C21DC77254"
@@ -27,7 +27,7 @@
       Compressed="yes">
 
     <!-- Block same/older reinstalls with a clear message; allow upgrades. -->
-    <MajorUpgrade DowngradeErrorMessage="A newer version of LithicBackup is already installed." />
+    <MajorUpgrade DowngradeErrorMessage="A newer version of Lithic Backup is already installed." />
 
     <MediaTemplate EmbedCab="yes" />
 
@@ -37,12 +37,12 @@
 
     <!-- Install location: 64-bit Program Files. -->
     <StandardDirectory Id="ProgramFiles64Folder">
-      <Directory Id="INSTALLFOLDER" Name="LithicBackup" />
+      <Directory Id="INSTALLFOLDER" Name="Lithic Backup" />
     </StandardDirectory>
 
     <!-- Start Menu folder for the app shortcut. -->
     <StandardDirectory Id="ProgramMenuFolder">
-      <Directory Id="AppShortcutFolder" Name="LithicBackup" />
+      <Directory Id="AppShortcutFolder" Name="Lithic Backup" />
     </StandardDirectory>
 
     <!--
@@ -52,8 +52,21 @@
     <ComponentGroup Id="AppFiles" Directory="INSTALLFOLDER">
       <Files Include="publish\**">
         <Exclude Files="publish\LithicBackup.Worker.exe" />
+        <Exclude Files="publish\LithicBackup.exe" />
       </Files>
     </ComponentGroup>
+
+    <!--
+      The GUI executable, installed by its own component so it has a stable File
+      Id ("AppExe") that the "Launch Lithic Backup" custom action can reference
+      via [#AppExe] (resolves to the full install path at runtime).
+    -->
+    <Component Id="AppExeComponent"
+               Directory="INSTALLFOLDER"
+               Guid="4B0F2E7A-9C1D-4E5B-8A62-1F3C7D9A4E80"
+               Bitness="always64">
+      <File Id="AppExe" Source="publish\LithicBackup.exe" KeyPath="yes" />
+    </Component>
 
     <!--
       The Worker executable + the Windows service it backs.  The service runs as
@@ -68,27 +81,35 @@
       <File Id="WorkerExe" Source="publish\LithicBackup.Worker.exe" KeyPath="yes" />
 
       <ServiceInstall Id="WorkerServiceInstall"
-                      Name="LithicBackup"
-                      DisplayName="LithicBackup Worker"
-                      Description="Runs scheduled and on-demand LithicBackup backups in the background."
+                      Name="Lithic Backup"
+                      DisplayName="Lithic Backup Worker"
+                      Description="Runs scheduled and on-demand Lithic Backup backups in the background."
                       Type="ownProcess"
                       Start="auto"
                       ErrorControl="normal"
                       Account="LocalSystem"
                       Vital="no" />
 
-      <!-- Start on install (don't fail the install if start is slow). -->
-      <ServiceControl Id="WorkerServiceStart"
-                      Name="LithicBackup"
-                      Start="install"
-                      Wait="no" />
-
-      <!-- Stop and remove on uninstall (wait so files aren't locked). -->
+      <!--
+        Stop the running Worker on BOTH install and uninstall, and wait for it
+        to fully stop.  The "install" half is what matters for upgrades/reinstalls:
+        the elevated installer stops the service itself (via SCM) before touching
+        files, so its exe is never locked.  Without this the Restart Manager sees
+        the worker holding its own .exe, can't gracefully close a service, and
+        falls back to the "unable to automatically close all requested
+        applications" dialog.  Remove happens only on uninstall.
+      -->
       <ServiceControl Id="WorkerServiceStopRemove"
-                      Name="LithicBackup"
-                      Stop="uninstall"
+                      Name="Lithic Backup"
+                      Stop="both"
                       Remove="uninstall"
                       Wait="yes" />
+
+      <!-- Start (or restart) on install, after the stop above has completed. -->
+      <ServiceControl Id="WorkerServiceStart"
+                      Name="Lithic Backup"
+                      Start="install"
+                      Wait="no" />
     </Component>
 
     <!-- Start Menu shortcut for the GUI. -->
@@ -97,7 +118,7 @@
                Guid="C96CEDA6-142F-4896-904C-34EA8C8466B1"
                Bitness="always64">
       <Shortcut Id="StartMenuShortcut"
-                Name="LithicBackup"
+                Name="Lithic Backup"
                 Description="Disc and directory backup"
                 Target="[INSTALLFOLDER]LithicBackup.exe"
                 WorkingDirectory="INSTALLFOLDER" />
@@ -110,8 +131,9 @@
                      KeyPath="yes" />
     </Component>
 
-    <Feature Id="Main" Title="LithicBackup" Level="1">
+    <Feature Id="Main" Title="Lithic Backup" Level="1">
       <ComponentGroupRef Id="AppFiles" />
+      <ComponentRef Id="AppExeComponent" />
       <ComponentRef Id="WorkerService" />
       <ComponentRef Id="AppShortcut" />
     </Feature>
@@ -121,6 +143,29 @@
               Id="WixUI_InstallDir"
               InstallDirectory="INSTALLFOLDER" />
     <WixVariable Id="WixUILicenseRtf" Value="License.rtf" />
+
+    <!--
+      Offer to launch the GUI from the final wizard page.  Uses the WixUI exit
+      dialog's built-in optional checkbox (checked by default), wired to a
+      WixShellExec custom action that starts LithicBackup.exe.  Impersonate="yes"
+      so the app runs as the installing user, not the elevated installer account;
+      asyncNoWait so the wizard closes immediately without blocking on the app.
+    -->
+    <Property Id="WIXUI_EXITDIALOGOPTIONALCHECKBOXTEXT" Value="Launch Lithic Backup" />
+    <Property Id="WIXUI_EXITDIALOGOPTIONALCHECKBOX" Value="1" />
+    <Property Id="WixShellExecTarget" Value="[#AppExe]" />
+    <CustomAction Id="LaunchApplication"
+                  BinaryRef="Wix4UtilCA_X64"
+                  DllEntry="WixShellExec"
+                  Impersonate="yes" />
+
+    <UI>
+      <Publish Dialog="ExitDialog"
+               Control="Finish"
+               Event="DoAction"
+               Value="LaunchApplication"
+               Condition="WIXUI_EXITDIALOGOPTIONALCHECKBOX = 1 and NOT Installed" />
+    </UI>
 
   </Package>
 </Wix>
