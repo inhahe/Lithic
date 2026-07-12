@@ -16,14 +16,30 @@ table (≈1M rows for large sets) on a background thread with `Mouse.OverrideCur
 Wait`, just to diff which source folders were dropped/added — work that is pointless
 when the selection didn't change.
 
-**Fix:** Added a conservative fast-path at the top of the reconcile: if the source
-selection is unchanged from when the dialog opened (`SelectionsEquivalent`, comparing
-the same `JsonSerializer.Serialize` form the catalog persists with), return
-immediately without loading any file records. Any genuine selection change serializes
-differently and still runs the full reconcile, so purge/backup prompts for
-dropped/added folders are unaffected. Gating on the JSON diff (rather than
-`HasUnsavedChanges`) is correct for both the auto-save-on-close and explicit-Save-then-close
-paths, since `HasUnsavedChanges` resets after an explicit save.
+**Fix (part 1 — unchanged selection):** Added a conservative fast-path at the top of
+the reconcile: if the source selection is unchanged from when the dialog opened
+(`SelectionsEquivalent`, comparing the same `JsonSerializer.Serialize` form the catalog
+persists with), return immediately without loading any file records. Any genuine
+selection change serializes differently and still runs the reconcile below, so
+purge/backup prompts for dropped/added folders are unaffected. Gating on the JSON diff
+(rather than `HasUnsavedChanges`) is correct for both the auto-save-on-close and
+explicit-Save-then-close paths, since `HasUnsavedChanges` resets after an explicit save.
+
+**Fix (part 2 — changed selection, targeted reconcile):** Even when the selection *did*
+change, the reconcile no longer loads the whole file table. `SourceSelectionViewModel`
+now records the path of every node the user toggles this session (in
+`RequestSelectionSettle`, which fires only for user-clicked nodes — propagation to
+children/ancestors is suppressed before it reaches the settle call) and exposes them as
+`ChangedSelectionPaths`. `ComputeRemovedFilesTargeted` queries only those subtrees via
+`GetFileRecordsUnderDirectoryAsync` (which matches a path and all its descendants,
+working for both file and directory nodes), keeping records that were included before
+the edit and excluded after. This is correct because a file's inclusion can only change
+if the user toggled that file or one of its ancestor directories — so every removed
+file sits at or under a recorded path. Two fallbacks preserve correctness: a recorded
+empty path (the virtual "All Drives" root, e.g. "deselect all") reverts to the full
+`GetAllFilesForBackupSetAsync` scan since a whole-tree change can't be localised; and an
+empty recorded set (only cosmetic/expansion or auto-include-new edits, which never drop
+an already-backed-up file) skips catalog reads entirely.
 
 **Related latent concern (not fixed, low risk):** auto-save on close calls
 `sourceSelection.GetSelections()`. Selection restore is deferred to a post-show async

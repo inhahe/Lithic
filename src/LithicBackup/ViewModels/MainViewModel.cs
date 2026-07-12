@@ -556,7 +556,8 @@ public class MainViewModel : ViewModelBase
             // back up newly added ones.  Skipped entirely when nothing was saved
             // (e.g. the user discarded changes on close).
             if (savedThisSession)
-                await ReconcileDestinationAfterEditAsync(backupSet, originalSelections);
+                await ReconcileDestinationAfterEditAsync(
+                    backupSet, originalSelections, sourceSelection.ChangedSelectionPaths);
         };
 
         // Save button: persist everything and show confirmation.
@@ -918,19 +919,20 @@ public class MainViewModel : ViewModelBase
     /// covers but the old one didn't.
     /// </summary>
     private async Task ReconcileDestinationAfterEditAsync(
-        BackupSet backupSet, IReadOnlyList<Core.Models.SourceSelection> originalSelections)
+        BackupSet backupSet,
+        IReadOnlyList<Core.Models.SourceSelection> originalSelections,
+        IReadOnlyCollection<string> changedPaths)
     {
         var newSelections = backupSet.SourceSelections
             ?? new List<Core.Models.SourceSelection>();
 
         // Fast path: if the source selection is unchanged from when the dialog
         // opened, there is nothing to reconcile — no folders were dropped or
-        // added. Skip the expensive GetAllFilesForBackupSetAsync scan (which can
-        // load ~1M rows and stall the UI for several seconds) that would
-        // otherwise run on EVERY dialog close, since close auto-saves and thus
-        // always sets savedThisSession. The comparison uses the same JSON
-        // serialization the catalog persists with, so it is conservative: any
-        // real change produces different JSON and still runs the full reconcile.
+        // added. Skip all catalog work that would otherwise run on EVERY dialog
+        // close, since close auto-saves and thus always sets savedThisSession.
+        // The comparison uses the same JSON serialization the catalog persists
+        // with, so it is conservative: any real change produces different JSON
+        // and still runs the reconcile below.
         if (SelectionsEquivalent(originalSelections, newSelections))
             return;
 
@@ -942,17 +944,16 @@ public class MainViewModel : ViewModelBase
         {
             (removed, addedRoots) = await Task.Run(() =>
             {
-                var all = _catalog
-                    .GetAllFilesForBackupSetAsync(backupSet.Id)
-                    .GetAwaiter().GetResult();
-
                 // Removed: currently-active catalog files whose source path was
-                // covered before the edit but isn't covered any more.
-                var rem = all
-                    .Where(f => !f.IsDeleted
-                        && SourceSelection.IsPathIncluded(originalSelections, f.SourcePath)
-                        && !SourceSelection.IsPathIncluded(newSelections, f.SourcePath))
-                    .ToList();
+                // covered before the edit but isn't covered any more.  Rather
+                // than load the whole (potentially ~1M-row) file table, query
+                // only the subtrees the user actually toggled this session: every
+                // file whose inclusion changed sits at or under one of those
+                // toggled nodes (a removal can only be caused by unchecking that
+                // node or an ancestor of it), so scoping the reads to them is
+                // both correct and far cheaper.
+                var rem = ComputeRemovedFilesTargeted(
+                    backupSet.Id, originalSelections, newSelections, changedPaths);
 
                 // Added: new covering roots not already covered by an old root.
                 var oldRoots = SourceSelection.CollectSelectedRoots(originalSelections);
@@ -999,6 +1000,107 @@ public class MainViewModel : ViewModelBase
             // (correctness over the optimisation).
             return false;
         }
+    }
+
+    /// <summary>
+    /// Find the catalog files dropped by an edit, reading ONLY the subtrees the
+    /// user toggled this session instead of the whole file table.  Correct
+    /// because a file's inclusion can only change if the user toggled that file
+    /// or one of its ancestor directories, so every removed file sits at or
+    /// under one of <paramref name="changedPaths"/>.  Each candidate is kept only
+    /// when it was included before the edit and is excluded now, so over-scoping
+    /// (e.g. a toggled folder that also gained files) never yields false
+    /// removals.
+    /// </summary>
+    private List<FileRecord> ComputeRemovedFilesTargeted(
+        int backupSetId,
+        IReadOnlyList<Core.Models.SourceSelection> originalSelections,
+        IReadOnlyList<Core.Models.SourceSelection> newSelections,
+        IReadOnlyCollection<string> changedPaths)
+    {
+        // A bulk toggle can record the virtual "All Drives" root (empty path),
+        // which covers everything — e.g. "deselect all".  There is no cheaper
+        // way to reconcile a whole-tree change than scanning every backed-up
+        // file, so fall back to the full load in that (rare) case.
+        if (changedPaths.Any(string.IsNullOrEmpty))
+            return ComputeRemovedFilesFull(backupSetId, originalSelections, newSelections);
+
+        // No checkbox was toggled, yet the JSON diff flagged a change — so the
+        // edit was purely cosmetic (expansion state) or an auto-include-new
+        // toggle.  Neither drops an already-backed-up file: existing children of
+        // a directory are always materialised as explicit selections, so
+        // auto-include only governs FUTURE entries, and expansion state is
+        // display-only.  Nothing can have been removed, so skip all catalog
+        // reads.
+        if (changedPaths.Count == 0)
+            return new List<FileRecord>();
+
+        // Collapse to a minimal set so overlapping subtrees are queried once.
+        var roots = MinimizePaths(changedPaths);
+
+        var seen = new HashSet<long>();
+        var removed = new List<FileRecord>();
+        foreach (var path in roots)
+        {
+            // Matches the path itself and every descendant, so it works whether
+            // the toggled node was a file or a directory.
+            var records = _catalog
+                .GetFileRecordsUnderDirectoryAsync(backupSetId, path)
+                .GetAwaiter().GetResult();
+
+            foreach (var f in records)
+            {
+                if (f.IsDeleted || !seen.Add(f.Id))
+                    continue;
+                if (SourceSelection.IsPathIncluded(originalSelections, f.SourcePath)
+                    && !SourceSelection.IsPathIncluded(newSelections, f.SourcePath))
+                    removed.Add(f);
+            }
+        }
+        return removed;
+    }
+
+    /// <summary>
+    /// Whole-table fallback for <see cref="ComputeRemovedFilesTargeted"/> used
+    /// when the change can't be localised (e.g. a bulk deselect-all).  Loads
+    /// every catalog file and keeps those covered before the edit but not after.
+    /// </summary>
+    private List<FileRecord> ComputeRemovedFilesFull(
+        int backupSetId,
+        IReadOnlyList<Core.Models.SourceSelection> originalSelections,
+        IReadOnlyList<Core.Models.SourceSelection> newSelections)
+    {
+        var all = _catalog
+            .GetAllFilesForBackupSetAsync(backupSetId)
+            .GetAwaiter().GetResult();
+
+        return all
+            .Where(f => !f.IsDeleted
+                && SourceSelection.IsPathIncluded(originalSelections, f.SourcePath)
+                && !SourceSelection.IsPathIncluded(newSelections, f.SourcePath))
+            .ToList();
+    }
+
+    /// <summary>
+    /// Reduce a set of paths to the minimal covering set: drop any path that
+    /// equals or lies under another path in the set, so a subtree isn't queried
+    /// twice (once for a parent and again for a child).
+    /// </summary>
+    private static List<string> MinimizePaths(IEnumerable<string> paths)
+    {
+        var distinct = paths
+            .Where(p => !string.IsNullOrEmpty(p))
+            .Distinct(StringComparer.OrdinalIgnoreCase)
+            .OrderBy(p => p.Length)
+            .ToList();
+
+        var minimal = new List<string>();
+        foreach (var path in distinct)
+        {
+            if (!IsCoveredBy(minimal, path))
+                minimal.Add(path);
+        }
+        return minimal;
     }
 
     /// <summary>True when <paramref name="path"/> equals one of
