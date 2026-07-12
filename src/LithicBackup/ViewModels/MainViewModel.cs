@@ -472,6 +472,14 @@ public class MainViewModel : ViewModelBase
             fileHashCache: _fileHashCache, scanner: _scanner);
         sourceSelection.IsEditMode = true;
 
+        // Selection restore is deferred to Phase 3 (after the window is visible),
+        // so mark "applying" NOW — before the tree ever renders — so the include
+        // checkboxes stay hidden until their real state loads from the catalog.
+        // Otherwise the first frame shows a full column of unchecked boxes, which
+        // looks exactly like "all my sources were deleted." Phase 3 clears it in
+        // its finally block once selections are restored.
+        sourceSelection.IsApplyingSelections = true;
+
         // Restore backup set settings from saved state.
         sourceSelection.SetName = backupSet.Name;
         RestoreSourceSettings(sourceSelection, backupSet.JobOptions);
@@ -880,13 +888,11 @@ public class MainViewModel : ViewModelBase
         // ---------------------------------------------------------------
         // Phase 3: load catalog, restore selections, compute sizes (dialog visible)
         // ---------------------------------------------------------------
-        // The view shows a "Restoring selections..." overlay (bound to
-        // IsApplyingSelections) while this runs.  This avoids blocking
-        // the UI for seconds before the window appears.
-
-        // Show the "Restoring selections..." overlay for the whole restore span
-        // (catalog load + selection restore) so the visible-but-empty tree isn't
-        // shown mid-population.
+        // While IsApplyingSelections is set, the tree's include/auto-include
+        // checkboxes stay hidden (see SourceSelectionView.xaml), so the user never
+        // sees a column of unchecked boxes before the real state loads. This keeps
+        // it set across the whole restore span (catalog load + selection restore);
+        // it was already set at construction, so this is belt-and-suspenders.
         sourceSelection.IsApplyingSelections = true;
         try
         {

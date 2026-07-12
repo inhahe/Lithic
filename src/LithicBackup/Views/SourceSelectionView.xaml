@@ -670,7 +670,10 @@
                                               FontSize="11"
                                               Foreground="{StaticResource TextSecondaryBrush}"
                                               VerticalContentAlignment="Center"
-                                              ToolTip="Check/uncheck all auto-include" />
+                                              ToolTip="Check/uncheck all auto-include"
+                                              Visibility="{Binding IsApplyingSelections,
+                                                           Converter={StaticResource BoolToVis},
+                                                           ConverterParameter=Invert}" />
                                 </Border>
                                 <Border Grid.Column="1"
                                         BorderBrush="{StaticResource BorderBrush}"
@@ -680,7 +683,10 @@
                                               IsThreeState="False"
                                               VerticalAlignment="Center"
                                               HorizontalAlignment="Center"
-                                              ToolTip="Check/uncheck all" />
+                                              ToolTip="Check/uncheck all"
+                                              Visibility="{Binding IsApplyingSelections,
+                                                           Converter={StaticResource BoolToVis},
+                                                           ConverterParameter=Invert}" />
                                 </Border>
                                 <Border Grid.Column="2"
                                         BorderBrush="{StaticResource BorderBrush}"
@@ -787,11 +793,23 @@
                                             <CheckBox IsChecked="{Binding AutoIncludeNew, Mode=TwoWay}"
                                                       VerticalAlignment="Center"
                                                       HorizontalAlignment="Center"
-                                                      ToolTip="Auto-include new subdirectories"
-                                                      Visibility="{Binding IsDirectory, Converter={StaticResource BoolToVis}}">
+                                                      ToolTip="Auto-include new subdirectories">
                                                 <CheckBox.Style>
                                                     <Style TargetType="CheckBox">
+                                                        <!-- Default hidden: only directories get this checkbox,
+                                                             and only once selections have loaded (so the column
+                                                             isn't a scary field of unchecked boxes at startup). -->
+                                                        <Setter Property="Visibility" Value="Collapsed" />
                                                         <Style.Triggers>
+                                                            <MultiDataTrigger>
+                                                                <MultiDataTrigger.Conditions>
+                                                                    <Condition Binding="{Binding IsDirectory}" Value="True" />
+                                                                    <Condition Binding="{Binding DataContext.IsApplyingSelections,
+                                                                               RelativeSource={RelativeSource AncestorType=TreeView}}"
+                                                                               Value="False" />
+                                                                </MultiDataTrigger.Conditions>
+                                                                <Setter Property="Visibility" Value="Visible" />
+                                                            </MultiDataTrigger>
                                                             <DataTrigger Binding="{Binding IsNodeEnabled}" Value="False">
                                                                 <Setter Property="Opacity" Value="0.35" />
                                                             </DataTrigger>
@@ -805,10 +823,17 @@
                                         <Border Grid.Column="1"
                                                 BorderBrush="{StaticResource BorderBrush}"
                                                 BorderThickness="0,0,1,0">
+                                            <!-- Hidden until selections have been restored from the
+                                                 catalog, so the user never sees a full column of
+                                                 unchecked boxes and fears their sources were lost. -->
                                             <CheckBox IsChecked="{Binding IsSelected, Mode=TwoWay}"
                                                       IsThreeState="False"
                                                       VerticalAlignment="Center"
-                                                      HorizontalAlignment="Center" />
+                                                      HorizontalAlignment="Center"
+                                                      Visibility="{Binding DataContext.IsApplyingSelections,
+                                                                   RelativeSource={RelativeSource AncestorType=TreeView},
+                                                                   Converter={StaticResource BoolToVis},
+                                                                   ConverterParameter=Invert}" />
                                         </Border>
 
                                         <!-- Col 2: Clickable name area (single-click expands directories) -->
