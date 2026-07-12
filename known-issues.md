@@ -1,5 +1,39 @@
 # LithicBackup — Known Issues & Tech Debt
 
+## FIXED: Auto-include-new ignored on partially-selected directories (2026-07-12)
+
+**Status:** Fixed 2026-07-12 in `SourceSelection`, `FileScanner`, and
+`OrphanedDirectoriesViewModel`.
+
+**Symptom:** With `D:\` set as a source (auto-include-new on) but *partially*
+selected — i.e. a few subfolders deselected, which flips the node's tristate
+`IsSelected` from `true` to `null` — new top-level entries under `D:\` were never
+backed up. Reported via a continuous-mode rename: `D:\warez` → `D:\test_warez` was
+not renamed at the destination. The USN journal produced the move, but the
+continuous path judged `D:\test_warez` (a new, unlisted child of the partial `D:\`
+node) as *not in the set*, so it classified the rename as "moved out": it
+soft-deleted `warez`'s catalog records and ignored `test_warez` entirely.
+
+**Root cause:** three separate copies of the inclusion rule
+(`FileScanner.ScanNode`, `SourceSelection.IsPathIncluded`/`EvaluateNode`, and
+`OrphanedDirectoriesViewModel.SelectionCoversPath`) all gated auto-include-new
+behind `IsSelected == true`, so a partially-selected (`null`) directory never
+picked up unlisted descendants even with `AutoIncludeNewSubdirectories = true`.
+This was a silent data-loss risk on full scans too, not just continuous renames.
+
+**Fix:** extracted one shared predicate,
+`SourceSelection.IncludesUnlistedDescendants(node)`, used by all three sites. A
+not-excluded directory covers unlisted descendants when it's either fully selected
+with no child overrides (whole subtree) *or* has auto-include-new enabled —
+regardless of whether it is fully or partially selected. The per-directory
+auto-include toggle is now the sole control, as intended.
+
+**Recovery for the already-broken state:** the earlier rename already soft-deleted
+`warez` and skipped `test_warez`; the fix does not retroactively repair that. A full
+/reconciling backup will now pick up `test_warez` as fresh files (the stale `warez`
+destination copy lingers until the next cleanup/retention purge). Future renames
+under a partial+auto-include directory will relocate in place correctly.
+
 ## ADDED: Continuous-mode fallback for non-NTFS source volumes (2026-07-12)
 
 **Status:** Implemented 2026-07-12 in `BackupWorker`, `FileSystemMonitorImpl`, and

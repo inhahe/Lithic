@@ -67,9 +67,10 @@ public class FileScanner : IFileScanner
                 foreach (var child in node.Children)
                     ScanNode(child, results, ref filesFound, ref totalBytes, progress, ct, isExcluded);
 
-                // For fully-selected directories with AutoIncludeNewSubdirectories,
-                // also pick up any children on disk that aren't in the selection tree.
-                if (node.IsSelected == true && node.AutoIncludeNewSubdirectories)
+                // Pick up any children on disk that aren't in the selection tree
+                // when this directory auto-includes new entries — for a fully- or
+                // partially-selected directory alike (see IncludesUnlistedDescendants).
+                if (SourceSelection.IncludesUnlistedDescendants(node))
                 {
                     var knownChildren = new HashSet<string>(
                         node.Children.Select(c => c.Path),

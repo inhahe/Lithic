@@ -121,9 +121,8 @@ public class SourceSelection
     ///   <item>A node with <c>IsSelected == false</c> excludes its whole subtree.</item>
     ///   <item>A file node is included unless explicitly deselected.</item>
     ///   <item>A directory follows explicit child selections; an unlisted
-    ///         descendant is included only when the governing directory is fully
-    ///         selected and either has no child overrides or auto-includes new
-    ///         entries.</item>
+    ///         descendant is included per <see cref="IncludesUnlistedDescendants"/>
+    ///         (auto-include-new applies to partially-selected directories too).</item>
     /// </list>
     /// Glob/extension exclusions are applied separately by the backup service.
     /// </remarks>
@@ -163,9 +162,36 @@ public class SourceSelection
         }
 
         // No explicit child governs filePath: it's an unlisted descendant.
-        // Included only when the directory is fully selected and either has no
-        // child overrides (everything included) or auto-includes new entries.
-        return node.IsSelected == true
-               && (node.Children.Count == 0 || node.AutoIncludeNewSubdirectories);
+        return IncludesUnlistedDescendants(node);
+    }
+
+    /// <summary>
+    /// Whether a directory node backs up descendants that aren't explicitly listed
+    /// among its children (newly-created folders/files, or entries the user never
+    /// individually decided on). The single source of truth shared by the scanner
+    /// (<c>FileScanner.ScanNode</c>), the continuous-backup predicate
+    /// (<see cref="IsPathIncluded"/>), and orphan detection, so all three agree on
+    /// what a partially-selected auto-include directory covers.
+    /// </summary>
+    /// <remarks>
+    /// <list type="bullet">
+    ///   <item>Excluded (<c>IsSelected == false</c>) or a file node — never.</item>
+    ///   <item>Fully selected with no child overrides — always (the whole subtree
+    ///         is in, regardless of the auto-include flag).</item>
+    ///   <item>Otherwise (fully selected with some overrides, or partially selected)
+    ///         — only when <see cref="AutoIncludeNewSubdirectories"/> is on. This is
+    ///         what makes "back up D:\ except these few folders, and auto-include
+    ///         anything new" work on a partially-selected root.</item>
+    /// </list>
+    /// </remarks>
+    public static bool IncludesUnlistedDescendants(SourceSelection node)
+    {
+        if (node.IsSelected == false || !node.IsDirectory)
+            return false;
+
+        if (node.IsSelected == true && node.Children.Count == 0)
+            return true;
+
+        return node.AutoIncludeNewSubdirectories;
     }
 }

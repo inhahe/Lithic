@@ -2075,8 +2075,9 @@ public class OrphanedDirectoriesViewModel : ViewModelBase
     /// Recursive descent that mirrors <c>FileScanner.ScanNode</c>'s inclusion
     /// rules: a node with <c>IsSelected == false</c> excludes its entire
     /// subtree; a node with <c>true</c> includes everything (unless an
-    /// explicitly-listed child overrides); <c>null</c> means partial — only
-    /// children with explicit decisions cover their subtrees.
+    /// explicitly-listed child overrides); a <c>null</c> (partial) node covers
+    /// its explicitly-decided children, plus any unlisted descendants when it
+    /// auto-includes new entries (see <c>SourceSelection.IncludesUnlistedDescendants</c>).
     /// </summary>
     private static bool SelectionCoversPath(SourceSelection node, string targetPath)
     {
@@ -2093,12 +2094,10 @@ public class OrphanedDirectoriesViewModel : ViewModelBase
                 return SelectionCoversPath(child, targetPath);
         }
 
-        // No child explicitly covers targetPath.  A fully-selected directory
-        // with AutoIncludeNewSubdirectories=true picks up unlisted descendants;
-        // a partially-selected (null) or auto-include-off node does not.
-        return node.IsSelected == true
-            && node.IsDirectory
-            && node.AutoIncludeNewSubdirectories;
+        // No child explicitly covers targetPath: it's an unlisted descendant.
+        // A directory that auto-includes new entries covers it — whether the
+        // directory is fully or partially selected (see IncludesUnlistedDescendants).
+        return SourceSelection.IncludesUnlistedDescendants(node);
     }
 
     /// <summary>
