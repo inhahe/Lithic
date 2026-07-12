@@ -1529,7 +1529,8 @@ public class DirectoryBackupService
         string oldPath,
         string newPath,
         bool isDirectory,
-        CancellationToken ct)
+        CancellationToken ct,
+        Action<string>? trace = null)
     {
         if (!job.BackupSetId.HasValue)
             throw new ArgumentException("Targeted move requires an existing backup set.", nameof(job));
@@ -1540,10 +1541,15 @@ public class DirectoryBackupService
             ? await _catalog.GetFileRecordsUnderDirectoryAsync(setId, oldPath, ct)
             : await _catalog.GetFileRecordsByPathAsync(setId, oldPath, ct);
 
+        trace?.Invoke($"MoveTargetedAsync: found {records.Count} catalog record(s) under old path '{oldPath}'.");
+
         // Nothing tracked under the old path — there is no destination copy to
         // relocate. The new side is just a fresh source (typically an atomic save).
         if (records.Count == 0)
+        {
+            trace?.Invoke("no records under old path -> NothingToRelocate (old name was never backed up).");
             return TargetedMoveOutcome.NothingToRelocate;
+        }
 
         // Directory backups only ever produce plain / .dedup / .fileref records
         // (IsSplit and IsZipped are always false — those are optical-media
@@ -1551,13 +1557,16 @@ public class DirectoryBackupService
         // an archive, neither of which a plain rename can relocate, so bail safely
         // if one somehow appears.
         if (records.Any(r => r.IsSplit || r.IsZipped))
+        {
+            trace?.Invoke("record(s) are split/zipped -> FellBack (cannot relocate optical-media formats).");
             return TargetedMoveOutcome.FellBack;
+        }
 
         try
         {
             return isDirectory
-                ? await RelocateDirectoryAsync(setId, targetDirectory, oldPath, newPath, records, ct)
-                : await RelocateFileAsync(setId, targetDirectory, newPath, records, ct);
+                ? await RelocateDirectoryAsync(setId, targetDirectory, oldPath, newPath, records, ct, trace)
+                : await RelocateFileAsync(setId, targetDirectory, newPath, records, ct, trace);
         }
         catch (OperationCanceledException) when (ct.IsCancellationRequested)
         {
@@ -1567,6 +1576,7 @@ public class DirectoryBackupService
         {
             // Destination busy/locked or a name collision — fall back to a re-copy
             // rather than risk a half-applied relocation.
+            trace?.Invoke($"relocation threw {ex.GetType().Name}: {ex.Message} -> FellBack (will re-copy).");
             return TargetedMoveOutcome.FellBack;
         }
     }
@@ -1582,7 +1592,8 @@ public class DirectoryBackupService
     /// </summary>
     private async Task<TargetedMoveOutcome> RelocateDirectoryAsync(
         int setId, string targetDirectory, string oldPath, string newPath,
-        IReadOnlyList<FileRecord> records, CancellationToken ct)
+        IReadOnlyList<FileRecord> records, CancellationToken ct,
+        Action<string>? trace = null)
     {
         string drivePrefix = GetDrivePrefix(oldPath);
         string oldRel = GetRelativePath(oldPath);
@@ -1593,6 +1604,9 @@ public class DirectoryBackupService
         string oldPrev = Path.Combine(targetDirectory, drivePrefix + "_prev", oldRel);
         string newPrev = Path.Combine(targetDirectory, drivePrefix + "_prev", newRel);
 
+        trace?.Invoke($"RelocateDirectoryAsync: current tree '{oldCur}' -> '{newCur}'");
+        trace?.Invoke($"RelocateDirectoryAsync: history tree '{oldPrev}' -> '{newPrev}'");
+
         bool curMoved = false, prevMoved = false;
         try
         {
@@ -1601,18 +1615,27 @@ public class DirectoryBackupService
                 EnsureParentDirectory(newCur);
                 Directory.Move(oldCur, newCur);
                 curMoved = true;
+                trace?.Invoke("renamed current-version tree on disk.");
+            }
+            else
+            {
+                trace?.Invoke($"current tree not present on disk ('{oldCur}' does not exist).");
             }
             if (Directory.Exists(oldPrev))
             {
                 EnsureParentDirectory(newPrev);
                 Directory.Move(oldPrev, newPrev);
                 prevMoved = true;
+                trace?.Invoke("renamed history (_prev) tree on disk.");
             }
 
             // Nothing physically present under the old path — let the caller
             // re-copy the new path as fresh files.
             if (!curMoved && !prevMoved)
+            {
+                trace?.Invoke("nothing physically present under old path -> FellBack (will re-copy new path).");
                 return TargetedMoveOutcome.FellBack;
+            }
 
             using var tx = await _catalog.BeginTransactionAsync(setId, ct);
             foreach (var rec in records)
@@ -1624,12 +1647,14 @@ public class DirectoryBackupService
                 await _catalog.UpdateFileRecordAsync(rec, ct);
             }
             tx.Complete();
+            trace?.Invoke($"updated {records.Count} catalog record(s) to the new path -> Relocated.");
             return TargetedMoveOutcome.Relocated;
         }
         catch
         {
             // Reverse whatever we physically moved so the destination tree matches
             // the (rolled-back) catalog, then fall back to a re-copy.
+            trace?.Invoke("catalog update failed — reversing physical rename(s) and rolling back.");
             if (prevMoved) TryMoveDirectoryBack(newPrev, oldPrev);
             if (curMoved) TryMoveDirectoryBack(newCur, oldCur);
             throw;
@@ -1645,7 +1670,8 @@ public class DirectoryBackupService
     /// </summary>
     private async Task<TargetedMoveOutcome> RelocateFileAsync(
         int setId, string targetDirectory, string newPath,
-        IReadOnlyList<FileRecord> records, CancellationToken ct)
+        IReadOnlyList<FileRecord> records, CancellationToken ct,
+        Action<string>? trace = null)
     {
         // (newAbs -> oldAbs) pairs we can undo on failure.
         var undo = new List<(string From, string To)>();
@@ -1661,11 +1687,15 @@ public class DirectoryBackupService
                 EnsureParentDirectory(newAbs);
                 File.Move(oldAbs, newAbs, overwrite: false);
                 undo.Add((newAbs, oldAbs));
+                trace?.Invoke($"RelocateFileAsync: renamed '{oldAbs}' -> '{newAbs}'");
             }
 
             // Nothing physically present — let the caller re-copy from the new source.
             if (undo.Count == 0)
+            {
+                trace?.Invoke("no destination copies present -> FellBack (will re-copy new path).");
                 return TargetedMoveOutcome.FellBack;
+            }
 
             using var tx = await _catalog.BeginTransactionAsync(setId, ct);
             foreach (var rec in records)
@@ -1676,6 +1706,7 @@ public class DirectoryBackupService
                 await _catalog.UpdateFileRecordAsync(rec, ct);
             }
             tx.Complete();
+            trace?.Invoke($"updated {records.Count} catalog record(s) -> Relocated.");
             return TargetedMoveOutcome.Relocated;
         }
         catch
