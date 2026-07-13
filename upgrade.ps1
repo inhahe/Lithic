@@ -94,13 +94,25 @@ Write-Host ("  Size: {0:N1} MB" -f ($msi.Length / 1MB))
 # The Worker service is stopped by the MSI's own ServiceControl, but the GUI is
 # an interactive app that minimizes to the tray on a normal close, so the
 # installer's Restart Manager can't shut it down on its own. Close it here first.
-# (The MSI also self-defends via util:CloseApplication, but doing it up front
-# gives a clean, prompt-free upgrade even with an older MSI.)
+#
+# This is only a best-effort nicety: the MSI self-defends via util:CloseApplication
+# (which runs inside the elevated install, sends WM_QUERYENDSESSION for a graceful
+# exit, and force-terminates as a fallback), so it can always close the GUI even
+# when we can't. In particular, if the GUI is running elevated (higher integrity
+# than this unelevated build step) Stop-Process fails with "Access is denied" -
+# we must NOT let that abort the upgrade, so this whole block is non-fatal and
+# we fall back to letting the elevated MSI handle the close.
 $gui = Get-Process -Name LithicBackup -ErrorAction SilentlyContinue
 if ($gui) {
     Write-Step "Closing running Lithic Backup GUI..."
-    $gui | Stop-Process -Force
-    Start-Sleep -Milliseconds 500
+    try {
+        $gui | Stop-Process -Force -ErrorAction Stop
+        Start-Sleep -Milliseconds 500
+    }
+    catch {
+        Write-Host "  Could not close the GUI from here ($($_.Exception.Message))." -ForegroundColor Yellow
+        Write-Host "  The elevated installer will close it during the upgrade." -ForegroundColor Yellow
+    }
 }
 
 # --- 4. Run the MSI (self-elevates via UAC) -----------------------------------
