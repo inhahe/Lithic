@@ -258,6 +258,12 @@ public partial class App : Application
 
         // Start background monitoring if there are existing backup sets.
         _ = StartBackgroundMonitoringAsync();
+
+        // Quietly check GitHub for a newer release (opt-out via settings). Runs
+        // in the background so it never delays showing the window; surfaces an
+        // in-window banner only if a new, non-dismissed version is available.
+        if (_settings.CheckForUpdates)
+            _ = mainViewModel.CheckForUpdatesAsync(userInitiated: false);
     }
 
     /// <summary>

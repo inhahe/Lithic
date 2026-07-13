@@ -13,8 +13,11 @@
       * WiX UI extension: wix extension add -g WixToolset.UI.wixext
 
 .PARAMETER Version
-    Product version stamped into the MSI (default 1.0.0). Must be x.y.z with
-    each part <= 65535 (MSI ProductVersion constraint).
+    Product version stamped into the MSI. When omitted it is read from
+    src\Directory.Build.props (the single source of truth shared with the
+    assembly version), so the MSI ProductVersion can never drift from the
+    version the app reports at runtime. Must be x.y.z with each part <= 65535
+    (MSI ProductVersion constraint).
 
 .PARAMETER Configuration
     Build configuration passed to dotnet publish (default Release).
@@ -23,7 +26,7 @@
     powershell -ExecutionPolicy Bypass -File build-installer.ps1 -Version 1.2.0
 #>
 param(
-    [string]$Version = "1.0.0",
+    [string]$Version = "",
     [string]$Configuration = "Release"
 )
 
@@ -31,6 +34,19 @@ $ErrorActionPreference = "Stop"
 $here = Split-Path -Parent $MyInvocation.MyCommand.Definition
 $repo = Split-Path -Parent $here
 $publish = Join-Path $here "publish"
+
+# --- 0. Resolve version from Directory.Build.props unless overridden ----------
+if (-not $Version) {
+    $propsPath = Join-Path $repo "src\Directory.Build.props"
+    if (-not (Test-Path $propsPath)) {
+        throw "Cannot resolve version: '$propsPath' not found. Pass -Version explicitly."
+    }
+    $m = Select-String -Path $propsPath -Pattern '<Version>\s*([^<]+?)\s*</Version>' |
+         Select-Object -First 1
+    if (-not $m) { throw "No <Version> element found in '$propsPath'. Pass -Version explicitly." }
+    $Version = $m.Matches[0].Groups[1].Value
+    Write-Host "Version $Version (from src\Directory.Build.props)" -ForegroundColor DarkGray
+}
 
 Write-Host "=== LithicBackup installer build (v$Version) ===" -ForegroundColor Cyan
 

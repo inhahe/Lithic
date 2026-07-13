@@ -197,6 +197,20 @@ Run the **Lithic Backup MSI installer** (`LithicBackup-<version>-x64.msi`). It:
 
 Because it installs a service, the installer requests administrator elevation.
 
+### Updates
+
+Lithic Backup checks for newer versions on [GitHub Releases](https://github.com/inhahe/Lithic/releases).
+Shortly after startup it quietly asks GitHub whether a newer release exists and,
+if so, shows a banner across the top of the window with **Update Now** (downloads
+the release MSI and launches it, closing the app so the installer can replace the
+running files), **Release Notes** (opens the release page), and **Dismiss** (hides
+the banner for that version until an even newer one appears). You can also check
+on demand from **Help → Check for Updates**, and turn the automatic startup check
+off under **File → Settings → Check for updates on startup**. The installer's
+`MajorUpgrade` handling means running the newer MSI upgrades in place — your
+backup sets, catalog, and settings (in `C:\ProgramData\LithicBackup`) are
+preserved.
+
 > The Worker service can still be installed/started/stopped from within the GUI
 > (see *Scheduled and Continuous Backups*) — the installer just does it for you
 > up front. If you previously installed the service manually from the GUI,
@@ -226,12 +240,19 @@ the `wix` dotnet tool). The build script publishes both executables self-contain
 and compiles the MSI:
 
 ```
-powershell -ExecutionPolicy Bypass -File installer\build-installer.ps1 -Version 1.0.0
+powershell -ExecutionPolicy Bypass -File installer\build-installer.ps1
 ```
 
-It installs the `wix` tool and the WiX UI and Util extensions on first run if
-they're missing, then writes `installer\LithicBackup-<version>-x64.msi`. The WiX
-source lives in `installer\Package.wxs`.
+With no `-Version`, the script reads the version from `src\Directory.Build.props`
+— the single source of truth that also stamps every assembly, so the MSI's
+`ProductVersion` can never drift from the version the app reports and compares
+against GitHub Releases. Pass `-Version x.y.z` to override. It installs the `wix`
+tool and the WiX UI and Util extensions on first run if they're missing, then
+writes `installer\LithicBackup-<version>-x64.msi`. The WiX source lives in
+`installer\Package.wxs`.
+
+To cut a release: bump `<Version>` in `src\Directory.Build.props`, build the MSI,
+and publish a GitHub release tagged `v<version>` with the MSI attached.
 
 ## License
 

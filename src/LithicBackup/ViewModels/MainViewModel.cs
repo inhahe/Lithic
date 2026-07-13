@@ -43,6 +43,12 @@ public class MainViewModel : ViewModelBase
     private Func<Task>? _pendingSettingsSave;
     private int? _unsavedNewSetId;
 
+    // --- In-app update check (GitHub Releases) ---
+    private UpdateInfo? _availableUpdate;
+    private bool _updateBannerVisible;
+    private string _updateBannerText = "";
+    private bool _isCheckingForUpdates;
+
     public MainViewModel(
         ICatalogRepository catalog,
         IDiscBurner burner,
@@ -191,6 +197,18 @@ public class MainViewModel : ViewModelBase
         StartServiceCommand = new RelayCommand(_ => StartService());
         StopServiceCommand = new RelayCommand(_ => StopService());
 
+        // In-app update check (GitHub Releases).
+        CheckForUpdatesCommand = new RelayCommand(
+            _ => _ = CheckForUpdatesAsync(userInitiated: true),
+            _ => !_isCheckingForUpdates);
+        DownloadUpdateCommand = new RelayCommand(
+            _ => _ = DownloadUpdateAsync(),
+            _ => _availableUpdate is not null);
+        ViewReleaseNotesCommand = new RelayCommand(
+            _ => ViewReleaseNotes(),
+            _ => _availableUpdate is not null);
+        DismissUpdateCommand = new RelayCommand(_ => DismissUpdate());
+
         // Simulated burner failure injection (--test-mode only). These are
         // the *while-burning* triggers — momentary actions pressed during a live
         // burn to inject an error that can occur mid-write. They target whichever
@@ -311,6 +329,34 @@ public class MainViewModel : ViewModelBase
     public ICommand UninstallServiceCommand { get; }
     public ICommand StartServiceCommand { get; }
     public ICommand StopServiceCommand { get; }
+
+    // --- In-app update check (GitHub Releases) ---
+
+    public ICommand CheckForUpdatesCommand { get; }
+    public ICommand DownloadUpdateCommand { get; }
+    public ICommand ViewReleaseNotesCommand { get; }
+    public ICommand DismissUpdateCommand { get; }
+
+    /// <summary>The newer release found by the last check, or null if none.</summary>
+    public UpdateInfo? AvailableUpdate
+    {
+        get => _availableUpdate;
+        private set => SetProperty(ref _availableUpdate, value);
+    }
+
+    /// <summary>Whether the "an update is available" banner is shown.</summary>
+    public bool UpdateBannerVisible
+    {
+        get => _updateBannerVisible;
+        private set => SetProperty(ref _updateBannerVisible, value);
+    }
+
+    /// <summary>Banner caption, e.g. "Lithic Backup 1.0.3 is available (you have 1.0.2).".</summary>
+    public string UpdateBannerText
+    {
+        get => _updateBannerText;
+        private set => SetProperty(ref _updateBannerText, value);
+    }
 
     // Simulated burner failure injection (--test-mode only).
     public bool IsTestMode => _switchableBurner is not null;
@@ -3906,6 +3952,150 @@ public class MainViewModel : ViewModelBase
             StatusText = "Failed to stop service.";
             RefreshServiceStatus();
         }
+    }
+
+    // -------------------------------------------------------------------
+    // In-app update check (GitHub Releases)
+    // -------------------------------------------------------------------
+
+    /// <summary>The running assembly version, coerced to at least x.y.z.</summary>
+    private static Version CurrentAppVersion =>
+        System.Reflection.Assembly.GetEntryAssembly()?.GetName().Version
+            ?? new Version(0, 0, 0);
+
+    /// <summary>
+    /// Checks GitHub for a newer release. A background startup check
+    /// (<paramref name="userInitiated"/> = false) stays completely silent unless
+    /// a new, non-dismissed version is found; a user-initiated check always
+    /// reports the outcome (up to date / error) via a message box.
+    /// </summary>
+    public async Task CheckForUpdatesAsync(bool userInitiated)
+    {
+        if (_isCheckingForUpdates) return;
+        _isCheckingForUpdates = true;
+        CommandManager.InvalidateRequerySuggested();
+        if (userInitiated) StatusText = "Checking for updates...";
+
+        try
+        {
+            var result = await UpdateService.CheckForUpdateAsync(CurrentAppVersion);
+
+            if (result.IsUpdateAvailable && result.Update is { } update)
+            {
+                // Respect a prior dismissal of this exact version for the silent
+                // startup check; an explicit check always shows it.
+                if (!userInitiated &&
+                    string.Equals(_settings.DismissedUpdateVersion, update.TagName,
+                        StringComparison.OrdinalIgnoreCase))
+                {
+                    return;
+                }
+
+                AvailableUpdate = update;
+                UpdateBannerText =
+                    $"Lithic Backup {update.Version} is available " +
+                    $"(you have {CurrentAppVersion.ToString(3)}).";
+                UpdateBannerVisible = true;
+                if (userInitiated) StatusText = "An update is available.";
+            }
+            else if (result.Failed)
+            {
+                if (userInitiated)
+                {
+                    StatusText = "Update check failed.";
+                    MessageBox.Show(
+                        $"Couldn't check for updates:\n\n{result.Error}",
+                        "Check for Updates", MessageBoxButton.OK, MessageBoxImage.Warning);
+                }
+            }
+            else
+            {
+                // Up to date.
+                if (userInitiated)
+                {
+                    StatusText = "You're on the latest version.";
+                    MessageBox.Show(
+                        $"You're running the latest version ({CurrentAppVersion.ToString(3)}).",
+                        "Check for Updates", MessageBoxButton.OK, MessageBoxImage.Information);
+                }
+            }
+        }
+        finally
+        {
+            _isCheckingForUpdates = false;
+            CommandManager.InvalidateRequerySuggested();
+        }
+    }
+
+    /// <summary>
+    /// Downloads the release MSI and launches it, then shuts the app down so the
+    /// installer can replace the running files. If the release has no MSI asset,
+    /// falls back to opening the release page in the browser.
+    /// </summary>
+    private async Task DownloadUpdateAsync()
+    {
+        if (AvailableUpdate is not { } update) return;
+
+        if (string.IsNullOrEmpty(update.MsiDownloadUrl))
+        {
+            ViewReleaseNotes();
+            return;
+        }
+
+        try
+        {
+            StatusText = $"Downloading Lithic Backup {update.Version}...";
+            var msiPath = await UpdateService.DownloadMsiAsync(update);
+
+            StatusText = "Launching installer...";
+            System.Diagnostics.Process.Start(new System.Diagnostics.ProcessStartInfo(msiPath)
+            {
+                UseShellExecute = true
+            });
+
+            // Close the app so the MSI can overwrite the running executables.
+            Application.Current.Shutdown();
+        }
+        catch (Exception ex)
+        {
+            StatusText = "Update download failed.";
+            MessageBox.Show(
+                $"Couldn't download or launch the installer:\n\n{ex.Message}\n\n" +
+                "You can download it manually from the release page.",
+                "Download Update", MessageBoxButton.OK, MessageBoxImage.Warning);
+            ViewReleaseNotes();
+        }
+    }
+
+    /// <summary>Opens the GitHub release page in the default browser.</summary>
+    private void ViewReleaseNotes()
+    {
+        if (AvailableUpdate is not { } update) return;
+        var url = !string.IsNullOrEmpty(update.ReleasePageUrl)
+            ? update.ReleasePageUrl
+            : $"https://github.com/inhahe/Lithic/releases";
+        try
+        {
+            System.Diagnostics.Process.Start(new System.Diagnostics.ProcessStartInfo(url)
+            {
+                UseShellExecute = true
+            });
+        }
+        catch { /* best-effort; nothing actionable if the browser won't open */ }
+    }
+
+    /// <summary>
+    /// Hides the banner and remembers this version so the silent startup check
+    /// won't nag about it again (a newer release supersedes the dismissal).
+    /// </summary>
+    private void DismissUpdate()
+    {
+        if (AvailableUpdate is { } update)
+        {
+            _settings.DismissedUpdateVersion = update.TagName;
+            _settings.Save();
+        }
+        UpdateBannerVisible = false;
     }
 
     // -------------------------------------------------------------------

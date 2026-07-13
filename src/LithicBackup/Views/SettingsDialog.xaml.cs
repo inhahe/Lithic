@@ -29,6 +29,7 @@ public partial class SettingsDialog : Window, INotifyPropertyChanged
         _fixedGb = mb.FixedGb.ToString(CultureInfo.CurrentCulture);
         _suppressBackupSuggestions = settings.SuppressBackupSuggestions;
         _burnInPlace = settings.DiscStagingMode == DiscStagingMode.InPlace;
+        _checkForUpdates = settings.CheckForUpdates;
     }
 
     private bool _isAuto;
@@ -77,6 +78,13 @@ public partial class SettingsDialog : Window, INotifyPropertyChanged
     {
         get => _suppressBackupSuggestions;
         set { _suppressBackupSuggestions = value; OnPropertyChanged(); }
+    }
+
+    private bool _checkForUpdates;
+    public bool CheckForUpdates
+    {
+        get => _checkForUpdates;
+        set { _checkForUpdates = value; OnPropertyChanged(); }
     }
 
     private bool _burnInPlace;
@@ -161,6 +169,7 @@ public partial class SettingsDialog : Window, INotifyPropertyChanged
     {
         _settings.MemoryBudget = BuildOptions();
         _settings.SuppressBackupSuggestions = _suppressBackupSuggestions;
+        _settings.CheckForUpdates = _checkForUpdates;
         _settings.DiscStagingMode = _burnInPlace
             ? DiscStagingMode.InPlace
             : DiscStagingMode.TemporaryCopy;

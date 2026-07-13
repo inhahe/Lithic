@@ -107,6 +107,10 @@
                   IsChecked="{Binding SuppressBackupSuggestions}"
                   Margin="0,0,0,4" />
 
+        <CheckBox Content="Check for updates on startup"
+                  IsChecked="{Binding CheckForUpdates}"
+                  Margin="0,8,0,4" />
+
         <Border Height="1" Background="{StaticResource BorderBrush}"
                 Margin="0,20,0,16" />
 

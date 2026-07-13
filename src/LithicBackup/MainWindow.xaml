@@ -26,9 +26,40 @@
                           InputGestureText="Alt+F4" />
             </MenuItem>
             <MenuItem Header="_Help">
+                <MenuItem Header="Check for _Updates…"
+                          Command="{Binding CheckForUpdatesCommand}" />
+                <Separator />
                 <MenuItem Header="_About Lithic Backup" Click="About_Click" />
             </MenuItem>
         </Menu>
+
+        <!-- Update-available banner (docked under the menu, shown only when a
+             newer GitHub release is found). -->
+        <Border DockPanel.Dock="Top"
+                Background="{StaticResource PrimaryLightBrush}"
+                BorderBrush="{StaticResource PrimaryBrush}"
+                BorderThickness="0,0,0,1"
+                Padding="16,8"
+                Visibility="{Binding UpdateBannerVisible, Converter={StaticResource BoolToVis}}">
+            <DockPanel>
+                <StackPanel DockPanel.Dock="Right" Orientation="Horizontal"
+                            VerticalAlignment="Center">
+                    <Button Content="Update Now"
+                            Style="{StaticResource PrimaryButton}"
+                            Command="{Binding DownloadUpdateCommand}"
+                            Margin="0,0,8,0" />
+                    <Button Content="Release Notes"
+                            Command="{Binding ViewReleaseNotesCommand}"
+                            Margin="0,0,8,0" />
+                    <Button Content="Dismiss"
+                            Command="{Binding DismissUpdateCommand}" />
+                </StackPanel>
+                <TextBlock Text="{Binding UpdateBannerText}"
+                           VerticalAlignment="Center"
+                           FontWeight="SemiBold"
+                           Foreground="{StaticResource PrimaryDarkBrush}" />
+            </DockPanel>
+        </Border>
 
         <Grid Margin="16">
             <Grid.RowDefinitions>
