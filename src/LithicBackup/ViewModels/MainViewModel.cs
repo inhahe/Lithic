@@ -1838,10 +1838,30 @@ public class MainViewModel : ViewModelBase
         try
         {
             await _catalog.DeleteBackupSetAsync(backupSet.Id);
-            await LoadBackupSetsAsync();
+
+            // Remove the row explicitly rather than leaning on LoadBackupSetsAsync's
+            // reconcile. That reconcile deliberately KEEPS any row whose IsRunning
+            // flag is set (to shield a concurrently-running set from an incidental
+            // reload), and IsRunning stays true after a backup completes until the
+            // finished progress panel is dismissed. So a set deleted while its row
+            // still shows that panel would survive the reconcile forever as a ghost
+            // — present in the list with no catalog record behind it. A set the user
+            // explicitly deleted must always disappear, so drop its row here and
+            // cancel anything still attached to it.
+            var row = RowFor(backupSet.Id);
+            if (row is not null)
+            {
+                row.ScanCts?.Cancel();
+                if (row.Progress?.CancelCommand is ICommand cancel && cancel.CanExecute(null))
+                    cancel.Execute(null);
+                BackupSets.Remove(row);
+            }
 
             if (SelectedBackupSet?.Id == backupSet.Id)
                 SelectedBackupSet = null;
+
+            // Refresh the rest (ordering, other sets) now that the row is gone.
+            await LoadBackupSetsAsync();
 
             StatusText = $"Deleted \"{backupSet.Name}\".";
         }
