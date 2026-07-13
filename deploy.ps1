@@ -6,8 +6,8 @@
 .DESCRIPTION
     The GUI (LithicBackup.exe) and the Worker service (LithicBackup.Worker.exe)
     share the same class libraries (Core / Infrastructure / Services). If you
-    ever update those DLLs piecemeal — e.g. copy a fresh Infrastructure.dll to
-    fix the Worker but leave the old GUI in place — the halves reference each
+    ever update those DLLs piecemeal - e.g. copy a fresh Infrastructure.dll to
+    fix the Worker but leave the old GUI in place - the halves reference each
     other's types by name and you get a startup TypeLoadException
     ("Could not load type 'X' from assembly 'Y'").
 
@@ -19,7 +19,7 @@
     Because the MSI installs a SELF-CONTAINED build (the .NET runtime is bundled
     in the install folder), this script also publishes self-contained. That
     keeps the .exe host, runtimeconfig.json, deps.json and the runtime DLLs all
-    mutually consistent — never mix a framework-dependent build into a
+    mutually consistent - never mix a framework-dependent build into a
     self-contained install.
 
     Run it from an elevated (Administrator) PowerShell: it writes to
@@ -77,7 +77,7 @@ Write-Host ""
 
 # --- 1. Publish GUI + Worker (self-contained) into ONE shared folder ----------
 # Both projects publish into $publish so every shared library resolves to a
-# single build — this is what guarantees version consistency.
+# single build - this is what guarantees version consistency.
 if (Test-Path $publish) { Remove-Item -Recurse -Force $publish }
 
 $commonArgs = @(
@@ -100,7 +100,7 @@ if ($LASTEXITCODE -ne 0) { throw "Worker publish failed." }
 
 foreach ($exe in @("LithicBackup.exe", "LithicBackup.Worker.exe")) {
     if (-not (Test-Path (Join-Path $publish $exe))) {
-        throw "Expected $exe missing from publish output — build produced an unexpected layout."
+        throw "Expected $exe missing from publish output - build produced an unexpected layout."
     }
 }
 
