@@ -14,7 +14,8 @@
   Build inputs live in .\publish (populated by build-installer.ps1 via
   `dotnet publish`).  Version is passed in with `-d Version=x.y.z`.
 -->
-<Wix xmlns="http://wixtoolset.org/schemas/v4/wxs">
+<Wix xmlns="http://wixtoolset.org/schemas/v4/wxs"
+     xmlns:util="http://wixtoolset.org/schemas/v4/wxs/util">
 
   <?define Version = "$(var.Version)" ?>
 
@@ -28,6 +29,29 @@
 
     <!-- Block same/older reinstalls with a clear message; allow upgrades. -->
     <MajorUpgrade DowngradeErrorMessage="A newer version of Lithic Backup is already installed." />
+
+    <!--
+      Close the running GUI before touching files.  Unlike the Worker (a service
+      the installer can stop via SCM), LithicBackup.exe is an interactive app,
+      and it minimizes to the tray on a plain WM_CLOSE instead of exiting - so
+      the Restart Manager's polite close request just hides it and the process
+      keeps its .exe locked, producing "Setup was unable to automatically close
+      the application" on upgrade.
+
+      EndSessionMessage sends WM_QUERYENDSESSION, which the app now treats as a
+      real exit (App.OnSessionEnding), so it shuts down gracefully.  If it hasn't
+      exited by the timeout, TerminateProcess force-closes it as a fallback so
+      the upgrade can always proceed.  RebootPrompt="no" avoids demanding a
+      reboot if a stubborn instance lingers.
+    -->
+    <util:CloseApplication
+        Id="CloseLithicGui"
+        Target="LithicBackup.exe"
+        Description="Please close Lithic Backup so the upgrade can replace its files."
+        CloseMessage="no"
+        EndSessionMessage="yes"
+        TerminateProcess="1"
+        RebootPrompt="no" />
 
     <MediaTemplate EmbedCab="yes" />
 

@@ -90,7 +90,20 @@ if (-not $msi) {
 Write-Host "  MSI : $($msi.FullName)"
 Write-Host ("  Size: {0:N1} MB" -f ($msi.Length / 1MB))
 
-# --- 3. Run the MSI (self-elevates via UAC) -----------------------------------
+# --- 3. Close the running GUI so the MSI never hits "files in use" -------------
+# The Worker service is stopped by the MSI's own ServiceControl, but the GUI is
+# an interactive app that minimizes to the tray on a normal close, so the
+# installer's Restart Manager can't shut it down on its own. Close it here first.
+# (The MSI also self-defends via util:CloseApplication, but doing it up front
+# gives a clean, prompt-free upgrade even with an older MSI.)
+$gui = Get-Process -Name LithicBackup -ErrorAction SilentlyContinue
+if ($gui) {
+    Write-Step "Closing running Lithic Backup GUI..."
+    $gui | Stop-Process -Force
+    Start-Sleep -Milliseconds 500
+}
+
+# --- 4. Run the MSI (self-elevates via UAC) -----------------------------------
 $log = Join-Path $env:TEMP ("lithic-upgrade-{0:yyyyMMdd-HHmmss}.log" -f (Get-Date))
 $msiArgs = @("/i", "`"$($msi.FullName)`"", "/L*v", "`"$log`"")
 if ($Silent) { $msiArgs += "/qb" }
@@ -98,7 +111,7 @@ if ($Silent) { $msiArgs += "/qb" }
 Write-Step "Launching installer (a UAC prompt will appear)..."
 $proc = Start-Process -FilePath "msiexec.exe" -ArgumentList $msiArgs -Verb RunAs -Wait -PassThru
 
-# --- 4. Report ----------------------------------------------------------------
+# --- 5. Report ----------------------------------------------------------------
 Write-Host ""
 switch ($proc.ExitCode) {
     0     { Write-Host "=== Upgrade complete ===" -ForegroundColor Green }

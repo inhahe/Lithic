@@ -342,6 +342,21 @@ public partial class App : Application
     }
 
     /// <summary>
+    /// A session-end request — Windows logging off/shutting down, OR an installer's
+    /// Restart Manager asking us to close so it can replace our files (this is what
+    /// the MSI upgrade sends). Treat it as a real exit: without this, the main
+    /// window's OnClosing would cancel the close and minimize to tray, leaving the
+    /// process alive and holding LithicBackup.exe locked — which is what makes an
+    /// upgrade fail with "Setup was unable to automatically close the application."
+    /// Flag the real shutdown so OnClosing lets the window close.
+    /// </summary>
+    protected override void OnSessionEnding(SessionEndingCancelEventArgs e)
+    {
+        IsExiting = true;
+        base.OnSessionEnding(e);
+    }
+
+    /// <summary>
     /// Open the application settings dialog (memory budget, reminders).
     /// Keeps the tray reminders checkbox in sync with any change made here.
     /// </summary>
