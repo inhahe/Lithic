@@ -258,8 +258,7 @@ public class BackupOrchestrator : IBackupOrchestrator
 
             // Stage files to a temp directory.
             string stagingDir = Path.Combine(Path.GetTempPath(), "LithicBackup", $"disc-{discSequence}");
-            if (Directory.Exists(stagingDir))
-                Directory.Delete(stagingDir, true);
+            ForceDeleteDirectory(stagingDir);
             Directory.CreateDirectory(stagingDir);
 
             // Read locks held on in-place (uncopied) source files. Kept open from
@@ -983,7 +982,7 @@ public class BackupOrchestrator : IBackupOrchestrator
                 {
                     try { h.Dispose(); } catch { /* best effort */ }
                 }
-                try { Directory.Delete(stagingDir, true); } catch { }
+                try { ForceDeleteDirectory(stagingDir); } catch { }
             }
 
             discIndex++;
@@ -997,7 +996,7 @@ public class BackupOrchestrator : IBackupOrchestrator
             // Remove any spill snapshots taken for split files.
             foreach (var spill in spillDirs)
             {
-                try { if (Directory.Exists(spill)) Directory.Delete(spill, true); } catch { }
+                try { ForceDeleteDirectory(spill); } catch { }
             }
         }
 
@@ -1096,8 +1095,7 @@ public class BackupOrchestrator : IBackupOrchestrator
 
             string stagingDir = Path.Combine(
                 Path.GetTempPath(), "LithicBackup", $"consolidate-{backupSetId}-disc-{discSequence}");
-            if (Directory.Exists(stagingDir))
-                Directory.Delete(stagingDir, true);
+            ForceDeleteDirectory(stagingDir);
             Directory.CreateDirectory(stagingDir);
 
             try
@@ -1195,7 +1193,7 @@ public class BackupOrchestrator : IBackupOrchestrator
             }
             finally
             {
-                try { Directory.Delete(stagingDir, true); } catch { }
+                try { ForceDeleteDirectory(stagingDir); } catch { }
             }
         }
 
@@ -1412,8 +1410,7 @@ public class BackupOrchestrator : IBackupOrchestrator
     {
         string stagingDir = Path.Combine(
             Path.GetTempPath(), "LithicBackup", $"reburn-{backupSetId}-{Guid.NewGuid():N}");
-        if (Directory.Exists(stagingDir))
-            Directory.Delete(stagingDir, true);
+        ForceDeleteDirectory(stagingDir);
         Directory.CreateDirectory(stagingDir);
 
         try
@@ -1482,13 +1479,43 @@ public class BackupOrchestrator : IBackupOrchestrator
         }
         finally
         {
-            try { Directory.Delete(stagingDir, true); } catch { }
+            try { ForceDeleteDirectory(stagingDir); } catch { }
         }
     }
 
     // -------------------------------------------------------------------
     // Helpers
     // -------------------------------------------------------------------
+
+    /// <summary>
+    /// Recursively delete a directory, clearing the read-only attribute on every
+    /// file first. <see cref="File.Copy(string,string,bool)"/> preserves the
+    /// source's read-only flag, and a large fraction of backed-up content is
+    /// read-only (git object/pack files, anything copied from read-only media), so
+    /// the staged copies are read-only too. A plain <see cref="Directory.Delete(string,bool)"/>
+    /// throws <see cref="UnauthorizedAccessException"/> on those, which both leaks
+    /// the staging temp folder forever (post-burn cleanup is best-effort) and, worse,
+    /// aborts the next disc burn when the unguarded pre-clean hits a leftover
+    /// read-only file. Clearing the attribute first makes cleanup reliable.
+    /// </summary>
+    private static void ForceDeleteDirectory(string path)
+    {
+        if (!Directory.Exists(path))
+            return;
+
+        foreach (var file in Directory.EnumerateFiles(path, "*", SearchOption.AllDirectories))
+        {
+            try
+            {
+                var fi = new FileInfo(file);
+                if (fi.IsReadOnly)
+                    fi.IsReadOnly = false;
+            }
+            catch { /* best effort — a stuck attribute must not block cleanup */ }
+        }
+
+        Directory.Delete(path, true);
+    }
 
     /// <summary>
     /// Try to pull a file from the pending queue that fits in the remaining space.

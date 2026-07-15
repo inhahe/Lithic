@@ -6,7 +6,13 @@ are ordered roughly by priority. When one ships, move its detail into
 
 ---
 
-## 1. Disc-burn staging inherits source read-only → temp leak + burn-abort landmine
+## 1. Disc-burn staging inherits source read-only → temp leak + burn-abort landmine ✅ DONE
+
+**Status: SHIPPED.** Added `BackupOrchestrator.ForceDeleteDirectory` (clears the
+read-only attribute on every file before `Directory.Delete`) and routed all seven
+staging-cleanup sites through it (main per-disc pre-clean + post-burn finally, the
+split-spill cleanup, and the consolidate/reburn staging paths). See the FIXED entry
+in `known-issues.md`.
 
 **Priority: high (real latent bug, small fix).**
 

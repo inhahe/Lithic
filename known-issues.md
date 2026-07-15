@@ -1,5 +1,29 @@
 # LithicBackup — Known Issues & Tech Debt
 
+## FIXED: Disc-burn staging inherited source read-only → temp leak + burn-abort landmine (2026-07-15)
+
+**Symptom (two failures from one cause):** `BackupOrchestrator` staged files into
+`%TEMP%\LithicBackup\disc-*` via `File.Copy`, which **preserves the source's
+read-only attribute**. A large fraction of backed-up content is read-only (git
+object/pack files, anything copied from read-only media), so the staged copies were
+read-only too. Consequences: (1) the post-burn cleanup `Directory.Delete(stagingDir,
+true)` — wrapped in `catch {}` — silently failed on those files and leaked the staging
+folder forever; (2) worse, the **unguarded** pre-clean `Directory.Delete` at the top
+of the per-disc loop threw `UnauthorizedAccessException` on a leftover read-only file
+from a prior run and **aborted the next disc burn** before it started.
+
+**Fix:** added `BackupOrchestrator.ForceDeleteDirectory(path)`, which clears the
+read-only attribute on every file (recursive enumerate, best-effort per file) before
+`Directory.Delete(path, true)` — mirroring the existing `ForceDeleteFile`/`ClearReadOnly`
+in `DirectoryBackupService`. Routed **all seven** staging-cleanup sites through it: the
+main per-disc pre-clean and post-burn `finally`, the split-file spill cleanup, and the
+consolidate and reburn staging paths (each had its own pre-clean + `finally`). This is
+the disc-backup analog of the already-fixed directory-backup read-only deletion bug.
+
+Scope: only `DiscStagingMode.TemporaryCopy` copies plain files to temp, but zipped/split
+files and the split spill stage to temp even in `InPlace` mode, so the helper is needed
+regardless of mode.
+
 ## FIXED: Source tree showed auto-included new folders as unchecked (display/coverage mismatch) (2026-07-14)
 
 **Symptom:** With a *partially-selected* root (e.g. `D:\` selected with some
