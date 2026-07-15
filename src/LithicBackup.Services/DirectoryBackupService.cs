@@ -166,6 +166,17 @@ public class DirectoryBackupService
             ? await _catalog.GetLatestVersionInfoAsync(backupSetId, ct)
             : new Dictionary<string, FileVersionInfo>(StringComparer.OrdinalIgnoreCase);
 
+        // Orphaned history: paths whose every catalog record is soft-deleted, so
+        // they're absent from versionInfo above. When such a path reappears we
+        // RESURRECT its version chain (continue numbering, move the old copy into
+        // _prev) instead of restarting at version 1 and discarding history. This
+        // is what lets atomically-saved files (e.g. KeyNote .knt, which briefly
+        // delete-and-recreate the original on every save, tombstoning the record)
+        // keep accumulating versions. Looked up lazily per file below.
+        var orphanedVersionInfo = job.BackupSetId.HasValue
+            ? await _catalog.GetOrphanedVersionInfoAsync(backupSetId, ct)
+            : new Dictionary<string, FileVersionInfo>(StringComparer.OrdinalIgnoreCase);
+
         // Map of content hash -> destination-relative path of an active PLAIN
         // copy of that content somewhere in the backup tree (a real-bytes file
         // stored under its own name, in the current tree or a "{drive}_prev"
@@ -501,6 +512,28 @@ public class DirectoryBackupService
             // the version number.
             int version = 1;
             bool hasExistingInfo = versionInfo.TryGetValue(file.FullPath, out var existingInfo);
+
+            // Resurrection: if there's no LIVE prior version but this path has a
+            // fully-tombstoned history (its file was deleted then reappeared —
+            // e.g. an atomic save), continue that chain instead of starting over.
+            // Treat it exactly like a normal existing version from here on: the
+            // _prev move below picks up the old copy (still at its live on-disk
+            // path) and un-deletes it as a retained version.
+            bool resurrecting = false;
+            if (!hasExistingInfo
+                && orphanedVersionInfo.TryGetValue(file.FullPath, out var orphanInfo))
+            {
+                existingInfo = orphanInfo;
+                hasExistingInfo = true;
+                resurrecting = true;
+                // The diff classifies a reappeared (tombstoned) path as a NEW
+                // file, so isChanged is false — but relative to its retained
+                // history it IS a change. Promote it so the downstream _prev
+                // move, content-identity short-circuit, and dedup hint all treat
+                // it as a changed existing file rather than a fresh version-1.
+                isChanged = true;
+            }
+
             if (hasExistingInfo)
                 version = existingInfo.MaxVersion + 1;
 
@@ -639,35 +672,72 @@ public class DirectoryBackupService
                     && !string.IsNullOrEmpty(existingInfo.Hash)
                     && string.Equals(hash, existingInfo.Hash, StringComparison.OrdinalIgnoreCase))
                 {
-                    // Refresh the stored timestamp AND size so the next scan
-                    // stops re-detecting this file. A stale stored size (from a
-                    // prior scan that raced an edit) would otherwise keep the
-                    // file flagged as changed and re-hashed on every run.
-                    if (job.BackupSetId.HasValue
-                        && (existingInfo.SourceLastWriteUtc != file.LastWriteUtc
-                            || existingInfo.SizeBytes != contentSize))
+                    if (resurrecting)
                     {
-                        var latest = await _catalog.GetFileRecordByPathAndVersionAsync(
-                            job.BackupSetId.Value, file.FullPath, existingInfo.MaxVersion, ct);
-                        if (latest is not null)
+                        // The reappeared file is byte-for-byte identical to its
+                        // tombstoned latest version. If that version's destination
+                        // copy is still on disk, just revive the record in place
+                        // (un-delete + refresh timestamp/size) rather than rewriting
+                        // identical bytes and cutting a redundant version. If the
+                        // copy is gone (e.g. retention purged it) we fall through to
+                        // a normal write so a live copy is recreated.
+                        string revivePath = GetCurrentPath(
+                            targetDirectory, file.FullPath,
+                            existingInfo.IsDeduped, existingInfo.IsFileRef);
+                        if (File.Exists(revivePath) && job.BackupSetId.HasValue)
                         {
-                            latest.SourceLastWriteUtc = file.LastWriteUtc;
-                            latest.SizeBytes = contentSize;
-                            await _catalog.UpdateFileRecordAsync(latest, ct);
-                        }
-                    }
+                            var revived = await _catalog.GetFileRecordByPathAndVersionAsync(
+                                job.BackupSetId.Value, file.FullPath, existingInfo.MaxVersion, ct);
+                            if (revived is not null)
+                            {
+                                revived.IsDeleted = false;
+                                revived.SourceLastWriteUtc = file.LastWriteUtc;
+                                revived.SizeBytes = contentSize;
+                                await _catalog.UpdateFileRecordAsync(revived, ct);
 
-                    // Keep the in-memory view current for the rest of this run.
-                    versionInfo[file.FullPath] = existingInfo with
+                                versionInfo[file.FullPath] = existingInfo with
+                                {
+                                    SourceLastWriteUtc = file.LastWriteUtc,
+                                    SizeBytes = contentSize,
+                                };
+                                bytesProcessed += file.SizeBytes;
+                                break; // revived in place — move on to the next file
+                            }
+                        }
+                        // Fall through: no surviving copy to revive, so write fresh.
+                    }
+                    else
                     {
-                        SourceLastWriteUtc = file.LastWriteUtc,
-                        SizeBytes = contentSize,
-                    };
-                    // Unchanged content writes nothing, but it's a planned file
-                    // now dealt with — advance the progress numerator so a run
-                    // over a large unchanged tree doesn't look frozen.
-                    bytesProcessed += file.SizeBytes;
-                    break; // unchanged content — move on to the next file
+                        // Refresh the stored timestamp AND size so the next scan
+                        // stops re-detecting this file. A stale stored size (from a
+                        // prior scan that raced an edit) would otherwise keep the
+                        // file flagged as changed and re-hashed on every run.
+                        if (job.BackupSetId.HasValue
+                            && (existingInfo.SourceLastWriteUtc != file.LastWriteUtc
+                                || existingInfo.SizeBytes != contentSize))
+                        {
+                            var latest = await _catalog.GetFileRecordByPathAndVersionAsync(
+                                job.BackupSetId.Value, file.FullPath, existingInfo.MaxVersion, ct);
+                            if (latest is not null)
+                            {
+                                latest.SourceLastWriteUtc = file.LastWriteUtc;
+                                latest.SizeBytes = contentSize;
+                                await _catalog.UpdateFileRecordAsync(latest, ct);
+                            }
+                        }
+
+                        // Keep the in-memory view current for the rest of this run.
+                        versionInfo[file.FullPath] = existingInfo with
+                        {
+                            SourceLastWriteUtc = file.LastWriteUtc,
+                            SizeBytes = contentSize,
+                        };
+                        // Unchanged content writes nothing, but it's a planned file
+                        // now dealt with — advance the progress numerator so a run
+                        // over a large unchanged tree doesn't look frozen.
+                        bytesProcessed += file.SizeBytes;
+                        break; // unchanged content — move on to the next file
+                    }
                 }
 
                 // Decide storage format. Priority:
@@ -816,6 +886,13 @@ public class DirectoryBackupService
                             if (oldRecord is not null)
                             {
                                 oldRecord.DiscPath = prevDiscPath;
+                                // Resurrection: the old version is a tombstone (its
+                                // file was deleted-and-recreated). Now that it holds
+                                // the real _prev bytes of a live chain again, un-delete
+                                // it so it's a retained version rather than a ghost
+                                // hidden from restore/version listings.
+                                if (resurrecting)
+                                    oldRecord.IsDeleted = false;
                                 await _catalog.UpdateFileRecordAsync(oldRecord, ct);
                             }
                         }

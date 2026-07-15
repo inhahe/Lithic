@@ -71,6 +71,22 @@ public interface ICatalogRepository : IDisposable
     Task<Dictionary<string, FileVersionInfo>> GetLatestVersionInfoAsync(int backupSetId, CancellationToken ct = default);
 
     /// <summary>
+    /// Get lightweight version info for paths whose ENTIRE history is soft-deleted
+    /// — i.e. every catalog record for that SourcePath has <c>IsDeleted = 1</c>, so
+    /// the path is absent from <see cref="GetLatestVersionInfoAsync"/>. Returns one
+    /// entry per such path, carrying the max version and its metadata.
+    ///
+    /// This is the "orphaned history" set. It exists so a backup can *resurrect* a
+    /// version chain when a previously-deleted path reappears: without it, the
+    /// reappearing file looks brand-new (version resets to 1, the old copy is never
+    /// moved into _prev). This matters for editors that save atomically (write a
+    /// temp file then replace the original, e.g. KeyNote's .knt files): each save
+    /// briefly removes the original, tombstoning its record, so the next backup
+    /// must continue the chain rather than start over.
+    /// </summary>
+    Task<Dictionary<string, FileVersionInfo>> GetOrphanedVersionInfoAsync(int backupSetId, CancellationToken ct = default);
+
+    /// <summary>
     /// Fast scalar count of distinct source paths in a backup set (non-deleted).
     /// Use for progress bar estimates instead of loading full file metadata.
     /// </summary>

@@ -467,6 +467,58 @@ internal sealed class SqliteSetDatabase : IDisposable
         return dict;
     }
 
+    public async Task<Dictionary<string, FileVersionInfo>> GetOrphanedVersionInfoAsync(int backupSetId, CancellationToken ct = default)
+    {
+        ct.ThrowIfCancellationRequested();
+        using var _ = await LockAsync(ct).ConfigureAwait(false);
+
+        using var cmd = _connection.CreateCommand();
+        // Latest record per SourcePath across ALL rows (deleted included),
+        // keeping only paths whose newest row is soft-deleted. A path with a
+        // live (IsDeleted = 0) latest row is already covered by
+        // GetLatestVersionInfoAsync and is intentionally excluded here so the
+        // two dictionaries never overlap. COLLATE NOCASE mirrors that method:
+        // the Windows filesystem is case-insensitive, so all casings of a path
+        // share one version chain.
+        cmd.CommandText = """
+            SELECT SourcePath, Version, SizeBytes, SourceLastWriteUtc, IsDeduped, IsFileRef, Hash
+            FROM (
+                SELECT f.SourcePath,
+                       f.Version,
+                       f.SizeBytes,
+                       f.SourceLastWriteUtc,
+                       f.IsDeduped,
+                       f.IsFileRef,
+                       f.Hash,
+                       f.IsDeleted,
+                       ROW_NUMBER() OVER (
+                           PARTITION BY f.SourcePath COLLATE NOCASE
+                           ORDER BY f.Version DESC, f.Id DESC
+                       ) AS rn
+                FROM Files f
+                INNER JOIN Discs d ON f.DiscId = d.Id
+                WHERE d.BackupSetId = $setId
+            )
+            WHERE rn = 1 AND IsDeleted = 1
+            """;
+        cmd.Parameters.AddWithValue("$setId", backupSetId);
+
+        var dict = new Dictionary<string, FileVersionInfo>(StringComparer.OrdinalIgnoreCase);
+        using var r = cmd.ExecuteReader();
+        while (r.Read())
+        {
+            string path = r.GetString(0);
+            dict[path] = new FileVersionInfo(
+                MaxVersion: r.GetInt32(1),
+                SizeBytes: r.GetInt64(2),
+                SourceLastWriteUtc: DateTime.Parse(r.GetString(3), null, DateTimeStyles.RoundtripKind),
+                IsDeduped: r.GetInt32(4) != 0,
+                IsFileRef: r.GetInt32(5) != 0,
+                Hash: r.IsDBNull(6) ? "" : r.GetString(6));
+        }
+        return dict;
+    }
+
     public async Task<int> GetFileCountForBackupSetAsync(int backupSetId, CancellationToken ct = default)
     {
         ct.ThrowIfCancellationRequested();

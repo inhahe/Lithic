@@ -1,5 +1,52 @@
 # LithicBackup — Known Issues & Tech Debt
 
+## FIXED (part 1 of 2): Atomically-saved files (e.g. KeyNote .knt) never accumulate versions (2026-07-15)
+
+**Symptom.** A file edited by an application that saves *atomically* — writing a
+temp file then replacing/renaming the original (KeyNote NF `.knt`, and many text
+editors) — is re-copied on every save but **never accumulates versions in `_prev`**,
+and its version number stays stuck at 1. Diagnosed on the user's live catalogs:
+`D:\youtube\philosophy\philosophy.knt` had two catalog rows, **both Version 1, both
+`IsDeleted = 1`**, different DiscIds, **different hashes** (content genuinely changed
+2026-07-12 → 2026-07-15). No `_prev` row was ever cut. Meanwhile files KeyNote writes
+in place (its `_BAK@Dn`/`_BAK@Wn` rotation copies) *did* version correctly
+(`philosophy_BAK@D5.knt` reached v4 with `.v3`/`.v2` in `D_prev`).
+
+**Root cause.** An atomic save briefly removes the original file. Continuous backup
+sees the disappearance and soft-deletes the catalog record (`IsDeleted = 1`), then
+sees the replacement as a brand-new file. `SqliteSetDatabase.GetLatestVersionInfoAsync`
+filters `WHERE IsDeleted = 0`, so the next backup finds **no prior version** →
+`hasExistingInfo = false` → the `if (isChanged && keepVersions && hasExistingInfo)`
+block in `DirectoryBackupService` that moves the old copy into `_prev` never runs, and
+the version resets to 1. History is discarded on every save.
+
+**Fix (this commit) — version-chain resurrection.** New
+`ICatalogRepository.GetOrphanedVersionInfoAsync` returns the "orphaned history" set:
+paths whose *entire* history is tombstoned (latest row `IsDeleted = 1`), so they're
+absent from `GetLatestVersionInfoAsync`. `DirectoryBackupService.ExecuteAsync` now
+loads this alongside `versionInfo` and, when the live lookup misses, falls back to it
+(`resurrecting = true`): it continues the chain (`version = MaxVersion + 1`), the
+`_prev` move picks up the old copy still at its live on-disk path and **un-deletes**
+that record as a retained version, and the content-identity short-circuit revives an
+identical reappeared file in place (un-delete + refresh) instead of leaving it a ghost.
+Source-agnostic: any deleted-then-reappeared path now keeps its history.
+
+**Still open (part 2 of 2) — atomic-save-aware change detection (NEXT).** Resurrection
+*repairs* the chain but the churn root remains: every atomic save still tombstones the
+record and cuts a fresh row, inflating the catalog with duplicate `v1` tombstones (the
+two `philosophy.knt` rows) and duplicating DiscPaths. The proper follow-up is to
+recognize an atomic-save *replace* (temp-write + rename/`File.Replace`, or a
+delete-immediately-followed-by-recreate of the same path) as a **modification of the
+existing file**, not a delete+create — so the record is never tombstoned in the first
+place and versioning happens on the normal in-place path. Likely lives in the Worker's
+USN move/delete classification (`BackupWorker` — `MarkMovedOutAsync`, and the
+delete/rename-out handling) plus the reconcile scan's missing-file → delete step: treat
+a path that is present on disk at apply time as never-deleted, and coalesce a
+rename-old/rename-new pair on the same final path into an update. Until then, resurrection
+keeps versioning correct; this cleanup removes the tombstone churn.
+
+---
+
 ## FIXED: Case-only path changes corrupt version history + orphan _prev files (2026-07-15)
 
 **Fixed 2026-07-15** — the new-backup half of this bug is resolved. Every
