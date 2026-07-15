@@ -10,9 +10,32 @@ written."
 Each item maps to a completed roadmap entry. Do the ones that touch hardware/UI —
 skip anything you don't have media for.
 
+> **Now automated (2026-07-15):** most of items 1, 3, 4, 5, and 6 that *can* run
+> headless now have dedicated harness tests, so the manual list below has shrunk to
+> the parts a simulator genuinely can't prove — real optical hardware and the actual
+> on-screen WPF dialog. Automated coverage per item:
+> - **1** — `disc_test_harness`: `readonly-source-main-path-no-staging-leak` (main
+>   burn path) + `reburn-staging-cleanup-handles-readonly-source` (File.Copy reburn path).
+> - **3** — `disc_test_harness`: `disc-over-reports-capacity` (simulates a smaller
+>   *actual* capacity than reported → graceful re-plan). **Answer to "is it reported
+>   or silent?":** it's **reported, not silent** — both the simulator and real IMAPI2
+>   hardware throw once committed bytes exceed the true capacity, and the orchestrator
+>   now catches that, caps remaining discs to the observed capacity, and re-packs the
+>   rest onto more discs automatically. The user never has to manually override the size.
+> - **4** — `disc_test_harness`: `udf-warning-decision-yes-no-cancel` +
+>   `udf-warning-below-threshold-stays-silent` drive the Yes/No/Cancel decision
+>   programmatically through the shared `DiscCompatibilityAdvisor` (the same logic the
+>   dialog uses). Only the dialog's *visual appearance* is left to eyeball.
+> - **5** — `dir_dedup_test`: large (>64 KiB) same-size files, both streaming and
+>   buffered paths.
+> - **6** — `dedup_estimate_test`: runs the real backup **and** the estimator over
+>   identical inputs and asserts the estimate equals the bytes actually written.
+
 ---
 
 ## 1. Read-only source files → disc burn (temp-leak + burn-abort fix)
+
+*Automated: yes (see note above). Manual value: confirm on a real burner.*
 
 The fix clears the read-only attribute before deleting staging dirs, so read-only
 content no longer leaks into `%TEMP%\LithicBackup` or aborts the *next* burn.
