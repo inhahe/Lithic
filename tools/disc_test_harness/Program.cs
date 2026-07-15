@@ -23,6 +23,16 @@ using LithicBackup.Services;
 string root = Path.Combine(Path.GetTempPath(), "lithic-disc-harness");
 if (Directory.Exists(root))
 {
+    // Clear read-only attributes first: some tests intentionally create read-only
+    // source files (the item-1 reburn cleanup test), and File.Copy preserves that
+    // flag into staging/shelf/restore trees. A plain Directory.Delete would throw
+    // on any leftover read-only file and leak the whole tree into the next run.
+    try
+    {
+        foreach (var f in Directory.EnumerateFiles(root, "*", SearchOption.AllDirectories))
+            try { new FileInfo(f).IsReadOnly = false; } catch { }
+    }
+    catch { /* best effort */ }
     try { Directory.Delete(root, true); } catch { /* best effort */ }
 }
 Directory.CreateDirectory(root);
@@ -128,6 +138,56 @@ await runner.Run("verify-disc-integrity", async ws =>
         var vr = await restore.VerifyDiscAsync(disc.Id, discRoot, verifyContents: true);
         ws.Assert(vr.Success, $"disc {disc.Label} failed integrity: {string.Join("; ", vr.Issues.Select(i => $"{i.SourcePath}:{i.Kind}"))}");
     }
+});
+
+await runner.Run("reburn-staging-cleanup-handles-readonly-source", async ws =>
+{
+    // Roadmap item 1: staging cleanup must clear the read-only attribute before
+    // deleting the temp staging directory (ForceDeleteDirectory). The re-burn /
+    // consolidate paths stage via File.Copy, which PRESERVES the source's read-only
+    // flag — so a read-only SOURCE file (git object/pack files, anything copied
+    // from read-only media) lands as a read-only STAGED copy. A plain
+    // Directory.Delete then throws UnauthorizedAccessException and, because the
+    // cleanup is wrapped in catch{}, the reburn still "succeeds" while leaking its
+    // staging tree in %TEMP%\LithicBackup\reburn-* forever. (The MAIN backup path
+    // stages with a manual stream copy, which creates a fresh non-read-only file,
+    // so only the File.Copy-based reburn/consolidate paths hit this.) This test
+    // drives ReplaceDiscFilesAsync on a read-only source and pins the observable:
+    // no reburn staging directory is left behind.
+    var srcs = ws.MakeTree(("ro/locked.bin", 50_000), ("ro/normal.bin", 30_000));
+    new FileInfo(srcs[0]).IsReadOnly = true;
+
+    var (burner, result) = await ws.Backup(srcs);
+    ws.Assert(result.Success, "initial backup should succeed");
+
+    var disc = (await ws.Catalog.GetDiscsForBackupSetAsync(ws.BackupSetId)).Single();
+    var files = await ws.Catalog.GetFilesOnDiscAsync(disc.Id);
+    var lockedId = files.Single(f => f.SourcePath.EndsWith("locked.bin")).Id;
+
+    // Snapshot existing reburn-* staging dirs (the name carries a GUID) so we only
+    // judge THIS reburn's cleanup, immune to anything a prior test may have left.
+    string lithicTmp = Path.Combine(Path.GetTempPath(), "LithicBackup");
+    HashSet<string> Reburns() => Directory.Exists(lithicTmp)
+        ? Directory.GetDirectories(lithicTmp, "reburn-*").ToHashSet(StringComparer.OrdinalIgnoreCase)
+        : new HashSet<string>(StringComparer.OrdinalIgnoreCase);
+    var before = Reburns();
+
+    var orch = ws.BuildOrchestrator(burner);
+    int reburned = await orch.ReplaceDiscFilesAsync(disc.Id, new[] { lockedId }, Workspace.RecorderId);
+    ws.Assert(reburned == 1, $"expected the read-only file re-burned, got {reburned}");
+
+    var leaked = Reburns();
+    leaked.ExceptWith(before);
+    ws.Assert(leaked.Count == 0,
+        $"reburn staging dir leaked (read-only cleanup failed): [{string.Join(", ", leaked.Select(Path.GetFileName))}]");
+
+    // The re-burned read-only file must still restore byte-for-byte.
+    var r = await ws.RestoreAndVerify(burner, srcs);
+    ws.Assert(r.Mismatches == 0, $"{r.Mismatches} restored file(s) had wrong content");
+    ws.Assert(r.Restored == srcs.Count, $"restored {r.Restored}/{srcs.Count} files");
+
+    // Leave the source tree deletable for the harness's best-effort root cleanup.
+    try { new FileInfo(srcs[0]).IsReadOnly = false; } catch { }
 });
 
 // ------------------------------------------------------------------
