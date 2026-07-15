@@ -1,5 +1,44 @@
 # LithicBackup — Known Issues & Tech Debt
 
+## FIXED: Files open in their editor (e.g. KeyNote `.knt`) were silently skipped, so no version history accumulated (2026-07-15)
+
+**Symptom.** A KeyNote NF note (`philosophy.knt`) kept in memory/open in KeyNote
+never showed up with version history under `_prev` (`D_prev`), even though the
+version-chain / `_prev` mechanism itself works for closed files.
+
+**Root cause.** The continuous backup path read every source file with
+`FileShare.Read`. That share mode *denies writers* — so a file another process
+holds open **for writing** (KeyNote keeps its `.knt` open with a lock that permits
+only `FileShare.ReadWrite`) cannot be opened, throwing a sharing violation. The
+file was then counted as a failed file and hidden inside the truncated
+"…N more failed files" summary, so it silently never got backed up or versioned.
+
+Proven with a lock test: `philosophy.knt` (held open by KeyNote) could **not** be
+opened with `FileShare.Read`/`None`, but **could** with `FileShare.ReadWrite`.
+
+**Fix.** Every source-side read in the continuous backup path now opens with
+`FileShare.ReadWrite` (the standard share mode for backing up live/open files):
+- `DirectoryBackupService.CopyFileAsync` / `CopyFileWithHashAsync` (source stream),
+- `DirectoryBackupService.ComputePrefixHashAsync`,
+- `DirectoryBackupService.WriteNewBlocksAsync`,
+- `DirectoryBackupService.ComputeFileHashAndSizeAsync` (safe for dest callers too —
+  they never write concurrently),
+- new `DirectoryBackupService.ReadAllBytesSharedAsync` helper replacing
+  `File.ReadAllBytesAsync` (which forces `FileShare.Read` internally),
+- `BlockDeduplicationEngine.ProcessFile` (source stream).
+
+Deliberately left as `FileShare.Read`: `BackupOrchestrator` (intentional read-lock
+for disc-burn consistency) and the restore/verify/analysis paths (not the
+continuous write path).
+
+**Separate, dominant environment issue (NOT a code bug).** set-4 ("backup to j:")
+targets **J:, which is 100% full — 0 GB free of 1749 GB** — so it physically
+cannot write new versions regardless of this fix. The code fix's effect is visible
+on set-11 ("backup to i:", has free space) once the open `.knt` is re-saved after
+deploy. The backup scope is also very broad (C:\Windows\Temp, browser caches,
+$RECYCLE.BIN, Unreal DDC → thousands of churned files per cycle), which is what
+fills J:.
+
 ## FIXED: MSI upgrade couldn't close the GUI — it minimized to tray and the .exe stayed locked (2026-07-15)
 
 **Symptom.** During an MSI upgrade the installer's Restart Manager tries to close

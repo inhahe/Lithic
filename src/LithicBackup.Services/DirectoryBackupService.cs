@@ -619,7 +619,7 @@ public class DirectoryBackupService
                             // buffer is dropped when this iteration ends.
                             try
                             {
-                                contentBuffer = await File.ReadAllBytesAsync(file.FullPath, ct);
+                                contentBuffer = await ReadAllBytesSharedAsync(file.FullPath, ct);
                                 contentSize = contentBuffer.Length;
                                 hash = ComputeHashOfBuffer(contentBuffer);
                             }
@@ -1983,7 +1983,10 @@ public class DirectoryBackupService
         {
             await using (var srcStream = new FileStream(
                 sourcePath, FileMode.Open, FileAccess.Read,
-                FileShare.Read, bufferSize: 81920, useAsync: true))
+                // ReadWrite share so a file another app holds open for writing
+                // (e.g. a note still open in KeyNote NF) can still be backed up,
+                // instead of failing with a sharing violation and being skipped.
+                FileShare.ReadWrite, bufferSize: 81920, useAsync: true))
             await using (var dstStream = new FileStream(
                 tempPath, FileMode.Create, FileAccess.Write,
                 FileShare.None, bufferSize: 81920, useAsync: true))
@@ -2047,7 +2050,10 @@ public class DirectoryBackupService
 
             await using (var srcStream = new FileStream(
                 sourcePath, FileMode.Open, FileAccess.Read,
-                FileShare.Read, bufferSize: 81920, useAsync: true))
+                // ReadWrite share so a file another app holds open for writing
+                // (e.g. a note still open in KeyNote NF) can still be backed up,
+                // instead of failing with a sharing violation and being skipped.
+                FileShare.ReadWrite, bufferSize: 81920, useAsync: true))
             await using (var dstStream = new FileStream(
                 tempPath, FileMode.Create, FileAccess.Write,
                 FileShare.None, bufferSize: 81920, useAsync: true))
@@ -2171,7 +2177,9 @@ public class DirectoryBackupService
     {
         await using var stream = new FileStream(
             path, FileMode.Open, FileAccess.Read,
-            FileShare.Read, bufferSize: 81920, useAsync: true);
+            // ReadWrite share so a file another app holds open for writing
+            // (e.g. a note still open in KeyNote NF) can still be read.
+            FileShare.ReadWrite, bufferSize: 81920, useAsync: true);
 
         var buf = new byte[PrefixHashBytes];
         int total = 0, n;
@@ -2227,7 +2235,9 @@ public class DirectoryBackupService
     {
         await using var src = new FileStream(
             sourceFilePath, FileMode.Open, FileAccess.Read,
-            FileShare.Read, bufferSize: 81920, useAsync: true);
+            // ReadWrite share so a file another app holds open for writing
+            // (e.g. a note still open in KeyNote NF) can still be read.
+            FileShare.ReadWrite, bufferSize: 81920, useAsync: true);
 
         var buffer = new byte[blockSize];
 
@@ -2549,6 +2559,25 @@ public class DirectoryBackupService
         => (await ComputeFileHashAndSizeAsync(filePath, ct)).Hash;
 
     /// <summary>
+    /// Read an entire file into memory using a ReadWrite share mode. Unlike
+    /// <see cref="File.ReadAllBytesAsync(string, CancellationToken)"/> (which
+    /// opens with FileShare.Read and therefore fails with a sharing violation
+    /// on a file another app holds open for writing), this can back up a file
+    /// that is still open in its editor — e.g. a note open in KeyNote NF.
+    /// </summary>
+    private static async Task<byte[]> ReadAllBytesSharedAsync(string filePath, CancellationToken ct)
+    {
+        await using var stream = new FileStream(
+            filePath, FileMode.Open, FileAccess.Read, FileShare.ReadWrite,
+            bufferSize: 81920, useAsync: true);
+
+        using var ms = new MemoryStream(
+            stream.Length > 0 && stream.Length <= int.MaxValue ? (int)stream.Length : 0);
+        await stream.CopyToAsync(ms, ct);
+        return ms.ToArray();
+    }
+
+    /// <summary>
     /// Hash a file and report the number of bytes actually read. The returned
     /// size is authoritative for the hashed content: it is captured from the
     /// same read that produced the hash, so it cannot drift from the stored
@@ -2559,7 +2588,10 @@ public class DirectoryBackupService
         string filePath, CancellationToken ct)
     {
         await using var stream = new FileStream(
-            filePath, FileMode.Open, FileAccess.Read, FileShare.Read,
+            // ReadWrite share so a file another app holds open for writing
+            // (e.g. a note still open in KeyNote NF) can still be hashed.
+            // Safe for destination callers too: they never write concurrently.
+            filePath, FileMode.Open, FileAccess.Read, FileShare.ReadWrite,
             bufferSize: 81920, useAsync: true);
 
         var hash = await SHA256.HashDataAsync(stream, ct);
