@@ -376,6 +376,19 @@ public class BackupCoverageViewModel : ViewModelBase
 
     public bool HasActualSize => !string.IsNullOrEmpty(_actualSizeText);
 
+    private DedupSizeEstimate? _lastEstimate;
+    /// <summary>
+    /// The raw result of the most recent "compute actual size" pass (null until one
+    /// runs). Exposed as a structured value — not just the formatted
+    /// <see cref="ActualSizeText"/> — so it can be logged/exported and compared
+    /// against what a real backup actually writes (see tools/dedup_estimate_test).
+    /// </summary>
+    public DedupSizeEstimate? LastEstimate
+    {
+        get => _lastEstimate;
+        private set => SetProperty(ref _lastEstimate, value);
+    }
+
     private string _actualSizeProgressText = "";
     public string ActualSizeProgressText
     {
@@ -439,6 +452,7 @@ public class BackupCoverageViewModel : ViewModelBase
 
             var est = await Task.Run(
                 () => _estimator.EstimateAsync(job, files, targetDir, progress, ct), ct);
+            LastEstimate = est;
 
             string kind = est.BlockLevel ? "block-level dedup" : "file-level dedup";
             ActualSizeText =

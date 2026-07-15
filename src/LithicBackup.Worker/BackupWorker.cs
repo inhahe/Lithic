@@ -35,8 +35,17 @@ public sealed class BackupWorker : BackgroundService
     private readonly IDestinationResolver _destinationResolver;
     private readonly ISourceResolver _sourceResolver;
 
-    /// <summary>How often we reload backup sets, check schedules, and read journals.</summary>
-    private static readonly TimeSpan PollInterval = TimeSpan.FromSeconds(30);
+    /// <summary>
+    /// Default cadence for reloading backup sets, checking schedules, and reading
+    /// journals. Continuous sets can request a shorter interval via
+    /// <see cref="BackupSchedule.PollIntervalSeconds"/>; see
+    /// <see cref="ComputeEffectivePollInterval"/>.
+    /// </summary>
+    private static readonly TimeSpan DefaultPollInterval = TimeSpan.FromSeconds(30);
+
+    /// <summary>Floor on the continuous poll interval so a tiny configured value
+    /// can't spin the worker loop into a busy-poll.</summary>
+    private static readonly TimeSpan MinPollInterval = TimeSpan.FromSeconds(5);
 
     /// <summary>
     /// Upper bound on how long a continuous-mode change may stay pending before
@@ -206,7 +215,7 @@ public sealed class BackupWorker : BackgroundService
                     _logger.LogError(ex, "Error in worker loop.");
                 }
 
-                await Task.Delay(PollInterval, stoppingToken);
+                await Task.Delay(ComputeEffectivePollInterval(), stoppingToken);
             }
         }
         finally
@@ -336,6 +345,35 @@ public sealed class BackupWorker : BackgroundService
     // ------------------------------------------------------------------
     // Continuous / USN-journal-driven
     // ------------------------------------------------------------------
+
+    /// <summary>
+    /// The loop delay for the next poll: the smallest
+    /// <see cref="BackupSchedule.PollIntervalSeconds"/> requested by any active
+    /// continuous set (clamped to <see cref="MinPollInterval"/>), or
+    /// <see cref="DefaultPollInterval"/> when no continuous set is active. A single
+    /// shared loop serves every set, so the most demanding continuous set sets the
+    /// pace; interval/daily sets are unaffected by a faster cadence.
+    /// </summary>
+    private TimeSpan ComputeEffectivePollInterval()
+    {
+        var effective = DefaultPollInterval;
+
+        foreach (var state in _sets.Values)
+        {
+            if (!state.IsActive
+                || state.BackupSet.JobOptions?.Schedule is not { Mode: ScheduleMode.Continuous } schedule)
+                continue;
+
+            if (schedule.PollIntervalSeconds <= 0)
+                continue; // treat unset/invalid as "use default"
+
+            var requested = TimeSpan.FromSeconds(schedule.PollIntervalSeconds);
+            if (requested < effective)
+                effective = requested;
+        }
+
+        return effective < MinPollInterval ? MinPollInterval : effective;
+    }
 
     private async Task CheckContinuousAsync(CancellationToken ct)
     {
@@ -943,6 +981,12 @@ public sealed class BackupWorker : BackgroundService
                 _logger.LogWarning(
                     "Continuous backup for \"{Name}\" had {Count} failed file(s).",
                     set.Name, result.FailedFiles.Count);
+
+                foreach (var f in result.FailedFiles.Take(10))
+                    _logger.LogWarning("  Failed: {Path} — {Error}", f.Path, f.Error);
+                if (result.FailedFiles.Count > 10)
+                    _logger.LogWarning(
+                        "  … and {More} more failed file(s).", result.FailedFiles.Count - 10);
             }
         }
         catch (OperationCanceledException) when (ct.IsCancellationRequested)
@@ -1059,7 +1103,10 @@ public sealed class BackupWorker : BackgroundService
                             // a full scan that never runs in pure-continuous mode).
                             recopied++;
                             EnqueueForBackup(state, move.NewPath, move.IsDirectory, now);
-                            await MarkMovedOutAsync(set, move.OldPath, move.IsDirectory, ct);
+                            if (!await MarkMovedOutAsync(set, move.OldPath, move.IsDirectory, ct))
+                                // A file was re-created at the old path (atomic-save
+                                // replace): it wasn't tombstoned, so back it up in place.
+                                EnqueueForBackup(state, move.OldPath, move.IsDirectory, now);
                             break;
                     }
                 }
@@ -1082,7 +1129,10 @@ public sealed class BackupWorker : BackgroundService
                         "[rename-trace] step 4: '{Old}' moved OUT of the set (new path not covered) — " +
                         "marking removed, destination copy left as-is.",
                         move.OldPath);
-                    await MarkMovedOutAsync(set, move.OldPath, move.IsDirectory, ct);
+                    if (!await MarkMovedOutAsync(set, move.OldPath, move.IsDirectory, ct))
+                        // A file was re-created at the old path (atomic-save replace):
+                        // it wasn't tombstoned, so back it up in place instead.
+                        EnqueueForBackup(state, move.OldPath, move.IsDirectory, now);
                 }
             }
 
@@ -1149,21 +1199,49 @@ public sealed class BackupWorker : BackgroundService
     /// exactly as a full-scan deletion would mark them: version history (and the
     /// destination copy) is retained until the user's next cleanup purges it. The
     /// destination is never touched here.
+    ///
+    /// Returns <c>true</c> when the record(s) were actually tombstoned, or
+    /// <c>false</c> when the tombstone was SKIPPED because a file/directory still
+    /// occupies the "vacated" path — see the atomic-save guard below. A caller that
+    /// gets <c>false</c> should back the path up instead (it still holds content).
     /// </summary>
-    private async Task MarkMovedOutAsync(BackupSet set, string oldPath, bool isDirectory, CancellationToken ct)
+    private async Task<bool> MarkMovedOutAsync(BackupSet set, string oldPath, bool isDirectory, CancellationToken ct)
     {
+        // Atomic-save / same-name-recreate guard. Applications that save atomically
+        // (KeyNote's .knt files, and many editors) rename the original out to a
+        // temp/backup name — which the journal reports as a move whose new name is
+        // outside the set — and IMMEDIATELY write a replacement at the original
+        // path. By the time we apply the move (next poll), a file already exists
+        // again at oldPath. Tombstoning it here would soft-delete the live record,
+        // so the next backup can't find the prior version: it restarts at v1 and
+        // never moves the old copy into _prev (the version chain is discarded on
+        // every save). If something still occupies the path, it was replaced in
+        // place, not removed — leave the record live and let the caller back it up
+        // so it versions normally.
+        bool stillOccupied = isDirectory ? Directory.Exists(oldPath) : File.Exists(oldPath);
+        if (stillOccupied)
+        {
+            _logger.LogDebug(
+                "Continuous backup for \"{Name}\": path \"{Path}\" reported moved-out but still " +
+                "exists on disk (atomic-save replace) — keeping its record live and backing it up.",
+                set.Name, oldPath);
+            return false;
+        }
+
         try
         {
             if (isDirectory)
                 await _catalog.MarkFilesDeletedByDirectoryAsync(set.Id, oldPath, ct);
             else
                 await _catalog.MarkFilesDeletedBySourcePathsAsync(set.Id, new[] { oldPath }, ct);
+            return true;
         }
         catch (Exception ex)
         {
             _logger.LogWarning(ex,
                 "Continuous backup for \"{Name}\": failed to reconcile moved-out path \"{Path}\".",
                 set.Name, oldPath);
+            return false;
         }
     }
 
@@ -1235,6 +1313,9 @@ public sealed class BackupWorker : BackgroundService
 
                 foreach (var f in result.FailedFiles.Take(10))
                     _logger.LogWarning("  Failed: {Path} — {Error}", f.Path, f.Error);
+                if (result.FailedFiles.Count > 10)
+                    _logger.LogWarning(
+                        "  … and {More} more failed file(s).", result.FailedFiles.Count - 10);
             }
 
             return true;

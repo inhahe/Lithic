@@ -1781,6 +1781,7 @@ public class MainViewModel : ViewModelBase
                         DailyHour = src.JobOptions.Schedule.DailyHour,
                         DailyMinute = src.JobOptions.Schedule.DailyMinute,
                         DebounceSeconds = src.JobOptions.Schedule.DebounceSeconds,
+                        PollIntervalSeconds = src.JobOptions.Schedule.PollIntervalSeconds,
                     };
                 }
             }
@@ -2371,22 +2372,11 @@ public class MainViewModel : ViewModelBase
     private bool WarnAndMaybeSwitchToUdf(
         BackupJob job, BackupPlan plan, string setName, Action stopScanProgress)
     {
-        // Only IncompatibleOnly silently zips for compatibility. ZipMode.All zips
-        // everything regardless of format; ZipMode.None never zips. And if the format
-        // is already UDF there's nothing more permissive to suggest.
-        if (job.ZipMode != ZipMode.IncompatibleOnly || job.FilesystemType == FilesystemType.UDF)
-            return true;
-
+        // The significance rules (which ZipMode/format qualify, and the 5%-files /
+        // 5%-bytes / 20-files thresholds) live in DiscCompatibilityAdvisor so the
+        // headless test harness exercises the exact same decision the user sees.
         var summary = _orchestrator.SummarizeCompatibility(plan, job.FilesystemType);
-        if (!summary.HasIncompatible)
-            return true;
-
-        // "Significant" = enough that the user should reconsider the format up front:
-        // at least 5% of files, at least 5% of bytes, or at least 20 files affected.
-        bool significant = summary.IncompatibleFileFraction >= 0.05
-            || summary.IncompatibleByteFraction >= 0.05
-            || summary.IncompatibleFiles >= 20;
-        if (!significant)
+        if (!DiscCompatibilityAdvisor.ShouldWarn(job.ZipMode, job.FilesystemType, summary))
             return true;
 
         // Stop scan-progress callbacks from overwriting the dialog's status text.
@@ -2405,22 +2395,22 @@ public class MainViewModel : ViewModelBase
             + $"\u2022 No \u2014 keep {fmt} and zip the incompatible files\n"
             + "\u2022 Cancel \u2014 don't start the backup";
 
-        var choice = MessageBox.Show(
+        var result = MessageBox.Show(
             message,
             "Many files incompatible with the disc format",
             MessageBoxButton.YesNoCancel, MessageBoxImage.Warning);
 
-        switch (choice)
+        var choice = result switch
         {
-            case MessageBoxResult.Yes:
-                job.FilesystemType = FilesystemType.UDF;
-                StatusText = $"\"{setName}\": switched to UDF for this backup.";
-                return true;
-            case MessageBoxResult.No:
-                return true;
-            default:
-                return false;
-        }
+            MessageBoxResult.Yes => UdfWarningChoice.SwitchToUdf,
+            MessageBoxResult.No => UdfWarningChoice.KeepFormat,
+            _ => UdfWarningChoice.Cancel,
+        };
+
+        bool proceed = DiscCompatibilityAdvisor.ApplyChoice(job, choice);
+        if (choice == UdfWarningChoice.SwitchToUdf)
+            StatusText = $"\"{setName}\": switched to UDF for this backup.";
+        return proceed;
     }
 
     private async void StartIncrementalFlow(BackupSetRowViewModel row)
@@ -2885,6 +2875,7 @@ public class MainViewModel : ViewModelBase
             vm.ScheduleDailyHour = sched.DailyHour;
             vm.ScheduleDailyMinute = sched.DailyMinute;
             vm.ScheduleDebounceSeconds = sched.DebounceSeconds.ToString();
+            vm.SchedulePollSeconds = sched.PollIntervalSeconds.ToString();
         }
     }
 
@@ -2956,6 +2947,7 @@ public class MainViewModel : ViewModelBase
                 DailyHour = vm.ScheduleDailyHour,
                 DailyMinute = vm.ScheduleDailyMinute,
                 DebounceSeconds = int.TryParse(vm.ScheduleDebounceSeconds, out var s) ? s : 60,
+                PollIntervalSeconds = int.TryParse(vm.SchedulePollSeconds, out var p) && p > 0 ? p : 30,
             };
         }
         else if (opts.Schedule is not null)

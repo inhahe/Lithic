@@ -23,6 +23,16 @@ using LithicBackup.Services;
 string root = Path.Combine(Path.GetTempPath(), "lithic-disc-harness");
 if (Directory.Exists(root))
 {
+    // Clear read-only attributes first: some tests intentionally create read-only
+    // source files (the item-1 reburn cleanup test), and File.Copy preserves that
+    // flag into staging/shelf/restore trees. A plain Directory.Delete would throw
+    // on any leftover read-only file and leak the whole tree into the next run.
+    try
+    {
+        foreach (var f in Directory.EnumerateFiles(root, "*", SearchOption.AllDirectories))
+            try { new FileInfo(f).IsReadOnly = false; } catch { }
+    }
+    catch { /* best effort */ }
     try { Directory.Delete(root, true); } catch { /* best effort */ }
 }
 Directory.CreateDirectory(root);
@@ -128,6 +138,93 @@ await runner.Run("verify-disc-integrity", async ws =>
         var vr = await restore.VerifyDiscAsync(disc.Id, discRoot, verifyContents: true);
         ws.Assert(vr.Success, $"disc {disc.Label} failed integrity: {string.Join("; ", vr.Issues.Select(i => $"{i.SourcePath}:{i.Kind}"))}");
     }
+});
+
+await runner.Run("reburn-staging-cleanup-handles-readonly-source", async ws =>
+{
+    // Roadmap item 1: staging cleanup must clear the read-only attribute before
+    // deleting the temp staging directory (ForceDeleteDirectory). The re-burn /
+    // consolidate paths stage via File.Copy, which PRESERVES the source's read-only
+    // flag — so a read-only SOURCE file (git object/pack files, anything copied
+    // from read-only media) lands as a read-only STAGED copy. A plain
+    // Directory.Delete then throws UnauthorizedAccessException and, because the
+    // cleanup is wrapped in catch{}, the reburn still "succeeds" while leaking its
+    // staging tree in %TEMP%\LithicBackup\reburn-* forever. (The MAIN backup path
+    // stages with a manual stream copy, which creates a fresh non-read-only file,
+    // so only the File.Copy-based reburn/consolidate paths hit this.) This test
+    // drives ReplaceDiscFilesAsync on a read-only source and pins the observable:
+    // no reburn staging directory is left behind.
+    var srcs = ws.MakeTree(("ro/locked.bin", 50_000), ("ro/normal.bin", 30_000));
+    new FileInfo(srcs[0]).IsReadOnly = true;
+
+    var (burner, result) = await ws.Backup(srcs);
+    ws.Assert(result.Success, "initial backup should succeed");
+
+    var disc = (await ws.Catalog.GetDiscsForBackupSetAsync(ws.BackupSetId)).Single();
+    var files = await ws.Catalog.GetFilesOnDiscAsync(disc.Id);
+    var lockedId = files.Single(f => f.SourcePath.EndsWith("locked.bin")).Id;
+
+    // Snapshot existing reburn-* staging dirs (the name carries a GUID) so we only
+    // judge THIS reburn's cleanup, immune to anything a prior test may have left.
+    string lithicTmp = Path.Combine(Path.GetTempPath(), "LithicBackup");
+    HashSet<string> Reburns() => Directory.Exists(lithicTmp)
+        ? Directory.GetDirectories(lithicTmp, "reburn-*").ToHashSet(StringComparer.OrdinalIgnoreCase)
+        : new HashSet<string>(StringComparer.OrdinalIgnoreCase);
+    var before = Reburns();
+
+    var orch = ws.BuildOrchestrator(burner);
+    int reburned = await orch.ReplaceDiscFilesAsync(disc.Id, new[] { lockedId }, Workspace.RecorderId);
+    ws.Assert(reburned == 1, $"expected the read-only file re-burned, got {reburned}");
+
+    var leaked = Reburns();
+    leaked.ExceptWith(before);
+    ws.Assert(leaked.Count == 0,
+        $"reburn staging dir leaked (read-only cleanup failed): [{string.Join(", ", leaked.Select(Path.GetFileName))}]");
+
+    // The re-burned read-only file must still restore byte-for-byte.
+    var r = await ws.RestoreAndVerify(burner, srcs);
+    ws.Assert(r.Mismatches == 0, $"{r.Mismatches} restored file(s) had wrong content");
+    ws.Assert(r.Restored == srcs.Count, $"restored {r.Restored}/{srcs.Count} files");
+
+    // Leave the source tree deletable for the harness's best-effort root cleanup.
+    try { new FileInfo(srcs[0]).IsReadOnly = false; } catch { }
+});
+
+await runner.Run("readonly-source-main-path-no-staging-leak", async ws =>
+{
+    // Roadmap item 1, main-burn-path angle: a plain disc backup of read-only
+    // source files (git objects, anything off read-only media) must succeed,
+    // restore byte-for-byte, and leave NO staging directory behind in
+    // %TEMP%\LithicBackup (disc-*/spill-*). The main path stages via a fresh
+    // stream copy (so staged files aren't read-only), and all seven cleanup
+    // sites route through ForceDeleteDirectory — this pins that a whole set of
+    // read-only content burns and cleans up without leaking temp.
+    var srcs = ws.MakeTree(
+        ("ro/a.bin", 60_000), ("ro/b.bin", 40_000), ("ro/c.bin", 50_000));
+    foreach (var s in srcs) new FileInfo(s).IsReadOnly = true;
+
+    string lithicTmp = Path.Combine(Path.GetTempPath(), "LithicBackup");
+    HashSet<string> Staging() => Directory.Exists(lithicTmp)
+        ? Directory.GetDirectories(lithicTmp, "*")
+            .Where(d => { var n = Path.GetFileName(d); return n.StartsWith("disc-") || n.StartsWith("spill-"); })
+            .ToHashSet(StringComparer.OrdinalIgnoreCase)
+        : new HashSet<string>(StringComparer.OrdinalIgnoreCase);
+    var before = Staging();
+
+    var (burner, result) = await ws.Backup(srcs);
+    ws.Assert(result.Success, "read-only-source backup should succeed");
+
+    var leaked = Staging();
+    leaked.ExceptWith(before);
+    ws.Assert(leaked.Count == 0,
+        $"main-path staging dir leaked on read-only source: [{string.Join(", ", leaked.Select(Path.GetFileName))}]");
+
+    var r = await ws.RestoreAndVerify(burner, srcs);
+    ws.Assert(r.Mismatches == 0, $"{r.Mismatches} restored file(s) had wrong content");
+    ws.Assert(r.Restored == srcs.Count, $"restored {r.Restored}/{srcs.Count} files");
+
+    // Leave the source tree deletable for the harness's best-effort root cleanup.
+    foreach (var s in srcs) { try { new FileInfo(s).IsReadOnly = false; } catch { } }
 });
 
 // ------------------------------------------------------------------
@@ -282,6 +379,69 @@ await runner.Run("plan-time-compat-summary-counts-incompatible", async ws =>
     ws.Assert(udf.IncompatibleFiles == 0,
         $"UDF is permissive; expected 0 incompatible, got {udf.IncompatibleFiles}");
     ws.Assert(!udf.HasIncompatible, "UDF summary should flag nothing");
+});
+
+await runner.Run("udf-warning-decision-yes-no-cancel", async ws =>
+{
+    // Roadmap item 4, the DIALOG side: the WPF warning is a thin shell over
+    // DiscCompatibilityAdvisor, which the view-model and this test share. Here we
+    // drive the three user answers programmatically (no MessageBox) and pin the
+    // outcomes: Yes flips the job to UDF and proceeds, No keeps the format and
+    // proceeds (files will be zipped at burn), Cancel aborts.
+    //
+    // 30 lowercase files => ISO-incompatible; well past the significance floor
+    // (>=5% files / >=5% bytes / >=20 files) so ShouldWarn fires.
+    var spec = Enumerable.Range(0, 30).Select(i => ($"vol/file{i}.txt", 3_000 + i)).ToArray();
+    var srcs = ws.MakeTree(spec);
+    var (orch, plan) = await ws.PlanFor(srcs, FilesystemType.ISO9660);
+    var summary = orch.SummarizeCompatibility(plan, FilesystemType.ISO9660);
+
+    // Significance gate: fires for ISO with many incompatible files...
+    ws.Assert(DiscCompatibilityAdvisor.ShouldWarn(ZipMode.IncompatibleOnly, FilesystemType.ISO9660, summary),
+        "warning should fire for ISO 9660 with 30 incompatible files");
+    // ...never for UDF (nothing more permissive to suggest)...
+    var udfSummary = orch.SummarizeCompatibility(plan, FilesystemType.UDF);
+    ws.Assert(!DiscCompatibilityAdvisor.ShouldWarn(ZipMode.IncompatibleOnly, FilesystemType.UDF, udfSummary),
+        "warning must never fire when the format is already UDF");
+    // ...and never when zipping isn't the compatibility fallback.
+    ws.Assert(!DiscCompatibilityAdvisor.ShouldWarn(ZipMode.All, FilesystemType.ISO9660, summary),
+        "warning must not fire under ZipMode.All (unconditional zip, not a compat fallback)");
+
+    // Yes -> switch this run to UDF, proceed.
+    var jobYes = new BackupJob { FilesystemType = FilesystemType.ISO9660 };
+    bool proceedYes = DiscCompatibilityAdvisor.ApplyChoice(jobYes, UdfWarningChoice.SwitchToUdf);
+    ws.Assert(proceedYes, "Yes should proceed with the burn");
+    ws.Assert(jobYes.FilesystemType == FilesystemType.UDF, "Yes should switch the job to UDF");
+
+    // No -> keep the selected format, proceed (incompatible files get zipped).
+    var jobNo = new BackupJob { FilesystemType = FilesystemType.ISO9660 };
+    bool proceedNo = DiscCompatibilityAdvisor.ApplyChoice(jobNo, UdfWarningChoice.KeepFormat);
+    ws.Assert(proceedNo, "No should still proceed with the burn");
+    ws.Assert(jobNo.FilesystemType == FilesystemType.ISO9660, "No should leave the format unchanged");
+
+    // Cancel -> abort, format untouched.
+    var jobCancel = new BackupJob { FilesystemType = FilesystemType.ISO9660 };
+    bool proceedCancel = DiscCompatibilityAdvisor.ApplyChoice(jobCancel, UdfWarningChoice.Cancel);
+    ws.Assert(!proceedCancel, "Cancel should abort the backup");
+    ws.Assert(jobCancel.FilesystemType == FilesystemType.ISO9660, "Cancel should leave the format unchanged");
+});
+
+await runner.Run("udf-warning-below-threshold-stays-silent", async ws =>
+{
+    // The warning must NOT interrupt for a trivial amount of incompatibility: a
+    // single lowercase (ISO-incompatible) file among 40 legal 8.3 uppercase names
+    // is below the 5%-files / 5%-bytes / 20-files floor, so ShouldWarn is false and
+    // the burn's IncompatibleOnly fallback just zips that one file silently.
+    var spec = Enumerable.Range(0, 41).Select(i =>
+        (i == 0 ? "vol/lower.txt" : $"vol/FILE{i}.TXT", 3_000)).ToArray();
+    var srcs = ws.MakeTree(spec);
+    var (orch, plan) = await ws.PlanFor(srcs, FilesystemType.ISO9660);
+    var summary = orch.SummarizeCompatibility(plan, FilesystemType.ISO9660);
+
+    ws.Assert(summary.IncompatibleFiles == 1,
+        $"fixture should have exactly 1 incompatible file, got {summary.IncompatibleFiles}");
+    ws.Assert(!DiscCompatibilityAdvisor.ShouldWarn(ZipMode.IncompatibleOnly, FilesystemType.ISO9660, summary),
+        "1 incompatible file out of 41 is below every threshold; must not warn");
 });
 
 // ------------------------------------------------------------------

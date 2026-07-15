@@ -406,6 +406,9 @@ public class SqliteCatalogRepository : ICatalogRepository
     public Task<Dictionary<string, FileVersionInfo>> GetLatestVersionInfoAsync(int backupSetId, CancellationToken ct = default)
         => GetSet(backupSetId).GetLatestVersionInfoAsync(backupSetId, ct);
 
+    public Task<Dictionary<string, FileVersionInfo>> GetOrphanedVersionInfoAsync(int backupSetId, CancellationToken ct = default)
+        => GetSet(backupSetId).GetOrphanedVersionInfoAsync(backupSetId, ct);
+
     public Task<int> GetFileCountForBackupSetAsync(int backupSetId, CancellationToken ct = default)
         => GetSet(backupSetId).GetFileCountForBackupSetAsync(backupSetId, ct);
 

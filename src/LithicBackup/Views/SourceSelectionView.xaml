@@ -605,8 +605,29 @@
                             <TextBlock Text="Wait" VerticalAlignment="Center" Margin="0,0,6,0" />
                             <TextBox Text="{Binding ScheduleDebounceSeconds, UpdateSourceTrigger=PropertyChanged}"
                                      Padding="4,3" Width="60"
-                                     BorderBrush="{StaticResource BorderBrush}" />
+                                     BorderBrush="{StaticResource BorderBrush}"
+                                     ToolTip="Seconds a file must be quiet after its last change before it is backed up (debounce)." />
                             <TextBlock Text="seconds after last change"
+                                       VerticalAlignment="Center" Margin="6,0,0,0" />
+                        </StackPanel>
+                        <!-- Continuous poll interval -->
+                        <StackPanel Orientation="Horizontal" Margin="0,0,0,4">
+                            <StackPanel.Style>
+                                <Style TargetType="StackPanel">
+                                    <Setter Property="Visibility" Value="Collapsed" />
+                                    <Style.Triggers>
+                                        <DataTrigger Binding="{Binding ScheduleMode}" Value="Continuous">
+                                            <Setter Property="Visibility" Value="Visible" />
+                                        </DataTrigger>
+                                    </Style.Triggers>
+                                </Style>
+                            </StackPanel.Style>
+                            <TextBlock Text="Check for changes every" VerticalAlignment="Center" Margin="0,0,6,0" />
+                            <TextBox Text="{Binding SchedulePollSeconds, UpdateSourceTrigger=PropertyChanged}"
+                                     Padding="4,3" Width="60"
+                                     BorderBrush="{StaticResource BorderBrush}"
+                                     ToolTip="How often the Worker polls the change journal for this set. The Worker uses the smallest value across all continuous sets. Minimum 5 seconds." />
+                            <TextBlock Text="seconds"
                                        VerticalAlignment="Center" Margin="6,0,0,0" />
                         </StackPanel>
                     </StackPanel>

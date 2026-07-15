@@ -1,5 +1,137 @@
 # LithicBackup — Known Issues & Tech Debt
 
+## FIXED (both parts): Atomically-saved files (e.g. KeyNote .knt) never accumulate versions (2026-07-15)
+
+**Symptom.** A file edited by an application that saves *atomically* — writing a
+temp file then replacing/renaming the original (KeyNote NF `.knt`, and many text
+editors) — is re-copied on every save but **never accumulates versions in `_prev`**,
+and its version number stays stuck at 1. Diagnosed on the user's live catalogs:
+`D:\youtube\philosophy\philosophy.knt` had two catalog rows, **both Version 1, both
+`IsDeleted = 1`**, different DiscIds, **different hashes** (content genuinely changed
+2026-07-12 → 2026-07-15). No `_prev` row was ever cut. Meanwhile files KeyNote writes
+in place (its `_BAK@Dn`/`_BAK@Wn` rotation copies) *did* version correctly
+(`philosophy_BAK@D5.knt` reached v4 with `.v3`/`.v2` in `D_prev`).
+
+**Root cause.** An atomic save briefly removes the original file. Continuous backup
+sees the disappearance and soft-deletes the catalog record (`IsDeleted = 1`), then
+sees the replacement as a brand-new file. `SqliteSetDatabase.GetLatestVersionInfoAsync`
+filters `WHERE IsDeleted = 0`, so the next backup finds **no prior version** →
+`hasExistingInfo = false` → the `if (isChanged && keepVersions && hasExistingInfo)`
+block in `DirectoryBackupService` that moves the old copy into `_prev` never runs, and
+the version resets to 1. History is discarded on every save.
+
+**Fix (this commit) — version-chain resurrection.** New
+`ICatalogRepository.GetOrphanedVersionInfoAsync` returns the "orphaned history" set:
+paths whose *entire* history is tombstoned (latest row `IsDeleted = 1`), so they're
+absent from `GetLatestVersionInfoAsync`. `DirectoryBackupService.ExecuteAsync` now
+loads this alongside `versionInfo` and, when the live lookup misses, falls back to it
+(`resurrecting = true`): it continues the chain (`version = MaxVersion + 1`), the
+`_prev` move picks up the old copy still at its live on-disk path and **un-deletes**
+that record as a retained version, and the content-identity short-circuit revives an
+identical reappeared file in place (un-delete + refresh) instead of leaving it a ghost.
+Source-agnostic: any deleted-then-reappeared path now keeps its history.
+
+**Fix part 2 — atomic-save-aware change detection (stops the churn at the source).**
+Resurrection *repairs* the chain, but the churn root was that every atomic save
+tombstoned the record and cut a fresh `v1` row (the two `philosophy.knt` rows) and
+duplicated DiscPaths. The tombstone came from the Worker's move path: an atomic save
+renames the original out to a temp/backup name (a move whose *new* name is outside the
+set), which `RunMovesAsync` treats as "moved OUT of the set" and hands to
+`MarkMovedOutAsync` to soft-delete — even though the app immediately re-creates a file
+at the original path. `BackupWorker.MarkMovedOutAsync` now **guards on on-disk
+presence**: before tombstoning a "vacated" path it checks `File.Exists`/`Directory.Exists`,
+and if something still occupies the path (an in-place replace, not a real removal) it
+skips the tombstone, returns `false`, and the caller enqueues the path for a normal
+backup so it versions in place. This applies to both the `FellBack` (within-set move
+that couldn't relocate) and `oldIn`-only (moved-out) branches. The two fixes compose:
+if a poll happens to land inside the save's brief file-absent window and does tombstone,
+part 1 (resurrection) still recovers the chain on the next backup. Net result: an
+atomically-saved file now versions on the normal in-place path (v→v+1, old copy into
+`_prev`) with no tombstone churn.
+
+*Not covered by an automated test:* the guard lives deep in the Worker's USN
+move-application path (`RunMovesAsync`), which needs a live NTFS USN journal and the
+full worker dependency graph to exercise end-to-end; a proportionate harness doesn't
+exist yet. The guard itself is a simple on-disk-presence check, and part 1's
+resurrection (covered by `tools/resurrection_test`) is the safety net for the residual
+race. Worth adding a worker-level move-classification harness later.
+
+---
+
+## FIXED: Case-only path changes corrupt version history + orphan _prev files (2026-07-15)
+
+**Fixed 2026-07-15** — the new-backup half of this bug is resolved. Every
+`SourcePath` comparison/partition in `SqliteSetDatabase` is now `COLLATE NOCASE`
+(`GetLatestVersionInfoAsync` `PARTITION BY`, `GetFileCountForBackupSetAsync`
+`COUNT(DISTINCT …)`, `GetFileRecordByPathAndVersionAsync`, `GetFileRecordsByPathAsync`,
+`GetFileRecordsUnderDirectoryAsync` exact match, `MarkFilesDeletedByDirectoryAsync`
+exact match, `MarkFilesDeletedBySourcePathsAsync`). A case-only rename now advances the
+single version chain and repoints the old row into `_prev` instead of forking the chain
+and orphaning the file. Covered by `tools/case_rename_test` (end-to-end: two real
+directory backups against a real per-set catalog with a case-only dir rename in
+between; the test fails with the `COLLATE NOCASE` clauses removed). `tools/dir_dedup_test`
+still passes (no dedup regression).
+
+**Still open — data repair.** This fix only stops NEW corruption. Existing catalogs
+that already forked (e.g. set-11's `forward raytracer\ROADMAP.md` with parallel
+`ROADMAP.md`/`roadmap.md` chains and four v4 rows) still need a one-time reconcile:
+fold case-variant `SourcePath`s into one chain, renumber versions, drop redundant
+"current" rows. The 708 already-orphaned `_prev` files remain cleanable via the
+"Untracked Files (destination scan)" cleanup. Sketch below under **Proper fix**.
+
+---
+
+**Symptom:** the destination "Untracked Files" scan lists many `_prev` version
+files that have no catalog row. In set-11 (I:\lithicbackup) a direct disk-vs-catalog
+diff found **708 orphaned `_prev` files** under `D_prev` (392 `.fileref`, 316 plain)
+that no catalog `DiscPath` references. Most (706/708) are legacy from a June catalog
+rollback, but **2 are live (July 14–15)** and pinpoint an ongoing bug.
+
+**Root cause — inconsistent case sensitivity in catalog path handling.** Windows
+paths are case-insensitive, but the catalog treats `SourcePath` case-*sensitively* in
+some places and case-*insensitively* in others:
+- `SqliteSetDatabase.GetLatestVersionInfoAsync` partitions with
+  `ROW_NUMBER() OVER (PARTITION BY f.SourcePath ...)` under SQLite's default BINARY
+  (case-sensitive) collation, so `D:\...\ROADMAP.md` and `D:\...\roadmap.md` become
+  **two** partitions, each returning its own "latest" row. The caller then loads
+  these into a `Dictionary<string,FileVersionInfo>(OrdinalIgnoreCase)` which
+  **collapses them nondeterministically** (last row inserted wins; the outer query
+  has no ORDER BY).
+- `GetFileRecordByPathAndVersionAsync` matches `f.SourcePath = $path` (case-sensitive).
+- The versioning move in `DirectoryBackupService.ExecuteAsync` (~line 786) uses
+  `File.Exists` (case-insensitive on Windows) to decide the `_prev` move, but repoints
+  the old catalog row via the case-sensitive `GetFileRecordByPathAndVersionAsync`.
+
+When a file's path casing changes between backups (e.g. an editor rewrites
+`ROADMAP.md` as `roadmap.md`), `version = existingInfo.MaxVersion + 1` is computed
+from whichever casing survived the dict collapse, the physical file **is** moved to
+`_prev`, but the repoint lookup uses the current-scan casing and returns null → the
+`_prev` file is orphaned, and the catalog accumulates duplicate/parallel version
+chains. Confirmed in set-11: `forward raytracer\ROADMAP.md` has simultaneously-active
+rows for `ROADMAP.md` v1, `roadmap.md` v2/v3, and **four** `ROADMAP.md` v4 rows, all
+pointing at the same physical (case-insensitive) file, plus orphaned
+`roadmap.md.v1` and `ROADMAP.md.v3` under `_prev`.
+`COUNT(DISTINCT SourcePath COLLATE NOCASE)` = 1 where `COUNT(DISTINCT SourcePath)` = 2
+for this file — proof the catalog is double-counting one file.
+
+**Proper fix:** make `SourcePath` handling consistently case-insensitive across the
+catalog on Windows. Apply `COLLATE NOCASE` to every `SourcePath` comparison and to the
+`PARTITION BY` in `GetLatestVersionInfoAsync` (and the grouping in
+`GetFileRecordsByPathAsync`, retention grouping, dedup lookups, etc.), OR canonicalize
+`SourcePath` casing at write time so the catalog never stores two casings for one file.
+NOCASE partition + NOCASE lookup fixes version numbering and the repoint together so
+new backups stop orphaning and stop forking version chains. **Also needs a repair
+story for existing data:** the 708 orphaned `_prev` files are cleanable via the
+"Untracked Files (destination scan)" cleanup today; the duplicated/forked catalog
+version rows need a reconcile (fold case-variant `SourcePath`s into one chain,
+renumber versions, drop the redundant "current" rows).
+
+**Not a retention or a save-versioning failure:** current backups DO catalog `_prev`
+versions correctly (channels.conf v1–v7 are tracked under `_prev`), and retention
+works per the configured "Custom 1" tier (`*.conf` etc. keep all versions ≤10 days).
+The orphans are (a) legacy from a June catalog rollback and (b) fresh casualties of
+this case-sensitivity bug — not a failure to write version rows.
+
 ## ADDED: Dedup-aware "actual backup size" estimate (2026-07-15)
 
 **Problem (roadmap item 6):** the pre-backup coverage scan

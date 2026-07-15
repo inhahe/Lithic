@@ -434,7 +434,13 @@ internal sealed class SqliteSetDatabase : IDisposable
                        f.IsFileRef,
                        f.Hash,
                        ROW_NUMBER() OVER (
-                           PARTITION BY f.SourcePath
+                           -- COLLATE NOCASE: the Windows filesystem is
+                           -- case-insensitive, so "Foo\bar.txt" and
+                           -- "foo\bar.txt" are the SAME file and must share one
+                           -- version chain.  Without NOCASE, a case-only rename
+                           -- forks the chain (two "current" rows) and breaks the
+                           -- _prev repoint, orphaning old versions on disk.
+                           PARTITION BY f.SourcePath COLLATE NOCASE
                            ORDER BY f.Version DESC, f.Id DESC
                        ) AS rn
                 FROM Files f
@@ -461,6 +467,58 @@ internal sealed class SqliteSetDatabase : IDisposable
         return dict;
     }
 
+    public async Task<Dictionary<string, FileVersionInfo>> GetOrphanedVersionInfoAsync(int backupSetId, CancellationToken ct = default)
+    {
+        ct.ThrowIfCancellationRequested();
+        using var _ = await LockAsync(ct).ConfigureAwait(false);
+
+        using var cmd = _connection.CreateCommand();
+        // Latest record per SourcePath across ALL rows (deleted included),
+        // keeping only paths whose newest row is soft-deleted. A path with a
+        // live (IsDeleted = 0) latest row is already covered by
+        // GetLatestVersionInfoAsync and is intentionally excluded here so the
+        // two dictionaries never overlap. COLLATE NOCASE mirrors that method:
+        // the Windows filesystem is case-insensitive, so all casings of a path
+        // share one version chain.
+        cmd.CommandText = """
+            SELECT SourcePath, Version, SizeBytes, SourceLastWriteUtc, IsDeduped, IsFileRef, Hash
+            FROM (
+                SELECT f.SourcePath,
+                       f.Version,
+                       f.SizeBytes,
+                       f.SourceLastWriteUtc,
+                       f.IsDeduped,
+                       f.IsFileRef,
+                       f.Hash,
+                       f.IsDeleted,
+                       ROW_NUMBER() OVER (
+                           PARTITION BY f.SourcePath COLLATE NOCASE
+                           ORDER BY f.Version DESC, f.Id DESC
+                       ) AS rn
+                FROM Files f
+                INNER JOIN Discs d ON f.DiscId = d.Id
+                WHERE d.BackupSetId = $setId
+            )
+            WHERE rn = 1 AND IsDeleted = 1
+            """;
+        cmd.Parameters.AddWithValue("$setId", backupSetId);
+
+        var dict = new Dictionary<string, FileVersionInfo>(StringComparer.OrdinalIgnoreCase);
+        using var r = cmd.ExecuteReader();
+        while (r.Read())
+        {
+            string path = r.GetString(0);
+            dict[path] = new FileVersionInfo(
+                MaxVersion: r.GetInt32(1),
+                SizeBytes: r.GetInt64(2),
+                SourceLastWriteUtc: DateTime.Parse(r.GetString(3), null, DateTimeStyles.RoundtripKind),
+                IsDeduped: r.GetInt32(4) != 0,
+                IsFileRef: r.GetInt32(5) != 0,
+                Hash: r.IsDBNull(6) ? "" : r.GetString(6));
+        }
+        return dict;
+    }
+
     public async Task<int> GetFileCountForBackupSetAsync(int backupSetId, CancellationToken ct = default)
     {
         ct.ThrowIfCancellationRequested();
@@ -468,7 +526,7 @@ internal sealed class SqliteSetDatabase : IDisposable
 
         using var cmd = _connection.CreateCommand();
         cmd.CommandText = """
-            SELECT COUNT(DISTINCT f.SourcePath)
+            SELECT COUNT(DISTINCT f.SourcePath COLLATE NOCASE)
             FROM Files f
             INNER JOIN Discs d ON f.DiscId = d.Id
             WHERE d.BackupSetId = $setId AND f.IsDeleted = 0
@@ -488,7 +546,7 @@ internal sealed class SqliteSetDatabase : IDisposable
             SELECT f.* FROM Files f
             INNER JOIN Discs d ON f.DiscId = d.Id
             WHERE d.BackupSetId = $setId
-              AND f.SourcePath = $path
+              AND f.SourcePath = $path COLLATE NOCASE
               AND f.Version = $ver
             LIMIT 1
             """;
@@ -510,7 +568,7 @@ internal sealed class SqliteSetDatabase : IDisposable
             SELECT f.* FROM Files f
             INNER JOIN Discs d ON f.DiscId = d.Id
             WHERE d.BackupSetId = $setId
-              AND f.SourcePath = $path
+              AND f.SourcePath = $path COLLATE NOCASE
             ORDER BY f.Version
             """;
         cmd.Parameters.AddWithValue("$setId", backupSetId);
@@ -545,7 +603,7 @@ internal sealed class SqliteSetDatabase : IDisposable
             SELECT f.* FROM Files f
             INNER JOIN Discs d ON f.DiscId = d.Id
             WHERE d.BackupSetId = $setId
-              AND (f.SourcePath LIKE $prefix ESCAPE '\' OR f.SourcePath = $exact)
+              AND (f.SourcePath LIKE $prefix ESCAPE '\' OR f.SourcePath = $exact COLLATE NOCASE)
             ORDER BY f.SourcePath, f.Version
             """;
         cmd.Parameters.AddWithValue("$setId", backupSetId);
@@ -675,7 +733,7 @@ internal sealed class SqliteSetDatabase : IDisposable
             UPDATE Files SET IsDeleted = 1
             WHERE IsDeleted = 0
               AND DiscId IN (SELECT Id FROM Discs WHERE BackupSetId = $setId)
-              AND (SourcePath LIKE $prefix ESCAPE '\' OR SourcePath = $exact)
+              AND (SourcePath LIKE $prefix ESCAPE '\' OR SourcePath = $exact COLLATE NOCASE)
             """;
         cmd.Parameters.AddWithValue("$setId", backupSetId);
         // Escape the escape character (backslash) FIRST — Windows source paths
@@ -705,7 +763,7 @@ internal sealed class SqliteSetDatabase : IDisposable
             UPDATE Files SET IsDeleted = 1
             WHERE IsDeleted = 0
               AND DiscId IN (SELECT Id FROM Discs WHERE BackupSetId = $setId)
-              AND SourcePath = $path
+              AND SourcePath = $path COLLATE NOCASE
             """;
         cmd.Parameters.AddWithValue("$setId", backupSetId);
         var pathParam = cmd.Parameters.AddWithValue("$path", "");
