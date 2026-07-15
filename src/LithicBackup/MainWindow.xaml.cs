@@ -1,15 +1,66 @@
 using System.ComponentModel;
 using System.Windows;
+using System.Windows.Interop;
 using LithicBackup.Views;
 
 namespace LithicBackup;
 
 public partial class MainWindow : Window
 {
+    // Session-end messages the MSI's Restart Manager (WiX util:CloseApplication
+    // with EndSessionMessage="yes") posts to this window's HWND during an upgrade.
+    private const int WM_QUERYENDSESSION = 0x0011;
+    private const int WM_ENDSESSION = 0x0016;
+
     public MainWindow()
     {
         InitializeComponent();
         ContentRendered += OnContentRendered;
+        SourceInitialized += OnSourceInitialized;
+    }
+
+    /// <summary>
+    /// Hook the raw window procedure so we can catch the Restart Manager's
+    /// WM_QUERYENDSESSION / WM_ENDSESSION messages. WiX's util:CloseApplication
+    /// posts these directly to the visible main window during an MSI upgrade, but
+    /// WPF only routes session-end handling through Application.SessionEnding for
+    /// messages that hit its own hidden management window — so without this hook
+    /// the message falls through to OnClosing, which minimizes to tray and leaves
+    /// LithicBackup.exe locked, breaking the upgrade with "Setup was unable to
+    /// automatically close all requested applications."
+    /// </summary>
+    private void OnSourceInitialized(object? sender, EventArgs e)
+    {
+        if (PresentationSource.FromVisual(this) is HwndSource source)
+            source.AddHook(WndProc);
+    }
+
+    private IntPtr WndProc(IntPtr hwnd, int msg, IntPtr wParam, IntPtr lParam, ref bool handled)
+    {
+        if (Application.Current is not App app)
+            return IntPtr.Zero;
+
+        switch (msg)
+        {
+            case WM_QUERYENDSESSION:
+                // Approve the close so a subsequent WM_ENDSESSION/close is allowed
+                // to proceed instead of minimizing to tray. Let the default proc
+                // reply TRUE (handled stays false).
+                app.MarkRestartManagerExit();
+                break;
+
+            case WM_ENDSESSION:
+                if (wParam != IntPtr.Zero)
+                    // The session end is really happening — tear the process down
+                    // (OnExplicitShutdown means closing the window alone won't).
+                    app.ShutdownForRestartManager();
+                else
+                    // The session end was vetoed elsewhere — keep running in tray.
+                    app.AbortRestartManagerExit();
+                break;
+        }
+
+        return IntPtr.Zero;
     }
 
     private void OnContentRendered(object? sender, EventArgs e)

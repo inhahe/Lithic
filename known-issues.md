@@ -1,5 +1,43 @@
 # LithicBackup — Known Issues & Tech Debt
 
+## FIXED: MSI upgrade couldn't close the GUI — it minimized to tray and the .exe stayed locked (2026-07-15)
+
+**Symptom.** During an MSI upgrade the installer's Restart Manager tries to close
+the running GUI. Instead of exiting, LithicBackup showed its "Minimized to tray"
+balloon and kept running, so `LithicBackup.exe` stayed locked and the installer
+popped **"The setup was unable to automatically close all requested applications."**
+Cancelling from there rolled the upgrade back but could still route through a
+wizard page offering to *launch* the (old) app.
+
+**Root cause.** Two things compounded:
+1. `App.xaml` sets `ShutdownMode="OnExplicitShutdown"`, so closing a window never
+   ends the process — only an explicit `Application.Shutdown()` does.
+2. The installer (`installer\Package.wxs`, `util:CloseApplication`
+   `EndSessionMessage="yes"`) posts `WM_QUERYENDSESSION` / `WM_ENDSESSION`
+   **directly to the visible main window's HWND**. WPF only raises
+   `Application.SessionEnding` for session messages that hit its own hidden
+   management window, so `App.OnSessionEnding` never fired. The message fell
+   through to `MainWindow.OnClosing`, which saw `IsExiting = false` and minimized
+   to tray. The earlier `OnSessionEnding` override was therefore dead code for
+   this path.
+
+**Fix.** `MainWindow` now hooks its own window procedure
+(`SourceInitialized` → `HwndSource.AddHook(WndProc)`) and handles the session
+messages where they actually arrive: `WM_QUERYENDSESSION` → `App.MarkRestartManagerExit()`
+(sets `IsExiting`, approves the close); `WM_ENDSESSION` with `wParam != 0` →
+`App.ShutdownForRestartManager()` (sets `IsExiting` **and calls `Shutdown()`**, the
+real exit that `OnExplicitShutdown` requires); `WM_ENDSESSION` with `wParam == 0`
+(session vetoed) → `App.AbortRestartManagerExit()` (keeps running in tray).
+`OnSessionEnding` also now calls `Shutdown()` for the genuine logoff/shutdown path.
+Because the GUI now releases its `.exe` promptly, the installer never hits the
+files-in-use dialog, so the cancel→"launch old app" path is no longer reachable.
+
+**Bootstrap caveat.** The fix only prevents the hang once the *running* GUI
+already contains it. The upgrade that first delivers it must still close the old
+(unfixed) GUI — done by exiting it before the upgrade (or the installer's
+`TerminateProcess="1"` force-close fallback). No automated test: reproducing it
+needs a real elevated MSI run against a live interactive GUI.
+
 ## FIXED (both parts): Atomically-saved files (e.g. KeyNote .knt) never accumulate versions (2026-07-15)
 
 **Symptom.** A file edited by an application that saves *atomically* — writing a
