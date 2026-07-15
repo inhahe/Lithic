@@ -43,7 +43,13 @@ so the helper is still needed.
 
 ---
 
-## 2. Remove the dead schedule-wipe landmine in `SaveBackupSetAsync`
+## 2. Remove the dead schedule-wipe landmine in `SaveBackupSetAsync` ✅ DONE
+
+**Status: SHIPPED.** Deleted `MainViewModel.ShowJobConfig` (zero callers) and the whole
+cluster that only it reached: `SaveBackupSetAsync`, `RestoreJobOptions`,
+`ApplySourceSettings`, and `BackupJobViewModel.BuildSchedule`. The live save path
+(`SyncSettingsToJobOptions`, which preserves the existing schedule object) is unaffected.
+GUI builds clean, 0 warnings.
 
 **Priority: medium (dead code, remove a footgun).**
 

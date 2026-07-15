@@ -1,5 +1,23 @@
 # LithicBackup — Known Issues & Tech Debt
 
+## FIXED: Removed dead schedule-wipe code path (`ShowJobConfig` cluster) (2026-07-15)
+
+**Problem (dead code + latent footgun):** `MainViewModel.ShowJobConfig` had **zero
+callers** but dragged along a null-returning schedule builder. Its `PlanCompleted`
+handler called `SaveBackupSetAsync(..., jobConfig.BuildSchedule())`, and
+`BackupJobViewModel.BuildSchedule()` returns `null` when `ScheduleEnabled` is false —
+so if this path were ever re-wired it would wipe a stored schedule to null (reverting a
+set to Off/Interval on reload) whenever the config checkbox happened to be off,
+inconsistent with the live save path `SyncSettingsToJobOptions`, which preserves the
+existing schedule object.
+
+**Fix:** deleted the entire dead cluster reachable only from `ShowJobConfig` —
+`ShowJobConfig`, `SaveBackupSetAsync`, `RestoreJobOptions`, `ApplySourceSettings`
+(all in `MainViewModel`), and `BackupJobViewModel.BuildSchedule`. Verified no other
+callers anywhere in `src\` before removing; `_pendingSettingsSave`, `StartEditFlow`,
+`StartNewBackupFlow`, and `StartBurnForSavedSet` are used by live paths and were kept.
+GUI builds clean, 0 warnings.
+
 ## FIXED: Disc-burn staging inherited source read-only → temp leak + burn-abort landmine (2026-07-15)
 
 **Symptom (two failures from one cause):** `BackupOrchestrator` staged files into
