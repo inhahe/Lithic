@@ -3,6 +3,7 @@ using System.Security.Cryptography;
 using LithicBackup.Core;
 using LithicBackup.Core.Interfaces;
 using LithicBackup.Core.Models;
+using LithicBackup.Infrastructure.FileSystem;
 
 namespace LithicBackup.Services;
 
@@ -99,6 +100,47 @@ public class BackupOrchestrator : IBackupOrchestrator
             TotalBytes = filesToBackup.Sum(f => f.SizeBytes),
         };
     }
+
+    public DiscCompatibilitySummary SummarizeCompatibility(BackupPlan plan, FilesystemType filesystemType)
+    {
+        int total = 0, incompatible = 0;
+        long totalBytes = 0, incompatibleBytes = 0;
+
+        // Walk every file the plan allocated to a disc and apply the exact per-file
+        // check the burn uses under ZipMode.IncompatibleOnly (see the zip-handling
+        // block in ExecuteAsync), so the reported count matches what would actually
+        // be zipped. Dedupe by source path in case a file appears in >1 allocation.
+        var seen = new HashSet<string>(StringComparer.OrdinalIgnoreCase);
+        foreach (var alloc in plan.DiscAllocations)
+        {
+            foreach (var file in alloc.Files)
+            {
+                if (!seen.Add(file.FullPath))
+                    continue;
+
+                total++;
+                totalBytes += file.SizeBytes;
+                if (!IsCompatibleForDisc(file.FullPath, filesystemType))
+                {
+                    incompatible++;
+                    incompatibleBytes += file.SizeBytes;
+                }
+            }
+        }
+
+        return new DiscCompatibilitySummary(
+            filesystemType, total, totalBytes, incompatible, incompatibleBytes);
+    }
+
+    /// <summary>
+    /// Whether a source file's <em>disc-relative</em> path (the path that actually
+    /// lands on the burned disc — see <see cref="GetRelativeStagingPath"/>) satisfies
+    /// the target filesystem's name/path/depth limits. Both the burn's proactive-zip
+    /// decision and <see cref="SummarizeCompatibility"/> route through this so the
+    /// plan-time warning can't drift from what the burn does.
+    /// </summary>
+    private static bool IsCompatibleForDisc(string sourceFullPath, FilesystemType fs)
+        => PathCompatibility.CheckCompatibility(GetRelativeStagingPath(sourceFullPath), fs) is null;
 
     // -------------------------------------------------------------------
     // ExecuteAsync
@@ -455,7 +497,11 @@ public class BackupOrchestrator : IBackupOrchestrator
                     }
                     else if (plan.Job.ZipMode == ZipMode.IncompatibleOnly)
                     {
-                        shouldZip = !_zipHandler.IsPathCompatible(file.FullPath, filesystemType);
+                        // Check the DISC-RELATIVE path (what actually lands on the
+                        // disc), not the raw source path, and route through the same
+                        // helper SummarizeCompatibility uses so the plan-time warning
+                        // can't disagree with what the burn zips here.
+                        shouldZip = !IsCompatibleForDisc(file.FullPath, filesystemType);
                     }
 
                     // Resolve this file's version now (from the pre-run max) so its

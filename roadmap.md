@@ -100,7 +100,20 @@ observed actual capacity back into the packer.
 
 ---
 
-## 4. Plan-time disc-filesystem compatibility warning (suggest UDF up front)
+## 4. Plan-time disc-filesystem compatibility warning (suggest UDF up front) ✅ DONE
+
+**Status: SHIPPED.** Added `DiscCompatibilitySummary` (Core.Models) and
+`IBackupOrchestrator.SummarizeCompatibility(plan, filesystemType)`, which walks every
+planned file and applies the *same* per-file check the burn uses under
+`ZipMode.IncompatibleOnly` — now routed through a shared `IsCompatibleForDisc` helper
+that checks the **disc-relative** path (what actually lands on the disc), so the
+plan-time count can't drift from what the burn zips. `MainViewModel.WarnAndMaybeSwitchToUdf`
+runs the summary in the disc-burn path (after plan, before burn); when a significant
+fraction (≥5% of files, ≥5% of bytes, or ≥20 files) would be zipped and the format
+isn't already UDF, it shows a Yes/No/Cancel warning offering to switch this run to UDF
+(no re-scan needed — bin-packing is capacity-based/format-independent, so it just flips
+`job.FilesystemType`). Harness test `plan-time-compat-summary-counts-incompatible`
+locks the summary counts (25/25 pass). See the ADDED entry in `known-issues.md`.
 
 **Priority: medium (UX; prevents surprise mass-zipping).**
 

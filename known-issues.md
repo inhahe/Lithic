@@ -1,5 +1,43 @@
 # LithicBackup — Known Issues & Tech Debt
 
+## TECH DEBT: `StartBurnForSavedSet` / `PlanCompleted` now have zero callers (2026-07-15)
+
+Discovered while wiring roadmap item 4. `MainViewModel.StartBurnForSavedSet` and
+`BackupJobViewModel.PlanCompleted` (raised at ~line 559) have **no remaining callers**
+in `src\` — they were reached only through `ShowJobConfig`, which the item-2 cleanup
+deleted. The item-2 FIXED note kept `StartBurnForSavedSet` believing it was live, but a
+`grep` for both symbols now returns only their own definitions. Proper fix: delete
+`StartBurnForSavedSet`, the `PlanCompleted` event, and its `Invoke` (and re-check
+`BackupJobViewModel` for other now-dead members freed up by that). Left for a focused
+follow-up rather than folded into the item-4 UX change.
+
+## ADDED: Plan-time disc-format compatibility warning (suggest UDF) (2026-07-15)
+
+**Feature (roadmap item 4):** the disc `FilesystemType` (ISO 9660 / Joliet / UDF) was
+chosen in Settings and only *acted on* at burn time — `ZipMode.IncompatibleOnly` (the
+default) silently auto-zips any file whose disc path violates the format's
+name/path/depth limits. A set full of long Unicode paths burned as ISO 9660 got quietly
+zipped wholesale with no chance to reconsider the format.
+
+**What shipped:** `DiscCompatibilitySummary` (Core.Models) +
+`IBackupOrchestrator.SummarizeCompatibility(plan, filesystemType)` tally how many
+planned files (and bytes) would be zipped for a given format, using the **same**
+per-file predicate the burn applies — both now route through a shared
+`BackupOrchestrator.IsCompatibleForDisc`, which checks the **disc-relative** path
+(`GetRelativeStagingPath`) rather than the raw source path, so the summary can't
+disagree with what the burn zips. (The burn's own zip check at the ZipMode branch was
+switched from `file.FullPath` to that helper — the correct input, since the disc
+filesystem only ever sees the disc-relative path.) In the GUI,
+`MainViewModel.WarnAndMaybeSwitchToUdf` runs the summary in the disc-burn path (after
+planning, before the burn); when a significant fraction would be zipped
+(≥5% of files, ≥5% of bytes, or ≥20 files) and the format isn't already UDF, it shows a
+Yes/No/Cancel warning offering to switch this run to UDF. Switching just flips
+`job.FilesystemType` (no re-scan — bin-packing is capacity-based and
+format-independent). `ZipMode.IncompatibleOnly` remains the fallback for the handful of
+files still incompatible under the chosen format. Directory backups are unaffected
+(no filesystem-format limits). Harness test
+`plan-time-compat-summary-counts-incompatible` verifies the counts; 25/25 pass.
+
 ## FIXED: Graceful re-plan when a disc over-reports its capacity (2026-07-15)
 
 **Problem (fail-safe, not graceful):** when media physically holds less than

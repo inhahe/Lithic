@@ -2352,6 +2352,77 @@ public class MainViewModel : ViewModelBase
         StatusText = "";
     }
 
+    /// <summary>
+    /// Plan-time disc-filesystem compatibility gate. Asks the orchestrator how many
+    /// of the planned files would be auto-zipped to satisfy the selected format's
+    /// name/path limits (the same check the burn applies under
+    /// <see cref="ZipMode.IncompatibleOnly"/>). When a <em>significant</em> fraction
+    /// would be zipped and the format isn't already UDF, warns the user and offers to
+    /// switch this run to UDF (the most permissive format) so the content lands
+    /// unzipped. Mutating <paramref name="job"/>'s <c>FilesystemType</c> is enough —
+    /// the bin-packing is capacity-based and format-independent, so no re-plan/re-scan
+    /// is needed; the burn reads <c>plan.Job.FilesystemType</c> at write time.
+    /// </summary>
+    /// <returns>
+    /// <c>true</c> to proceed with the burn (either nothing significant to warn about,
+    /// or the user chose to continue / switch to UDF); <c>false</c> if the user
+    /// cancelled the backup from the warning.
+    /// </returns>
+    private bool WarnAndMaybeSwitchToUdf(
+        BackupJob job, BackupPlan plan, string setName, Action stopScanProgress)
+    {
+        // Only IncompatibleOnly silently zips for compatibility. ZipMode.All zips
+        // everything regardless of format; ZipMode.None never zips. And if the format
+        // is already UDF there's nothing more permissive to suggest.
+        if (job.ZipMode != ZipMode.IncompatibleOnly || job.FilesystemType == FilesystemType.UDF)
+            return true;
+
+        var summary = _orchestrator.SummarizeCompatibility(plan, job.FilesystemType);
+        if (!summary.HasIncompatible)
+            return true;
+
+        // "Significant" = enough that the user should reconsider the format up front:
+        // at least 5% of files, at least 5% of bytes, or at least 20 files affected.
+        bool significant = summary.IncompatibleFileFraction >= 0.05
+            || summary.IncompatibleByteFraction >= 0.05
+            || summary.IncompatibleFiles >= 20;
+        if (!significant)
+            return true;
+
+        // Stop scan-progress callbacks from overwriting the dialog's status text.
+        stopScanProgress();
+
+        string fmt = job.FilesystemType == FilesystemType.ISO9660 ? "ISO 9660" : "Joliet";
+        var message =
+            $"{summary.IncompatibleFiles:N0} of {summary.TotalFiles:N0} files "
+            + $"({FormatBytes(summary.IncompatibleBytes)}) have names or paths that are "
+            + $"incompatible with the {fmt} disc format and will be individually zipped "
+            + $"so they fit. Zipping changes how those files land on the disc.\n\n"
+            + "Switch this backup to UDF instead? UDF is the most permissive format "
+            + "(long Unicode paths, large files) and would let these files be written "
+            + "as-is, without zipping.\n\n"
+            + "\u2022 Yes \u2014 switch this run to UDF and burn the files unzipped\n"
+            + $"\u2022 No \u2014 keep {fmt} and zip the incompatible files\n"
+            + "\u2022 Cancel \u2014 don't start the backup";
+
+        var choice = MessageBox.Show(
+            message,
+            "Many files incompatible with the disc format",
+            MessageBoxButton.YesNoCancel, MessageBoxImage.Warning);
+
+        switch (choice)
+        {
+            case MessageBoxResult.Yes:
+                job.FilesystemType = FilesystemType.UDF;
+                StatusText = $"\"{setName}\": switched to UDF for this backup.";
+                return true;
+            case MessageBoxResult.No:
+                return true;
+            default:
+                return false;
+        }
+    }
+
     private async void StartIncrementalFlow(BackupSetRowViewModel row)
         => await RunIncrementalFlowAsync(row, forceReview: false);
 
@@ -2645,6 +2716,21 @@ public class MainViewModel : ViewModelBase
                 }
 
                 StatusText = $"{totalFiles:N0} file(s) to back up ({FormatBytes(plan.TotalBytes)})";
+
+                // Plan-time disc-format compatibility check: if a significant fraction
+                // of the planned files would be silently auto-zipped to satisfy the
+                // selected filesystem's name/path limits, warn the user up front and
+                // offer to switch this run to UDF (the most permissive format) so the
+                // content lands unzipped. Only meaningful under ZipMode.IncompatibleOnly.
+                if (!WarnAndMaybeSwitchToUdf(job, plan, backupSet.Name, () => scanning = false))
+                {
+                    // User cancelled from the compatibility warning.
+                    row.Progress = null;
+                    row.IsRunning = false;
+                    row.LastResultText = "Backup cancelled.";
+                    StatusText = $"\"{backupSet.Name}\": backup cancelled.";
+                    return;
+                }
             }
 
             // Stop scan-progress callbacks from overwriting burn status.

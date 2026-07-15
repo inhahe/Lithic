@@ -256,6 +256,34 @@ await runner.Run("many-incompatible-files-no-repeat-prompt", async ws =>
     ws.Assert(r.Mismatches == 0, $"{r.Mismatches} restored file(s) had wrong content");
 });
 
+await runner.Run("plan-time-compat-summary-counts-incompatible", async ws =>
+{
+    // Plan-time compatibility summary (roadmap item 4): mixed set of ISO 9660
+    // Level-1-illegal filenames (lowercase) and legal 8.3 uppercase names.
+    // Under ISO 9660 the summary must count exactly the incompatible files; under
+    // UDF (permissive) nothing is incompatible.
+    var srcs = ws.MakeTree(
+        ("d/lower1.txt", 10_000),   // lowercase -> ISO-incompatible
+        ("d/lower2.txt", 20_000),   // lowercase -> ISO-incompatible
+        ("d/FILEA.TXT", 30_000),    // uppercase 8.3 -> ISO-compatible
+        ("d/FILEB.TXT", 40_000));   // uppercase 8.3 -> ISO-compatible
+
+    var (orch, plan) = await ws.PlanFor(srcs, FilesystemType.ISO9660);
+
+    var iso = orch.SummarizeCompatibility(plan, FilesystemType.ISO9660);
+    ws.Assert(iso.TotalFiles == 4, $"expected 4 planned files, got {iso.TotalFiles}");
+    ws.Assert(iso.IncompatibleFiles == 2,
+        $"expected 2 ISO-incompatible files, got {iso.IncompatibleFiles}");
+    ws.Assert(iso.IncompatibleBytes == 30_000,
+        $"expected 30,000 incompatible bytes, got {iso.IncompatibleBytes}");
+    ws.Assert(iso.HasIncompatible, "summary should flag incompatibility");
+
+    var udf = orch.SummarizeCompatibility(plan, FilesystemType.UDF);
+    ws.Assert(udf.IncompatibleFiles == 0,
+        $"UDF is permissive; expected 0 incompatible, got {udf.IncompatibleFiles}");
+    ws.Assert(!udf.HasIncompatible, "UDF summary should flag nothing");
+});
+
 // ------------------------------------------------------------------
 // Disc-fault repair: re-burn failed files onto a fresh disc
 // ------------------------------------------------------------------
@@ -788,6 +816,41 @@ sealed class Workspace : IDisposable
         var sessionStrategy = new DiscSessionStrategy(burner, Catalog);
         return new BackupOrchestrator(Catalog, burner, scanner, packer, zipHandler,
             sessionStrategy, fileSystemMonitor: null);
+    }
+
+    /// <summary>Plan a set of sources without executing, returning the orchestrator
+    /// (for SummarizeCompatibility) and the computed plan.</summary>
+    public async Task<(BackupOrchestrator Orchestrator, BackupPlan Plan)> PlanFor(
+        List<string> sources,
+        FilesystemType filesystemType,
+        ZipMode zipMode = ZipMode.IncompatibleOnly)
+    {
+        var burner = NewBurner(null);
+        var set = await Catalog.CreateBackupSetAsync(new BackupSet
+        {
+            Name = "harness-set",
+            SourceRoots = new List<string> { _sourceDir },
+            CreatedUtc = DateTime.UtcNow,
+        });
+        BackupSetId = set.Id;
+
+        var orchestrator = BuildOrchestrator(burner);
+        var job = new BackupJob
+        {
+            BackupSetId = BackupSetId,
+            Sources = sources.Select(s => new SourceSelection
+            {
+                Path = s,
+                IsDirectory = false,
+                IsSelected = true,
+            }).ToList(),
+            IncludeCatalogOnDisc = false,
+            ZipMode = zipMode,
+            FilesystemType = filesystemType,
+            CapacityOverrideBytes = 4_700_000_000L,
+        };
+        var plan = await orchestrator.PlanAsync(job);
+        return (orchestrator, plan);
     }
 
     // -- restore + verify --------------------------------------------

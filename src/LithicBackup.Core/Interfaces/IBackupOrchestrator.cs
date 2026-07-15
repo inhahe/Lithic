@@ -24,6 +24,15 @@ public interface IBackupOrchestrator
         IProgress<ScanProgress>? scanProgress = null);
 
     /// <summary>
+    /// Inspect a computed plan and report how many of its files would be auto-zipped
+    /// for compatibility with the given disc <paramref name="filesystemType"/> (the
+    /// same per-file check the burn applies under <see cref="ZipMode.IncompatibleOnly"/>).
+    /// Lets the caller warn the user — and suggest a more permissive format such as
+    /// UDF — before the burn silently zips a large fraction of the set.
+    /// </summary>
+    DiscCompatibilitySummary SummarizeCompatibility(BackupPlan plan, FilesystemType filesystemType);
+
+    /// <summary>
     /// Execute the backup plan: stage files, burn discs, update catalog.
     /// </summary>
     Task<BackupResult> ExecuteAsync(
