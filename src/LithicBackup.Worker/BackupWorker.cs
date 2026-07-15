@@ -981,6 +981,12 @@ public sealed class BackupWorker : BackgroundService
                 _logger.LogWarning(
                     "Continuous backup for \"{Name}\" had {Count} failed file(s).",
                     set.Name, result.FailedFiles.Count);
+
+                foreach (var f in result.FailedFiles.Take(10))
+                    _logger.LogWarning("  Failed: {Path} — {Error}", f.Path, f.Error);
+                if (result.FailedFiles.Count > 10)
+                    _logger.LogWarning(
+                        "  … and {More} more failed file(s).", result.FailedFiles.Count - 10);
             }
         }
         catch (OperationCanceledException) when (ct.IsCancellationRequested)
@@ -1307,6 +1313,9 @@ public sealed class BackupWorker : BackgroundService
 
                 foreach (var f in result.FailedFiles.Take(10))
                     _logger.LogWarning("  Failed: {Path} — {Error}", f.Path, f.Error);
+                if (result.FailedFiles.Count > 10)
+                    _logger.LogWarning(
+                        "  … and {More} more failed file(s).", result.FailedFiles.Count - 10);
             }
 
             return true;
