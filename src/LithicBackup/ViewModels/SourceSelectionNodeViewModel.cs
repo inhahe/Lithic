@@ -120,6 +120,13 @@ public class SourceSelectionNodeViewModel : ViewModelBase
     /// the work runs inline via <see cref="SettleSelection"/>.
     /// </summary>
     private readonly Action<SourceSelectionNodeViewModel>? _requestSelectionSettle;
+    /// <summary>
+    /// When set, registers an in-flight async task (e.g. the load-then-pin work
+    /// kicked off when auto-include-new is toggled on a not-yet-enumerated
+    /// directory) with the owning viewmodel so a subsequent Save awaits it before
+    /// serialising.  Null (e.g. in tests) means such work runs without a Save gate.
+    /// </summary>
+    private readonly Action<Task>? _registerPendingWork;
     // Catalog data is provided via a getter rather than a captured value so it
     // can arrive AFTER the tree is built.  The full catalog dictionary can hold
     // ~1M entries and take several seconds to query, so it is loaded in the
@@ -136,7 +143,8 @@ public class SourceSelectionNodeViewModel : ViewModelBase
         Func<bool>? getShowSelectedOnly = null,
         Func<Dictionary<string, FileVersionInfo>?>? getCatalogInfo = null,
         Func<Func<string, bool>?>? getExcludeFilter = null,
-        Action<SourceSelectionNodeViewModel>? requestSelectionSettle = null)
+        Action<SourceSelectionNodeViewModel>? requestSelectionSettle = null,
+        Action<Task>? registerPendingWork = null)
     {
         Path = path;
         Name = System.IO.Path.GetFileName(path);
@@ -151,6 +159,7 @@ public class SourceSelectionNodeViewModel : ViewModelBase
         _getShowSelectedOnly = getShowSelectedOnly ?? parent?._getShowSelectedOnly;
         _getExcludeFilter = getExcludeFilter ?? parent?._getExcludeFilter;
         _requestSelectionSettle = requestSelectionSettle ?? parent?._requestSelectionSettle;
+        _registerPendingWork = registerPendingWork ?? parent?._registerPendingWork;
         _getCatalogInfo = getCatalogInfo ?? parent?._getCatalogInfo;
         Depth = parent is null ? 0 : parent.Depth + 1;
         Children = [];
@@ -575,44 +584,106 @@ public class SourceSelectionNodeViewModel : ViewModelBase
     public bool AutoIncludeNew
     {
         get => _autoIncludeNew;
-        set
+        set => ApplyAutoIncludeNew(value, userInitiated: true);
+    }
+
+    /// <summary>
+    /// Core of the <see cref="AutoIncludeNew"/> setter, split so the change can be
+    /// applied both by a user toggle (<paramref name="userInitiated"/> = true) and by
+    /// recursive propagation into loaded children (false).
+    /// </summary>
+    /// <remarks>
+    /// "Auto-include NEW" governs *future* folders; turning it off must NOT
+    /// retroactively evict a folder it already adopted.  Any descendant that rendered
+    /// checked only because auto-include was on (<see cref="_isAutoIncludeDerived"/>)
+    /// would, once the rule is off, stop being a covered unlisted descendant and drop
+    /// out of scope — silently removing already-backed-up content.  So at the moment
+    /// the rule flips off we PIN the current folders as explicit selections: clear the
+    /// derived flag so ToModel serialises them, and — crucially — make sure the
+    /// directory's children are actually LOADED so it stops looking like a
+    /// "fully-selected childless" node (which <see cref="Core.Models.SourceSelection.IncludesUnlistedDescendants"/>
+    /// treats as "whole subtree in, flag ignored").  Only with children materialised
+    /// does the off-flag actually exclude genuinely-new subdirectories.
+    ///
+    /// For a drive root like <c>C:\</c> that was restored fully-selected but never
+    /// expanded, its children are unloaded, so a plain toggle would (a) not persist
+    /// meaningfully and (b) be moot per the rule above.  We therefore load one level
+    /// of children asynchronously and pin them, registering that task so Save waits
+    /// for it (see <see cref="LoadThenApplyAutoIncludeAsync"/>).
+    /// </remarks>
+    private void ApplyAutoIncludeNew(bool value, bool userInitiated)
+    {
+        bool turningOff = _autoIncludeNew && !value;
+        if (!SetProperty(ref _autoIncludeNew, value, nameof(AutoIncludeNew)))
+            return;
+
+        // Self-pin: if this node rendered checked only via a parent's auto-include
+        // rule, a change here makes it an explicit selection so ToModel serialises it.
+        if (turningOff && _isAutoIncludeDerived)
+            _isAutoIncludeDerived = false;
+
+        if (IsDirectory && _isLoaded)
         {
-            bool turningOff = _autoIncludeNew && !value;
-            if (!SetProperty(ref _autoIncludeNew, value))
-                return;
-
-            // "Auto-include NEW" governs *future* folders; turning it off must NOT
-            // retroactively evict a folder it already adopted.  Any descendant that
-            // rendered checked only because auto-include was on (_isAutoIncludeDerived)
-            // would, once the rule is off, stop being an "unlisted descendant that's
-            // covered" and drop out of scope — silently removing already-backed-up
-            // content.  So at the moment the rule flips off, PIN those folders as
-            // explicit selections: clear the derived flag so ToModel serialises them.
-            //
-            //   * This node, if it was itself auto-include-derived, is pinned here;
-            //     the recursion below runs each child directory's setter, so the
-            //     same self-pin fires at every level.
-            //   * A pinned directory that HAS loaded children keeps them explicit,
-            //     so IncludesUnlistedDescendants(node) returns the now-off flag and
-            //     genuinely new folders under it stay excluded — exactly the intent.
-            //   * A pinned directory with no loaded children serialises as a
-            //     fully-selected subtree, preserving all of its current content.
-            if (turningOff && _isAutoIncludeDerived)
-                _isAutoIncludeDerived = false;
-
-            // Propagate down to all loaded child directories (their setters self-pin
-            // recursively), and pin any auto-include-derived files directly.
-            if (IsDirectory && _isLoaded)
-            {
-                foreach (var child in Children)
-                {
-                    if (child.IsDirectory)
-                        child.AutoIncludeNew = value;
-                    else if (turningOff && child._isAutoIncludeDerived)
-                        child._isAutoIncludeDerived = false;
-                }
-            }
+            PropagateAutoIncludeToLoadedChildren(value, turningOff);
         }
+        else if (IsDirectory && userInitiated && turningOff)
+        {
+            // Turning the rule OFF on a not-yet-enumerated directory (e.g. an
+            // unexpanded C:\).  A fully-selected childless node ignores the flag
+            // entirely (IncludesUnlistedDescendants treats it as "whole subtree in"),
+            // so simply persisting off would be a no-op on reload.  Load one level of
+            // children and pin them so the directory becomes "fully-selected WITH
+            // explicit children" — making the off-flag actually exclude future
+            // subdirectories.  Gate Save on that task.  (Turning the rule ON needs no
+            // load: a childless fully-selected node is already "everything in".)
+            var task = LoadThenApplyAutoIncludeAsync(value, turningOff);
+            _registerPendingWork?.Invoke(task);
+        }
+
+        // Mark the set dirty (enable Save) for the user's own toggle — not for each
+        // recursively-propagated child, which would fire the aggregate many times.
+        if (userInitiated)
+            _onSelectionChanged?.Invoke();
+    }
+
+    /// <summary>
+    /// Push an auto-include-new change down to already-loaded child directories
+    /// (their own <see cref="ApplyAutoIncludeNew"/> self-pins recursively) and pin any
+    /// auto-include-derived files directly.  Does NOT force-load unloaded children.
+    /// </summary>
+    private void PropagateAutoIncludeToLoadedChildren(bool value, bool turningOff)
+    {
+        foreach (var child in Children)
+        {
+            if (child.IsDirectory)
+                child.ApplyAutoIncludeNew(value, userInitiated: false);
+            else if (turningOff && child._isAutoIncludeDerived)
+                child._isAutoIncludeDerived = false;
+        }
+    }
+
+    /// <summary>
+    /// Enumerate this directory's children (if not already loaded) and then pin them
+    /// to the given auto-include-new value.  Kicked off when the user toggles the flag
+    /// on a directory whose children were never loaded, so that turning the rule off
+    /// actually excludes future subdirectories instead of being ignored (see
+    /// <see cref="Core.Models.SourceSelection.IncludesUnlistedDescendants"/>).
+    /// </summary>
+    private async Task LoadThenApplyAutoIncludeAsync(bool value, bool turningOff)
+    {
+        await EnsureChildrenLoadedAsync();
+
+        // The user may have toggled again while the load was in flight; only act if
+        // our flag still matches what this load was for.
+        if (_autoIncludeNew != value)
+            return;
+
+        // Enumeration may have failed (unreadable dir) leaving _isLoaded false; the
+        // persisted flag alone will have to stand for those — nothing to pin.
+        if (!_isLoaded)
+            return;
+
+        PropagateAutoIncludeToLoadedChildren(value, turningOff);
     }
 
     public bool IsExpanded
@@ -1864,7 +1935,25 @@ public class SourceSelectionNodeViewModel : ViewModelBase
         // and permanently destroy the saved subtree.  Return the originally
         // restored model verbatim so the selection survives untouched.
         if (IsDirectory && !_isLoaded && _restoredModel is not null)
-            return _restoredModel;
+        {
+            // Normally return the saved subtree verbatim.  But fold in the user's
+            // current auto-include-new choice, which may have been toggled since
+            // restore: the normal toggle path loads + pins children (making _isLoaded
+            // true so we never reach here), but this guards the race where children
+            // never loaded — e.g. an unreadable dir, or Save racing the load — so the
+            // flag itself isn't silently lost.
+            if (_restoredModel.AutoIncludeNewSubdirectories == AutoIncludeNew)
+                return _restoredModel;
+            return new Core.Models.SourceSelection
+            {
+                Path = _restoredModel.Path,
+                IsDirectory = _restoredModel.IsDirectory,
+                IsSelected = _restoredModel.IsSelected,
+                IsExpanded = _restoredModel.IsExpanded,
+                AutoIncludeNewSubdirectories = AutoIncludeNew,
+                Children = _restoredModel.Children,
+            };
+        }
 
         var model = new Core.Models.SourceSelection
         {

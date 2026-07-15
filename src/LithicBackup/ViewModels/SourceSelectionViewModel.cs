@@ -106,6 +106,14 @@ public class SourceSelectionViewModel : ViewModelBase
     /// Null when nothing is pending.
     /// </summary>
     private TaskCompletionSource? _selectionSettleTcs;
+    /// <summary>
+    /// In-flight async node work that Save must wait for — currently the
+    /// load-then-pin task started when auto-include-new is toggled on a directory
+    /// whose children weren't loaded yet (see
+    /// <see cref="SourceSelectionNodeViewModel"/> and <see cref="RegisterPendingWork"/>).
+    /// Tasks self-remove on completion.
+    /// </summary>
+    private readonly List<Task> _pendingNodeWork = [];
 
     /// <summary>
     /// Raised just before a deferred selection-settle pass runs its
@@ -1111,6 +1119,37 @@ public class SourceSelectionViewModel : ViewModelBase
             TaskCreationOptions.RunContinuationsAsynchronously)).Task;
     }
 
+    /// <summary>
+    /// Register an in-flight async node task (e.g. the load-then-pin work started
+    /// when auto-include-new is toggled on an unloaded directory) so a subsequent
+    /// Save awaits it before serialising.  The task self-removes when it completes.
+    /// Handed to every node via the constructor's <c>registerPendingWork</c> delegate.
+    /// </summary>
+    private void RegisterPendingWork(Task task)
+    {
+        if (task.IsCompleted)
+            return;
+        _pendingNodeWork.Add(task);
+        // Remove on completion, on the UI thread (the list isn't thread-safe and is
+        // also drained by Save on the UI thread).
+        _ = task.ContinueWith(
+            _ => _pendingNodeWork.Remove(task),
+            CancellationToken.None,
+            TaskContinuationOptions.ExecuteSynchronously,
+            TaskScheduler.FromCurrentSynchronizationContext());
+    }
+
+    /// <summary>
+    /// A task that completes when all registered in-flight node work has finished.
+    /// Save awaits this alongside <see cref="WaitForSelectionSettledAsync"/>.
+    /// </summary>
+    private Task WaitForPendingNodeWorkAsync()
+    {
+        if (_pendingNodeWork.Count == 0)
+            return Task.CompletedTask;
+        return Task.WhenAll(_pendingNodeWork.ToArray());
+    }
+
     private void LoadDriveRoots()
     {
         // Create a virtual "All Drives" root node.
@@ -1121,7 +1160,8 @@ public class SourceSelectionViewModel : ViewModelBase
             () => ShowSelectedSizesOnly,
             () => _catalogInfo,
             getExcludeFilter: () => GetExcludeFilter(),
-            requestSelectionSettle: RequestSelectionSettle);
+            requestSelectionSettle: RequestSelectionSettle,
+            registerPendingWork: RegisterPendingWork);
         RootNode = root;
 
         // Mark as loaded BEFORE setting IsExpanded — otherwise the
@@ -1433,9 +1473,12 @@ public class SourceSelectionViewModel : ViewModelBase
     private async void OnSave()
     {
         // A checkbox toggle defers its propagation/aggregation work to a
-        // Background-priority settle pass.  If one is still pending, wait for
-        // it (with a busy cursor) so we never serialise a half-propagated tree.
-        var pending = WaitForSelectionSettledAsync();
+        // Background-priority settle pass; an auto-include-new toggle on an unloaded
+        // directory kicks off an async load-then-pin.  If either is still pending,
+        // wait (with a busy cursor) so we never serialise a half-propagated or
+        // not-yet-pinned tree.
+        var pending = Task.WhenAll(
+            WaitForSelectionSettledAsync(), WaitForPendingNodeWorkAsync());
         if (!pending.IsCompleted)
         {
             Mouse.OverrideCursor = Cursors.Wait;
