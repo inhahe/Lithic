@@ -15,20 +15,28 @@ enumerated child `_isSelected = parent._isSelected ?? false`, so under a partial
 (`null`) parent a new folder rendered unchecked regardless of the auto-include
 flag.
 
-**Fix (display/serialisation decoupling):** `CreateChildNode` now derives the
-unlisted-descendant checkbox from the rule the scanner uses —
+**Fix (display/serialisation decoupling + pin-on-toggle-off):** `CreateChildNode`
+now derives the unlisted-descendant checkbox from the rule the scanner uses —
 `_isSelected = parent._isSelected switch { false => false, true => true, null => parent._autoIncludeNew }`
-— so a new folder under a partial auto-include parent renders **checked**. To
-avoid *pinning* (an auto-include-derived check surviving an auto-include-OFF
-toggle, diverging from the scanner), the node is flagged `_isAutoIncludeDerived`
-and `ToModel()` **skips** it: the saved selection stays byte-for-byte identical
-to before the display change (no reconcile churn — `MainViewModel.SelectionsEquivalent`
-sees no diff), and the folder is re-derived from the parent's auto-include on
-reload. The flag is cleared the instant the node gets a real state — a user
-click, a descendant edit rippling up through `IsSelected`/`UpdateFromChildren`,
-or a saved-model restore in `ApplySelectionAsync` — so a genuinely curated
-subtree serialises normally. Net effect: display now agrees with coverage, while
-persistence is unchanged.
+— so a new folder under a partial auto-include parent renders **checked**. Such a
+node is flagged `_isAutoIncludeDerived`, and while auto-include stays ON `ToModel()`
+**skips** it: the saved selection stays byte-for-byte identical (no bloat, no
+reconcile churn — `MainViewModel.SelectionsEquivalent` sees no diff), and the
+folder is re-derived from the parent's auto-include on reload. The flag clears the
+instant the node gets a real state — a user click, a descendant edit rippling up
+through `IsSelected`/`UpdateFromChildren`, or a saved-model restore in
+`ApplySelectionAsync`.
+
+**Semantics of turning auto-include OFF:** "Auto-include *new*" governs *future*
+folders only — turning it off must NOT retroactively evict a folder it already
+adopted. So the `AutoIncludeNew` setter, on a true→false transition, **pins** every
+currently-covered derived descendant (clears its `_isAutoIncludeDerived` flag so
+`ToModel` serialises it) as it propagates the flag down. A pinned directory that
+has loaded children keeps them explicit, so `IncludesUnlistedDescendants` returns
+the now-off flag and genuinely new folders stay excluded; a pinned directory with
+no loaded children serialises as a fully-selected subtree, preserving its current
+content. Net effect: display agrees with coverage, already-adopted folders survive
+an auto-include-off toggle, and only future additions are excluded.
 
 
 ## FIXED: Changed file re-burned to the same multisession disc collided/shadowed (2026-07-12)

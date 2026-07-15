@@ -577,16 +577,39 @@ public class SourceSelectionNodeViewModel : ViewModelBase
         get => _autoIncludeNew;
         set
         {
+            bool turningOff = _autoIncludeNew && !value;
             if (!SetProperty(ref _autoIncludeNew, value))
                 return;
 
-            // Propagate down to all loaded child directories.
+            // "Auto-include NEW" governs *future* folders; turning it off must NOT
+            // retroactively evict a folder it already adopted.  Any descendant that
+            // rendered checked only because auto-include was on (_isAutoIncludeDerived)
+            // would, once the rule is off, stop being an "unlisted descendant that's
+            // covered" and drop out of scope — silently removing already-backed-up
+            // content.  So at the moment the rule flips off, PIN those folders as
+            // explicit selections: clear the derived flag so ToModel serialises them.
+            //
+            //   * This node, if it was itself auto-include-derived, is pinned here;
+            //     the recursion below runs each child directory's setter, so the
+            //     same self-pin fires at every level.
+            //   * A pinned directory that HAS loaded children keeps them explicit,
+            //     so IncludesUnlistedDescendants(node) returns the now-off flag and
+            //     genuinely new folders under it stay excluded — exactly the intent.
+            //   * A pinned directory with no loaded children serialises as a
+            //     fully-selected subtree, preserving all of its current content.
+            if (turningOff && _isAutoIncludeDerived)
+                _isAutoIncludeDerived = false;
+
+            // Propagate down to all loaded child directories (their setters self-pin
+            // recursively), and pin any auto-include-derived files directly.
             if (IsDirectory && _isLoaded)
             {
                 foreach (var child in Children)
                 {
                     if (child.IsDirectory)
                         child.AutoIncludeNew = value;
+                    else if (turningOff && child._isAutoIncludeDerived)
+                        child._isAutoIncludeDerived = false;
                 }
             }
         }
