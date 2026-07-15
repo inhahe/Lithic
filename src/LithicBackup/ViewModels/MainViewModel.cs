@@ -43,6 +43,12 @@ public class MainViewModel : ViewModelBase
     private Func<Task>? _pendingSettingsSave;
     private int? _unsavedNewSetId;
 
+    // --- In-app update check (GitHub Releases) ---
+    private UpdateInfo? _availableUpdate;
+    private bool _updateBannerVisible;
+    private string _updateBannerText = "";
+    private bool _isCheckingForUpdates;
+
     public MainViewModel(
         ICatalogRepository catalog,
         IDiscBurner burner,
@@ -191,6 +197,18 @@ public class MainViewModel : ViewModelBase
         StartServiceCommand = new RelayCommand(_ => StartService());
         StopServiceCommand = new RelayCommand(_ => StopService());
 
+        // In-app update check (GitHub Releases).
+        CheckForUpdatesCommand = new RelayCommand(
+            _ => _ = CheckForUpdatesAsync(userInitiated: true),
+            _ => !_isCheckingForUpdates);
+        DownloadUpdateCommand = new RelayCommand(
+            _ => _ = DownloadUpdateAsync(),
+            _ => _availableUpdate is not null);
+        ViewReleaseNotesCommand = new RelayCommand(
+            _ => ViewReleaseNotes(),
+            _ => _availableUpdate is not null);
+        DismissUpdateCommand = new RelayCommand(_ => DismissUpdate());
+
         // Simulated burner failure injection (--test-mode only). These are
         // the *while-burning* triggers — momentary actions pressed during a live
         // burn to inject an error that can occur mid-write. They target whichever
@@ -311,6 +329,34 @@ public class MainViewModel : ViewModelBase
     public ICommand UninstallServiceCommand { get; }
     public ICommand StartServiceCommand { get; }
     public ICommand StopServiceCommand { get; }
+
+    // --- In-app update check (GitHub Releases) ---
+
+    public ICommand CheckForUpdatesCommand { get; }
+    public ICommand DownloadUpdateCommand { get; }
+    public ICommand ViewReleaseNotesCommand { get; }
+    public ICommand DismissUpdateCommand { get; }
+
+    /// <summary>The newer release found by the last check, or null if none.</summary>
+    public UpdateInfo? AvailableUpdate
+    {
+        get => _availableUpdate;
+        private set => SetProperty(ref _availableUpdate, value);
+    }
+
+    /// <summary>Whether the "an update is available" banner is shown.</summary>
+    public bool UpdateBannerVisible
+    {
+        get => _updateBannerVisible;
+        private set => SetProperty(ref _updateBannerVisible, value);
+    }
+
+    /// <summary>Banner caption, e.g. "Lithic Backup 1.0.3 is available (you have 1.0.2).".</summary>
+    public string UpdateBannerText
+    {
+        get => _updateBannerText;
+        private set => SetProperty(ref _updateBannerText, value);
+    }
 
     // Simulated burner failure injection (--test-mode only).
     public bool IsTestMode => _switchableBurner is not null;
@@ -1792,10 +1838,30 @@ public class MainViewModel : ViewModelBase
         try
         {
             await _catalog.DeleteBackupSetAsync(backupSet.Id);
-            await LoadBackupSetsAsync();
+
+            // Remove the row explicitly rather than leaning on LoadBackupSetsAsync's
+            // reconcile. That reconcile deliberately KEEPS any row whose IsRunning
+            // flag is set (to shield a concurrently-running set from an incidental
+            // reload), and IsRunning stays true after a backup completes until the
+            // finished progress panel is dismissed. So a set deleted while its row
+            // still shows that panel would survive the reconcile forever as a ghost
+            // — present in the list with no catalog record behind it. A set the user
+            // explicitly deleted must always disappear, so drop its row here and
+            // cancel anything still attached to it.
+            var row = RowFor(backupSet.Id);
+            if (row is not null)
+            {
+                row.ScanCts?.Cancel();
+                if (row.Progress?.CancelCommand is ICommand cancel && cancel.CanExecute(null))
+                    cancel.Execute(null);
+                BackupSets.Remove(row);
+            }
 
             if (SelectedBackupSet?.Id == backupSet.Id)
                 SelectedBackupSet = null;
+
+            // Refresh the rest (ordering, other sets) now that the row is gone.
+            await LoadBackupSetsAsync();
 
             StatusText = $"Deleted \"{backupSet.Name}\".";
         }
@@ -2286,6 +2352,77 @@ public class MainViewModel : ViewModelBase
         StatusText = "";
     }
 
+    /// <summary>
+    /// Plan-time disc-filesystem compatibility gate. Asks the orchestrator how many
+    /// of the planned files would be auto-zipped to satisfy the selected format's
+    /// name/path limits (the same check the burn applies under
+    /// <see cref="ZipMode.IncompatibleOnly"/>). When a <em>significant</em> fraction
+    /// would be zipped and the format isn't already UDF, warns the user and offers to
+    /// switch this run to UDF (the most permissive format) so the content lands
+    /// unzipped. Mutating <paramref name="job"/>'s <c>FilesystemType</c> is enough —
+    /// the bin-packing is capacity-based and format-independent, so no re-plan/re-scan
+    /// is needed; the burn reads <c>plan.Job.FilesystemType</c> at write time.
+    /// </summary>
+    /// <returns>
+    /// <c>true</c> to proceed with the burn (either nothing significant to warn about,
+    /// or the user chose to continue / switch to UDF); <c>false</c> if the user
+    /// cancelled the backup from the warning.
+    /// </returns>
+    private bool WarnAndMaybeSwitchToUdf(
+        BackupJob job, BackupPlan plan, string setName, Action stopScanProgress)
+    {
+        // Only IncompatibleOnly silently zips for compatibility. ZipMode.All zips
+        // everything regardless of format; ZipMode.None never zips. And if the format
+        // is already UDF there's nothing more permissive to suggest.
+        if (job.ZipMode != ZipMode.IncompatibleOnly || job.FilesystemType == FilesystemType.UDF)
+            return true;
+
+        var summary = _orchestrator.SummarizeCompatibility(plan, job.FilesystemType);
+        if (!summary.HasIncompatible)
+            return true;
+
+        // "Significant" = enough that the user should reconsider the format up front:
+        // at least 5% of files, at least 5% of bytes, or at least 20 files affected.
+        bool significant = summary.IncompatibleFileFraction >= 0.05
+            || summary.IncompatibleByteFraction >= 0.05
+            || summary.IncompatibleFiles >= 20;
+        if (!significant)
+            return true;
+
+        // Stop scan-progress callbacks from overwriting the dialog's status text.
+        stopScanProgress();
+
+        string fmt = job.FilesystemType == FilesystemType.ISO9660 ? "ISO 9660" : "Joliet";
+        var message =
+            $"{summary.IncompatibleFiles:N0} of {summary.TotalFiles:N0} files "
+            + $"({FormatBytes(summary.IncompatibleBytes)}) have names or paths that are "
+            + $"incompatible with the {fmt} disc format and will be individually zipped "
+            + $"so they fit. Zipping changes how those files land on the disc.\n\n"
+            + "Switch this backup to UDF instead? UDF is the most permissive format "
+            + "(long Unicode paths, large files) and would let these files be written "
+            + "as-is, without zipping.\n\n"
+            + "\u2022 Yes \u2014 switch this run to UDF and burn the files unzipped\n"
+            + $"\u2022 No \u2014 keep {fmt} and zip the incompatible files\n"
+            + "\u2022 Cancel \u2014 don't start the backup";
+
+        var choice = MessageBox.Show(
+            message,
+            "Many files incompatible with the disc format",
+            MessageBoxButton.YesNoCancel, MessageBoxImage.Warning);
+
+        switch (choice)
+        {
+            case MessageBoxResult.Yes:
+                job.FilesystemType = FilesystemType.UDF;
+                StatusText = $"\"{setName}\": switched to UDF for this backup.";
+                return true;
+            case MessageBoxResult.No:
+                return true;
+            default:
+                return false;
+        }
+    }
+
     private async void StartIncrementalFlow(BackupSetRowViewModel row)
         => await RunIncrementalFlowAsync(row, forceReview: false);
 
@@ -2579,6 +2716,21 @@ public class MainViewModel : ViewModelBase
                 }
 
                 StatusText = $"{totalFiles:N0} file(s) to back up ({FormatBytes(plan.TotalBytes)})";
+
+                // Plan-time disc-format compatibility check: if a significant fraction
+                // of the planned files would be silently auto-zipped to satisfy the
+                // selected filesystem's name/path limits, warn the user up front and
+                // offer to switch this run to UDF (the most permissive format) so the
+                // content lands unzipped. Only meaningful under ZipMode.IncompatibleOnly.
+                if (!WarnAndMaybeSwitchToUdf(job, plan, backupSet.Name, () => scanning = false))
+                {
+                    // User cancelled from the compatibility warning.
+                    row.Progress = null;
+                    row.IsRunning = false;
+                    row.LastResultText = "Backup cancelled.";
+                    StatusText = $"\"{backupSet.Name}\": backup cancelled.";
+                    return;
+                }
             }
 
             // Stop scan-progress callbacks from overwriting burn status.
@@ -2605,157 +2757,6 @@ public class MainViewModel : ViewModelBase
     // -------------------------------------------------------------------
     // Shared: Job Config → Plan → Burn
     // -------------------------------------------------------------------
-
-    private void ShowJobConfig(List<SourceSelection> sources, int? backupSetId,
-        SourceSelectionViewModel? sourceSettings = null,
-        BackupSetEditorWindow? dialog = null)
-    {
-        var jobConfig = new BackupJobViewModel(sources, _orchestrator, _burner, _directoryBackupService);
-
-        if (backupSetId.HasValue && SelectedBackupSet is not null)
-        {
-            jobConfig.SetName = SelectedBackupSet.Name;
-            RestoreJobOptions(jobConfig, SelectedBackupSet.JobOptions);
-        }
-
-        // Settings from the source selection page take precedence over
-        // saved options, so apply them after RestoreJobOptions.
-        if (sourceSettings is not null)
-            ApplySourceSettings(jobConfig, sourceSettings);
-
-        // Save the backup set when planning completes.
-        jobConfig.PlanCompleted += async job =>
-        {
-            try
-            {
-                backupSetId = await SaveBackupSetAsync(
-                    backupSetId, jobConfig.SetName, sources, job, jobConfig.BuildSchedule());
-                StatusText = $"Backup set \"{jobConfig.SetName}\" saved. {DateTime.Now:HH:mm:ss}";
-                await LoadBackupSetsAsync();
-            }
-            catch (Exception ex)
-            {
-                StatusText = $"Failed to save backup set: {ex.Message}";
-            }
-        };
-
-        if (dialog is not null)
-        {
-            // Editing in dialog — navigation stays within the dialog window.
-            dialog.SetEditorContent(jobConfig);
-            jobConfig.BackRequested += StartEditFlow;
-            jobConfig.StartRequested += plan =>
-            {
-                _pendingSettingsSave = null; // PlanCompleted already saved — don't overwrite
-                dialog.Close();
-                plan.Job.BackupSetId = backupSetId;
-                StartBurnForSavedSet(plan, backupSetId);
-            };
-        }
-        else
-        {
-            // Inline in main window (new backup set or incremental backup).
-            CurrentView = jobConfig;
-            jobConfig.BackRequested += backupSetId.HasValue
-                ? () => StartEditFlow()
-                : StartNewBackupFlow;
-            jobConfig.StartRequested += plan =>
-            {
-                plan.Job.BackupSetId = backupSetId;
-                StartBurnForSavedSet(plan, backupSetId);
-            };
-        }
-
-        StatusText = "Configure your backup options, then click Plan Backup.";
-    }
-
-    /// <summary>
-    /// Restore saved job options into a BackupJobViewModel.
-    /// </summary>
-    private static void RestoreJobOptions(BackupJobViewModel vm, JobOptions? opts)
-    {
-        if (opts is null)
-            return;
-
-        vm.ZipMode = opts.ZipMode;
-        vm.FilesystemType = opts.FilesystemType;
-        vm.VerifyAfterBurn = opts.VerifyAfterBurn;
-        vm.VerifyAfterBackup = opts.VerifyAfterBackup;
-        vm.IncludeCatalogOnDisc = opts.IncludeCatalogOnDisc;
-        vm.AllowFileSplitting = opts.AllowFileSplitting;
-        vm.EnableFileDeduplication = opts.EnableFileDeduplication;
-        vm.EnableDeduplication = opts.EnableDeduplication;
-
-        if (opts.CapacityOverrideBytes.HasValue)
-        {
-            double gb = opts.CapacityOverrideBytes.Value / (1024.0 * 1024 * 1024);
-            vm.CapacityOverrideGb = gb.ToString(System.Globalization.CultureInfo.InvariantCulture);
-        }
-
-        if (opts.DeduplicationBlockSize > 0)
-            vm.DeduplicationBlockSizeKb = (opts.DeduplicationBlockSize / 1024).ToString();
-
-        if (opts.TargetDirectory is not null)
-        {
-            vm.IsDirectoryMode = true;
-            vm.TargetDirectoryPath = opts.TargetDirectory;
-        }
-
-        vm.CreateSubdirectory = opts.CreateSubdirectory;
-        if (opts.SubdirectoryName is not null)
-            vm.SubdirectoryName = opts.SubdirectoryName;
-
-        if (opts.ExcludedExtensions.Count > 0)
-            vm.ExcludedExtensions = BackupJobViewModel.FormatExclusionPatterns(opts.ExcludedExtensions);
-
-        // Restore tier sets.
-        if (opts.TierSets.Count > 0)
-        {
-            vm.TierSets.Clear();
-            foreach (var ts in opts.TierSets)
-            {
-                var tsVm = TierSetViewModel.FromModel(ts, ts.Name is "Default" or "None");
-                vm.TierSets.Add(tsVm);
-            }
-        }
-        else if (opts.RetentionTiers.Count > 0)
-        {
-            // Backward compat: convert flat RetentionTiers to "Default" tier set.
-            vm.TierSets.Clear();
-            var defaultModel = new VersionTierSet { Name = "Default", Tiers = [.. opts.RetentionTiers] };
-            vm.TierSets.Add(TierSetViewModel.FromModel(defaultModel, isBuiltIn: true));
-            vm.TierSets.Add(TierSetViewModel.FromModel(new VersionTierSet { Name = "None" }, isBuiltIn: true));
-        }
-
-        // Restore legacy RetentionTiers from the "Default" tier set.
-        var defSet = vm.TierSets.FirstOrDefault(t => t.Name == "Default");
-        if (defSet is not null)
-        {
-            vm.RetentionTiers.Clear();
-            foreach (var tier in defSet.Tiers)
-            {
-                var model = tier.ToModel();
-                var tierVm = RetentionTierViewModel.FromModel(model);
-                tierVm.RemoveRequested += t => vm.RetentionTiers.Remove(t);
-                vm.RetentionTiers.Add(tierVm);
-            }
-        }
-
-        // Restore schedule. Load all fields whenever a schedule exists (even if
-        // disabled) so the editor reflects the stored Mode/interval/debounce.
-        // Guarding on Enabled==true would drop the stored Mode and let the UI
-        // defaults (Off + Interval) silently overwrite it on the next save.
-        if (opts.Schedule is { } sched)
-        {
-            vm.ScheduleEnabled = sched.Enabled;
-            vm.ScheduleMode = sched.Mode;
-            vm.ScheduleIntervalHours = sched.IntervalHours.ToString(
-                System.Globalization.CultureInfo.InvariantCulture);
-            vm.ScheduleDailyHour = sched.DailyHour;
-            vm.ScheduleDailyMinute = sched.DailyMinute;
-            vm.ScheduleDebounceSeconds = sched.DebounceSeconds.ToString();
-        }
-    }
 
     /// <summary>
     /// After seeding, check the source tree nodes that correspond to the
@@ -2963,142 +2964,6 @@ public class MainViewModel : ViewModelBase
         }
 
         backupSet.JobOptions = opts;
-    }
-
-    /// <summary>
-    /// Transfer all settings from the source selection view into the backup job view.
-    /// Called after RestoreJobOptions so source selection values take precedence.
-    /// </summary>
-    private static void ApplySourceSettings(BackupJobViewModel job, SourceSelectionViewModel src)
-    {
-        // Identity.
-        if (!string.IsNullOrEmpty(src.SetName))
-            job.SetName = src.SetName;
-
-        // Target mode + directory.
-        job.IsDirectoryMode = src.IsDirectoryMode;
-        if (src.IsDirectoryMode)
-        {
-            job.TargetDirectoryPath = src.TargetDirectory;
-            job.CreateSubdirectory = src.CreateSubdirectory;
-            job.SubdirectoryName = src.SubdirectoryName;
-        }
-
-        // Disc options.
-        job.ZipMode = src.ZipMode;
-        job.FilesystemType = src.FilesystemType;
-        job.CapacityOverrideGb = src.CapacityOverrideGb;
-        job.VerifyAfterBurn = src.VerifyAfterBurn;
-        job.IncludeCatalogOnDisc = src.IncludeCatalogOnDisc;
-        job.AllowFileSplitting = src.AllowFileSplitting;
-
-        // Directory options.
-        job.EnableFileDeduplication = src.EnableFileDeduplication;
-        job.EnableDeduplication = src.EnableBlockDeduplication;
-        job.DeduplicationBlockSizeKb = src.BlockSizeKb;
-
-        // Excluded-from-backup glob patterns (carried forward to the job page,
-        // which has its own editor for the same value).
-        job.ExcludedExtensions = src.ExcludedExtensions;
-
-        // Retention tier sets.
-        job.TierSets.Clear();
-        foreach (var srcTs in src.TierSets)
-        {
-            var tsVm = TierSetViewModel.FromModel(srcTs.ToModel(), srcTs.IsBuiltIn);
-            job.TierSets.Add(tsVm);
-        }
-
-        // Also populate the legacy RetentionTiers from the "Default" tier set
-        // for backward compatibility with the backup service.
-        job.RetentionTiers.Clear();
-        var defaultTs = src.TierSets.FirstOrDefault(t => t.Name == "Default");
-        if (defaultTs is not null)
-        {
-            foreach (var srcTier in defaultTs.Tiers)
-            {
-                var model = srcTier.ToModel();
-                var tierVm = RetentionTierViewModel.FromModel(model);
-                tierVm.RemoveRequested += t => job.RetentionTiers.Remove(t);
-                job.RetentionTiers.Add(tierVm);
-            }
-        }
-
-        // Schedule.
-        job.ScheduleEnabled = src.ScheduleEnabled;
-        job.ScheduleMode = src.ScheduleMode;
-        job.ScheduleIntervalHours = src.ScheduleIntervalHours;
-        job.ScheduleDailyHour = src.ScheduleDailyHour;
-        job.ScheduleDailyMinute = src.ScheduleDailyMinute;
-        job.ScheduleDebounceSeconds = src.ScheduleDebounceSeconds;
-    }
-
-    /// <summary>
-    /// Create or update a backup set with the full source selection tree and job options.
-    /// </summary>
-    private async Task<int> SaveBackupSetAsync(
-        int? existingId, string name, List<SourceSelection> sources,
-        BackupJob job, BackupSchedule? schedule)
-    {
-        var jobOptions = new JobOptions
-        {
-            ZipMode = job.ZipMode,
-            FilesystemType = job.FilesystemType,
-            CapacityOverrideBytes = job.CapacityOverrideBytes,
-            VerifyAfterBurn = job.VerifyAfterBurn,
-            VerifyAfterBackup = job.VerifyAfterBackup,
-            IncludeCatalogOnDisc = job.IncludeCatalogOnDisc,
-            AllowFileSplitting = job.AllowFileSplitting,
-            EnableFileDeduplication = job.EnableFileDeduplication,
-            EnableDeduplication = job.EnableDeduplication,
-            DeduplicationBlockSize = job.DeduplicationBlockSize,
-            RetentionTiers = job.RetentionTiers,
-            TierSets = job.TierSets.Select(ts => new VersionTierSet
-            {
-                Name = ts.Name,
-                Tiers = ts.Tiers.Select(t => new VersionRetentionTier
-                {
-                    MaxAge = t.MaxAge,
-                    MaxVersions = t.MaxVersions,
-                }).ToList(),
-                FilePatterns = [.. ts.FilePatterns],
-                FileExemptPatterns = [.. ts.FileExemptPatterns],
-            }).ToList(),
-            TargetDirectory = job.TargetDirectory,
-            CreateSubdirectory = job.CreateSubdirectory,
-            SubdirectoryName = job.SubdirectoryName,
-            ExcludedExtensions = job.ExcludedExtensions,
-            Schedule = schedule,
-        };
-
-        if (existingId.HasValue)
-        {
-            var existing = await _catalog.GetBackupSetAsync(existingId.Value);
-            if (existing is not null)
-            {
-                existing.Name = name;
-                existing.SourceRoots = sources.Select(s => s.Path).ToList();
-                existing.SourceSelections = sources;
-                existing.JobOptions = jobOptions;
-                existing.DefaultFilesystemType = job.FilesystemType;
-                existing.CapacityOverrideBytes = job.CapacityOverrideBytes;
-                await _catalog.UpdateBackupSetAsync(existing);
-                return existing.Id;
-            }
-        }
-
-        var newSet = await _catalog.CreateBackupSetAsync(new BackupSet
-        {
-            Name = name,
-            SourceRoots = sources.Select(s => s.Path).ToList(),
-            SourceSelections = sources,
-            JobOptions = jobOptions,
-            DefaultMediaType = job.TargetDirectory is not null ? MediaType.Directory : MediaType.Unknown,
-            DefaultFilesystemType = job.FilesystemType,
-            CapacityOverrideBytes = job.CapacityOverrideBytes,
-            CreatedUtc = DateTime.UtcNow,
-        });
-        return newSet.Id;
     }
 
     /// <summary>
@@ -3588,7 +3453,16 @@ public class MainViewModel : ViewModelBase
     {
         if (SelectedBackupSet is null) return;
 
-        var vm = new BackupCoverageViewModel(_catalog, _scanner, SelectedBackupSet);
+        // Estimator for the opt-in dedup-aware "actual size" pass. The block
+        // engine is stateless (it hashes against the destination's _blocks store
+        // passed per call), and the file hash cache lets unchanged files skip a
+        // re-read on repeat estimates.
+        var estimator = new Services.DedupSizeEstimator(
+            _catalog,
+            new LithicBackup.Infrastructure.Deduplication.BlockDeduplicationEngine(),
+            _fileHashCache);
+
+        var vm = new BackupCoverageViewModel(_catalog, _scanner, SelectedBackupSet, estimator);
         vm.DoneRequested += GoHome;
 
         CurrentView = vm;
@@ -3906,6 +3780,150 @@ public class MainViewModel : ViewModelBase
             StatusText = "Failed to stop service.";
             RefreshServiceStatus();
         }
+    }
+
+    // -------------------------------------------------------------------
+    // In-app update check (GitHub Releases)
+    // -------------------------------------------------------------------
+
+    /// <summary>The running assembly version, coerced to at least x.y.z.</summary>
+    private static Version CurrentAppVersion =>
+        System.Reflection.Assembly.GetEntryAssembly()?.GetName().Version
+            ?? new Version(0, 0, 0);
+
+    /// <summary>
+    /// Checks GitHub for a newer release. A background startup check
+    /// (<paramref name="userInitiated"/> = false) stays completely silent unless
+    /// a new, non-dismissed version is found; a user-initiated check always
+    /// reports the outcome (up to date / error) via a message box.
+    /// </summary>
+    public async Task CheckForUpdatesAsync(bool userInitiated)
+    {
+        if (_isCheckingForUpdates) return;
+        _isCheckingForUpdates = true;
+        CommandManager.InvalidateRequerySuggested();
+        if (userInitiated) StatusText = "Checking for updates...";
+
+        try
+        {
+            var result = await UpdateService.CheckForUpdateAsync(CurrentAppVersion);
+
+            if (result.IsUpdateAvailable && result.Update is { } update)
+            {
+                // Respect a prior dismissal of this exact version for the silent
+                // startup check; an explicit check always shows it.
+                if (!userInitiated &&
+                    string.Equals(_settings.DismissedUpdateVersion, update.TagName,
+                        StringComparison.OrdinalIgnoreCase))
+                {
+                    return;
+                }
+
+                AvailableUpdate = update;
+                UpdateBannerText =
+                    $"Lithic Backup {update.Version} is available " +
+                    $"(you have {CurrentAppVersion.ToString(3)}).";
+                UpdateBannerVisible = true;
+                if (userInitiated) StatusText = "An update is available.";
+            }
+            else if (result.Failed)
+            {
+                if (userInitiated)
+                {
+                    StatusText = "Update check failed.";
+                    MessageBox.Show(
+                        $"Couldn't check for updates:\n\n{result.Error}",
+                        "Check for Updates", MessageBoxButton.OK, MessageBoxImage.Warning);
+                }
+            }
+            else
+            {
+                // Up to date.
+                if (userInitiated)
+                {
+                    StatusText = "You're on the latest version.";
+                    MessageBox.Show(
+                        $"You're running the latest version ({CurrentAppVersion.ToString(3)}).",
+                        "Check for Updates", MessageBoxButton.OK, MessageBoxImage.Information);
+                }
+            }
+        }
+        finally
+        {
+            _isCheckingForUpdates = false;
+            CommandManager.InvalidateRequerySuggested();
+        }
+    }
+
+    /// <summary>
+    /// Downloads the release MSI and launches it, then shuts the app down so the
+    /// installer can replace the running files. If the release has no MSI asset,
+    /// falls back to opening the release page in the browser.
+    /// </summary>
+    private async Task DownloadUpdateAsync()
+    {
+        if (AvailableUpdate is not { } update) return;
+
+        if (string.IsNullOrEmpty(update.MsiDownloadUrl))
+        {
+            ViewReleaseNotes();
+            return;
+        }
+
+        try
+        {
+            StatusText = $"Downloading Lithic Backup {update.Version}...";
+            var msiPath = await UpdateService.DownloadMsiAsync(update);
+
+            StatusText = "Launching installer...";
+            System.Diagnostics.Process.Start(new System.Diagnostics.ProcessStartInfo(msiPath)
+            {
+                UseShellExecute = true
+            });
+
+            // Close the app so the MSI can overwrite the running executables.
+            Application.Current.Shutdown();
+        }
+        catch (Exception ex)
+        {
+            StatusText = "Update download failed.";
+            MessageBox.Show(
+                $"Couldn't download or launch the installer:\n\n{ex.Message}\n\n" +
+                "You can download it manually from the release page.",
+                "Download Update", MessageBoxButton.OK, MessageBoxImage.Warning);
+            ViewReleaseNotes();
+        }
+    }
+
+    /// <summary>Opens the GitHub release page in the default browser.</summary>
+    private void ViewReleaseNotes()
+    {
+        if (AvailableUpdate is not { } update) return;
+        var url = !string.IsNullOrEmpty(update.ReleasePageUrl)
+            ? update.ReleasePageUrl
+            : $"https://github.com/inhahe/Lithic/releases";
+        try
+        {
+            System.Diagnostics.Process.Start(new System.Diagnostics.ProcessStartInfo(url)
+            {
+                UseShellExecute = true
+            });
+        }
+        catch { /* best-effort; nothing actionable if the browser won't open */ }
+    }
+
+    /// <summary>
+    /// Hides the banner and remembers this version so the silent startup check
+    /// won't nag about it again (a newer release supersedes the dismissal).
+    /// </summary>
+    private void DismissUpdate()
+    {
+        if (AvailableUpdate is { } update)
+        {
+            _settings.DismissedUpdateVersion = update.TagName;
+            _settings.Save();
+        }
+        UpdateBannerVisible = false;
     }
 
     // -------------------------------------------------------------------

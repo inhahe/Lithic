@@ -57,7 +57,9 @@ internal static class DestinationFilePurger
                 && (nowMs - lastProgressMs >= ProgressIntervalMs || idx == total))
             {
                 lastProgressMs = nowMs;
-                progress.Report($"Deleting files {idx:N0}/{total:N0}: {Path.GetFileName(discRel)}");
+                int pct = total == 0 ? 100 : (int)(idx * 100L / total);
+                progress.Report(
+                    $"Deleting files {idx:N0}/{total:N0} ({pct}%): {Path.GetFileName(discRel)}");
             }
 
             string fullPath = Path.Combine(targetDir, discRel);
@@ -89,12 +91,17 @@ internal static class DestinationFilePurger
         }
 
         // Sweep empty subdirectories so the destination doesn't accumulate
-        // hollow trees after large purges.
+        // hollow trees after large purges.  This walk can traverse the whole
+        // destination tree (tens of thousands of directories), so it drives a
+        // throttled live counter rather than a single static message — without
+        // it the UI sits on "Cleaning up empty directories..." looking frozen
+        // for the entire sweep.
         progress?.Report("Cleaning up empty directories...");
         try
         {
+            var sweep = new SweepProgress(progress, sw);
             foreach (var subDir in new DirectoryInfo(targetDir).EnumerateDirectories())
-                CleanEmptyDirectories(subDir);
+                CleanEmptyDirectories(subDir, sweep);
         }
         catch
         {
@@ -110,6 +117,14 @@ internal static class DestinationFilePurger
     /// removed even when they momentarily appear empty.
     /// </summary>
     public static void CleanEmptyDirectories(DirectoryInfo dir)
+        => CleanEmptyDirectories(dir, null);
+
+    /// <summary>
+    /// Recursive worker for <see cref="CleanEmptyDirectories(DirectoryInfo)"/>,
+    /// threading an optional <see cref="SweepProgress"/> so large sweeps can
+    /// report how many directories they've scanned so far.
+    /// </summary>
+    private static void CleanEmptyDirectories(DirectoryInfo dir, SweepProgress? sweep)
     {
         try
         {
@@ -117,8 +132,10 @@ internal static class DestinationFilePurger
                 dir.Name.Equals("_filestore", StringComparison.OrdinalIgnoreCase))
                 return;
 
+            sweep?.Tick();
+
             foreach (var subDir in dir.EnumerateDirectories())
-                CleanEmptyDirectories(subDir);
+                CleanEmptyDirectories(subDir, sweep);
 
             if (!dir.EnumerateFileSystemInfos().Any())
                 dir.Delete();
@@ -126,6 +143,28 @@ internal static class DestinationFilePurger
         catch
         {
             // Permission errors etc. — skip.
+        }
+    }
+
+    /// <summary>
+    /// Throttled directory-scan counter for the empty-directory sweep.  Shares
+    /// the caller's stopwatch so the whole purge uses one monotonic clock, and
+    /// reports at the same <see cref="ProgressIntervalMs"/> cadence as the rest
+    /// of the operation.
+    /// </summary>
+    private sealed class SweepProgress(IProgress<string>? progress, Stopwatch sw)
+    {
+        private int _scanned;
+        private long _lastMs = long.MinValue;
+
+        public void Tick()
+        {
+            _scanned++;
+            if (progress is null) return;
+            long nowMs = sw.ElapsedMilliseconds;
+            if (nowMs - _lastMs < ProgressIntervalMs) return;
+            _lastMs = nowMs;
+            progress.Report($"Cleaning empty directories: {_scanned:N0} scanned");
         }
     }
 }

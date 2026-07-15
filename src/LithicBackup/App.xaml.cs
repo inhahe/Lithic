@@ -258,6 +258,12 @@ public partial class App : Application
 
         // Start background monitoring if there are existing backup sets.
         _ = StartBackgroundMonitoringAsync();
+
+        // Quietly check GitHub for a newer release (opt-out via settings). Runs
+        // in the background so it never delays showing the window; surfaces an
+        // in-window banner only if a new, non-dismissed version is available.
+        if (_settings.CheckForUpdates)
+            _ = mainViewModel.CheckForUpdatesAsync(userInitiated: false);
     }
 
     /// <summary>
@@ -333,6 +339,21 @@ public partial class App : Application
     {
         IsExiting = true;
         Shutdown();
+    }
+
+    /// <summary>
+    /// A session-end request — Windows logging off/shutting down, OR an installer's
+    /// Restart Manager asking us to close so it can replace our files (this is what
+    /// the MSI upgrade sends). Treat it as a real exit: without this, the main
+    /// window's OnClosing would cancel the close and minimize to tray, leaving the
+    /// process alive and holding LithicBackup.exe locked — which is what makes an
+    /// upgrade fail with "Setup was unable to automatically close the application."
+    /// Flag the real shutdown so OnClosing lets the window close.
+    /// </summary>
+    protected override void OnSessionEnding(SessionEndingCancelEventArgs e)
+    {
+        IsExiting = true;
+        base.OnSessionEnding(e);
     }
 
     /// <summary>

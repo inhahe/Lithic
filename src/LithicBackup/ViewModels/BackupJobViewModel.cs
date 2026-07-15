@@ -593,34 +593,6 @@ public class BackupJobViewModel : ViewModelBase
     }
 
     /// <summary>
-    /// Build a <see cref="BackupSchedule"/> from the current UI state.
-    /// Returns null if scheduling is disabled.
-    /// </summary>
-    internal BackupSchedule? BuildSchedule()
-    {
-        if (!ScheduleEnabled) return null;
-
-        double intervalHours = 24;
-        if (double.TryParse(ScheduleIntervalHours, System.Globalization.NumberStyles.Float,
-                System.Globalization.CultureInfo.InvariantCulture, out double h) && h > 0)
-            intervalHours = h;
-
-        int debounce = 60;
-        if (int.TryParse(ScheduleDebounceSeconds, out int d) && d > 0)
-            debounce = d;
-
-        return new BackupSchedule
-        {
-            Enabled = true,
-            Mode = ScheduleMode,
-            IntervalHours = intervalHours,
-            DailyHour = ScheduleDailyHour,
-            DailyMinute = ScheduleDailyMinute,
-            DebounceSeconds = debounce,
-        };
-    }
-
-    /// <summary>
     /// Parse an exclusion pattern string into a normalized list. Splits on
     /// newlines only — commas and semicolons are allowed in patterns since
     /// they are valid characters in Windows file names.

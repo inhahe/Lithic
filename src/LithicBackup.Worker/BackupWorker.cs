@@ -360,6 +360,12 @@ public sealed class BackupWorker : BackgroundService
 
         var truncatedDrives = new HashSet<char>();
 
+        // Newly-created directories that are included via a parent's auto-include
+        // rule but aren't yet explicit selections. Collected during change routing
+        // and pinned into their sets afterwards (see MaterializeDiscoveredDirectoriesAsync)
+        // so their membership persists past the user turning auto-include off.
+        var discoveredDirs = new List<(SetState State, string Dir)>();
+
         // [rename-trace] Running totals for the once-per-poll summary below.
         int traceTotalChanges = 0, traceTotalMoves = 0;
 
@@ -378,7 +384,7 @@ public sealed class BackupWorker : BackgroundService
             // this volume. If a directory rename doesn't show up here, detection
             // (not propagation) is the problem.
             if (moves.Count > 0)
-                _logger.LogInformation(
+                _logger.LogDebug(
                     "[rename-trace] step 1: USN journal on {Drive}: reported {Count} move(s): {Moves}",
                     drive, moves.Count,
                     string.Join(" | ", moves.Select(m =>
@@ -387,7 +393,23 @@ public sealed class BackupWorker : BackgroundService
             foreach (var change in changes)
             {
                 if (change.IsDirectory)
+                {
+                    // A brand-new directory that the set covers only through a
+                    // parent's auto-include rule should become a permanent explicit
+                    // selection. Skip plain metadata changes on existing directories
+                    // (their child files carry their own change records) and dirs
+                    // already gone by poll time.
+                    bool created = (change.Reason & UsnJournalReader.UsnReasonFileCreate) != 0;
+                    if (created && Directory.Exists(change.FullPath))
+                    {
+                        foreach (var state in continuousSets)
+                        {
+                            if (PathBelongsToSet(state.BackupSet, change.FullPath))
+                                discoveredDirs.Add((state, change.FullPath));
+                        }
+                    }
                     continue;
+                }
 
                 foreach (var state in continuousSets)
                 {
@@ -416,7 +438,7 @@ public sealed class BackupWorker : BackgroundService
                         state.PendingMoves.Add(move);
                         // [rename-trace] step 2: this move was matched to a set and
                         // queued for the apply step.
-                        _logger.LogInformation(
+                        _logger.LogDebug(
                             "[rename-trace] step 2: queued move '{Old}' -> '{New}' (isDir={IsDir}) " +
                             "for set \"{Name}\" (oldIn={OldIn}, newIn={NewIn})",
                             move.OldPath, move.NewPath, move.IsDirectory,
@@ -430,7 +452,7 @@ public sealed class BackupWorker : BackgroundService
         // loop is actually running (~every 30s) and see whether anything was
         // detected. If you rename a directory and never see a move counted here,
         // the change never reached the worker.
-        _logger.LogInformation(
+        _logger.LogDebug(
             "[rename-trace] continuous poll: {Sets} set(s), {Drives} drive(s) read, " +
             "{Changes} file change(s), {Moves} move(s) detected",
             continuousSets.Count, driveLetters.Count, traceTotalChanges, traceTotalMoves);
@@ -441,7 +463,11 @@ public sealed class BackupWorker : BackgroundService
         //     reconcile with a full timestamp/size scan whenever watching
         //     (re)starts or its buffer overflows.
         MaintainFallbackWatchers(continuousSets);
-        DrainFallbackChanges(continuousSets, now);
+        DrainFallbackChanges(continuousSets, now, discoveredDirs);
+
+        // Pin any newly-discovered auto-include folders into their sets as explicit
+        // selections so their membership survives auto-include being turned off.
+        await MaterializeDiscoveredDirectoriesAsync(discoveredDirs, ct);
 
         // 2. If a watched volume's journal lost continuity (it wrapped or was
         //    recreated while the service was down), the incremental USN stream
@@ -688,7 +714,9 @@ public sealed class BackupWorker : BackgroundService
     /// move-in may not fire per-file events); an overflow flags the affected sets for
     /// a full reconciling scan because their change list is incomplete.
     /// </summary>
-    private void DrainFallbackChanges(IReadOnlyList<SetState> continuousSets, DateTime now)
+    private void DrainFallbackChanges(
+        IReadOnlyList<SetState> continuousSets, DateTime now,
+        List<(SetState State, string Dir)> discoveredDirs)
     {
         while (_fswChanges.TryDequeue(out var change))
         {
@@ -706,7 +734,12 @@ public sealed class BackupWorker : BackgroundService
                     // timestamp updating — the child's own event covers the real
                     // change — so skip it to avoid re-walking the tree on every write.
                     if (changeType is FileChangeType.Created or FileChangeType.Renamed)
+                    {
                         EnqueueForBackup(state, changedPath, isDirectory: true, now);
+                        // A new folder covered only by auto-include should also become
+                        // a permanent explicit selection (pinned after routing).
+                        discoveredDirs.Add((state, changedPath));
+                    }
                 }
                 else
                 {
@@ -739,6 +772,85 @@ public sealed class BackupWorker : BackgroundService
                     "(too many changes at once to enumerate). Running a full reconciling backup " +
                     "to capture the changes that were dropped.",
                     state.BackupSet.Name);
+            }
+        }
+    }
+
+    /// <summary>
+    /// Pin newly-discovered directories that are currently included only via a
+    /// parent's auto-include-new rule into their sets as explicit, checked
+    /// selections — so their membership is persisted and survives the user later
+    /// turning auto-include off (a live-rule-only folder would otherwise drop out
+    /// of scope at that point without ever having been backed up as a real entry).
+    /// </summary>
+    /// <remarks>
+    /// Each affected set is re-read fresh from the catalog before mutation rather
+    /// than persisting the worker's in-memory copy: that copy can be up to a poll
+    /// interval stale, so writing it back would clobber any edit the GUI saved in
+    /// the meantime. Reading fresh confines the read-modify-write to a sub-second
+    /// window and preserves everything the user changed. (The reverse race — the
+    /// GUI overwriting a pin made while its editor was open — is benign: while
+    /// auto-include stays on the folder is simply re-pinned on its next change.)
+    /// Legacy root-only sets have no selection tree to pin into and are skipped.
+    /// </remarks>
+    private async Task MaterializeDiscoveredDirectoriesAsync(
+        IReadOnlyList<(SetState State, string Dir)> discovered, CancellationToken ct)
+    {
+        if (discovered.Count == 0)
+            return;
+
+        foreach (var group in discovered.GroupBy(d => d.State))
+        {
+            var state = group.Key;
+            if (state.BackupSet.SourceSelections is not { Count: > 0 })
+                continue; // legacy root-only set — nothing to pin into.
+
+            BackupSet? fresh;
+            try
+            {
+                fresh = await _catalog.GetBackupSetAsync(state.BackupSet.Id, ct);
+            }
+            catch (Exception ex)
+            {
+                _logger.LogWarning(ex,
+                    "Failed reloading set {Id} to pin auto-included folders — will retry next poll.",
+                    state.BackupSet.Id);
+                continue;
+            }
+
+            if (fresh?.SourceSelections is not { Count: > 0 })
+                continue;
+
+            bool changed = false;
+            foreach (var dir in group
+                         .Select(d => d.Dir)
+                         .Distinct(StringComparer.OrdinalIgnoreCase))
+            {
+                if (SourceSelection.MaterializeDirectory(fresh.SourceSelections, dir))
+                {
+                    changed = true;
+                    _logger.LogInformation(
+                        "Auto-included new folder \"{Dir}\" into set \"{Name}\" as a permanent selection.",
+                        dir, fresh.Name);
+                }
+            }
+
+            if (!changed)
+                continue;
+
+            try
+            {
+                await _catalog.UpdateBackupSetAsync(fresh, ct);
+                // Adopt the freshly-persisted copy so this poll's later stages and
+                // subsequent polls route against the pinned tree.
+                state.BackupSet = fresh;
+                state.WatchRoots = ResolveWatchRoots(fresh);
+            }
+            catch (Exception ex)
+            {
+                _logger.LogWarning(ex,
+                    "Failed persisting auto-included folders for set \"{Name}\" — will retry next poll.",
+                    fresh.Name);
             }
         }
     }
@@ -859,7 +971,7 @@ public sealed class BackupWorker : BackgroundService
         if (!await _backupLock.WaitAsync(0, ct))
         {
             // [rename-trace] step 3: another backup holds the lock — moves wait.
-            _logger.LogInformation(
+            _logger.LogDebug(
                 "[rename-trace] step 3: RunMovesAsync for \"{Name}\" skipped — another backup " +
                 "in progress; {Count} move(s) stay queued for next poll.",
                 state.BackupSet.Name, state.PendingMoves.Count);
@@ -874,7 +986,7 @@ public sealed class BackupWorker : BackgroundService
             if (targetDir is null)
             {
                 // [rename-trace] step 3: destination offline — moves wait.
-                _logger.LogInformation(
+                _logger.LogDebug(
                     "[rename-trace] step 3: RunMovesAsync for \"{Name}\" skipped — destination " +
                     "not connected; {Count} move(s) stay queued.",
                     set.Name, state.PendingMoves.Count);
@@ -890,7 +1002,7 @@ public sealed class BackupWorker : BackgroundService
 
             // [rename-trace] step 3: we hold the lock and have a live destination —
             // about to apply the queued moves.
-            _logger.LogInformation(
+            _logger.LogDebug(
                 "[rename-trace] step 3: RunMovesAsync for \"{Name}\": applying {Count} move(s); " +
                 "destination='{Dest}'.",
                 set.Name, moves.Count, targetDir);
@@ -910,17 +1022,17 @@ public sealed class BackupWorker : BackgroundService
                     // [rename-trace] step 4: both endpoints are in the set — this
                     // is an in-place relocation. The trace callback surfaces the
                     // physical destination paths computed inside the service.
-                    _logger.LogInformation(
+                    _logger.LogDebug(
                         "[rename-trace] step 4: relocating in place '{Old}' -> '{New}' " +
                         "(isDir={IsDir}) for \"{Name}\".",
                         move.OldPath, move.NewPath, move.IsDirectory, set.Name);
 
                     var outcome = await _directoryBackup.MoveTargetedAsync(
                         job, targetDir, move.OldPath, move.NewPath, move.IsDirectory, ct,
-                        trace: msg => _logger.LogInformation("[rename-trace] step 5: {Msg}", msg));
+                        trace: msg => _logger.LogDebug("[rename-trace] step 5: {Msg}", msg));
 
                     // [rename-trace] step 6: the service's verdict for this move.
-                    _logger.LogInformation(
+                    _logger.LogDebug(
                         "[rename-trace] step 6: '{Old}' -> '{New}' => {Outcome}.",
                         move.OldPath, move.NewPath, outcome);
 
@@ -954,7 +1066,7 @@ public sealed class BackupWorker : BackgroundService
                 else if (newIn)
                 {
                     // Entered the set from outside — back up the new side as fresh.
-                    _logger.LogInformation(
+                    _logger.LogDebug(
                         "[rename-trace] step 4: '{New}' entered the set (old path not covered) — " +
                         "backing up as fresh, no in-place relocation.",
                         move.NewPath);
@@ -966,7 +1078,7 @@ public sealed class BackupWorker : BackgroundService
                     // identically to a deletion — soft-delete its catalog record(s) so
                     // version history is retained until the user's next cleanup purges
                     // them. The moved item is NOT relocated on the destination.
-                    _logger.LogInformation(
+                    _logger.LogDebug(
                         "[rename-trace] step 4: '{Old}' moved OUT of the set (new path not covered) — " +
                         "marking removed, destination copy left as-is.",
                         move.OldPath);

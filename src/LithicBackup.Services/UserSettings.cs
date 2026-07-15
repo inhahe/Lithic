@@ -35,6 +35,21 @@ public class UserSettings
     /// </summary>
     public DiscStagingMode DiscStagingMode { get; set; } = DiscStagingMode.TemporaryCopy;
 
+    /// <summary>
+    /// When true (default), the app quietly checks GitHub Releases for a newer
+    /// version shortly after startup and shows an in-window banner if one is
+    /// available. The "Check for updates" menu item always works regardless of
+    /// this setting.
+    /// </summary>
+    public bool CheckForUpdates { get; set; } = true;
+
+    /// <summary>
+    /// The latest-release version the user explicitly dismissed. While the newest
+    /// available release equals this value the startup check stays silent; a newer
+    /// release than this supersedes the dismissal and the banner returns.
+    /// </summary>
+    public string? DismissedUpdateVersion { get; set; }
+
     public static UserSettings Load()
     {
         try

@@ -14,7 +14,8 @@
   Build inputs live in .\publish (populated by build-installer.ps1 via
   `dotnet publish`).  Version is passed in with `-d Version=x.y.z`.
 -->
-<Wix xmlns="http://wixtoolset.org/schemas/v4/wxs">
+<Wix xmlns="http://wixtoolset.org/schemas/v4/wxs"
+     xmlns:util="http://wixtoolset.org/schemas/v4/wxs/util">
 
   <?define Version = "$(var.Version)" ?>
 
@@ -28,6 +29,29 @@
 
     <!-- Block same/older reinstalls with a clear message; allow upgrades. -->
     <MajorUpgrade DowngradeErrorMessage="A newer version of Lithic Backup is already installed." />
+
+    <!--
+      Close the running GUI before touching files.  Unlike the Worker (a service
+      the installer can stop via SCM), LithicBackup.exe is an interactive app,
+      and it minimizes to the tray on a plain WM_CLOSE instead of exiting - so
+      the Restart Manager's polite close request just hides it and the process
+      keeps its .exe locked, producing "Setup was unable to automatically close
+      the application" on upgrade.
+
+      EndSessionMessage sends WM_QUERYENDSESSION, which the app now treats as a
+      real exit (App.OnSessionEnding), so it shuts down gracefully.  If it hasn't
+      exited by the timeout, TerminateProcess force-closes it as a fallback so
+      the upgrade can always proceed.  RebootPrompt="no" avoids demanding a
+      reboot if a stubborn instance lingers.
+    -->
+    <util:CloseApplication
+        Id="CloseLithicGui"
+        Target="LithicBackup.exe"
+        Description="Please close Lithic Backup so the upgrade can replace its files."
+        CloseMessage="no"
+        EndSessionMessage="yes"
+        TerminateProcess="1"
+        RebootPrompt="no" />
 
     <MediaTemplate EmbedCab="yes" />
 
@@ -150,6 +174,26 @@
       WixShellExec custom action that starts LithicBackup.exe.  Impersonate="yes"
       so the app runs as the installing user, not the elevated installer account;
       asyncNoWait so the wizard closes immediately without blocking on the app.
+
+      Why this never launches after a FAILED/CANCELLED install:
+        * WixUI routes outcomes to different dialogs - success -> ExitDialog
+          (this one), user cancel -> UserExit, fatal error/rollback -> FatalError.
+          Only ExitDialog carries the launch checkbox + DoAction, so a cancel or
+          a rolled-back install can't reach this launch at all.
+        * The one path that could once show ExitDialog with the app NOT actually
+          updated was "files in use -> user declines to close -> file swap
+          deferred to the next reboot -> transaction succeeds with a reboot
+          pending", which then offered to launch the still-old exe.  We remove
+          that path at the source: util:CloseApplication (above) force-closes the
+          GUI before file transfer, so nothing is ever in use and no reboot is
+          ever scheduled - ExitDialog therefore only appears after a genuinely
+          complete install.
+
+      Conditions on the launch:
+        * WIXUI_EXITDIALOGOPTIONALCHECKBOX = 1  - the user left the box ticked.
+        * NOT Installed                         - a first-time install or a
+          major upgrade (the new package is not yet registered), never a repair,
+          modify, or uninstall.
     -->
     <Property Id="WIXUI_EXITDIALOGOPTIONALCHECKBOXTEXT" Value="Launch Lithic Backup" />
     <Property Id="WIXUI_EXITDIALOGOPTIONALCHECKBOX" Value="1" />
@@ -164,7 +208,7 @@
                Control="Finish"
                Event="DoAction"
                Value="LaunchApplication"
-               Condition="WIXUI_EXITDIALOGOPTIONALCHECKBOX = 1 and NOT Installed" />
+               Condition="WIXUI_EXITDIALOGOPTIONALCHECKBOX = 1 and NOT Installed and NOT REMOVE" />
     </UI>
 
   </Package>

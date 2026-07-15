@@ -1,5 +1,244 @@
 # LithicBackup — Known Issues & Tech Debt
 
+## ADDED: Dedup-aware "actual backup size" estimate (2026-07-15)
+
+**Problem (roadmap item 6):** the pre-backup coverage scan
+(`BackupCoverageViewModel`) summed **raw** file sizes and bucketed files against the
+catalog *by path* — it never hashed content, so two identical files at different
+paths both counted in full. For a set with dedup enabled this over-stated the space
+the backup would actually consume, sometimes badly.
+
+**What shipped:** `DedupSizeEstimator` (`src/LithicBackup.Services/DedupSizeEstimator.cs`),
+an opt-in estimator that mirrors `DirectoryBackupService` dedup accounting so its
+reported `StoredBytes` matches what a real backup would write:
+- **File-level dedup:** size gate first (a size colliding with nothing already
+  stored is definitely new → counted full, no read), then item-5 progressive
+  prefix-hash escalation for size-colliders (settled after 64 KiB unless a real
+  prefix collision forces a full hash). Dedups against both already-stored plain
+  content and files seen earlier in the same scan.
+- **Block-level dedup:** reads and hashes every block of every file via
+  `IDeduplicationEngine`, counting only blocks not already in the store and not
+  already seen this run (`seenNewBlocks`) — partial hashing buys nothing here, so the
+  pass is exact but expensive and gated behind an explicit user action with a "this
+  reads all your data" warning (`RequiresFullRead`).
+- Reuses the shared dedup primitives (`GetActivePlainContentSizesAsync`,
+  `GetActivePlainContentPathsAsync`, whole-file hash, block store, and the
+  path+size+mtime `_hashCache`) so the estimate can't drift from the real result.
+
+Surfaced in `BackupCoverageView` as a "Compute actual size" button (visible only when
+a dedup mode is enabled and a target is known); the fast raw-size scan stays the
+default. Directory-backup only — disc backups don't dedup.
+
+**Coverage:** `tools/dedup_estimate_test` runs BOTH the real `DirectoryBackupService`
+and the estimator over identical inputs and asserts `StoredBytes` equals the bytes
+physically written (plain copies + `_blocks/*.blk`, ignoring tiny `.fileref`/`.dedup`
+manifests) across no-dedup (stored == raw), file-level (dup + unique + same-size-
+different), block-level (files sharing a block, incl. partial last blocks), and an
+all-redundant incremental re-run (0 new bytes). All checks pass.
+
+## FIXED: Double-read on large size-colliding files during file dedup (2026-07-15)
+
+**Problem (roadmap item 5):** in directory-backup file-level dedup, a file whose size
+collided with other content was hashed in full up front and then, if it turned out
+*not* to be a duplicate, read a second time to copy its bytes. The redundant read only
+hit files larger than the in-memory buffer budget (small files are buffered on the
+first read and copied from memory), but on multi-GB size-colliders it doubled the I/O.
+
+**What shipped:** a progressive prefix pre-check in `DirectoryBackupService`. An
+intra-run index `intraRunPlainPrefixes` (size → set of 64 KiB SHA-256 prefixes of
+already-stored plain copies) plus `RuledOutByPrefixAsync`: for a large, non-buffered
+file whose size collides *only* with other files in this run and **not** with any
+already-stored plain content (`IsIntraRunOnlyCollision` = candidate size count ≥ 2 and
+size not in `existingPlainSizes`), a cheap prefix hash proves it shares no prefix with
+any same-size plain copy stored so far. When ruled out, the full up-front hash is
+skipped and `deferHashToCopy` reads the file exactly once (hashing while copying via
+`CopyFileWithHashAsync`). When the prefix collides, it escalates to the full hash to
+confirm and, if identical, writes a `.fileref`. **Every** plain copy of a colliding
+size registers its prefix after landing (`ComputePrefixHashOfBuffer` for buffered
+writes, `ComputePrefixHashAsync` for streamed) — required for correctness, or a later
+identical file could be stored as a second plain copy (a missed dedup). Existing-content
+size collisions deliberately keep the full up-front hash: no schema change, no
+destination reads. Test-stub plain writes are excluded from registration (`!stubbedPlain`).
+
+**Coverage:** directory-backup dedup previously had **zero** automated tests. Added
+`tools/dir_dedup_test`, which drives the real `DirectoryBackupService` and asserts:
+identical files → 1 plain + 1 `.fileref`; different same-size files → 2 plain, 0 ref;
+a mixed X / Y(diff, same size) / X sequence → 2 plain + 1 ref resolving to X. Each
+scenario runs under both `MemoryBudget = Fixed 0 GiB` (forces the streaming/prefix
+path) and the default Auto budget (buffered path) — 24/24 checks pass. The disc harness
+still passes 25/25.
+
+## TECH DEBT: `StartBurnForSavedSet` / `PlanCompleted` now have zero callers (2026-07-15)
+
+Discovered while wiring roadmap item 4. `MainViewModel.StartBurnForSavedSet` and
+`BackupJobViewModel.PlanCompleted` (raised at ~line 559) have **no remaining callers**
+in `src\` — they were reached only through `ShowJobConfig`, which the item-2 cleanup
+deleted. The item-2 FIXED note kept `StartBurnForSavedSet` believing it was live, but a
+`grep` for both symbols now returns only their own definitions. Proper fix: delete
+`StartBurnForSavedSet`, the `PlanCompleted` event, and its `Invoke` (and re-check
+`BackupJobViewModel` for other now-dead members freed up by that). Left for a focused
+follow-up rather than folded into the item-4 UX change.
+
+## ADDED: Plan-time disc-format compatibility warning (suggest UDF) (2026-07-15)
+
+**Feature (roadmap item 4):** the disc `FilesystemType` (ISO 9660 / Joliet / UDF) was
+chosen in Settings and only *acted on* at burn time — `ZipMode.IncompatibleOnly` (the
+default) silently auto-zips any file whose disc path violates the format's
+name/path/depth limits. A set full of long Unicode paths burned as ISO 9660 got quietly
+zipped wholesale with no chance to reconsider the format.
+
+**What shipped:** `DiscCompatibilitySummary` (Core.Models) +
+`IBackupOrchestrator.SummarizeCompatibility(plan, filesystemType)` tally how many
+planned files (and bytes) would be zipped for a given format, using the **same**
+per-file predicate the burn applies — both now route through a shared
+`BackupOrchestrator.IsCompatibleForDisc`, which checks the **disc-relative** path
+(`GetRelativeStagingPath`) rather than the raw source path, so the summary can't
+disagree with what the burn zips. (The burn's own zip check at the ZipMode branch was
+switched from `file.FullPath` to that helper — the correct input, since the disc
+filesystem only ever sees the disc-relative path.) In the GUI,
+`MainViewModel.WarnAndMaybeSwitchToUdf` runs the summary in the disc-burn path (after
+planning, before the burn); when a significant fraction would be zipped
+(≥5% of files, ≥5% of bytes, or ≥20 files) and the format isn't already UDF, it shows a
+Yes/No/Cancel warning offering to switch this run to UDF. Switching just flips
+`job.FilesystemType` (no re-scan — bin-packing is capacity-based and
+format-independent). `ZipMode.IncompatibleOnly` remains the fallback for the handful of
+files still incompatible under the chosen format. Directory backups are unaffected
+(no filesystem-format limits). Harness test
+`plan-time-compat-summary-counts-incompatible` verifies the counts; 25/25 pass.
+
+## FIXED: Graceful re-plan when a disc over-reports its capacity (2026-07-15)
+
+**Problem (fail-safe, not graceful):** when media physically holds less than
+`GetMediaInfoAsync` reported, the planner bin-packs to the reported size and the burn
+only discovers the shortfall mid-write. The burner threw a plain `IOException` once
+committed bytes exceeded true capacity, so the whole backup **aborted** — correct
+(no silent truncation) but needlessly destructive when the remaining files could
+simply spill onto more discs.
+
+**Fix:** introduced a typed `DiscCapacityExceededException` (in `IDiscBurner.cs`)
+carrying `ObservedCapacityBytes` (the largest byte count known to fit).
+`SimulatedDiscBurner` now throws it when `committedBytes + fileSize` exceeds its
+`ActualCapacityBytes` knob, and clears the disc-shelf directory at burn start so a
+failed attempt leaves no stale content for the retry. `BackupOrchestrator.ExecuteAsync`
+catches it — guarded by `when (!hadIncomingCarry)` so a split spanning in from a prior
+*recorded* disc still aborts safely (restarting would double-write committed chunks) —
+caps every remaining disc to the observed capacity (`capacityCap`), re-packs all
+not-yet-burned files (staged sources + carry + overflow + re-queued + later
+allocations, deduped by path), splices the fresh allocations into the current slot,
+resets carry/overflow/re-queued, and `continue`s without advancing `discIndex` (the
+`finally` releases in-place locks and cleans staging). `ExecuteAsync` now works from a
+mutable local `allocations` list rather than the immutable `plan.DiscAllocations`. The
+`disc-over-reports-capacity` harness test was rewritten to assert graceful recovery
+(succeeds across ≥2 discs, no disc exceeds the observed 100 KB, restore matches);
+24/24 harness tests pass.
+
+## FIXED: Removed dead schedule-wipe code path (`ShowJobConfig` cluster) (2026-07-15)
+
+**Problem (dead code + latent footgun):** `MainViewModel.ShowJobConfig` had **zero
+callers** but dragged along a null-returning schedule builder. Its `PlanCompleted`
+handler called `SaveBackupSetAsync(..., jobConfig.BuildSchedule())`, and
+`BackupJobViewModel.BuildSchedule()` returns `null` when `ScheduleEnabled` is false —
+so if this path were ever re-wired it would wipe a stored schedule to null (reverting a
+set to Off/Interval on reload) whenever the config checkbox happened to be off,
+inconsistent with the live save path `SyncSettingsToJobOptions`, which preserves the
+existing schedule object.
+
+**Fix:** deleted the entire dead cluster reachable only from `ShowJobConfig` —
+`ShowJobConfig`, `SaveBackupSetAsync`, `RestoreJobOptions`, `ApplySourceSettings`
+(all in `MainViewModel`), and `BackupJobViewModel.BuildSchedule`. Verified no other
+callers anywhere in `src\` before removing; `_pendingSettingsSave`, `StartEditFlow`,
+`StartNewBackupFlow`, and `StartBurnForSavedSet` are used by live paths and were kept.
+GUI builds clean, 0 warnings.
+
+## FIXED: Disc-burn staging inherited source read-only → temp leak + burn-abort landmine (2026-07-15)
+
+**Symptom (two failures from one cause):** `BackupOrchestrator` staged files into
+`%TEMP%\LithicBackup\disc-*` via `File.Copy`, which **preserves the source's
+read-only attribute**. A large fraction of backed-up content is read-only (git
+object/pack files, anything copied from read-only media), so the staged copies were
+read-only too. Consequences: (1) the post-burn cleanup `Directory.Delete(stagingDir,
+true)` — wrapped in `catch {}` — silently failed on those files and leaked the staging
+folder forever; (2) worse, the **unguarded** pre-clean `Directory.Delete` at the top
+of the per-disc loop threw `UnauthorizedAccessException` on a leftover read-only file
+from a prior run and **aborted the next disc burn** before it started.
+
+**Fix:** added `BackupOrchestrator.ForceDeleteDirectory(path)`, which clears the
+read-only attribute on every file (recursive enumerate, best-effort per file) before
+`Directory.Delete(path, true)` — mirroring the existing `ForceDeleteFile`/`ClearReadOnly`
+in `DirectoryBackupService`. Routed **all seven** staging-cleanup sites through it: the
+main per-disc pre-clean and post-burn `finally`, the split-file spill cleanup, and the
+consolidate and reburn staging paths (each had its own pre-clean + `finally`). This is
+the disc-backup analog of the already-fixed directory-backup read-only deletion bug.
+
+Scope: only `DiscStagingMode.TemporaryCopy` copies plain files to temp, but zipped/split
+files and the split spill stage to temp even in `InPlace` mode, so the helper is needed
+regardless of mode.
+
+## FIXED: Source tree showed auto-included new folders as unchecked (display/coverage mismatch) (2026-07-14)
+
+**Symptom:** With a *partially-selected* root (e.g. `D:\` selected with some
+exclusions) whose `AutoIncludeNewSubdirectories` is ON, a newly-created
+subdirectory showed **unchecked** in the Sources tree even though it *was* in
+backup scope. The file scanner and the continuous-backup predicate both include
+it via `SourceSelection.IncludesUnlistedDescendants` (returns true for a partial
+parent with auto-include on), so any files placed in it while the flag is on get
+backed up — but the checkbox never reflected that.
+
+**Root cause:** `SourceSelectionNodeViewModel.CreateChildNode` gave a freshly
+enumerated child `_isSelected = parent._isSelected ?? false`, so under a partial
+(`null`) parent a new folder rendered unchecked regardless of the auto-include
+flag.
+
+**Fix (display/serialisation decoupling + pin-on-toggle-off):** `CreateChildNode`
+now derives the unlisted-descendant checkbox from the rule the scanner uses —
+`_isSelected = parent._isSelected switch { false => false, true => true, null => parent._autoIncludeNew }`
+— so a new folder under a partial auto-include parent renders **checked**. Such a
+node is flagged `_isAutoIncludeDerived`, and while auto-include stays ON `ToModel()`
+**skips** it: the saved selection stays byte-for-byte identical (no bloat, no
+reconcile churn — `MainViewModel.SelectionsEquivalent` sees no diff), and the
+folder is re-derived from the parent's auto-include on reload. The flag clears the
+instant the node gets a real state — a user click, a descendant edit rippling up
+through `IsSelected`/`UpdateFromChildren`, or a saved-model restore in
+`ApplySelectionAsync`.
+
+**Semantics of turning auto-include OFF:** "Auto-include *new*" governs *future*
+folders only — turning it off must NOT retroactively evict a folder it already
+adopted. So the `AutoIncludeNew` setter, on a true→false transition, **pins** every
+currently-covered derived descendant (clears its `_isAutoIncludeDerived` flag so
+`ToModel` serialises it) as it propagates the flag down. A pinned directory that
+has loaded children keeps them explicit, so `IncludesUnlistedDescendants` returns
+the now-off flag and genuinely new folders stay excluded; a pinned directory with
+no loaded children serialises as a fully-selected subtree, preserving its current
+content. Net effect: display agrees with coverage, already-adopted folders survive
+an auto-include-off toggle, and only future additions are excluded.
+
+**Proper fix (worker-side materialisation — the durable half):** the editor-side
+pinning above only reaches folders that are *materialised* in the tree (loaded/
+expanded); an auto-include-covered folder the user never expanded would still drop
+from scope if auto-include was turned off before it became an explicit entry. There
+is a real difference between a folder's files being backed up via the *live rule*
+and the folder being a *persisted checked entry* — only the latter survives the
+rule changing. The continuous-backup worker now closes that gap: when it discovers
+a **newly-created** directory (USN `USN_REASON_FILE_CREATE`, or a FileSystemWatcher
+`Created`/`Renamed`) that a set covers *only* through a parent's auto-include rule,
+it writes that folder into the set's `SourceSelections` as an explicit
+`IsSelected = true` entry — exactly as if the user had ticked it — via
+`SourceSelection.MaterializeDirectory` (creates the intermediate directory chain as
+partial nodes, the target as selected, inheriting the governing ancestor's
+auto-include flag). It re-reads the set fresh from the catalog before mutating so a
+poll-interval-stale in-memory copy can't clobber a GUI edit; the reverse race (GUI
+overwriting a just-made pin) is benign — while auto-include stays on the folder is
+re-pinned on its next change. `MaterializeDirectory` no-ops when the folder is
+already explicit or already covered by a fully-selected ancestor. Net effect: a new
+folder created under an auto-include parent becomes permanent membership a few
+seconds after it appears, so turning auto-include off later never silently drops it.
+Detection is scoped to directory **creates** (not arbitrary metadata changes), so
+pre-existing rule-covered folders are left as live-rule coverage until they actually
+change. *Follow-up not yet done:* a directory that *enters* the covered area via an
+intra-volume move (handled by `RunMovesAsync`, not the create path) is backed up but
+not yet materialised — low priority; it re-pins on its next in-place change.
+
+
 ## FIXED: Changed file re-burned to the same multisession disc collided/shadowed (2026-07-12)
 
 **Symptom (hardware edge case, follow-on from the multisession fix below):** once
@@ -762,11 +1001,22 @@ back to the old streaming re-read; a budget of 0 disables buffering entirely and
 still correct). The `preRecipes`/`wholeFileCount`/`blockOccur` hash maps above are
 NOT subject to that cap — they are the residual unbounded structure.
 
-**Proper fix if the hash maps ever bite:** stream the analysis — keep only
-`wholeFileCount` + `blockOccur` (both O(unique hashes), much smaller) during counting,
-drop per-file recipes, and recompute each file's recipe in the main loop only for files
-that turn out to be `.dedup`. That trades one extra read of the dedup'd files for
-bounded memory. Alternatively spill `preRecipes` to a temp SQLite/disk structure.
+**Scope:** this is a **directory-backup-only** concern. Block-level dedup is
+deliberately never applied to optical/disc backups (write-once media has no
+persistent shared `_blocks` store to dedup against — see the note at
+`BackupOrchestrator.cs` ~366), so the pre-pass and `preRecipes` only ever run when
+the destination is a folder/drive.
+
+**Proper fix if the hash maps ever bite (spill, don't recompute):** the recipes are
+already computed once in the pre-pass, so the cheap fix is to **persist them** —
+spill `preRecipes` to a temp on-disk structure (temp SQLite table, or a simple
+per-file temp file keyed by path hash) during the pass and stream them back in the
+main loop, keeping only `wholeFileCount` + `blockOccur` (both O(unique hashes)) in
+RAM. Reading a stored recipe back is a few KB of I/O per file. The alternative —
+dropping the recipes and *recomputing* each `.dedup` file's recipe in the main loop —
+is worse: it re-reads the file's entire content (potentially GB) and re-hashes it,
+trading a large amount of disk I/O + CPU to save a small amount of temp disk. Prefer
+the spill.
 
 ## Leftover `_filestore` blobs after old→new format conversion (2026-06-13)
 

@@ -1,0 +1,23 @@
+<Project>
+
+  <!--
+    Single source of truth for the LithicBackup version.
+
+    Every project under src\ inherits this file automatically (MSBuild walks up
+    the directory tree and imports the nearest Directory.Build.props), so the
+    GUI, the Worker service and all shared libraries stamp the SAME version into
+    their assemblies. The in-app "check for updates" feature reads this version
+    at runtime via Assembly.GetEntryAssembly().GetName().Version and compares it
+    against the latest GitHub release tag.
+
+    installer\build-installer.ps1 also reads <Version> from this file so the MSI
+    ProductVersion can never drift from the assembly version.
+
+    Bump this one number for every release, then rebuild + publish a matching
+    GitHub release tagged v<Version> with the MSI attached.
+  -->
+  <PropertyGroup>
+    <Version>1.0.3</Version>
+  </PropertyGroup>
+
+</Project>

@@ -32,6 +32,10 @@
     <Color x:Key="DangerTintColor">#FEE2E2</Color>
     <Color x:Key="DangerDarkColor">#B91C1C</Color>
 
+    <!-- Disabled control surface (flat grey so inactive buttons read as dead) -->
+    <Color x:Key="DisabledFillColor">#E8ECF1</Color>
+    <Color x:Key="DisabledTextColor">#9AA6B6</Color>
+
     <!-- Brushes -->
     <SolidColorBrush x:Key="PrimaryBrush" Color="{StaticResource PrimaryColor}" />
     <SolidColorBrush x:Key="PrimaryDarkBrush" Color="{StaticResource PrimaryDarkColor}" />
@@ -52,5 +56,7 @@
     <SolidColorBrush x:Key="ControlTextBrush" Color="{StaticResource ControlTextColor}" />
     <SolidColorBrush x:Key="DangerTintBrush" Color="{StaticResource DangerTintColor}" />
     <SolidColorBrush x:Key="DangerDarkBrush" Color="{StaticResource DangerDarkColor}" />
+    <SolidColorBrush x:Key="DisabledFillBrush" Color="{StaticResource DisabledFillColor}" />
+    <SolidColorBrush x:Key="DisabledTextBrush" Color="{StaticResource DisabledTextColor}" />
 
 </ResourceDictionary>

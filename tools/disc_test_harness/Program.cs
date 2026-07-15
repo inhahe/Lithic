@@ -256,6 +256,34 @@ await runner.Run("many-incompatible-files-no-repeat-prompt", async ws =>
     ws.Assert(r.Mismatches == 0, $"{r.Mismatches} restored file(s) had wrong content");
 });
 
+await runner.Run("plan-time-compat-summary-counts-incompatible", async ws =>
+{
+    // Plan-time compatibility summary (roadmap item 4): mixed set of ISO 9660
+    // Level-1-illegal filenames (lowercase) and legal 8.3 uppercase names.
+    // Under ISO 9660 the summary must count exactly the incompatible files; under
+    // UDF (permissive) nothing is incompatible.
+    var srcs = ws.MakeTree(
+        ("d/lower1.txt", 10_000),   // lowercase -> ISO-incompatible
+        ("d/lower2.txt", 20_000),   // lowercase -> ISO-incompatible
+        ("d/FILEA.TXT", 30_000),    // uppercase 8.3 -> ISO-compatible
+        ("d/FILEB.TXT", 40_000));   // uppercase 8.3 -> ISO-compatible
+
+    var (orch, plan) = await ws.PlanFor(srcs, FilesystemType.ISO9660);
+
+    var iso = orch.SummarizeCompatibility(plan, FilesystemType.ISO9660);
+    ws.Assert(iso.TotalFiles == 4, $"expected 4 planned files, got {iso.TotalFiles}");
+    ws.Assert(iso.IncompatibleFiles == 2,
+        $"expected 2 ISO-incompatible files, got {iso.IncompatibleFiles}");
+    ws.Assert(iso.IncompatibleBytes == 30_000,
+        $"expected 30,000 incompatible bytes, got {iso.IncompatibleBytes}");
+    ws.Assert(iso.HasIncompatible, "summary should flag incompatibility");
+
+    var udf = orch.SummarizeCompatibility(plan, FilesystemType.UDF);
+    ws.Assert(udf.IncompatibleFiles == 0,
+        $"UDF is permissive; expected 0 incompatible, got {udf.IncompatibleFiles}");
+    ws.Assert(!udf.HasIncompatible, "UDF summary should flag nothing");
+});
+
 // ------------------------------------------------------------------
 // Disc-fault repair: re-burn failed files onto a fresh disc
 // ------------------------------------------------------------------
@@ -354,18 +382,35 @@ await runner.Run("replace-disc-files-source-grown", async ws =>
 });
 
 // ------------------------------------------------------------------
-// Media that over-reports its capacity -> data won't fit -> burn fails
+// Media that over-reports its capacity -> graceful re-plan onto more discs
 // ------------------------------------------------------------------
 
 await runner.Run("disc-over-reports-capacity", async ws =>
 {
     // Plan thinks everything fits on one 200 KB disc, but the media's REAL
-    // writable capacity is only 100 KB, so the burn must fail partway through.
+    // writable capacity is only 100 KB. The burn fails partway through with a
+    // DiscCapacityExceededException; the orchestrator must catch it, discard the
+    // partial (uncatalogued) disc, cap all remaining discs to the OBSERVED
+    // capacity, re-pack the not-yet-burned files, and continue — so the backup
+    // succeeds across more (smaller) discs instead of aborting.
     var srcs = ws.MakeTree(("o/a.bin", 60_000), ("o/b.bin", 60_000), ("o/c.bin", 30_000));
-    var ex = await ws.ExpectThrow(() => ws.Backup(srcs,
+    var (burner, result) = await ws.Backup(srcs,
         capacityBytes: 200_000,
-        configure: b => b.ActualCapacityBytes = 100_000));
-    ws.Assert(ex is IOException, $"expected IOException from over-reported media, got {ex?.GetType().Name ?? "none"}");
+        configure: b => b.ActualCapacityBytes = 100_000);
+
+    ws.Assert(result.Success, "backup should succeed by re-planning onto more discs at the observed capacity");
+
+    var discs = await ws.Catalog.GetDiscsForBackupSetAsync(ws.BackupSetId);
+    ws.Assert(discs.Count >= 2, $"150 KB of data at 100 KB/disc should need >= 2 discs, got {discs.Count}");
+
+    // No burned disc may exceed the media's TRUE writable capacity.
+    long overflow = ws.MaxDiscOverflowBytes(burner, 100_000);
+    ws.Assert(overflow == 0, $"a disc exceeded the observed 100 KB capacity by {overflow} bytes");
+
+    // Every file must still restore with correct content after the re-plan.
+    var r = await ws.RestoreAndVerify(burner, srcs);
+    ws.Assert(r.Mismatches == 0, $"{r.Mismatches} restored file(s) had wrong content");
+    ws.Assert(r.Restored == srcs.Count, $"restored {r.Restored}/{srcs.Count} files");
 });
 
 await runner.Run("file-grows-between-plan-and-burn", async ws =>
@@ -771,6 +816,41 @@ sealed class Workspace : IDisposable
         var sessionStrategy = new DiscSessionStrategy(burner, Catalog);
         return new BackupOrchestrator(Catalog, burner, scanner, packer, zipHandler,
             sessionStrategy, fileSystemMonitor: null);
+    }
+
+    /// <summary>Plan a set of sources without executing, returning the orchestrator
+    /// (for SummarizeCompatibility) and the computed plan.</summary>
+    public async Task<(BackupOrchestrator Orchestrator, BackupPlan Plan)> PlanFor(
+        List<string> sources,
+        FilesystemType filesystemType,
+        ZipMode zipMode = ZipMode.IncompatibleOnly)
+    {
+        var burner = NewBurner(null);
+        var set = await Catalog.CreateBackupSetAsync(new BackupSet
+        {
+            Name = "harness-set",
+            SourceRoots = new List<string> { _sourceDir },
+            CreatedUtc = DateTime.UtcNow,
+        });
+        BackupSetId = set.Id;
+
+        var orchestrator = BuildOrchestrator(burner);
+        var job = new BackupJob
+        {
+            BackupSetId = BackupSetId,
+            Sources = sources.Select(s => new SourceSelection
+            {
+                Path = s,
+                IsDirectory = false,
+                IsSelected = true,
+            }).ToList(),
+            IncludeCatalogOnDisc = false,
+            ZipMode = zipMode,
+            FilesystemType = filesystemType,
+            CapacityOverrideBytes = 4_700_000_000L,
+        };
+        var plan = await orchestrator.PlanAsync(job);
+        return (orchestrator, plan);
     }
 
     // -- restore + verify --------------------------------------------

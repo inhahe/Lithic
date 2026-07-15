@@ -3,6 +3,7 @@ using System.Security.Cryptography;
 using LithicBackup.Core;
 using LithicBackup.Core.Interfaces;
 using LithicBackup.Core.Models;
+using LithicBackup.Infrastructure.FileSystem;
 
 namespace LithicBackup.Services;
 
@@ -100,6 +101,47 @@ public class BackupOrchestrator : IBackupOrchestrator
         };
     }
 
+    public DiscCompatibilitySummary SummarizeCompatibility(BackupPlan plan, FilesystemType filesystemType)
+    {
+        int total = 0, incompatible = 0;
+        long totalBytes = 0, incompatibleBytes = 0;
+
+        // Walk every file the plan allocated to a disc and apply the exact per-file
+        // check the burn uses under ZipMode.IncompatibleOnly (see the zip-handling
+        // block in ExecuteAsync), so the reported count matches what would actually
+        // be zipped. Dedupe by source path in case a file appears in >1 allocation.
+        var seen = new HashSet<string>(StringComparer.OrdinalIgnoreCase);
+        foreach (var alloc in plan.DiscAllocations)
+        {
+            foreach (var file in alloc.Files)
+            {
+                if (!seen.Add(file.FullPath))
+                    continue;
+
+                total++;
+                totalBytes += file.SizeBytes;
+                if (!IsCompatibleForDisc(file.FullPath, filesystemType))
+                {
+                    incompatible++;
+                    incompatibleBytes += file.SizeBytes;
+                }
+            }
+        }
+
+        return new DiscCompatibilitySummary(
+            filesystemType, total, totalBytes, incompatible, incompatibleBytes);
+    }
+
+    /// <summary>
+    /// Whether a source file's <em>disc-relative</em> path (the path that actually
+    /// lands on the burned disc — see <see cref="GetRelativeStagingPath"/>) satisfies
+    /// the target filesystem's name/path/depth limits. Both the burn's proactive-zip
+    /// decision and <see cref="SummarizeCompatibility"/> route through this so the
+    /// plan-time warning can't drift from what the burn does.
+    /// </summary>
+    private static bool IsCompatibleForDisc(string sourceFullPath, FilesystemType fs)
+        => PathCompatibility.CheckCompatibility(GetRelativeStagingPath(sourceFullPath), fs) is null;
+
     // -------------------------------------------------------------------
     // ExecuteAsync
     // -------------------------------------------------------------------
@@ -186,12 +228,23 @@ public class BackupOrchestrator : IBackupOrchestrator
         // Spill snapshots created for split files; deleted after the whole run.
         var spillDirs = new List<string>();
 
+        // Mutable working copy of the planned allocations. When a disc turns out to
+        // physically hold less than it reported (see DiscCapacityExceededException),
+        // the tail of this list — every not-yet-burned file — is re-packed at the
+        // observed smaller capacity and spliced back in, so the run continues onto
+        // fresh discs instead of aborting. plan.DiscAllocations itself is immutable.
+        var allocations = plan.DiscAllocations.ToList();
+
+        // Once a disc over-reports its capacity, every subsequent disc is capped to
+        // the observed real capacity so the packer can't over-fill again.
+        long? capacityCap = null;
+
         // Capacity of the most recently opened disc, reused for any discs the loop
         // must open beyond the planned allocations (to finish a spanning file or
         // place overflow). The bin-packer guarantees TotalBytes+FreeBytes == the
         // disc capacity for every allocation.
-        long lastCapacity = plan.DiscAllocations.Count > 0
-            ? plan.DiscAllocations[0].TotalBytes + plan.DiscAllocations[0].FreeBytes
+        long lastCapacity = allocations.Count > 0
+            ? allocations[0].TotalBytes + allocations[0].FreeBytes
             : 25L * 1024 * 1024 * 1024;
 
         // Live burn coordinator: real-time FSW-based change detection that
@@ -221,16 +274,19 @@ public class BackupOrchestrator : IBackupOrchestrator
         // files were bumped off earlier discs (overflowFiles), so a large file can
         // genuinely span multiple physical discs.
         int discIndex = 0;
-        while (discIndex < plan.DiscAllocations.Count || carry is not null || overflowFiles.Count > 0)
+        while (discIndex < allocations.Count || carry is not null || overflowFiles.Count > 0)
         {
             ct.ThrowIfCancellationRequested();
 
-            DiscAllocation? allocation = discIndex < plan.DiscAllocations.Count
-                ? plan.DiscAllocations[discIndex]
+            DiscAllocation? allocation = discIndex < allocations.Count
+                ? allocations[discIndex]
                 : null;
             long discCapacityForDisc = allocation is not null
                 ? allocation.TotalBytes + allocation.FreeBytes
                 : lastCapacity;
+            // Never exceed a real capacity already discovered on an earlier disc.
+            if (capacityCap.HasValue)
+                discCapacityForDisc = Math.Min(discCapacityForDisc, capacityCap.Value);
             lastCapacity = discCapacityForDisc;
             int discSequence = sequenceBase + discIndex + 1;
 
@@ -247,7 +303,7 @@ public class BackupOrchestrator : IBackupOrchestrator
             progress?.Report(new BackupProgress
             {
                 CurrentDisc = discSequence,
-                TotalDiscs = Math.Max(plan.TotalDiscsRequired, discSequence),
+                TotalDiscs = Math.Max(Math.Max(plan.TotalDiscsRequired, sequenceBase + allocations.Count), discSequence),
                 CurrentFile = "Staging files...",
                 BytesWrittenTotal = totalBytesWritten,
                 BytesTotalAll = plan.TotalBytes,
@@ -258,8 +314,7 @@ public class BackupOrchestrator : IBackupOrchestrator
 
             // Stage files to a temp directory.
             string stagingDir = Path.Combine(Path.GetTempPath(), "LithicBackup", $"disc-{discSequence}");
-            if (Directory.Exists(stagingDir))
-                Directory.Delete(stagingDir, true);
+            ForceDeleteDirectory(stagingDir);
             Directory.CreateDirectory(stagingDir);
 
             // Read locks held on in-place (uncopied) source files. Kept open from
@@ -277,6 +332,12 @@ public class BackupOrchestrator : IBackupOrchestrator
                 // A carried split is placed first, filling this disc before any
                 // other file, until either the file is fully written or the disc
                 // is full (in which case the carry rolls over to the next disc).
+                // Remember whether a split spanned INTO this disc from a prior
+                // (already-burned, already-recorded) disc: if so, a capacity failure
+                // here cannot be safely re-planned by restarting the whole file
+                // (its earlier chunks are already committed to a good disc), so we
+                // fall back to the safe abort in that narrow case.
+                bool hadIncomingCarry = carry is not null;
                 carry = await PlaceSplitChunksAsync(
                     carry, stagedFiles, stagingDir, discCapacity, ct);
 
@@ -290,9 +351,9 @@ public class BackupOrchestrator : IBackupOrchestrator
                     pendingQueue.Enqueue(rq);
                 reQueuedFiles.Clear();
 
-                for (int futureDisc = discIndex + 1; futureDisc < plan.DiscAllocations.Count; futureDisc++)
+                for (int futureDisc = discIndex + 1; futureDisc < allocations.Count; futureDisc++)
                 {
-                    foreach (var f in plan.DiscAllocations[futureDisc].Files)
+                    foreach (var f in allocations[futureDisc].Files)
                         pendingQueue.Enqueue(f);
                 }
 
@@ -436,7 +497,11 @@ public class BackupOrchestrator : IBackupOrchestrator
                     }
                     else if (plan.Job.ZipMode == ZipMode.IncompatibleOnly)
                     {
-                        shouldZip = !_zipHandler.IsPathCompatible(file.FullPath, filesystemType);
+                        // Check the DISC-RELATIVE path (what actually lands on the
+                        // disc), not the raw source path, and route through the same
+                        // helper SummarizeCompatibility uses so the plan-time warning
+                        // can't disagree with what the burn zips here.
+                        shouldZip = !IsCompatibleForDisc(file.FullPath, filesystemType);
                     }
 
                     // Resolve this file's version now (from the pre-run max) so its
@@ -803,7 +868,7 @@ public class BackupOrchestrator : IBackupOrchestrator
 
                 // Export catalog database to staging directory if requested.
                 string? catalogStagedPath = null;
-                if (plan.Job.IncludeCatalogOnDisc && discIndex == plan.DiscAllocations.Count - 1)
+                if (plan.Job.IncludeCatalogOnDisc && discIndex == allocations.Count - 1)
                 {
                     catalogStagedPath = Path.Combine(stagingDir, "LithicBackup-Catalog.db");
                     await _catalog.ExportDatabaseAsync(backupSetId, catalogStagedPath, ct);
@@ -816,7 +881,7 @@ public class BackupOrchestrator : IBackupOrchestrator
                         progress.Report(new BackupProgress
                         {
                             CurrentDisc = discSequence,
-                            TotalDiscs = Math.Max(plan.TotalDiscsRequired, discSequence),
+                            TotalDiscs = Math.Max(Math.Max(plan.TotalDiscsRequired, sequenceBase + allocations.Count), discSequence),
                             CurrentFile = bp.CurrentFile,
                             BytesWrittenTotal = totalBytesWritten + bp.BytesWritten,
                             BytesTotalAll = plan.TotalBytes,
@@ -862,7 +927,65 @@ public class BackupOrchestrator : IBackupOrchestrator
                 if (catalogStagedPath is not null)
                     burnItems.Add(new BurnItem("LithicBackup-Catalog.db", catalogStagedPath));
 
-                await _burner.BurnAsync(recorderId, burnItems, burnOptions, burnProgress, ct);
+                try
+                {
+                    await _burner.BurnAsync(recorderId, burnItems, burnOptions, burnProgress, ct);
+                }
+                catch (DiscCapacityExceededException capEx) when (!hadIncomingCarry)
+                {
+                    // The media physically held less than it reported and ran out of
+                    // room mid-burn. The partially-written disc is abandoned; nothing was
+                    // recorded in the catalog yet (recording happens only after a clean
+                    // burn), so there is nothing to roll back. Cap every future disc to
+                    // the observed real capacity, re-pack every not-yet-burned file at
+                    // that size, splice the fresh allocations into this slot, and retry
+                    // WITHOUT advancing discIndex. The finally below releases the in-place
+                    // read locks and cleans the staging dir before the retry.
+                    //
+                    // (When a split spanned INTO this disc from a prior, already-recorded
+                    // disc — hadIncomingCarry — this handler is skipped and the exception
+                    // aborts the run, because restarting the whole file would double-write
+                    // the chunks already committed to the good disc. That is the existing
+                    // safe fail behaviour, preserved for that narrow case.)
+                    long observed = Math.Max(1, capEx.ObservedCapacityBytes);
+                    capacityCap = capacityCap.HasValue
+                        ? Math.Min(capacityCap.Value, observed)
+                        : observed;
+
+                    var remaining = new List<ScannedFile>();
+                    var seen = new HashSet<string>(StringComparer.OrdinalIgnoreCase);
+                    void AddRemaining(ScannedFile f)
+                    {
+                        if (seen.Add(f.FullPath)) remaining.Add(f);
+                    }
+                    foreach (var sf in stagedFiles) AddRemaining(sf.Source);
+                    if (carry is not null) AddRemaining(carry.Ctx.Source);
+                    foreach (var f in overflowFiles) AddRemaining(f);
+                    foreach (var f in reQueuedFiles) AddRemaining(f);
+                    for (int later = discIndex + 1; later < allocations.Count; later++)
+                        foreach (var f in allocations[later].Files) AddRemaining(f);
+
+                    var repacked = _packer.Pack(remaining, capacityCap.Value).ToList();
+                    allocations = allocations.Take(discIndex).Concat(repacked).ToList();
+
+                    // The remainder is now owned by the re-packed allocations; reset the
+                    // carry/overflow/re-queue state so nothing is double-placed.
+                    carry = null;
+                    overflowFiles.Clear();
+                    reQueuedFiles.Clear();
+
+                    progress?.Report(new BackupProgress
+                    {
+                        CurrentDisc = discSequence,
+                        TotalDiscs = Math.Max(Math.Max(plan.TotalDiscsRequired, sequenceBase + allocations.Count), discSequence),
+                        CurrentFile = "Disc over-reported its capacity — re-planning onto more discs...",
+                        StatusMessage = $"Disc {discSequence} holds only ~{observed:N0} bytes; re-planning the remaining files.",
+                        BytesWrittenTotal = totalBytesWritten,
+                        BytesTotalAll = plan.TotalBytes,
+                    });
+
+                    continue; // retry this disc slot with the smaller allocation
+                }
 
                 long discBytesUsed = stagedFiles.Sum(sf => sf.StagedSizeBytes);
 
@@ -983,7 +1106,7 @@ public class BackupOrchestrator : IBackupOrchestrator
                 {
                     try { h.Dispose(); } catch { /* best effort */ }
                 }
-                try { Directory.Delete(stagingDir, true); } catch { }
+                try { ForceDeleteDirectory(stagingDir); } catch { }
             }
 
             discIndex++;
@@ -997,7 +1120,7 @@ public class BackupOrchestrator : IBackupOrchestrator
             // Remove any spill snapshots taken for split files.
             foreach (var spill in spillDirs)
             {
-                try { if (Directory.Exists(spill)) Directory.Delete(spill, true); } catch { }
+                try { ForceDeleteDirectory(spill); } catch { }
             }
         }
 
@@ -1096,8 +1219,7 @@ public class BackupOrchestrator : IBackupOrchestrator
 
             string stagingDir = Path.Combine(
                 Path.GetTempPath(), "LithicBackup", $"consolidate-{backupSetId}-disc-{discSequence}");
-            if (Directory.Exists(stagingDir))
-                Directory.Delete(stagingDir, true);
+            ForceDeleteDirectory(stagingDir);
             Directory.CreateDirectory(stagingDir);
 
             try
@@ -1195,7 +1317,7 @@ public class BackupOrchestrator : IBackupOrchestrator
             }
             finally
             {
-                try { Directory.Delete(stagingDir, true); } catch { }
+                try { ForceDeleteDirectory(stagingDir); } catch { }
             }
         }
 
@@ -1412,8 +1534,7 @@ public class BackupOrchestrator : IBackupOrchestrator
     {
         string stagingDir = Path.Combine(
             Path.GetTempPath(), "LithicBackup", $"reburn-{backupSetId}-{Guid.NewGuid():N}");
-        if (Directory.Exists(stagingDir))
-            Directory.Delete(stagingDir, true);
+        ForceDeleteDirectory(stagingDir);
         Directory.CreateDirectory(stagingDir);
 
         try
@@ -1482,13 +1603,43 @@ public class BackupOrchestrator : IBackupOrchestrator
         }
         finally
         {
-            try { Directory.Delete(stagingDir, true); } catch { }
+            try { ForceDeleteDirectory(stagingDir); } catch { }
         }
     }
 
     // -------------------------------------------------------------------
     // Helpers
     // -------------------------------------------------------------------
+
+    /// <summary>
+    /// Recursively delete a directory, clearing the read-only attribute on every
+    /// file first. <see cref="File.Copy(string,string,bool)"/> preserves the
+    /// source's read-only flag, and a large fraction of backed-up content is
+    /// read-only (git object/pack files, anything copied from read-only media), so
+    /// the staged copies are read-only too. A plain <see cref="Directory.Delete(string,bool)"/>
+    /// throws <see cref="UnauthorizedAccessException"/> on those, which both leaks
+    /// the staging temp folder forever (post-burn cleanup is best-effort) and, worse,
+    /// aborts the next disc burn when the unguarded pre-clean hits a leftover
+    /// read-only file. Clearing the attribute first makes cleanup reliable.
+    /// </summary>
+    private static void ForceDeleteDirectory(string path)
+    {
+        if (!Directory.Exists(path))
+            return;
+
+        foreach (var file in Directory.EnumerateFiles(path, "*", SearchOption.AllDirectories))
+        {
+            try
+            {
+                var fi = new FileInfo(file);
+                if (fi.IsReadOnly)
+                    fi.IsReadOnly = false;
+            }
+            catch { /* best effort — a stuck attribute must not block cleanup */ }
+        }
+
+        Directory.Delete(path, true);
+    }
 
     /// <summary>
     /// Try to pull a file from the pending queue that fits in the remaining space.

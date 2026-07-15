@@ -23,7 +23,7 @@ Backing up to optical media comes with challenges that Lithic Backup handles aut
 - **Post-burn verification**: when enabled (a per-set option, on by default), every file is read back off the freshly burned disc and its SHA-256 compared against the source — catching a disc that wrote "successfully" but recorded corrupt or truncated data. The drive reloads the media first so the just-written filesystem is mounted; if it can't be re-read the burn is reported complete but unverified rather than failed
 - **Staging mode (copy-to-temp or burn-in-place)**: choose how files reach the burner. In the default *copy to temp* mode each file is copied to a temporary folder first, which is safest but needs enough free temp space to hold a full disc's worth of data (up to ~100 GB for Blu-ray). In *burn in place* mode plain files are burned straight from their original location with no temporary copy — the app instead holds a read lock on each source file for the duration of the burn (so it can't be modified, grow, or be deleted mid-burn), which avoids needing large temp space at the cost of locking your files while the disc is written. Zipped and split files always use a temporary copy because their on-disc bytes differ from the source. The setting lives in **Settings → Disc staging** and applies to all disc backups.
 - **Capacity overrides**: override the reported disc capacity for media that over-reports (common with M-Disc)
-- **Automatic zipping for incompatible paths**: files whose names or paths are too long or contain characters that the target disc filesystem doesn't support can be automatically zipped before burning. Three modes are available: zip all files, zip only incompatible files, or never zip. Zipping is also offered as a fallback when a file fails to stage normally.
+- **Automatic zipping for incompatible paths**: files whose names or paths are too long or contain characters that the target disc filesystem doesn't support can be automatically zipped before burning. Three modes are available: zip all files, zip only incompatible files, or never zip. Zipping is also offered as a fallback when a file fails to stage normally. When *zip only incompatible files* is in effect, Lithic Backup also checks the plan **before** the burn starts and, if a significant share of the set would be silently zipped to fit the chosen format (e.g. long Unicode paths under ISO 9660), warns you up front and offers to switch that backup to UDF (the most permissive format) so the files land as-is instead.
 - **Filesystem options**: ISO 9660, Joliet, and UDF — UDF is the default and is required for Blu-Ray
 
 ### Deduplication
@@ -74,9 +74,10 @@ Only directory-mode backup sets can be scheduled (disc burns require physical me
 ### Source Selection
 
 - Treeview file browser with tristate checkboxes — select entire drives, individual directories, or specific files
-- New subdirectories are automatically included for parents with "Auto-include new" checked
+- New subdirectories are automatically included for parents with "Auto-include new" checked. When continuous backup is running, a newly-created folder is also promoted to a permanent, explicitly-checked selection a few seconds after it appears — so it keeps being backed up even if you later turn "Auto-include new" off (that setting only stops *future* folders from being adopted; folders already adopted stay in the set)
 - **Global exclusion patterns**: each backup set carries a list of glob patterns (one per line, e.g. `*.log`, `temp_*`, `*\bin\*`) that exclude matching files from the backup entirely. Filename patterns match against the file name; patterns containing a path separator match against the full path. Excluded files are never copied or versioned.
 - **Pre-backup size calculator**: calculate how much data will be written before actually running the backup. Shows new files, changed files, per-source-root breakdown, destination free space, and whether the data will fit.
+- **Backup Coverage** — a per-set view (right-click menu) that scans the sources and shows how much of the current source data is already backed up, split into *backed up*, *not backed up*, and *changed*, with file counts, sizes, and expandable lists of the not-yet-covered and changed files. For sets with deduplication enabled, a **Compute actual size** action estimates the bytes the backup would *really* write once dedup is applied — instead of the raw sum, it accounts for whole-file duplicates and (when block-level dedup is on) shared blocks, matching exactly what `DirectoryBackupService` would store. The file-level estimate uses a size gate plus a progressive prefix hash so it settles most files after a few kilobytes; the block-level estimate must read every file, so it's opt-in behind a "this reads all your data" warning. It dedups against both already-stored content and duplicates within the same scan, so the number reflects reality (a re-run where everything is already stored estimates zero new bytes).
 - **Post-scan file review**: after a scan, inspect exactly what's about to be backed up in a tristate treeview showing only the incremental delta (new and changed files) with per-directory and per-file sizes. Each row shows a status — files are *New* or *Changed*, and directories aggregate their contents as *New*, *Changed*, or *Mixed*. Click the **Name**, **Status**, **Files**, or **Size** column headers to sort (click again to reverse); the tree defaults to largest-first by size. Deselect anything you don't want, and the running total shows whether the selection now fits the destination's free space. Opens automatically when the destination lacks room for the full backup, or on demand via the set's **Review Files & Back Up…** context-menu item. An optional checkbox also removes the deselected files/folders from the set's sources so future backups skip them too.
 
 ### Restore
@@ -197,6 +198,20 @@ Run the **Lithic Backup MSI installer** (`LithicBackup-<version>-x64.msi`). It:
 
 Because it installs a service, the installer requests administrator elevation.
 
+### Updates
+
+Lithic Backup checks for newer versions on [GitHub Releases](https://github.com/inhahe/Lithic/releases).
+Shortly after startup it quietly asks GitHub whether a newer release exists and,
+if so, shows a banner across the top of the window with **Update Now** (downloads
+the release MSI and launches it, closing the app so the installer can replace the
+running files), **Release Notes** (opens the release page), and **Dismiss** (hides
+the banner for that version until an even newer one appears). You can also check
+on demand from **Help → Check for Updates**, and turn the automatic startup check
+off under **File → Settings → Check for updates on startup**. The installer's
+`MajorUpgrade` handling means running the newer MSI upgrades in place — your
+backup sets, catalog, and settings (in `C:\ProgramData\LithicBackup`) are
+preserved.
+
 > The Worker service can still be installed/started/stopped from within the GUI
 > (see *Scheduled and Continuous Backups*) — the installer just does it for you
 > up front. If you previously installed the service manually from the GUI,
@@ -226,12 +241,19 @@ the `wix` dotnet tool). The build script publishes both executables self-contain
 and compiles the MSI:
 
 ```
-powershell -ExecutionPolicy Bypass -File installer\build-installer.ps1 -Version 1.0.0
+powershell -ExecutionPolicy Bypass -File installer\build-installer.ps1
 ```
 
-It installs the `wix` tool and the WiX UI and Util extensions on first run if
-they're missing, then writes `installer\LithicBackup-<version>-x64.msi`. The WiX
-source lives in `installer\Package.wxs`.
+With no `-Version`, the script reads the version from `src\Directory.Build.props`
+— the single source of truth that also stamps every assembly, so the MSI's
+`ProductVersion` can never drift from the version the app reports and compares
+against GitHub Releases. Pass `-Version x.y.z` to override. It installs the `wix`
+tool and the WiX UI and Util extensions on first run if they're missing, then
+writes `installer\LithicBackup-<version>-x64.msi`. The WiX source lives in
+`installer\Package.wxs`.
+
+To cut a release: bump `<Version>` in `src\Directory.Build.props`, build the MSI,
+and publish a GitHub release tagged `v<version>` with the MSI attached.
 
 ## License
 

@@ -1,0 +1,14 @@
+﻿[2026-07-13 00:08:00.053 -04:00] FATAL [gui] OnStartup initialization failed
+  Process : LithicBackup (PID 17196)
+  Assembly: LithicBackup, Version=1.0.0.0, Culture=neutral, PublicKeyToken=null
+  User    : LOGOPLEX3\inhah
+  Machine : LOGOPLEX3
+  OS      : Microsoft Windows 10.0.26200
+  CLR     : .NET 8.0.28
+  Exception:
+    System.TypeLoadException: Could not load type 'LithicBackup.Infrastructure.FileSystem.FileSplitter' from assembly 'LithicBackup.Infrastructure, Version=1.0.0.0, Culture=neutral, PublicKeyToken=null'.
+       at LithicBackup.App.StartupCoreAsync()
+       at System.Runtime.CompilerServices.AsyncMethodBuilderCore.Start[TStateMachine](TStateMachine& stateMachine)
+       at LithicBackup.App.StartupCoreAsync()
+       at LithicBackup.App.OnStartup(StartupEventArgs e)
+------------------------------------------------------------------------

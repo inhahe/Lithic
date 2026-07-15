@@ -264,6 +264,22 @@
                        Text="{Binding SummaryText}"
                        TextWrapping="Wrap" />
 
+            <!-- Catalog classification is on-demand: the full catalog read +
+                 classification is slow on large sets and isn't needed when the
+                 user only wants the destination scan or reconcile below. -->
+            <Border Style="{StaticResource Card}" Padding="10" Margin="0,10,0,0">
+                <StackPanel>
+                    <TextBlock Text="Scan Catalog" FontWeight="SemiBold"
+                               Margin="0,0,0,4" />
+                    <TextBlock Foreground="{StaticResource TextSecondaryBrush}" FontSize="11"
+                               TextWrapping="Wrap" Margin="0,0,0,8"
+                               Text="Read every catalog record and classify it into the removed-from-sources, deleted-from-disk, configured-exclusion, and excess-version categories below. Can take a while on large sets — run it when you want the catalog-side cleanup categories." />
+                    <Button HorizontalAlignment="Left" Content="Scan Catalog"
+                            Command="{Binding ScanCatalogCommand}"
+                            Padding="12,6" Cursor="Hand" />
+                </StackPanel>
+            </Border>
+
             <!-- Optional scans: exclusion-pattern scan + destination filesystem scan -->
             <Grid Margin="0,10,0,0">
                 <Grid.ColumnDefinitions>
