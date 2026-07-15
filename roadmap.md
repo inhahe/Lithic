@@ -109,6 +109,32 @@ Notes:
 
 ---
 
+## 5. Avoid the double-read on large size-colliding files (progressive prefix hash)
+
+**Priority: low (optional; narrow win).**
+
+In directory-backup file-level dedup, files whose size collides with existing plain
+content are read once to compute a full hash and, if they turn out *not* to be a
+duplicate, read a second time to copy the bytes — but only when the file is over the
+in-memory buffer budget (small files are buffered on the first read and copied from
+memory, so they're already read once). The redundant second read only hits large
+size-colliding files.
+
+WinDirStat's progressive-tier hashing (`FileDupeControl.cpp`: SMALL 4 KiB → MEDIUM
+1 MiB → whole file, gated by a size bucket with ≥2 members) is the right shape for
+cutting this: hash a cheap prefix first and only escalate to the full hash when the
+prefix collides too. Storing/streaming a prefix hash would let most size-collisions be
+ruled out after reading a few KiB instead of the whole file, shrinking the double-read
+to only the files that genuinely share both size *and* prefix.
+
+This is the **only** part of the WinDirStat progressive-hashing design that transfers
+to Lithic's backup path — non-duplicates still have to be read in full to *copy* them,
+and confirmed duplicates still need a full hash to be written safely as a `.fileref`,
+so progressive tiers buy nothing there. It's a modest optimization on a narrow file
+class, hence low priority.
+
+---
+
 ## Related ideas — already implemented, pending hardware validation
 
 These two came up as new ideas but turn out to already exist. The remaining work is
