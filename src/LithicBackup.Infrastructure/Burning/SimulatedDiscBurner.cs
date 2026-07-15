@@ -174,9 +174,16 @@ public class SimulatedDiscBurner : IDiscBurner
         if (totalBytes == 0)
             totalBytes = 1; // avoid division by zero
 
-        // Prepare the shelf directory for this disc.
+        // Prepare the shelf directory for this disc. Clear any leftover content
+        // first: SessionCount only advances after a *successful* burn, so this
+        // directory is non-empty only when a previous attempt at this same disc
+        // failed mid-write (e.g. the media over-reported its capacity). A real
+        // retry uses a fresh blank disc, so the abandoned partial content must not
+        // linger on the shelf.
         int discNumber = state.SessionCount + 1;
         string discDir = GetDiscPath(recorderId, discNumber);
+        if (Directory.Exists(discDir))
+            Directory.Delete(discDir, true);
         Directory.CreateDirectory(discDir);
 
         // Simulate burn speed: DVD 1x ~ 1.35 MB/s.
@@ -210,9 +217,10 @@ public class SimulatedDiscBurner : IDiscBurner
             if (ActualCapacityBytes.HasValue
                 && committedBytes + fileSize > ActualCapacityBytes.Value)
             {
-                throw new IOException(
+                throw new DiscCapacityExceededException(
                     $"Simulated out of disc space: the media over-reported its capacity " +
-                    $"({committedBytes + fileSize} bytes needed, only {ActualCapacityBytes.Value} available).");
+                    $"({committedBytes + fileSize} bytes needed, only {ActualCapacityBytes.Value} available).",
+                    observedCapacityBytes: ActualCapacityBytes.Value);
             }
             committedBytes += fileSize;
 

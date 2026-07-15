@@ -34,6 +34,30 @@ public interface IDiscBurner
 }
 
 /// <summary>
+/// Thrown by <see cref="IDiscBurner.BurnAsync"/> when the media physically runs out
+/// of room mid-burn because it over-reported its capacity (planning trusted the
+/// reported size and packed to it, but the disc actually holds less). Unlike a plain
+/// <see cref="IOException"/>, this carries the largest byte count known to have fit —
+/// <see cref="ObservedCapacityBytes"/> — so the orchestrator can re-plan the remaining
+/// files onto fresh discs at the observed (smaller) capacity instead of aborting.
+/// </summary>
+public sealed class DiscCapacityExceededException : IOException
+{
+    /// <summary>
+    /// The largest number of bytes known to fit on this media. A safe capacity to
+    /// re-pack the remainder at: every file that already fit before the overflow is
+    /// guaranteed to fit again at this size.
+    /// </summary>
+    public long ObservedCapacityBytes { get; }
+
+    public DiscCapacityExceededException(string message, long observedCapacityBytes)
+        : base(message)
+    {
+        ObservedCapacityBytes = observedCapacityBytes;
+    }
+}
+
+/// <summary>
 /// One file to be written to a disc.
 /// </summary>
 /// <param name="DiscRelativePath">

@@ -354,18 +354,35 @@ await runner.Run("replace-disc-files-source-grown", async ws =>
 });
 
 // ------------------------------------------------------------------
-// Media that over-reports its capacity -> data won't fit -> burn fails
+// Media that over-reports its capacity -> graceful re-plan onto more discs
 // ------------------------------------------------------------------
 
 await runner.Run("disc-over-reports-capacity", async ws =>
 {
     // Plan thinks everything fits on one 200 KB disc, but the media's REAL
-    // writable capacity is only 100 KB, so the burn must fail partway through.
+    // writable capacity is only 100 KB. The burn fails partway through with a
+    // DiscCapacityExceededException; the orchestrator must catch it, discard the
+    // partial (uncatalogued) disc, cap all remaining discs to the OBSERVED
+    // capacity, re-pack the not-yet-burned files, and continue — so the backup
+    // succeeds across more (smaller) discs instead of aborting.
     var srcs = ws.MakeTree(("o/a.bin", 60_000), ("o/b.bin", 60_000), ("o/c.bin", 30_000));
-    var ex = await ws.ExpectThrow(() => ws.Backup(srcs,
+    var (burner, result) = await ws.Backup(srcs,
         capacityBytes: 200_000,
-        configure: b => b.ActualCapacityBytes = 100_000));
-    ws.Assert(ex is IOException, $"expected IOException from over-reported media, got {ex?.GetType().Name ?? "none"}");
+        configure: b => b.ActualCapacityBytes = 100_000);
+
+    ws.Assert(result.Success, "backup should succeed by re-planning onto more discs at the observed capacity");
+
+    var discs = await ws.Catalog.GetDiscsForBackupSetAsync(ws.BackupSetId);
+    ws.Assert(discs.Count >= 2, $"150 KB of data at 100 KB/disc should need >= 2 discs, got {discs.Count}");
+
+    // No burned disc may exceed the media's TRUE writable capacity.
+    long overflow = ws.MaxDiscOverflowBytes(burner, 100_000);
+    ws.Assert(overflow == 0, $"a disc exceeded the observed 100 KB capacity by {overflow} bytes");
+
+    // Every file must still restore with correct content after the re-plan.
+    var r = await ws.RestoreAndVerify(burner, srcs);
+    ws.Assert(r.Mismatches == 0, $"{r.Mismatches} restored file(s) had wrong content");
+    ws.Assert(r.Restored == srcs.Count, $"restored {r.Restored}/{srcs.Count} files");
 });
 
 await runner.Run("file-grows-between-plan-and-burn", async ws =>

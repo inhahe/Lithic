@@ -1,5 +1,31 @@
 # LithicBackup — Known Issues & Tech Debt
 
+## FIXED: Graceful re-plan when a disc over-reports its capacity (2026-07-15)
+
+**Problem (fail-safe, not graceful):** when media physically holds less than
+`GetMediaInfoAsync` reported, the planner bin-packs to the reported size and the burn
+only discovers the shortfall mid-write. The burner threw a plain `IOException` once
+committed bytes exceeded true capacity, so the whole backup **aborted** — correct
+(no silent truncation) but needlessly destructive when the remaining files could
+simply spill onto more discs.
+
+**Fix:** introduced a typed `DiscCapacityExceededException` (in `IDiscBurner.cs`)
+carrying `ObservedCapacityBytes` (the largest byte count known to fit).
+`SimulatedDiscBurner` now throws it when `committedBytes + fileSize` exceeds its
+`ActualCapacityBytes` knob, and clears the disc-shelf directory at burn start so a
+failed attempt leaves no stale content for the retry. `BackupOrchestrator.ExecuteAsync`
+catches it — guarded by `when (!hadIncomingCarry)` so a split spanning in from a prior
+*recorded* disc still aborts safely (restarting would double-write committed chunks) —
+caps every remaining disc to the observed capacity (`capacityCap`), re-packs all
+not-yet-burned files (staged sources + carry + overflow + re-queued + later
+allocations, deduped by path), splices the fresh allocations into the current slot,
+resets carry/overflow/re-queued, and `continue`s without advancing `discIndex` (the
+`finally` releases in-place locks and cleans staging). `ExecuteAsync` now works from a
+mutable local `allocations` list rather than the immutable `plan.DiscAllocations`. The
+`disc-over-reports-capacity` harness test was rewritten to assert graceful recovery
+(succeeds across ≥2 discs, no disc exceeds the observed 100 KB, restore matches);
+24/24 harness tests pass.
+
 ## FIXED: Removed dead schedule-wipe code path (`ShowJobConfig` cluster) (2026-07-15)
 
 **Problem (dead code + latent footgun):** `MainViewModel.ShowJobConfig` had **zero

@@ -67,7 +67,20 @@ still otherwise used before removing anything shared.
 
 ---
 
-## 3. Graceful re-plan when a disc over-reports its capacity
+## 3. Graceful re-plan when a disc over-reports its capacity ✅ DONE
+
+**Status: SHIPPED.** Added a typed `DiscCapacityExceededException` (in
+`IDiscBurner.cs`) that carries `ObservedCapacityBytes` — the largest byte count known
+to fit. `SimulatedDiscBurner` throws it when `committedBytes + fileSize` exceeds the
+`ActualCapacityBytes` knob (and now clears the disc-shelf dir at burn start so a failed
+attempt leaves no stale content behind). `BackupOrchestrator.ExecuteAsync` catches it
+(guarded by `when (!hadIncomingCarry)` so a split spanning in from a prior *recorded*
+disc still aborts safely rather than double-writing committed chunks), caps all
+remaining discs to the observed capacity, re-packs every not-yet-burned file
+(staged sources + carry + overflow + re-queued + later allocations, deduped by path),
+splices the fresh allocations into the current slot, and `continue`s without advancing
+`discIndex`. The over-report harness test now asserts graceful recovery (24/24 pass).
+See the FIXED entry in `known-issues.md`.
 
 **Priority: medium (currently fails safe, not gracefully).**
 
