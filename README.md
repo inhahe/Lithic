@@ -69,6 +69,8 @@ A Windows Service (Lithic Backup Worker) runs in the background and backs up you
 
 Each backup set can have its own schedule and mode. The Worker Service is installed, started, and stopped directly from the GUI — no command-line work required.
 
+**Full-destination warning** — because the Worker runs in the background with no window, a continuous set whose destination drive fills up would otherwise fail silently: new versions simply stop being written with nothing to tell you. While the app is running, it watches the destination drive of every set that has continuous backup enabled and pops a tray notification the moment one is (practically) full, so you can free up space before you miss any versions. The warning fires once per fill-up (not repeatedly) and re-arms after the drive recovers.
+
 Only directory-mode backup sets can be scheduled (disc burns require physical media interaction).
 
 ### Source Selection
