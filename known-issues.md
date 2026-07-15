@@ -827,11 +827,22 @@ back to the old streaming re-read; a budget of 0 disables buffering entirely and
 still correct). The `preRecipes`/`wholeFileCount`/`blockOccur` hash maps above are
 NOT subject to that cap — they are the residual unbounded structure.
 
-**Proper fix if the hash maps ever bite:** stream the analysis — keep only
-`wholeFileCount` + `blockOccur` (both O(unique hashes), much smaller) during counting,
-drop per-file recipes, and recompute each file's recipe in the main loop only for files
-that turn out to be `.dedup`. That trades one extra read of the dedup'd files for
-bounded memory. Alternatively spill `preRecipes` to a temp SQLite/disk structure.
+**Scope:** this is a **directory-backup-only** concern. Block-level dedup is
+deliberately never applied to optical/disc backups (write-once media has no
+persistent shared `_blocks` store to dedup against — see the note at
+`BackupOrchestrator.cs` ~366), so the pre-pass and `preRecipes` only ever run when
+the destination is a folder/drive.
+
+**Proper fix if the hash maps ever bite (spill, don't recompute):** the recipes are
+already computed once in the pre-pass, so the cheap fix is to **persist them** —
+spill `preRecipes` to a temp on-disk structure (temp SQLite table, or a simple
+per-file temp file keyed by path hash) during the pass and stream them back in the
+main loop, keeping only `wholeFileCount` + `blockOccur` (both O(unique hashes)) in
+RAM. Reading a stored recipe back is a few KB of I/O per file. The alternative —
+dropping the recipes and *recomputing* each `.dedup` file's recipe in the main loop —
+is worse: it re-reads the file's entire content (potentially GB) and re-hashes it,
+trading a large amount of disk I/O + CPU to save a small amount of temp disk. Prefer
+the spill.
 
 ## Leftover `_filestore` blobs after old→new format conversion (2026-06-13)
 
