@@ -1,5 +1,37 @@
 # LithicBackup — Known Issues & Tech Debt
 
+## FIXED: Double-read on large size-colliding files during file dedup (2026-07-15)
+
+**Problem (roadmap item 5):** in directory-backup file-level dedup, a file whose size
+collided with other content was hashed in full up front and then, if it turned out
+*not* to be a duplicate, read a second time to copy its bytes. The redundant read only
+hit files larger than the in-memory buffer budget (small files are buffered on the
+first read and copied from memory), but on multi-GB size-colliders it doubled the I/O.
+
+**What shipped:** a progressive prefix pre-check in `DirectoryBackupService`. An
+intra-run index `intraRunPlainPrefixes` (size → set of 64 KiB SHA-256 prefixes of
+already-stored plain copies) plus `RuledOutByPrefixAsync`: for a large, non-buffered
+file whose size collides *only* with other files in this run and **not** with any
+already-stored plain content (`IsIntraRunOnlyCollision` = candidate size count ≥ 2 and
+size not in `existingPlainSizes`), a cheap prefix hash proves it shares no prefix with
+any same-size plain copy stored so far. When ruled out, the full up-front hash is
+skipped and `deferHashToCopy` reads the file exactly once (hashing while copying via
+`CopyFileWithHashAsync`). When the prefix collides, it escalates to the full hash to
+confirm and, if identical, writes a `.fileref`. **Every** plain copy of a colliding
+size registers its prefix after landing (`ComputePrefixHashOfBuffer` for buffered
+writes, `ComputePrefixHashAsync` for streamed) — required for correctness, or a later
+identical file could be stored as a second plain copy (a missed dedup). Existing-content
+size collisions deliberately keep the full up-front hash: no schema change, no
+destination reads. Test-stub plain writes are excluded from registration (`!stubbedPlain`).
+
+**Coverage:** directory-backup dedup previously had **zero** automated tests. Added
+`tools/dir_dedup_test`, which drives the real `DirectoryBackupService` and asserts:
+identical files → 1 plain + 1 `.fileref`; different same-size files → 2 plain, 0 ref;
+a mixed X / Y(diff, same size) / X sequence → 2 plain + 1 ref resolving to X. Each
+scenario runs under both `MemoryBudget = Fixed 0 GiB` (forces the streaming/prefix
+path) and the default Auto budget (buffered path) — 24/24 checks pass. The disc harness
+still passes 25/25.
+
 ## TECH DEBT: `StartBurnForSavedSet` / `PlanCompleted` now have zero callers (2026-07-15)
 
 Discovered while wiring roadmap item 4. `MainViewModel.StartBurnForSavedSet` and

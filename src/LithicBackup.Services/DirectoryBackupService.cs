@@ -346,6 +346,25 @@ public class DirectoryBackupService
             candidateSizeCounts.GetValueOrDefault(f.SizeBytes) >= 2
             || existingPlainSizes.Contains(f.SizeBytes);
 
+        // Progressive prefix-hash index (roadmap item 5): maps a byte size to the
+        // set of prefix hashes of every plain copy of that size stored SO FAR this
+        // run. A large size-colliding file that would otherwise be read twice (once
+        // to hash, again to copy if it turns out unique) first hashes a cheap prefix;
+        // if no same-size plain content this run shares that prefix, the file cannot
+        // be an intra-run duplicate and is read just once (hash-while-copy). Only
+        // populated/consulted for INTRA-run size collisions — an existing-content
+        // size collision keeps the full up-front hash, because we don't have the
+        // stored content's prefixes here. Only meaningful when file-level dedup is on
+        // and block dedup is off (block dedup already reads every file in its pre-pass).
+        var intraRunPlainPrefixes = new Dictionary<long, HashSet<string>>();
+
+        // Whether a size is an intra-run-only collision (≥2 candidates share it AND
+        // no already-stored plain content has it) — the exact class the prefix
+        // optimization applies to.
+        bool IsIntraRunOnlyCollision(long size) =>
+            candidateSizeCounts.GetValueOrDefault(size) >= 2
+            && !existingPlainSizes.Contains(size);
+
         // 6. Copy files.
         var failedFiles = new List<FailedFile>();
         long totalBytes = filesToBackup.Sum(f => f.SizeBytes);
@@ -576,6 +595,25 @@ public class DirectoryBackupService
                                 contentBuffer = null;
                                 (hash, contentSize) = await ComputeFileHashAndSizeAsync(file.FullPath, ct);
                             }
+                        }
+                        else if (!blockDedupEnabled
+                            && job.EnableFileDeduplication
+                            && !mightBeUnchanged
+                            && !StubPlainContentForTesting
+                            && IsIntraRunOnlyCollision(file.SizeBytes)
+                            && await RuledOutByPrefixAsync(file.FullPath, file.SizeBytes,
+                                    intraRunPlainPrefixes, ct))
+                        {
+                            // Large file whose size collides only with OTHER files in
+                            // this run (not already-stored content): a cheap prefix
+                            // hash proved it shares no prefix with any same-size plain
+                            // copy stored so far, so it cannot be an intra-run
+                            // duplicate. Skip the full up-front hash and read the file
+                            // exactly once, hashing while copying (deferHashToCopy is
+                            // honored by the write section below). Its prefix is
+                            // registered after it lands so later same-size files can
+                            // be ruled out or escalated against it.
+                            deferHashToCopy = true;
                         }
                         else
                         {
@@ -898,6 +936,26 @@ public class DirectoryBackupService
                 // and .dedup entries don't themselves hold the bytes.
                 if (!isFileRef && !isDeduped && !string.IsNullOrEmpty(hash))
                     knownContentPaths[hash] = GetCurrentDiscPath(file.FullPath, false, false);
+
+                // Register this plain copy's prefix hash so a LATER same-size file can
+                // be ruled out (or escalated) by the progressive prefix check. Keyed
+                // by the scan size (file.SizeBytes) to match how candidates collide
+                // and how the check looks up. Only for intra-run-only colliding sizes
+                // — the only sizes the check ever consults — so the index (and the
+                // small prefix read for non-buffered files) stays off the common path.
+                // Registering EVERY plain copy of such a size is required for
+                // correctness: a missing entry could let a later identical file be
+                // stored as a second plain copy instead of a .fileref (a missed dedup).
+                if (!isFileRef && !isDeduped && !stubbedPlain
+                    && IsIntraRunOnlyCollision(file.SizeBytes))
+                {
+                    string prefix = contentBuffer is not null
+                        ? ComputePrefixHashOfBuffer(contentBuffer)
+                        : await ComputePrefixHashAsync(currentPath, ct);
+                    if (!intraRunPlainPrefixes.TryGetValue(file.SizeBytes, out var prefixSet))
+                        intraRunPlainPrefixes[file.SizeBytes] = prefixSet = new HashSet<string>();
+                    prefixSet.Add(prefix);
+                }
 
                 // Create catalog record.
                 await _catalog.CreateFileRecordAsync(new FileRecord
@@ -1993,6 +2051,68 @@ public class DirectoryBackupService
     /// <summary>Lowercase-hex SHA-256 of an in-memory buffer.</summary>
     private static string ComputeHashOfBuffer(byte[] content)
         => Convert.ToHexString(SHA256.HashData(content)).ToLowerInvariant();
+
+    // -------------------------------------------------------------------
+    // Progressive prefix hashing (intra-run collision pre-check)
+    //
+    // For large (non-buffered) files whose size collides with another file
+    // in THIS run — but not with any existing stored plain content — a cheap
+    // hash of the first PrefixHashBytes is enough to rule out a genuine
+    // duplicate without reading the whole file up front. If the prefix does
+    // NOT match any already-stored plain file of the same size, the file
+    // cannot be a duplicate, so we defer the full hash into the copy pass
+    // (single read). If the prefix DOES match, we fall back to the full
+    // up-front hash to confirm (and, if confirmed, store a .fileref).
+    // -------------------------------------------------------------------
+
+    /// <summary>Number of leading bytes hashed for the cheap prefix pre-check.</summary>
+    private const int PrefixHashBytes = 64 * 1024;
+
+    /// <summary>
+    /// Returns true when <paramref name="path"/> can be ruled out as an
+    /// intra-run duplicate purely from its prefix hash — i.e. no already-stored
+    /// plain file of the same size shares its leading bytes. When true, the
+    /// caller can safely defer the full hash into the copy pass.
+    /// </summary>
+    private static async Task<bool> RuledOutByPrefixAsync(
+        string path,
+        long size,
+        Dictionary<long, HashSet<string>> intraRunPlainPrefixes,
+        CancellationToken ct)
+    {
+        // No same-size plain content stored yet this run — cannot be a dup.
+        if (!intraRunPlainPrefixes.TryGetValue(size, out var prefixes) || prefixes.Count == 0)
+            return true;
+
+        string prefix = await ComputePrefixHashAsync(path, ct);
+        // Ruled out iff no stored plain file of this size shares the prefix.
+        return !prefixes.Contains(prefix);
+    }
+
+    /// <summary>Lowercase-hex SHA-256 of the first <see cref="PrefixHashBytes"/> bytes of a file.</summary>
+    private static async Task<string> ComputePrefixHashAsync(string path, CancellationToken ct)
+    {
+        await using var stream = new FileStream(
+            path, FileMode.Open, FileAccess.Read,
+            FileShare.Read, bufferSize: 81920, useAsync: true);
+
+        var buf = new byte[PrefixHashBytes];
+        int total = 0, n;
+        while (total < buf.Length &&
+               (n = await stream.ReadAsync(buf.AsMemory(total, buf.Length - total), ct)) > 0)
+        {
+            total += n;
+        }
+
+        return Convert.ToHexString(SHA256.HashData(buf.AsSpan(0, total))).ToLowerInvariant();
+    }
+
+    /// <summary>Lowercase-hex SHA-256 of the first <see cref="PrefixHashBytes"/> bytes of a buffer.</summary>
+    private static string ComputePrefixHashOfBuffer(byte[] content)
+    {
+        int n = Math.Min(PrefixHashBytes, content.Length);
+        return Convert.ToHexString(SHA256.HashData(content.AsSpan(0, n))).ToLowerInvariant();
+    }
 
     /// <summary>
     /// TESTING ONLY — write a tiny placeholder file (hash + logical size) in

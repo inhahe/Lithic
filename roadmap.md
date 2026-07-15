@@ -147,7 +147,26 @@ Notes:
 
 ---
 
-## 5. Avoid the double-read on large size-colliding files (progressive prefix hash)
+## 5. Avoid the double-read on large size-colliding files (progressive prefix hash) ✅ DONE
+
+**Status: SHIPPED.** Added an intra-run prefix index to `DirectoryBackupService`
+(`intraRunPlainPrefixes`: size → set of 64 KiB SHA-256 prefixes of already-stored
+plain copies) plus a `RuledOutByPrefixAsync` pre-check. For a large (non-buffered)
+file whose size collides *only* with other files in the same run — not with any
+already-stored plain content (`IsIntraRunOnlyCollision`) — a cheap prefix hash
+proves it shares no prefix with any same-size plain copy stored so far, so the full
+up-front hash is skipped and `deferHashToCopy` reads the file exactly once (hashing
+while copying). If the prefix *does* collide, it escalates to the full hash to
+confirm and, if identical, writes a `.fileref`. Every plain copy of a colliding
+size registers its prefix (`ComputePrefixHashOfBuffer` for buffered writes,
+`ComputePrefixHashAsync` for streamed) so no later identical file can slip through
+as a second plain copy (a missed-dedup bug). Existing-content size collisions keep
+the full up-front hash (no schema change, no destination reads). New harness
+`tools/dir_dedup_test` (directory-backup dedup had zero automated coverage) verifies
+identical files still dedup to one plain + one `.fileref`, different same-size files
+store two plain copies, and a mixed X/Y/X sequence resolves the ref to X — on both
+the streaming (Fixed 0 GiB) and buffered budgets (24/24 checks pass). See the FIXED
+entry in `known-issues.md`.
 
 **Priority: low (optional; narrow win).**
 
