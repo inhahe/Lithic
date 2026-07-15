@@ -1,5 +1,79 @@
 # LithicBackup — Known Issues & Tech Debt
 
+## FIXED: Case-only path changes corrupt version history + orphan _prev files (2026-07-15)
+
+**Fixed 2026-07-15** — the new-backup half of this bug is resolved. Every
+`SourcePath` comparison/partition in `SqliteSetDatabase` is now `COLLATE NOCASE`
+(`GetLatestVersionInfoAsync` `PARTITION BY`, `GetFileCountForBackupSetAsync`
+`COUNT(DISTINCT …)`, `GetFileRecordByPathAndVersionAsync`, `GetFileRecordsByPathAsync`,
+`GetFileRecordsUnderDirectoryAsync` exact match, `MarkFilesDeletedByDirectoryAsync`
+exact match, `MarkFilesDeletedBySourcePathsAsync`). A case-only rename now advances the
+single version chain and repoints the old row into `_prev` instead of forking the chain
+and orphaning the file. Covered by `tools/case_rename_test` (end-to-end: two real
+directory backups against a real per-set catalog with a case-only dir rename in
+between; the test fails with the `COLLATE NOCASE` clauses removed). `tools/dir_dedup_test`
+still passes (no dedup regression).
+
+**Still open — data repair.** This fix only stops NEW corruption. Existing catalogs
+that already forked (e.g. set-11's `forward raytracer\ROADMAP.md` with parallel
+`ROADMAP.md`/`roadmap.md` chains and four v4 rows) still need a one-time reconcile:
+fold case-variant `SourcePath`s into one chain, renumber versions, drop redundant
+"current" rows. The 708 already-orphaned `_prev` files remain cleanable via the
+"Untracked Files (destination scan)" cleanup. Sketch below under **Proper fix**.
+
+---
+
+**Symptom:** the destination "Untracked Files" scan lists many `_prev` version
+files that have no catalog row. In set-11 (I:\lithicbackup) a direct disk-vs-catalog
+diff found **708 orphaned `_prev` files** under `D_prev` (392 `.fileref`, 316 plain)
+that no catalog `DiscPath` references. Most (706/708) are legacy from a June catalog
+rollback, but **2 are live (July 14–15)** and pinpoint an ongoing bug.
+
+**Root cause — inconsistent case sensitivity in catalog path handling.** Windows
+paths are case-insensitive, but the catalog treats `SourcePath` case-*sensitively* in
+some places and case-*insensitively* in others:
+- `SqliteSetDatabase.GetLatestVersionInfoAsync` partitions with
+  `ROW_NUMBER() OVER (PARTITION BY f.SourcePath ...)` under SQLite's default BINARY
+  (case-sensitive) collation, so `D:\...\ROADMAP.md` and `D:\...\roadmap.md` become
+  **two** partitions, each returning its own "latest" row. The caller then loads
+  these into a `Dictionary<string,FileVersionInfo>(OrdinalIgnoreCase)` which
+  **collapses them nondeterministically** (last row inserted wins; the outer query
+  has no ORDER BY).
+- `GetFileRecordByPathAndVersionAsync` matches `f.SourcePath = $path` (case-sensitive).
+- The versioning move in `DirectoryBackupService.ExecuteAsync` (~line 786) uses
+  `File.Exists` (case-insensitive on Windows) to decide the `_prev` move, but repoints
+  the old catalog row via the case-sensitive `GetFileRecordByPathAndVersionAsync`.
+
+When a file's path casing changes between backups (e.g. an editor rewrites
+`ROADMAP.md` as `roadmap.md`), `version = existingInfo.MaxVersion + 1` is computed
+from whichever casing survived the dict collapse, the physical file **is** moved to
+`_prev`, but the repoint lookup uses the current-scan casing and returns null → the
+`_prev` file is orphaned, and the catalog accumulates duplicate/parallel version
+chains. Confirmed in set-11: `forward raytracer\ROADMAP.md` has simultaneously-active
+rows for `ROADMAP.md` v1, `roadmap.md` v2/v3, and **four** `ROADMAP.md` v4 rows, all
+pointing at the same physical (case-insensitive) file, plus orphaned
+`roadmap.md.v1` and `ROADMAP.md.v3` under `_prev`.
+`COUNT(DISTINCT SourcePath COLLATE NOCASE)` = 1 where `COUNT(DISTINCT SourcePath)` = 2
+for this file — proof the catalog is double-counting one file.
+
+**Proper fix:** make `SourcePath` handling consistently case-insensitive across the
+catalog on Windows. Apply `COLLATE NOCASE` to every `SourcePath` comparison and to the
+`PARTITION BY` in `GetLatestVersionInfoAsync` (and the grouping in
+`GetFileRecordsByPathAsync`, retention grouping, dedup lookups, etc.), OR canonicalize
+`SourcePath` casing at write time so the catalog never stores two casings for one file.
+NOCASE partition + NOCASE lookup fixes version numbering and the repoint together so
+new backups stop orphaning and stop forking version chains. **Also needs a repair
+story for existing data:** the 708 orphaned `_prev` files are cleanable via the
+"Untracked Files (destination scan)" cleanup today; the duplicated/forked catalog
+version rows need a reconcile (fold case-variant `SourcePath`s into one chain,
+renumber versions, drop the redundant "current" rows).
+
+**Not a retention or a save-versioning failure:** current backups DO catalog `_prev`
+versions correctly (channels.conf v1–v7 are tracked under `_prev`), and retention
+works per the configured "Custom 1" tier (`*.conf` etc. keep all versions ≤10 days).
+The orphans are (a) legacy from a June catalog rollback and (b) fresh casualties of
+this case-sensitivity bug — not a failure to write version rows.
+
 ## ADDED: Dedup-aware "actual backup size" estimate (2026-07-15)
 
 **Problem (roadmap item 6):** the pre-backup coverage scan
