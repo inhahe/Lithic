@@ -1,33 +1,34 @@
 # LithicBackup — Known Issues & Tech Debt
 
-## OPEN: Source tree shows auto-included new folders as unchecked (display/coverage mismatch)
+## FIXED: Source tree showed auto-included new folders as unchecked (display/coverage mismatch) (2026-07-14)
 
 **Symptom:** With a *partially-selected* root (e.g. `D:\` selected with some
 exclusions) whose `AutoIncludeNewSubdirectories` is ON, a newly-created
-subdirectory shows **unchecked** in the Sources tree even though it *is* in
+subdirectory showed **unchecked** in the Sources tree even though it *was* in
 backup scope. The file scanner and the continuous-backup predicate both include
 it via `SourceSelection.IncludesUnlistedDescendants` (returns true for a partial
 parent with auto-include on), so any files placed in it while the flag is on get
-backed up — but the checkbox never reflects that.
+backed up — but the checkbox never reflected that.
 
-**Root cause:** `SourceSelectionNodeViewModel.CreateChildNode` gives a freshly
+**Root cause:** `SourceSelectionNodeViewModel.CreateChildNode` gave a freshly
 enumerated child `_isSelected = parent._isSelected ?? false`, so under a partial
-(`null`) parent a new folder renders unchecked regardless of the auto-include
-flag. New folders only become an *explicit* check ("materialised as explicit
-selections") when the user edits and **saves** the Sources selection, or a scan
-does so — not from continuous backup, which reads the selection read-only and
-never writes discovered folders back into the tree.
+(`null`) parent a new folder rendered unchecked regardless of the auto-include
+flag.
 
-**Consequence / user confusion:** Turning auto-include OFF and then looking at
-the tree shows the new folder unchecked, which *looks* like it was never covered.
-It was covered while the flag was on (its files were backed up); disabling the
-flag only stops *future* additions. No data loss — just a misleading display.
-
-**Proper fix (design decision needed):** either (a) render unlisted descendants
-of an auto-include parent as checked (tri-state "covered by rule"), or (b) show a
-distinct visual state for "included via auto-include" vs "explicitly selected",
-so the checkbox stops implying the folder is excluded. Deferred because it
-changes selection-display semantics across the Sources editor.
+**Fix (display/serialisation decoupling):** `CreateChildNode` now derives the
+unlisted-descendant checkbox from the rule the scanner uses —
+`_isSelected = parent._isSelected switch { false => false, true => true, null => parent._autoIncludeNew }`
+— so a new folder under a partial auto-include parent renders **checked**. To
+avoid *pinning* (an auto-include-derived check surviving an auto-include-OFF
+toggle, diverging from the scanner), the node is flagged `_isAutoIncludeDerived`
+and `ToModel()` **skips** it: the saved selection stays byte-for-byte identical
+to before the display change (no reconcile churn — `MainViewModel.SelectionsEquivalent`
+sees no diff), and the folder is re-derived from the parent's auto-include on
+reload. The flag is cleared the instant the node gets a real state — a user
+click, a descendant edit rippling up through `IsSelected`/`UpdateFromChildren`,
+or a saved-model restore in `ApplySelectionAsync` — so a genuinely curated
+subtree serialises normally. Net effect: display now agrees with coverage, while
+persistence is unchanged.
 
 
 ## FIXED: Changed file re-burned to the same multisession disc collided/shadowed (2026-07-12)

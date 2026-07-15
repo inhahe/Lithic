@@ -27,6 +27,21 @@ public enum BackupStatus
 public class SourceSelectionNodeViewModel : ViewModelBase
 {
     private bool? _isSelected = false;
+    /// <summary>
+    /// True when this node's <see cref="_isSelected"/> is <c>true</c> ONLY because
+    /// it was auto-include-derived at creation (an unlisted descendant of a
+    /// partially-selected, auto-include-on directory — see
+    /// <see cref="CreateChildNode"/>), not because the user or a saved model
+    /// selected it.  Display-only: the checkbox renders checked so it agrees with
+    /// what auto-include actually backs up, but <see cref="ToModel"/> skips such a
+    /// node so the saved selection stays byte-for-byte what it was before this
+    /// display change — the folder is re-derived from the parent's auto-include on
+    /// reload rather than being pinned as an explicit selection.  Any real change
+    /// (the user toggling this node, or a descendant edit rippling up through the
+    /// <see cref="IsSelected"/> setter, or a saved-model restore) clears the flag,
+    /// at which point the node serialises normally.
+    /// </summary>
+    private bool _isAutoIncludeDerived;
     private bool _autoIncludeNew = true;
     private bool _isExpanded;
     private bool _isLoaded;
@@ -465,6 +480,11 @@ public class SourceSelectionNodeViewModel : ViewModelBase
                 return;
 
             _isSelected = value;
+            // Any actual state change — a user click, or a descendant edit
+            // rippling up through UpdateFromChildren — means this node is no
+            // longer a pure auto-include derivation, so it must serialise
+            // normally from now on (see _isAutoIncludeDerived).
+            _isAutoIncludeDerived = false;
             OnPropertyChanged();
             OnPropertyChanged(nameof(IsNodeEnabled));
 
@@ -627,6 +647,9 @@ public class SourceSelectionNodeViewModel : ViewModelBase
         // Apply state without triggering propagation.
         _suppressPropagation = true;
         _isSelected = model.IsSelected;
+        // Restored from a saved model → this is an explicit, persisted selection,
+        // not an auto-include derivation, so it serialises normally.
+        _isAutoIncludeDerived = false;
         OnPropertyChanged(nameof(IsSelected));
         OnPropertyChanged(nameof(IsNodeEnabled));
         _suppressPropagation = false;
@@ -1030,7 +1053,31 @@ public class SourceSelectionNodeViewModel : ViewModelBase
     {
         var child = new SourceSelectionNodeViewModel(entry.FullName, entry.IsDirectory, this)
         {
-            _isSelected = _isSelected ?? false,
+            // A freshly-enumerated child with no saved-model entry is an
+            // "unlisted descendant".  Its default selection must match the rule
+            // the scanner and continuous-backup actually apply
+            // (SourceSelection.IncludesUnlistedDescendants): included under a
+            // fully-selected parent; included under a partially-selected parent
+            // only when auto-include-new is on; excluded under an excluded
+            // parent.  Using the parent's auto-include flag for the partial case
+            // (instead of a flat "unchecked") makes auto-included new folders
+            // render CHECKED, so the checkbox no longer contradicts what will be
+            // backed up.  If the child also appears in the saved model,
+            // ApplyChildModelsAsync overrides this below.
+            _isSelected = _isSelected switch
+            {
+                false => false,
+                true => true,
+                null => _autoIncludeNew,
+            },
+            // When the parent is partially selected and auto-include is on, the
+            // "checked" state above is a pure derivation — the folder isn't in
+            // the saved selection, it's covered by IncludesUnlistedDescendants.
+            // Flag it so ToModel doesn't pin it as an explicit selection (which
+            // would survive an auto-include-off toggle and diverge from what the
+            // scanner does).  The flag is cleared the moment the user or a
+            // saved-model restore gives the node a real state.
+            _isAutoIncludeDerived = _isSelected is null && _autoIncludeNew,
             _autoIncludeNew = entry.IsDirectory ? _autoIncludeNew : true,
             _size = entry.Size,
             _fileCount = entry.FileCount,
@@ -1774,6 +1821,17 @@ public class SourceSelectionNodeViewModel : ViewModelBase
     public Core.Models.SourceSelection? ToModel()
     {
         if (IsSelected == false)
+            return null;
+
+        // Auto-include derivation: this node renders checked only because it's an
+        // unlisted descendant of a partially-selected auto-include directory (see
+        // _isAutoIncludeDerived).  Don't serialise it — the parent's auto-include
+        // re-derives it on reload, and skipping it keeps the saved selection
+        // identical to what it was before the checkbox began showing checked
+        // (no pinning, and MainViewModel's SelectionsEquivalent sees no change).
+        // Any real edit clears the flag, so a genuinely curated subtree still
+        // serialises.
+        if (_isAutoIncludeDerived)
             return null;
 
         // Lossless fallback: this directory has a saved selection but its
