@@ -242,21 +242,30 @@ public partial class App : Application
             });
         };
 
-        // Warn (via a tray balloon) if a continuous set's destination drive is
-        // full. The Worker that runs continuous backups is headless, so a full
-        // destination would otherwise fail silently — new versions just never get
-        // written. This GUI-side monitor polls destination free space and pops a
-        // warning the moment a continuous destination can no longer accept writes.
+        // Warn if a continuous set's destination drive is full. The Worker that
+        // runs continuous backups is headless, so a full destination would
+        // otherwise fail silently — new versions just never get written. This
+        // GUI-side monitor polls destination free space and raises DestinationFull
+        // the moment a continuous destination can no longer accept writes.
         _destinationSpaceMonitor = new DestinationSpaceMonitor(_catalog, destinationResolver);
         _destinationSpaceMonitor.DestinationFull += message =>
         {
-            Current.Dispatcher.Invoke(() =>
+            // A tray balloon self-dismisses after a few seconds, so an
+            // away-from-keyboard user would miss it. Use a modal dialog that stays
+            // up until acknowledged. BeginInvoke (not Invoke) so the monitor's poll
+            // thread isn't blocked while the dialog is open — that lets a second
+            // drive filling up still be detected and reported. The monitor's own
+            // per-drive hysteresis guarantees this fires only once per fill event
+            // (re-arming only after the drive recovers), so the dialog won't
+            // reappear unless space is freed and that drive fills again, or a
+            // different continuous destination fills.
+            Current.Dispatcher.BeginInvoke(() =>
             {
-                _notifyIcon?.ShowBalloonTip(
-                    10000,
-                    "Lithic Backup \u2014 Destination Drive Full",
+                MessageBox.Show(
                     message,
-                    WinForms.ToolTipIcon.Warning);
+                    "Lithic Backup \u2014 Destination Drive Full",
+                    MessageBoxButton.OK,
+                    MessageBoxImage.Warning);
             });
         };
 
