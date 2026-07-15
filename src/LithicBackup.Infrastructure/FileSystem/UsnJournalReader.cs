@@ -415,6 +415,13 @@ public sealed class UsnJournalReader : IDisposable
     /// <summary>The requested start USN has been purged from the journal (it wrapped).</summary>
     private const int ERROR_JOURNAL_ENTRY_DELETED = 1181;
 
+    /// <summary>
+    /// USN reason flag meaning the file or directory was newly created. Exposed
+    /// so consumers can distinguish a brand-new directory (worth materialising as
+    /// an explicit selection) from a mere metadata change on an existing one.
+    /// </summary>
+    public const uint UsnReasonFileCreate = 0x00000100;
+
     // USN_REASON_* flags relevant to move detection.
     private const uint USN_REASON_RENAME_OLD_NAME = 0x00001000;
     private const uint USN_REASON_RENAME_NEW_NAME = 0x00002000;

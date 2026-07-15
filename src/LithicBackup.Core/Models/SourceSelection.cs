@@ -194,4 +194,124 @@ public class SourceSelection
 
         return node.AutoIncludeNewSubdirectories;
     }
+
+    /// <summary>
+    /// Promote a directory that is currently included <em>only</em> via a
+    /// parent's auto-include-new rule into an explicit, checked selection entry —
+    /// exactly as if the user had ticked it themselves in the editor. Used by the
+    /// continuous-backup worker when it discovers a newly-created folder under a
+    /// partially-selected, auto-include-on parent, so the folder's membership
+    /// becomes <em>persisted</em> and survives the user later turning auto-include
+    /// off (a live-rule-only folder would silently drop out of scope at that point).
+    /// </summary>
+    /// <remarks>
+    /// No-ops (returns <c>false</c>, leaving the tree untouched) when the directory
+    /// is not covered by the tree at all, is already an explicit entry, or is
+    /// already permanently covered by a fully-selected ancestor (a fully-selected
+    /// childless directory means "the whole subtree is in" regardless of the
+    /// auto-include flag, so nothing needs pinning). It only mutates the tree when
+    /// the directory is a genuine unlisted auto-include descendant.
+    ///
+    /// Intermediate directories between the governing ancestor and the target are
+    /// materialised as partial (<c>IsSelected == null</c>) nodes so their own
+    /// unlisted descendants keep the same coverage they had via the rule; the
+    /// target itself becomes <c>IsSelected == true</c>. Every created node inherits
+    /// the governing ancestor's <see cref="AutoIncludeNewSubdirectories"/> value, so
+    /// the freshly-pinned subtree behaves identically to the rule it replaces.
+    /// </remarks>
+    /// <param name="roots">The set's top-level selection nodes (mutated in place).</param>
+    /// <param name="directoryPath">Absolute path of the directory to pin.</param>
+    /// <returns><c>true</c> if the tree was modified and should be persisted.</returns>
+    public static bool MaterializeDirectory(IReadOnlyList<SourceSelection> roots, string directoryPath)
+    {
+        foreach (var root in roots)
+        {
+            if (NodeContains(root, directoryPath))
+                return MaterializeInNode(root, directoryPath);
+        }
+        return false;
+    }
+
+    private static bool MaterializeInNode(SourceSelection node, string directoryPath)
+    {
+        // The target is already an explicit node in the tree — nothing to add.
+        if (string.Equals(node.Path, directoryPath, StringComparison.OrdinalIgnoreCase))
+            return false;
+
+        // Excluded subtree, or a file node that happens to prefix-match: not a
+        // covered directory, so there is nothing to pin.
+        if (node.IsSelected == false || !node.IsDirectory)
+            return false;
+
+        // Descend through the explicit child that governs the target, if any.
+        foreach (var child in node.Children)
+        {
+            if (NodeContains(child, directoryPath))
+                return MaterializeInNode(child, directoryPath);
+        }
+
+        // No explicit child governs the target: it is an unlisted descendant of
+        // this node. If the whole subtree is already permanently included (a
+        // fully-selected childless directory), or this node does not actually
+        // cover unlisted descendants, there is nothing to pin.
+        if (node.IsSelected == true && node.Children.Count == 0)
+            return false;
+        if (!node.AutoIncludeNewSubdirectories)
+            return false;
+
+        AddDescendantChain(node, directoryPath);
+        return true;
+    }
+
+    /// <summary>
+    /// Build the chain of explicit directory nodes from <paramref name="ancestor"/>
+    /// down to <paramref name="directoryPath"/>, creating each missing intermediate
+    /// directory as a partial node and the final target as a selected node. The
+    /// caller guarantees no existing child of <paramref name="ancestor"/> governs
+    /// the target, so the chain is built from scratch.
+    /// </summary>
+    private static void AddDescendantChain(SourceSelection ancestor, string directoryPath)
+    {
+        bool autoInclude = ancestor.AutoIncludeNewSubdirectories;
+
+        var ancestorPath = ancestor.Path.TrimEnd('\\');
+        var rest = directoryPath.Length > ancestorPath.Length
+            ? directoryPath.Substring(ancestorPath.Length).Trim('\\')
+            : string.Empty;
+        var segments = rest.Split('\\', StringSplitOptions.RemoveEmptyEntries);
+        if (segments.Length == 0)
+            return;
+
+        var current = ancestor;
+        var accum = ancestorPath;
+        for (int i = 0; i < segments.Length; i++)
+        {
+            accum = accum + "\\" + segments[i];
+            bool isTarget = i == segments.Length - 1;
+
+            var existing = current.Children.FirstOrDefault(c =>
+                string.Equals(c.Path, accum, StringComparison.OrdinalIgnoreCase));
+
+            if (existing is null)
+            {
+                existing = new SourceSelection
+                {
+                    Path = accum,
+                    IsDirectory = true,
+                    // Intermediates stay partial (only the child on the path is
+                    // decided); the target itself becomes an explicit inclusion.
+                    IsSelected = isTarget ? true : null,
+                    AutoIncludeNewSubdirectories = autoInclude,
+                    Children = [],
+                };
+                current.Children.Add(existing);
+            }
+            else if (isTarget)
+            {
+                existing.IsSelected = true;
+            }
+
+            current = existing;
+        }
+    }
 }

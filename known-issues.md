@@ -38,6 +38,32 @@ no loaded children serialises as a fully-selected subtree, preserving its curren
 content. Net effect: display agrees with coverage, already-adopted folders survive
 an auto-include-off toggle, and only future additions are excluded.
 
+**Proper fix (worker-side materialisation — the durable half):** the editor-side
+pinning above only reaches folders that are *materialised* in the tree (loaded/
+expanded); an auto-include-covered folder the user never expanded would still drop
+from scope if auto-include was turned off before it became an explicit entry. There
+is a real difference between a folder's files being backed up via the *live rule*
+and the folder being a *persisted checked entry* — only the latter survives the
+rule changing. The continuous-backup worker now closes that gap: when it discovers
+a **newly-created** directory (USN `USN_REASON_FILE_CREATE`, or a FileSystemWatcher
+`Created`/`Renamed`) that a set covers *only* through a parent's auto-include rule,
+it writes that folder into the set's `SourceSelections` as an explicit
+`IsSelected = true` entry — exactly as if the user had ticked it — via
+`SourceSelection.MaterializeDirectory` (creates the intermediate directory chain as
+partial nodes, the target as selected, inheriting the governing ancestor's
+auto-include flag). It re-reads the set fresh from the catalog before mutating so a
+poll-interval-stale in-memory copy can't clobber a GUI edit; the reverse race (GUI
+overwriting a just-made pin) is benign — while auto-include stays on the folder is
+re-pinned on its next change. `MaterializeDirectory` no-ops when the folder is
+already explicit or already covered by a fully-selected ancestor. Net effect: a new
+folder created under an auto-include parent becomes permanent membership a few
+seconds after it appears, so turning auto-include off later never silently drops it.
+Detection is scoped to directory **creates** (not arbitrary metadata changes), so
+pre-existing rule-covered folders are left as live-rule coverage until they actually
+change. *Follow-up not yet done:* a directory that *enters* the covered area via an
+intra-volume move (handled by `RunMovesAsync`, not the create path) is backed up but
+not yet materialised — low priority; it re-pins on its next in-place change.
+
 
 ## FIXED: Changed file re-burned to the same multisession disc collided/shadowed (2026-07-12)
 
