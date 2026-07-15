@@ -1,6 +1,6 @@
 # LithicBackup — Known Issues & Tech Debt
 
-## FIXED (part 1 of 2): Atomically-saved files (e.g. KeyNote .knt) never accumulate versions (2026-07-15)
+## FIXED (both parts): Atomically-saved files (e.g. KeyNote .knt) never accumulate versions (2026-07-15)
 
 **Symptom.** A file edited by an application that saves *atomically* — writing a
 temp file then replacing/renaming the original (KeyNote NF `.knt`, and many text
@@ -31,19 +31,30 @@ that record as a retained version, and the content-identity short-circuit revive
 identical reappeared file in place (un-delete + refresh) instead of leaving it a ghost.
 Source-agnostic: any deleted-then-reappeared path now keeps its history.
 
-**Still open (part 2 of 2) — atomic-save-aware change detection (NEXT).** Resurrection
-*repairs* the chain but the churn root remains: every atomic save still tombstones the
-record and cuts a fresh row, inflating the catalog with duplicate `v1` tombstones (the
-two `philosophy.knt` rows) and duplicating DiscPaths. The proper follow-up is to
-recognize an atomic-save *replace* (temp-write + rename/`File.Replace`, or a
-delete-immediately-followed-by-recreate of the same path) as a **modification of the
-existing file**, not a delete+create — so the record is never tombstoned in the first
-place and versioning happens on the normal in-place path. Likely lives in the Worker's
-USN move/delete classification (`BackupWorker` — `MarkMovedOutAsync`, and the
-delete/rename-out handling) plus the reconcile scan's missing-file → delete step: treat
-a path that is present on disk at apply time as never-deleted, and coalesce a
-rename-old/rename-new pair on the same final path into an update. Until then, resurrection
-keeps versioning correct; this cleanup removes the tombstone churn.
+**Fix part 2 — atomic-save-aware change detection (stops the churn at the source).**
+Resurrection *repairs* the chain, but the churn root was that every atomic save
+tombstoned the record and cut a fresh `v1` row (the two `philosophy.knt` rows) and
+duplicated DiscPaths. The tombstone came from the Worker's move path: an atomic save
+renames the original out to a temp/backup name (a move whose *new* name is outside the
+set), which `RunMovesAsync` treats as "moved OUT of the set" and hands to
+`MarkMovedOutAsync` to soft-delete — even though the app immediately re-creates a file
+at the original path. `BackupWorker.MarkMovedOutAsync` now **guards on on-disk
+presence**: before tombstoning a "vacated" path it checks `File.Exists`/`Directory.Exists`,
+and if something still occupies the path (an in-place replace, not a real removal) it
+skips the tombstone, returns `false`, and the caller enqueues the path for a normal
+backup so it versions in place. This applies to both the `FellBack` (within-set move
+that couldn't relocate) and `oldIn`-only (moved-out) branches. The two fixes compose:
+if a poll happens to land inside the save's brief file-absent window and does tombstone,
+part 1 (resurrection) still recovers the chain on the next backup. Net result: an
+atomically-saved file now versions on the normal in-place path (v→v+1, old copy into
+`_prev`) with no tombstone churn.
+
+*Not covered by an automated test:* the guard lives deep in the Worker's USN
+move-application path (`RunMovesAsync`), which needs a live NTFS USN journal and the
+full worker dependency graph to exercise end-to-end; a proportionate harness doesn't
+exist yet. The guard itself is a simple on-disk-presence check, and part 1's
+resurrection (covered by `tools/resurrection_test`) is the safety net for the residual
+race. Worth adding a worker-level move-classification harness later.
 
 ---
 
