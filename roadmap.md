@@ -135,6 +135,52 @@ class, hence low priority.
 
 ---
 
+## 6. "Actual backup size" estimate that accounts for dedup
+
+**Priority: medium (UX; the current estimate over-states deduped backups).**
+
+Today's pre-backup scan (`BackupCoverageViewModel`) sums **raw** file sizes and
+buckets each file against the catalog *by path* — it never hashes content, so two
+identical files at different paths both count in full. For a set with dedup enabled
+that over-states the space the backup will actually consume, sometimes badly.
+
+Add an opt-in "compute actual size" pass that mirrors what the real
+`DirectoryBackupService` dedup path would store, so the number matches reality:
+
+- **File-level dedup enabled, block-level off:** a file only dedupes if its *whole*
+  content matches existing plain content (or an earlier file in this run). Rule out
+  the vast majority by the **size gate** first (a size that collides with nothing
+  already stored is definitely new → count full, no read). For the size-colliders,
+  use the **progressive prefix-hash** algorithm (item 5 / WinDirStat's tiers: cheap
+  prefix → escalate only on collision) so most candidates are settled after a few KiB
+  instead of a full read. This is the case where partial hashing genuinely pays off.
+- **Block-level dedup enabled:** you must read and hash *every block of every file* to
+  know which blocks are already stored, so the whole content is read regardless —
+  **partial/prefix hashing buys nothing here** (as noted, correctly, in the request).
+  The pass is exact but expensive; gate it behind an explicit user action and a
+  clear "this reads all your data" warning.
+- **Both enabled:** block-level dominates the cost (full read either way), so treat it
+  like the block-level case.
+
+Implementation notes:
+- Reuse the existing dedup machinery so the estimate can't drift from the real result:
+  the size pre-check (`GetActivePlainContentSizesAsync`), the whole-file hash, the
+  block-hash store, and the `_hashCache` (path+size+mtime) so unchanged files aren't
+  re-read on repeat estimates.
+- Dedup against **both** already-stored content *and* files seen earlier in the same
+  scan (intra-run dedup), matching backup behaviour.
+- Directory-backup only — disc backups don't dedup.
+- Keep the existing fast raw-size scan as the default; this exact pass is a separate,
+  clearly-slower option because in the block-dedup case it reads everything.
+
+Confirmed while scoping this: the default fast scan already **honours exclusions** —
+`FileScanner` skips deselected subtrees (`IsSelected == false`) and applies the
+`isExcluded` glob filter, which covers both filename patterns (`*.log`) and path
+patterns (`*/bin/*`). So the raw estimate is already exclusion-correct; this item only
+adds dedup-awareness on top.
+
+---
+
 ## Related ideas — already implemented, pending hardware validation
 
 These two came up as new ideas but turn out to already exist. The remaining work is
