@@ -1,5 +1,41 @@
 # LithicBackup — Known Issues & Tech Debt
 
+## ADDED: Dedup-aware "actual backup size" estimate (2026-07-15)
+
+**Problem (roadmap item 6):** the pre-backup coverage scan
+(`BackupCoverageViewModel`) summed **raw** file sizes and bucketed files against the
+catalog *by path* — it never hashed content, so two identical files at different
+paths both counted in full. For a set with dedup enabled this over-stated the space
+the backup would actually consume, sometimes badly.
+
+**What shipped:** `DedupSizeEstimator` (`src/LithicBackup.Services/DedupSizeEstimator.cs`),
+an opt-in estimator that mirrors `DirectoryBackupService` dedup accounting so its
+reported `StoredBytes` matches what a real backup would write:
+- **File-level dedup:** size gate first (a size colliding with nothing already
+  stored is definitely new → counted full, no read), then item-5 progressive
+  prefix-hash escalation for size-colliders (settled after 64 KiB unless a real
+  prefix collision forces a full hash). Dedups against both already-stored plain
+  content and files seen earlier in the same scan.
+- **Block-level dedup:** reads and hashes every block of every file via
+  `IDeduplicationEngine`, counting only blocks not already in the store and not
+  already seen this run (`seenNewBlocks`) — partial hashing buys nothing here, so the
+  pass is exact but expensive and gated behind an explicit user action with a "this
+  reads all your data" warning (`RequiresFullRead`).
+- Reuses the shared dedup primitives (`GetActivePlainContentSizesAsync`,
+  `GetActivePlainContentPathsAsync`, whole-file hash, block store, and the
+  path+size+mtime `_hashCache`) so the estimate can't drift from the real result.
+
+Surfaced in `BackupCoverageView` as a "Compute actual size" button (visible only when
+a dedup mode is enabled and a target is known); the fast raw-size scan stays the
+default. Directory-backup only — disc backups don't dedup.
+
+**Coverage:** `tools/dedup_estimate_test` runs BOTH the real `DirectoryBackupService`
+and the estimator over identical inputs and asserts `StoredBytes` equals the bytes
+physically written (plain copies + `_blocks/*.blk`, ignoring tiny `.fileref`/`.dedup`
+manifests) across no-dedup (stored == raw), file-level (dup + unique + same-size-
+different), block-level (files sharing a block, incl. partial last blocks), and an
+all-redundant incremental re-run (0 new bytes). All checks pass.
+
 ## FIXED: Double-read on large size-colliding files during file dedup (2026-07-15)
 
 **Problem (roadmap item 5):** in directory-backup file-level dedup, a file whose size

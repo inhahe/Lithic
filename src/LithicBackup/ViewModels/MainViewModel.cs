@@ -3453,7 +3453,16 @@ public class MainViewModel : ViewModelBase
     {
         if (SelectedBackupSet is null) return;
 
-        var vm = new BackupCoverageViewModel(_catalog, _scanner, SelectedBackupSet);
+        // Estimator for the opt-in dedup-aware "actual size" pass. The block
+        // engine is stateless (it hashes against the destination's _blocks store
+        // passed per call), and the file hash cache lets unchanged files skip a
+        // re-read on repeat estimates.
+        var estimator = new Services.DedupSizeEstimator(
+            _catalog,
+            new LithicBackup.Infrastructure.Deduplication.BlockDeduplicationEngine(),
+            _fileHashCache);
+
+        var vm = new BackupCoverageViewModel(_catalog, _scanner, SelectedBackupSet, estimator);
         vm.DoneRequested += GoHome;
 
         CurrentView = vm;

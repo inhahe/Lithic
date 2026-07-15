@@ -192,7 +192,25 @@ class, hence low priority.
 
 ---
 
-## 6. "Actual backup size" estimate that accounts for dedup
+## 6. "Actual backup size" estimate that accounts for dedup ✅ DONE
+
+**Status: SHIPPED.** Added `DedupSizeEstimator` (`src/LithicBackup.Services/DedupSizeEstimator.cs`),
+a standalone estimator that faithfully mirrors `DirectoryBackupService` dedup
+accounting to report the bytes a backup would actually write. File-level path uses
+the size gate + item-5 progressive prefix-hash escalation (most candidates settled
+after 64 KiB, full read deferred only on a real prefix collision); block-level path
+reads/hashes every file via `IDeduplicationEngine` and counts only new blocks
+(existing store + intra-run `seenNewBlocks`), gated behind an explicit user action
+with a "this reads all your data" warning. Both dedup against already-stored content
+*and* files seen earlier in the same scan, and reuse the shared dedup primitives
+(`GetActivePlainContentSizesAsync`, whole-file hash, block store, `_hashCache`) so the
+number can't drift from the real backup. Surfaced in `BackupCoverageViewModel` /
+`BackupCoverageView` as an opt-in "Compute actual size" button; the fast raw-size scan
+remains the default. A no-drift test (`tools/dedup_estimate_test`) runs BOTH the real
+`DirectoryBackupService` and the estimator over identical inputs and asserts
+`StoredBytes` equals the bytes physically written across no-dedup, file-level,
+block-level (incl. partial blocks), and all-redundant incremental scenarios. See the
+ADDED entry in `known-issues.md`.
 
 **Priority: medium (UX; the current estimate over-states deduped backups).**
 

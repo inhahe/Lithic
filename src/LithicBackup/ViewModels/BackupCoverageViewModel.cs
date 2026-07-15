@@ -1,8 +1,10 @@
 using System.Collections.ObjectModel;
+using System.Windows;
 using System.Windows.Input;
 using LithicBackup.Core;
 using LithicBackup.Core.Interfaces;
 using LithicBackup.Core.Models;
+using LithicBackup.Services;
 
 namespace LithicBackup.ViewModels;
 
@@ -15,6 +17,12 @@ public class BackupCoverageViewModel : ViewModelBase
     private readonly ICatalogRepository _catalog;
     private readonly IFileScanner _scanner;
     private readonly BackupSet _backupSet;
+    private readonly DedupSizeEstimator? _estimator;
+
+    // Retained from the coverage scan so the dedup-aware size pass reuses the
+    // same file list instead of re-scanning the sources.
+    private IReadOnlyList<ScannedFile>? _scannedFiles;
+    private CancellationTokenSource? _estimateCts;
 
     private bool _isLoading = true;
     private bool _isProgressIndeterminate = true;
@@ -40,11 +48,13 @@ public class BackupCoverageViewModel : ViewModelBase
     public BackupCoverageViewModel(
         ICatalogRepository catalog,
         IFileScanner scanner,
-        BackupSet backupSet)
+        BackupSet backupSet,
+        DedupSizeEstimator? estimator = null)
     {
         _catalog = catalog;
         _scanner = scanner;
         _backupSet = backupSet;
+        _estimator = estimator;
 
         NotBackedUpFiles = [];
         ChangedFiles = [];
@@ -52,8 +62,13 @@ public class BackupCoverageViewModel : ViewModelBase
         CloseCommand = new RelayCommand(_ =>
         {
             _cts?.Cancel();
+            _estimateCts?.Cancel();
             DoneRequested?.Invoke();
         });
+
+        ComputeActualSizeCommand = new RelayCommand(
+            _ => _ = ComputeActualSizeAsync(),
+            _ => CanComputeActualSize);
 
         _cts = new CancellationTokenSource();
         _ = LoadAsync(_cts.Token);
@@ -211,6 +226,7 @@ public class BackupCoverageViewModel : ViewModelBase
             }
 
             var scannedFiles = await scanTask;
+            _scannedFiles = scannedFiles;
 
             if (ct.IsCancellationRequested) return;
 
@@ -316,6 +332,136 @@ public class BackupCoverageViewModel : ViewModelBase
             IsLoading = false;
             _cts?.Dispose();
             _cts = null;
+            // The scan is done, so the dedup-aware size pass can now run.
+            OnPropertyChanged(nameof(CanComputeActualSize));
+            CommandManager.InvalidateRequerySuggested();
+        }
+    }
+
+    // --- Dedup-aware "actual size" pass -------------------------------
+
+    /// <summary>
+    /// True when a dedup-aware size can be computed: a directory backup with
+    /// dedup enabled, the scan finished, and an estimator was supplied.
+    /// </summary>
+    public bool CanComputeActualSize =>
+        _estimator is not null
+        && !IsLoading
+        && !IsComputingActualSize
+        && _scannedFiles is not null
+        && _backupSet.JobOptions?.TargetDirectory is not null
+        && (_backupSet.JobOptions.EnableFileDeduplication
+            || _backupSet.JobOptions.EnableDeduplication);
+
+    private bool _isComputingActualSize;
+    public bool IsComputingActualSize
+    {
+        get => _isComputingActualSize;
+        private set
+        {
+            if (SetProperty(ref _isComputingActualSize, value))
+            {
+                OnPropertyChanged(nameof(CanComputeActualSize));
+                CommandManager.InvalidateRequerySuggested();
+            }
+        }
+    }
+
+    private string _actualSizeText = "";
+    public string ActualSizeText
+    {
+        get => _actualSizeText;
+        private set { if (SetProperty(ref _actualSizeText, value)) OnPropertyChanged(nameof(HasActualSize)); }
+    }
+
+    public bool HasActualSize => !string.IsNullOrEmpty(_actualSizeText);
+
+    private string _actualSizeProgressText = "";
+    public string ActualSizeProgressText
+    {
+        get => _actualSizeProgressText;
+        private set => SetProperty(ref _actualSizeProgressText, value);
+    }
+
+    public ICommand ComputeActualSizeCommand { get; }
+
+    private async Task ComputeActualSizeAsync()
+    {
+        if (_estimator is null || _scannedFiles is null) return;
+        var opts = _backupSet.JobOptions;
+        if (opts?.TargetDirectory is null) return;
+
+        // Effective target dir (mirrors the backup path's subdirectory handling)
+        // so block-level dedup resolves the correct _blocks store.
+        string targetDir = opts.TargetDirectory;
+        if (opts.CreateSubdirectory && !string.IsNullOrWhiteSpace(opts.SubdirectoryName))
+            targetDir = System.IO.Path.Combine(targetDir, opts.SubdirectoryName.Trim());
+
+        var job = new BackupJob
+        {
+            BackupSetId = _backupSet.Id,
+            Sources = _backupSet.SourceSelections ?? [],
+            TargetDirectory = targetDir,
+            EnableFileDeduplication = opts.EnableFileDeduplication,
+            EnableDeduplication = opts.EnableDeduplication,
+            DeduplicationBlockSize = opts.DeduplicationBlockSize > 0 ? opts.DeduplicationBlockSize : 64 * 1024,
+        };
+
+        // Block-level dedup must read every file — warn before that.
+        if (_estimator.RequiresFullRead(job))
+        {
+            var answer = MessageBox.Show(
+                "Computing the exact deduplicated size with block-level dedup enabled reads " +
+                "every file in full (it must hash every block). This can take a while and " +
+                "read all of your source data.\n\nCompute it now?",
+                "Compute Actual Size",
+                MessageBoxButton.YesNo,
+                MessageBoxImage.Warning);
+            if (answer != MessageBoxResult.Yes) return;
+        }
+
+        IsComputingActualSize = true;
+        ActualSizeText = "";
+        ActualSizeProgressText = "Computing deduplicated size...";
+        _estimateCts = new CancellationTokenSource();
+        var ct = _estimateCts.Token;
+
+        try
+        {
+            var files = _scannedFiles;
+            var progress = new Progress<EstimateProgress>(p =>
+            {
+                ActualSizeProgressText = p.TotalFiles > 0
+                    ? $"Computing deduplicated size... {p.FilesProcessed:N0} / {p.TotalFiles:N0} files"
+                      + (p.BytesRead > 0 ? $" ({FormatBytes(p.BytesRead)} read)" : "")
+                    : "Computing deduplicated size...";
+            });
+
+            var est = await Task.Run(
+                () => _estimator.EstimateAsync(job, files, targetDir, progress, ct), ct);
+
+            string kind = est.BlockLevel ? "block-level dedup" : "file-level dedup";
+            ActualSizeText =
+                $"Deduplicated size: {FormatBytes(est.StoredBytes)} bytes to store " +
+                $"(raw {FormatBytes(est.RawBytes)} — saves {FormatBytes(est.SavedBytes)}, " +
+                $"{est.SavedFraction * 100:F1}% via {kind}).";
+            ActualSizeProgressText = "";
+        }
+        catch (OperationCanceledException)
+        {
+            ActualSizeProgressText = "";
+            ActualSizeText = "Size computation cancelled.";
+        }
+        catch (Exception ex)
+        {
+            ActualSizeProgressText = "";
+            ActualSizeText = $"Size computation failed: {ex.Message}";
+        }
+        finally
+        {
+            IsComputingActualSize = false;
+            _estimateCts?.Dispose();
+            _estimateCts = null;
         }
     }
 
