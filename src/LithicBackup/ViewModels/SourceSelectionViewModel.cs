@@ -53,6 +53,7 @@ public class SourceSelectionViewModel : ViewModelBase
     private int _scheduleDailyHour = 2;
     private int _scheduleDailyMinute;
     private string _scheduleDebounceSeconds = "60";
+    private string _schedulePollSeconds = "30";
     private readonly SizeComputeScheduler _scheduler = new();
     private Dictionary<string, FileVersionInfo>? _catalogInfo;
     private readonly List<DriveData>? _preloadedDrives;
@@ -771,6 +772,13 @@ public class SourceSelectionViewModel : ViewModelBase
     {
         get => _scheduleDebounceSeconds;
         set => SetProperty(ref _scheduleDebounceSeconds, value);
+    }
+
+    /// <summary>Poll interval in seconds (Continuous mode) as a text field.</summary>
+    public string SchedulePollSeconds
+    {
+        get => _schedulePollSeconds;
+        set => SetProperty(ref _schedulePollSeconds, value);
     }
 
     /// <summary>

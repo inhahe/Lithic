@@ -35,8 +35,17 @@ public sealed class BackupWorker : BackgroundService
     private readonly IDestinationResolver _destinationResolver;
     private readonly ISourceResolver _sourceResolver;
 
-    /// <summary>How often we reload backup sets, check schedules, and read journals.</summary>
-    private static readonly TimeSpan PollInterval = TimeSpan.FromSeconds(30);
+    /// <summary>
+    /// Default cadence for reloading backup sets, checking schedules, and reading
+    /// journals. Continuous sets can request a shorter interval via
+    /// <see cref="BackupSchedule.PollIntervalSeconds"/>; see
+    /// <see cref="ComputeEffectivePollInterval"/>.
+    /// </summary>
+    private static readonly TimeSpan DefaultPollInterval = TimeSpan.FromSeconds(30);
+
+    /// <summary>Floor on the continuous poll interval so a tiny configured value
+    /// can't spin the worker loop into a busy-poll.</summary>
+    private static readonly TimeSpan MinPollInterval = TimeSpan.FromSeconds(5);
 
     /// <summary>
     /// Upper bound on how long a continuous-mode change may stay pending before
@@ -206,7 +215,7 @@ public sealed class BackupWorker : BackgroundService
                     _logger.LogError(ex, "Error in worker loop.");
                 }
 
-                await Task.Delay(PollInterval, stoppingToken);
+                await Task.Delay(ComputeEffectivePollInterval(), stoppingToken);
             }
         }
         finally
@@ -336,6 +345,35 @@ public sealed class BackupWorker : BackgroundService
     // ------------------------------------------------------------------
     // Continuous / USN-journal-driven
     // ------------------------------------------------------------------
+
+    /// <summary>
+    /// The loop delay for the next poll: the smallest
+    /// <see cref="BackupSchedule.PollIntervalSeconds"/> requested by any active
+    /// continuous set (clamped to <see cref="MinPollInterval"/>), or
+    /// <see cref="DefaultPollInterval"/> when no continuous set is active. A single
+    /// shared loop serves every set, so the most demanding continuous set sets the
+    /// pace; interval/daily sets are unaffected by a faster cadence.
+    /// </summary>
+    private TimeSpan ComputeEffectivePollInterval()
+    {
+        var effective = DefaultPollInterval;
+
+        foreach (var state in _sets.Values)
+        {
+            if (!state.IsActive
+                || state.BackupSet.JobOptions?.Schedule is not { Mode: ScheduleMode.Continuous } schedule)
+                continue;
+
+            if (schedule.PollIntervalSeconds <= 0)
+                continue; // treat unset/invalid as "use default"
+
+            var requested = TimeSpan.FromSeconds(schedule.PollIntervalSeconds);
+            if (requested < effective)
+                effective = requested;
+        }
+
+        return effective < MinPollInterval ? MinPollInterval : effective;
+    }
 
     private async Task CheckContinuousAsync(CancellationToken ct)
     {

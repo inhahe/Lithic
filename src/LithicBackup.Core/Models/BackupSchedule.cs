@@ -27,6 +27,15 @@ public class BackupSchedule
     /// while the user is actively editing files.
     /// </summary>
     public int DebounceSeconds { get; set; } = 60;
+
+    /// <summary>
+    /// How often (seconds) the Worker polls the change journal / watcher for
+    /// this set's sources in <see cref="ScheduleMode.Continuous"/> mode. Lower
+    /// values detect changes sooner at the cost of more frequent journal reads.
+    /// The Worker runs a single shared poll loop, so the effective interval is
+    /// the smallest configured value across all active continuous sets.
+    /// </summary>
+    public int PollIntervalSeconds { get; set; } = 30;
 }
 
 /// <summary>
