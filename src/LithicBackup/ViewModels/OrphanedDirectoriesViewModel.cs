@@ -60,6 +60,9 @@ public class OrphanedDirectoriesViewModel : ViewModelBase
         PurgeSelectedCommand = new RelayCommand(
             _ => PurgeSelected(),
             _ => !IsPurging && Categories.Any(c => c.HasCheckedItems));
+        ScanCatalogCommand = new RelayCommand(
+            _ => _ = LoadAsync(),
+            _ => !IsLoading && !IsPurging);
         ScanExcludedCommand = new RelayCommand(_ => _ = ScanForExcludedAsync(), _ => !IsLoading && !IsPurging);
         ScanDestinationCommand = new RelayCommand(
             _ => _ = ScanDestinationAsync(),
@@ -76,10 +79,18 @@ public class OrphanedDirectoriesViewModel : ViewModelBase
                  && _targetDir is not null && _reconcileReport?.HasChanges == true);
         CloseCommand = new RelayCommand(_ => DoneRequested?.Invoke());
 
-        // Fire-and-forget the initial load; it runs its heavy work on a
-        // background thread and drives the view's own progress (SummaryText /
-        // IsLoading), so nothing needs to await it.
-        _ = LoadAsync();
+        // The catalog classification (read every record + group/classify into
+        // the removed/deleted/excluded/excess-version categories) is a
+        // synchronous multi-second SQLite scan on large sets.  It is NOT needed
+        // when the user only wants to scan the destination filesystem or
+        // reconcile, so it is now an explicit action (ScanCatalogCommand)
+        // rather than an automatic load on open.  Destination scan and reconcile
+        // load whatever catalog data they need themselves; the manual
+        // exclusion-pattern scan lazily runs the catalog load first.
+        SummaryText = "Click \u201CScan catalog\u201D to classify catalog records "
+            + "(removed from sources, deleted from disk, configured exclusions, "
+            + "excess versions). You can also scan the destination filesystem or "
+            + "reconcile below without scanning the catalog first.";
     }
 
     // ------------------------------------------------------------------
@@ -278,6 +289,7 @@ public class OrphanedDirectoriesViewModel : ViewModelBase
     }
 
     public ICommand PurgeSelectedCommand { get; }
+    public ICommand ScanCatalogCommand { get; }
     public ICommand ScanExcludedCommand { get; }
     public ICommand ScanDestinationCommand { get; }
     public ICommand SortByNameCommand { get; }
@@ -1138,6 +1150,11 @@ public class OrphanedDirectoriesViewModel : ViewModelBase
     /// </summary>
     private async Task ScanForExcludedAsync()
     {
+        // The manual exclusion scan filters the catalog's active records, so it
+        // needs the catalog loaded.  With the catalog scan now on-demand, load
+        // it here if the user jumped straight to this without scanning first.
+        if (_activeFiles is null)
+            await LoadAsync();
         if (_activeFiles is null)
             return;
 
@@ -1273,7 +1290,10 @@ public class OrphanedDirectoriesViewModel : ViewModelBase
     /// </summary>
     private async Task ScanDestinationAsync()
     {
-        if (_activeFiles is null || _targetDir is null)
+        // The destination walk loads its own catalog snapshot (below), so it no
+        // longer depends on the on-demand catalog classification having run —
+        // only on the set having a destination directory.
+        if (_targetDir is null)
             return;
 
         // Give immediate feedback the moment the button is pressed: flip the
@@ -1727,8 +1747,10 @@ public class OrphanedDirectoriesViewModel : ViewModelBase
                         {
                             lastProgressMs = nowMs;
                             var dirName = Path.GetFileName(wi.DirectoryPath.TrimEnd('\\'));
+                            int pct = workItems.Count == 0
+                                ? 100 : (int)((i + 1) * 100L / workItems.Count);
                             ((IProgress<string>)progress).Report(
-                                $"Updating catalog {i + 1:N0}/{workItems.Count:N0}: {dirName}");
+                                $"Updating catalog {i + 1:N0}/{workItems.Count:N0} ({pct}%): {dirName}");
                         }
 
                         if (wi.Reason is OrphanedReason.UntrackedFile)

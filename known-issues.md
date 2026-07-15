@@ -1,5 +1,35 @@
 # LithicBackup — Known Issues & Tech Debt
 
+## OPEN: Source tree shows auto-included new folders as unchecked (display/coverage mismatch)
+
+**Symptom:** With a *partially-selected* root (e.g. `D:\` selected with some
+exclusions) whose `AutoIncludeNewSubdirectories` is ON, a newly-created
+subdirectory shows **unchecked** in the Sources tree even though it *is* in
+backup scope. The file scanner and the continuous-backup predicate both include
+it via `SourceSelection.IncludesUnlistedDescendants` (returns true for a partial
+parent with auto-include on), so any files placed in it while the flag is on get
+backed up — but the checkbox never reflects that.
+
+**Root cause:** `SourceSelectionNodeViewModel.CreateChildNode` gives a freshly
+enumerated child `_isSelected = parent._isSelected ?? false`, so under a partial
+(`null`) parent a new folder renders unchecked regardless of the auto-include
+flag. New folders only become an *explicit* check ("materialised as explicit
+selections") when the user edits and **saves** the Sources selection, or a scan
+does so — not from continuous backup, which reads the selection read-only and
+never writes discovered folders back into the tree.
+
+**Consequence / user confusion:** Turning auto-include OFF and then looking at
+the tree shows the new folder unchecked, which *looks* like it was never covered.
+It was covered while the flag was on (its files were backed up); disabling the
+flag only stops *future* additions. No data loss — just a misleading display.
+
+**Proper fix (design decision needed):** either (a) render unlisted descendants
+of an auto-include parent as checked (tri-state "covered by rule"), or (b) show a
+distinct visual state for "included via auto-include" vs "explicitly selected",
+so the checkbox stops implying the folder is excluded. Deferred because it
+changes selection-display semantics across the Sources editor.
+
+
 ## FIXED: Changed file re-burned to the same multisession disc collided/shadowed (2026-07-12)
 
 **Symptom (hardware edge case, follow-on from the multisession fix below):** once
