@@ -38,11 +38,16 @@
       keeps its .exe locked, producing "Setup was unable to automatically close
       the application" on upgrade.
 
-      EndSessionMessage sends WM_QUERYENDSESSION, which the app now treats as a
-      real exit (App.OnSessionEnding), so it shuts down gracefully.  If it hasn't
-      exited by the timeout, TerminateProcess force-closes it as a fallback so
-      the upgrade can always proceed.  RebootPrompt="no" avoids demanding a
-      reboot if a stubborn instance lingers.
+      EndSessionMessage sends WM_QUERYENDSESSION / WM_ENDSESSION to the GUI's
+      top-level window.  WPF does NOT route those into Application.SessionEnding
+      when they arrive at the visible main window, so the app hooks its own
+      WndProc (MainWindow.WndProc) and, on WM_ENDSESSION, calls Application
+      .Shutdown() — a real exit is required because ShutdownMode is
+      OnExplicitShutdown, so merely closing the window would leave the process
+      (and its locked .exe) alive.  If it still hasn't exited by the timeout,
+      TerminateProcess force-closes it as a fallback so the upgrade can always
+      proceed.  RebootPrompt="no" avoids demanding a reboot if a stubborn
+      instance lingers.
     -->
     <util:CloseApplication
         Id="CloseLithicGui"

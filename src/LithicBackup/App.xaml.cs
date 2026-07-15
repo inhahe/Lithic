@@ -349,11 +349,45 @@ public partial class App : Application
     /// process alive and holding LithicBackup.exe locked — which is what makes an
     /// upgrade fail with "Setup was unable to automatically close the application."
     /// Flag the real shutdown so OnClosing lets the window close.
+    ///
+    /// Note: WPF only raises this for session messages delivered to its own hidden
+    /// management window. The MSI's util:CloseApplication posts WM_QUERYENDSESSION/
+    /// WM_ENDSESSION straight to the visible main window's HWND, which does NOT
+    /// route through here — <see cref="MainWindow"/> hooks its WndProc and calls
+    /// <see cref="ShutdownForRestartManager"/> to cover that path.
     /// </summary>
     protected override void OnSessionEnding(SessionEndingCancelEventArgs e)
     {
         IsExiting = true;
+        Shutdown();
         base.OnSessionEnding(e);
+    }
+
+    /// <summary>
+    /// Approve a pending session-end/Restart-Manager close (WM_QUERYENDSESSION):
+    /// flag the real exit so a subsequent close is allowed to proceed instead of
+    /// minimizing to tray. Does not shut down yet — the session end could still be
+    /// vetoed, in which case <see cref="AbortRestartManagerExit"/> undoes this.
+    /// </summary>
+    internal void MarkRestartManagerExit() => IsExiting = true;
+
+    /// <summary>
+    /// The session end was cancelled (WM_ENDSESSION with wParam = FALSE): keep the
+    /// app running in the tray by clearing the pending-exit flag.
+    /// </summary>
+    internal void AbortRestartManagerExit() => IsExiting = false;
+
+    /// <summary>
+    /// Actually tear the process down in response to a Restart Manager / session
+    /// end (WM_ENDSESSION with wParam = TRUE). Because <c>ShutdownMode</c> is
+    /// <see cref="ShutdownMode.OnExplicitShutdown"/>, closing the window is not
+    /// enough to end the process — we must call <see cref="Application.Shutdown()"/>
+    /// so LithicBackup.exe is released and the installer can replace it.
+    /// </summary>
+    internal void ShutdownForRestartManager()
+    {
+        IsExiting = true;
+        Shutdown();
     }
 
     /// <summary>

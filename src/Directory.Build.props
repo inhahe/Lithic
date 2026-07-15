@@ -17,7 +17,7 @@
     GitHub release tagged v<Version> with the MSI attached.
   -->
   <PropertyGroup>
-    <Version>1.0.3</Version>
+    <Version>1.0.5</Version>
   </PropertyGroup>
 
 </Project>
