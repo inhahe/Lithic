@@ -75,6 +75,40 @@ observed actual capacity back into the packer.
 
 ---
 
+## 4. Plan-time disc-filesystem compatibility warning (suggest UDF up front)
+
+**Priority: medium (UX; prevents surprise mass-zipping).**
+
+Today the disc `FilesystemType` (ISO 9660 / Joliet / UDF) is chosen in Settings and
+only *acted on* during the burn: `ZipMode.IncompatibleOnly` (the default) silently
+auto-zips any file whose name/path/depth violates the selected format's limits
+(`PathCompatibility.CheckCompatibility`). That's a safe fallback, but the user never
+sees it coming — a set full of long Unicode paths burned as ISO 9660 gets quietly
+zipped wholesale, changing how the content lands on the disc, with no chance to
+reconsider the format first.
+
+This is the cleaner alternative to the rejected "switch filesystem format mid-burn"
+idea: a physical disc authors as a single image, so the real fix is to pick the right
+format *before* the burn, not partway through.
+
+**Fix:** at plan time (after file enumeration, before staging/burn), run each planned
+file's disc-relative path through `PathCompatibility.CheckCompatibility` for the
+selected `FilesystemType` and produce a summary, e.g. "142 of 5,003 files (2.1 GB)
+will be zipped for ISO 9660 compatibility." If a significant fraction is incompatible,
+surface a warning that suggests switching to **UDF** (the most permissive format,
+already the default) and offer to re-plan under UDF without zipping. Show this in the
+plan/confirmation UI so the user chooses the format up front.
+
+Notes:
+- The compatibility check already exists per-format in `PathCompatibility`; this is
+  wiring it into a pre-burn pass + summary, not new format logic.
+- Keep `ZipMode.IncompatibleOnly` as the fallback for the handful of files that are
+  still incompatible under the chosen format (e.g. a genuinely too-long path even for
+  UDF), so the warning informs rather than blocks.
+- Only relevant to disc backups; directory backups have no filesystem-format limits.
+
+---
+
 ## Related ideas — already implemented, pending hardware validation
 
 These two came up as new ideas but turn out to already exist. The remaining work is
