@@ -39,7 +39,32 @@ deploy. The backup scope is also very broad (C:\Windows\Temp, browser caches,
 $RECYCLE.BIN, Unreal DDC → thousands of churned files per cycle), which is what
 fills J:.
 
-## FIXED: MSI upgrade couldn't close the GUI — it minimized to tray and the .exe stayed locked (2026-07-15)
+## FIXED (for real, v1.0.9): MSI upgrade couldn't close the GUI — force-kill before InstallValidate (2026-07-15)
+
+> **Update (v1.0.9).** The cooperative WndProc / `EndSessionMessage` approach
+> described below was shipped (v1.0.5/1.0.6) but **did not work in practice** — the
+> user still hit "The setup was unable to automatically close all requested
+> applications" on a real upgrade. Two reasons: (1) the main window is hidden in
+> the tray, so the Restart Manager frequently can't message it at all, and (2)
+> `util:CloseApplication`'s terminate fallback runs via `WixCloseApplications`,
+> which is scheduled **after `InstallInitialize`** — i.e. **after `InstallValidate`**,
+> the standard action that performs the file-in-use check and raises the dialog.
+> The terminate therefore always ran too late to prevent it.
+>
+> **The definitive fix** (`installer\Package.wxs`) stops relying on the app
+> cooperating at all. `util:CloseApplication` is removed and replaced with a Type 34
+> immediate custom action `KillLithicGui` that runs
+> `taskkill /F /IM LithicBackup.exe`, scheduled **`Before InstallValidate`** in
+> `InstallExecuteSequence`. By the time MSI checks for open files the process is
+> already gone, so the file-in-use dialog can never appear. The GUI runs unelevated
+> (`asInvoker` — no app.manifest / `<ApplicationManifest>`), so the impersonated
+> immediate CA (`Impersonate="yes"`) kills it with no special rights;
+> `Return="ignore"` makes taskkill's exit-128 "not running" case a harmless no-op
+> (first-time installs, already-closed GUI). This also fixes the bootstrap case:
+> the kill CA lives in the *new* MSI, so it runs even on the very upgrade that first
+> delivers it. The WndProc/`OnSessionEnding` handlers in `MainWindow`/`App` are now
+> only relevant for genuine OS logoff/shutdown; they are no longer load-bearing for
+> the installer.
 
 **Symptom.** During an MSI upgrade the installer's Restart Manager tries to close
 the running GUI. Instead of exiting, LithicBackup showed its "Minimized to tray"
