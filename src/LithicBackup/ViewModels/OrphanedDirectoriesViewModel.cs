@@ -288,6 +288,22 @@ public class OrphanedDirectoriesViewModel : ViewModelBase
         set => SetProperty(ref _reconcileStatusText, value);
     }
 
+    /// <summary>
+    /// True once <see cref="ReconcileAnalyzeAsync"/> has produced a dry-run
+    /// report with pending changes. The Apply button is hidden until then, so
+    /// it only appears after Analyze surfaces something to apply (mirroring the
+    /// other cards, whose action buttons/results appear only after a scan).
+    /// </summary>
+    public bool CanApplyReconcile => _reconcileReport?.HasChanges == true;
+
+    /// <summary>Assigns the reconcile report and notifies the Apply button's
+    /// enabled/visible state.</summary>
+    private void SetReconcileReport(ReconcileReport? report)
+    {
+        _reconcileReport = report;
+        OnPropertyChanged(nameof(CanApplyReconcile));
+    }
+
     public ICommand PurgeSelectedCommand { get; }
     public ICommand ScanCatalogCommand { get; }
     public ICommand ScanExcludedCommand { get; }
@@ -1927,7 +1943,7 @@ public class OrphanedDirectoriesViewModel : ViewModelBase
             return;
 
         IsReconciling = true;
-        _reconcileReport = null;
+        SetReconcileReport(null);
         ReconcileStatusText = "Analyzing catalog against destination...";
 
         try
@@ -1936,7 +1952,7 @@ public class OrphanedDirectoriesViewModel : ViewModelBase
             var report = await Task.Run(() =>
                 _reconcile.AnalyzeAsync(_backupSet.Id, _targetDir, progress));
 
-            _reconcileReport = report;
+            SetReconcileReport(report);
 
             long flipBytes = report.Flips.Sum(f => f.SizeBytes);
             long pruneBytes = report.Prunes.Sum(p => p.SizeBytes);
@@ -1967,7 +1983,7 @@ public class OrphanedDirectoriesViewModel : ViewModelBase
         }
         catch (Exception ex)
         {
-            _reconcileReport = null;
+            SetReconcileReport(null);
             ReconcileStatusText = $"Analysis failed: {ex.Message}";
         }
         finally
@@ -1997,7 +2013,7 @@ public class OrphanedDirectoriesViewModel : ViewModelBase
             var result = await Task.Run(() =>
                 _reconcile.ApplyAsync(_backupSet.Id, report, _targetDir, progress));
 
-            _reconcileReport = null;
+            SetReconcileReport(null);
 
             var parts = new List<string>();
             if (result.Flipped > 0)

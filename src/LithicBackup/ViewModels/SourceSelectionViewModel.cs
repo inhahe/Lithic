@@ -73,6 +73,21 @@ public class SourceSelectionViewModel : ViewModelBase
     private bool _seedSkipHashing = true;
     private CancellationTokenSource? _seedCts;
     private bool _needsSave = true;
+
+    /// <summary>
+    /// When false, the catch-all "mark dirty on any change" handlers are muted.
+    /// The modify/new-set dialog suspends tracking across its programmatic init
+    /// span (selection restore, catalog/size stamping, and the settings panel's
+    /// first-render binding write-backs) so none of that machinery is mistaken
+    /// for a user edit — which previously produced a spurious "unsaved changes"
+    /// prompt when a set was opened and closed without touching anything.
+    /// Genuine checkbox toggles still mark dirty during the span because they
+    /// set <see cref="_needsSave"/> directly (see <see cref="RequestSelectionSettle"/>),
+    /// bypassing these handlers.  Defaults true so any other host of this view
+    /// keeps immediate dirty tracking.
+    /// </summary>
+    private bool _dirtyTrackingArmed = true;
+
     private string _destinationSpaceText = "";
     private readonly FileHashCache? _fileHashCache;
     private readonly IFileScanner? _scanner;
@@ -246,6 +261,8 @@ public class SourceSelectionViewModel : ViewModelBase
                     or nameof(DestinationSpaceText)
                     or nameof(IsAnalyzingDedup) or nameof(DedupAnalysisResult)))
             {
+                if (!_dirtyTrackingArmed)
+                    return;
                 if (!string.IsNullOrEmpty(_saveStatusText))
                     SaveStatusText = "";
                 if (!_needsSave)
@@ -257,6 +274,8 @@ public class SourceSelectionViewModel : ViewModelBase
         };
         SelectionChanged += () =>
         {
+            if (!_dirtyTrackingArmed)
+                return;
             if (!string.IsNullOrEmpty(_saveStatusText))
                 SaveStatusText = "";
             if (!_needsSave)
@@ -911,6 +930,18 @@ public class SourceSelectionViewModel : ViewModelBase
         _needsSave = false;
         CommandManager.InvalidateRequerySuggested();
     }
+
+    /// <summary>
+    /// Mute the catch-all dirty handlers for the duration of the dialog's
+    /// programmatic initialisation (selection restore, catalog/size stamping,
+    /// and the settings panel's first-render binding write-backs).  Genuine
+    /// checkbox toggles still mark the set dirty while suspended.  Pair with
+    /// <see cref="ResumeDirtyTracking"/>.
+    /// </summary>
+    public void SuspendDirtyTracking() => _dirtyTrackingArmed = false;
+
+    /// <summary>Re-arm the catch-all dirty handlers once init has settled.</summary>
+    public void ResumeDirtyTracking() => _dirtyTrackingArmed = true;
 
     // --- Commands ---
 

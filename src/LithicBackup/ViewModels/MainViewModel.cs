@@ -518,6 +518,15 @@ public class MainViewModel : ViewModelBase
             fileHashCache: _fileHashCache, scanner: _scanner);
         sourceSelection.IsEditMode = true;
 
+        // Mute dirty tracking across the whole programmatic init below (settings
+        // restore, selection restore, catalog/size stamping, and the settings
+        // panel's first-render binding write-backs).  Without this, that
+        // machinery trips the catch-all "mark dirty" handlers, so opening a set
+        // and immediately closing it — without touching anything — pops a bogus
+        // "You have unsaved changes" prompt.  Re-armed in PostShowInitAsync's
+        // finally once init has settled.
+        sourceSelection.SuspendDirtyTracking();
+
         // Selection restore is deferred to Phase 3 (after the window is visible),
         // so mark "applying" NOW — before the tree ever renders — so the include
         // checkboxes stay hidden until their real state loads from the catalog.
@@ -980,30 +989,47 @@ public class MainViewModel : ViewModelBase
 
         async Task PostShowInitAsync()
         {
-            // Now that the tree is visible and interactive, load the big catalog
-            // dictionary on a background thread and stamp backup-status badges on
-            // the already-loaded (visible) nodes. Collapsed folders pick up their
-            // badges when expanded, since new child nodes read the shared catalog
-            // getter (which SetCatalogInfo populates here).
-            var catalogInfo = await Task.Run(() =>
+            try
             {
-                try { return _catalog.GetLatestVersionInfoAsync(backupSet.Id).GetAwaiter().GetResult(); }
-                catch { return null as Dictionary<string, Core.Models.FileVersionInfo>; }
-            });
-            sourceSelection.SetCatalogInfo(catalogInfo);
+                // Now that the tree is visible and interactive, load the big catalog
+                // dictionary on a background thread and stamp backup-status badges on
+                // the already-loaded (visible) nodes. Collapsed folders pick up their
+                // badges when expanded, since new child nodes read the shared catalog
+                // getter (which SetCatalogInfo populates here).
+                var catalogInfo = await Task.Run(() =>
+                {
+                    try { return _catalog.GetLatestVersionInfoAsync(backupSet.Id).GetAwaiter().GetResult(); }
+                    catch { return null as Dictionary<string, Core.Models.FileVersionInfo>; }
+                });
+                sourceSelection.SetCatalogInfo(catalogInfo);
 
-            // Show catalog summary so the user knows files are already tracked
-            // (e.g. from a previous seed or backup).
-            if (catalogInfo is { Count: > 0 })
+                // Show catalog summary so the user knows files are already tracked
+                // (e.g. from a previous seed or backup).
+                if (catalogInfo is { Count: > 0 })
+                {
+                    long totalBytes = 0;
+                    foreach (var fvi in catalogInfo.Values)
+                        totalBytes += fvi.SizeBytes;
+                    sourceSelection.SeedResult =
+                        $"{catalogInfo.Count:N0} files ({FormatBytes(totalBytes)}) in catalog.";
+                }
+
+                await sourceSelection.ComputeAllUnknownSizesAsync();
+            }
+            finally
             {
-                long totalBytes = 0;
-                foreach (var fvi in catalogInfo.Values)
-                    totalBytes += fvi.SizeBytes;
-                sourceSelection.SeedResult =
-                    $"{catalogInfo.Count:N0} files ({FormatBytes(totalBytes)}) in catalog.";
+                // Re-arm dirty tracking once the programmatic init has settled.
+                // Scheduling at ContextIdle guarantees the settings panel's
+                // first-render binding write-backs (which run at Render priority,
+                // higher than ContextIdle) have flushed first, so none of them is
+                // mistaken for a user edit.  Done in a finally so a failed
+                // catalog/size load can never leave the dialog permanently unable
+                // to detect edits (and thus unable to save).
+                await Application.Current.Dispatcher.InvokeAsync(
+                    sourceSelection.ResumeDirtyTracking,
+                    System.Windows.Threading.DispatcherPriority.ContextIdle);
             }
 
-            await sourceSelection.ComputeAllUnknownSizesAsync();
             planCheckReady = true;
             autoCheckCts = new CancellationTokenSource();
             await RunPlanCheckInEditorAsync(sourceSelection, backupSet, autoCheckCts.Token);
