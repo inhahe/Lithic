@@ -264,31 +264,70 @@
                        Text="{Binding SummaryText}"
                        TextWrapping="Wrap" />
 
-            <!-- Catalog classification is on-demand: the full catalog read +
-                 classification is slow on large sets and isn't needed when the
-                 user only wants the destination scan or reconcile below. -->
-            <Border Style="{StaticResource Card}" Padding="10" Margin="0,10,0,0">
-                <StackPanel>
-                    <TextBlock Text="Scan Catalog" FontWeight="SemiBold"
-                               Margin="0,0,0,4" />
-                    <TextBlock Foreground="{StaticResource TextSecondaryBrush}" FontSize="11"
-                               TextWrapping="Wrap" Margin="0,0,0,8"
-                               Text="Read every catalog record and classify it into the removed-from-sources, deleted-from-disk, configured-exclusion, and excess-version categories below. Can take a while on large sets — run it when you want the catalog-side cleanup categories." />
-                    <Button HorizontalAlignment="Left" Content="Scan Catalog"
-                            Command="{Binding ScanCatalogCommand}"
-                            Padding="12,6" Cursor="Hand" />
-                </StackPanel>
-            </Border>
+            <!-- Scan / maintenance actions laid out as a uniform 2×2 grid so
+                 every card is the same width and height regardless of content.
+                 The two destination-dependent cards (Reconcile, Scan
+                 Destination) collapse when the set has no destination; a
+                 UniformGrid skips collapsed children, so the remaining two
+                 cards reflow into a single tidy row. -->
+            <UniformGrid Columns="2" Margin="0,10,0,0">
 
-            <!-- Optional scans: exclusion-pattern scan + destination filesystem scan -->
-            <Grid Margin="0,10,0,0">
-                <Grid.ColumnDefinitions>
-                    <ColumnDefinition Width="*" />
-                    <ColumnDefinition Width="*" />
-                </Grid.ColumnDefinitions>
+                <!-- Scan Catalog: on-demand full catalog read + classification -->
+                <Border Style="{StaticResource Card}" Padding="10" Margin="0,0,4,8">
+                    <StackPanel>
+                        <TextBlock Text="Scan Catalog" FontWeight="SemiBold"
+                                   Margin="0,0,0,4" />
+                        <TextBlock Foreground="{StaticResource TextSecondaryBrush}" FontSize="11"
+                                   TextWrapping="Wrap" Margin="0,0,0,8"
+                                   Text="Read every catalog record and classify it into the removed-from-sources, deleted-from-disk, configured-exclusion, and excess-version categories below. Can take a while on large sets." />
+                        <Button HorizontalAlignment="Left" Content="Scan Catalog"
+                                Command="{Binding ScanCatalogCommand}"
+                                Padding="12,6" Cursor="Hand"
+                                VerticalAlignment="Bottom" />
+                    </StackPanel>
+                </Border>
 
-                <!-- Exclusion pattern scanner -->
-                <Border Grid.Column="0" Style="{StaticResource Card}" Padding="10" Margin="0,0,4,0">
+                <!-- Reconcile Catalog with Destination: flip stale .fileref rows
+                     to plain and prune rows whose content is missing.  Dry-run
+                     first (Analyze), then an explicit Apply.  Collapses when the
+                     set has no destination. -->
+                <Border Padding="10" Margin="4,0,0,8">
+                    <Border.Style>
+                        <Style TargetType="Border" BasedOn="{StaticResource Card}">
+                            <Style.Triggers>
+                                <DataTrigger Binding="{Binding CanScanDestination}" Value="False">
+                                    <Setter Property="Visibility" Value="Collapsed" />
+                                </DataTrigger>
+                            </Style.Triggers>
+                        </Style>
+                    </Border.Style>
+                    <StackPanel>
+                        <TextBlock Text="Reconcile Catalog with Destination" FontWeight="SemiBold"
+                                   Margin="0,0,0,4" />
+                        <TextBlock Foreground="{StaticResource TextSecondaryBrush}" FontSize="11"
+                                   TextWrapping="Wrap" Margin="0,0,0,8"
+                                   Text="Repairs catalog rows that no longer match the destination: flips stale file-reference rows back to plain (hash-verified) and prunes active rows whose content is missing. Analyze is a dry run; nothing changes until you click Apply." />
+                        <DockPanel>
+                            <StackPanel DockPanel.Dock="Right" Orientation="Horizontal"
+                                        VerticalAlignment="Top" Margin="8,0,0,0">
+                                <Button Content="Analyze"
+                                        Command="{Binding ReconcileAnalyzeCommand}"
+                                        Padding="12,6" Margin="0,0,6,0" Cursor="Hand" />
+                                <Button Content="Apply"
+                                        Command="{Binding ReconcileApplyCommand}"
+                                        Padding="12,6" Cursor="Hand" />
+                            </StackPanel>
+                            <TextBlock Text="{Binding ReconcileStatusText}"
+                                       Foreground="{StaticResource TextSecondaryBrush}"
+                                       FontSize="11"
+                                       VerticalAlignment="Center"
+                                       TextWrapping="Wrap" />
+                        </DockPanel>
+                    </StackPanel>
+                </Border>
+
+                <!-- Scan for Excluded Files: exclusion-pattern scanner -->
+                <Border Style="{StaticResource Card}" Padding="10" Margin="0,0,4,0">
                     <StackPanel>
                         <TextBlock Text="Scan for Excluded Files" FontWeight="SemiBold"
                                    Margin="0,0,0,4" />
@@ -311,8 +350,10 @@
                     </StackPanel>
                 </Border>
 
-                <!-- Destination filesystem scan -->
-                <Border Grid.Column="1" Padding="10" Margin="4,0,0,0">
+                <!-- Scan Destination Filesystem: walk the destination for
+                     untracked / catalog-deleted files.  Collapses when the set
+                     has no destination. -->
+                <Border Padding="10" Margin="4,0,0,0">
                     <Border.Style>
                         <Style TargetType="Border" BasedOn="{StaticResource Card}">
                             <Style.Triggers>
@@ -327,7 +368,7 @@
                                    Margin="0,0,0,4" />
                         <TextBlock Foreground="{StaticResource TextSecondaryBrush}" FontSize="11"
                                    TextWrapping="Wrap" Margin="0,0,0,8"
-                                   Text="Walk the backup destination to find untracked files (not in the catalog at all) and catalog-deleted files (marked deleted but still on disk). Slower than the catalog scan above." />
+                                   Text="Walk the backup destination to find untracked files (not in the catalog at all) and catalog-deleted files (marked deleted but still on disk). Slower than the catalog scan." />
                         <DockPanel>
                             <Button DockPanel.Dock="Right" Content="Scan"
                                     Command="{Binding ScanDestinationCommand}"
@@ -341,37 +382,7 @@
                         </DockPanel>
                     </StackPanel>
                 </Border>
-            </Grid>
-
-            <!-- Catalog reconcile: flip stale .fileref rows to plain and prune
-                 rows whose content is missing.  Dry-run first (Analyze), then
-                 an explicit Apply.  Hidden when the set has no destination. -->
-            <Border Style="{StaticResource Card}" Padding="10" Margin="0,8,0,0"
-                    Visibility="{Binding CanScanDestination, Converter={StaticResource BoolToVis}}">
-                <StackPanel>
-                    <TextBlock Text="Reconcile Catalog with Destination" FontWeight="SemiBold"
-                               Margin="0,0,0,4" />
-                    <TextBlock Foreground="{StaticResource TextSecondaryBrush}" FontSize="11"
-                               TextWrapping="Wrap" Margin="0,0,0,8"
-                               Text="Repairs catalog rows that no longer match the destination: flips stale file-reference rows back to plain (hash-verified) and prunes active rows whose content is missing. Analyze is a dry run; nothing changes until you click Apply." />
-                    <DockPanel>
-                        <StackPanel DockPanel.Dock="Right" Orientation="Horizontal"
-                                    VerticalAlignment="Top" Margin="8,0,0,0">
-                            <Button Content="Analyze"
-                                    Command="{Binding ReconcileAnalyzeCommand}"
-                                    Padding="12,6" Margin="0,0,6,0" Cursor="Hand" />
-                            <Button Content="Apply"
-                                    Command="{Binding ReconcileApplyCommand}"
-                                    Padding="12,6" Cursor="Hand" />
-                        </StackPanel>
-                        <TextBlock Text="{Binding ReconcileStatusText}"
-                                   Foreground="{StaticResource TextSecondaryBrush}"
-                                   FontSize="11"
-                                   VerticalAlignment="Center"
-                                   TextWrapping="Wrap" />
-                    </DockPanel>
-                </StackPanel>
-            </Border>
+            </UniformGrid>
         </StackPanel>
 
         <!-- Bottom area: persistent last-cleanup result above the action row -->

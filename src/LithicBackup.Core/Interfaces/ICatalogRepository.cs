@@ -64,6 +64,22 @@ public interface ICatalogRepository : IDisposable
         int backupSetId, CancellationToken ct = default, IProgress<int>? rowProgress = null);
 
     /// <summary>
+    /// Lightweight streaming query for the destination filesystem scan: returns
+    /// only (DiscPath, IsDeleted, SourcePath) for every file row in the set,
+    /// skipping the full 14-column record hydration AND the ORDER BY sort of
+    /// <see cref="GetAllFilesForBackupSetAsync"/>. Because it is unsorted, SQLite
+    /// streams rows straight off the disc/file indexes instead of materialising
+    /// and sorting the entire result set before returning the first row — so a
+    /// large set no longer stalls for minutes with no progress before the read
+    /// begins, and <paramref name="rowProgress"/> advances from the first batch.
+    /// This is all the destination walk needs (to know whether an on-disk file
+    /// matches a catalog path and whether any matching record is still active).
+    /// </summary>
+    Task<IReadOnlyList<(string DiscPath, bool IsDeleted, string SourcePath)>>
+        GetDiscPathEntriesForBackupSetAsync(
+            int backupSetId, CancellationToken ct = default, IProgress<int>? rowProgress = null);
+
+    /// <summary>
     /// Get lightweight version info for the latest version of each file in a
     /// backup set. Returns one entry per unique SourcePath with the max version
     /// and its metadata. Much cheaper than <see cref="GetAllFilesForBackupSetAsync"/>.

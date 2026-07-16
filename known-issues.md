@@ -1,5 +1,93 @@
 # LithicBackup — Known Issues & Tech Debt
 
+## FIXED: "Scan Destination Filesystem" stalled for many minutes before the walk started (2026-07-15)
+
+**Symptom.** After the UI-thread fix below, the app stayed responsive but the
+destination scan sat for 20+ minutes showing no progress before it suddenly
+"began scanning" (the catalog load, not the walk, was the bottleneck).
+
+**Root cause.** The scan loaded its catalog snapshot via the general-purpose
+`GetAllFilesForBackupSetAsync`, which (a) hydrates all 14 columns of every row
+into a `FileRecord` — 14 `GetOrdinal` string lookups + 2 `DateTime.Parse` per row
+— and (b) ends with `ORDER BY f.SourcePath, f.Version DESC`. The ORDER BY forces
+SQLite to materialise and sort the *entire* result set before returning the first
+row, so `rowProgress` never advanced (no rows yet) and the whole set had to be
+read + sorted up front. On a large set that's minutes of apparent hang, then the
+walk starts the instant the sort completes — exactly the reported symptom.
+
+**Fix.** Added a dedicated lightweight query
+`ICatalogRepository.GetDiscPathEntriesForBackupSetAsync` that selects only the
+three columns the walk uses — `DiscPath`, `IsDeleted`, `SourcePath` — read
+positionally (no `GetOrdinal`, no `DateTime.Parse`) and **without any ORDER BY**.
+Unsorted, SQLite streams rows straight off the disc/file indexes, so
+`rowProgress` advances from the first 5000-row batch and there's no giant
+materialise-and-sort. `WalkDestination` now consumes a
+`Dictionary<string, List<DestPathRecord>>` (a `readonly record struct` of just
+`IsDeleted` + `SourcePath`) instead of full `FileRecord`s. The heavy
+`GetAllFilesForBackupSetAsync` is unchanged and still used by the catalog scan,
+which needs full records and the ordering.
+
+## FIXED: "Scan Destination Filesystem" froze the UI thread on large catalogs (2026-07-15)
+
+**Symptom.** Clicking **Scan Destination Filesystem** in the Cleanup / Orphaned
+Directories view left the whole page greyed out with a busy cursor and the app
+genuinely unresponsive for minutes — a hard UI-thread freeze, not just a
+no-feedback cursor.
+
+**Root cause.** `OrphanedDirectoriesViewModel.ScanDestinationAsync` offloaded
+only the destination *walk* to `Task.Run`. The catalog load
+(`GetAllFilesForBackupSetAsync`) and the disc-path → records dictionary build
+ran on the UI thread *before* the `Task.Run`. `GetAllFilesForBackupSetAsync` is a
+synchronous SQLite `ExecuteReader` + row loop guarded by
+`await LockAsync(ct).ConfigureAwait(false)`; when the lock is uncontended the
+await completes synchronously, so `ConfigureAwait(false)` never hops threads and
+the entire read + dictionary build execute on (and freeze) the UI thread. For a
+large catalog that's a multi-minute freeze — matching the report exactly.
+
+**Fix.** Moved the catalog load *and* the dictionary build inside the existing
+`Task.Run` (now an `async` lambda), mirroring the working `LoadAsync` "Scan
+Catalog" path. A `Progress<int>` reports "Loading catalog: N records…" during the
+read. Dropped the now-unneeded `Mouse.OverrideCursor = Cursors.Wait`/`null`
+(the greyed Scan button via `IsScanningDestination` is the feedback). Only the
+final `Items.Add` marshals back to the UI thread.
+
+## FIXED: Post-edit destination reconcile showed a busy cursor with no feedback, no cancel, and could "stick" (2026-07-15)
+
+**Symptom.** After deselecting folders in a set and closing the editor, the app
+sat on a busy (Wait) cursor for a while, then popped the "remove them from the
+destination?" review dialog; confirming the removal left the app showing the
+busy cursor indefinitely even though it was responsive and no status indicated
+any work.
+
+**Root cause.** The whole post-edit reconcile flow
+(`MainViewModel.ReconcileDestinationAfterEditAsync` → `PromptAndPurgeRemovedAsync`
+/ `PromptAndBackupAddedAsync`) signalled progress only via a global
+`Mouse.OverrideCursor = Cursors.Wait` cleared in a `finally`. That gave no
+on-screen feedback and no way to cancel, and a long catalog reconcile running on
+with no status looked exactly like a "stuck" app; any gap in the set/clear
+pairing (a global override) could also leave the cursor visually stuck.
+
+**Fix.** Replaced the busy cursor in that flow with a reusable modal progress
+dialog (`Views/ProgressDialog` + `ViewModels/ProgressDialogViewModel`), driven by
+`ProgressDialog.RunAsync<T>(owner, title, message, cancellable, work)`:
+- The removed-files **scan** and the added-files **scan** run in a *cancellable*
+  dialog that states what it's doing and reports a live count ("Checked N files,
+  M to remove…"); closing it (X or Cancel) cancels the token, aborts the scan,
+  and deletes nothing.
+- The **purge + catalog reconcile** runs in a non-cancellable progress dialog
+  (the user already confirmed the deletion; aborting mid-purge would desync the
+  catalog and destination), so it always shows live status and the window
+  deterministically closes when the work finishes.
+- `ComputeRemovedFilesTargeted` / `ComputeRemovedFilesFull` now take an
+  `IProgress<string>` + `CancellationToken` and check the token / report counts
+  throttled at `ProgressUpdateIntervalMs`.
+
+Because the dialog's lifetime is tied to the work (closed in the work's
+completion continuation) and no global cursor override is used in this path, the
+stuck-cursor class of bug can't recur here. (Other paired `Mouse.OverrideCursor`
+sites — editor open, Cleanup/Orphaned purge, SourceSelection save — were left
+as-is.)
+
 ## FIXED: Files open in their editor (e.g. KeyNote `.knt`) were silently skipped, so no version history accumulated (2026-07-15)
 
 **Symptom.** A KeyNote NF note (`philosophy.knt`) kept in memory/open in KeyNote
