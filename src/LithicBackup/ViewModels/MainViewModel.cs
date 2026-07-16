@@ -1051,13 +1051,16 @@ public class MainViewModel : ViewModelBase
         if (SelectionsEquivalent(originalSelections, newSelections))
             return;
 
-        List<FileRecord> removed;
-        List<string> addedRoots;
-
-        Mouse.OverrideCursor = Cursors.Wait;
-        try
-        {
-            (removed, addedRoots) = await Task.Run(() =>
+        // Show a cancellable progress dialog (instead of a busy cursor) while we
+        // scan the catalog for dropped files: it says exactly what it's doing and
+        // reports a live count, and the user can close it to abort the scan —
+        // which leaves the destination untouched (nothing is deleted).
+        var (completed, scan) = await Views.ProgressDialog.RunAsync(
+            Application.Current.MainWindow,
+            "Updating backup",
+            "Checking for backed-up files no longer covered by the set\u2026",
+            cancellable: true,
+            (progress, ct) =>
             {
                 // Removed: currently-active catalog files whose source path was
                 // covered before the edit but isn't covered any more.  Rather
@@ -1068,7 +1071,8 @@ public class MainViewModel : ViewModelBase
                 // node or an ancestor of it), so scoping the reads to them is
                 // both correct and far cheaper.
                 var rem = ComputeRemovedFilesTargeted(
-                    backupSet.Id, originalSelections, newSelections, changedPaths);
+                    backupSet.Id, originalSelections, newSelections, changedPaths,
+                    progress, ct);
 
                 // Added: new covering roots not already covered by an old root.
                 var oldRoots = SourceSelection.CollectSelectedRoots(originalSelections);
@@ -1077,13 +1081,17 @@ public class MainViewModel : ViewModelBase
                     .Where(r => !IsCoveredBy(oldRoots, r))
                     .ToList();
 
-                return (rem, added);
+                return (Removed: rem, AddedRoots: added);
             });
-        }
-        finally
+
+        if (!completed)
         {
-            Mouse.OverrideCursor = null;
+            StatusText = "Cancelled — no destination files were changed.";
+            return;
         }
+
+        var removed = scan.Removed;
+        var addedRoots = scan.AddedRoots;
 
         // Removal and addition are disjoint (a path can't be both dropped and
         // newly covered), so both prompts may legitimately appear in sequence.
@@ -1131,14 +1139,16 @@ public class MainViewModel : ViewModelBase
         int backupSetId,
         IReadOnlyList<Core.Models.SourceSelection> originalSelections,
         IReadOnlyList<Core.Models.SourceSelection> newSelections,
-        IReadOnlyCollection<string> changedPaths)
+        IReadOnlyCollection<string> changedPaths,
+        IProgress<string>? progress,
+        CancellationToken ct)
     {
         // A bulk toggle can record the virtual "All Drives" root (empty path),
         // which covers everything — e.g. "deselect all".  There is no cheaper
         // way to reconcile a whole-tree change than scanning every backed-up
         // file, so fall back to the full load in that (rare) case.
         if (changedPaths.Any(string.IsNullOrEmpty))
-            return ComputeRemovedFilesFull(backupSetId, originalSelections, newSelections);
+            return ComputeRemovedFilesFull(backupSetId, originalSelections, newSelections, progress, ct);
 
         // No checkbox was toggled, yet the JSON diff flagged a change — so the
         // edit was purely cosmetic (expansion state) or an auto-include-new
@@ -1155,8 +1165,13 @@ public class MainViewModel : ViewModelBase
 
         var seen = new HashSet<long>();
         var removed = new List<FileRecord>();
+        long checkedCount = 0;
+        var sw = System.Diagnostics.Stopwatch.StartNew();
+        long lastReportMs = -ProgressUpdateIntervalMs;   // fire the first report immediately
         foreach (var path in roots)
         {
+            ct.ThrowIfCancellationRequested();
+
             // Matches the path itself and every descendant, so it works whether
             // the toggled node was a file or a directory.
             var records = _catalog
@@ -1165,6 +1180,16 @@ public class MainViewModel : ViewModelBase
 
             foreach (var f in records)
             {
+                ct.ThrowIfCancellationRequested();
+                checkedCount++;
+
+                long nowMs = sw.ElapsedMilliseconds;
+                if (progress is not null && nowMs - lastReportMs >= ProgressUpdateIntervalMs)
+                {
+                    lastReportMs = nowMs;
+                    progress.Report($"Checked {checkedCount:N0} files, {removed.Count:N0} to remove\u2026");
+                }
+
                 if (f.IsDeleted || !seen.Add(f.Id))
                     continue;
                 if (SourceSelection.IsPathIncluded(originalSelections, f.SourcePath)
@@ -1172,6 +1197,7 @@ public class MainViewModel : ViewModelBase
                     removed.Add(f);
             }
         }
+        progress?.Report($"Checked {checkedCount:N0} files, {removed.Count:N0} to remove.");
         return removed;
     }
 
@@ -1183,17 +1209,39 @@ public class MainViewModel : ViewModelBase
     private List<FileRecord> ComputeRemovedFilesFull(
         int backupSetId,
         IReadOnlyList<Core.Models.SourceSelection> originalSelections,
-        IReadOnlyList<Core.Models.SourceSelection> newSelections)
+        IReadOnlyList<Core.Models.SourceSelection> newSelections,
+        IProgress<string>? progress,
+        CancellationToken ct)
     {
+        progress?.Report("Loading backup catalog\u2026");
         var all = _catalog
             .GetAllFilesForBackupSetAsync(backupSetId)
             .GetAwaiter().GetResult();
 
-        return all
-            .Where(f => !f.IsDeleted
+        var removed = new List<FileRecord>();
+        long checkedCount = 0;
+        int total = all.Count;
+        var sw = System.Diagnostics.Stopwatch.StartNew();
+        long lastReportMs = -ProgressUpdateIntervalMs;   // fire the first report immediately
+        foreach (var f in all)
+        {
+            ct.ThrowIfCancellationRequested();
+            checkedCount++;
+
+            long nowMs = sw.ElapsedMilliseconds;
+            if (progress is not null && nowMs - lastReportMs >= ProgressUpdateIntervalMs)
+            {
+                lastReportMs = nowMs;
+                progress.Report($"Checked {checkedCount:N0}/{total:N0} files, {removed.Count:N0} to remove\u2026");
+            }
+
+            if (!f.IsDeleted
                 && SourceSelection.IsPathIncluded(originalSelections, f.SourcePath)
                 && !SourceSelection.IsPathIncluded(newSelections, f.SourcePath))
-            .ToList();
+                removed.Add(f);
+        }
+        progress?.Report($"Checked {checkedCount:N0} files, {removed.Count:N0} to remove.");
+        return removed;
     }
 
     /// <summary>
@@ -1272,60 +1320,70 @@ public class MainViewModel : ViewModelBase
             removed.Select(f => f.DiscPath.Replace('/', '\\')),
             StringComparer.OrdinalIgnoreCase);
 
-        Mouse.OverrideCursor = Cursors.Wait;
         int catPurged = 0, filesDeleted = 0, delFailures = 0;
         long bytesFreed = 0;
         try
         {
-            (catPurged, filesDeleted, delFailures, bytesFreed) = await Task.Run(() =>
-            {
-                // Catalog marks inside a single transaction (mirrors Cleanup).
-                var tx = _catalog.BeginTransactionAsync(backupSet.Id).GetAwaiter().GetResult();
-                int purged;
-                try
+            // Progress dialog (not a busy cursor) so the deletion + catalog
+            // reconcile always shows live status and the window deterministically
+            // closes when the work finishes — the old global cursor override
+            // could visually "stick" if a long reconcile ran on with no feedback.
+            // Not cancellable: the user already confirmed the deletion, and
+            // aborting mid-purge would leave the catalog and destination out of
+            // step (Cleanup can always finish a partial purge later).
+            var (_, purge) = await Views.ProgressDialog.RunAsync<(int Cat, int Files, int Fail, long Bytes)>(
+                Application.Current.MainWindow,
+                "Removing files from destination",
+                "Deleting backed-up copies of the removed folders\u2026",
+                cancellable: false,
+                (progress, ct) =>
                 {
-                    purged = _catalog
-                        .MarkFilesDeletedBySourcePathsAsync(backupSet.Id, sourcePaths)
-                        .GetAwaiter().GetResult();
-                    tx.Complete();
-                }
-                finally
-                {
-                    tx.Dispose();
-                }
+                    // Catalog marks inside a single transaction (mirrors Cleanup).
+                    progress.Report("Updating catalog\u2026");
+                    var tx = _catalog.BeginTransactionAsync(backupSet.Id).GetAwaiter().GetResult();
+                    int purged;
+                    try
+                    {
+                        purged = _catalog
+                            .MarkFilesDeletedBySourcePathsAsync(backupSet.Id, sourcePaths)
+                            .GetAwaiter().GetResult();
+                        tx.Complete();
+                    }
+                    finally
+                    {
+                        tx.Dispose();
+                    }
 
-                // Physical deletion outside the tx so file errors can't roll the
-                // catalog back.  Skipped entirely if no destination is set.
-                int fd = 0, ff = 0;
-                long bytes = 0;
-                if (targetDir is not null)
-                {
-                    var (d, f, b) = Services.DestinationFilePurger
-                        .DeleteFilesAndSweep(targetDir, discPaths, null);
-                    fd = d; ff = f; bytes = b;
-                }
-                return (purged, fd, ff, bytes);
-            });
+                    // Physical deletion outside the tx so file errors can't roll
+                    // the catalog back.  Skipped entirely if no destination is set.
+                    int fd = 0, ff = 0;
+                    long bytes = 0;
+                    if (targetDir is not null)
+                    {
+                        var (d, f, b) = Services.DestinationFilePurger
+                            .DeleteFilesAndSweep(targetDir, discPaths, progress);
+                        fd = d; ff = f; bytes = b;
 
-            // Repair any references left stale by the deletions (a plain copy
-            // that other rows referenced may now be gone), exactly as manual
-            // Cleanup's reconcile step does.
-            if (targetDir is not null)
-            {
-                var reconcile = new CatalogReconcileService(_catalog);
-                var report = await reconcile.AnalyzeAsync(backupSet.Id, targetDir);
-                if (report.HasChanges)
-                    await reconcile.ApplyAsync(backupSet.Id, report, targetDir);
-            }
+                        // Repair any references left stale by the deletions (a
+                        // plain copy other rows referenced may now be gone),
+                        // exactly as manual Cleanup's reconcile step does.
+                        progress.Report("Repairing catalog references\u2026");
+                        var reconcile = new CatalogReconcileService(_catalog);
+                        var report = reconcile.AnalyzeAsync(backupSet.Id, targetDir)
+                            .GetAwaiter().GetResult();
+                        if (report.HasChanges)
+                            reconcile.ApplyAsync(backupSet.Id, report, targetDir)
+                                .GetAwaiter().GetResult();
+                    }
+                    return (purged, fd, ff, bytes);
+                });
+
+            (catPurged, filesDeleted, delFailures, bytesFreed) = purge;
         }
         catch (Exception ex)
         {
             StatusText = $"Failed to remove destination files: {ex.Message}";
             return;
-        }
-        finally
-        {
-            Mouse.OverrideCursor = null;
         }
 
         var parts = new List<string>();
@@ -1355,30 +1413,44 @@ public class MainViewModel : ViewModelBase
         IReadOnlyList<Core.Models.SourceSelection> originalSelections,
         IReadOnlyList<Core.Models.SourceSelection> newSelections)
     {
-        List<(string SourcePath, long SizeBytes)> addedFiles;
-
-        Mouse.OverrideCursor = Cursors.Wait;
-        try
-        {
-            addedFiles = await Task.Run(() =>
+        // Cancellable progress dialog while walking the added folders on disk;
+        // closing it aborts the scan and skips the add prompt entirely.
+        var (completed, addedFiles) = await Views.ProgressDialog.RunAsync(
+            Application.Current.MainWindow,
+            "Updating backup",
+            "Scanning newly added folders\u2026",
+            cancellable: true,
+            (progress, ct) =>
             {
                 // Walk the added roots on disk and keep only files the new
                 // selection covers but the old one didn't — the exact inverse of
                 // the removal diff, so partial (de)selections are respected.
-                var result = new List<(string, long)>();
+                var result = new List<(string SourcePath, long SizeBytes)>();
+                long scanned = 0;
+                var sw = System.Diagnostics.Stopwatch.StartNew();
+                long lastReportMs = -ProgressUpdateIntervalMs;
                 foreach (var (path, size) in EnumerateFilesUnderRoots(addedRoots))
                 {
+                    ct.ThrowIfCancellationRequested();
+                    scanned++;
+
+                    long nowMs = sw.ElapsedMilliseconds;
+                    if (nowMs - lastReportMs >= ProgressUpdateIntervalMs)
+                    {
+                        lastReportMs = nowMs;
+                        progress.Report($"Scanned {scanned:N0} files, {result.Count:N0} new\u2026");
+                    }
+
                     if (SourceSelection.IsPathIncluded(newSelections, path)
                         && !SourceSelection.IsPathIncluded(originalSelections, path))
                         result.Add((path, size));
                 }
                 return result;
             });
-        }
-        finally
-        {
-            Mouse.OverrideCursor = null;
-        }
+
+        // Cancelled the scan — leave the added folders for the next backup.
+        if (!completed)
+            return;
 
         // Nothing newly covered actually exists on disk (e.g. empty folders were
         // added) — there's nothing to preview or back up right now.
