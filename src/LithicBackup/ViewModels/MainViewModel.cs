@@ -1879,6 +1879,7 @@ public class MainViewModel : ViewModelBase
                         DailyHour = src.JobOptions.Schedule.DailyHour,
                         DailyMinute = src.JobOptions.Schedule.DailyMinute,
                         DebounceSeconds = src.JobOptions.Schedule.DebounceSeconds,
+                        MaxWaitSeconds = src.JobOptions.Schedule.MaxWaitSeconds,
                         PollIntervalSeconds = src.JobOptions.Schedule.PollIntervalSeconds,
                     };
                 }
@@ -2973,6 +2974,7 @@ public class MainViewModel : ViewModelBase
             vm.ScheduleDailyHour = sched.DailyHour;
             vm.ScheduleDailyMinute = sched.DailyMinute;
             vm.ScheduleDebounceSeconds = sched.DebounceSeconds.ToString();
+            vm.ScheduleMaxWaitSeconds = sched.MaxWaitSeconds.ToString();
             vm.SchedulePollSeconds = sched.PollIntervalSeconds.ToString();
         }
     }
@@ -3045,6 +3047,7 @@ public class MainViewModel : ViewModelBase
                 DailyHour = vm.ScheduleDailyHour,
                 DailyMinute = vm.ScheduleDailyMinute,
                 DebounceSeconds = int.TryParse(vm.ScheduleDebounceSeconds, out var s) ? s : 60,
+                MaxWaitSeconds = int.TryParse(vm.ScheduleMaxWaitSeconds, out var mw) && mw > 0 ? mw : 300,
                 PollIntervalSeconds = int.TryParse(vm.SchedulePollSeconds, out var p) && p > 0 ? p : 30,
             };
         }

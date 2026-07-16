@@ -48,11 +48,14 @@ public sealed class BackupWorker : BackgroundService
     private static readonly TimeSpan MinPollInterval = TimeSpan.FromSeconds(5);
 
     /// <summary>
-    /// Upper bound on how long a continuous-mode change may stay pending before
-    /// it is backed up regardless of ongoing activity. Prevents a constantly-
-    /// written file (e.g. an active log) from starving its own debounce window.
+    /// Default upper bound on how long a continuous-mode change may stay pending
+    /// before it is backed up regardless of ongoing activity. Prevents a
+    /// constantly-written file (e.g. an active log) from starving its own
+    /// debounce window. Overridable per set via
+    /// <see cref="BackupSchedule.MaxWaitSeconds"/>; this value is the fallback
+    /// when a set leaves it at 0 (or an out-of-range value).
     /// </summary>
-    private static readonly TimeSpan MaxContinuousWait = TimeSpan.FromMinutes(5);
+    private static readonly TimeSpan DefaultMaxContinuousWait = TimeSpan.FromMinutes(5);
 
     /// <summary>Per-set tracking state.</summary>
     private readonly ConcurrentDictionary<int, SetState> _sets = new();
@@ -577,11 +580,18 @@ public sealed class BackupWorker : BackgroundService
             var schedule = state.BackupSet.JobOptions!.Schedule!;
             var ready = new List<string>();
 
+            // Per-set cap on how long an actively-changing file may stay pending
+            // before it is versioned anyway; falls back to the default when the
+            // set leaves it unset (0) or supplies a nonsensical negative value.
+            var maxWait = schedule.MaxWaitSeconds > 0
+                ? TimeSpan.FromSeconds(schedule.MaxWaitSeconds)
+                : DefaultMaxContinuousWait;
+
             foreach (var (path, t) in state.Pending.ToList())
             {
                 var quiet = now - t.Last;
                 var waited = now - t.First;
-                if (quiet.TotalSeconds >= schedule.DebounceSeconds || waited >= MaxContinuousWait)
+                if (quiet.TotalSeconds >= schedule.DebounceSeconds || waited >= maxWait)
                 {
                     ready.Add(path);
                     state.Pending.Remove(path);
