@@ -1,5 +1,29 @@
 # LithicBackup — Known Issues & Tech Debt
 
+## FIXED: "Scan Destination Filesystem" froze the UI thread on large catalogs (2026-07-15)
+
+**Symptom.** Clicking **Scan Destination Filesystem** in the Cleanup / Orphaned
+Directories view left the whole page greyed out with a busy cursor and the app
+genuinely unresponsive for minutes — a hard UI-thread freeze, not just a
+no-feedback cursor.
+
+**Root cause.** `OrphanedDirectoriesViewModel.ScanDestinationAsync` offloaded
+only the destination *walk* to `Task.Run`. The catalog load
+(`GetAllFilesForBackupSetAsync`) and the disc-path → records dictionary build
+ran on the UI thread *before* the `Task.Run`. `GetAllFilesForBackupSetAsync` is a
+synchronous SQLite `ExecuteReader` + row loop guarded by
+`await LockAsync(ct).ConfigureAwait(false)`; when the lock is uncontended the
+await completes synchronously, so `ConfigureAwait(false)` never hops threads and
+the entire read + dictionary build execute on (and freeze) the UI thread. For a
+large catalog that's a multi-minute freeze — matching the report exactly.
+
+**Fix.** Moved the catalog load *and* the dictionary build inside the existing
+`Task.Run` (now an `async` lambda), mirroring the working `LoadAsync` "Scan
+Catalog" path. A `Progress<int>` reports "Loading catalog: N records…" during the
+read. Dropped the now-unneeded `Mouse.OverrideCursor = Cursors.Wait`/`null`
+(the greyed Scan button via `IsScanningDestination` is the feedback). Only the
+final `Items.Add` marshals back to the UI thread.
+
 ## FIXED: Post-edit destination reconcile showed a busy cursor with no feedback, no cancel, and could "stick" (2026-07-15)
 
 **Symptom.** After deselecting folders in a set and closing the editor, the app

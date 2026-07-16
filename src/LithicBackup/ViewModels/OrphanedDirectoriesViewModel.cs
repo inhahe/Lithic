@@ -1305,10 +1305,9 @@ public class OrphanedDirectoriesViewModel : ViewModelBase
         // during that gap.
         IsScanningDestination = true;
         DestinationScanStatusText = "Scanning destination directory...";
-        Mouse.OverrideCursor = Cursors.Wait;
 
         // Yield at Background priority so WPF actually renders the disabled
-        // button + wait cursor before we block the dispatcher clearing Items.
+        // button before the work below starts.
         await Dispatcher.Yield(DispatcherPriority.Background);
 
         bool removedAny = false;
@@ -1325,37 +1324,43 @@ public class OrphanedDirectoriesViewModel : ViewModelBase
                 }
             }
 
-            // Pull ALL records (including deleted) so we can detect the
-            // CatalogDeleted category — _activeFiles excludes them by design.
-            var allFiles = await _catalog.GetAllFilesForBackupSetAsync(_backupSet.Id);
-
-            // Build disc-path → records lookup, separating deleted from active.
-            var discPathLookup = new Dictionary<string, List<FileRecord>>(
-                StringComparer.OrdinalIgnoreCase);
-            foreach (var f in allFiles)
-            {
-                string normalised = f.DiscPath.Replace('/', '\\');
-                if (!discPathLookup.TryGetValue(normalised, out var list))
-                {
-                    list = [];
-                    discPathLookup[normalised] = list;
-                }
-                list.Add(f);
-            }
-
             string targetDir = _targetDir;
             var progress = new Progress<string>(msg => DestinationScanStatusText = msg);
+            int setId = _backupSet.Id;
 
-            // Initialization is done; the walk below runs on a background
-            // thread with live progress text, so drop the wait cursor here —
-            // it only needed to cover the synchronous init gap above.  The
-            // button stays greyed (IsScanningDestination) for the whole walk.
-            Mouse.OverrideCursor = null;
+            // Do the WHOLE catalog load + lookup build + destination walk off the
+            // UI thread. The catalog read is a SYNCHRONOUS SQLite scan
+            // (ExecuteReader + row loop) whose awaited lock completes
+            // synchronously when uncontended — so `ConfigureAwait(false)` never
+            // actually hops threads and, for a large set, the load and the
+            // dictionary build would run on (and freeze) the UI thread. Offload
+            // all three phases; only the final Items.Add marshals back.
+            var (untracked, catalogDeleted, directoriesSkipped, filesScanned) = await Task.Run(async () =>
+            {
+                // Pull ALL records (including deleted) so we can detect the
+                // CatalogDeleted category — _activeFiles excludes them by design.
+                var loadProgress = new Progress<int>(
+                    n => DestinationScanStatusText = $"Loading catalog: {n:N0} records\u2026");
+                var allFiles = await _catalog
+                    .GetAllFilesForBackupSetAsync(setId, CancellationToken.None, loadProgress)
+                    .ConfigureAwait(false);
 
-            // Walk the destination on a background thread so the UI stays
-            // responsive during multi-minute walks of large backups.
-            var (untracked, catalogDeleted, directoriesSkipped, filesScanned) = await Task.Run(() =>
-                WalkDestination(targetDir, discPathLookup, progress));
+                // Build disc-path → records lookup, separating deleted from active.
+                var discPathLookup = new Dictionary<string, List<FileRecord>>(
+                    StringComparer.OrdinalIgnoreCase);
+                foreach (var f in allFiles)
+                {
+                    string normalised = f.DiscPath.Replace('/', '\\');
+                    if (!discPathLookup.TryGetValue(normalised, out var list))
+                    {
+                        list = [];
+                        discPathLookup[normalised] = list;
+                    }
+                    list.Add(f);
+                }
+
+                return WalkDestination(targetDir, discPathLookup, progress);
+            });
 
             // ---- UI thread from here on ----
             void AddCategory(OrphanedReason reason, List<(string DiscRel, long Size, string? SourcePath)> hits)
@@ -1423,7 +1428,6 @@ public class OrphanedDirectoriesViewModel : ViewModelBase
         finally
         {
             IsScanningDestination = false;
-            Mouse.OverrideCursor = null;
         }
     }
 
