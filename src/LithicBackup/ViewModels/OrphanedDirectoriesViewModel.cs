@@ -1742,7 +1742,18 @@ public class OrphanedDirectoriesViewModel : ViewModelBase
 
             int backupSetId = _backupSet.Id;
             string? targetDir = _targetDir;
-            var progress = new Progress<string>(status => PurgeStatusText = status);
+            // Route live progress into BOTH the transient action-row line
+            // (PurgeStatusText) and the prominent header subtitle
+            // (SummaryText, right under the "Cleanup" title).  The header is
+            // where the user's eye rests, so echoing progress there is what
+            // makes the purge visibly "doing something" instead of sitting on
+            // a static "Purging..." while the real updates hide in the small
+            // grey action-row text.
+            var progress = new Progress<string>(status =>
+            {
+                PurgeStatusText = status;
+                SummaryText = status;
+            });
 
             // Run all DB work + disk deletion on a background thread — the
             // catalog methods are synchronous (ExecuteNonQuery /
