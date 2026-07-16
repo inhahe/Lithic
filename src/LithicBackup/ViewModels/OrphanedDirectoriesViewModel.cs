@@ -1337,26 +1337,33 @@ public class OrphanedDirectoriesViewModel : ViewModelBase
             // all three phases; only the final Items.Add marshals back.
             var (untracked, catalogDeleted, directoriesSkipped, filesScanned) = await Task.Run(async () =>
             {
-                // Pull ALL records (including deleted) so we can detect the
-                // CatalogDeleted category — _activeFiles excludes them by design.
+                // Pull a lightweight (DiscPath, IsDeleted, SourcePath) row per
+                // catalog record — INCLUDING deleted ones so we can detect the
+                // CatalogDeleted category (_activeFiles excludes them by design).
+                // This dedicated query skips the full 14-column record hydration
+                // and, crucially, the ORDER BY sort of the general "get all
+                // files" call: the sort returned no rows (so no progress) until
+                // the entire set was materialised, which made a large set look
+                // frozen for many minutes before the walk began. The unsorted
+                // streaming read advances the counter from the first batch.
                 var loadProgress = new Progress<int>(
                     n => DestinationScanStatusText = $"Loading catalog: {n:N0} records\u2026");
-                var allFiles = await _catalog
-                    .GetAllFilesForBackupSetAsync(setId, CancellationToken.None, loadProgress)
+                var entries = await _catalog
+                    .GetDiscPathEntriesForBackupSetAsync(setId, CancellationToken.None, loadProgress)
                     .ConfigureAwait(false);
 
                 // Build disc-path → records lookup, separating deleted from active.
-                var discPathLookup = new Dictionary<string, List<FileRecord>>(
+                var discPathLookup = new Dictionary<string, List<DestPathRecord>>(
                     StringComparer.OrdinalIgnoreCase);
-                foreach (var f in allFiles)
+                foreach (var (discPath, isDeleted, sourcePath) in entries)
                 {
-                    string normalised = f.DiscPath.Replace('/', '\\');
+                    string normalised = discPath.Replace('/', '\\');
                     if (!discPathLookup.TryGetValue(normalised, out var list))
                     {
                         list = [];
                         discPathLookup[normalised] = list;
                     }
-                    list.Add(f);
+                    list.Add(new DestPathRecord(isDeleted, sourcePath));
                 }
 
                 return WalkDestination(targetDir, discPathLookup, progress);
@@ -1432,6 +1439,15 @@ public class OrphanedDirectoriesViewModel : ViewModelBase
     }
 
     /// <summary>
+    /// Minimal catalog projection the destination walk needs per disc-path: is
+    /// there a still-active record (so the on-disk file is properly tracked and
+    /// should be skipped), and the source path for display when only deleted
+    /// records remain. Far cheaper to build than a full <c>FileRecord</c>, which
+    /// is why the walk loads these via <c>GetDiscPathEntriesForBackupSetAsync</c>.
+    /// </summary>
+    private readonly record struct DestPathRecord(bool IsDeleted, string SourcePath);
+
+    /// <summary>
     /// Background-thread destination walk.  For every file under
     /// <paramref name="targetDir"/>, either skips it (when the catalog
     /// records the path as active), routes it to <c>catalogDeleted</c>
@@ -1445,7 +1461,7 @@ public class OrphanedDirectoriesViewModel : ViewModelBase
                     int FilesScanned)
         WalkDestination(
             string targetDir,
-            Dictionary<string, List<FileRecord>> discPathLookup,
+            Dictionary<string, List<DestPathRecord>> discPathLookup,
             IProgress<string> progress)
     {
         var untracked = new List<(string, long, string?)>();

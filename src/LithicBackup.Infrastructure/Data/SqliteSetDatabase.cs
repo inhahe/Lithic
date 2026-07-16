@@ -417,6 +417,42 @@ internal sealed class SqliteSetDatabase : IDisposable
         return list;
     }
 
+    public async Task<IReadOnlyList<(string DiscPath, bool IsDeleted, string SourcePath)>>
+        GetDiscPathEntriesForBackupSetAsync(int backupSetId, CancellationToken ct = default, IProgress<int>? rowProgress = null)
+    {
+        ct.ThrowIfCancellationRequested();
+        using var _ = await LockAsync(ct).ConfigureAwait(false);
+
+        using var cmd = _connection.CreateCommand();
+        // Only the three columns the destination walk needs, and NO ORDER BY:
+        // an unsorted read streams rows as the disc/file indexes yield them, so
+        // rowProgress advances immediately instead of the whole set having to be
+        // materialised and sorted (the cause of a large set appearing to hang for
+        // minutes before the walk even started). Columns are read positionally to
+        // avoid a per-row GetOrdinal lookup.
+        cmd.CommandText = """
+            SELECT f.DiscPath, f.IsDeleted, f.SourcePath FROM Files f
+            INNER JOIN Discs d ON f.DiscId = d.Id
+            WHERE d.BackupSetId = $setId
+            """;
+        cmd.Parameters.AddWithValue("$setId", backupSetId);
+
+        var list = new List<(string, bool, string)>();
+        using var r = cmd.ExecuteReader();
+        while (r.Read())
+        {
+            ct.ThrowIfCancellationRequested();
+            list.Add((
+                r.GetString(0),
+                r.GetInt32(1) != 0,
+                r.IsDBNull(2) ? "" : r.GetString(2)));
+            if (rowProgress is not null && list.Count % 5000 == 0)
+                rowProgress.Report(list.Count);
+        }
+        rowProgress?.Report(list.Count);
+        return list;
+    }
+
     public async Task<Dictionary<string, FileVersionInfo>> GetLatestVersionInfoAsync(int backupSetId, CancellationToken ct = default)
     {
         ct.ThrowIfCancellationRequested();

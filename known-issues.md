@@ -1,5 +1,32 @@
 # LithicBackup — Known Issues & Tech Debt
 
+## FIXED: "Scan Destination Filesystem" stalled for many minutes before the walk started (2026-07-15)
+
+**Symptom.** After the UI-thread fix below, the app stayed responsive but the
+destination scan sat for 20+ minutes showing no progress before it suddenly
+"began scanning" (the catalog load, not the walk, was the bottleneck).
+
+**Root cause.** The scan loaded its catalog snapshot via the general-purpose
+`GetAllFilesForBackupSetAsync`, which (a) hydrates all 14 columns of every row
+into a `FileRecord` — 14 `GetOrdinal` string lookups + 2 `DateTime.Parse` per row
+— and (b) ends with `ORDER BY f.SourcePath, f.Version DESC`. The ORDER BY forces
+SQLite to materialise and sort the *entire* result set before returning the first
+row, so `rowProgress` never advanced (no rows yet) and the whole set had to be
+read + sorted up front. On a large set that's minutes of apparent hang, then the
+walk starts the instant the sort completes — exactly the reported symptom.
+
+**Fix.** Added a dedicated lightweight query
+`ICatalogRepository.GetDiscPathEntriesForBackupSetAsync` that selects only the
+three columns the walk uses — `DiscPath`, `IsDeleted`, `SourcePath` — read
+positionally (no `GetOrdinal`, no `DateTime.Parse`) and **without any ORDER BY**.
+Unsorted, SQLite streams rows straight off the disc/file indexes, so
+`rowProgress` advances from the first 5000-row batch and there's no giant
+materialise-and-sort. `WalkDestination` now consumes a
+`Dictionary<string, List<DestPathRecord>>` (a `readonly record struct` of just
+`IsDeleted` + `SourcePath`) instead of full `FileRecord`s. The heavy
+`GetAllFilesForBackupSetAsync` is unchanged and still used by the catalog scan,
+which needs full records and the ordering.
+
 ## FIXED: "Scan Destination Filesystem" froze the UI thread on large catalogs (2026-07-15)
 
 **Symptom.** Clicking **Scan Destination Filesystem** in the Cleanup / Orphaned
