@@ -1,5 +1,83 @@
 # LithicBackup — Known Issues & Tech Debt
 
+## FIXED: Turning off "auto-include new subdirectories" left removed content undeleted (2026-07-16)
+
+**Symptom.** A user had 100+ GB of `C:\Users` data in the destination that they
+no longer wanted. They removed `C:\Users` from the set's sources, confirmed the
+post-edit "remove these from the destination?" dialog — yet the files stayed in
+the destination, and a subsequent "Scan Destination Filesystem" + purge also
+left them. Live inspection of `set-11.db` showed **664,314 `C:\Users\` records
+still marked active** (`IsDeleted = 0`), with only 16,942 ever marked deleted.
+
+**Root cause.** Two compounding issues:
+
+1. *The reconcile never saw the removal.* The set's `C:\` root is *partial*
+   (`IsSelected = null`) with `AutoIncludeNewSubdirectories = false` and only a
+   few explicit children (none of them `Users`). `C:\Users` had been covered
+   *only* by the drive root's auto-include-new rule. When the user turned that
+   rule **off**, every unlisted descendant (all of `C:\Users`) dropped out of the
+   selection — but the post-edit destination reconcile
+   (`MainViewModel.ComputeRemovedFilesTargeted`) scopes its catalog scan to the
+   paths in `SourceSelectionViewModel._changedSelectionPaths`, and **only the
+   `IsSelected` checkbox recorded into that set** (via `_requestSelectionSettle`).
+   `AutoIncludeNew`'s setter recorded nothing, so `changedPaths` was empty, the
+   method hit its `changedPaths.Count == 0` early-return, and reported zero
+   removed files. The old comment there wrongly assumed auto-include only governs
+   *future* entries — true only if every existing descendant is materialised as
+   an explicit selection node, which an unexpanded drive root's deep descendants
+   are not.
+
+2. *The destination scan can't catch active records.* `WalkDestination` skips any
+   on-disk file that still has an active catalog record, so once the rows stayed
+   active nothing downstream could remove them either.
+
+**Fix.** Added an `Action<string>? _recordChangedPath` delegate to
+`SourceSelectionNodeViewModel`, wired from `SourceSelectionViewModel` to
+`_changedSelectionPaths.Add`. `ApplyAutoIncludeNew` now records the toggled
+directory's path (on any user-initiated toggle) so the post-edit reconcile
+rescans that subtree. Turning auto-include **off** on `C:\` therefore now scans
+all `C:\` catalog files and the "included before AND excluded now" filter flags
+the dropped descendants for the removal-confirmation dialog + purge. Recording on
+turn-*on* is harmless (the filter yields no removals when coverage only grew).
+Updated the stale `changedPaths.Count == 0` comment.
+
+**Cleaning up the existing orphans (already-affected sets):** the fix only
+prevents recurrence. To purge the 664k rows that were already orphaned, run
+**Cleanup → Scan Catalog** (NOT "Scan Destination Filesystem"): the catalog scan's
+`RemovedFromSources` phase uses `IsDirectoryInSources`, which correctly returns
+false for `C:\Users\…` under the current selection, so those rows are flagged and
+**Clean Selected** marks them deleted and deletes their destination copies. No
+data was lost — the rows were still active, so nothing had been deleted; they
+simply were never cleaned.
+
+**Possible follow-up (not done):** make "Scan Destination Filesystem" also flag
+on-disk files whose active catalog record's `SourcePath` is no longer covered by
+the current selection, so the user's instinct ("scan the destination and purge
+everything that shouldn't be here") works without needing the catalog scan.
+`DestPathRecord` already carries `SourcePath`, so the selection check could be
+threaded into `WalkDestination`.
+
+## FIXED: Unobserved-task crash — empty path passed to DirectoryInfo during child reconcile (2026-07-16)
+
+**Symptom.** `crash-gui-*.log` showed
+`System.ArgumentException: The path is empty. (Parameter 'path')` at
+`Path.GetFullPath` → `DirectoryInfo..ctor` in
+`SourceSelectionNodeViewModel.EnumerateChildEntriesAsync`, surfaced via
+`TaskScheduler.UnobservedTaskException`.
+
+**Root cause.** The virtual "All Drives" root node has `Path == ""` (its children
+are the drive roots, populated by `SourceSelectionViewModel`, not enumerated from
+disk). `EnumerateChildEntriesAsync` built `new DirectoryInfo(Path)` *before* its
+`try`, so an empty path threw `ArgumentException`. When a re-expand triggered
+`ReconcileChildrenAsync` on the root, the faulted Task's result was discarded and
+the exception became an unobserved-task crash.
+
+**Fix.** `EnumerateChildEntriesAsync` now returns `(empty, ReadFailed: true)`
+immediately when `Path` is empty, before constructing `DirectoryInfo`. Callers
+already treat `readFailed && entries.Count == 0` as "couldn't read — leave the
+existing children intact", so the root's drive nodes are preserved and nothing
+throws.
+
 ## FIXED: "Scan Destination Filesystem" stalled for many minutes before the walk started (2026-07-15)
 
 **Symptom.** After the UI-thread fix below, the app stayed responsive but the

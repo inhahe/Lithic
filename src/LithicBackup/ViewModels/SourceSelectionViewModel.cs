@@ -1169,7 +1169,8 @@ public class SourceSelectionViewModel : ViewModelBase
             () => _catalogInfo,
             getExcludeFilter: () => GetExcludeFilter(),
             requestSelectionSettle: RequestSelectionSettle,
-            registerPendingWork: RegisterPendingWork);
+            registerPendingWork: RegisterPendingWork,
+            recordChangedPath: p => _changedSelectionPaths.Add(p));
         RootNode = root;
 
         // Mark as loaded BEFORE setting IsExpanded — otherwise the

@@ -127,6 +127,18 @@ public class SourceSelectionNodeViewModel : ViewModelBase
     /// serialising.  Null (e.g. in tests) means such work runs without a Save gate.
     /// </summary>
     private readonly Action<Task>? _registerPendingWork;
+    /// <summary>
+    /// When set, records a directory path whose <em>coverage</em> changed via
+    /// something other than a checkbox toggle — specifically an auto-include-new
+    /// flip — into the owning viewmodel's changed-paths set, so the post-edit
+    /// destination reconcile scans that subtree for files it just dropped.  The
+    /// checkbox <see cref="IsSelected"/> path already records via
+    /// <see cref="_requestSelectionSettle"/>; auto-include has no such hook, and
+    /// turning it OFF on a directory whose existing descendants were covered
+    /// only by the rule (e.g. an unexpanded <c>C:\</c>) silently evicts them —
+    /// which must trigger a reconcile.  Null (tests) means no recording.
+    /// </summary>
+    private readonly Action<string>? _recordChangedPath;
     // Catalog data is provided via a getter rather than a captured value so it
     // can arrive AFTER the tree is built.  The full catalog dictionary can hold
     // ~1M entries and take several seconds to query, so it is loaded in the
@@ -144,7 +156,8 @@ public class SourceSelectionNodeViewModel : ViewModelBase
         Func<Dictionary<string, FileVersionInfo>?>? getCatalogInfo = null,
         Func<Func<string, bool>?>? getExcludeFilter = null,
         Action<SourceSelectionNodeViewModel>? requestSelectionSettle = null,
-        Action<Task>? registerPendingWork = null)
+        Action<Task>? registerPendingWork = null,
+        Action<string>? recordChangedPath = null)
     {
         Path = path;
         Name = System.IO.Path.GetFileName(path);
@@ -160,6 +173,7 @@ public class SourceSelectionNodeViewModel : ViewModelBase
         _getExcludeFilter = getExcludeFilter ?? parent?._getExcludeFilter;
         _requestSelectionSettle = requestSelectionSettle ?? parent?._requestSelectionSettle;
         _registerPendingWork = registerPendingWork ?? parent?._registerPendingWork;
+        _recordChangedPath = recordChangedPath ?? parent?._recordChangedPath;
         _getCatalogInfo = getCatalogInfo ?? parent?._getCatalogInfo;
         Depth = parent is null ? 0 : parent.Depth + 1;
         Children = [];
@@ -643,7 +657,22 @@ public class SourceSelectionNodeViewModel : ViewModelBase
         // Mark the set dirty (enable Save) for the user's own toggle — not for each
         // recursively-propagated child, which would fire the aggregate many times.
         if (userInitiated)
+        {
             _onSelectionChanged?.Invoke();
+
+            // Record this directory as a changed subtree so the post-edit
+            // destination reconcile rescans it.  Turning auto-include OFF on a
+            // directory whose existing descendants were covered ONLY by the rule
+            // (e.g. an unexpanded C:\ with a handful of explicit children) evicts
+            // those descendants from the selection, yet fires no checkbox toggle —
+            // so without this the reconcile's changed-paths set stays empty and the
+            // now-orphaned catalog rows are never marked deleted or purged from the
+            // destination.  Recording on turn-ON too is harmless: the reconcile's
+            // "included before AND excluded now" filter yields no removals when
+            // coverage only grew.
+            if (IsDirectory && !string.IsNullOrEmpty(Path))
+                _recordChangedPath?.Invoke(Path);
+        }
     }
 
     /// <summary>
@@ -1057,6 +1086,17 @@ public class SourceSelectionNodeViewModel : ViewModelBase
             // genuinely-empty directory (no exception) from one we simply
             // could not read — the latter must NOT clobber a saved selection.
             bool failed = false;
+
+            // The virtual "All Drives" root has an empty Path and no real
+            // filesystem directory (its children are the drive roots, managed
+            // by SourceSelectionViewModel, not enumerated here).  `new
+            // DirectoryInfo("")` throws ArgumentException, and because this
+            // runs in a Task whose result may be discarded (e.g. a re-expand
+            // reconcile), that surfaced as an unobserved-task crash.  Report it
+            // as a read failure so callers leave the existing children intact.
+            if (string.IsNullOrEmpty(Path))
+                return (result, true);
+
             var dirInfo = new DirectoryInfo(Path);
 
             try

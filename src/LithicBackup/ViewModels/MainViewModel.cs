@@ -1150,13 +1150,13 @@ public class MainViewModel : ViewModelBase
         if (changedPaths.Any(string.IsNullOrEmpty))
             return ComputeRemovedFilesFull(backupSetId, originalSelections, newSelections, progress, ct);
 
-        // No checkbox was toggled, yet the JSON diff flagged a change — so the
-        // edit was purely cosmetic (expansion state) or an auto-include-new
-        // toggle.  Neither drops an already-backed-up file: existing children of
-        // a directory are always materialised as explicit selections, so
-        // auto-include only governs FUTURE entries, and expansion state is
-        // display-only.  Nothing can have been removed, so skip all catalog
-        // reads.
+        // Nothing was recorded as changed, yet the JSON diff flagged a change — so
+        // the edit was purely cosmetic (expansion state, which is display-only and
+        // can't drop a backed-up file).  Auto-include-new toggles DO record their
+        // directory path (see SourceSelectionNodeViewModel.ApplyAutoIncludeNew ->
+        // _recordChangedPath), precisely because turning the rule off can evict
+        // existing descendants that were covered only by it; so an auto-include
+        // change reaches the scan below rather than this no-op early-return.
         if (changedPaths.Count == 0)
             return new List<FileRecord>();
 
