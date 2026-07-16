@@ -31,32 +31,39 @@
     <MajorUpgrade DowngradeErrorMessage="A newer version of Lithic Backup is already installed." />
 
     <!--
-      Close the running GUI before touching files.  Unlike the Worker (a service
-      the installer can stop via SCM), LithicBackup.exe is an interactive app,
-      and it minimizes to the tray on a plain WM_CLOSE instead of exiting - so
-      the Restart Manager's polite close request just hides it and the process
-      keeps its .exe locked, producing "Setup was unable to automatically close
-      the application" on upgrade.
+      Close the running GUI BEFORE Windows Installer's file-in-use check — by
+      ASKING it to exit itself, not by killing it.
 
-      EndSessionMessage sends WM_QUERYENDSESSION / WM_ENDSESSION to the GUI's
-      top-level window.  WPF does NOT route those into Application.SessionEnding
-      when they arrive at the visible main window, so the app hooks its own
-      WndProc (MainWindow.WndProc) and, on WM_ENDSESSION, calls Application
-      .Shutdown() — a real exit is required because ShutdownMode is
-      OnExplicitShutdown, so merely closing the window would leave the process
-      (and its locked .exe) alive.  If it still hasn't exited by the timeout,
-      TerminateProcess force-closes it as a fallback so the upgrade can always
-      proceed.  RebootPrompt="no" avoids demanding a reboot if a stubborn
-      instance lingers.
+      Background: LithicBackup.exe is an interactive tray app.  On a plain
+      WM_CLOSE it minimizes to the tray instead of exiting, and because
+      ShutdownMode is OnExplicitShutdown the process (and its locked .exe) stays
+      alive.  Mechanisms we tried and rejected:
+        * Restart Manager / util:CloseApplication only *ask the window* to close
+          (WM_QUERYENDSESSION / WM_ENDSESSION).  The main window is hidden in the
+          tray, so RM often can't message it, and the WndProc-cooperation path
+          proved unreliable.  Its terminate fallback (WixCloseApplications) is
+          also scheduled AFTER InstallValidate, too late to prevent the dialog.
+        * taskkill /F before InstallValidate.  This works only when the installer
+          action outranks the GUI: if the user runs the GUI ELEVATED (High
+          integrity), the pre-InstallValidate action — which runs at the invoking
+          user's Medium integrity for a double-clicked per-machine MSI — gets
+          Access Denied and cannot kill it (UIPI).  That failure is exactly what
+          drove the whole "unable to close" saga.
+
+      The reliable, elevation-free fix: the installer SIGNALS the GUI over a
+      simple IPC handshake and the GUI closes ITSELF.  A process can always shut
+      itself down regardless of integrity level, so nothing needs to out-rank the
+      elevated GUI.  The managed custom action SignalLithicGuiShutdown (see the
+      Binary + CustomAction near the bottom of this file, and installer\
+      CustomActions\CustomAction.cs) sets a named event the GUI listens on
+      (App.xaml.cs, "LithicBackup.Shutdown"), then waits for LithicBackup.exe to
+      exit — all BEFORE InstallValidate, so by the file-in-use check the .exe is
+      already released.  No taskkill, no elevation, no self-elevating bundle, and
+      no forced reboot.  (Bootstrap note: this only helps once the *running* build
+      already contains the listener; the upgrade that first delivers it still
+      relies on the in-app updater closing the old GUI itself — the wait in the
+      custom action removes that race — or on the user closing it manually.)
     -->
-    <util:CloseApplication
-        Id="CloseLithicGui"
-        Target="LithicBackup.exe"
-        Description="Please close Lithic Backup so the upgrade can replace its files."
-        CloseMessage="no"
-        EndSessionMessage="yes"
-        TerminateProcess="1"
-        RebootPrompt="no" />
 
     <MediaTemplate EmbedCab="yes" />
 
@@ -189,10 +196,10 @@
           updated was "files in use -> user declines to close -> file swap
           deferred to the next reboot -> transaction succeeds with a reboot
           pending", which then offered to launch the still-old exe.  We remove
-          that path at the source: util:CloseApplication (above) force-closes the
-          GUI before file transfer, so nothing is ever in use and no reboot is
-          ever scheduled - ExitDialog therefore only appears after a genuinely
-          complete install.
+          that path at the source: the SignalLithicGuiShutdown custom action asks
+          the GUI to close before InstallValidate, so (once the running build has
+          the listener) nothing is ever in use and no reboot is ever scheduled -
+          ExitDialog therefore only appears after a genuinely complete install.
 
       Conditions on the launch:
         * WIXUI_EXITDIALOGOPTIONALCHECKBOX = 1  - the user left the box ticked.
@@ -200,6 +207,42 @@
           major upgrade (the new package is not yet registered), never a repair,
           modify, or uninstall.
     -->
+    <!--
+      Ask the running GUI to close itself before the file-in-use check.
+
+      Managed (DTF) custom action, built by installer\CustomActions and embedded
+      as the LithicCustomActions binary.  SignalLithicGuiShutdown sets the named
+      event the GUI listens on and waits (bounded) for LithicBackup.exe to exit.
+      Scheduled Before InstallValidate (see InstallExecuteSequence below) so the
+      .exe is released before MSI looks for open files — this is what prevents the
+      "unable to automatically close all requested applications" upgrade dialog,
+      without needing to out-rank an elevated GUI.
+
+        * Execute="immediate"  — runs during sequence processing, before the
+          file-in-use detection; a deferred action would run far too late.
+        * Impersonate="yes"    — runs as the invoking user (Medium).  Signalling a
+          same-user, unlabeled event needs no elevation even when the GUI is High.
+        * Return="ignore"      — this is a best-effort convenience; the action also
+          returns Success internally.  A first-time install (no GUI running) is a
+          harmless no-op.
+
+      No condition: attempting the signal on every install/upgrade/uninstall is
+      harmless (a no-op when the GUI isn't running) and keeps behavior predictable.
+    -->
+    <Binary Id="LithicCustomActions"
+            SourceFile="CustomActions\bin\Release\LithicBackup.CustomActions.CA.dll" />
+
+    <CustomAction Id="SignalLithicGuiShutdown"
+                  BinaryRef="LithicCustomActions"
+                  DllEntry="SignalLithicGuiShutdown"
+                  Execute="immediate"
+                  Impersonate="yes"
+                  Return="ignore" />
+
+    <InstallExecuteSequence>
+      <Custom Action="SignalLithicGuiShutdown" Before="InstallValidate" />
+    </InstallExecuteSequence>
+
     <Property Id="WIXUI_EXITDIALOGOPTIONALCHECKBOXTEXT" Value="Launch Lithic Backup" />
     <Property Id="WIXUI_EXITDIALOGOPTIONALCHECKBOX" Value="1" />
     <Property Id="WixShellExecTarget" Value="[#AppExe]" />

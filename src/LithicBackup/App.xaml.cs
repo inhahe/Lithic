@@ -1,4 +1,6 @@
 using System.IO;
+using System.Security.AccessControl;
+using System.Security.Principal;
 using System.Threading;
 using System.Windows;
 using LithicBackup.Core.Interfaces;
@@ -17,6 +19,7 @@ public partial class App : Application
 {
     private SqliteCatalogRepository? _catalog;
     private TrayService? _trayService;
+    private DestinationSpaceMonitor? _destinationSpaceMonitor;
     private WinForms.NotifyIcon? _notifyIcon;
     private WinForms.ToolStripMenuItem? _remindersItem;
     private UserSettings _settings = new();
@@ -28,6 +31,23 @@ public partial class App : Application
     private EventWaitHandle? _showInstanceEvent;
     private RegisteredWaitHandle? _showInstanceWait;
     private bool _ownsSingleInstance;
+
+    // --- Installer shutdown signal (IPC) ---
+    // The upgrade installer needs the running GUI gone before its file-in-use
+    // check (InstallValidate), or the upgrade fails with "The setup was unable to
+    // automatically close all requested applications." Rather than have the
+    // installer TERMINATE us (which fails when the GUI runs elevated: a
+    // Medium-integrity installer custom action cannot kill a High-integrity
+    // process), the installer just SIGNALS this named event and we close
+    // ourselves gracefully. A process can always shut itself down regardless of
+    // integrity level, so no elevation, taskkill, or Burn-bundle is needed — see
+    // installer\Package.wxs (SignalLithicGuiShutdown) and the MSI-upgrade entry in
+    // known-issues.md. The event is session-local (matching the single-instance
+    // primitives): the installer's pre-InstallValidate custom action runs in the
+    // user's own msiexec client process, i.e. the same session as the GUI.
+    private const string ShutdownSignalName = "LithicBackup.Shutdown";
+    private EventWaitHandle? _shutdownSignalEvent;
+    private RegisteredWaitHandle? _shutdownSignalWait;
 
     /// <summary>
     /// Set when the user chooses Exit from the tray menu.
@@ -137,6 +157,42 @@ public partial class App : Application
             millisecondsTimeOutInterval: Timeout.Infinite,
             executeOnlyOnce: false);
 
+        // Listen for the upgrade installer's "please close" signal (see the
+        // ShutdownSignalName field comment). Grant Authenticated Users the right to
+        // signal + wait on the event so the installer's custom action — which runs
+        // as the invoking user, at Medium integrity — can Set it even when this GUI
+        // is running elevated (High). Without an explicit label the event is Medium
+        // integrity, so a Medium signaller is not blocked by no-write-up. When set,
+        // we perform the same graceful shutdown as a Restart Manager close, which
+        // releases LithicBackup.exe so the upgrade can replace it.
+        try
+        {
+            var shutdownSecurity = new EventWaitHandleSecurity();
+            shutdownSecurity.AddAccessRule(new EventWaitHandleAccessRule(
+                new SecurityIdentifier(WellKnownSidType.AuthenticatedUserSid, null),
+                EventWaitHandleRights.Modify | EventWaitHandleRights.Synchronize,
+                AccessControlType.Allow));
+            _shutdownSignalEvent = EventWaitHandleAcl.Create(
+                initialState: false,
+                mode: EventResetMode.AutoReset,
+                name: ShutdownSignalName,
+                createdNew: out _,
+                eventSecurity: shutdownSecurity);
+            _shutdownSignalWait = ThreadPool.RegisterWaitForSingleObject(
+                _shutdownSignalEvent,
+                (_, _) => Current?.Dispatcher.BeginInvoke(new Action(ShutdownForRestartManager)),
+                state: null,
+                millisecondsTimeOutInterval: Timeout.Infinite,
+                executeOnlyOnce: true);
+        }
+        catch (Exception ex)
+        {
+            // A missing shutdown listener only degrades upgrade UX (the installer
+            // falls back to its wait/RestartManager handling); it must never stop
+            // the app from starting.
+            CrashLogger.Log(ex, "Failed to register installer shutdown signal listener");
+        }
+
         // Show splash screen immediately while services initialize.
         var splash = new SplashWindow();
         splash.Show();
@@ -241,6 +297,33 @@ public partial class App : Application
             });
         };
 
+        // Warn if a continuous set's destination drive is full. The Worker that
+        // runs continuous backups is headless, so a full destination would
+        // otherwise fail silently — new versions just never get written. This
+        // GUI-side monitor polls destination free space and raises DestinationFull
+        // the moment a continuous destination can no longer accept writes.
+        _destinationSpaceMonitor = new DestinationSpaceMonitor(_catalog, destinationResolver);
+        _destinationSpaceMonitor.DestinationFull += message =>
+        {
+            // A tray balloon self-dismisses after a few seconds, so an
+            // away-from-keyboard user would miss it. Use a modal dialog that stays
+            // up until acknowledged. BeginInvoke (not Invoke) so the monitor's poll
+            // thread isn't blocked while the dialog is open — that lets a second
+            // drive filling up still be detected and reported. The monitor's own
+            // per-drive hysteresis guarantees this fires only once per fill event
+            // (re-arming only after the drive recovers), so the dialog won't
+            // reappear unless space is freed and that drive fills again, or a
+            // different continuous destination fills.
+            Current.Dispatcher.BeginInvoke(() =>
+            {
+                MessageBox.Show(
+                    message,
+                    "Lithic Backup \u2014 Destination Drive Full",
+                    MessageBoxButton.OK,
+                    MessageBoxImage.Warning);
+            });
+        };
+
         // Swap splash for main window.
         // Explicitly set MainWindow so MinimizeToTray and other
         // callers of Application.MainWindow reference the real window
@@ -258,6 +341,10 @@ public partial class App : Application
 
         // Start background monitoring if there are existing backup sets.
         _ = StartBackgroundMonitoringAsync();
+
+        // Start watching continuous sets' destination drives for a full disk
+        // (fires an initial sweep immediately, then every couple of minutes).
+        _destinationSpaceMonitor.Start(TimeSpan.FromMinutes(2));
 
         // Quietly check GitHub for a newer release (opt-out via settings). Runs
         // in the background so it never delays showing the window; surfaces an
@@ -466,7 +553,12 @@ public partial class App : Application
     {
         _notifyIcon?.Dispose();
         _trayService?.Dispose();
+        _destinationSpaceMonitor?.Dispose();
         _catalog?.Dispose();
+
+        // Release the installer shutdown-signal listener.
+        _shutdownSignalWait?.Unregister(null);
+        _shutdownSignalEvent?.Dispose();
 
         // Release single-instance primitives.
         _showInstanceWait?.Unregister(null);

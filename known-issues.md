@@ -1,6 +1,115 @@
 # LithicBackup — Known Issues & Tech Debt
 
-## FIXED: MSI upgrade couldn't close the GUI — it minimized to tray and the .exe stayed locked (2026-07-15)
+## FIXED: Files open in their editor (e.g. KeyNote `.knt`) were silently skipped, so no version history accumulated (2026-07-15)
+
+**Symptom.** A KeyNote NF note (`philosophy.knt`) kept in memory/open in KeyNote
+never showed up with version history under `_prev` (`D_prev`), even though the
+version-chain / `_prev` mechanism itself works for closed files.
+
+**Root cause.** The continuous backup path read every source file with
+`FileShare.Read`. That share mode *denies writers* — so a file another process
+holds open **for writing** (KeyNote keeps its `.knt` open with a lock that permits
+only `FileShare.ReadWrite`) cannot be opened, throwing a sharing violation. The
+file was then counted as a failed file and hidden inside the truncated
+"…N more failed files" summary, so it silently never got backed up or versioned.
+
+Proven with a lock test: `philosophy.knt` (held open by KeyNote) could **not** be
+opened with `FileShare.Read`/`None`, but **could** with `FileShare.ReadWrite`.
+
+**Fix.** Every source-side read in the continuous backup path now opens with
+`FileShare.ReadWrite` (the standard share mode for backing up live/open files):
+- `DirectoryBackupService.CopyFileAsync` / `CopyFileWithHashAsync` (source stream),
+- `DirectoryBackupService.ComputePrefixHashAsync`,
+- `DirectoryBackupService.WriteNewBlocksAsync`,
+- `DirectoryBackupService.ComputeFileHashAndSizeAsync` (safe for dest callers too —
+  they never write concurrently),
+- new `DirectoryBackupService.ReadAllBytesSharedAsync` helper replacing
+  `File.ReadAllBytesAsync` (which forces `FileShare.Read` internally),
+- `BlockDeduplicationEngine.ProcessFile` (source stream).
+
+Deliberately left as `FileShare.Read`: `BackupOrchestrator` (intentional read-lock
+for disc-burn consistency) and the restore/verify/analysis paths (not the
+continuous write path).
+
+**Separate, dominant environment issue (NOT a code bug).** set-4 ("backup to j:")
+targets **J:, which is 100% full — 0 GB free of 1749 GB** — so it physically
+cannot write new versions regardless of this fix. The code fix's effect is visible
+on set-11 ("backup to i:", has free space) once the open `.knt` is re-saved after
+deploy. The backup scope is also very broad (C:\Windows\Temp, browser caches,
+$RECYCLE.BIN, Unreal DDC → thousands of churned files per cycle), which is what
+fills J:.
+
+## FIXED (definitively, v1.0.11): MSI upgrade couldn't close the GUI — installer *asks* the GUI to exit itself over IPC (2026-07-15)
+
+> **Update (v1.0.11) — the actual root cause and the simple, definitive fix.** The
+> v1.0.9 `KillLithicGui` taskkill CA (below) was *necessary but not sufficient*, and
+> the user hit "the same error" again on a real upgrade. The reason: this user runs
+> the GUI **elevated (High integrity)**, but a double-clicked per-machine `.msi` runs
+> its pre-`InstallValidate` immediate custom actions in the **client process at the
+> invoking user's Medium integrity**. Under Windows UIPI a Medium process **cannot**
+> terminate a High-integrity one — `taskkill` returns Access Denied, which
+> `Return="ignore"` silently swallowed, the `.exe` stayed locked, and
+> `InstallValidate` raised the files-in-use dialog exactly as before. Confirmed by a
+> P/Invoke integrity-level probe (GUI = High, CA = Medium).
+>
+> **A brief detour (v1.0.10, since removed): a self-elevating WiX Burn bundle.** Wrapping
+> the MSI in a bundle that elevated up front *did* work (the elevated engine's kill
+> could terminate the High GUI), but it was the wrong tool: it needed a second UAC
+> prompt, shipped a 60 MB `.exe` wrapper, and — in `/passive`/`/quiet` automation —
+> could force a machine **reboot** when a package returned 3010. Both the elevation
+> and the reboot risk exist *only* because we were trying to KILL the GUI from outside.
+>
+> **The definitive fix (v1.0.11): don't kill it — ask it to exit.** A process can
+> always shut *itself* down regardless of integrity level, so no elevation is needed.
+> The GUI now runs a tiny listener (`App.xaml.cs`: a `ThreadPool.RegisterWaitForSingleObject`
+> on a session-local named `EventWaitHandle` `"LithicBackup.Shutdown"`, DACL granting
+> Authenticated Users `Modify|Synchronize` so a Medium signaller can Set it even against
+> a High GUI — an unlabeled event is Medium integrity, so no-write-up doesn't block it).
+> When signalled it performs the same graceful shutdown as a Restart-Manager close
+> (`ShutdownForRestartManager`), releasing `LithicBackup.exe`. The installer signals it
+> via a managed **DTF custom action** `SignalLithicGuiShutdown`
+> (`installer\CustomActions\CustomAction.cs`, built to `LithicBackup.CustomActions.CA.dll`
+> and embedded as a `<Binary>`), scheduled `Before InstallValidate`, `Impersonate="yes"`:
+> it opens + Sets the event, then waits (bounded ~15 s) for `LithicBackup.exe` to exit.
+> By the file-in-use check the `.exe` is already free. **No taskkill, no elevation, no
+> Burn bundle, no forced reboot** — and we ship a plain `.msi` again.
+>
+> **Bootstrap caveat (unavoidable, minor).** IPC only helps once the *running* build
+> already contains the listener, so the upgrade that first delivers it (onto a
+> pre-listener build) can't be signalled. Two things cover this: (1) the in-app updater
+> already closes the old GUI itself around launching the installer, and the custom
+> action's *wait* removes the race even for a listener-less build; (2) a manual
+> double-click over a still-running pre-listener GUI needs the user to close it once.
+> From any listener build forward, every upgrade is seamless.
+>
+> Why the event is session-local (not `Global\`): the installer's pre-InstallValidate
+> action runs in the user's own msiexec client process — same session as the GUI — and
+> a non-admin GUI lacks `SeCreateGlobalPrivilege` to create a `Global\` object anyway.
+>
+> **Update (v1.0.9) — superseded by the above.** The cooperative WndProc / `EndSessionMessage` approach
+> described below was shipped (v1.0.5/1.0.6) but **did not work in practice** — the
+> user still hit "The setup was unable to automatically close all requested
+> applications" on a real upgrade. Two reasons: (1) the main window is hidden in
+> the tray, so the Restart Manager frequently can't message it at all, and (2)
+> `util:CloseApplication`'s terminate fallback runs via `WixCloseApplications`,
+> which is scheduled **after `InstallInitialize`** — i.e. **after `InstallValidate`**,
+> the standard action that performs the file-in-use check and raises the dialog.
+> The terminate therefore always ran too late to prevent it.
+>
+> **The definitive fix** (`installer\Package.wxs`) stops relying on the app
+> cooperating at all. `util:CloseApplication` is removed and replaced with a Type 34
+> immediate custom action `KillLithicGui` that runs
+> `taskkill /F /IM LithicBackup.exe`, scheduled **`Before InstallValidate`** in
+> `InstallExecuteSequence`. By the time MSI checks for open files the process is
+> already gone, so the file-in-use dialog can never appear. The GUI runs unelevated
+> (`asInvoker` — no app.manifest / `<ApplicationManifest>`), so the impersonated
+> immediate CA (`Impersonate="yes"`) kills it with no special rights;
+> `Return="ignore"` makes taskkill's exit-128 "not running" case a harmless no-op
+> (first-time installs, already-closed GUI). This also fixes the bootstrap case:
+> the kill CA lives in the *new* MSI, so it runs even on the very upgrade that first
+> delivers it. The WndProc/`OnSessionEnding` handlers in `MainWindow`/`App` are now
+> only relevant for genuine OS logoff/shutdown; they are no longer load-bearing for
+> the installer.
 
 **Symptom.** During an MSI upgrade the installer's Restart Manager tries to close
 the running GUI. Instead of exiting, LithicBackup showed its "Minimized to tray"

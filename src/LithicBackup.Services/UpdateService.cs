@@ -13,8 +13,8 @@ public sealed record UpdateInfo(
     string ReleaseName,
     string ReleaseNotes,
     string ReleasePageUrl,
-    string? MsiDownloadUrl,
-    string? MsiFileName);
+    string? InstallerDownloadUrl,
+    string? InstallerFileName);
 
 /// <summary>
 /// Outcome of an update check. Exactly one of <see cref="Update"/> /
@@ -31,9 +31,14 @@ public sealed record UpdateCheckResult(
 }
 
 /// <summary>
-/// Checks GitHub Releases for a newer version of the app and locates the MSI
-/// asset to download. Pure network/parse logic with no UI dependencies so it can
-/// be unit-tested and reused from the GUI or Worker.
+/// Checks GitHub Releases for a newer version of the app and locates the
+/// installer asset to download. Prefers the self-elevating Burn bundle
+/// (<c>.exe</c>) over the bare <c>.msi</c>: the bundle elevates up front so the
+/// upgrade can close a running, elevated GUI before InstallValidate (a
+/// double-clicked/launched bare .msi runs its kill step at Medium integrity and
+/// cannot terminate a High-integrity GUI — see installer\Bundle.wxs and the
+/// v1.0.10 entry in known-issues.md). Pure network/parse logic with no UI
+/// dependencies so it can be unit-tested and reused from the GUI or Worker.
 /// </summary>
 public static class UpdateService
 {
@@ -97,6 +102,11 @@ public static class UpdateService
             var notes = root.TryGetProperty("body", out var b) ? b.GetString() ?? "" : "";
             var page = root.TryGetProperty("html_url", out var h) ? h.GetString() ?? "" : "";
 
+            // Prefer the self-elevating bundle (.exe); fall back to the bare .msi
+            // only if no .exe asset is attached. The .exe closes a running elevated
+            // GUI during upgrade without the "unable to close" dialog; the .msi
+            // cannot (see class summary).
+            string? exeUrl = null, exeName = null;
             string? msiUrl = null, msiName = null;
             if (root.TryGetProperty("assets", out var assets) &&
                 assets.ValueKind == JsonValueKind.Array)
@@ -104,17 +114,27 @@ public static class UpdateService
                 foreach (var asset in assets.EnumerateArray())
                 {
                     var an = asset.TryGetProperty("name", out var ap) ? ap.GetString() : null;
-                    if (an is not null && an.EndsWith(".msi", StringComparison.OrdinalIgnoreCase))
+                    if (an is null) continue;
+                    var url = asset.TryGetProperty("browser_download_url", out var du)
+                        ? du.GetString() : null;
+
+                    if (exeUrl is null && an.EndsWith(".exe", StringComparison.OrdinalIgnoreCase))
+                    {
+                        exeName = an;
+                        exeUrl = url;
+                    }
+                    else if (msiUrl is null && an.EndsWith(".msi", StringComparison.OrdinalIgnoreCase))
                     {
                         msiName = an;
-                        msiUrl = asset.TryGetProperty("browser_download_url", out var du)
-                            ? du.GetString() : null;
-                        break;
+                        msiUrl = url;
                     }
                 }
             }
 
-            var info = new UpdateInfo(latest, tag, name, notes, page, msiUrl, msiName);
+            var installerUrl = exeUrl ?? msiUrl;
+            var installerName = exeUrl is not null ? exeName : msiName;
+
+            var info = new UpdateInfo(latest, tag, name, notes, page, installerUrl, installerName);
             return new UpdateCheckResult(info, currentVersion, latest, null);
         }
         catch (OperationCanceledException)
@@ -128,20 +148,21 @@ public static class UpdateService
     }
 
     /// <summary>
-    /// Downloads the release MSI to a temp file and returns its path. Throws on
-    /// failure so the caller can report it.
+    /// Downloads the release installer (the self-elevating <c>.exe</c> bundle when
+    /// present, otherwise the <c>.msi</c>) to a temp file and returns its path.
+    /// Throws on failure so the caller can report it.
     /// </summary>
-    public static async Task<string> DownloadMsiAsync(
+    public static async Task<string> DownloadInstallerAsync(
         UpdateInfo info, IProgress<double>? progress = null, CancellationToken ct = default)
     {
-        if (string.IsNullOrEmpty(info.MsiDownloadUrl))
-            throw new InvalidOperationException("This release has no MSI asset to download.");
+        if (string.IsNullOrEmpty(info.InstallerDownloadUrl))
+            throw new InvalidOperationException("This release has no installer asset to download.");
 
-        var fileName = info.MsiFileName ?? $"LithicBackup-{info.Version}-x64.msi";
+        var fileName = info.InstallerFileName ?? $"LithicBackup-{info.Version}-x64.exe";
         var dest = Path.Combine(Path.GetTempPath(), fileName);
 
         using var resp = await Http.GetAsync(
-            info.MsiDownloadUrl, HttpCompletionOption.ResponseHeadersRead, ct)
+            info.InstallerDownloadUrl, HttpCompletionOption.ResponseHeadersRead, ct)
             .ConfigureAwait(false);
         resp.EnsureSuccessStatusCode();
 

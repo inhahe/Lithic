@@ -39,7 +39,13 @@ test_source/
 test_source_orig/
 test_source_reference/
 
-# Installer build artifacts (publish staging + generated MSI/PDB/wixpdb)
+# Installer build artifacts (publish staging + generated MSI/EXE bundle/PDB/wixpdb).
+# The 60 MB+ self-contained installers are release deliverables, not source, so
+# they stay out of history — both where the build writes them (installer\) and
+# where build-msi.bat copies them (repo root).
 installer/publish/
 installer/*.msi
+installer/*.exe
 installer/*.wixpdb
+/LithicBackup-*-x64.msi
+/LithicBackup-*-x64.exe

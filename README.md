@@ -69,6 +69,8 @@ A Windows Service (Lithic Backup Worker) runs in the background and backs up you
 
 Each backup set can have its own schedule and mode. The Worker Service is installed, started, and stopped directly from the GUI — no command-line work required.
 
+**Full-destination warning** — because the Worker runs in the background with no window, a continuous set whose destination drive fills up would otherwise fail silently: new versions simply stop being written with nothing to tell you. While the app is running, it watches the destination drive of every set that has continuous backup enabled and pops up a warning dialog the moment one is (practically) full, so you can free up space before you miss any versions. The dialog stays on screen until you dismiss it (rather than a tray balloon that self-dismisses after a few seconds), so you'll still catch it if you were away from your desk. It appears once per fill-up (not repeatedly) and only warns again for that drive after it recovers and then fills up once more — a different destination filling up is warned separately.
+
 Only directory-mode backup sets can be scheduled (disc burns require physical media interaction).
 
 ### Source Selection
@@ -198,25 +200,33 @@ Run the **Lithic Backup MSI installer** (`LithicBackup-<version>-x64.msi`). It:
 
 Because it installs a service, the installer requests administrator elevation.
 
+> **Upgrading over a running copy** used to fail with *"The setup was unable to
+> automatically close all requested applications."* The installer now *asks* a
+> running Lithic Backup to close itself (a small signal it listens for) and waits
+> for it to exit before replacing files, so upgrades are seamless — no forced
+> reboot and no elevation tricks. This works once you're on a build that has the
+> listener; the first upgrade onto such a build closes the old copy via the
+> in-app updater (below) or by you closing it first.
+
 ### Updates
 
 Lithic Backup checks for newer versions on [GitHub Releases](https://github.com/inhahe/Lithic/releases).
 Shortly after startup it quietly asks GitHub whether a newer release exists and,
 if so, shows a banner across the top of the window with **Update Now** (downloads
-the release MSI and launches it, closing the app so the installer can replace the
-running files), **Release Notes** (opens the release page), and **Dismiss** (hides
-the banner for that version until an even newer one appears). You can also check
-on demand from **Help → Check for Updates**, and turn the automatic startup check
-off under **File → Settings → Check for updates on startup**. The installer's
-`MajorUpgrade` handling means running the newer MSI upgrades in place — your
-backup sets, catalog, and settings (in `C:\ProgramData\LithicBackup`) are
-preserved.
+the release installer and launches it, closing the app so the installer can
+replace the running files), **Release Notes** (opens the release page), and
+**Dismiss** (hides the banner for that version until an even newer one appears).
+You can also check on demand from **Help → Check for Updates**, and turn the
+automatic startup check off under **File → Settings → Check for updates on
+startup**. The installer's `MajorUpgrade` handling means the newer installer
+upgrades in place — your backup sets, catalog, and settings (in
+`C:\ProgramData\LithicBackup`) are preserved.
 
 > The Worker service can still be installed/started/stopped from within the GUI
 > (see *Scheduled and Continuous Backups*) — the installer just does it for you
 > up front. If you previously installed the service manually from the GUI,
-> remove it there (or with `sc delete "Lithic Backup"`) before running the MSI so
-> the installer can manage its own copy.
+> remove it there (or with `sc delete "Lithic Backup"`) before running the
+> installer so it can manage its own copy.
 
 ## Requirements
 
@@ -237,8 +247,8 @@ dotnet build LithicBackup.sln
 ### Building the installer
 
 The MSI is built with the [WiX Toolset](https://wixtoolset.org/) v5 (invoked via
-the `wix` dotnet tool). The build script publishes both executables self-contained
-and compiles the MSI:
+the `wix` dotnet tool). The build script publishes both executables
+self-contained, builds a small managed custom action, and compiles the MSI:
 
 ```
 powershell -ExecutionPolicy Bypass -File installer\build-installer.ps1
@@ -248,8 +258,10 @@ With no `-Version`, the script reads the version from `src\Directory.Build.props
 — the single source of truth that also stamps every assembly, so the MSI's
 `ProductVersion` can never drift from the version the app reports and compares
 against GitHub Releases. Pass `-Version x.y.z` to override. It installs the `wix`
-tool and the WiX UI and Util extensions on first run if they're missing, then
-writes `installer\LithicBackup-<version>-x64.msi`. The WiX source lives in
+tool and the WiX UI and Util extensions on first run if they're missing, builds
+`installer\CustomActions` (the `SignalLithicGuiShutdown` action that asks a
+running GUI to close itself before an upgrade), then writes
+`installer\LithicBackup-<version>-x64.msi`. The WiX source lives in
 `installer\Package.wxs`.
 
 To cut a release: bump `<Version>` in `src\Directory.Build.props`, build the MSI,

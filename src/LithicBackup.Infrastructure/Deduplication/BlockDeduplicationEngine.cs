@@ -35,7 +35,9 @@ public class BlockDeduplicationEngine : IDeduplicationEngine
             throw new ArgumentOutOfRangeException(nameof(blockSize), "Block size must be positive.");
 
         await using var fileStream = new FileStream(
-            filePath, FileMode.Open, FileAccess.Read, FileShare.Read,
+            // ReadWrite share so a file another app holds open for writing
+            // (e.g. a note still open in KeyNote NF) can still be read.
+            filePath, FileMode.Open, FileAccess.Read, FileShare.ReadWrite,
             bufferSize: blockSize, useAsync: true);
 
         var fileInfo = new FileInfo(filePath);
