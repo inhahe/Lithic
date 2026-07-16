@@ -1,0 +1,32 @@
+<Project Sdk="Microsoft.NET.Sdk">
+
+  <!--
+    Managed (DTF) Windows Installer custom action that tells a running Lithic
+    Backup GUI to close itself before the MSI's file-in-use check. See
+    CustomAction.cs and installer\Package.wxs (SignalLithicGuiShutdown).
+
+    Built with `dotnet build` as part of installer\build-installer.ps1. Targets
+    .NET Framework 4.7.2 (the runtime DTF's SfxCA host loads); the reference
+    assemblies come from the Microsoft.NETFramework.ReferenceAssemblies NuGet
+    package so this compiles without a Visual-Studio-installed targeting pack.
+    The WixToolset.Dtf.CustomAction package's targets run MakeSfxCA after compile
+    to wrap the managed assembly + DTF dependency into a native
+    LithicBackup.CustomActions.CA.dll (written to the intermediate obj\ dir), which
+    Package.wxs embeds as a <Binary>.
+  -->
+  <PropertyGroup>
+    <TargetFramework>net472</TargetFramework>
+    <LangVersion>latest</LangVersion>
+    <Nullable>disable</Nullable>
+    <AssemblyName>LithicBackup.CustomActions</AssemblyName>
+    <!-- No standalone app; this assembly is only ever hosted by SfxCA. -->
+    <GenerateAssemblyInfo>true</GenerateAssemblyInfo>
+    <AppendTargetFrameworkToOutputPath>false</AppendTargetFrameworkToOutputPath>
+  </PropertyGroup>
+
+  <ItemGroup>
+    <PackageReference Include="WixToolset.Dtf.CustomAction" Version="5.0.2" />
+    <PackageReference Include="Microsoft.NETFramework.ReferenceAssemblies" Version="1.0.3" PrivateAssets="all" />
+  </ItemGroup>
+
+</Project>

@@ -31,29 +31,38 @@
     <MajorUpgrade DowngradeErrorMessage="A newer version of Lithic Backup is already installed." />
 
     <!--
-      Force-close the running GUI BEFORE Windows Installer's file-in-use check.
+      Close the running GUI BEFORE Windows Installer's file-in-use check — by
+      ASKING it to exit itself, not by killing it.
 
       Background: LithicBackup.exe is an interactive tray app.  On a plain
       WM_CLOSE it minimizes to the tray instead of exiting, and because
       ShutdownMode is OnExplicitShutdown the process (and its locked .exe) stays
-      alive.  Every "polite" mechanism we tried failed:
-        * The Restart Manager / util:CloseApplication only *ask* the window to
-          close (WM_QUERYENDSESSION / WM_ENDSESSION).  The main window is hidden
-          in the tray, so RM often can't message it, and even when it can the
-          WndProc-cooperation path proved unreliable in practice.
-        * util:CloseApplication's terminate fallback (WixCloseApplications) is
-          scheduled AFTER InstallInitialize — which is AFTER InstallValidate, the
-          standard action that detects files in use and raises the
-          "setup was unable to automatically close all requested applications"
-          dialog.  So the terminate always ran too late to prevent that dialog.
+      alive.  Mechanisms we tried and rejected:
+        * Restart Manager / util:CloseApplication only *ask the window* to close
+          (WM_QUERYENDSESSION / WM_ENDSESSION).  The main window is hidden in the
+          tray, so RM often can't message it, and the WndProc-cooperation path
+          proved unreliable.  Its terminate fallback (WixCloseApplications) is
+          also scheduled AFTER InstallValidate, too late to prevent the dialog.
+        * taskkill /F before InstallValidate.  This works only when the installer
+          action outranks the GUI: if the user runs the GUI ELEVATED (High
+          integrity), the pre-InstallValidate action — which runs at the invoking
+          user's Medium integrity for a double-clicked per-machine MSI — gets
+          Access Denied and cannot kill it (UIPI).  That failure is exactly what
+          drove the whole "unable to close" saga.
 
-      The reliable fix is to kill the process OURSELVES, immediately, BEFORE
-      InstallValidate runs (see the KillLithicGui custom action + its
-      InstallExecuteSequence scheduling near the bottom of this file).  By the
-      time MSI checks for open files, LithicBackup.exe is already gone, so the
-      file-in-use dialog can never appear.  The GUI runs unelevated (asInvoker),
-      and taskkill /F from the installer context terminates it unconditionally —
-      no cooperation from the app required.
+      The reliable, elevation-free fix: the installer SIGNALS the GUI over a
+      simple IPC handshake and the GUI closes ITSELF.  A process can always shut
+      itself down regardless of integrity level, so nothing needs to out-rank the
+      elevated GUI.  The managed custom action SignalLithicGuiShutdown (see the
+      Binary + CustomAction near the bottom of this file, and installer\
+      CustomActions\CustomAction.cs) sets a named event the GUI listens on
+      (App.xaml.cs, "LithicBackup.Shutdown"), then waits for LithicBackup.exe to
+      exit — all BEFORE InstallValidate, so by the file-in-use check the .exe is
+      already released.  No taskkill, no elevation, no self-elevating bundle, and
+      no forced reboot.  (Bootstrap note: this only helps once the *running* build
+      already contains the listener; the upgrade that first delivers it still
+      relies on the in-app updater closing the old GUI itself — the wait in the
+      custom action removes that race — or on the user closing it manually.)
     -->
 
     <MediaTemplate EmbedCab="yes" />
@@ -187,10 +196,10 @@
           updated was "files in use -> user declines to close -> file swap
           deferred to the next reboot -> transaction succeeds with a reboot
           pending", which then offered to launch the still-old exe.  We remove
-          that path at the source: the KillLithicGui custom action force-closes
-          the GUI before InstallValidate, so nothing is ever in use and no reboot
-          is ever scheduled - ExitDialog therefore only appears after a genuinely
-          complete install.
+          that path at the source: the SignalLithicGuiShutdown custom action asks
+          the GUI to close before InstallValidate, so (once the running build has
+          the listener) nothing is ever in use and no reboot is ever scheduled -
+          ExitDialog therefore only appears after a genuinely complete install.
 
       Conditions on the launch:
         * WIXUI_EXITDIALOGOPTIONALCHECKBOX = 1  - the user left the box ticked.
@@ -199,37 +208,39 @@
           modify, or uninstall.
     -->
     <!--
-      Guaranteed close of the running GUI before the file-in-use check.
+      Ask the running GUI to close itself before the file-in-use check.
 
-      Type 34 (exe + working directory) custom action that runs
-      "taskkill /F /IM LithicBackup.exe".  Scheduled Before InstallValidate (see
-      InstallExecuteSequence below) so the process is already dead by the time
-      MSI looks for open files — this is what actually prevents the "unable to
-      automatically close all requested applications" upgrade dialog.
+      Managed (DTF) custom action, built by installer\CustomActions and embedded
+      as the LithicCustomActions binary.  SignalLithicGuiShutdown sets the named
+      event the GUI listens on and waits (bounded) for LithicBackup.exe to exit.
+      Scheduled Before InstallValidate (see InstallExecuteSequence below) so the
+      .exe is released before MSI looks for open files — this is what prevents the
+      "unable to automatically close all requested applications" upgrade dialog,
+      without needing to out-rank an elevated GUI.
 
         * Execute="immediate"  — runs during sequence processing, before the
-          file-in-use detection; deferred actions would run far too late.
-        * Impersonate="yes"    — the GUI runs unelevated as the installing user;
-          killing it as that same user needs no special rights.  (An elevated
-          installer context could kill it too, so this is belt-and-suspenders.)
-        * Return="ignore"      — taskkill exits 128 when the process isn't
-          running (e.g. a first-time install or the user already closed it).
-          That is a perfectly normal, non-fatal outcome, so never fail the
-          install on it.
+          file-in-use detection; a deferred action would run far too late.
+        * Impersonate="yes"    — runs as the invoking user (Medium).  Signalling a
+          same-user, unlabeled event needs no elevation even when the GUI is High.
+        * Return="ignore"      — this is a best-effort convenience; the action also
+          returns Success internally.  A first-time install (no GUI running) is a
+          harmless no-op.
 
-      No condition: attempting the kill on every install/upgrade/uninstall is
-      harmless (it's a no-op when the GUI isn't running) and keeps the behavior
-      simple and predictable.
+      No condition: attempting the signal on every install/upgrade/uninstall is
+      harmless (a no-op when the GUI isn't running) and keeps behavior predictable.
     -->
-    <CustomAction Id="KillLithicGui"
-                  Directory="INSTALLFOLDER"
-                  ExeCommand="&quot;[System64Folder]taskkill.exe&quot; /F /IM LithicBackup.exe"
+    <Binary Id="LithicCustomActions"
+            SourceFile="CustomActions\bin\Release\LithicBackup.CustomActions.CA.dll" />
+
+    <CustomAction Id="SignalLithicGuiShutdown"
+                  BinaryRef="LithicCustomActions"
+                  DllEntry="SignalLithicGuiShutdown"
                   Execute="immediate"
                   Impersonate="yes"
                   Return="ignore" />
 
     <InstallExecuteSequence>
-      <Custom Action="KillLithicGui" Before="InstallValidate" />
+      <Custom Action="SignalLithicGuiShutdown" Before="InstallValidate" />
     </InstallExecuteSequence>
 
     <Property Id="WIXUI_EXITDIALOGOPTIONALCHECKBOXTEXT" Value="Launch Lithic Backup" />

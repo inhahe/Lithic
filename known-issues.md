@@ -39,9 +39,54 @@ deploy. The backup scope is also very broad (C:\Windows\Temp, browser caches,
 $RECYCLE.BIN, Unreal DDC → thousands of churned files per cycle), which is what
 fills J:.
 
-## FIXED (for real, v1.0.9): MSI upgrade couldn't close the GUI — force-kill before InstallValidate (2026-07-15)
+## FIXED (definitively, v1.0.11): MSI upgrade couldn't close the GUI — installer *asks* the GUI to exit itself over IPC (2026-07-15)
 
-> **Update (v1.0.9).** The cooperative WndProc / `EndSessionMessage` approach
+> **Update (v1.0.11) — the actual root cause and the simple, definitive fix.** The
+> v1.0.9 `KillLithicGui` taskkill CA (below) was *necessary but not sufficient*, and
+> the user hit "the same error" again on a real upgrade. The reason: this user runs
+> the GUI **elevated (High integrity)**, but a double-clicked per-machine `.msi` runs
+> its pre-`InstallValidate` immediate custom actions in the **client process at the
+> invoking user's Medium integrity**. Under Windows UIPI a Medium process **cannot**
+> terminate a High-integrity one — `taskkill` returns Access Denied, which
+> `Return="ignore"` silently swallowed, the `.exe` stayed locked, and
+> `InstallValidate` raised the files-in-use dialog exactly as before. Confirmed by a
+> P/Invoke integrity-level probe (GUI = High, CA = Medium).
+>
+> **A brief detour (v1.0.10, since removed): a self-elevating WiX Burn bundle.** Wrapping
+> the MSI in a bundle that elevated up front *did* work (the elevated engine's kill
+> could terminate the High GUI), but it was the wrong tool: it needed a second UAC
+> prompt, shipped a 60 MB `.exe` wrapper, and — in `/passive`/`/quiet` automation —
+> could force a machine **reboot** when a package returned 3010. Both the elevation
+> and the reboot risk exist *only* because we were trying to KILL the GUI from outside.
+>
+> **The definitive fix (v1.0.11): don't kill it — ask it to exit.** A process can
+> always shut *itself* down regardless of integrity level, so no elevation is needed.
+> The GUI now runs a tiny listener (`App.xaml.cs`: a `ThreadPool.RegisterWaitForSingleObject`
+> on a session-local named `EventWaitHandle` `"LithicBackup.Shutdown"`, DACL granting
+> Authenticated Users `Modify|Synchronize` so a Medium signaller can Set it even against
+> a High GUI — an unlabeled event is Medium integrity, so no-write-up doesn't block it).
+> When signalled it performs the same graceful shutdown as a Restart-Manager close
+> (`ShutdownForRestartManager`), releasing `LithicBackup.exe`. The installer signals it
+> via a managed **DTF custom action** `SignalLithicGuiShutdown`
+> (`installer\CustomActions\CustomAction.cs`, built to `LithicBackup.CustomActions.CA.dll`
+> and embedded as a `<Binary>`), scheduled `Before InstallValidate`, `Impersonate="yes"`:
+> it opens + Sets the event, then waits (bounded ~15 s) for `LithicBackup.exe` to exit.
+> By the file-in-use check the `.exe` is already free. **No taskkill, no elevation, no
+> Burn bundle, no forced reboot** — and we ship a plain `.msi` again.
+>
+> **Bootstrap caveat (unavoidable, minor).** IPC only helps once the *running* build
+> already contains the listener, so the upgrade that first delivers it (onto a
+> pre-listener build) can't be signalled. Two things cover this: (1) the in-app updater
+> already closes the old GUI itself around launching the installer, and the custom
+> action's *wait* removes the race even for a listener-less build; (2) a manual
+> double-click over a still-running pre-listener GUI needs the user to close it once.
+> From any listener build forward, every upgrade is seamless.
+>
+> Why the event is session-local (not `Global\`): the installer's pre-InstallValidate
+> action runs in the user's own msiexec client process — same session as the GUI — and
+> a non-admin GUI lacks `SeCreateGlobalPrivilege` to create a `Global\` object anyway.
+>
+> **Update (v1.0.9) — superseded by the above.** The cooperative WndProc / `EndSessionMessage` approach
 > described below was shipped (v1.0.5/1.0.6) but **did not work in practice** — the
 > user still hit "The setup was unable to automatically close all requested
 > applications" on a real upgrade. Two reasons: (1) the main window is hidden in

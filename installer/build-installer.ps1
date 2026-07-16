@@ -115,7 +115,19 @@ function Ensure-WixExtension {
 Ensure-WixExtension "WixToolset.UI.wixext"
 Ensure-WixExtension "WixToolset.Util.wixext"
 
-# --- 3. Compile the MSI -------------------------------------------------------
+# --- 3. Build the managed custom action ---------------------------------------
+# SignalLithicGuiShutdown (installer\CustomActions) asks a running GUI to close
+# itself before InstallValidate, so an upgrade never hits the file-in-use dialog
+# — without needing elevation to kill an elevated GUI.  Its targets run MakeSfxCA
+# to emit LithicBackup.CustomActions.CA.dll, which Package.wxs embeds as a Binary.
+$caProj = Join-Path $here "CustomActions\LithicBackup.CustomActions.csproj"
+$caDll  = Join-Path $here "CustomActions\bin\Release\LithicBackup.CustomActions.CA.dll"
+Write-Host "Building installer custom action..." -ForegroundColor Yellow
+dotnet build $caProj -c Release --nologo
+if ($LASTEXITCODE -ne 0) { throw "Custom action build failed." }
+if (-not (Test-Path $caDll)) { throw "Custom action built but $caDll is missing." }
+
+# --- 4. Compile the MSI -------------------------------------------------------
 $msi = Join-Path $here ("LithicBackup-{0}-x64.msi" -f $Version)
 if (Test-Path $msi) { Remove-Item -Force $msi }
 
@@ -136,4 +148,4 @@ finally {
 Write-Host ""
 Write-Host "=== Done ===" -ForegroundColor Green
 Write-Host "MSI: $msi"
-Write-Host ("Size: {0:N1} MB" -f ((Get-Item $msi).Length / 1MB))
+Write-Host ("     {0:N1} MB" -f ((Get-Item $msi).Length / 1MB))

@@ -3848,15 +3848,18 @@ public class MainViewModel : ViewModelBase
     }
 
     /// <summary>
-    /// Downloads the release MSI and launches it, then shuts the app down so the
-    /// installer can replace the running files. If the release has no MSI asset,
-    /// falls back to opening the release page in the browser.
+    /// Downloads the release installer (the self-elevating <c>.exe</c> bundle when
+    /// present, otherwise the <c>.msi</c>) and launches it, then shuts the app down
+    /// so the installer can replace the running files. The bundle elevates itself,
+    /// so its embedded MSI can close this (possibly elevated) GUI before the
+    /// file-in-use check. If the release has no installer asset, falls back to
+    /// opening the release page in the browser.
     /// </summary>
     private async Task DownloadUpdateAsync()
     {
         if (AvailableUpdate is not { } update) return;
 
-        if (string.IsNullOrEmpty(update.MsiDownloadUrl))
+        if (string.IsNullOrEmpty(update.InstallerDownloadUrl))
         {
             ViewReleaseNotes();
             return;
@@ -3865,15 +3868,15 @@ public class MainViewModel : ViewModelBase
         try
         {
             StatusText = $"Downloading Lithic Backup {update.Version}...";
-            var msiPath = await UpdateService.DownloadMsiAsync(update);
+            var installerPath = await UpdateService.DownloadInstallerAsync(update);
 
             StatusText = "Launching installer...";
-            System.Diagnostics.Process.Start(new System.Diagnostics.ProcessStartInfo(msiPath)
+            System.Diagnostics.Process.Start(new System.Diagnostics.ProcessStartInfo(installerPath)
             {
                 UseShellExecute = true
             });
 
-            // Close the app so the MSI can overwrite the running executables.
+            // Close the app so the installer can overwrite the running executables.
             Application.Current.Shutdown();
         }
         catch (Exception ex)
