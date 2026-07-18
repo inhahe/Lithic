@@ -324,6 +324,15 @@ public partial class App : Application
             });
         };
 
+        // Persistent per-row "destination full" status. The same sweep that
+        // drives the continuous-set balloon also reports the live full/not-full
+        // state of every set's destination; push it onto the home-screen rows so
+        // a full destination is visible at a glance (and clears when space is
+        // freed). Marshalled to the UI thread — the event fires on a pool thread.
+        _destinationSpaceMonitor.StatusUpdated += statuses =>
+            Current.Dispatcher.BeginInvoke(() =>
+                mainViewModel.ApplyDestinationSpaceStatus(statuses));
+
         // Swap splash for main window.
         // Explicitly set MainWindow so MinimizeToTray and other
         // callers of Application.MainWindow reference the real window
@@ -342,9 +351,12 @@ public partial class App : Application
         // Start background monitoring if there are existing backup sets.
         _ = StartBackgroundMonitoringAsync();
 
-        // Start watching continuous sets' destination drives for a full disk
-        // (fires an initial sweep immediately, then every couple of minutes).
-        _destinationSpaceMonitor.Start(TimeSpan.FromMinutes(2));
+        // Start watching destination drives for a full disk (fires an initial
+        // sweep immediately, then on a short cadence). The sweep is cheap — a
+        // local catalog read plus one free-space query per connected
+        // destination — so a 30-second interval keeps the per-row "destination
+        // full" status responsive without meaningful cost.
+        _destinationSpaceMonitor.Start(TimeSpan.FromSeconds(30));
 
         // Quietly check GitHub for a newer release (opt-out via settings). Runs
         // in the background so it never delays showing the window; surfaces an

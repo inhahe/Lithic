@@ -4108,6 +4108,31 @@ public class MainViewModel : ViewModelBase
         }
     }
 
+    /// <summary>
+    /// Apply the latest destination free-space snapshot from the
+    /// <c>DestinationSpaceMonitor</c> to the loaded rows: flag each set whose
+    /// destination is full and clear the flag on any that recovered (or whose
+    /// destination is absent from the snapshot). Must be called on the UI thread.
+    /// </summary>
+    public void ApplyDestinationSpaceStatus(
+        IReadOnlyDictionary<int, Services.DestinationSpaceStatus> statuses)
+    {
+        foreach (var row in BackupSets)
+        {
+            if (statuses.TryGetValue(row.Id, out var st) && st.IsFull)
+            {
+                row.IsDestinationFull = true;
+                row.DestinationFullText =
+                    $"Destination drive {st.Root} is full ({st.FreeSpaceText} free)";
+            }
+            else
+            {
+                row.IsDestinationFull = false;
+                row.DestinationFullText = "";
+            }
+        }
+    }
+
     /// <summary>Find the row VM wrapping the given backup set, if loaded.</summary>
     private BackupSetRowViewModel? RowFor(int setId) =>
         BackupSets.FirstOrDefault(r => r.Id == setId);

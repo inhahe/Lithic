@@ -109,6 +109,32 @@ public class BackupSetRowViewModel : ViewModelBase
     /// <summary>True when there is a last-result summary to display.</summary>
     public bool HasLastResult => !string.IsNullOrEmpty(_lastResultText);
 
+    private bool _isDestinationFull;
+    /// <summary>
+    /// True while this set's destination drive is (practically) full. Driven by
+    /// the GUI's <c>DestinationSpaceMonitor</c> sweep and refreshed periodically,
+    /// so it stays accurate — set when the drive fills, cleared when space is
+    /// freed. A persistent warning line on the row reflects it (see
+    /// <see cref="DestinationFullText"/>), unlike the one-shot full-drive dialog.
+    /// </summary>
+    public bool IsDestinationFull
+    {
+        get => _isDestinationFull;
+        set => SetProperty(ref _isDestinationFull, value);
+    }
+
+    private string _destinationFullText = "";
+    /// <summary>
+    /// The persistent "destination drive full" message shown on the row while
+    /// <see cref="IsDestinationFull"/> is true (e.g.
+    /// "Destination drive J: is full (512 MB free)"). Empty otherwise.
+    /// </summary>
+    public string DestinationFullText
+    {
+        get => _destinationFullText;
+        set => SetProperty(ref _destinationFullText, value);
+    }
+
     private bool _lastResultIsError;
     /// <summary>True when <see cref="LastResultText"/> describes a failure (for styling).</summary>
     public bool LastResultIsError
