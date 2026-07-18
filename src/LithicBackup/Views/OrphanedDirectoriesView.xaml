@@ -563,7 +563,27 @@
                                            FontSize="11"
                                            Foreground="{StaticResource TextSecondaryBrush}"
                                            TextWrapping="Wrap"
-                                           Margin="28,2,0,6" />
+                                           Margin="28,2,0,2" />
+
+                                <!-- Purge effect: makes clear whether purging this
+                                     section physically deletes destination files or
+                                     only rewrites catalog rows. -->
+                                <TextBlock Text="{Binding PurgeEffect}"
+                                           FontSize="11"
+                                           FontWeight="SemiBold"
+                                           TextWrapping="Wrap"
+                                           Margin="28,0,0,6">
+                                    <TextBlock.Style>
+                                        <Style TargetType="TextBlock">
+                                            <Setter Property="Foreground" Value="{StaticResource WarningBrush}" />
+                                            <Style.Triggers>
+                                                <DataTrigger Binding="{Binding PurgeDeletesFiles}" Value="False">
+                                                    <Setter Property="Foreground" Value="{StaticResource SuccessBrush}" />
+                                                </DataTrigger>
+                                            </Style.Triggers>
+                                        </Style>
+                                    </TextBlock.Style>
+                                </TextBlock>
 
                                 <!-- Tree view (collapsed/expanded) -->
                                 <Border Margin="0,4,0,0"
