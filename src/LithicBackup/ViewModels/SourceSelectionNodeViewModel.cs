@@ -519,6 +519,18 @@ public class SourceSelectionNodeViewModel : ViewModelBase
                 OnPropertyChanged(nameof(BackupStatus));
             }
 
+            // A user-initiated exclusion must invalidate this directory's deferred
+            // child restore *synchronously*, before the coalesced settle pass runs.
+            // Otherwise a lazy expand racing the settle would re-apply the saved
+            // child selections (and any worker-materialised auto-include leaves
+            // under them), and UpdateFromChildren would then re-derive this node
+            // from those children back to partial (null) — silently undoing the
+            // exclusion. That is exactly why excluding a directory that had
+            // materialised descendant selections (e.g. C:\ProgramData with pinned
+            // auto-include junk) never stuck, while a childless one (C:\Users) did.
+            if (value == false && IsDirectory && !_suppressPropagation)
+                DiscardSavedSubtreeSelections();
+
             if (_suppressPropagation)
                 return;
 
@@ -549,9 +561,22 @@ public class SourceSelectionNodeViewModel : ViewModelBase
     {
         var value = _isSelected;
 
-        // Propagate down: set all loaded children to the same definite state.
-        if (value.HasValue && IsDirectory && _isLoaded)
+        if (value == false && IsDirectory)
         {
+            // Exclusion: hard-exclude the entire subtree. Discard any saved or
+            // deferred child selections this node holds, then drive every loaded
+            // descendant to excluded (clearing *its* deferred state too). This is
+            // what makes an exclusion stick: no lazy expand's deferred restore and
+            // no UpdateFromChildren ripple from a materialised descendant can
+            // resurrect the old selection and re-derive this node to partial.
+            DiscardSavedSubtreeSelections();
+            if (_isLoaded)
+                foreach (var child in Children)
+                    child.ExcludeSubtree();
+        }
+        else if (value.HasValue && IsDirectory && _isLoaded)
+        {
+            // Inclusion: push the definite state down to loaded children.
             foreach (var child in Children)
             {
                 child._suppressPropagation = true;
@@ -562,6 +587,52 @@ public class SourceSelectionNodeViewModel : ViewModelBase
 
         // Propagate up: recalculate parent's tristate.
         Parent?.UpdateFromChildren();
+    }
+
+    /// <summary>
+    /// Recursively force this node and every loaded descendant into the excluded
+    /// state, discarding each one's saved/deferred child selections. Used when an
+    /// ancestor is excluded: the whole subtree is out, and any materialised or
+    /// deferred descendant selection must be dropped so a later expand — or an
+    /// <see cref="UpdateFromChildren"/> ripple — can't resurrect it and undo the
+    /// exclusion. Does not propagate up (the caller owns the excluded parent).
+    /// </summary>
+    private void ExcludeSubtree()
+    {
+        _suppressPropagation = true;
+        _isSelected = false;
+        _isAutoIncludeDerived = false;
+        _suppressPropagation = false;
+        OnPropertyChanged(nameof(IsSelected));
+        OnPropertyChanged(nameof(IsNodeEnabled));
+
+        if (_backupStatus != BackupStatus.Unknown)
+        {
+            _backupStatus = BackupStatus.Unknown;
+            OnPropertyChanged(nameof(BackupStatus));
+        }
+
+        DiscardSavedSubtreeSelections();
+
+        if (IsDirectory && _isLoaded)
+            foreach (var child in Children)
+                child.ExcludeSubtree();
+    }
+
+    /// <summary>
+    /// Drop any saved/deferred child-selection state this node is holding: the
+    /// deferred-restore flag, the restored-model fallback, and preserved orphan
+    /// child models. Called when the node becomes definitively excluded so none of
+    /// them can later re-apply the old subtree selection. Safe for an excluded
+    /// node because <see cref="ToModel"/> serialises it as a bare tombstone
+    /// (returning at its <c>IsSelected == false</c> branch before it would ever
+    /// consult <see cref="_restoredModel"/> or the orphan models).
+    /// </summary>
+    private void DiscardSavedSubtreeSelections()
+    {
+        _pendingDeferredRestore = false;
+        _restoredModel = null;
+        _orphanedChildModels = null;
     }
 
     /// <summary>

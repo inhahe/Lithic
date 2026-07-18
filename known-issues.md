@@ -39,9 +39,52 @@ would false-positive. Classifying against the true tree is the correct guard.
 
 **Recovery.** Source files are intact; the wrongly-purged J: backups are gone from
 disk but will be re-created on the next backup of the J: set (the sources still
-select them). `C:\ProgramData` was never actually excluded (still
-`IsSelected = null`, auto-include on, with materialised system-junk leaves), so it
-keeps re-accumulating — the user should exclude `C:\ProgramData` explicitly.
+select them).
+
+## FIXED: Excluding a directory with materialised descendants never stuck (2026-07-18)
+
+**Symptom.** The user excluded `C:\ProgramData` from the J: set **several times**,
+including the last edit, yet the saved selection tree kept coming back as
+`IsSelected = null` (partial), auto-include on, with the worker-materialised
+system-junk leaves under it intact (e.g.
+`C:\ProgramData\Microsoft\Diagnosis\Temp`, `…\IDrive\…\Enum`) — so it kept being
+backed up and re-accumulating. `C:\Users`, excluded the same way, tombstoned fine.
+The one difference: `C:\ProgramData` had explicit `IsSelected = true` descendant
+leaves (pinned earlier by the worker's auto-include materialisation);
+`C:\Users` had none.
+
+**Root cause.** A collapsed directory restores its saved child selections lazily:
+`ApplySelectionAsync` stashes the saved subtree in `_restoredModel` and sets
+`_pendingDeferredRestore = true` instead of loading children. When the user then
+excluded the node, `IsSelected` was set to `false` — but the deferred restore was
+**not** invalidated. On the next expand or settle, `LoadChildrenAsync` re-applied
+`_restoredModel.Children` (restoring the `true` junk leaves), and
+`UpdateFromChildren` — which derives a node's tristate purely from its direct
+children — then re-derived the excluded parent from those restored children back
+to `null` (partial), silently undoing the exclusion before the save. On save,
+`ToModel` took its `_restoredModel`-verbatim fallback (reached only when
+`IsSelected != false`), persisting the original partial subtree, junk and all.
+`C:\Users` had no saved children to re-apply, so nothing dragged it back.
+
+**Fix.** In `SourceSelectionNodeViewModel`, a user-initiated exclusion now
+discards the node's deferred/saved subtree state so it can never be resurrected:
+- The `IsSelected` setter calls `DiscardSavedSubtreeSelections()` synchronously on
+  a `false` user edit (clears `_pendingDeferredRestore`, `_restoredModel`,
+  `_orphanedChildModels`) — synchronously, to beat a lazy expand racing the
+  coalesced settle pass.
+- `PropagateSelection` hard-excludes the whole subtree on `false`: it discards
+  this node's saved state and recurses into every loaded descendant via
+  `ExcludeSubtree()`, forcing each to excluded and clearing its deferred state
+  too. Nothing a later expand or `UpdateFromChildren` ripple can do will re-derive
+  the node to partial.
+
+Safe because `ToModel` serialises an excluded node as a bare tombstone (returns at
+its `IsSelected == false` branch before it would consult `_restoredModel`).
+
+**Recovery.** With the fix, re-excluding `C:\ProgramData` once persists a clean
+`{ Path: C:\ProgramData, IsSelected: false }` tombstone; the worker won't
+re-materialise under a `false` node (`MaterializeInNode` early-returns on
+`IsSelected == false`), so it stays excluded for good.
 
 ## FIXED: Turning off "auto-include new subdirectories" left removed content undeleted (2026-07-16)
 
