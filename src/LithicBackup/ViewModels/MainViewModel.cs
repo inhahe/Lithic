@@ -1463,10 +1463,10 @@ public class MainViewModel : ViewModelBase
                         // exactly as manual Cleanup's reconcile step does.
                         progress.Report("Repairing catalog references\u2026");
                         var reconcile = new CatalogReconcileService(_catalog);
-                        var report = reconcile.AnalyzeAsync(backupSet.Id, targetDir)
+                        var report = reconcile.AnalyzeAsync(backupSet.Id, targetDir, progress, ct)
                             .GetAwaiter().GetResult();
                         if (report.HasChanges)
-                            reconcile.ApplyAsync(backupSet.Id, report, targetDir)
+                            reconcile.ApplyAsync(backupSet.Id, report, targetDir, progress, ct)
                                 .GetAwaiter().GetResult();
                     }
                     return (purged, fd, ff, bytes);

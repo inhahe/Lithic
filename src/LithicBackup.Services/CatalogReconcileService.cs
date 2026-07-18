@@ -30,6 +30,9 @@ namespace LithicBackup.Services;
 /// </summary>
 public sealed class CatalogReconcileService
 {
+    /// <summary>Throttle cadence for progress reports (matches the rest of the app).</summary>
+    private const int ProgressIntervalMs = 500;
+
     private readonly ICatalogRepository _catalog;
 
     public CatalogReconcileService(ICatalogRepository catalog) => _catalog = catalog;
@@ -44,6 +47,7 @@ public sealed class CatalogReconcileService
         IProgress<string>? progress = null, CancellationToken ct = default)
     {
         var report = new ReconcileReport();
+        var sw = System.Diagnostics.Stopwatch.StartNew();
 
         progress?.Report("Loading catalog...");
         var all = await _catalog.GetAllFilesForBackupSetAsync(backupSetId, ct);
@@ -66,10 +70,12 @@ public sealed class CatalogReconcileService
 
         // --- Pass 1: flip stale filerefs. ---
         int processed = 0;
+        long lastReportMs = -ProgressIntervalMs; // fire the first report immediately
         foreach (var r in active)
         {
             ct.ThrowIfCancellationRequested();
-            Report(progress, ref processed, total, "Checking for materialised references");
+            Report(progress, sw, ref lastReportMs, ref processed, total,
+                "Checking for materialised references");
 
             if (!r.IsFileRef || r.IsZipped || r.IsSplit)
                 continue;
@@ -104,10 +110,12 @@ public sealed class CatalogReconcileService
         if (report.TargetPresent)
         {
             processed = 0;
+            lastReportMs = -ProgressIntervalMs;
             foreach (var r in active)
             {
                 ct.ThrowIfCancellationRequested();
-                Report(progress, ref processed, total, "Checking for missing content");
+                Report(progress, sw, ref lastReportMs, ref processed, total,
+                    "Checking for missing content");
 
                 if (r.IsZipped || r.IsSplit)
                     continue; // disc-format rows aren't part of a directory destination
@@ -171,7 +179,10 @@ public sealed class CatalogReconcileService
         foreach (var f in report.Flips)
         {
             ct.ThrowIfCancellationRequested();
-            progress?.Report($"Flipping references {++i:N0}/{report.Flips.Count:N0}...");
+            i++;
+            progress?.Report(
+                $"Flipping references {i:N0}/{report.Flips.Count:N0} "
+                + $"({(int)(i * 100L / report.Flips.Count)}%)");
 
             string strippedAbs = Path.Combine(targetDirectory, f.NewDiscPath);
             if (!File.Exists(strippedAbs)) { skipped++; continue; } // plain vanished — leave the row alone
@@ -197,7 +208,10 @@ public sealed class CatalogReconcileService
             foreach (var p in report.Prunes)
             {
                 ct.ThrowIfCancellationRequested();
-                progress?.Report($"Pruning missing rows {++i:N0}/{report.Prunes.Count:N0}...");
+                i++;
+                progress?.Report(
+                    $"Pruning missing rows {i:N0}/{report.Prunes.Count:N0} "
+                    + $"({(int)(i * 100L / report.Prunes.Count)}%)");
 
                 // Re-verify the content is STILL missing before marking deleted.
                 var r = p.Record;
@@ -274,12 +288,21 @@ public sealed class CatalogReconcileService
         fi.Delete();
     }
 
-    private static void Report(IProgress<string>? p, ref int processed, int total, string phase)
+    private static void Report(
+        IProgress<string>? p, System.Diagnostics.Stopwatch sw, ref long lastReportMs,
+        ref int processed, int total, string phase)
     {
         processed++;
         if (p is null) return;
-        if (processed % 500 == 0 || processed == total)
-            p.Report($"{phase}: {processed:N0}/{total:N0}");
+        // Time-throttled + always report the final item, so the counter animates
+        // smoothly and lands on N/N (100%) — matching the app's other progress
+        // stages ("Updating catalog x/y (n%)", "Deleting backed-up files x/y (n%)").
+        long nowMs = sw.ElapsedMilliseconds;
+        if (nowMs - lastReportMs < ProgressIntervalMs && processed != total)
+            return;
+        lastReportMs = nowMs;
+        int pct = total == 0 ? 100 : (int)(processed * 100L / total);
+        p.Report($"{phase} {processed:N0}/{total:N0} ({pct}%)");
     }
 }
 
