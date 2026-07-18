@@ -199,6 +199,17 @@ public class SourceSelectionNodeViewModel : ViewModelBase
     /// <summary>Nesting depth (0 for root nodes). Used for indentation in the custom TreeViewItem template.</summary>
     public int Depth { get; }
 
+    /// <summary>
+    /// True when this entry is a Hidden or System directory/file. These used to be
+    /// omitted from the editor tree entirely, which meant a user could never see
+    /// (or deselect) something like <c>C:\ProgramData</c> even though the backup
+    /// engine happily included it — a confusing "backed up but invisible" mismatch.
+    /// They are now shown but rendered in a distinct (dimmer) colour so it's clear
+    /// they're special. Set by <see cref="CreateChildNode"/> from the enumerated
+    /// file-system attributes.
+    /// </summary>
+    public bool IsHiddenOrSystem { get; internal set; }
+
     /// <summary>Whether this directory's children have been loaded from the filesystem.</summary>
     public bool IsLoaded
     {
@@ -1118,15 +1129,17 @@ public class SourceSelectionNodeViewModel : ViewModelBase
     }
 
     /// <summary>Shape of one enumerated child entry: its full path, whether it
-    /// is a directory, and any inline-computed (cached) size accounting.</summary>
+    /// is a directory, whether it is Hidden/System, and any inline-computed
+    /// (cached) size accounting.</summary>
     private readonly record struct ChildEntry(
-        string FullName, bool IsDirectory,
+        string FullName, bool IsDirectory, bool IsHiddenOrSystem,
         long Size, int FileCount, long FilteredSize, int FilteredFileCount);
 
     /// <summary>
     /// Enumerate this directory's immediate children on a background thread,
-    /// skipping System/Hidden subdirectories and precomputing cached recursive
-    /// (and, when a filter is active, filtered) sizes for directory entries.
+    /// flagging (but no longer hiding) System/Hidden subdirectories and
+    /// precomputing cached recursive (and, when a filter is active, filtered)
+    /// sizes for directory entries.
     /// Returns the sorted entries (directories first, then files, alphabetically)
     /// and a flag indicating whether the top-level enumeration failed (drive not
     /// ready, I/O error, access denied) — used by callers to avoid clobbering a
@@ -1176,8 +1189,10 @@ public class SourceSelectionNodeViewModel : ViewModelBase
                 {
                     try
                     {
-                        if ((subDir.Attributes & (FileAttributes.System | FileAttributes.Hidden)) != 0)
-                            continue;
+                        // Hidden/System directories are shown (so they can be
+                        // seen and deselected) but flagged for distinct colouring.
+                        bool hiddenOrSystem =
+                            (subDir.Attributes & (FileAttributes.System | FileAttributes.Hidden)) != 0;
 
                         long dirSize = -1;
                         int dirFileCount = -1;
@@ -1212,8 +1227,8 @@ public class SourceSelectionNodeViewModel : ViewModelBase
                             }
                         }
 
-                        result.Add(new ChildEntry(subDir.FullName, true, dirSize, dirFileCount,
-                                    filtDirSize, filtDirFileCount));
+                        result.Add(new ChildEntry(subDir.FullName, true, hiddenOrSystem,
+                                    dirSize, dirFileCount, filtDirSize, filtDirFileCount));
                     }
                     catch (UnauthorizedAccessException) { }
                 }
@@ -1230,7 +1245,9 @@ public class SourceSelectionNodeViewModel : ViewModelBase
                         long size = 0;
                         try { size = file.Length; }
                         catch { }
-                        result.Add(new ChildEntry(file.FullName, false, size, 1, size, 1));
+                        bool hiddenOrSystem =
+                            (file.Attributes & (FileAttributes.System | FileAttributes.Hidden)) != 0;
+                        result.Add(new ChildEntry(file.FullName, false, hiddenOrSystem, size, 1, size, 1));
                     }
                     catch (UnauthorizedAccessException) { }
                 }
@@ -1293,6 +1310,8 @@ public class SourceSelectionNodeViewModel : ViewModelBase
             // model, ApplyChildModelsAsync corrects it before the next render, so
             // its checkbox can be shown immediately without a wrong-state flash.
             _isSelectionRestored = true,
+            // Hidden/System entries are shown but coloured differently in the tree.
+            IsHiddenOrSystem = entry.IsHiddenOrSystem,
         };
 
         // Determine backup status for files from the catalog.
@@ -1595,13 +1614,8 @@ public class SourceSelectionNodeViewModel : ViewModelBase
         {
             foreach (var subDir in dir.EnumerateDirectories())
             {
-                try
-                {
-                    if ((subDir.Attributes & (FileAttributes.System | FileAttributes.Hidden)) != 0)
-                        continue;
-                }
-                catch { continue; }
-
+                // Hidden/System directories are included in size totals so the
+                // displayed size matches what the backup engine actually copies.
                 // Check if the directory itself is excluded (e.g. */node_modules/*)
                 // by testing a synthetic child path.
                 if (isExcluded(System.IO.Path.Combine(subDir.FullName, "_")))
@@ -1671,13 +1685,8 @@ public class SourceSelectionNodeViewModel : ViewModelBase
         {
             foreach (var subDir in dir.EnumerateDirectories())
             {
-                try
-                {
-                    if ((subDir.Attributes & (FileAttributes.System | FileAttributes.Hidden)) != 0)
-                        continue;
-                }
-                catch { continue; }
-
+                // Hidden/System directories are included in size totals so the
+                // displayed size matches what the backup engine actually copies.
                 if (isExcluded(System.IO.Path.Combine(subDir.FullName, "_")))
                     continue;
 
@@ -1807,13 +1816,8 @@ public class SourceSelectionNodeViewModel : ViewModelBase
         {
             foreach (var subDir in dir.EnumerateDirectories())
             {
-                try
-                {
-                    if ((subDir.Attributes & (FileAttributes.System | FileAttributes.Hidden)) != 0)
-                        continue;
-                }
-                catch { continue; }
-
+                // Hidden/System directories are included in size totals so the
+                // displayed size matches what the backup engine actually copies.
                 var (subSize, subCount) = ComputeDirectorySizeCached(subDir, cache);
                 subdirSizeTotal += subSize;
                 subdirFileTotal += subCount;

@@ -1,5 +1,37 @@
 # LithicBackup — Known Issues & Tech Debt
 
+## FIXED: Hidden/System directories were invisible in the source-selection tree (2026-07-18)
+
+**Symptom.** The user could not find `C:\ProgramData` anywhere in the source-selection
+tree ("I can't see it in the selection tree at all"), yet the backup engine was still
+copying its contents. This is the *display* half of the ProgramData confusion: the
+folder was being backed up but the user had no way to see it or deselect it.
+
+**Root cause.** The editor tree deliberately **skipped** Hidden and System directories
+when enumerating children (`SourceSelectionNodeViewModel.EnumerateChildEntriesAsync`,
+plus the three recursive size-computation methods). `C:\ProgramData` is a Hidden
+directory, so it never appeared as a tree node. The backup engine (`FileScanner` /
+continuous backup) applies **no** such Hidden/System filter, so those directories were
+copied regardless — a "backed up but invisible" mismatch. The user couldn't uncheck
+something that was never drawn.
+
+**Fix (user chose visibility over silent exclusion).** Hidden/System directories and
+files are now **shown** in the tree so they can be seen and deselected, and rendered
+in a distinct violet (`HiddenSystemBrush`) with a "Hidden or system item" tooltip so
+it's clear they're special.
+- `SourceSelectionNodeViewModel`: added an `IsHiddenOrSystem` property and a matching
+  field on the private `ChildEntry` record. `EnumerateChildEntriesAsync` now records the
+  Hidden/System attribute as a flag instead of `continue`-skipping the entry (computed
+  for both directories and files); `CreateChildNode` copies the flag onto the node.
+- The three recursive size methods (`ComputeDirectorySizeFiltered`,
+  `ComputeDirectorySizeFilteredCached`, `ComputeDirectorySizeCached`) dropped their
+  Hidden/System skips so displayed sizes match what the engine actually copies.
+- `SourceSelectionView.xaml`: the tree `ItemTemplate` gained a `DataTrigger` on
+  `IsHiddenOrSystem` that paints the name violet; `Colors.xaml` defines
+  `HiddenSystemColor`/`HiddenSystemBrush` (`#8B5CF6`).
+
+**Files.** `SourceSelectionNodeViewModel.cs`, `SourceSelectionView.xaml`, `Colors.xaml`.
+
 ## FIXED: App backed up its own data directory (C:\ProgramData\LithicBackup) (2026-07-18)
 
 **Symptom.** The user found `C:\ProgramData` being backed up by set 4 even though
@@ -15,12 +47,12 @@ own live catalog files (`set-4.db-shm` → "File region is locked").
    `IsSelected=null`, partial), so via C:'s auto-include-new rule its unlisted
    descendants — including `C:\ProgramData\LithicBackup` — were swept into the
    backup. The Worker thus tried to copy its own open catalog/WAL/SHM files.
-2. **Why ProgramData looked un-selected in the editor.** It renders as an
-   indeterminate (partial) checkbox, not a checked one, because the continuous
-   Worker had *materialized* partial intermediate chains under it (`Microsoft`,
-   `IDrive`, `MuseAuthService`, `boost_interprocess`) when those apps wrote files.
-   A partial+auto-include directory still backs up unlisted content, but visually
-   reads as "not checked", so the user assumed it was excluded.
+2. **Why ProgramData looked un-selected in the editor.** `C:\ProgramData` is a
+   *Hidden* directory, and the editor tree skipped Hidden/System directories
+   entirely, so it never appeared as a node at all — the user couldn't see it,
+   let alone tell it was partial+auto-include (and therefore backing up unlisted
+   content). See the separate "Hidden/System directories were invisible" fix,
+   which now shows them (coloured violet) so they can be deselected.
 
 **Fix.** Added `CatalogLocation.IsInsideAppDataDirectory(path)` and enforced it as a
 **hard, unconditional exclusion** of the app's own data root

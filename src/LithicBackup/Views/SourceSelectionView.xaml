@@ -1023,12 +1023,24 @@
                 </Style>
             </TreeView.ItemContainerStyle>
 
-            <!-- Data template: just the name (checkboxes are in the ControlTemplate) -->
+            <!-- Data template: just the name (checkboxes are in the ControlTemplate).
+                 Hidden/System entries (e.g. C:\ProgramData) are shown but painted a
+                 distinct violet so it's clear they're special. -->
             <TreeView.ItemTemplate>
                 <HierarchicalDataTemplate ItemsSource="{Binding Children}">
-                    <TextBlock Text="{Binding Name}"
-                               VerticalAlignment="Center"
-                               Foreground="{StaticResource TextPrimaryBrush}" />
+                    <TextBlock Text="{Binding Name}" VerticalAlignment="Center">
+                        <TextBlock.Style>
+                            <Style TargetType="TextBlock">
+                                <Setter Property="Foreground" Value="{StaticResource TextPrimaryBrush}" />
+                                <Style.Triggers>
+                                    <DataTrigger Binding="{Binding IsHiddenOrSystem}" Value="True">
+                                        <Setter Property="Foreground" Value="{StaticResource HiddenSystemBrush}" />
+                                        <Setter Property="ToolTip" Value="Hidden or system item" />
+                                    </DataTrigger>
+                                </Style.Triggers>
+                            </Style>
+                        </TextBlock.Style>
+                    </TextBlock>
                 </HierarchicalDataTemplate>
             </TreeView.ItemTemplate>
         </TreeView>

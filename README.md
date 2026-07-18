@@ -76,6 +76,7 @@ Only directory-mode backup sets can be scheduled (disc burns require physical me
 ### Source Selection
 
 - Treeview file browser with tristate checkboxes — select entire drives, individual directories, or specific files
+- Hidden and system folders (e.g. `C:\ProgramData`) are shown in the tree — coloured violet so they stand out — so you can see and deselect them; they're backed up like any other folder unless you uncheck them
 - New subdirectories are automatically included for parents with "Auto-include new" checked. When continuous backup is running, a newly-created folder is also promoted to a permanent, explicitly-checked selection a few seconds after it appears — so it keeps being backed up even if you later turn "Auto-include new" off (that setting only stops *future* folders from being adopted; folders already adopted stay in the set)
 - **Global exclusion patterns**: each backup set carries a list of glob patterns (one per line, e.g. `*.log`, `temp_*`, `*\bin\*`) that exclude matching files from the backup entirely. Filename patterns match against the file name; patterns containing a path separator match against the full path. Excluded files are never copied or versioned.
 - **Pre-backup size calculator**: calculate how much data will be written before actually running the backup. Shows new files, changed files, per-source-root breakdown, destination free space, and whether the data will fit.
