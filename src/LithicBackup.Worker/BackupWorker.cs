@@ -1,6 +1,7 @@
 using System.Collections.Concurrent;
 using LithicBackup.Core.Interfaces;
 using LithicBackup.Core.Models;
+using LithicBackup.Infrastructure.Data;
 using LithicBackup.Infrastructure.FileSystem;
 using LithicBackup.Services;
 
@@ -909,6 +910,13 @@ public sealed class BackupWorker : BackgroundService
     /// </summary>
     private static bool PathBelongsToSet(BackupSet set, string path)
     {
+        // Hard exclusion: the app's own data directory (catalog DBs, logs, dumps)
+        // is never part of any set, regardless of an auto-include-new parent. This
+        // stops the worker from queuing its own live database writes for backup and
+        // from materializing C:\ProgramData\LithicBackup into the selection tree.
+        if (CatalogLocation.IsInsideAppDataDirectory(path))
+            return false;
+
         if (set.SourceSelections is { Count: > 0 })
             return SourceSelection.IsPathIncluded(set.SourceSelections, path);
 

@@ -37,6 +37,40 @@ public static class CatalogLocation
     private const string DbFileName = "catalog.db";
 
     /// <summary>
+    /// The shared application-data root (<c>C:\ProgramData\LithicBackup</c>) that
+    /// holds the master catalog, per-set databases, logs, and crash dumps. This is
+    /// a pure path computation with no directory creation or ACL work, so it is
+    /// cheap enough to call on hot paths such as the per-file backup filter.
+    /// </summary>
+    public static string RootDirectory { get; } =
+        Path.Combine(
+            Environment.GetFolderPath(Environment.SpecialFolder.CommonApplicationData),
+            AppFolderName);
+
+    /// <summary>
+    /// True when <paramref name="path"/> is the application's own data directory
+    /// (<see cref="RootDirectory"/>) or anything beneath it. The backup engine uses
+    /// this to <b>unconditionally</b> skip its own live files — catalog databases,
+    /// their WAL/SHM sidecars, logs, and crash dumps. Backing them up is never
+    /// wanted: it wastes space and, because the databases are open for writing by
+    /// this very process, fails with sharing/lock errors ("File region is locked").
+    /// The check is enforced independently of the user's selection tree and glob
+    /// exclusions, so an auto-include-new parent (e.g. all of <c>C:\</c>) can never
+    /// sweep the app's data directory into a backup.
+    /// </summary>
+    public static bool IsInsideAppDataDirectory(string path)
+    {
+        if (string.IsNullOrEmpty(path))
+            return false;
+
+        var root = RootDirectory.TrimEnd('\\');
+        if (path.Equals(root, StringComparison.OrdinalIgnoreCase))
+            return true;
+
+        return path.StartsWith(root + "\\", StringComparison.OrdinalIgnoreCase);
+    }
+
+    /// <summary>
     /// Returns the path to the shared catalog database, creating its directory
     /// (with an ACL both the user and SYSTEM can write) and, on first run,
     /// migrating any pre-existing per-user catalog into the shared location.

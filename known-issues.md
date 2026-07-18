@@ -1,5 +1,52 @@
 # LithicBackup — Known Issues & Tech Debt
 
+## FIXED: App backed up its own data directory (C:\ProgramData\LithicBackup) (2026-07-18)
+
+**Symptom.** The user found `C:\ProgramData` being backed up by set 4 even though
+they "keep having to manually exclude and then delete" it, and it "didn't show up
+in the modify function" as selected. The Worker was also seen trying to back up its
+own live catalog files (`set-4.db-shm` → "File region is locked").
+
+**Root cause (two layers).**
+1. **The app never excluded its own data directory.** Set 4's C:\ root is *fully
+   selected* (`IsSelected=true`) with `AutoIncludeNewSubdirectories=true` — i.e.
+   "back up all of C:, minus the explicitly-excluded folders, and auto-include new
+   ones." `C:\ProgramData` was **not** among the excluded children (it sat at
+   `IsSelected=null`, partial), so via C:'s auto-include-new rule its unlisted
+   descendants — including `C:\ProgramData\LithicBackup` — were swept into the
+   backup. The Worker thus tried to copy its own open catalog/WAL/SHM files.
+2. **Why ProgramData looked un-selected in the editor.** It renders as an
+   indeterminate (partial) checkbox, not a checked one, because the continuous
+   Worker had *materialized* partial intermediate chains under it (`Microsoft`,
+   `IDrive`, `MuseAuthService`, `boost_interprocess`) when those apps wrote files.
+   A partial+auto-include directory still backs up unlisted content, but visually
+   reads as "not checked", so the user assumed it was excluded.
+
+**Fix.** Added `CatalogLocation.IsInsideAppDataDirectory(path)` and enforced it as a
+**hard, unconditional exclusion** of the app's own data root
+(`C:\ProgramData\LithicBackup` and everything under it), independent of the
+selection tree and glob patterns:
+- `DirectoryBackupService.BuildExclusionFilter` now always returns a filter (even
+  with no user exclusions) that drops any path inside the app data dir. Covers both
+  the full-scan (`FileScanner`) and continuous (`ExecuteTargetedAsync`) paths, and
+  because the filter is checked *before* `FileInfo`, the open DB files are never
+  even touched (no more "File region is locked").
+- `BackupWorker.PathBelongsToSet` returns false for app-dir paths, so the Worker
+  neither queues its own DB writes for backup nor materializes
+  `C:\ProgramData\LithicBackup` into any set's selection tree.
+
+**Files.** `CatalogLocation.cs` (`RootDirectory` + `IsInsideAppDataDirectory`),
+`DirectoryBackupService.cs` (`BuildExclusionFilter`), `BackupWorker.cs`
+(`PathBelongsToSet`).
+
+**Not covered by this fix (user's choice).** The *rest* of `C:\ProgramData` is still
+included because C: is configured as "back up everything except excluded folders,
+auto-include new". Only the app's own subfolder is force-excluded. If the user wants
+all of `C:\ProgramData` gone from the set, they exclude it in the editor (exclusions
+now stick — see the "exclusions stick" fix). Possible future enhancement: surface
+partial+auto-include directories more clearly in the tree so "silently backing up
+new content" isn't mistaken for "not selected".
+
 ## FIXED: "cleanup failed: sqlite error 5: 'database is locked'" (GUI vs Worker write collision) (2026-07-18)
 
 **Symptom.** A GUI operation (Cleanup, in this report) failed outright with
