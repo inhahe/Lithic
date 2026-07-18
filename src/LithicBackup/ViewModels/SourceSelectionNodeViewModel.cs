@@ -1955,7 +1955,28 @@ public class SourceSelectionNodeViewModel : ViewModelBase
     public Core.Models.SourceSelection? ToModel()
     {
         if (IsSelected == false)
-            return null;
+        {
+            // Normally a deselected node doesn't need saving — on reload it
+            // starts deselected by default.  BUT if the parent would auto-include
+            // this node (fully-selected parent, or partially-selected + auto-
+            // include-on), the exclusion must be persisted explicitly — otherwise
+            // on reload the node comes back selected and the user's exclusion is
+            // silently undone.
+            bool parentWouldAutoInclude =
+                Parent is not null &&
+                Parent.IsSelected != false &&
+                (Parent.IsSelected == true || Parent.AutoIncludeNew);
+            if (!parentWouldAutoInclude)
+                return null;
+
+            // Persist just the exclusion — no need to recurse into children.
+            return new Core.Models.SourceSelection
+            {
+                Path = Path,
+                IsDirectory = IsDirectory,
+                IsSelected = false,
+            };
+        }
 
         // Auto-include derivation: this node renders checked only because it's an
         // unlisted descendant of a partially-selected auto-include directory (see
