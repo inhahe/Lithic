@@ -666,7 +666,9 @@ public class SqliteCatalogRepository : ICatalogRepository
             db.Dispose();
 
         var path = SetDbPath(setId);
-        foreach (var suffix in new[] { "", "-wal", "-shm" })
+        // ".writelock" is the cross-process write-lock marker file created beside
+        // the set DB by SqliteSetDatabase; remove it too so it isn't orphaned.
+        foreach (var suffix in new[] { "", "-wal", "-shm", ".writelock" })
         {
             try { if (File.Exists(path + suffix)) File.Delete(path + suffix); }
             catch { /* best effort */ }

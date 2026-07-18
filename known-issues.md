@@ -1,5 +1,55 @@
 # LithicBackup — Known Issues & Tech Debt
 
+## FIXED: "cleanup failed: sqlite error 5: 'database is locked'" (GUI vs Worker write collision) (2026-07-18)
+
+**Symptom.** A GUI operation (Cleanup, in this report) failed outright with
+`SQLite Error 5: 'database is locked'`. The user was emphatic: "this should never
+happen. we have to make sure this never happens."
+
+**Root cause.** The interactive GUI and the LocalSystem Worker service are separate
+processes that both open the *same* per-set database file
+(`C:\ProgramData\LithicBackup\sets\set-{id}.db`). WAL mode lets their **readers**
+run concurrently, but only one **writer** can hold SQLite's write lock at a time.
+The Worker runs *continuous* backups and, in `DirectoryBackupService`, holds a
+single write transaction for up to `CommitIntervalSeconds = 30`s per commit batch.
+The GUI's `PRAGMA busy_timeout` was only 15s — shorter than a Worker batch — so a
+GUI write that landed mid-batch waited out its timeout and threw
+`SQLITE_BUSY`/"database is locked". Bumping the timeout alone can never *guarantee*
+success: any timeout, however large, can still be exceeded under contention.
+
+**Fix — cross-process write serialization via a per-set lock file.** In
+`SqliteSetDatabase`, every **write** now takes a machine-wide exclusive lock before
+touching SQLite: it opens a marker file `set-{id}.db.writelock` with
+`FileShare.None`, so only one process can hold it. The wait
+(`AcquireCrossProcessWriteAsync`) polls (25 ms) and is **cancellable but unbounded**
+— there is no timeout that could re-manufacture the failure — and the OS releases
+the handle automatically if the holder crashes. Because writers on a given set now
+serialize across processes, SQLite's own write lock is never actually contended,
+so the busy-timeout race can't occur.
+
+- New `WriteLockAsync` (acquire file lock → then the in-process gate) wraps every
+  standalone write: `InsertDiscAsync`, `UpdateDiscAsync`, `MarkDiscAsBadAsync`,
+  `CreateFileRecordAsync`, `UpdateFileRecordAsync`, `MarkFilesDeletedByDirectoryAsync`,
+  `MarkFilesDeletedBySourcePathsAsync`, `RemapSourcePathPrefixAsync`,
+  `CreateFileChunkAsync`.
+- `BeginTransactionAsync` takes the file lock for the whole transaction (covering
+  `ClearCatalogAsync`, `ImportLegacyRecordsAsync`, and every batch commit), released
+  in `TransactionScope.Dispose` after the gate.
+- Reads deliberately **don't** take the file lock (WAL keeps them concurrent).
+- The `_inTransaction` reentrancy short-circuit is honored so inside-transaction
+  writes don't re-acquire either lock.
+- `busy_timeout` raised 15s → 30s purely as a backstop for brief WAL-checkpoint
+  edge cases.
+- `RemoveSetDatabaseFile` now also deletes `.writelock` so it isn't orphaned when a
+  set is deleted.
+
+**Files.** `SqliteSetDatabase.cs` (file-lock machinery + write methods),
+`SqliteCatalogRepository.cs` (`.writelock` cleanup).
+
+**Related, not yet fixed.** The Worker's set 4 sources include `C:\ProgramData`, so
+it backs up its own live catalog DB files (`set-4.db-shm` "File region is locked").
+`C:\ProgramData\LithicBackup` should be excluded from backups. See separate note.
+
 ## FIXED: Spurious "scanning newly added folders" on save after only browsing the tree (2026-07-18)
 
 **Symptom.** The user edited a set, browsed around in the source treeview
