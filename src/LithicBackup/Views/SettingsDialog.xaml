@@ -111,6 +111,14 @@
                   IsChecked="{Binding CheckForUpdates}"
                   Margin="0,8,0,4" />
 
+        <CheckBox Content="After editing a set, offer to sync added/removed folders"
+                  IsChecked="{Binding ReconcileAfterEdit}"
+                  Margin="0,8,0,0" />
+        <TextBlock Text="When on, saving a change to a set's folders scans the affected folders so it can offer to back up ones you added and remove copies of ones you dropped. Turn off to skip that scan — those changes then sync on the next full backup instead. (Merely browsing the folder tree never triggers a scan either way.)"
+                   Foreground="{StaticResource TextSecondaryBrush}"
+                   FontSize="11" TextWrapping="Wrap"
+                   Margin="24,4,0,4" />
+
         <Border Height="1" Background="{StaticResource BorderBrush}"
                 Margin="0,20,0,16" />
 

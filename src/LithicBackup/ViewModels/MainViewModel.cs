@@ -662,8 +662,10 @@ public class MainViewModel : ViewModelBase
             // If the edit actually saved, reconcile the destination with the new
             // source selection: offer to purge copies of removed folders and to
             // back up newly added ones.  Skipped entirely when nothing was saved
-            // (e.g. the user discarded changes on close).
-            if (savedThisSession)
+            // (e.g. the user discarded changes on close), or when the user has
+            // turned off post-edit reconcile in Settings (added/removed folders
+            // then sync on the next full backup instead).
+            if (savedThisSession && _settings.ReconcileAfterEdit)
                 await ReconcileDestinationAfterEditAsync(
                     backupSet, originalSelections, sourceSelection.ChangedSelectionPaths);
         };
@@ -1075,6 +1077,21 @@ public class MainViewModel : ViewModelBase
         // with, so it is conservative: any real change produces different JSON
         // and still runs the reconcile below.
         if (SelectionsEquivalent(originalSelections, newSelections))
+            return;
+
+        // Second fast path: the serialized trees differ, but ONLY because of
+        // display-only state — the user expanded/collapsed folders while browsing,
+        // which ToModel persists as IsExpanded so the tree reopens the same way.
+        // Expansion can neither add nor remove a covered file, and every real
+        // coverage change (a checkbox toggle, or an auto-include-new toggle) is
+        // recorded into changedPaths at the moment it happens (see
+        // SourceSelectionViewModel.RequestSelectionSettle and the ApplyAutoIncludeNew
+        // -> _recordChangedPath wiring; a bulk select/deselect-all records the
+        // virtual root as an empty path).  So if nothing was recorded, the edit
+        // touched no selection at all — skip the (potentially huge, hundreds of
+        // thousands of files) catalog + filesystem scans that would otherwise fire
+        // just because the user opened a few folders to look around.
+        if (changedPaths.Count == 0)
             return;
 
         // Show a cancellable progress dialog (instead of a busy cursor) while we

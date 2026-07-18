@@ -30,6 +30,7 @@ public partial class SettingsDialog : Window, INotifyPropertyChanged
         _suppressBackupSuggestions = settings.SuppressBackupSuggestions;
         _burnInPlace = settings.DiscStagingMode == DiscStagingMode.InPlace;
         _checkForUpdates = settings.CheckForUpdates;
+        _reconcileAfterEdit = settings.ReconcileAfterEdit;
     }
 
     private bool _isAuto;
@@ -85,6 +86,13 @@ public partial class SettingsDialog : Window, INotifyPropertyChanged
     {
         get => _checkForUpdates;
         set { _checkForUpdates = value; OnPropertyChanged(); }
+    }
+
+    private bool _reconcileAfterEdit;
+    public bool ReconcileAfterEdit
+    {
+        get => _reconcileAfterEdit;
+        set { _reconcileAfterEdit = value; OnPropertyChanged(); }
     }
 
     private bool _burnInPlace;
@@ -170,6 +178,7 @@ public partial class SettingsDialog : Window, INotifyPropertyChanged
         _settings.MemoryBudget = BuildOptions();
         _settings.SuppressBackupSuggestions = _suppressBackupSuggestions;
         _settings.CheckForUpdates = _checkForUpdates;
+        _settings.ReconcileAfterEdit = _reconcileAfterEdit;
         _settings.DiscStagingMode = _burnInPlace
             ? DiscStagingMode.InPlace
             : DiscStagingMode.TemporaryCopy;

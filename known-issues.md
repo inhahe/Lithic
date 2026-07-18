@@ -1,5 +1,42 @@
 # LithicBackup — Known Issues & Tech Debt
 
+## FIXED: Spurious "scanning newly added folders" on save after only browsing the tree (2026-07-18)
+
+**Symptom.** The user edited a set, browsed around in the source treeview
+(expanding folders to look, but *not* toggling any checkbox), then saved/closed —
+and the app announced "Scanning newly added folders…" and began scanning hundreds
+of thousands of files. Nothing had actually been added.
+
+**Root cause.** `MainViewModel.ReconcileDestinationAfterEditAsync` had one
+fast-path skip: `SelectionsEquivalent(originalSelections, newSelections)`. But
+`ToModel` persists **display-only** `IsExpanded` state, and `SelectionsEquivalent`
+compares the full serialized JSON *including* `IsExpanded`. So merely expanding a
+folder makes the two trees differ, defeating the fast-path, and the reconcile
+proceeds to its added-roots scan — which (unlike the removed-files query) was
+**not** scoped to the set of folders the user actually toggled. Result: a huge
+filesystem walk fired purely because the user opened some folders to look.
+
+**Fix (two parts).**
+1. **Gate on real changes.** After the `SelectionsEquivalent` check, added a
+   second fast-path: `if (changedPaths.Count == 0) return;`. `changedPaths`
+   (`SourceSelectionViewModel.ChangedSelectionPaths`) is populated *only* when a
+   checkbox is genuinely toggled (`RequestSelectionSettle`) or auto-include-new is
+   flipped (`ApplyAutoIncludeNew → _recordChangedPath`); expanding/collapsing
+   never records anything. So if nothing was recorded, the edit changed no
+   coverage and the whole scan is skipped. This directly implements the agreed
+   design of "track which directories the user actually clicks on to know what to
+   scan."
+2. **Make the reconcile itself optional.** Added a `ReconcileAfterEdit` user
+   setting (default on) exposed in the Settings dialog. When off, the post-edit
+   reconcile+scan is skipped entirely even for real edits; added/removed folders
+   then sync on the next full backup of the set instead. (Gated in
+   `MainViewModel` at the reconcile call site: `savedThisSession &&
+   _settings.ReconcileAfterEdit`.)
+
+**Files.** `MainViewModel.cs` (second fast-path + settings gate),
+`UserSettings.cs` (`ReconcileAfterEdit`), `SettingsDialog.xaml`/`.xaml.cs`
+(checkbox).
+
 ## FIXED: Cleanup wrongly purged in-scope backups ("it forgot my C: drive is backed up") (2026-07-18)
 
 **Symptom.** After a user removed `C:\Users` from the J: set's sources and ran
