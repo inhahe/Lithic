@@ -17,19 +17,27 @@ namespace LithicBackup.Infrastructure.Burning;
 
 // --- CoClasses (CLSIDs from imapi2.idl / imapi2fs.idl) ---
 
-[ComImport, Guid("E2B4A659-7CB1-4A36-9B04-2AB90F6B9026")]
+// CLSIDs verified against the live registry (HKCR\CLSID) and the canonical
+// IMAPI2 values from imapi2.h — the previous GUIDs here were wrong for four of
+// the five coclasses (only Media Erase was correct), so `new MsftDiscMaster2()`
+// threw REGDB_E_CLASSNOTREG and recorder enumeration silently reported zero
+// drives even when a burner was present. Registry names for reference:
+//   2735412E = "Disc Master", 2735412D = "CD DVD Device Object",
+//   2735412A = "Standard Data Writer", 2735412B = "Media Erase",
+//   2C941FC5 = "FileSystemImage Class".
+[ComImport, Guid("2735412E-7F64-5B0F-8F00-5D77AFBE261E")]
 internal class MsftDiscMaster2 { }
 
-[ComImport, Guid("2735412A-7F64-5B0F-8F00-5D77AFBE261E")]
+[ComImport, Guid("2735412D-7F64-5B0F-8F00-5D77AFBE261E")]
 internal class MsftDiscRecorder2 { }
 
-[ComImport, Guid("27354130-7F64-5B0F-8F00-5D77AFBE261E")]
+[ComImport, Guid("2735412A-7F64-5B0F-8F00-5D77AFBE261E")]
 internal class MsftDiscFormat2Data { }
 
 [ComImport, Guid("2735412B-7F64-5B0F-8F00-5D77AFBE261E")]
 internal class MsftDiscFormat2Erase { }
 
-[ComImport, Guid("2C941FE1-975B-59BE-A960-9A2A262853A5")]
+[ComImport, Guid("2C941FC5-975B-59BE-A960-9A2A262853A5")]
 internal class MsftFileSystemImage { }
 
 // --- Progress event dispinterfaces ---
