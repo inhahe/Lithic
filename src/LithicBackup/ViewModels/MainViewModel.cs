@@ -1211,7 +1211,7 @@ public class MainViewModel : ViewModelBase
         IReadOnlyList<Core.Models.SourceSelection> originalSelections,
         IReadOnlyList<Core.Models.SourceSelection> newSelections,
         IReadOnlyCollection<string> changedPaths,
-        IProgress<string>? progress,
+        IProgress<ProgressReport>? progress,
         CancellationToken ct)
     {
         // A bulk toggle can record the virtual "All Drives" root (empty path),
@@ -1281,7 +1281,7 @@ public class MainViewModel : ViewModelBase
         int backupSetId,
         IReadOnlyList<Core.Models.SourceSelection> originalSelections,
         IReadOnlyList<Core.Models.SourceSelection> newSelections,
-        IProgress<string>? progress,
+        IProgress<ProgressReport>? progress,
         CancellationToken ct)
     {
         progress?.Report("Loading backup catalog\u2026");
@@ -1303,7 +1303,10 @@ public class MainViewModel : ViewModelBase
             if (progress is not null && nowMs - lastReportMs >= ProgressUpdateIntervalMs)
             {
                 lastReportMs = nowMs;
-                progress.Report($"Checked {checkedCount:N0}/{total:N0} files, {removed.Count:N0} to remove\u2026");
+                int pct = total == 0 ? 100 : (int)(checkedCount * 100L / total);
+                progress.Report(new ProgressReport(
+                    $"Checked {checkedCount:N0}/{total:N0} files, {removed.Count:N0} to remove\u2026",
+                    pct));
             }
 
             if (!f.IsDeleted
@@ -1432,9 +1435,10 @@ public class MainViewModel : ViewModelBase
                                 lastReportMs = nowMs;
                                 int pct = sourcePaths.Count == 0
                                     ? 100 : (int)((i + 1) * 100L / sourcePaths.Count);
-                                progress.Report(
+                                progress.Report(new ProgressReport(
                                     $"Updating catalog {i + 1:N0}/{sourcePaths.Count:N0} ({pct}%): "
-                                    + Path.GetFileName(path.TrimEnd('\\')));
+                                    + Path.GetFileName(path.TrimEnd('\\')),
+                                    pct));
                             }
 
                             purged += _catalog

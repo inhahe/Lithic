@@ -1726,10 +1726,13 @@ public class OrphanedDirectoriesViewModel : ViewModelBase
             // makes the purge visibly "doing something" instead of sitting on
             // a static "Purging..." while the real updates hide in the small
             // grey action-row text.
-            var progress = new Progress<string>(status =>
+            // Cleanup surfaces progress as text labels (not a percentage bar), so
+            // it only needs the report's Text; the shared DestinationFilePurger now
+            // speaks ProgressReport (text + optional percent).
+            var progress = new Progress<Services.ProgressReport>(report =>
             {
-                PurgeStatusText = status;
-                SummaryText = status;
+                PurgeStatusText = report.Text;
+                SummaryText = report.Text;
             });
 
             // Run all DB work + disk deletion on a background thread — the
@@ -1773,7 +1776,7 @@ public class OrphanedDirectoriesViewModel : ViewModelBase
                             var dirName = Path.GetFileName(wi.DirectoryPath.TrimEnd('\\'));
                             int pct = workItems.Count == 0
                                 ? 100 : (int)((i + 1) * 100L / workItems.Count);
-                            ((IProgress<string>)progress).Report(
+                            ((IProgress<Services.ProgressReport>)progress).Report(
                                 $"Updating catalog {i + 1:N0}/{workItems.Count:N0} ({pct}%): {dirName}");
                         }
 
@@ -1936,7 +1939,7 @@ public class OrphanedDirectoriesViewModel : ViewModelBase
 
         try
         {
-            var progress = new Progress<string>(msg => ReconcileStatusText = msg);
+            var progress = new Progress<Services.ProgressReport>(r => ReconcileStatusText = r.Text);
             var report = await Task.Run(() =>
                 _reconcile.AnalyzeAsync(_backupSet.Id, _targetDir, progress));
 
@@ -1997,7 +2000,7 @@ public class OrphanedDirectoriesViewModel : ViewModelBase
 
         try
         {
-            var progress = new Progress<string>(msg => ReconcileStatusText = msg);
+            var progress = new Progress<Services.ProgressReport>(r => ReconcileStatusText = r.Text);
             var result = await Task.Run(() =>
                 _reconcile.ApplyAsync(_backupSet.Id, report, _targetDir, progress));
 

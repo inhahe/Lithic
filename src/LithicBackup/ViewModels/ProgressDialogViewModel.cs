@@ -15,6 +15,8 @@ public class ProgressDialogViewModel : ViewModelBase
     private string _message;
     private string _detail = "";
     private bool _canCancel;
+    private double _progressValue;
+    private bool _isIndeterminate = true;
 
     public ProgressDialogViewModel(string title, string message, bool cancellable)
     {
@@ -39,6 +41,28 @@ public class ProgressDialogViewModel : ViewModelBase
     {
         get => _detail;
         set => SetProperty(ref _detail, value);
+    }
+
+    /// <summary>
+    /// Determinate progress for the current stage, 0–100. Only meaningful when
+    /// <see cref="IsIndeterminate"/> is false.
+    /// </summary>
+    public double ProgressValue
+    {
+        get => _progressValue;
+        set => SetProperty(ref _progressValue, value);
+    }
+
+    /// <summary>
+    /// Whether the progress bar is a marquee (true) rather than showing a real
+    /// percentage. Starts true, flips false as soon as a stage reports a measured
+    /// percent, and flips back for unbounded steps (e.g. the empty-directory
+    /// sweep) that report text only.
+    /// </summary>
+    public bool IsIndeterminate
+    {
+        get => _isIndeterminate;
+        set => SetProperty(ref _isIndeterminate, value);
     }
 
     /// <summary>Whether this operation can be cancelled at all (shows the button).</summary>

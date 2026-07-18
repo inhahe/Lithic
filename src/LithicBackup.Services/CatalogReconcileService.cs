@@ -44,7 +44,7 @@ public sealed class CatalogReconcileService
     /// </summary>
     public async Task<ReconcileReport> AnalyzeAsync(
         int backupSetId, string targetDirectory,
-        IProgress<string>? progress = null, CancellationToken ct = default)
+        IProgress<ProgressReport>? progress = null, CancellationToken ct = default)
     {
         var report = new ReconcileReport();
         var sw = System.Diagnostics.Stopwatch.StartNew();
@@ -171,7 +171,7 @@ public sealed class CatalogReconcileService
     /// </summary>
     public async Task<ReconcileApplyResult> ApplyAsync(
         int backupSetId, ReconcileReport report, string targetDirectory,
-        IProgress<string>? progress = null, CancellationToken ct = default)
+        IProgress<ProgressReport>? progress = null, CancellationToken ct = default)
     {
         int flipped = 0, pruned = 0, skipped = 0;
 
@@ -180,9 +180,9 @@ public sealed class CatalogReconcileService
         {
             ct.ThrowIfCancellationRequested();
             i++;
-            progress?.Report(
-                $"Flipping references {i:N0}/{report.Flips.Count:N0} "
-                + $"({(int)(i * 100L / report.Flips.Count)}%)");
+            int pct = (int)(i * 100L / report.Flips.Count);
+            progress?.Report(new ProgressReport(
+                $"Flipping references {i:N0}/{report.Flips.Count:N0} ({pct}%)", pct));
 
             string strippedAbs = Path.Combine(targetDirectory, f.NewDiscPath);
             if (!File.Exists(strippedAbs)) { skipped++; continue; } // plain vanished — leave the row alone
@@ -209,9 +209,9 @@ public sealed class CatalogReconcileService
             {
                 ct.ThrowIfCancellationRequested();
                 i++;
-                progress?.Report(
-                    $"Pruning missing rows {i:N0}/{report.Prunes.Count:N0} "
-                    + $"({(int)(i * 100L / report.Prunes.Count)}%)");
+                int pct = (int)(i * 100L / report.Prunes.Count);
+                progress?.Report(new ProgressReport(
+                    $"Pruning missing rows {i:N0}/{report.Prunes.Count:N0} ({pct}%)", pct));
 
                 // Re-verify the content is STILL missing before marking deleted.
                 var r = p.Record;
@@ -289,7 +289,7 @@ public sealed class CatalogReconcileService
     }
 
     private static void Report(
-        IProgress<string>? p, System.Diagnostics.Stopwatch sw, ref long lastReportMs,
+        IProgress<ProgressReport>? p, System.Diagnostics.Stopwatch sw, ref long lastReportMs,
         ref int processed, int total, string phase)
     {
         processed++;
@@ -302,7 +302,7 @@ public sealed class CatalogReconcileService
             return;
         lastReportMs = nowMs;
         int pct = total == 0 ? 100 : (int)(processed * 100L / total);
-        p.Report($"{phase} {processed:N0}/{total:N0} ({pct}%)");
+        p.Report(new ProgressReport($"{phase} {processed:N0}/{total:N0} ({pct}%)", pct));
     }
 }
 
