@@ -1,5 +1,61 @@
 # LithicBackup — Known Issues & Tech Debt
 
+## OPEN: Major upgrade leaves the previous version registered (duplicate ARP entries) (2026-07-18)
+
+**Symptom.** Add/Remove Programs (and the registry `Uninstall` keys) show **two**
+Lithic Backup entries at once — e.g. `1.0.20` *and* an orphaned `1.0.10`. The
+`MajorUpgrade` in `Package.wxs` is supposed to uninstall the down-level product when
+the new one installs, so only one entry should ever remain.
+
+**Likely cause.** The in-app updater and/or a failed/partial upgrade left a stale
+product registration behind. `RemoveExistingProducts` is scheduled after
+`InstallValidate` (WiX default), so if a prior upgrade didn't run the full MSI
+transaction to completion (e.g. the updater swapped files another way, or an upgrade
+was interrupted), the old product's ARP row survives. Each lingering related product
+also makes every future install's `FindRelatedProducts` / `RemoveExistingProducts` do
+more work.
+
+**Impact.** Mostly cosmetic + confusing (two uninstall entries), but a leftover
+product can also cause component-reference-count quirks on a later uninstall (shared
+files not removed until the last referencing product goes).
+
+**To investigate / fix.** Confirm whether `1.0.10`'s files still exist under
+`Program Files\Lithic Backup` or it's a pure orphan registry row. If orphaned, the
+user can remove it via `msiexec /x {C891C255-948E-4315-AC45-153A77ED9EB3}` (the
+ProductCode observed on this machine). For the code fix, verify the upgrade path
+always goes through the MSI transaction (so `RemoveExistingProducts` actually runs),
+and consider `AllowSameVersionUpgrades` behavior. Not yet fixed.
+
+## FIXED: Installer's long one-time "Computing space requirements" pause (2026-07-18)
+
+**Symptom.** Running the MSI paused for an "inordinately long time" on *Computing space
+requirements*.
+
+**Diagnosis (measured, not guessed).** A verbose-logged admin extract
+(`msiexec /a … /l*v`) timed each standard action: **`CostInitialize` took ~85 s on the
+first run and ~4 s on the second.** The 85 s was a single silent gap right at the start
+of `CostInitialize`, *before any files were written*. Per-drive `GetDiskFreeSpaceEx` /
+`GetVolumeInformation` timings were all <35 ms (so it was **not** the optical/removable
+drive volume-enumeration stall first suspected). The cold-vs-warm gap (85 s → 4 s) is
+the signature of **on-access antivirus (Windows Defender) scanning the large 62 MB
+self-contained, unsigned MSI on first touch** during costing. It's a one-time,
+per-download cost, not a package-logic bug and unrelated to recent code changes.
+
+**Fix (reduce what AV has to scan).** Set `<SatelliteResourceLanguages>en</SatelliteResourceLanguages>`
+in `src/Directory.Build.props` (inherited by every project). Lithic Backup has no
+localized UI, but a self-contained publish otherwise drags in ~13 framework satellite
+resource folders (~221 `.resources.dll` files). Dropping them cut the payload from
+**504 → 283 files (505 → 284 components)** and the MSI from **62.2 → 55.6 MB**, with
+zero user-visible change.
+
+**Not done (deliberately).** Single-file publish would cut file count further but
+duplicates the shared WPF/runtime assemblies into *both* the GUI and Worker exes,
+growing the total payload (and the MSI that AV scans) — a net loss for the
+scan-the-big-MSI cost, plus WPF single-file needs interactive testing. Framework-
+dependent publish would shrink it most but reintroduces a .NET runtime prerequisite,
+which the self-contained design intentionally avoids. Code signing the MSI would also
+reduce SmartScreen/AV scrutiny but is out of scope here.
+
 ## FIXED: Hidden/System directories were invisible in the source-selection tree (2026-07-18)
 
 **Symptom.** The user could not find `C:\ProgramData` anywhere in the source-selection
