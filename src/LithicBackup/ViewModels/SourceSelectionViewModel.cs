@@ -1475,10 +1475,21 @@ public class SourceSelectionViewModel : ViewModelBase
                 }
             }
 
-            // ApplySelectionAsync bypasses the IsSelected setter, so the
-            // virtual root's tristate was never recomputed from its children.
-            RootNode.UpdateFromChildren();
         }
+
+        // ApplySelectionAsync applies each node's saved IsSelected verbatim and never
+        // recomputes a parent from its materialised children, so a directory saved as
+        // fully-checked that actually has some children excluded would keep showing a
+        // full check.  Walk the loaded tree bottom-up once, now that the whole restore
+        // has settled, to correct any such stale parent tristate (this also recomputes
+        // the virtual root from its drive children).
+        RootNode.RecomputeLoadedTristate();
+
+        // The virtual "All Drives" root isn't persisted (GetSelections unwraps it and
+        // saves only the drive children), so re-derive its auto-include-new flag from
+        // the restored drives instead of leaving it at the constructor default — that
+        // default is what made "turn off auto-include on All Drives" silently revert.
+        RootNode.UpdateAutoIncludeFromChildren();
 
         RefreshHasSelection();
         OnPropertyChanged(nameof(IsAllSelected));

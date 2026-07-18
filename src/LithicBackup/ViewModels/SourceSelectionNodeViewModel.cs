@@ -1103,6 +1103,18 @@ public class SourceSelectionNodeViewModel : ViewModelBase
                 _pendingDeferredRestore = false;
                 await ApplyChildModelsAsync(_restoredModel.Children);
                 SortChildren();
+
+                // Reconcile this node's tristate (and its ancestors') with the
+                // children that were just materialised.  The saved parent state can
+                // disagree with the restored subtree — e.g. a directory saved as
+                // fully-selected (a full check) that actually has some children
+                // excluded keeps showing a full check until its children load.  Now
+                // that every child exists (freshly enumerated, with saved overrides
+                // applied on top), recompute so the parent shows the correct
+                // partial/full state instead of a stale one.  Suppressed inside
+                // UpdateFromChildren, so this neither pushes state back down nor
+                // marks the set dirty.
+                UpdateFromChildren();
             }
 
             // Compute aggregate backup status for this directory.
@@ -2021,6 +2033,62 @@ public class SourceSelectionNodeViewModel : ViewModelBase
 
         // Continue propagating up.
         Parent?.UpdateFromChildren();
+    }
+
+    /// <summary>
+    /// Depth-first, bottom-up: recompute every loaded directory's tristate from its
+    /// children so a node restored with a state that disagrees with its subtree is
+    /// corrected.  During a selection restore each node's <see cref="IsSelected"/> is
+    /// applied verbatim from the saved model (see <see cref="ApplySelectionAsync"/>),
+    /// which can leave a directory saved as fully-checked showing a full check even
+    /// though some of its children are excluded.  Unlike <see cref="UpdateFromChildren"/>
+    /// this walks <em>down</em> first (so children are settled before their parent) and
+    /// never ripples up to <see cref="Parent"/>, so it can be run once on the tree root
+    /// after a restore without racing concurrent sibling restores.  Assignments are
+    /// suppressed, so they don't push state back down or mark the set dirty.
+    /// </summary>
+    internal void RecomputeLoadedTristate()
+    {
+        if (!IsDirectory || !_isLoaded || Children.Count == 0)
+            return;
+
+        foreach (var child in Children)
+            child.RecomputeLoadedTristate();
+
+        bool allSelected = Children.All(c => c.IsSelected == true);
+        bool allDeselected = Children.All(c => c.IsSelected == false);
+
+        _suppressPropagation = true;
+        if (allSelected)
+            IsSelected = true;
+        else if (allDeselected)
+            IsSelected = false;
+        else
+            IsSelected = null; // Mixed — tristate indeterminate
+        _suppressPropagation = false;
+    }
+
+    /// <summary>
+    /// Re-derive this node's <see cref="AutoIncludeNew"/> flag from its directory
+    /// children.  Used for the virtual "All Drives" root, whose own state is never
+    /// persisted (GetSelections unwraps it and saves only the drive children).
+    /// Without this the root's auto-include flag reverts to the constructor default
+    /// (true) on every reload, silently undoing a user who turned it off.  The
+    /// backing field is set directly (not via the setter) so this restore-time
+    /// derivation neither propagates back down to the drives nor marks the set dirty.
+    /// </summary>
+    internal void UpdateAutoIncludeFromChildren()
+    {
+        var dirs = Children.Where(c => c.IsDirectory).ToList();
+        if (dirs.Count == 0)
+            return;
+
+        bool derived = dirs.All(c => c.AutoIncludeNew);
+        if (_autoIncludeNew != derived)
+        {
+            _autoIncludeNew = derived;
+            OnPropertyChanged(nameof(AutoIncludeNew));
+        }
     }
 
     /// <summary>

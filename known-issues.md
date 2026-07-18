@@ -1,5 +1,49 @@
 # LithicBackup — Known Issues & Tech Debt
 
+## FIXED: Source-tree selection bugs — "All Drives" auto-include reverting + stale full-check on restore (2026-07-18)
+
+**Symptoms (both reported together).**
+1. Turning **"auto-include new" off** on the **"All Drives"** row (and, by
+   propagation, its drives) never stuck — it was back **on** every time the editor
+   reopened.
+2. On reopen a directory could show a **full check** while a sibling with the same
+   "only some children selected" situation showed a **partial** check (e.g. `C:\`
+   full while `D:\` and "All Drives" were partial), even though all three had only
+   some descendants selected.
+
+**Root causes (confirmed by inspecting the persisted `SourceSelectionJson` and the
+restore path).**
+- **Auto-include revert.** `SourceSelectionViewModel.GetSelections()` **unwraps** the
+  virtual `Path=""` "All Drives" root and serialises only its drive children
+  (downstream consumers — scanner, DB — can't handle an empty path). The root's own
+  `AutoIncludeNewSubdirectories` is therefore **never persisted**, so on reload it
+  fell back to the `SourceSelection` constructor default (`true`). (Its drive children
+  *do* persist their flag, so this was specific to the aggregate root row.)
+- **Stale tristate.** `SourceSelectionNodeViewModel.ApplySelectionAsync` applies each
+  node's saved `IsSelected` **verbatim** and never recomputes a parent from its
+  materialised children. A directory saved as fully-checked that actually has some
+  children excluded kept showing a full check. Live editing preserves this invariant
+  via `UpdateFromChildren`; restore (and lazy deferred-expand) did not.
+
+**Fixes.**
+- Added `SourceSelectionNodeViewModel.RecomputeLoadedTristate()` — a depth-first,
+  bottom-up pass (never ripples to `Parent`, assignments suppressed so it neither
+  pushes state down nor marks the set dirty) run once on the root at the end of
+  `ApplySelectionsAsync`, so every loaded directory's check state matches the
+  aggregate of its children after a restore.
+- Added `UpdateFromChildren()` after the **deferred** child restore in
+  `LoadChildrenAsync`, so a collapsed-at-save node that only materialises its excluded
+  children when the user first expands it also reconciles its parent tristate.
+- Added `SourceSelectionNodeViewModel.UpdateAutoIncludeFromChildren()`, called on the
+  root in `ApplySelectionsAsync`, to **re-derive** the virtual root's auto-include
+  flag from its drives (the aggregate the row represents) instead of leaving it at the
+  constructor default. Since toggling the root propagates the flag to all drives — and
+  those *do* persist — the round-trip now sticks.
+
+**Note.** The virtual "All Drives" root is a UI aggregate with no persisted state of
+its own; its `IsSelected` was already re-derived from children on reload (so it always
+showed the correct partial state), and now its auto-include flag is too.
+
 ## EXPLAINED: Duplicate "Lithic Backup 1.0.10" in Add/Remove Programs (orphaned Burn-bundle row) (2026-07-18)
 
 **Symptom.** Add/Remove Programs shows **two** Lithic Backup entries: the real MSI
