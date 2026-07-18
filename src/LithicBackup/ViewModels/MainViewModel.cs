@@ -4032,12 +4032,13 @@ public class MainViewModel : ViewModelBase
     }
 
     /// <summary>
-    /// Downloads the release installer (the self-elevating <c>.exe</c> bundle when
-    /// present, otherwise the <c>.msi</c>) and launches it, then shuts the app down
-    /// so the installer can replace the running files. The bundle elevates itself,
-    /// so its embedded MSI can close this (possibly elevated) GUI before the
-    /// file-in-use check. If the release has no installer asset, falls back to
-    /// opening the release page in the browser.
+    /// Downloads the release installer (the bare <c>.msi</c>; a legacy <c>.exe</c>
+    /// bundle is accepted only as a fallback) and launches it, then shuts this app
+    /// down so the installer can replace the running files. Closing the GUI here
+    /// means the upgrade never trips the file-in-use check on our own executables;
+    /// the MSI's <c>SignalLithicGuiShutdown</c> custom action covers the manual
+    /// (double-click-the-MSI-while-running) path too. If the release has no
+    /// installer asset, falls back to opening the release page in the browser.
     /// </summary>
     private async Task DownloadUpdateAsync()
     {

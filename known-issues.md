@@ -1,30 +1,50 @@
 # LithicBackup — Known Issues & Tech Debt
 
-## OPEN: Major upgrade leaves the previous version registered (duplicate ARP entries) (2026-07-18)
+## EXPLAINED: Duplicate "Lithic Backup 1.0.10" in Add/Remove Programs (orphaned Burn-bundle row) (2026-07-18)
 
-**Symptom.** Add/Remove Programs (and the registry `Uninstall` keys) show **two**
-Lithic Backup entries at once — e.g. `1.0.20` *and* an orphaned `1.0.10`. The
-`MajorUpgrade` in `Package.wxs` is supposed to uninstall the down-level product when
-the new one installs, so only one entry should ever remain.
+**Symptom.** Add/Remove Programs shows **two** Lithic Backup entries: the real MSI
+`1.0.20` and a stale `1.0.10`. `msiexec /x {C891C255-948E-4315-AC45-153A77ED9EB3}`
+returns "*this action is only valid for products that are currently installed*".
 
-**Likely cause.** The in-app updater and/or a failed/partial upgrade left a stale
-product registration behind. `RemoveExistingProducts` is scheduled after
-`InstallValidate` (WiX default), so if a prior upgrade didn't run the full MSI
-transaction to completion (e.g. the updater swapped files another way, or an upgrade
-was interrupted), the old product's ARP row survives. Each lingering related product
-also makes every future install's `FindRelatedProducts` / `RemoveExistingProducts` do
-more work.
+**Root cause (confirmed by inspection).** The `1.0.10` row is **not an MSI product** —
+it's an orphaned **WiX Burn bundle** registration left over from the packaging
+transition:
+- The Windows Installer product database lists exactly one Lithic product:
+  `{7C29CC18-…}` = MSI `1.0.20`. The `1.0.10` GUID is a *bundle* ARP row
+  (`WindowsInstaller=` empty), whose `UninstallString` is
+  `"C:\ProgramData\Package Cache\{C891C255-…}\LithicBackup-1.0.10-x64.exe" /uninstall`
+  — the classic Burn package-cache/`/uninstall` shape. That's why `msiexec /x`
+  rejects it: there's no MSI ProductCode behind it.
+- **History:** v1.0.9 / v1.0.10 shipped as self-elevating **`.exe` Burn bundles**
+  (still present in `installer\`); v1.0.11+ ship a **bare `.msi`**. A Burn bundle
+  registers its *own* ARP entry (keyed on the bundle's Burn UpgradeCode) separate from
+  the MSI it wraps. When the bare 1.0.11+ MSI later installed, its `MajorUpgrade`
+  (keyed on the *MSI* `UpgradeCode` `7BC4E6C1-…`) removed the bundle's **inner** MSI
+  but had no knowledge of the **outer** bundle registration — Burn ARP rows can only
+  be removed by Burn. So the bundle's shell survived as a harmless orphan pointing at
+  a 1.2 MB cached bootstrapper.
 
-**Impact.** Mostly cosmetic + confusing (two uninstall entries), but a leftover
-product can also cause component-reference-count quirks on a later uninstall (shared
-files not removed until the last referencing product goes).
+**Impact.** Cosmetic/confusing only. The inner MSI is long gone; nothing is installed
+under the orphan. It cannot recur for MSI→MSI upgrades — it's a one-time
+bundle→bare-MSI transition artifact affecting only machines that once ran the old
+`.exe` bundle.
 
-**To investigate / fix.** Confirm whether `1.0.10`'s files still exist under
-`Program Files\Lithic Backup` or it's a pure orphan registry row. If orphaned, the
-user can remove it via `msiexec /x {C891C255-948E-4315-AC45-153A77ED9EB3}` (the
-ProductCode observed on this machine). For the code fix, verify the upgrade path
-always goes through the MSI transaction (so `RemoveExistingProducts` actually runs),
-and consider `AllowSameVersionUpgrades` behavior. Not yet fixed.
+**Removal (for affected machines).** Either run the cached bootstrapper's uninstall —
+`"C:\ProgramData\Package Cache\{C891C255-948E-4315-AC45-153A77ED9EB3}\LithicBackup-1.0.10-x64.exe" /uninstall`
+(Burn finds its inner MSI already gone and just clears its own registration) — or, if
+that exe is missing, delete the orphan key
+`HKLM\SOFTWARE\Microsoft\Windows\CurrentVersion\Uninstall\{C891C255-948E-4315-AC45-153A77ED9EB3}`
+(elevated). Both are safe; the real install is untouched.
+
+**Related tech-debt fixed (2026-07-18).** `UpdateService` still **preferred** the
+retired `.exe` bundle over the `.msi` and its docs referenced the deleted
+`installer\Bundle.wxs`, claiming a bare MSI "cannot close an elevated GUI." That's
+obsolete: the bare MSI closes the GUI via the `SignalLithicGuiShutdown` custom action,
+and the in-app updater (`MainViewModel.DownloadUpdateAsync`) shuts the GUI down itself
+right after launching the installer. Flipped the asset preference to `.msi` (with the
+`.exe` kept only as a defensive fallback), fixed the default-filename fallback
+(`.exe`→`.msi`), and corrected the stale doc comments. `installer\Bundle.wxs` no longer
+exists — the Burn bundle is fully retired.
 
 ## FIXED: Installer's long one-time "Computing space requirements" pause (2026-07-18)
 
