@@ -1,5 +1,48 @@
 # LithicBackup — Known Issues & Tech Debt
 
+## FIXED: Cleanup wrongly purged in-scope backups ("it forgot my C: drive is backed up") (2026-07-18)
+
+**Symptom.** After a user removed `C:\Users` from the J: set's sources and ran
+Cleanup (catalog scan → purge, then destination-filesystem scan → purge), the
+app "somehow forgot that anything in my C drive is backed up." Live inspection of
+`set-4.db` confirmed the damage: of the C: catalog rows, only **2,867 were still
+active** and all of them were the junk the user *wanted gone*
+(`C:\Users` 1,395 + `C:\ProgramData` 1,472), while **612,663 C: rows were marked
+deleted — including 16,760 `C:\mIRC` files (Version 1, no active replacement)**
+even though `C:\mIRC` is explicitly selected (`IsSelected = true`) in the set's
+saved selection tree. The wrongly-purged rows also had their destination copies
+deleted from J:, so those backups are physically gone until re-run.
+
+**Root cause.** `MainViewModel.StartOrphanedDirsFlow` handed the cleanup view
+model the **live in-memory `SelectedBackupSet`** object. Cleanup decides what to
+purge by asking, for every catalogued file, whether it is still covered by the
+set's selection tree (`OrphanedDirectoriesViewModel.IsDirectoryInSources` →
+`SelectionCoversPath`). If the in-memory `SourceSelections` is ever stale (the
+worker persists auto-include materialisations to the catalog *out-of-process*, so
+the GUI's copy can drift) or partial/mid-edit, entire branches of the tree are
+missing — and every catalogued file under a missing branch classifies as
+`RemovedFromSources` and gets purged. That is how in-scope C: content
+(`C:\mIRC`, selected VirtualBox VMs, etc.) was mass-deleted while the current,
+correctly-saved tree still selects it. The classification logic itself
+(`SelectionCoversPath`, `SourceSelection.*`) is correct; the bug was feeding it a
+non-authoritative tree.
+
+**Fix.** `StartOrphanedDirsFlow` now reloads the set **fresh from the catalog**
+(`await _catalog.GetBackupSetAsync(setId)`) before constructing the cleanup view
+model, so classification always runs against the fully-persisted, authoritative
+selection tree — never a stale or mid-edit in-memory copy. This mirrors the
+worker's own `MaterializeDiscoveredDirectoriesAsync`, which already re-reads fresh
+"rather than persisting the worker's in-memory copy [which] can be stale."
+Note: a naive "refuse to purge if too many files are flagged" guard was rejected
+as the fix — a legitimate large exclusion (e.g. removing `C:\Users`, 581K files)
+would false-positive. Classifying against the true tree is the correct guard.
+
+**Recovery.** Source files are intact; the wrongly-purged J: backups are gone from
+disk but will be re-created on the next backup of the J: set (the sources still
+select them). `C:\ProgramData` was never actually excluded (still
+`IsSelected = null`, auto-include on, with materialised system-junk leaves), so it
+keeps re-accumulating — the user should exclude `C:\ProgramData` explicitly.
+
 ## FIXED: Turning off "auto-include new subdirectories" left removed content undeleted (2026-07-16)
 
 **Symptom.** A user had 100+ GB of `C:\Users` data in the destination that they

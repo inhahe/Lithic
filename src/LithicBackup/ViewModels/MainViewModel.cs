@@ -3482,16 +3482,54 @@ public class MainViewModel : ViewModelBase
         if (SelectedBackupSet is null)
             return;
 
+        _ = StartOrphanedDirsFlowAsync(SelectedBackupSet.Id);
+    }
+
+    private async Task StartOrphanedDirsFlowAsync(int setId)
+    {
+        // CRITICAL: classify against a FRESH copy of the set reloaded from the
+        // catalog, never the live in-memory SelectedBackupSet.  The in-memory
+        // copy's SourceSelections can be stale (the worker persists auto-include
+        // materialisations out-of-process) or reflect a partial/mid-edit tree.
+        // Cleanup decides what to purge by asking whether each catalogued file is
+        // still covered by the selection tree (IsDirectoryInSources); handing it a
+        // selection tree that is missing branches makes it classify *in-scope*
+        // files as "removed from sources" and delete live backups.  That is
+        // exactly how a whole drive's backup ("it forgot my C: drive is backed
+        // up") got wrongly purged — see the cleanup-mass-purge entry in
+        // known-issues.md.  Reloading fresh guarantees the authoritative,
+        // fully-persisted tree drives the classification.
+        BackupSet? fresh;
+        try
+        {
+            fresh = await _catalog.GetBackupSetAsync(setId);
+        }
+        catch (Exception ex)
+        {
+            MessageBox.Show(
+                $"Couldn't load the backup set for cleanup:\n\n{ex.Message}",
+                "Cleanup", MessageBoxButton.OK, MessageBoxImage.Error);
+            return;
+        }
+
+        if (fresh is null)
+        {
+            MessageBox.Show(
+                "The backup set could not be found in the catalog.",
+                "Cleanup", MessageBoxButton.OK, MessageBoxImage.Error);
+            return;
+        }
+
         // The catalog load + classification can take several seconds on large
         // backup sets, but it runs on a background thread inside the view model
         // (see OrphanedDirectoriesViewModel.LoadAsync).  The view is switched in
-        // synchronously below and surfaces its own live progress via SummaryText
-        // ("Loading catalogue...", then a running record count), so the app stays
-        // fully responsive throughout.  We deliberately do NOT set a global wait
-        // cursor here: it would falsely signal "busy/unresponsive", and because
-        // the load outlives this method it would also linger as a busy pointer if
-        // the user navigated away before the load finished.
-        var vm = new OrphanedDirectoriesViewModel(_catalog, SelectedBackupSet);
+        // below and surfaces its own live progress via SummaryText ("Loading
+        // catalogue...", then a running record count), so the app stays fully
+        // responsive throughout.  We deliberately do NOT set a global wait cursor
+        // here: it would falsely signal "busy/unresponsive", and because the load
+        // outlives this method it would also linger as a busy pointer if the user
+        // navigated away before the load finished.
+        var vm = new OrphanedDirectoriesViewModel(_catalog, fresh);
         vm.DoneRequested += GoHome;
         CurrentView = vm;
         StatusText = "Review files and directories that can be cleaned up.";
