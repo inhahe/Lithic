@@ -51,16 +51,16 @@ public class UserSettings
     public string? DismissedUpdateVersion { get; set; }
 
     /// <summary>
-    /// When true (default), after you edit a backup set's source selection the app
-    /// reconciles the destination with the change: it offers to purge copies of
-    /// folders you removed from the set and to back up folders you newly added.
-    /// This requires scanning the affected folders. When false, the reconcile (and
-    /// its scan) is skipped entirely — added/removed folders are then only synced
-    /// the next time you run a full backup of the set. The scan already runs only
-    /// when you actually toggle a checkbox (merely browsing/expanding the tree
-    /// never triggers it); this switch lets you turn it off even for real edits.
+    /// What happens after you edit a set's source selection and save: whether to
+    /// reconcile the destination (offer to back up newly-added folders and purge
+    /// copies of removed ones), which requires scanning the affected folders.
+    /// <see cref="ReconcileAfterEditMode.Ask"/> (default) prompts after each
+    /// change; <see cref="ReconcileAfterEditMode.Always"/> reconciles silently;
+    /// <see cref="ReconcileAfterEditMode.Never"/> skips it (folders sync on the
+    /// next full backup instead). The reconcile only runs when a checkbox was
+    /// actually toggled — browsing/expanding the tree never triggers it.
     /// </summary>
-    public bool ReconcileAfterEdit { get; set; } = true;
+    public ReconcileAfterEditMode ReconcileMode { get; set; } = ReconcileAfterEditMode.Ask;
 
     public static UserSettings Load()
     {

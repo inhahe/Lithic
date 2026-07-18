@@ -30,7 +30,7 @@ public partial class SettingsDialog : Window, INotifyPropertyChanged
         _suppressBackupSuggestions = settings.SuppressBackupSuggestions;
         _burnInPlace = settings.DiscStagingMode == DiscStagingMode.InPlace;
         _checkForUpdates = settings.CheckForUpdates;
-        _reconcileAfterEdit = settings.ReconcileAfterEdit;
+        _reconcileMode = settings.ReconcileMode;
     }
 
     private bool _isAuto;
@@ -88,11 +88,37 @@ public partial class SettingsDialog : Window, INotifyPropertyChanged
         set { _checkForUpdates = value; OnPropertyChanged(); }
     }
 
-    private bool _reconcileAfterEdit;
-    public bool ReconcileAfterEdit
+    private ReconcileAfterEditMode _reconcileMode;
+    public ReconcileAfterEditMode ReconcileMode
     {
-        get => _reconcileAfterEdit;
-        set { _reconcileAfterEdit = value; OnPropertyChanged(); }
+        get => _reconcileMode;
+        set
+        {
+            if (_reconcileMode == value) return;
+            _reconcileMode = value;
+            OnPropertyChanged();
+            OnPropertyChanged(nameof(ReconcileAsk));
+            OnPropertyChanged(nameof(ReconcileAlways));
+            OnPropertyChanged(nameof(ReconcileNever));
+        }
+    }
+
+    public bool ReconcileAsk
+    {
+        get => _reconcileMode == ReconcileAfterEditMode.Ask;
+        set { if (value) ReconcileMode = ReconcileAfterEditMode.Ask; }
+    }
+
+    public bool ReconcileAlways
+    {
+        get => _reconcileMode == ReconcileAfterEditMode.Always;
+        set { if (value) ReconcileMode = ReconcileAfterEditMode.Always; }
+    }
+
+    public bool ReconcileNever
+    {
+        get => _reconcileMode == ReconcileAfterEditMode.Never;
+        set { if (value) ReconcileMode = ReconcileAfterEditMode.Never; }
     }
 
     private bool _burnInPlace;
@@ -178,7 +204,7 @@ public partial class SettingsDialog : Window, INotifyPropertyChanged
         _settings.MemoryBudget = BuildOptions();
         _settings.SuppressBackupSuggestions = _suppressBackupSuggestions;
         _settings.CheckForUpdates = _checkForUpdates;
-        _settings.ReconcileAfterEdit = _reconcileAfterEdit;
+        _settings.ReconcileMode = _reconcileMode;
         _settings.DiscStagingMode = _burnInPlace
             ? DiscStagingMode.InPlace
             : DiscStagingMode.TemporaryCopy;

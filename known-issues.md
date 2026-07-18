@@ -26,16 +26,19 @@ filesystem walk fired purely because the user opened some folders to look.
    coverage and the whole scan is skipped. This directly implements the agreed
    design of "track which directories the user actually clicks on to know what to
    scan."
-2. **Make the reconcile itself optional.** Added a `ReconcileAfterEdit` user
-   setting (default on) exposed in the Settings dialog. When off, the post-edit
-   reconcile+scan is skipped entirely even for real edits; added/removed folders
-   then sync on the next full backup of the set instead. (Gated in
-   `MainViewModel` at the reconcile call site: `savedThisSession &&
-   _settings.ReconcileAfterEdit`.)
+2. **Make the reconcile itself optional, defaulting to "ask".** Added a
+   `ReconcileMode` user setting (`ReconcileAfterEditMode` enum: `Ask` (default) /
+   `Always` / `Never`) exposed as three radio buttons in the Settings dialog.
+   After a real change, `ReconcileDestinationAfterEditAsync` consults the mode:
+   `Never` skips the scan (folders sync on the next full backup), `Always`
+   reconciles silently, and `Ask` shows a Yes/No prompt ("You changed which
+   folders … Scan now?") so a large edit never kicks off a long scan without
+   consent. The decision lives inside the method after the two fast-path returns,
+   so it's only reached when a checkbox was genuinely toggled.
 
-**Files.** `MainViewModel.cs` (second fast-path + settings gate),
-`UserSettings.cs` (`ReconcileAfterEdit`), `SettingsDialog.xaml`/`.xaml.cs`
-(checkbox).
+**Files.** `MainViewModel.cs` (second fast-path + `ReconcileMode` switch),
+`UserSettings.cs` (`ReconcileMode`), `ReconcileAfterEditMode.cs` (new enum),
+`SettingsDialog.xaml`/`.xaml.cs` (radio buttons).
 
 ## FIXED: Cleanup wrongly purged in-scope backups ("it forgot my C: drive is backed up") (2026-07-18)
 

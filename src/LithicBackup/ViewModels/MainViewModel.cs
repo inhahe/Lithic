@@ -662,10 +662,10 @@ public class MainViewModel : ViewModelBase
             // If the edit actually saved, reconcile the destination with the new
             // source selection: offer to purge copies of removed folders and to
             // back up newly added ones.  Skipped entirely when nothing was saved
-            // (e.g. the user discarded changes on close), or when the user has
-            // turned off post-edit reconcile in Settings (added/removed folders
-            // then sync on the next full backup instead).
-            if (savedThisSession && _settings.ReconcileAfterEdit)
+            // (e.g. the user discarded changes on close).  Whether the reconcile
+            // runs at all — and whether it prompts first — is governed inside
+            // ReconcileDestinationAfterEditAsync by the ReconcileMode setting.
+            if (savedThisSession)
                 await ReconcileDestinationAfterEditAsync(
                     backupSet, originalSelections, sourceSelection.ChangedSelectionPaths);
         };
@@ -1093,6 +1093,34 @@ public class MainViewModel : ViewModelBase
         // just because the user opened a few folders to look around.
         if (changedPaths.Count == 0)
             return;
+
+        // A real coverage change was made and saved.  Whether we scan/reconcile
+        // now is up to the user's ReconcileMode setting:
+        //   Never  — skip; added/removed folders sync on the next full backup.
+        //   Always — reconcile silently.
+        //   Ask    — prompt first, so a large edit doesn't kick off a long scan
+        //            without consent (the default).
+        switch (_settings.ReconcileMode)
+        {
+            case Core.Models.ReconcileAfterEditMode.Never:
+                return;
+            case Core.Models.ReconcileAfterEditMode.Ask:
+                var answer = MessageBox.Show(
+                    $"You changed which folders \"{backupSet.Name}\" backs up.\n\n" +
+                    "Scan the affected folders now to back up ones you added and " +
+                    "remove copies of ones you dropped?\n\n" +
+                    "You can skip this and let the changes sync on the next full " +
+                    "backup instead.",
+                    "Update backup",
+                    MessageBoxButton.YesNo,
+                    MessageBoxImage.Question);
+                if (answer != MessageBoxResult.Yes)
+                    return;
+                break;
+            case Core.Models.ReconcileAfterEditMode.Always:
+            default:
+                break;
+        }
 
         // Show a cancellable progress dialog (instead of a busy cursor) while we
         // scan the catalog for dropped files: it says exactly what it's doing and
