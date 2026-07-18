@@ -1410,14 +1410,37 @@ public class MainViewModel : ViewModelBase
                 (progress, ct) =>
                 {
                     // Catalog marks inside a single transaction (mirrors Cleanup).
-                    progress.Report("Updating catalog\u2026");
+                    // Loop per source path so the marking shows live "x of y"
+                    // progress (throttled to ProgressUpdateIntervalMs) instead of a
+                    // single static "Updating catalog…" that looks frozen while
+                    // thousands of rows are updated — the user observed exactly this.
+                    var progressSw = System.Diagnostics.Stopwatch.StartNew();
+                    long lastReportMs = -ProgressUpdateIntervalMs; // fire first report immediately
                     var tx = _catalog.BeginTransactionAsync(backupSet.Id).GetAwaiter().GetResult();
-                    int purged;
+                    int purged = 0;
                     try
                     {
-                        purged = _catalog
-                            .MarkFilesDeletedBySourcePathsAsync(backupSet.Id, sourcePaths)
-                            .GetAwaiter().GetResult();
+                        for (int i = 0; i < sourcePaths.Count; i++)
+                        {
+                            var path = sourcePaths[i];
+                            long nowMs = progressSw.ElapsedMilliseconds;
+                            // Always report the final item so a "N/N" lands before
+                            // the disk-delete phase takes over; throttle the rest.
+                            if (nowMs - lastReportMs >= ProgressUpdateIntervalMs
+                                || i == sourcePaths.Count - 1)
+                            {
+                                lastReportMs = nowMs;
+                                int pct = sourcePaths.Count == 0
+                                    ? 100 : (int)((i + 1) * 100L / sourcePaths.Count);
+                                progress.Report(
+                                    $"Updating catalog {i + 1:N0}/{sourcePaths.Count:N0} ({pct}%): "
+                                    + Path.GetFileName(path.TrimEnd('\\')));
+                            }
+
+                            purged += _catalog
+                                .MarkFilesDeletedBySourcePathsAsync(backupSet.Id, new[] { path })
+                                .GetAwaiter().GetResult();
+                        }
                         tx.Complete();
                     }
                     finally
