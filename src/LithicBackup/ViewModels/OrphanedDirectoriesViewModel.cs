@@ -466,38 +466,15 @@ public class OrphanedDirectoriesViewModel : ViewModelBase
             progress.Bump(groupCount);
         }
 
-        // Collapse children of removed dirs into their highest ancestor.
-        // Sorted by length so parents (shorter paths) come first.
-        removedDirs.Sort((a, b) => a.DirectoryPath.Length.CompareTo(b.DirectoryPath.Length));
-        var collapsedRemoved = new List<OrphanedDirectoryItem>();
-        foreach (var item in removedDirs)
-        {
-            var parent = collapsedRemoved.FirstOrDefault(c =>
-                IsPathUnderRoot(item.DirectoryPath, c.DirectoryPath)
-                && !item.DirectoryPath.Equals(c.DirectoryPath, StringComparison.OrdinalIgnoreCase));
-            if (parent is not null)
-            {
-                parent.FileCount += item.FileCount;
-                parent.TotalSizeBytes += item.TotalSizeBytes;
-                // Merge child's file list into the parent so the displayed
-                // file rows include every file that would be purged.  The
-                // child item itself is discarded (not added to collapsedRemoved).
-                if (item.Files is not null)
-                {
-                    parent.Files ??= [];
-                    parent.Files.AddRange(item.Files);
-                }
-                if (item.DiscFilePaths is not null)
-                {
-                    parent.DiscFilePaths ??= [];
-                    parent.DiscFilePaths.AddRange(item.DiscFilePaths);
-                }
-            }
-            else
-            {
-                collapsedRemoved.Add(item);
-            }
-        }
+        // Keep every removed directory as its own item (no collapsing into the
+        // highest ancestor).  Collapsing merged all descendant files into one
+        // flat Files list on the top ancestor, so BuildTree could only render a
+        // single node with every file dumped in as a flat list — losing the
+        // directory hierarchy that all the other categories show.  With one item
+        // per directory, BuildTree nests files under their real subdirectories.
+        // Purge coverage is unchanged: checking a parent node cascades to all
+        // descendant items, and each item still carries its own DiscFilePaths.
+        var collapsedRemoved = removedDirs;
 
         // --- Phase 2: MatchesConfiguredExclusion ---
         progress.SetPhase("Detecting excluded files", totalFiles);
