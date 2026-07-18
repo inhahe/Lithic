@@ -59,7 +59,7 @@ internal static class DestinationFilePurger
                 lastProgressMs = nowMs;
                 int pct = total == 0 ? 100 : (int)(idx * 100L / total);
                 progress.Report(
-                    $"Deleting files {idx:N0}/{total:N0} ({pct}%): {Path.GetFileName(discRel)}");
+                    $"Deleting backed-up files {idx:N0}/{total:N0} ({pct}%): {Path.GetFileName(discRel)}");
             }
 
             string fullPath = Path.Combine(targetDir, discRel);
