@@ -18,26 +18,35 @@ checkbox columns, async catalog/size stamping, etc. Each prior fix chased one
 straggler; the next UI-churn source re-opened the hole.
 
 **Fix (v1.0.38).** Stop *inferring* dirtiness from event noise for the close
-prompt and instead **compare actual content to a baseline snapshot**
-(`MainViewModel.SnapshotEditorState`). Right after the initial load settles (the
-same `ContextIdle` pass that does `MarkClean` for existing sets) we capture a
-normalized string snapshot of everything the editor can change: the set name, the
-synced `JobOptions`, and the source selections. The snapshot runs
-`SyncSettingsToJobOptions` against a **throwaway clone** of the set (so the live
-one isn't mutated) and normalizes the selection tree — dropping the display-only
-`IsExpanded` flag (merely expanding a folder isn't a change) and sorting children
-by path (so re-sorting the tree, or the collapsed-vs-loaded `ToModel`
-serialization difference, doesn't register). The `dialog.Closing` handler now
-prompts only when **both** the cheap `_needsSave` flag is set (it never *misses* a
-real change) **and** the current snapshot differs from the baseline. The baseline
-is refreshed inside `SaveAllAsync` after every save, so a save-then-stray-event
-close doesn't re-prompt for changes already on disk. New (unsaved) sets keep the
-old always-prompt behavior — they have a real temp record to persist, so their
-baseline stays null. `_needsSave` is still used as-is for the Save button's
-CanExecute (over-enabling the button is harmless; a per-requery snapshot would be
-too costly on large trees). This makes the close prompt immune to spurious
-`PropertyChanged`/selection events rather than playing whack-a-mole with each new
-source of them.
+prompt and instead check two **precise, cheap** signals — crucially, without
+re-walking the whole selection tree (which would be slow to do synchronously on
+the close path for a large set):
+
+- **Selection changes** reuse the existing
+  `SourceSelectionViewModel.ChangedSelectionPaths` wiring. That set is populated
+  *only* by genuine user checkbox / auto-include toggles — programmatic restore
+  (`ApplySelectionAsync`) writes the backing fields directly and bypasses the
+  setters, and same-value binding write-backs are dropped by the setters'
+  equality guards. We record a `cleanSelectionMark` (its count) at the last clean
+  point and treat the set as selection-dirty only when the count has grown past
+  the mark.
+- **Setting changes** use `MainViewModel.SnapshotEditorSettings`: a snapshot
+  string of just the set name + `JobOptions` (target, disc/dir options,
+  exclusions, tier sets, schedule) — **no `GetSelections()` tree walk**. Built by
+  the new shared `ApplyVmSettingsToJobOptions` helper (extracted from
+  `SyncSettingsToJobOptions` so the save path and the snapshot can't drift) against
+  a throwaway clone of `JobOptions`, so the live set isn't mutated.
+
+The `dialog.Closing` handler prompts only when the cheap `_needsSave` flag is set
+(it never *misses* a real change, so a clean flag skips everything) **and** at
+least one of the two precise signals fired. Both the settings baseline and the
+clean selection mark are refreshed inside `SaveAllAsync` after every save, so a
+save-then-stray-event close doesn't re-prompt for changes already on disk. New
+(unsaved) sets keep the old always-prompt behavior — they have a real temp record
+to persist, so their baseline stays null. `_needsSave` is still used as-is for the
+Save button's CanExecute (over-enabling the button is harmless). This makes the
+close prompt immune to spurious `PropertyChanged`/selection events rather than
+playing whack-a-mole with each new source of them.
 
 ## FIXED: Upgrade "unable to close all requested applications" — forced shutdown now has a hard-exit watchdog (2026-07-19)
 
