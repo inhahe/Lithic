@@ -21,6 +21,26 @@
             <TabItem Header="General">
                 <ScrollViewer VerticalScrollBarVisibility="Auto" MaxHeight="1000">
                     <StackPanel Margin="0,0,4,0">
+                        <TextBlock Text="Preferences"
+                                   FontSize="15" FontWeight="SemiBold"
+                                   Foreground="{StaticResource TextPrimaryBrush}"
+                                   Margin="0,0,0,12" />
+
+                        <CheckBox Content="Don't suggest running a backup after file changes accumulate"
+                                  IsChecked="{Binding SuppressBackupSuggestions}"
+                                  Margin="0,0,0,4" />
+
+                        <CheckBox Content="Check for updates on startup"
+                                  IsChecked="{Binding CheckForUpdates}"
+                                  Margin="0,8,0,4" />
+                    </StackPanel>
+                </ScrollViewer>
+            </TabItem>
+
+            <!-- ================= Memory ================= -->
+            <TabItem Header="Memory">
+                <ScrollViewer VerticalScrollBarVisibility="Auto" MaxHeight="1000">
+                    <StackPanel Margin="0,0,4,0">
                         <TextBlock Text="Memory budget"
                                    FontSize="15" FontWeight="SemiBold"
                                    Foreground="{StaticResource TextPrimaryBrush}" />
@@ -111,21 +131,14 @@
                                            TextWrapping="Wrap" Margin="0,4,0,0" />
                             </StackPanel>
                         </Border>
+                    </StackPanel>
+                </ScrollViewer>
+            </TabItem>
 
-                        <Border Height="1" Background="{StaticResource BorderBrush}"
-                                Margin="0,20,0,16" />
-
-                        <CheckBox Content="Don't suggest running a backup after file changes accumulate"
-                                  IsChecked="{Binding SuppressBackupSuggestions}"
-                                  Margin="0,0,0,4" />
-
-                        <CheckBox Content="Check for updates on startup"
-                                  IsChecked="{Binding CheckForUpdates}"
-                                  Margin="0,8,0,4" />
-
-                        <Border Height="1" Background="{StaticResource BorderBrush}"
-                                Margin="0,20,0,16" />
-
+            <!-- ================= Editing ================= -->
+            <TabItem Header="Editing">
+                <ScrollViewer VerticalScrollBarVisibility="Auto" MaxHeight="1000">
+                    <StackPanel Margin="0,0,4,0">
                         <TextBlock Text="After editing a set's folders"
                                    FontSize="15" FontWeight="SemiBold"
                                    Foreground="{StaticResource TextPrimaryBrush}" />
@@ -146,10 +159,14 @@
                                      Content="Never — sync on the next full backup instead"
                                      IsChecked="{Binding ReconcileNever}"
                                      Margin="0,4,0,4" />
+                    </StackPanel>
+                </ScrollViewer>
+            </TabItem>
 
-                        <Border Height="1" Background="{StaticResource BorderBrush}"
-                                Margin="0,20,0,16" />
-
+            <!-- ================= Disc ================= -->
+            <TabItem Header="Disc">
+                <ScrollViewer VerticalScrollBarVisibility="Auto" MaxHeight="1000">
+                    <StackPanel Margin="0,0,4,0">
                         <TextBlock Text="Disc staging"
                                    FontSize="15" FontWeight="SemiBold"
                                    Foreground="{StaticResource TextPrimaryBrush}" />
