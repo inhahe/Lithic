@@ -88,7 +88,7 @@ Only directory-mode backup sets can be scheduled (disc burns require physical me
 
 ### Restore
 
-- Browse backed-up files in a checkbox treeview of directories and files (tristate checkboxes — check a folder to select everything under it) and pick exactly what to restore
+- Browse backed-up files in a checkbox treeview of directories and files (tristate checkboxes — check a folder to select everything under it) and pick exactly what to restore. The tree loads lazily — each folder's contents are read from the catalog only when you expand it, and only the files you actually select are read back at restore time — so the dialog opens instantly even on backup sets with hundreds of thousands of files
 - Handles all storage formats transparently: plain files, split files, zipped files, file-deduplicated, and block-deduplicated
 - Multi-disc restore with guided disc insertion prompts
 - Per-drive destinations: backups spanning multiple drives can be restored to multiple destinations, with one editable target folder per source drive — or restore everything back to its original location in one click

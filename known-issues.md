@@ -27,14 +27,34 @@ records… N" → "Building file tree…") via UI-marshalling `Progress<>` repor
 (`GetRestorableFilesAsync` gained an optional `IProgress<int> rowProgress`). The
 UI stays fully responsive throughout.
 
-**Not done: true lazy loading.** The user asked whether Restore could load lazily
-"like Modify." Modify's tree lazily enumerates the *live filesystem* on expand;
-Restore's tree is the *catalog's* flat file list, which has no per-directory child
-query, and a directory's restore selection implies all its catalog descendants
-(which lazy loading wouldn't have in memory). Off-threading the build removes the
-freeze without that redesign's selection-semantics complications. Lazy catalog
-paging remains possible future work if very large sets still feel slow to first
-paint.
+**Follow-up (v1.0.36): true lazy loading.** The off-thread build above removed the
+freeze but still read the *whole* catalog to open the dialog. v1.0.36 makes the
+restore tree genuinely lazy, like Modify — but backed by the catalog rather than
+the filesystem:
+
+- A new case-insensitive partial index `IX_Files_Active_SourcePath_NoCase`
+  (`SetSchema.sql`) lets the per-set DB list a directory's *direct* children with
+  a **loose-index skip-scan** (`SqliteSetDatabase.GetRestoreChildrenAsync`): seek
+  to the first active path under the prefix, emit the child it belongs to, then
+  jump the cursor past that child's whole subtree and repeat — O(direct children)
+  index seeks, never an O(subtree) scan. Expanding a node reads only that node's
+  children.
+- `RestoreNodeViewModel` is now a load-on-expand tristate node (`RestoreTreeChild`
+  rows, a "Loading..." placeholder, `_isLoaded`). The selection semantics exploit
+  the invariant that an *unexpanded* directory is always fully checked or fully
+  unchecked (it only becomes indeterminate once its children load), so a definite
+  directory state uniformly covers its whole subtree and descendants inherit it on
+  load.
+- At restore time `RestoreService.MaterializeSelectionAsync` reads only the
+  selected subset: a fully-checked directory expands to
+  `GetActiveLatestRecordsUnderPrefixAsync(prefix)` (one prefix query for the whole
+  subtree), an indeterminate directory recurses into its loaded children, and a
+  checked file resolves via `GetActiveLatestRecordByPathAsync`. The whole catalog
+  is never loaded — to browse it or to restore from it.
+- The selected-file count shown in the footer is computed on demand via
+  `GetActiveSubtreeStatsAsync` (bounded to the selection, cached per prefix), and
+  directory rows show a blank Size column (aggregate sizes aren't computed up front
+  in lazy mode).
 
 ## FIXED: Bogus "unsaved changes" prompt when opening Modify and clicking Cancel quickly (2026-07-19)
 

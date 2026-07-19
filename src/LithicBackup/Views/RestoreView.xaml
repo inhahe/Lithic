@@ -193,7 +193,7 @@
                                             <Border Grid.Column="2"
                                                     BorderBrush="{StaticResource BorderBrush}"
                                                     BorderThickness="0,0,1,0">
-                                                <TextBlock Text="{Binding SizeBytes, Converter={StaticResource FileSize}}"
+                                                <TextBlock Text="{Binding SizeText}"
                                                            VerticalAlignment="Center"
                                                            TextAlignment="Right"
                                                            FontSize="11"

@@ -780,6 +780,228 @@ internal sealed class SqliteSetDatabase : IDisposable
         return list;
     }
 
+    // ---------------------------------------------------------------
+    // Lazy restore browser
+    // ---------------------------------------------------------------
+
+    // A string that compares greater than any real source path sharing a given
+    // prefix, used as the exclusive upper bound of a "everything under P" range.
+    // U+FFFF is a non-character never present in a Windows path, and COLLATE
+    // NOCASE (which only case-folds ASCII) leaves it maximal, so "P" .. "P\uFFFF"
+    // brackets exactly the paths under P on the NOCASE index.
+    private const string PathUpperSentinel = "\uFFFF";
+
+    /// <summary>
+    /// List the direct children (subdirectories + files directly inside) of a
+    /// directory via a loose-index skip-scan: seek to the first active path under
+    /// the prefix, emit the child it belongs to, then jump the cursor past that
+    /// child's whole subtree and repeat.  O(direct children) index seeks — never a
+    /// full subtree scan — so expanding a node stays cheap even on a huge set.
+    /// </summary>
+    public async Task<IReadOnlyList<RestoreTreeChild>> GetRestoreChildrenAsync(
+        string parentPrefix, CancellationToken ct = default)
+    {
+        ct.ThrowIfCancellationRequested();
+        using var _ = await LockAsync(ct).ConfigureAwait(false);
+
+        // Normalise to a directory prefix WITH a trailing separator so a child is
+        // simply the next path segment after it.  Empty parent = list the roots.
+        string prefix = parentPrefix.Length == 0 ? "" : parentPrefix.TrimEnd('\\') + "\\";
+        string upper = prefix + PathUpperSentinel;
+
+        var dirs = new List<RestoreTreeChild>();
+        var files = new List<RestoreTreeChild>();
+
+        using var cmd = _connection.CreateCommand();
+        cmd.CommandText = """
+            SELECT SourcePath, SizeBytes, BackedUpUtc
+            FROM Files
+            WHERE IsDeleted = 0
+              AND SourcePath > $cursor COLLATE NOCASE
+              AND SourcePath < $upper COLLATE NOCASE
+            ORDER BY SourcePath COLLATE NOCASE, Version DESC
+            LIMIT 1
+            """;
+        string cursor = prefix;                       // first child is strictly > prefix
+        var pCursor = cmd.Parameters.AddWithValue("$cursor", cursor);
+        cmd.Parameters.AddWithValue("$upper", upper);
+
+        while (true)
+        {
+            ct.ThrowIfCancellationRequested();
+            pCursor.Value = cursor;
+
+            string sp;
+            long size;
+            string backedUp;
+            using (var r = cmd.ExecuteReader())
+            {
+                if (!r.Read())
+                    break;
+                sp = r.GetString(0);
+                size = r.GetInt64(1);
+                backedUp = r.GetString(2);
+            }
+
+            string rest = sp.Substring(prefix.Length);
+            int sep = rest.IndexOf('\\');
+            if (sep < 0)
+            {
+                // Direct file child.
+                files.Add(new RestoreTreeChild(
+                    rest, sp, false, size,
+                    DateTime.Parse(backedUp, null, DateTimeStyles.RoundtripKind)));
+                cursor = sp;                          // skip all versions of this path
+            }
+            else if (sep == 0)
+            {
+                // A leading separator. At the root prefix this is a UNC path
+                // (\\server\share\...), which groups under its share root just like
+                // a drive letter does. Anywhere else it is a malformed double
+                // separator we skip past so the loop keeps advancing.
+                string? share = prefix.Length == 0 ? TryGetUncShareRoot(rest) : null;
+                if (share is not null)
+                {
+                    dirs.Add(new RestoreTreeChild(share, share, true, 0, null));
+                    cursor = share + "\\" + PathUpperSentinel; // jump past this share's subtree
+                }
+                else
+                {
+                    cursor = sp;
+                }
+            }
+            else
+            {
+                string name = rest.Substring(0, sep);
+                string full = prefix + name;
+                dirs.Add(new RestoreTreeChild(name, full, true, 0, null));
+                cursor = full + "\\" + PathUpperSentinel; // jump past this subtree
+            }
+        }
+
+        // Directories first, then files, each alphabetical (case-insensitive).
+        dirs.Sort((a, b) => string.Compare(a.Name, b.Name, StringComparison.OrdinalIgnoreCase));
+        files.Sort((a, b) => string.Compare(a.Name, b.Name, StringComparison.OrdinalIgnoreCase));
+        var result = new List<RestoreTreeChild>(dirs.Count + files.Count);
+        result.AddRange(dirs);
+        result.AddRange(files);
+        return result;
+    }
+
+    /// <summary>
+    /// The UNC share root (<c>\\server\share</c>) of a path that starts with a
+    /// separator, or null if the path is not a complete UNC path (e.g. just
+    /// <c>\\server</c>). Used to give network-share backups a single root node in
+    /// the restore browser, mirroring how a drive letter roots a local path.
+    /// </summary>
+    private static string? TryGetUncShareRoot(string path)
+    {
+        int i = 0;
+        while (i < path.Length && path[i] == '\\')
+            i++;
+        if (i == 0)
+            return null;                                   // no leading separator after all
+        int serverEnd = path.IndexOf('\\', i);
+        if (serverEnd < 0)
+            return null;                                   // only "\\server", no share yet
+        int shareEnd = path.IndexOf('\\', serverEnd + 1);
+        return shareEnd < 0 ? path : path.Substring(0, shareEnd);
+    }
+
+    /// <summary>
+    /// Count of distinct active source paths under a directory prefix, and the sum
+    /// of their latest-version sizes.  Bounded by the NOCASE active-path index.
+    /// </summary>
+    public async Task<(int FileCount, long TotalBytes)> GetActiveSubtreeStatsAsync(
+        string directoryPrefix, CancellationToken ct = default)
+    {
+        ct.ThrowIfCancellationRequested();
+        using var _ = await LockAsync(ct).ConfigureAwait(false);
+
+        string prefix = directoryPrefix.Length == 0 ? "" : directoryPrefix.TrimEnd('\\') + "\\";
+        string upper = prefix + PathUpperSentinel;
+
+        using var cmd = _connection.CreateCommand();
+        cmd.CommandText = """
+            SELECT COUNT(*), COALESCE(SUM(SizeBytes), 0)
+            FROM (
+                SELECT SizeBytes,
+                       ROW_NUMBER() OVER (
+                           PARTITION BY SourcePath COLLATE NOCASE
+                           ORDER BY Version DESC, Id DESC
+                       ) AS rn
+                FROM Files
+                WHERE IsDeleted = 0
+                  AND SourcePath > $low COLLATE NOCASE
+                  AND SourcePath < $upper COLLATE NOCASE
+            )
+            WHERE rn = 1
+            """;
+        cmd.Parameters.AddWithValue("$low", prefix);
+        cmd.Parameters.AddWithValue("$upper", upper);
+
+        using var r = cmd.ExecuteReader();
+        return r.Read() ? ((int)r.GetInt64(0), r.GetInt64(1)) : (0, 0);
+    }
+
+    /// <summary>
+    /// The latest active record for each distinct source path under a directory
+    /// prefix (the concrete files a fully-selected directory expands to at restore).
+    /// </summary>
+    public async Task<IReadOnlyList<FileRecord>> GetActiveLatestRecordsUnderPrefixAsync(
+        string directoryPrefix, CancellationToken ct = default)
+    {
+        ct.ThrowIfCancellationRequested();
+        using var _ = await LockAsync(ct).ConfigureAwait(false);
+
+        string prefix = directoryPrefix.Length == 0 ? "" : directoryPrefix.TrimEnd('\\') + "\\";
+        string upper = prefix + PathUpperSentinel;
+
+        using var cmd = _connection.CreateCommand();
+        cmd.CommandText = """
+            SELECT * FROM (
+                SELECT f.*,
+                       ROW_NUMBER() OVER (
+                           PARTITION BY f.SourcePath COLLATE NOCASE
+                           ORDER BY f.Version DESC, f.Id DESC
+                       ) AS rn
+                FROM Files f
+                WHERE f.IsDeleted = 0
+                  AND f.SourcePath > $low COLLATE NOCASE
+                  AND f.SourcePath < $upper COLLATE NOCASE
+            )
+            WHERE rn = 1
+            """;
+        cmd.Parameters.AddWithValue("$low", prefix);
+        cmd.Parameters.AddWithValue("$upper", upper);
+
+        var list = new List<FileRecord>();
+        using var r = cmd.ExecuteReader();
+        while (r.Read())
+            list.Add(ReadFile(r));
+        return list;
+    }
+
+    /// <summary>The latest active record for one exact source path, or null.</summary>
+    public async Task<FileRecord?> GetActiveLatestRecordByPathAsync(
+        string sourcePath, CancellationToken ct = default)
+    {
+        ct.ThrowIfCancellationRequested();
+        using var _ = await LockAsync(ct).ConfigureAwait(false);
+
+        using var cmd = _connection.CreateCommand();
+        cmd.CommandText = """
+            SELECT * FROM Files
+            WHERE IsDeleted = 0 AND SourcePath = $path COLLATE NOCASE
+            ORDER BY Version DESC, Id DESC
+            LIMIT 1
+            """;
+        cmd.Parameters.AddWithValue("$path", sourcePath);
+
+        using var r = cmd.ExecuteReader();
+        return r.Read() ? ReadFile(r) : null;
+    }
+
     public async Task<HashSet<string>> GetActivePlainHashesAsync(int backupSetId, CancellationToken ct = default)
     {
         ct.ThrowIfCancellationRequested();

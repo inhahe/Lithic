@@ -22,6 +22,29 @@ public interface IRestoreService
         int backupSetId, CancellationToken ct = default, IProgress<int>? rowProgress = null);
 
     /// <summary>
+    /// Materialise a lazy restore-tree selection into the concrete list of
+    /// <see cref="RestorableFile"/>s to hand to <see cref="RestoreAsync"/>, reading
+    /// only the selected subset of the catalog (never the whole set).
+    /// <para>
+    /// <paramref name="selectedDirectoryPrefixes"/> are the source paths of
+    /// directories the user selected in full — every active latest-version file
+    /// under each is included. <paramref name="selectedFilePaths"/> are individual
+    /// file source paths selected on their own. Both are resolved through the
+    /// per-set catalog's prefix / exact-path queries and hydrated with their disc
+    /// and (for split files) chunk records. Duplicate source paths — e.g. a file
+    /// selected both individually and via an enclosing directory — are collapsed to
+    /// one entry. <paramref name="rowProgress"/>, if supplied, is reported
+    /// periodically with the running count of files materialised.
+    /// </para>
+    /// </summary>
+    Task<IReadOnlyList<RestorableFile>> MaterializeSelectionAsync(
+        int backupSetId,
+        IReadOnlyCollection<string> selectedDirectoryPrefixes,
+        IReadOnlyCollection<string> selectedFilePaths,
+        CancellationToken ct = default,
+        IProgress<int>? rowProgress = null);
+
+    /// <summary>
     /// Restore specific files, routing each to a destination chosen per source
     /// drive. <paramref name="driveDestinations"/> maps an uppercase drive
     /// letter (e.g. <c>"D"</c>) to the directory under which that drive's files
