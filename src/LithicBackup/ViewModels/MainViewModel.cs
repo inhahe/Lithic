@@ -1115,22 +1115,33 @@ public class MainViewModel : ViewModelBase
             {
                 if (_unsavedNewSetId is null)
                 {
-                    sourceSelection.MarkClean();
-                    // Refresh the baseline (first captured synchronously in Phase 1)
-                    // now that the first-render binding write-backs have settled, so
-                    // any benign settling folds into the clean state rather than
-                    // reading as a change.  The later catalog/size work raises no
-                    // state-changing edit, so this snapshot is stable.  A fast close
-                    // that beats this pass still has the Phase-1 baseline to compare
-                    // against, so it no longer falls through to a bogus prompt.
+                    // This delayed pass clears the racy dirty flag left by init /
+                    // first-render write-backs.  But it must NOT clobber a genuine
+                    // edit the user made during the (multi-second) load window — e.g.
+                    // ticking "Create subdirectory" right after open, which would
+                    // otherwise see Save disable ~half a second later when this pass
+                    // finally runs.  So only MarkClean when the current state still
+                    // matches the Phase-1 baseline (no real change); otherwise leave
+                    // _needsSave and the baseline intact so the edit sticks.
                     string refreshed = SnapshotEditorSettings(backupSet, sourceSelection);
-                    if (refreshed != settingsBaseline)
+                    bool selectionChanged =
+                        sourceSelection.ChangedSelectionPaths.Count > cleanSelectionMark;
+                    bool settingsChanged = refreshed != settingsBaseline;
+                    if (!selectionChanged && !settingsChanged)
+                    {
+                        // No real edit — clear first-render churn and fold any benign
+                        // settling into the clean baseline.
+                        sourceSelection.MarkClean();
+                        settingsBaseline = refreshed;
+                        cleanSelectionMark = sourceSelection.ChangedSelectionPaths.Count;
+                    }
+                    else
+                    {
                         CrashLogger.Log(null,
-                            $"[dirty-debug] Baseline drifted between Phase-1 and ContextIdle for " +
-                            $"set '{backupSet.Name}' (benign first-render settling):" +
-                            $"\n--- phase1 ---\n{settingsBaseline}\n--- settled ---\n{refreshed}\n--- end ---");
-                    settingsBaseline = refreshed;
-                    cleanSelectionMark = sourceSelection.ChangedSelectionPaths.Count;
+                            $"[dirty-debug] ContextIdle: real edit detected during load window " +
+                            $"for set '{backupSet.Name}' (selectionChanged={selectionChanged}, " +
+                            $"settingsChanged={settingsChanged}) — keeping _needsSave and baseline intact.");
+                    }
                 }
                 sourceSelection.ResumeDirtyTracking();
             },
