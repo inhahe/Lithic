@@ -486,6 +486,17 @@ public class MainViewModel : ViewModelBase
             : new List<Core.Models.SourceSelection>();
         bool savedThisSession = false;
 
+        // Baseline snapshot of the editor's editable state (settings + normalized
+        // selections), captured once the initial load settles (Phase 3) and
+        // refreshed after every save.  The close prompt compares the current state
+        // against this instead of trusting the racy event-based _needsSave flag, so
+        // stray programmatic PropertyChanged/selection events (lazy settings-tab
+        // realization, tree virtualization, catalog/size stamping) can no longer
+        // pop a bogus "unsaved changes" prompt when the user changed nothing.  Left
+        // null for brand-new sets, which always prompt (there's a real unsaved
+        // record to persist).
+        string? editorBaseline = null;
+
         // Completes once the deferred selection restore (Phase 3, below) has
         // finished.  The restore runs asynchronously AFTER the dialog is shown,
         // during which GetSelections() would return a partial/empty tree.  Every
@@ -564,6 +575,11 @@ public class MainViewModel : ViewModelBase
             backupSet.SourceSelections = sourceSelection.GetSelections();
             await Task.Run(() => _catalog.UpdateBackupSetAsync(backupSet));
             savedThisSession = true;
+
+            // The persisted state is now the new "clean" baseline, so a later
+            // stray dirty event followed by a close won't re-prompt to save
+            // changes that are already on disk.
+            editorBaseline = SnapshotEditorState(backupSet, sourceSelection);
         }
 
         // Register a pending save so settings are persisted on dialog close.
@@ -602,10 +618,22 @@ public class MainViewModel : ViewModelBase
             if (Application.Current is App { IsForcedShutdown: true })
                 return;
 
+            bool isNewSet = _unsavedNewSetId is not null;
+
+            // Cheap first gate: the event-based dirty flag never *misses* a real
+            // change (it errs the other way — firing on programmatic noise), so if
+            // it says clean, we truly are.
             if (!sourceSelection.HasUnsavedChanges)
                 return;
 
-            bool isNewSet = _unsavedNewSetId is not null;
+            // The flag says dirty, but it's prone to false positives.  For an
+            // existing set, confirm against the baseline snapshot: if the current
+            // editable state matches what was loaded/last-saved, nothing really
+            // changed and we must not prompt.  (New sets have no baseline and
+            // always prompt — there's an unsaved record to persist.)
+            if (!isNewSet && editorBaseline is not null
+                && SnapshotEditorState(backupSet, sourceSelection) == editorBaseline)
+                return;
 
             var result = MessageBox.Show(
                 isNewSet
@@ -1028,7 +1056,15 @@ public class MainViewModel : ViewModelBase
             () =>
             {
                 if (_unsavedNewSetId is null)
+                {
                     sourceSelection.MarkClean();
+                    // Record the just-loaded state as the clean baseline the close
+                    // prompt diffs against.  Captured here (not in PostShowInitAsync)
+                    // for the same reason as MarkClean: the first-render write-backs
+                    // have settled, and the later catalog/size work raises no
+                    // state-changing edit, so this snapshot is stable.
+                    editorBaseline = SnapshotEditorState(backupSet, sourceSelection);
+                }
                 sourceSelection.ResumeDirtyTracking();
             },
             System.Windows.Threading.DispatcherPriority.ContextIdle).Task;
@@ -3098,6 +3134,70 @@ public class MainViewModel : ViewModelBase
     /// <see cref="JobOptions"/> so they survive a dialog close without Plan.
     /// This is the inverse of <see cref="RestoreSourceSettings"/>.
     /// </summary>
+    /// <summary>
+    /// Produce a stable, normalized string snapshot of everything the editor lets
+    /// the user change: the set name, the synced <see cref="JobOptions"/>, and the
+    /// source selections.  Two calls compare equal iff the user made no substantive
+    /// change, so the editor's close prompt can rely on this instead of the racy
+    /// event-based dirty flag (which fires on programmatic UI churn).
+    /// </summary>
+    /// <remarks>
+    /// <list type="bullet">
+    ///   <item>Runs <see cref="SyncSettingsToJobOptions"/> against a throwaway clone
+    ///         of the set so the real <paramref name="backupSet"/> is never mutated
+    ///         (the sync writes <c>Name</c>/<c>SourceRoots</c>/<c>JobOptions</c> in
+    ///         place).</item>
+    ///   <item>Normalizes the selection tree: drops the display-only
+    ///         <see cref="SourceSelection.IsExpanded"/> flag (merely expanding a
+    ///         folder is not a change) and sorts children by path (so re-sorting the
+    ///         tree, or the collapsed-vs-expanded serialization difference, doesn't
+    ///         register as a change).</item>
+    /// </list>
+    /// </remarks>
+    private string SnapshotEditorState(BackupSet backupSet, SourceSelectionViewModel vm)
+    {
+        // Clone the set so SyncSettingsToJobOptions doesn't mutate the live one.
+        var probe = new BackupSet
+        {
+            Name = backupSet.Name,
+            JobOptions = backupSet.JobOptions is null
+                ? new JobOptions()
+                : JsonSerializer.Deserialize<JobOptions>(
+                    JsonSerializer.Serialize(backupSet.JobOptions, _jsonOptions),
+                    _jsonOptions) ?? new JobOptions(),
+        };
+        SyncSettingsToJobOptions(probe, vm);
+
+        var payload = new
+        {
+            probe.Name,
+            probe.SourceRoots,
+            probe.JobOptions,
+            Selections = vm.GetSelections()
+                .Select(NormalizeSelectionForSnapshot)
+                .ToList(),
+        };
+        return JsonSerializer.Serialize(payload, _jsonOptions);
+    }
+
+    /// <summary>
+    /// Copy a selection subtree for snapshot comparison, zeroing the display-only
+    /// <see cref="SourceSelection.IsExpanded"/> flag and ordering children by path
+    /// so the comparison reflects only substantive selection changes.
+    /// </summary>
+    private static SourceSelection NormalizeSelectionForSnapshot(SourceSelection s) => new()
+    {
+        Path = s.Path,
+        IsDirectory = s.IsDirectory,
+        IsSelected = s.IsSelected,
+        AutoIncludeNewSubdirectories = s.AutoIncludeNewSubdirectories,
+        IsExpanded = false,
+        Children = s.Children
+            .Select(NormalizeSelectionForSnapshot)
+            .OrderBy(c => c.Path, StringComparer.OrdinalIgnoreCase)
+            .ToList(),
+    };
+
     private static void SyncSettingsToJobOptions(BackupSet backupSet, SourceSelectionViewModel vm)
     {
         var opts = backupSet.JobOptions ?? new JobOptions();

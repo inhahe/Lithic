@@ -1,5 +1,44 @@
 # LithicBackup — Known Issues & Tech Debt
 
+## FIXED: Spurious "unsaved changes" prompt on closing Modify — close prompt now snapshot-diffs instead of trusting the racy dirty flag (2026-07-19)
+
+**Symptom.** Opening a backup set via **Modify**, changing nothing, and closing
+still popped "You have unsaved changes. Save before closing?" Repeatedly patched
+across v1.0.31–v1.0.34 and it kept recurring.
+
+**Cause.** The editor's dirty tracking is **event-based**: catch-all
+`PropertyChanged` + `SelectionChanged` handlers set `_needsSave = true` unless a
+`_dirtyTrackingArmed` gate is off. Init suspends the gate, then `MarkClean()` +
+`ResumeDirtyTracking()` fire once at `ContextIdle` priority (after the first-render
+Mode=TwoWay write-backs). This is fundamentally racy — any programmatic write-back
+that lands *after* that single clean-mark re-dirties the set: lazily-realized
+settings tabs (General/Options/Retention/Schedule) pushing binding write-backs on
+first render, combo `SelectedValue` resolution, tree virtualization revealing
+checkbox columns, async catalog/size stamping, etc. Each prior fix chased one
+straggler; the next UI-churn source re-opened the hole.
+
+**Fix (v1.0.38).** Stop *inferring* dirtiness from event noise for the close
+prompt and instead **compare actual content to a baseline snapshot**
+(`MainViewModel.SnapshotEditorState`). Right after the initial load settles (the
+same `ContextIdle` pass that does `MarkClean` for existing sets) we capture a
+normalized string snapshot of everything the editor can change: the set name, the
+synced `JobOptions`, and the source selections. The snapshot runs
+`SyncSettingsToJobOptions` against a **throwaway clone** of the set (so the live
+one isn't mutated) and normalizes the selection tree — dropping the display-only
+`IsExpanded` flag (merely expanding a folder isn't a change) and sorting children
+by path (so re-sorting the tree, or the collapsed-vs-loaded `ToModel`
+serialization difference, doesn't register). The `dialog.Closing` handler now
+prompts only when **both** the cheap `_needsSave` flag is set (it never *misses* a
+real change) **and** the current snapshot differs from the baseline. The baseline
+is refreshed inside `SaveAllAsync` after every save, so a save-then-stray-event
+close doesn't re-prompt for changes already on disk. New (unsaved) sets keep the
+old always-prompt behavior — they have a real temp record to persist, so their
+baseline stays null. `_needsSave` is still used as-is for the Save button's
+CanExecute (over-enabling the button is harmless; a per-requery snapshot would be
+too costly on large trees). This makes the close prompt immune to spurious
+`PropertyChanged`/selection events rather than playing whack-a-mole with each new
+source of them.
+
 ## FIXED: Upgrade "unable to close all requested applications" — forced shutdown now has a hard-exit watchdog (2026-07-19)
 
 **Symptom.** Running the MSI to upgrade failed again with "The setup was unable to
