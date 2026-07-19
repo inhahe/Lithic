@@ -56,6 +56,19 @@ public partial class App : Application
     /// </summary>
     internal bool IsExiting { get; private set; }
 
+    /// <summary>
+    /// Set when the shutdown is driven by the upgrade installer's Restart-Manager
+    /// signal or a Windows session end (log off / shutdown), as opposed to a
+    /// user-initiated File &gt; Exit / tray Exit. During such a forced shutdown no
+    /// window may show a blocking modal prompt: the upgrade installer waits only a
+    /// bounded time for LithicBackup.exe to exit, so a modal (e.g. the backup-set
+    /// editor's "save unsaved changes?" dialog) would stall <see cref="Application.Shutdown()"/>,
+    /// keep the .exe locked, and make the upgrade fail with "unable to close all
+    /// requested applications." Windows still lets a real File &gt; Exit prompt the
+    /// user, since that path leaves this flag false.
+    /// </summary>
+    internal bool IsForcedShutdown { get; private set; }
+
     protected override async void OnStartup(StartupEventArgs e)
     {
         base.OnStartup(e);
@@ -458,6 +471,7 @@ public partial class App : Application
     protected override void OnSessionEnding(SessionEndingCancelEventArgs e)
     {
         IsExiting = true;
+        IsForcedShutdown = true;
         Shutdown();
         base.OnSessionEnding(e);
     }
@@ -486,6 +500,7 @@ public partial class App : Application
     internal void ShutdownForRestartManager()
     {
         IsExiting = true;
+        IsForcedShutdown = true;
         Shutdown();
     }
 

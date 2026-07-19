@@ -1,5 +1,34 @@
 # LithicBackup — Known Issues & Tech Debt
 
+## FIXED: Upgrade "unable to close all requested applications" when the backup-set editor is open (2026-07-19)
+
+**Symptom.** Running the MSI to upgrade fails with "The setup was unable to
+automatically close all requested applications" — a regression; upgrades
+previously closed the GUI cleanly.
+
+**Cause.** The backup-set editor window's `Closing` handler (MainViewModel, the
+`dialog.Closing += …` for `BackupSetEditorWindow`) pops a modal Yes/No/Cancel
+`MessageBox` whenever the set `HasUnsavedChanges`. The upgrade path asks the GUI
+to close itself via the Restart-Manager IPC signal → `App.ShutdownForRestartManager`
+→ `Application.Shutdown()`, which fires that `Closing` handler. The modal message
+box **blocks the dispatcher**, so `LithicBackup.exe` never exits; the installer
+custom action (`SignalLithicGuiShutdown`) waits only ~15s, then the file-in-use
+check finds the .exe still locked and shows the dialog. The v1.0.30 top-tab
+restructure made this much more likely by falsely marking a set dirty after merely
+viewing a settings tab (fixed separately in v1.0.31), but the underlying flaw is
+that a forced shutdown must never be blockable by a modal prompt.
+
+**Fix (v1.0.32).** Added `App.IsForcedShutdown`, set true in
+`ShutdownForRestartManager` and `OnSessionEnding` (installer signal / Windows
+session end) but NOT for a user-initiated File > Exit / tray Exit. The editor's
+`Closing` handler returns early — no prompt — when `IsForcedShutdown` is set, so
+the window closes and releases the .exe promptly. The `Closed` handler still runs
+the pending best-effort save for existing sets; a user File > Exit still prompts
+about unsaved work. **Bootstrap caveat:** like the shutdown listener itself, this
+only takes effect once the *running* build already contains it — for the upgrade
+that first delivers v1.0.32 the user may still need to close an open editor
+manually (or the in-app updater closes the old GUI); subsequent upgrades are clean.
+
 ## FIXED: Bogus "unsaved changes" prompt after viewing a settings tab in the backup-set editor (2026-07-19)
 
 **Symptom.** Open a backup set in the modify dialog, click one of the settings

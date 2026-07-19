@@ -591,6 +591,17 @@ public class MainViewModel : ViewModelBase
         //   Cancel → stay open
         dialog.Closing += (_, e) =>
         {
+            // A forced shutdown (upgrade installer's Restart-Manager signal or a
+            // Windows session end) must not be blocked by a modal prompt: the
+            // installer waits only ~15s for LithicBackup.exe to exit, so stalling
+            // Application.Shutdown() on this dialog keeps the .exe locked and makes
+            // the upgrade fail with "unable to close all requested applications."
+            // Let the window close; the Closed handler still runs the pending
+            // best-effort save for existing sets (new sets discard their temp
+            // record, which is the right call for an unsaved set during shutdown).
+            if (Application.Current is App { IsForcedShutdown: true })
+                return;
+
             if (!sourceSelection.HasUnsavedChanges)
                 return;
 
