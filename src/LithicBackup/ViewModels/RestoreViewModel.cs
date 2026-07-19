@@ -122,6 +122,18 @@ public class RestoreViewModel : ViewModelBase
         set => SetProperty(ref _isLoading, value);
     }
 
+    /// <summary>
+    /// Live description of what the initial load is doing (e.g. "Loading catalog
+    /// records… 45,000" then "Building file tree…"), shown in the loading overlay
+    /// so a large-set load reads as progress rather than a frozen UI.
+    /// </summary>
+    public string LoadProgressText
+    {
+        get => _loadProgressText;
+        set => SetProperty(ref _loadProgressText, value);
+    }
+    private string _loadProgressText = "";
+
     public bool IsRestoring
     {
         get => _isRestoring;
@@ -176,29 +188,59 @@ public class RestoreViewModel : ViewModelBase
     {
         IsLoading = true;
         StatusText = "Loading files from catalog...";
+        LoadProgressText = "Loading catalog records…";
         Roots.Clear();
         SelectedFileCount = 0;
 
+        // Progress reporters are created here on the UI thread, so their callbacks
+        // marshal back to the UI thread automatically — safe to update bound
+        // properties even though the work below runs on a background thread.
+        var rowProgress = new Progress<int>(n =>
+            LoadProgressText = $"Loading catalog records… {n:N0}");
+        IProgress<string> stageProgress = new Progress<string>(s => LoadProgressText = s);
+
         try
         {
-            var files = await _restoreService.GetRestorableFilesAsync(backupSetId);
+            // The catalog read runs synchronously on the calling thread when the
+            // set DB is uncontended (its async lock completes without suspending),
+            // and building the whole node tree is O(files) CPU work. Both are far
+            // too heavy for the UI thread on a large set — that is exactly what
+            // used to freeze the app with no cursor and no progress. Run the entire
+            // load + tree build on a background thread and hand back only the
+            // finished, not-yet-bound root nodes to attach on the UI thread.
+            var (roots, driveLetters) = await Task.Run(async () =>
+            {
+                var files = await _restoreService
+                    .GetRestorableFilesAsync(backupSetId, default, rowProgress)
+                    .ConfigureAwait(false);
 
-            // Group by source path, show latest version.
-            var latestByPath = files
-                .GroupBy(f => f.Record.SourcePath, StringComparer.OrdinalIgnoreCase)
-                .Select(g => g.OrderByDescending(f => f.Record.BackedUpUtc).First())
-                .OrderBy(f => f.Record.SourcePath, StringComparer.OrdinalIgnoreCase)
-                .ToList();
+                stageProgress.Report("Building file tree…");
 
-            BuildTree(latestByPath);
+                // Group by source path, show latest version.
+                var latestByPath = files
+                    .GroupBy(f => f.Record.SourcePath, StringComparer.OrdinalIgnoreCase)
+                    .Select(g => g.OrderByDescending(f => f.Record.BackedUpUtc).First())
+                    .OrderBy(f => f.Record.SourcePath, StringComparer.OrdinalIgnoreCase)
+                    .ToList();
 
-            // One destination row per distinct source drive.
+                var builtRoots = BuildTree(latestByPath, OnNodeSelectionChanged);
+
+                var drives = latestByPath
+                    .Select(f => GetDriveLetter(f.Record.SourcePath))
+                    .Distinct(StringComparer.OrdinalIgnoreCase)
+                    .OrderBy(d => d, StringComparer.OrdinalIgnoreCase)
+                    .ToList();
+
+                return (builtRoots, drives);
+            });
+
+            // Back on the UI thread: publish the finished tree and drive rows into
+            // the bound collections.
+            foreach (var root in roots)
+                Roots.Add(root);
+
             DriveDestinations.Clear();
-            var drives = latestByPath
-                .Select(f => GetDriveLetter(f.Record.SourcePath))
-                .Distinct(StringComparer.OrdinalIgnoreCase)
-                .OrderBy(d => d, StringComparer.OrdinalIgnoreCase);
-            foreach (var drive in drives)
+            foreach (var drive in driveLetters)
             {
                 var driveVm = new DriveDestinationViewModel(drive);
                 // Re-evaluate the Restore button when a destination is edited.
@@ -208,7 +250,8 @@ public class RestoreViewModel : ViewModelBase
             }
 
             OnPropertyChanged(nameof(IsAllSelected));
-            StatusText = $"{latestByPath.Count:N0} files available for restore.";
+            int fileCount = roots.Sum(CountFiles);
+            StatusText = $"{fileCount:N0} files available for restore.";
         }
         catch (Exception ex)
         {
@@ -217,7 +260,19 @@ public class RestoreViewModel : ViewModelBase
         finally
         {
             IsLoading = false;
+            LoadProgressText = "";
         }
+    }
+
+    /// <summary>Count leaf-file descendants of a node (for the "files available" total).</summary>
+    private static int CountFiles(RestoreNodeViewModel node)
+    {
+        if (!node.IsDirectory)
+            return 1;
+        int total = 0;
+        foreach (var child in node.Children)
+            total += CountFiles(child);
+        return total;
     }
 
     /// <summary>
@@ -226,9 +281,17 @@ public class RestoreViewModel : ViewModelBase
     /// into path segments; directory nodes are created/reused on the way down
     /// and the file is attached as a leaf. Directories sort before files, both
     /// alphabetically. Directory sizes aggregate their descendants.
+    /// <para>
+    /// Pure and self-contained (it only creates nodes and returns the roots,
+    /// touching no bound collection), so it is safe to run on a background thread;
+    /// the caller attaches the returned roots to <see cref="Roots"/> on the UI
+    /// thread once building is complete.
+    /// </para>
     /// </summary>
-    private void BuildTree(IReadOnlyList<RestorableFile> files)
+    private static List<RestoreNodeViewModel> BuildTree(
+        IReadOnlyList<RestorableFile> files, Action onSelectionChanged)
     {
+        var roots = new List<RestoreNodeViewModel>();
         // Map of directory full-path -> node, so repeated prefixes are reused.
         var dirNodes = new Dictionary<string, RestoreNodeViewModel>(StringComparer.OrdinalIgnoreCase);
         var rootNodes = new Dictionary<string, RestoreNodeViewModel>(StringComparer.OrdinalIgnoreCase);
@@ -254,7 +317,7 @@ public class RestoreViewModel : ViewModelBase
                 if (!dirNodes.TryGetValue(accumulated, out var dirNode))
                 {
                     dirNode = new RestoreNodeViewModel(
-                        segments[i], accumulated, i, OnNodeSelectionChanged);
+                        segments[i], accumulated, i, onSelectionChanged);
                     dirNodes[accumulated] = dirNode;
 
                     if (parent is null)
@@ -271,7 +334,7 @@ public class RestoreViewModel : ViewModelBase
             // Leaf file node.
             string fileName = segments[^1];
             var fileNode = new RestoreNodeViewModel(
-                fileName, file, segments.Length - 1, OnNodeSelectionChanged)
+                fileName, file, segments.Length - 1, onSelectionChanged)
             {
                 Parent = parent,
             };
@@ -291,8 +354,10 @@ public class RestoreViewModel : ViewModelBase
             // Expand the top level so the tree isn't a single collapsed row.
             if (root.IsDirectory)
                 root.IsExpanded = true;
-            Roots.Add(root);
+            roots.Add(root);
         }
+
+        return roots;
     }
 
     /// <summary>

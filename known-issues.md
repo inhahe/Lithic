@@ -1,5 +1,41 @@
 # LithicBackup — Known Issues & Tech Debt
 
+## FIXED: Restore froze the UI (no cursor, no progress) while loading a large set (2026-07-19)
+
+**Symptom.** Clicking **Restore** on a backup set froze the whole window for
+several seconds (longer on big sets) with no busy cursor and no progress — it
+looked hung.
+
+**Cause.** `RestoreViewModel` loaded the *entire* catalog file list up front and
+built the whole checkbox tree on the **UI thread**. Two costs stacked there:
+(1) `RestoreService.GetRestorableFilesAsync` reads every file record, and the
+underlying `SqliteSetDatabase` read only truly runs off-thread when its async
+lock actually suspends — when the set DB is uncontended (the normal restore case,
+no backup running) `SemaphoreSlim.WaitAsync` completes synchronously, so
+`ConfigureAwait(false)` never yields and the whole `ExecuteReader` loop ran on the
+caller's (UI) thread; and (2) `BuildTree` then created one `RestoreNodeViewModel`
+per directory/file — O(all files) CPU — also on the UI thread. Both blocked the
+dispatcher, so nothing repainted and no cursor changed.
+
+**Fix (v1.0.35).** Run the whole load — catalog read *and* tree build — on a
+background thread via `Task.Run`, and hand only the finished, not-yet-bound root
+nodes back to the UI thread to attach to the bound `Roots` collection. `BuildTree`
+was made a pure static that returns the roots (it no longer touches any bound
+collection), so it is safe to run off-thread. The loading overlay now shows an
+indeterminate progress bar plus a live phase/count line ("Loading catalog
+records… N" → "Building file tree…") via UI-marshalling `Progress<>` reporters
+(`GetRestorableFilesAsync` gained an optional `IProgress<int> rowProgress`). The
+UI stays fully responsive throughout.
+
+**Not done: true lazy loading.** The user asked whether Restore could load lazily
+"like Modify." Modify's tree lazily enumerates the *live filesystem* on expand;
+Restore's tree is the *catalog's* flat file list, which has no per-directory child
+query, and a directory's restore selection implies all its catalog descendants
+(which lazy loading wouldn't have in memory). Off-threading the build removes the
+freeze without that redesign's selection-semantics complications. Lazy catalog
+paging remains possible future work if very large sets still feel slow to first
+paint.
+
 ## FIXED: Bogus "unsaved changes" prompt when opening Modify and clicking Cancel quickly (2026-07-19)
 
 **Symptom.** Open a set's Modify editor and click **Cancel** within a few seconds,

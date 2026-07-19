@@ -7,8 +7,19 @@ namespace LithicBackup.Core.Interfaces;
 /// </summary>
 public interface IRestoreService
 {
-    /// <summary>List all files in a backup set with their disc locations.</summary>
-    Task<IReadOnlyList<RestorableFile>> GetRestorableFilesAsync(int backupSetId, CancellationToken ct = default);
+    /// <summary>
+    /// List all files in a backup set with their disc locations.
+    /// <para>
+    /// Caution: this reads every file record in the set (potentially hundreds of
+    /// thousands) and the underlying catalog read runs synchronously on the
+    /// calling thread when the set DB is uncontended, so callers on the UI thread
+    /// must invoke it on a background thread to stay responsive.
+    /// <paramref name="rowProgress"/>, if supplied, is reported periodically with
+    /// the running count of records read so a caller can show live progress.
+    /// </para>
+    /// </summary>
+    Task<IReadOnlyList<RestorableFile>> GetRestorableFilesAsync(
+        int backupSetId, CancellationToken ct = default, IProgress<int>? rowProgress = null);
 
     /// <summary>
     /// Restore specific files, routing each to a destination chosen per source

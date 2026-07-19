@@ -30,7 +30,7 @@ public class RestoreService : IRestoreService
     /// List all non-deleted files in a backup set with their disc locations.
     /// </summary>
     public async Task<IReadOnlyList<RestorableFile>> GetRestorableFilesAsync(
-        int backupSetId, CancellationToken ct = default)
+        int backupSetId, CancellationToken ct = default, IProgress<int>? rowProgress = null)
     {
         var discs = await _catalog.GetDiscsForBackupSetAsync(backupSetId, ct);
         var discLookup = discs.ToDictionary(d => d.Id);
@@ -56,9 +56,16 @@ public class RestoreService : IRestoreService
                     Disc = disc,
                     Chunks = chunks,
                 });
+
+                // Reporting every few thousand rows keeps a large-set load (which
+                // can read hundreds of thousands of records over many seconds)
+                // from looking like a hang, without per-row callback overhead.
+                if (rowProgress is not null && results.Count % 5000 == 0)
+                    rowProgress.Report(results.Count);
             }
         }
 
+        rowProgress?.Report(results.Count);
         return results;
     }
 
