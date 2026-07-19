@@ -1,5 +1,45 @@
 # LithicBackup — Known Issues & Tech Debt
 
+## LIMITATION: Continuous mode cannot safely back up always-on databases (needs VSS / app-consistent snapshot) (2026-07-19)
+
+**What.** Continuous-mode backup (the USN/watcher-driven path in
+`BackupWorker.CheckContinuousAsync` → `DirectoryBackupService.ExecuteTargetedAsync`)
+captures changed files by **direct file copy**. That is fine for append-only files
+(`.log`, `.jsonl`) whose mid-write state is a valid prefix, but it is fundamentally
+unsafe for a **live database** (`.db`/`.sqlite`/`.sqlite3`, `.mdf`/`.ldf`, `.accdb`,
+LevelDB, etc.):
+
+- A DB is written **in place at random offsets**, so a copy taken mid-write is
+  **torn / transactionally inconsistent** and may not even open. Unlike a log, a
+  partial is worthless, not a valid prefix.
+- A live DB never goes quiet, so the debounce path never fires; the only trigger
+  would be **max-wait**, and every max-wait capture would be one of these torn copies.
+- In practice the DB is usually held **exclusively locked** while hot, so the copy
+  attempt fails with a sharing violation, lands in the failed-files list (which the
+  continuous path does **not** re-enqueue), and nothing is backed up anyway.
+
+**Current mitigation (by design, not a fix).** Database extensions are deliberately
+**left off** the default finite-max-wait include list (see the debounce/max-wait tier
+feature), so DBs get **infinite max-wait** → they are backed up **only when they go
+quiet** (app closes / connection released / DB detached), which is the only moment a
+file copy of a database is consistent. So an *idle* DB is captured fine; an
+*always-on* DB is effectively skipped rather than backed up as garbage.
+
+**Proper fix (future feature, orthogonal to the tier work).** To back up a live
+database consistently, use an **application-consistent snapshot** instead of a raw
+copy:
+- **VSS (Volume Shadow Copy Service)** — take a shadow copy of the source volume and
+  copy the DB file from the snapshot. Generic (works for any engine), the worker
+  already runs as LocalSystem so it has the privilege, and it also fixes torn copies
+  for *any* locked/continuously-written file, not just databases.
+- or the **engine's own backup API** for the common cases — SQLite Online Backup /
+  `VACUUM INTO`, SQL Server `BACKUP DATABASE` — which produce a guaranteed-consistent
+  copy without a volume snapshot, but require per-engine handling.
+
+VSS is the higher-leverage general answer; the engine APIs are a nicety for
+first-class engines. Either way this is a separate mechanism from the file-copy
+pipeline and is not addressed by the debounce/max-wait tiers.
+
 ## FIXED: Source-tree selection bugs — "All Drives" auto-include reverting + stale full-check on restore (2026-07-18)
 
 **Symptoms (both reported together).**

@@ -1,7 +1,10 @@
+using System.Collections.ObjectModel;
 using System.ComponentModel;
 using System.Globalization;
 using System.Runtime.CompilerServices;
+using System.Text.RegularExpressions;
 using System.Windows;
+using System.Windows.Controls;
 using LithicBackup.Core.Models;
 using LithicBackup.Services;
 
@@ -31,6 +34,196 @@ public partial class SettingsDialog : Window, INotifyPropertyChanged
         _burnInPlace = settings.DiscStagingMode == DiscStagingMode.InPlace;
         _checkForUpdates = settings.CheckForUpdates;
         _reconcileMode = settings.ReconcileMode;
+
+        // Seed the continuous-rule editors from the persisted (or default) rules.
+        LoadContinuousRows(settings.ContinuousRules ?? new ContinuousRules());
+    }
+
+    // ------------------------------------------------------------------
+    // Continuous rules (size-tiered debounce + mask-tiered max-wait)
+    // ------------------------------------------------------------------
+
+    /// <summary>Editable rows for the debounce (settle-time-by-size) grid.</summary>
+    public ObservableCollection<DebounceTierRow> DebounceRows { get; } = new();
+
+    /// <summary>Editable rows for the max-wait (by-name/path-mask) grid.</summary>
+    public ObservableCollection<MaxWaitTierRow> MaxWaitRows { get; } = new();
+
+    private void LoadContinuousRows(ContinuousRules rules)
+    {
+        DebounceRows.Clear();
+        foreach (var tier in rules.DebounceTiers ?? new())
+        {
+            DebounceRows.Add(new DebounceTierRow
+            {
+                SizeText = FormatSize(tier.MaxSizeBytes),
+                DebounceText = FormatSeconds(tier.DebounceSeconds),
+            });
+        }
+
+        MaxWaitRows.Clear();
+        foreach (var tier in rules.MaxWaitTiers ?? new())
+        {
+            MaxWaitRows.Add(new MaxWaitTierRow
+            {
+                Name = tier.Name ?? "",
+                IncludeText = string.Join(", ", tier.IncludeMasks ?? new()),
+                ExcludeText = string.Join(", ", tier.ExcludeMasks ?? new()),
+                MaxWaitText = tier.MaxWaitSeconds > 0 ? tier.MaxWaitSeconds.ToString(CultureInfo.CurrentCulture) : "",
+            });
+        }
+    }
+
+    private void AddDebounceRow_Click(object sender, RoutedEventArgs e) =>
+        DebounceRows.Add(new DebounceTierRow());
+
+    private void RemoveDebounceRow_Click(object sender, RoutedEventArgs e)
+    {
+        if (sender is FrameworkElement { DataContext: DebounceTierRow row })
+            DebounceRows.Remove(row);
+    }
+
+    private void AddMaxWaitRow_Click(object sender, RoutedEventArgs e) =>
+        MaxWaitRows.Add(new MaxWaitTierRow());
+
+    private void RemoveMaxWaitRow_Click(object sender, RoutedEventArgs e)
+    {
+        if (sender is FrameworkElement { DataContext: MaxWaitTierRow row })
+            MaxWaitRows.Remove(row);
+    }
+
+    private void RestoreContinuousDefaults_Click(object sender, RoutedEventArgs e) =>
+        LoadContinuousRows(new ContinuousRules());
+
+    /// <summary>Build a <see cref="ContinuousRules"/> from the current editor rows.</summary>
+    private ContinuousRules BuildContinuousRules()
+    {
+        var debounce = new List<DebounceSizeTier>();
+        foreach (var row in DebounceRows)
+        {
+            // A row needs a settle value to be meaningful; skip fully blank rows.
+            if (!TryParseSeconds(row.DebounceText, out var seconds))
+                continue;
+            debounce.Add(new DebounceSizeTier
+            {
+                MaxSizeBytes = ParseSize(row.SizeText),
+                DebounceSeconds = seconds,
+            });
+        }
+        // Resolution walks tiers smallest-first, so persist them sorted regardless
+        // of the order the user arranged the rows in.
+        debounce.Sort((a, b) => a.MaxSizeBytes.CompareTo(b.MaxSizeBytes));
+
+        var maxWait = new List<MaxWaitMaskTier>();
+        foreach (var row in MaxWaitRows)
+        {
+            var includes = SplitMasks(row.IncludeText);
+            // A tier with no include masks can never match — drop it.
+            if (includes.Count == 0)
+                continue;
+            maxWait.Add(new MaxWaitMaskTier
+            {
+                Name = (row.Name ?? "").Trim(),
+                IncludeMasks = includes,
+                ExcludeMasks = SplitMasks(row.ExcludeText),
+                MaxWaitSeconds = int.TryParse(row.MaxWaitText, NumberStyles.Integer,
+                    CultureInfo.CurrentCulture, out var s) && s > 0 ? s : 0,
+            });
+        }
+
+        return new ContinuousRules { DebounceTiers = debounce, MaxWaitTiers = maxWait };
+    }
+
+    private static List<string> SplitMasks(string? text)
+    {
+        if (string.IsNullOrWhiteSpace(text))
+            return new();
+        return text
+            .Split(new[] { ',', ';', ' ', '\t', '\n', '\r' }, StringSplitOptions.RemoveEmptyEntries)
+            .Select(m => m.Trim())
+            .Where(m => m.Length > 0)
+            .ToList();
+    }
+
+    private static string FormatSeconds(double seconds)
+    {
+        // Show 0.5 not 0.50, and 3 not 3.0.
+        return seconds.ToString("0.###", CultureInfo.CurrentCulture);
+    }
+
+    private static bool TryParseSeconds(string? text, out double seconds)
+    {
+        seconds = 0;
+        if (string.IsNullOrWhiteSpace(text))
+            return false;
+        return double.TryParse(text.Trim(), NumberStyles.Float, CultureInfo.CurrentCulture, out seconds)
+               && seconds >= 0;
+    }
+
+    /// <summary>Format a byte count as a friendly size; the catch-all tier
+    /// (<see cref="long.MaxValue"/>) renders as blank ("everything larger").</summary>
+    private static string FormatSize(long bytes)
+    {
+        if (bytes >= long.MaxValue)
+            return "";
+        if (bytes <= 0)
+            return "0";
+        string[] units = { "B", "KB", "MB", "GB", "TB" };
+        double b = bytes;
+        int u = 0;
+        while (b >= 1024 && u < units.Length - 1)
+        {
+            b /= 1024;
+            u++;
+        }
+        return $"{b.ToString("0.###", CultureInfo.CurrentCulture)} {units[u]}";
+    }
+
+    /// <summary>Parse a friendly size ("1 MB", "500 KB", "2.5 GB", "1048576").
+    /// Blank means the catch-all tier (<see cref="long.MaxValue"/>).</summary>
+    private static long ParseSize(string? text)
+    {
+        if (string.IsNullOrWhiteSpace(text))
+            return long.MaxValue;
+
+        var m = Regex.Match(text.Trim(), @"^\s*([0-9]*\.?[0-9]+)\s*([a-zA-Z]*)\s*$");
+        if (!m.Success)
+            return long.MaxValue;
+
+        if (!double.TryParse(m.Groups[1].Value, NumberStyles.Float, CultureInfo.InvariantCulture, out var val)
+            && !double.TryParse(m.Groups[1].Value, NumberStyles.Float, CultureInfo.CurrentCulture, out val))
+            return long.MaxValue;
+
+        long mult = m.Groups[2].Value.ToUpperInvariant() switch
+        {
+            "" or "B" => 1L,
+            "K" or "KB" => 1024L,
+            "M" or "MB" => 1024L * 1024,
+            "G" or "GB" => 1024L * 1024 * 1024,
+            "T" or "TB" => 1024L * 1024 * 1024 * 1024,
+            _ => 1L,
+        };
+
+        double bytes = val * mult;
+        if (bytes >= long.MaxValue)
+            return long.MaxValue;
+        return (long)bytes;
+    }
+
+    /// <summary>One row in the debounce (settle-time-by-size) editor.</summary>
+    public sealed class DebounceTierRow
+    {
+        public string SizeText { get; set; } = "";
+        public string DebounceText { get; set; } = "";
+    }
+
+    /// <summary>One row in the max-wait (by-name/path-mask) editor.</summary>
+    public sealed class MaxWaitTierRow
+    {
+        public string Name { get; set; } = "";
+        public string IncludeText { get; set; } = "";
+        public string ExcludeText { get; set; } = "";
+        public string MaxWaitText { get; set; } = "";
     }
 
     private bool _isAuto;
@@ -208,6 +401,7 @@ public partial class SettingsDialog : Window, INotifyPropertyChanged
         _settings.DiscStagingMode = _burnInPlace
             ? DiscStagingMode.InPlace
             : DiscStagingMode.TemporaryCopy;
+        _settings.ContinuousRules = BuildContinuousRules();
         _settings.Save();
         DialogResult = true;
         Close();

@@ -230,6 +230,73 @@
         </Setter>
     </Style>
 
+    <!-- ==========================================================
+         Tabbed pages (used by the Settings dialog). Flat underline
+         tabs on the light palette: selected tab gets a primary
+         underline + darker semibold label; the content area is a
+         plain transparent panel (no boxed border).
+         ========================================================== -->
+    <Style TargetType="TabControl">
+        <Setter Property="Background" Value="Transparent" />
+        <Setter Property="BorderThickness" Value="0" />
+        <Setter Property="Template">
+            <Setter.Value>
+                <ControlTemplate TargetType="TabControl">
+                    <Grid>
+                        <Grid.RowDefinitions>
+                            <RowDefinition Height="Auto" />
+                            <RowDefinition Height="*" />
+                        </Grid.RowDefinitions>
+                        <Border Grid.Row="0"
+                                BorderBrush="{StaticResource BorderBrush}"
+                                BorderThickness="0,0,0,1">
+                            <TabPanel IsItemsHost="True" Margin="0,0,0,-1" />
+                        </Border>
+                        <ContentPresenter Grid.Row="1"
+                                          ContentSource="SelectedContent"
+                                          Margin="0,16,0,0" />
+                    </Grid>
+                </ControlTemplate>
+            </Setter.Value>
+        </Setter>
+    </Style>
+
+    <Style TargetType="TabItem">
+        <Setter Property="Foreground" Value="{StaticResource TextSecondaryBrush}" />
+        <Setter Property="FontSize" Value="14" />
+        <Setter Property="FontWeight" Value="Medium" />
+        <Setter Property="Cursor" Value="Hand" />
+        <Setter Property="Template">
+            <Setter.Value>
+                <ControlTemplate TargetType="TabItem">
+                    <Border x:Name="Bd"
+                            Background="Transparent"
+                            Padding="14,8"
+                            BorderBrush="Transparent"
+                            BorderThickness="0,0,0,2">
+                        <ContentPresenter ContentSource="Header"
+                                          HorizontalAlignment="Center"
+                                          VerticalAlignment="Center" />
+                    </Border>
+                    <ControlTemplate.Triggers>
+                        <Trigger Property="IsSelected" Value="True">
+                            <Setter TargetName="Bd" Property="BorderBrush" Value="{StaticResource PrimaryBrush}" />
+                            <Setter Property="Foreground" Value="{StaticResource PrimaryDarkBrush}" />
+                            <Setter Property="FontWeight" Value="SemiBold" />
+                        </Trigger>
+                        <MultiTrigger>
+                            <MultiTrigger.Conditions>
+                                <Condition Property="IsSelected" Value="False" />
+                                <Condition Property="IsMouseOver" Value="True" />
+                            </MultiTrigger.Conditions>
+                            <Setter Property="Foreground" Value="{StaticResource TextPrimaryBrush}" />
+                        </MultiTrigger>
+                    </ControlTemplate.Triggers>
+                </ControlTemplate>
+            </Setter.Value>
+        </Setter>
+    </Style>
+
     <Style TargetType="ComboBox">
         <Setter Property="Foreground" Value="{StaticResource TextPrimaryBrush}" />
         <Setter Property="FontSize" Value="13" />

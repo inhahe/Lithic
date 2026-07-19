@@ -590,10 +590,14 @@
                                      BorderBrush="{StaticResource BorderBrush}"
                                      ToolTip="Minute (0-59)" />
                         </StackPanel>
-                        <!-- Continuous -->
-                        <StackPanel Orientation="Horizontal" Margin="0,0,0,4">
-                            <StackPanel.Style>
-                                <Style TargetType="StackPanel">
+                        <!-- Continuous: settle time (debounce) and max-wait are now
+                             machine-global rules (Settings ▸ Continuous), tiered by
+                             file size and by name/path mask, so they aren't set here
+                             per set. -->
+                        <TextBlock Margin="0,0,0,4" TextWrapping="Wrap"
+                                   Foreground="{StaticResource TextSecondaryBrush}" FontSize="11">
+                            <TextBlock.Style>
+                                <Style TargetType="TextBlock">
                                     <Setter Property="Visibility" Value="Collapsed" />
                                     <Style.Triggers>
                                         <DataTrigger Binding="{Binding ScheduleMode}" Value="Continuous">
@@ -601,35 +605,9 @@
                                         </DataTrigger>
                                     </Style.Triggers>
                                 </Style>
-                            </StackPanel.Style>
-                            <TextBlock Text="Wait" VerticalAlignment="Center" Margin="0,0,6,0" />
-                            <TextBox Text="{Binding ScheduleDebounceSeconds, UpdateSourceTrigger=PropertyChanged}"
-                                     Padding="4,3" Width="60"
-                                     BorderBrush="{StaticResource BorderBrush}"
-                                     ToolTip="Seconds a file must be quiet after its last change before it is backed up (debounce)." />
-                            <TextBlock Text="seconds after last change"
-                                       VerticalAlignment="Center" Margin="6,0,0,0" />
-                        </StackPanel>
-                        <!-- Continuous max-wait cap -->
-                        <StackPanel Orientation="Horizontal" Margin="0,0,0,4">
-                            <StackPanel.Style>
-                                <Style TargetType="StackPanel">
-                                    <Setter Property="Visibility" Value="Collapsed" />
-                                    <Style.Triggers>
-                                        <DataTrigger Binding="{Binding ScheduleMode}" Value="Continuous">
-                                            <Setter Property="Visibility" Value="Visible" />
-                                        </DataTrigger>
-                                    </Style.Triggers>
-                                </Style>
-                            </StackPanel.Style>
-                            <TextBlock Text="But back up at least every" VerticalAlignment="Center" Margin="0,0,6,0" />
-                            <TextBox Text="{Binding ScheduleMaxWaitSeconds, UpdateSourceTrigger=PropertyChanged}"
-                                     Padding="4,3" Width="60"
-                                     BorderBrush="{StaticResource BorderBrush}"
-                                     ToolTip="Cap on how long an actively-changing file may go unversioned. The debounce above never fires while a file keeps changing, so this guarantees a file you keep editing still gets a version this often. If lower than the debounce it wins, giving one version this often during a long editing burst. Default 300 (5 minutes)." />
-                            <TextBlock Text="seconds while still changing"
-                                       VerticalAlignment="Center" Margin="6,0,0,0" />
-                        </StackPanel>
+                            </TextBlock.Style>
+                            <Run Text="Settle time and the max-wait cap are configured globally in Settings ▸ Continuous (tiered by file size and by name/path mask)." />
+                        </TextBlock>
                         <!-- Continuous poll interval -->
                         <StackPanel Orientation="Horizontal" Margin="0,0,0,4">
                             <StackPanel.Style>
