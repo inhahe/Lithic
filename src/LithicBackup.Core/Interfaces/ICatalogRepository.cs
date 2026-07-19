@@ -171,6 +171,47 @@ public interface ICatalogRepository : IDisposable
     /// </summary>
     Task<IReadOnlyList<FileRecord>> GetActiveRecordsByHashAsync(int backupSetId, string hash, CancellationToken ct = default);
 
+    // --- Lazy restore browser ---
+
+    /// <summary>
+    /// List the <b>direct</b> children (immediate subdirectories and files that
+    /// live directly under the given directory) of <paramref name="parentPrefix"/>
+    /// among the set's active (non-deleted) files, latest version per file.  Pass
+    /// an empty string to list the top-level roots (source drives).  Implemented as
+    /// a loose-index skip-scan over <c>IX_Files_Active_SourcePath_NoCase</c> so the
+    /// cost is O(direct children) index seeks rather than O(subtree) — this is what
+    /// lets the restore tree expand a node without loading its whole subtree (or the
+    /// whole catalog) up front.  Results are sorted directories-first, then by name.
+    /// </summary>
+    Task<IReadOnlyList<RestoreTreeChild>> GetRestoreChildrenAsync(
+        int backupSetId, string parentPrefix, CancellationToken ct = default);
+
+    /// <summary>
+    /// Count of distinct active (non-deleted) source paths at or below
+    /// <paramref name="directoryPrefix"/>, and the sum of their latest-version
+    /// sizes.  Used by the lazy restore browser to show a checked directory's file
+    /// count (and optional aggregate size) without materialising its subtree.
+    /// </summary>
+    Task<(int FileCount, long TotalBytes)> GetActiveSubtreeStatsAsync(
+        int backupSetId, string directoryPrefix, CancellationToken ct = default);
+
+    /// <summary>
+    /// The latest active (non-deleted) file record for each distinct source path at
+    /// or below <paramref name="directoryPrefix"/>.  Used at restore time to expand
+    /// a fully-selected directory into the concrete files to restore, reading only
+    /// the selected subtree rather than the whole catalog.
+    /// </summary>
+    Task<IReadOnlyList<FileRecord>> GetActiveLatestRecordsUnderPrefixAsync(
+        int backupSetId, string directoryPrefix, CancellationToken ct = default);
+
+    /// <summary>
+    /// The latest active (non-deleted) file record for one exact source path, or
+    /// null if the path has no active record.  Used at restore time to resolve an
+    /// individually-selected file leaf.
+    /// </summary>
+    Task<FileRecord?> GetActiveLatestRecordByPathAsync(
+        int backupSetId, string sourcePath, CancellationToken ct = default);
+
     // --- Bad disc management ---
     Task MarkDiscAsBadAsync(int discId, CancellationToken ct = default);
     Task<IReadOnlyList<FileRecord>> GetFilesForReplacementAsync(int badDiscId, CancellationToken ct = default);

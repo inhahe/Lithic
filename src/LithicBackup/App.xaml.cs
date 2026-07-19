@@ -49,12 +49,42 @@ public partial class App : Application
     private EventWaitHandle? _shutdownSignalEvent;
     private RegisteredWaitHandle? _shutdownSignalWait;
 
+    // --- Forced-shutdown watchdog ---
+    // A graceful Application.Shutdown() can be blocked indefinitely by ANY open
+    // modal — the owner-less "Destination Drive Full" MessageBox (which can hide
+    // behind other windows or sit on a second monitor), a crash-handler dialog, an
+    // About/Settings/editor dialog — or by a wedged/busy dispatcher. That keeps
+    // LithicBackup.exe locked past the installer's bounded wait and resurrects the
+    // "The setup was unable to automatically close all requested applications"
+    // upgrade failure. When the upgrade signals us to close we still try a clean
+    // shutdown first, but also arm this watchdog on a plain background thread: if
+    // the process is still alive after a short grace period, hard-exit so the .exe
+    // is released. A process can always terminate ITSELF regardless of integrity
+    // level, so this needs no elevation. Only armed for a forced shutdown (installer
+    // signal / session end), never for a user File > Exit, so it can never cut short
+    // a normal quit or its unsaved-changes prompt.
+    private const double ForcedShutdownGraceSeconds = 5.0;
+    private int _forcedShutdownWatchdogArmed;
+
     /// <summary>
     /// Set when the user chooses Exit from the tray menu.
     /// Allows <see cref="MainWindow.OnClosing"/> to distinguish
     /// a real shutdown from the X button (which minimizes to tray).
     /// </summary>
     internal bool IsExiting { get; private set; }
+
+    /// <summary>
+    /// Set when the shutdown is driven by the upgrade installer's Restart-Manager
+    /// signal or a Windows session end (log off / shutdown), as opposed to a
+    /// user-initiated File &gt; Exit / tray Exit. During such a forced shutdown no
+    /// window may show a blocking modal prompt: the upgrade installer waits only a
+    /// bounded time for LithicBackup.exe to exit, so a modal (e.g. the backup-set
+    /// editor's "save unsaved changes?" dialog) would stall <see cref="Application.Shutdown()"/>,
+    /// keep the .exe locked, and make the upgrade fail with "unable to close all
+    /// requested applications." Windows still lets a real File &gt; Exit prompt the
+    /// user, since that path leaves this flag false.
+    /// </summary>
+    internal bool IsForcedShutdown { get; private set; }
 
     protected override async void OnStartup(StartupEventArgs e)
     {
@@ -180,7 +210,15 @@ public partial class App : Application
                 eventSecurity: shutdownSecurity);
             _shutdownSignalWait = ThreadPool.RegisterWaitForSingleObject(
                 _shutdownSignalEvent,
-                (_, _) => Current?.Dispatcher.BeginInvoke(new Action(ShutdownForRestartManager)),
+                (_, _) =>
+                {
+                    // Runs on a thread-pool thread, so it fires even if the UI
+                    // dispatcher is wedged. Arm the hard-exit watchdog FIRST, then
+                    // request the graceful shutdown — the watchdog only fires if that
+                    // graceful path hasn't ended the process within the grace window.
+                    ArmForcedShutdownWatchdog();
+                    Current?.Dispatcher.BeginInvoke(new Action(ShutdownForRestartManager));
+                },
                 state: null,
                 millisecondsTimeOutInterval: Timeout.Infinite,
                 executeOnlyOnce: true);
@@ -458,6 +496,8 @@ public partial class App : Application
     protected override void OnSessionEnding(SessionEndingCancelEventArgs e)
     {
         IsExiting = true;
+        IsForcedShutdown = true;
+        ArmForcedShutdownWatchdog();
         Shutdown();
         base.OnSessionEnding(e);
     }
@@ -486,7 +526,41 @@ public partial class App : Application
     internal void ShutdownForRestartManager()
     {
         IsExiting = true;
+        IsForcedShutdown = true;
+        ArmForcedShutdownWatchdog();
         Shutdown();
+    }
+
+    /// <summary>
+    /// Guarantee the process (and its lock on LithicBackup.exe) is released for an
+    /// upgrade even if the graceful <see cref="Application.Shutdown()"/> is blocked
+    /// by an open modal or a busy/wedged dispatcher. Starts a one-shot background
+    /// thread that hard-exits after <see cref="ForcedShutdownGraceSeconds"/> if the
+    /// process is still alive; a clean shutdown that completes first makes it moot
+    /// (the process is already gone before the timer elapses). Idempotent — safe to
+    /// call from every forced-shutdown entry point. See the field-level comment on
+    /// <see cref="_forcedShutdownWatchdogArmed"/> for why this needs no elevation.
+    /// </summary>
+    private void ArmForcedShutdownWatchdog()
+    {
+        if (Interlocked.Exchange(ref _forcedShutdownWatchdogArmed, 1) != 0)
+            return; // already armed by an earlier forced-shutdown entry point
+
+        var watchdog = new Thread(() =>
+        {
+            Thread.Sleep(TimeSpan.FromSeconds(ForcedShutdownGraceSeconds));
+            // If the graceful shutdown already ran, the process is gone and this
+            // line never executes. Otherwise force the .exe free for the upgrade.
+            CrashLogger.Log(null,
+                "Forced-shutdown watchdog: graceful shutdown did not complete within " +
+                ForcedShutdownGraceSeconds + "s (likely blocked by a modal); hard-exiting to release the executable for the upgrade.");
+            Environment.Exit(0);
+        })
+        {
+            IsBackground = true,
+            Name = "ForcedShutdownWatchdog",
+        };
+        watchdog.Start();
     }
 
     /// <summary>

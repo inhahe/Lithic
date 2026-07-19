@@ -48,16 +48,6 @@ public sealed class BackupWorker : BackgroundService
     /// can't spin the worker loop into a busy-poll.</summary>
     private static readonly TimeSpan MinPollInterval = TimeSpan.FromSeconds(5);
 
-    /// <summary>
-    /// Default upper bound on how long a continuous-mode change may stay pending
-    /// before it is backed up regardless of ongoing activity. Prevents a
-    /// constantly-written file (e.g. an active log) from starving its own
-    /// debounce window. Overridable per set via
-    /// <see cref="BackupSchedule.MaxWaitSeconds"/>; this value is the fallback
-    /// when a set leaves it at 0 (or an out-of-range value).
-    /// </summary>
-    private static readonly TimeSpan DefaultMaxContinuousWait = TimeSpan.FromMinutes(5);
-
     /// <summary>Per-set tracking state.</summary>
     private readonly ConcurrentDictionary<int, SetState> _sets = new();
 
@@ -68,6 +58,25 @@ public sealed class BackupWorker : BackgroundService
     /// <see cref="_fsMonitor"/> fallback instead.
     /// </summary>
     private readonly Dictionary<char, UsnJournalReader?> _journalReaders = new();
+
+    /// <summary>
+    /// Per-volume USN journal <em>push</em> waiters, keyed by drive letter. Each
+    /// blocks on the volume's journal and calls <see cref="SignalWake"/> the instant
+    /// the volume changes, so the loop reacts immediately instead of waiting out the
+    /// poll interval. Only created for drives whose journal a reader has already
+    /// opened (see <see cref="SyncJournalWaiters"/>); the periodic poll remains the
+    /// correctness backstop, so a volume without a waiter is still covered, just with
+    /// higher latency. Mutated only on the poll thread.
+    /// </summary>
+    private readonly Dictionary<char, UsnJournalWaiter> _journalWaiters = new();
+
+    /// <summary>
+    /// One-permit gate the loop waits on between cycles. A USN push waiter (or any
+    /// other early-wake source) releases it to cut the current sleep short; extra
+    /// releases collapse to a single pending wake (auto-reset semantics), so a burst
+    /// of changes wakes the loop exactly once.
+    /// </summary>
+    private readonly SemaphoreSlim _wake = new(0, 1);
 
     /// <summary>
     /// FileSystemWatcher-based fallback for volumes without a usable USN journal
@@ -104,6 +113,15 @@ public sealed class BackupWorker : BackgroundService
     /// <summary>Only one backup runs at a time.</summary>
     private readonly SemaphoreSlim _backupLock = new(1, 1);
 
+    /// <summary>
+    /// Machine-global continuous-backup timing rules (size-tiered debounce +
+    /// mask-tiered max-wait), reloaded from <see cref="UserSettings"/> at the top
+    /// of every poll cycle so edits in the GUI take effect without a restart.
+    /// These replace the old per-set <c>DebounceSeconds</c>/<c>MaxWaitSeconds</c>
+    /// fields (kept on <see cref="BackupSchedule"/> only for back-compat).
+    /// </summary>
+    private ContinuousRules _rules = new();
+
     public BackupWorker(
         ILogger<BackupWorker> logger,
         ICatalogRepository catalog,
@@ -118,9 +136,18 @@ public sealed class BackupWorker : BackgroundService
         _sourceResolver = sourceResolver;
 
         // Watcher events arrive on thread-pool threads; buffer them and let the
-        // poll loop route them, so per-set state stays single-threaded.
-        _fsMonitor.FileChanged += (_, e) => _fswChanges.Enqueue((e.FullPath, e.ChangeType));
-        _fsMonitor.Overflow += (_, e) => _fswOverflows.Enqueue(e.Root);
+        // poll loop route them, so per-set state stays single-threaded. Waking the
+        // loop makes the non-NTFS fallback push-driven too, matching the USN path.
+        _fsMonitor.FileChanged += (_, e) =>
+        {
+            _fswChanges.Enqueue((e.FullPath, e.ChangeType));
+            SignalWake();
+        };
+        _fsMonitor.Overflow += (_, e) =>
+        {
+            _fswOverflows.Enqueue(e.Root);
+            SignalWake();
+        };
     }
 
     /// <summary>
@@ -209,6 +236,10 @@ public sealed class BackupWorker : BackgroundService
                     await ReloadBackupSetsAsync(stoppingToken);
                     await CheckSchedulesAsync(stoppingToken);
                     await CheckContinuousAsync(stoppingToken);
+
+                    // Keep the set of USN push waiters in sync with the active
+                    // continuous volumes so a change wakes the loop immediately.
+                    SyncJournalWaiters();
                 }
                 catch (OperationCanceledException) when (stoppingToken.IsCancellationRequested)
                 {
@@ -219,11 +250,24 @@ public sealed class BackupWorker : BackgroundService
                     _logger.LogError(ex, "Error in worker loop.");
                 }
 
-                await Task.Delay(ComputeEffectivePollInterval(), stoppingToken);
+                // Wait until the next deadline, or until a push waiter reports a
+                // change (whichever comes first). Draining the gate here also
+                // clears any signal that fired during processing above.
+                try
+                {
+                    await _wake.WaitAsync(ComputeNextWakeDelay(DateTime.UtcNow), stoppingToken);
+                }
+                catch (OperationCanceledException) when (stoppingToken.IsCancellationRequested)
+                {
+                    break;
+                }
             }
         }
         finally
         {
+            foreach (var waiter in _journalWaiters.Values)
+                waiter.Dispose();
+            _journalWaiters.Clear();
             foreach (var reader in _journalReaders.Values)
                 reader?.Dispose();
             _journalReaders.Clear();
@@ -241,6 +285,10 @@ public sealed class BackupWorker : BackgroundService
     /// </summary>
     private async Task ReloadBackupSetsAsync(CancellationToken ct)
     {
+        // Refresh machine-global continuous timing rules so GUI edits (size-tiered
+        // debounce, mask-tiered max-wait) apply on the next poll without a restart.
+        _rules = UserSettings.Load().ContinuousRules ?? new();
+
         var allSets = await _catalog.GetAllBackupSetsAsync(ct);
         var seen = new HashSet<int>();
 
@@ -377,6 +425,132 @@ public sealed class BackupWorker : BackgroundService
         }
 
         return effective < MinPollInterval ? MinPollInterval : effective;
+    }
+
+    /// <summary>
+    /// Release the loop's wake gate so the current between-cycle wait ends early.
+    /// Called from USN push-waiter threads, so it must stay cheap and thread-safe;
+    /// extra releases while a permit is already pending are swallowed (auto-reset).
+    /// </summary>
+    private void SignalWake()
+    {
+        try { _wake.Release(); }
+        catch (SemaphoreFullException) { /* a wake is already pending — coalesce */ }
+    }
+
+    /// <summary>
+    /// The delay before the next loop cycle: the periodic backstop cadence
+    /// (<see cref="ComputeEffectivePollInterval"/>) shortened to the nearest pending
+    /// debounce / max-wait deadline so queued continuous changes are backed up on
+    /// time rather than at the next poll. Push waiters can cut this short further by
+    /// releasing the wake gate. Floored so a burst of same-tick changes can't spin
+    /// the loop.
+    /// </summary>
+    private TimeSpan ComputeNextWakeDelay(DateTime nowUtc)
+    {
+        var delay = ComputeEffectivePollInterval();
+
+        foreach (var state in _sets.Values)
+        {
+            if (!state.IsActive
+                || state.BackupSet.JobOptions?.Schedule is not { Mode: ScheduleMode.Continuous })
+                continue;
+
+            // Moves and pending reconciles are applied each cycle but gated on the
+            // backup lock / destination availability, so retry them soon.
+            if (state.NeedsReconcile || state.PendingMoves.Count > 0)
+            {
+                if (delay > MinPollInterval)
+                    delay = MinPollInterval;
+            }
+
+            if (state.Pending.Count == 0)
+                continue;
+
+            foreach (var (path, t) in state.Pending)
+            {
+                // Debounce window depends on the file's current size (bigger files
+                // demand a longer quiet period); max-wait depends on its name/path
+                // mask, and may be infinite (no cap) — in which case only the
+                // debounce deadline bounds the wake.
+                var debounce = TimeSpan.FromSeconds(_rules.ResolveDebounceSeconds(GetFileSizeSafe(path)));
+                var deadline = (t.Last + debounce) - nowUtc;
+
+                if (_rules.ResolveMaxWaitSeconds(path) is int maxWaitSec)
+                {
+                    var byMaxWait = (t.First + TimeSpan.FromSeconds(maxWaitSec)) - nowUtc;
+                    if (byMaxWait < deadline)
+                        deadline = byMaxWait;
+                }
+
+                if (deadline < delay)
+                    delay = deadline;
+            }
+        }
+
+        // Floor: avoid a busy loop when many items land in the same tick (their
+        // deadlines can already be in the past). A quarter-second is imperceptible
+        // for backup latency yet bounds journal re-reads under sustained churn.
+        var floor = TimeSpan.FromMilliseconds(250);
+        return delay < floor ? floor : delay;
+    }
+
+    /// <summary>
+    /// Start/stop per-volume USN push waiters so they cover exactly the drive
+    /// letters used by currently-active continuous sets whose journal is usable.
+    /// Poll-thread only (touches the journal-reader and waiter caches). A waiter
+    /// wakes the loop the instant its volume changes; the periodic poll still runs
+    /// as the correctness backstop, so a volume without a waiter (non-NTFS, or one
+    /// whose waiter failed to open) is simply served at poll latency instead.
+    /// </summary>
+    private void SyncJournalWaiters()
+    {
+        var desired = new HashSet<char>();
+
+        foreach (var state in _sets.Values)
+        {
+            if (!state.IsActive
+                || state.BackupSet.JobOptions?.Schedule is not { Mode: ScheduleMode.Continuous })
+                continue;
+
+            foreach (var root in state.WatchRoots)
+            {
+                var drive = GetDriveLetter(root);
+                if (drive == '\0')
+                    continue;
+
+                // Only NTFS volumes with a usable journal get a push waiter; the
+                // rest fall back to the FileSystemWatcher path (already event-driven).
+                if (GetJournalReader(drive) is not null)
+                    desired.Add(drive);
+            }
+        }
+
+        // Tear down waiters whose volume is no longer active.
+        foreach (var drive in _journalWaiters.Keys.ToList())
+        {
+            if (!desired.Contains(drive))
+            {
+                _journalWaiters[drive].Dispose();
+                _journalWaiters.Remove(drive);
+            }
+        }
+
+        // Bring up waiters for newly-active volumes.
+        foreach (var drive in desired)
+        {
+            if (_journalWaiters.ContainsKey(drive))
+                continue;
+
+            var waiter = UsnJournalWaiter.TryOpen(drive, SignalWake);
+            if (waiter is not null)
+            {
+                _journalWaiters[drive] = waiter;
+                _logger.LogInformation(
+                    "USN push notifications enabled on {Drive}: — continuous changes now wake " +
+                    "the worker immediately instead of waiting for the next poll.", drive);
+            }
+        }
     }
 
     private async Task CheckContinuousAsync(CancellationToken ct)
@@ -578,21 +752,28 @@ public sealed class BackupWorker : BackgroundService
             if (state.NeedsReconcile || state.Pending.Count == 0)
                 continue;
 
-            var schedule = state.BackupSet.JobOptions!.Schedule!;
             var ready = new List<string>();
-
-            // Per-set cap on how long an actively-changing file may stay pending
-            // before it is versioned anyway; falls back to the default when the
-            // set leaves it unset (0) or supplies a nonsensical negative value.
-            var maxWait = schedule.MaxWaitSeconds > 0
-                ? TimeSpan.FromSeconds(schedule.MaxWaitSeconds)
-                : DefaultMaxContinuousWait;
 
             foreach (var (path, t) in state.Pending.ToList())
             {
+                // Size-tiered debounce: a file is ready once it has been quiet for
+                // its size's window (bigger files demand more quiet, since a false
+                // trigger mid-write costs a larger wasted copy). Mask-tiered
+                // max-wait: an ever-changing file whose name/path opts in (logs,
+                // append-only session files) is versioned anyway after its cap;
+                // a file matching no max-wait tier has an infinite cap and is only
+                // copied once it settles via debounce.
+                long size = GetFileSizeSafe(path);
+                var debounceSeconds = _rules.ResolveDebounceSeconds(size);
+                int? maxWaitSeconds = _rules.ResolveMaxWaitSeconds(path);
+
                 var quiet = now - t.Last;
                 var waited = now - t.First;
-                if (quiet.TotalSeconds >= schedule.DebounceSeconds || waited >= maxWait)
+
+                bool isReady = quiet.TotalSeconds >= debounceSeconds
+                               || (maxWaitSeconds is int mw && waited.TotalSeconds >= mw);
+
+                if (isReady)
                 {
                     ready.Add(path);
                     state.Pending.Remove(path);
@@ -921,6 +1102,18 @@ public sealed class BackupWorker : BackgroundService
             return SourceSelection.IsPathIncluded(set.SourceSelections, path);
 
         return set.SourceRoots.Any(root => IsUnderRoot(path, root));
+    }
+
+    /// <summary>
+    /// Current size of a file in bytes, or 0 if it can't be stat'd (missing,
+    /// locked, or a transient error). Used to pick the debounce size tier; 0
+    /// simply selects the smallest tier, which is the safe default for a file we
+    /// can't measure.
+    /// </summary>
+    private static long GetFileSizeSafe(string path)
+    {
+        try { return new FileInfo(path).Length; }
+        catch { return 0; }
     }
 
     private static char GetDriveLetter(string path)

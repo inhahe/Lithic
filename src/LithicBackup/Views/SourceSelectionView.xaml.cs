@@ -87,4 +87,42 @@ public partial class SourceSelectionView : UserControl
     {
         e.Handled = true;
     }
+
+    /// <summary>
+    /// Absorb the first-render binding write-backs of a lazily-realized settings
+    /// tab so merely viewing a tab isn't mistaken for a user edit.
+    ///
+    /// The editor's top-level TabControl realizes each tab's content only when it
+    /// is first selected.  The settings tabs (General/Options/Retention/Schedule)
+    /// bind several controls Mode=TwoWay (radios, combos, the tier-set pattern
+    /// boxes); on first render those push their values back to the viewmodel,
+    /// raising PropertyChanged.  The VM's dirty tracking treats any such change as
+    /// an edit — so switching to a settings tab without changing anything would
+    /// pop a bogus "unsaved changes" prompt on Cancel/close.
+    ///
+    /// Mirror the initial-load absorption (see MainViewModel's post-restore
+    /// ContextIdle MarkClean/ResumeDirtyTracking): suspend dirty tracking for the
+    /// duration of the tab switch and re-arm one dispatcher cycle later, after the
+    /// new content's Render-priority write-backs have flushed.  We deliberately do
+    /// NOT MarkClean here, so any genuine unsaved edits made earlier on another tab
+    /// survive the switch.
+    /// </summary>
+    private void EditorTabs_SelectionChanged(object sender, SelectionChangedEventArgs e)
+    {
+        // Only the TabControl's own selection change — ignore SelectionChanged
+        // bubbling up from inner selectors (e.g. the ZipMode/Filesystem combos).
+        if (e.OriginalSource is not TabControl)
+            return;
+        // Skip the initial selection raised during construction; the initial-load
+        // window in MainViewModel already owns dirty tracking at that point.
+        if (!IsLoaded)
+            return;
+        if (DataContext is not SourceSelectionViewModel vm)
+            return;
+
+        vm.SuspendDirtyTracking();
+        Dispatcher.BeginInvoke(
+            DispatcherPriority.ContextIdle,
+            new Action(vm.ResumeDirtyTracking));
+    }
 }

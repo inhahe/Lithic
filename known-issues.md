@@ -1,5 +1,298 @@
 # LithicBackup — Known Issues & Tech Debt
 
+## FIXED: Spurious "unsaved changes" prompt on closing Modify — close prompt now snapshot-diffs instead of trusting the racy dirty flag (2026-07-19)
+
+**Symptom.** Opening a backup set via **Modify**, changing nothing, and closing
+still popped "You have unsaved changes. Save before closing?" Repeatedly patched
+across v1.0.31–v1.0.34 and it kept recurring.
+
+**Cause.** The editor's dirty tracking is **event-based**: catch-all
+`PropertyChanged` + `SelectionChanged` handlers set `_needsSave = true` unless a
+`_dirtyTrackingArmed` gate is off. Init suspends the gate, then `MarkClean()` +
+`ResumeDirtyTracking()` fire once at `ContextIdle` priority (after the first-render
+Mode=TwoWay write-backs). This is fundamentally racy — any programmatic write-back
+that lands *after* that single clean-mark re-dirties the set: lazily-realized
+settings tabs (General/Options/Retention/Schedule) pushing binding write-backs on
+first render, combo `SelectedValue` resolution, tree virtualization revealing
+checkbox columns, async catalog/size stamping, etc. Each prior fix chased one
+straggler; the next UI-churn source re-opened the hole.
+
+**Fix (v1.0.38).** Stop *inferring* dirtiness from event noise for the close
+prompt and instead check two **precise, cheap** signals — crucially, without
+re-walking the whole selection tree (which would be slow to do synchronously on
+the close path for a large set):
+
+- **Selection changes** reuse the existing
+  `SourceSelectionViewModel.ChangedSelectionPaths` wiring. That set is populated
+  *only* by genuine user checkbox / auto-include toggles — programmatic restore
+  (`ApplySelectionAsync`) writes the backing fields directly and bypasses the
+  setters, and same-value binding write-backs are dropped by the setters'
+  equality guards. We record a `cleanSelectionMark` (its count) at the last clean
+  point and treat the set as selection-dirty only when the count has grown past
+  the mark.
+- **Setting changes** use `MainViewModel.SnapshotEditorSettings`: a snapshot
+  string of just the set name + `JobOptions` (target, disc/dir options,
+  exclusions, tier sets, schedule) — **no `GetSelections()` tree walk**. Built by
+  the new shared `ApplyVmSettingsToJobOptions` helper (extracted from
+  `SyncSettingsToJobOptions` so the save path and the snapshot can't drift) against
+  a throwaway clone of `JobOptions`, so the live set isn't mutated.
+
+The `dialog.Closing` handler prompts only when the cheap `_needsSave` flag is set
+(it never *misses* a real change, so a clean flag skips everything) **and** at
+least one of the two precise signals fired. Both the settings baseline and the
+clean selection mark are refreshed inside `SaveAllAsync` after every save, so a
+save-then-stray-event close doesn't re-prompt for changes already on disk. New
+(unsaved) sets keep the old always-prompt behavior — they have a real temp record
+to persist, so their baseline stays null. `_needsSave` is still used as-is for the
+Save button's CanExecute (over-enabling the button is harmless). This makes the
+close prompt immune to spurious `PropertyChanged`/selection events rather than
+playing whack-a-mole with each new source of them.
+
+**Follow-up (v1.0.40) — the baseline was captured too late.** The first cut of
+the above captured the baseline in the Phase-3 `ContextIdle` pass, *after* the
+multi-second selection restore. The GUI log proved a user who opened a set and
+closed it within ~1.6s hit the close handler while `settingsBaseline` was still
+**null** and `_needsSave` was still at its `true` init-default — so it fell
+straight through to the prompt (the baseline only landed while the MessageBox was
+already up). Fix: capture the baseline **synchronously in Phase 1**, right after
+`RestoreSourceSettings`, before the dialog is ever shown. At that point every
+settings field is restored and the selection tree is untouched (restore writes
+node backing fields directly, never adding to `ChangedSelectionPaths`), so it's
+the true saved state and a fast close can no longer beat it. The `ContextIdle`
+pass still *refreshes* the baseline once first-render write-backs settle, but only
+`MarkClean`s when the current state still matches the Phase-1 baseline — otherwise
+a genuine edit made during the multi-second load window (e.g. ticking "Create
+subdirectory" right after open) would be silently wiped, disabling Save ~half a
+second later (fixed v1.0.41). The temporary `[dirty-debug]` logging was removed in
+v1.0.42 once both fixes were confirmed.
+
+## FIXED: Upgrade "unable to close all requested applications" — forced shutdown now has a hard-exit watchdog (2026-07-19)
+
+**Symptom.** Running the MSI to upgrade failed again with "The setup was unable to
+automatically close all requested applications" — reported upgrading **from
+1.0.34** (which already has the shutdown listener *and* the v1.0.32 editor-modal
+suppression), with **no dialog the user could find** open.
+
+**Cause.** The upgrade closes the GUI by signalling `LithicBackup.Shutdown`, whose
+listener calls `App.ShutdownForRestartManager` → `Application.Shutdown()`. That
+graceful shutdown fires each window's `Closing` and runs `OnExit`, so it can be
+**blocked by any open modal** — not just the backup-set editor's unsaved-changes
+prompt that v1.0.32 already suppresses. The remaining culprits are **owner-less
+`MessageBox.Show` dialogs the user may never see**: the "Destination Drive Full"
+warning (`App.StartupCoreAsync` `DestinationFull` handler) and the
+`DispatcherUnhandledException` crash box can both be sitting behind other windows
+or on a second monitor. A modal runs its own message loop, so `Shutdown()` never
+returns, `LithicBackup.exe` stays locked, the installer's ~15s wait expires, and
+the file-in-use dialog appears. The v1.0.32 fix only closed the *editor* instance
+of this class; the underlying flaw is that a forced shutdown must never be
+*blockable* at all.
+
+**Fix (v1.0.37).** Added a forced-shutdown **watchdog** (`App.ArmForcedShutdownWatchdog`).
+The moment the installer's shutdown signal arrives — on the thread-pool wait
+callback, so it runs even if the UI dispatcher is wedged — the GUI arms a one-shot
+background thread and *then* requests the graceful shutdown. If the process is
+still alive after a 5s grace window (i.e. the graceful path is blocked by a modal
+or a busy dispatcher), the watchdog calls `Environment.Exit(0)` to release the
+`.exe`. A process can always terminate **itself** regardless of integrity level,
+so this needs no elevation, no taskkill, and no bundle — same principle as the
+signal-and-self-close design. It is armed **only** for forced shutdowns (installer
+signal, `OnSessionEnding`, and the `WM_ENDSESSION` path via
+`ShutdownForRestartManager`), never for a user File > Exit, so a normal quit and
+its unsaved-changes prompt are untouched. 5s sits comfortably under the installer
+custom action's 15s wait, and a normal graceful shutdown (sub-second) beats the
+timer so the watchdog is a no-op in the common case. It logs one INFO line to the
+crash log if it ever has to fire. **Bootstrap caveat:** as always, this only helps
+once the *running* build already contains it — the upgrade that first delivers
+1.0.37 onto a 1.0.36-or-earlier GUI still depends on that older build's own
+close-handling; every subsequent upgrade is bulletproof.
+
+**If it recurs anyway:** capture a verbose MSI log to see exactly which process/
+file RestartManager found in use — `msiexec /i LithicBackup-<ver>-x64.msi /l*v
+%TEMP%\lithic-upgrade.log` — and check the `RMFilesInUse`/`FilesInUse` entries. A
+non-GUI locker (e.g. the `Lithic Backup` Worker service holding a shared DLL if
+its `ServiceControl` stop somehow lands after `InstallValidate`) would need a
+different fix than the GUI watchdog.
+
+## FIXED: Restore froze the UI (no cursor, no progress) while loading a large set (2026-07-19)
+
+**Symptom.** Clicking **Restore** on a backup set froze the whole window for
+several seconds (longer on big sets) with no busy cursor and no progress — it
+looked hung.
+
+**Cause.** `RestoreViewModel` loaded the *entire* catalog file list up front and
+built the whole checkbox tree on the **UI thread**. Two costs stacked there:
+(1) `RestoreService.GetRestorableFilesAsync` reads every file record, and the
+underlying `SqliteSetDatabase` read only truly runs off-thread when its async
+lock actually suspends — when the set DB is uncontended (the normal restore case,
+no backup running) `SemaphoreSlim.WaitAsync` completes synchronously, so
+`ConfigureAwait(false)` never yields and the whole `ExecuteReader` loop ran on the
+caller's (UI) thread; and (2) `BuildTree` then created one `RestoreNodeViewModel`
+per directory/file — O(all files) CPU — also on the UI thread. Both blocked the
+dispatcher, so nothing repainted and no cursor changed.
+
+**Fix (v1.0.35).** Run the whole load — catalog read *and* tree build — on a
+background thread via `Task.Run`, and hand only the finished, not-yet-bound root
+nodes back to the UI thread to attach to the bound `Roots` collection. `BuildTree`
+was made a pure static that returns the roots (it no longer touches any bound
+collection), so it is safe to run off-thread. The loading overlay now shows an
+indeterminate progress bar plus a live phase/count line ("Loading catalog
+records… N" → "Building file tree…") via UI-marshalling `Progress<>` reporters
+(`GetRestorableFilesAsync` gained an optional `IProgress<int> rowProgress`). The
+UI stays fully responsive throughout.
+
+**Follow-up (v1.0.36): true lazy loading.** The off-thread build above removed the
+freeze but still read the *whole* catalog to open the dialog. v1.0.36 makes the
+restore tree genuinely lazy, like Modify — but backed by the catalog rather than
+the filesystem:
+
+- A new case-insensitive partial index `IX_Files_Active_SourcePath_NoCase`
+  (`SetSchema.sql`) lets the per-set DB list a directory's *direct* children with
+  a **loose-index skip-scan** (`SqliteSetDatabase.GetRestoreChildrenAsync`): seek
+  to the first active path under the prefix, emit the child it belongs to, then
+  jump the cursor past that child's whole subtree and repeat — O(direct children)
+  index seeks, never an O(subtree) scan. Expanding a node reads only that node's
+  children.
+- `RestoreNodeViewModel` is now a load-on-expand tristate node (`RestoreTreeChild`
+  rows, a "Loading..." placeholder, `_isLoaded`). The selection semantics exploit
+  the invariant that an *unexpanded* directory is always fully checked or fully
+  unchecked (it only becomes indeterminate once its children load), so a definite
+  directory state uniformly covers its whole subtree and descendants inherit it on
+  load.
+- At restore time `RestoreService.MaterializeSelectionAsync` reads only the
+  selected subset: a fully-checked directory expands to
+  `GetActiveLatestRecordsUnderPrefixAsync(prefix)` (one prefix query for the whole
+  subtree), an indeterminate directory recurses into its loaded children, and a
+  checked file resolves via `GetActiveLatestRecordByPathAsync`. The whole catalog
+  is never loaded — to browse it or to restore from it.
+- The selected-file count shown in the footer is computed on demand via
+  `GetActiveSubtreeStatsAsync` (bounded to the selection, cached per prefix), and
+  directory rows show a blank Size column (aggregate sizes aren't computed up front
+  in lazy mode).
+
+## FIXED: Bogus "unsaved changes" prompt when opening Modify and clicking Cancel quickly (2026-07-19)
+
+**Symptom.** Open a set's Modify editor and click **Cancel** within a few seconds,
+without touching anything, and the "You have unsaved changes — save before
+closing?" prompt appears. Waiting longer before cancelling avoids it.
+
+**Cause (confirmed by instrumentation).** `SourceSelectionViewModel._needsSave`
+defaults to `true`. For an existing set the editor clears it via `MarkClean()`,
+scheduled at `DispatcherPriority.ContextIdle` right after the selection restore
+(MainViewModel, the `InvokeAsync(..., ContextIdle)` block in the Modify open flow).
+The clean-mark is deliberately at ContextIdle so it runs *after* the tree's
+first-render checkbox write-backs settle. But the code kicked off
+`PostShowInitAsync()` (catalog dictionary load + `ComputeAllUnknownSizesAsync` +
+the plan-check scan) immediately afterwards, and that work pumps a continuous
+stream of higher-than-ContextIdle dispatcher activity — **starving the ContextIdle
+queue for ~5 seconds** (measured: OPEN at 07:48:09 → MARKCLEAN at 07:48:14, with
+*zero* dirty transitions logged in between). During that whole window `_needsSave`
+sat at its `true` init-default, so a quick Cancel saw a "dirty" set. The set was
+never actually re-dirtied; the flag was simply never cleared in time.
+
+**Fix (v1.0.34).** `await` the ContextIdle clean-mark/resume pass *before* starting
+`PostShowInitAsync()`. With the dispatcher kept quiet until the clean-mark runs, it
+now fires within milliseconds of the dialog appearing (right after the first-render
+write-backs settle) instead of being starved for seconds. The multi-second catalog/
+size/plan work then starts afterwards as fire-and-forget. No behavior change for new
+sets (they legitimately stay dirty). Root-caused with a temporary
+`%TEMP%\lithic-dirty.log` stack-trace tracer that was removed once confirmed.
+
+## FIXED: Upgrade "unable to close all requested applications" when the backup-set editor is open (2026-07-19)
+
+**Symptom.** Running the MSI to upgrade fails with "The setup was unable to
+automatically close all requested applications" — a regression; upgrades
+previously closed the GUI cleanly.
+
+**Cause.** The backup-set editor window's `Closing` handler (MainViewModel, the
+`dialog.Closing += …` for `BackupSetEditorWindow`) pops a modal Yes/No/Cancel
+`MessageBox` whenever the set `HasUnsavedChanges`. The upgrade path asks the GUI
+to close itself via the Restart-Manager IPC signal → `App.ShutdownForRestartManager`
+→ `Application.Shutdown()`, which fires that `Closing` handler. The modal message
+box **blocks the dispatcher**, so `LithicBackup.exe` never exits; the installer
+custom action (`SignalLithicGuiShutdown`) waits only ~15s, then the file-in-use
+check finds the .exe still locked and shows the dialog. The v1.0.30 top-tab
+restructure made this much more likely by falsely marking a set dirty after merely
+viewing a settings tab (fixed separately in v1.0.31), but the underlying flaw is
+that a forced shutdown must never be blockable by a modal prompt.
+
+**Fix (v1.0.32).** Added `App.IsForcedShutdown`, set true in
+`ShutdownForRestartManager` and `OnSessionEnding` (installer signal / Windows
+session end) but NOT for a user-initiated File > Exit / tray Exit. The editor's
+`Closing` handler returns early — no prompt — when `IsForcedShutdown` is set, so
+the window closes and releases the .exe promptly. The `Closed` handler still runs
+the pending best-effort save for existing sets; a user File > Exit still prompts
+about unsaved work. **Bootstrap caveat:** like the shutdown listener itself, this
+only takes effect once the *running* build already contains it — for the upgrade
+that first delivers v1.0.32 the user may still need to close an open editor
+manually (or the in-app updater closes the old GUI); subsequent upgrades are clean.
+
+## FIXED: Bogus "unsaved changes" prompt after viewing a settings tab in the backup-set editor (2026-07-19)
+
+**Symptom.** Open a backup set in the modify dialog, click one of the settings
+tabs (General/Options/Retention/Schedule) to look at it, change nothing, then
+press Cancel — a spurious "you have unsaved changes" confirmation appears.
+
+**Cause.** A regression from moving the editor's `TabControl` to the top level
+with the sources hierarchy as the first tab (v1.0.30). The VM's dirty tracking
+(`SourceSelectionViewModel`, `_needsSave`/`_dirtyTrackingArmed`) assumes **all**
+first-render `Mode=TwoWay` binding write-backs happen inside a short init window
+that ends at `ContextIdle` after load (MainViewModel post-restore MarkClean +
+ResumeDirtyTracking). Previously the General settings tab was always visible in
+the bottom card, so its write-backs fired at load and were absorbed. After the
+restructure the settings tabs are **lazily realized** by the top-level TabControl
+— their content isn't instantiated until first selected, so their first-render
+write-backs (radios, combos, tier-set pattern boxes) fire *after* the init window
+and mark the set dirty even though the user changed nothing.
+
+**Fix.** `SourceSelectionView.EditorTabs_SelectionChanged` mirrors the initial-load
+absorption per tab switch: `SuspendDirtyTracking()` on the switch, then
+`ResumeDirtyTracking()` one dispatcher cycle later (`ContextIdle`, below the
+Render-priority binding updates). It deliberately does **not** `MarkClean`, so a
+genuine unsaved edit made earlier on another tab still survives the switch. The
+handler is gated on `e.OriginalSource is TabControl` (ignore bubbled ComboBox
+SelectionChanged) and `IsLoaded` (skip the initial selection during construction,
+which the MainViewModel init window already owns).
+
+## LIMITATION: Continuous mode cannot safely back up always-on databases (needs VSS / app-consistent snapshot) (2026-07-19)
+
+**What.** Continuous-mode backup (the USN/watcher-driven path in
+`BackupWorker.CheckContinuousAsync` → `DirectoryBackupService.ExecuteTargetedAsync`)
+captures changed files by **direct file copy**. That is fine for append-only files
+(`.log`, `.jsonl`) whose mid-write state is a valid prefix, but it is fundamentally
+unsafe for a **live database** (`.db`/`.sqlite`/`.sqlite3`, `.mdf`/`.ldf`, `.accdb`,
+LevelDB, etc.):
+
+- A DB is written **in place at random offsets**, so a copy taken mid-write is
+  **torn / transactionally inconsistent** and may not even open. Unlike a log, a
+  partial is worthless, not a valid prefix.
+- A live DB never goes quiet, so the debounce path never fires; the only trigger
+  would be **max-wait**, and every max-wait capture would be one of these torn copies.
+- In practice the DB is usually held **exclusively locked** while hot, so the copy
+  attempt fails with a sharing violation, lands in the failed-files list (which the
+  continuous path does **not** re-enqueue), and nothing is backed up anyway.
+
+**Current mitigation (by design, not a fix).** Database extensions are deliberately
+**left off** the default finite-max-wait include list (see the debounce/max-wait tier
+feature), so DBs get **infinite max-wait** → they are backed up **only when they go
+quiet** (app closes / connection released / DB detached), which is the only moment a
+file copy of a database is consistent. So an *idle* DB is captured fine; an
+*always-on* DB is effectively skipped rather than backed up as garbage.
+
+**Proper fix (future feature, orthogonal to the tier work).** To back up a live
+database consistently, use an **application-consistent snapshot** instead of a raw
+copy:
+- **VSS (Volume Shadow Copy Service)** — take a shadow copy of the source volume and
+  copy the DB file from the snapshot. Generic (works for any engine), the worker
+  already runs as LocalSystem so it has the privilege, and it also fixes torn copies
+  for *any* locked/continuously-written file, not just databases.
+- or the **engine's own backup API** for the common cases — SQLite Online Backup /
+  `VACUUM INTO`, SQL Server `BACKUP DATABASE` — which produce a guaranteed-consistent
+  copy without a volume snapshot, but require per-engine handling.
+
+VSS is the higher-leverage general answer; the engine APIs are a nicety for
+first-class engines. Either way this is a separate mechanism from the file-copy
+pipeline and is not addressed by the debounce/max-wait tiers.
+
 ## FIXED: Source-tree selection bugs — "All Drives" auto-include reverting + stale full-check on restore (2026-07-18)
 
 **Symptoms (both reported together).**

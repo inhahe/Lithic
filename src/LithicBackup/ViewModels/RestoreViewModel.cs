@@ -1,5 +1,4 @@
 using System.Collections.ObjectModel;
-using System.IO;
 using System.Windows.Input;
 using LithicBackup.Core.Interfaces;
 using LithicBackup.Core.Models;
@@ -7,8 +6,11 @@ using LithicBackup.Core.Models;
 namespace LithicBackup.ViewModels;
 
 /// <summary>
-/// ViewModel for the file restore view. Shows backup sets, their files,
-/// and allows the user to restore selected files.
+/// ViewModel for the file restore view. Browses a backup set's files as a lazy
+/// tree — a directory's direct children are read from the catalog only when it is
+/// expanded — and restores only the selected subset, materialised on demand. The
+/// whole catalog is never loaded up front, so opening the restore dialog is fast
+/// even on sets with hundreds of thousands of files.
 /// </summary>
 public class RestoreViewModel : ViewModelBase
 {
@@ -18,6 +20,7 @@ public class RestoreViewModel : ViewModelBase
     private BackupSet? _selectedBackupSet;
     private bool _restoreToOriginal;
     private HashSet<string> _selectedDriveKeys = new(StringComparer.OrdinalIgnoreCase);
+    private bool _hasSelection;
     private bool _isLoading;
     private bool _isRestoring;
     private bool _isComplete;
@@ -27,6 +30,13 @@ public class RestoreViewModel : ViewModelBase
     private string _currentFile = "";
     private string _progressText = "";
     private CancellationTokenSource? _cts;
+
+    // Coalesces the async selected-file-count recomputation across rapid toggles.
+    private CancellationTokenSource? _countCts;
+    // Per-directory subtree file-count cache (prefix -> count) so recounting a
+    // stable selection doesn't re-query the catalog.
+    private readonly Dictionary<string, int> _subtreeCountCache =
+        new(StringComparer.OrdinalIgnoreCase);
 
     /// <summary>Fired when the user clicks "Done" or "Close".</summary>
     public event Action? DoneRequested;
@@ -46,18 +56,17 @@ public class RestoreViewModel : ViewModelBase
         CancelCommand = new RelayCommand(_ => _cts?.Cancel(), _ => IsRestoring);
         DoneCommand = new RelayCommand(_ => DoneRequested?.Invoke());
 
-        // Load files immediately for the given backup set.
-        _ = LoadRestorableFilesAsync(backupSet.Id);
+        _ = LoadRootsAsync(backupSet.Id);
     }
 
     // --- Properties ---
 
     public BackupSet SelectedBackupSet => _selectedBackupSet!;
 
-    /// <summary>Root nodes of the restorable-file tree (one per drive).</summary>
+    /// <summary>Root nodes of the restorable-file tree (one per source drive).</summary>
     public ObservableCollection<RestoreNodeViewModel> Roots { get; }
 
-    /// <summary>Number of files currently checked for restore.</summary>
+    /// <summary>Number of files currently selected for restore (computed on demand).</summary>
     public int SelectedFileCount
     {
         get => _selectedFileCount;
@@ -81,8 +90,6 @@ public class RestoreViewModel : ViewModelBase
         }
         set
         {
-            // A click forces a definite state (false when toggling off an
-            // indeterminate box); apply it to every root, which cascades down.
             bool target = value == true;
             foreach (var root in Roots)
                 root.IsSelected = target;
@@ -121,6 +128,18 @@ public class RestoreViewModel : ViewModelBase
         get => _isLoading;
         set => SetProperty(ref _isLoading, value);
     }
+
+    /// <summary>
+    /// Live description of what the initial load is doing, shown in the loading
+    /// overlay. The lazy tree only reads the drive roots up front, so this is
+    /// brief — the whole catalog is no longer scanned to open the dialog.
+    /// </summary>
+    public string LoadProgressText
+    {
+        get => _loadProgressText;
+        set => SetProperty(ref _loadProgressText, value);
+    }
+    private string _loadProgressText = "";
 
     public bool IsRestoring
     {
@@ -172,43 +191,55 @@ public class RestoreViewModel : ViewModelBase
 
     // --- Logic ---
 
-    private async Task LoadRestorableFilesAsync(int backupSetId)
+    /// <summary>
+    /// Load only the top-level children (drive roots) of the set. Everything
+    /// below is fetched lazily on expand.
+    /// </summary>
+    private async Task LoadRootsAsync(int backupSetId)
     {
         IsLoading = true;
         StatusText = "Loading files from catalog...";
+        LoadProgressText = "Reading drives…";
         Roots.Clear();
         SelectedFileCount = 0;
 
         try
         {
-            var files = await _restoreService.GetRestorableFilesAsync(backupSetId);
+            // Run off the UI thread: the set DB's async lock completes synchronously
+            // when uncontended, so the skip-scan's index seeks would otherwise run on
+            // the caller (UI) thread. See the restore-freeze note in known-issues.md.
+            var rootChildren = await Task.Run(
+                () => _catalog.GetRestoreChildrenAsync(backupSetId, ""));
 
-            // Group by source path, show latest version.
-            var latestByPath = files
-                .GroupBy(f => f.Record.SourcePath, StringComparer.OrdinalIgnoreCase)
-                .Select(g => g.OrderByDescending(f => f.Record.BackedUpUtc).First())
-                .OrderBy(f => f.Record.SourcePath, StringComparer.OrdinalIgnoreCase)
-                .ToList();
+            var driveLetters = new SortedSet<string>(StringComparer.OrdinalIgnoreCase);
+            foreach (var child in rootChildren)
+            {
+                var node = new RestoreNodeViewModel(
+                    child.Name, child.FullPath, 0, child.IsDirectory,
+                    child.SizeBytes, child.BackedUpUtc,
+                    LoadChildrenFromCatalog, OnNodeSelectionChanged);
+                Roots.Add(node);
+                driveLetters.Add(GetDriveLetter(child.FullPath));
+            }
 
-            BuildTree(latestByPath);
-
-            // One destination row per distinct source drive.
             DriveDestinations.Clear();
-            var drives = latestByPath
-                .Select(f => GetDriveLetter(f.Record.SourcePath))
-                .Distinct(StringComparer.OrdinalIgnoreCase)
-                .OrderBy(d => d, StringComparer.OrdinalIgnoreCase);
-            foreach (var drive in drives)
+            foreach (var drive in driveLetters)
             {
                 var driveVm = new DriveDestinationViewModel(drive);
-                // Re-evaluate the Restore button when a destination is edited.
                 driveVm.PropertyChanged += (_, _) =>
                     CommandManager.InvalidateRequerySuggested();
                 DriveDestinations.Add(driveVm);
             }
 
+            // Expand the top level so the tree isn't a wall of collapsed drive rows.
+            foreach (var root in Roots)
+                if (root.IsDirectory)
+                    root.IsExpanded = true;
+
             OnPropertyChanged(nameof(IsAllSelected));
-            StatusText = $"{latestByPath.Count:N0} files available for restore.";
+            StatusText = Roots.Count == 0
+                ? "No files available for restore."
+                : "Select files to restore.";
         }
         catch (Exception ex)
         {
@@ -217,129 +248,87 @@ public class RestoreViewModel : ViewModelBase
         finally
         {
             IsLoading = false;
+            LoadProgressText = "";
         }
     }
 
     /// <summary>
-    /// Build the directory/file tree from the flat list of restorable files.
-    /// Each file's full source path (e.g. <c>D:\dir\sub\file.txt</c>) is split
-    /// into path segments; directory nodes are created/reused on the way down
-    /// and the file is attached as a leaf. Directories sort before files, both
-    /// alphabetically. Directory sizes aggregate their descendants.
+    /// Catalog child-listing delegate handed to every tree node. Runs off the UI
+    /// thread (<see cref="Task.Run(Func{Task{TResult}})"/>) because the set DB's
+    /// async lock completes synchronously when uncontended, so a directory's skip-
+    /// scan seeks would otherwise run on the UI thread.
     /// </summary>
-    private void BuildTree(IReadOnlyList<RestorableFile> files)
-    {
-        // Map of directory full-path -> node, so repeated prefixes are reused.
-        var dirNodes = new Dictionary<string, RestoreNodeViewModel>(StringComparer.OrdinalIgnoreCase);
-        var rootNodes = new Dictionary<string, RestoreNodeViewModel>(StringComparer.OrdinalIgnoreCase);
-
-        foreach (var file in files)
-        {
-            string path = file.Record.SourcePath;
-            string[] segments = path.Split(
-                ['\\', '/'], StringSplitOptions.RemoveEmptyEntries);
-            if (segments.Length == 0)
-                continue;
-
-            // Walk/create the directory chain for everything but the last
-            // segment (which is the file name).
-            RestoreNodeViewModel? parent = null;
-            string accumulated = "";
-            for (int i = 0; i < segments.Length - 1; i++)
-            {
-                accumulated = accumulated.Length == 0
-                    ? segments[i] + (segments[i].EndsWith(':') ? "\\" : "")
-                    : Path.Combine(accumulated, segments[i]);
-
-                if (!dirNodes.TryGetValue(accumulated, out var dirNode))
-                {
-                    dirNode = new RestoreNodeViewModel(
-                        segments[i], accumulated, i, OnNodeSelectionChanged);
-                    dirNodes[accumulated] = dirNode;
-
-                    if (parent is null)
-                        rootNodes[accumulated] = dirNode;
-                    else
-                    {
-                        dirNode.Parent = parent;
-                        parent.Children.Add(dirNode);
-                    }
-                }
-                parent = dirNode;
-            }
-
-            // Leaf file node.
-            string fileName = segments[^1];
-            var fileNode = new RestoreNodeViewModel(
-                fileName, file, segments.Length - 1, OnNodeSelectionChanged)
-            {
-                Parent = parent,
-            };
-            if (parent is null)
-                rootNodes[path] = fileNode;
-            else
-                parent.Children.Add(fileNode);
-        }
-
-        // Sort each node's children (directories first, then files), aggregate
-        // directory sizes, and publish the roots.
-        foreach (var root in rootNodes.Values
-                     .OrderByDescending(n => n.IsDirectory)
-                     .ThenBy(n => n.Name, StringComparer.OrdinalIgnoreCase))
-        {
-            SortAndAggregate(root);
-            // Expand the top level so the tree isn't a single collapsed row.
-            if (root.IsDirectory)
-                root.IsExpanded = true;
-            Roots.Add(root);
-        }
-    }
-
-    /// <summary>
-    /// Recursively sort a node's children (directories before files, each
-    /// alphabetical) and roll descendant file sizes up into directory sizes.
-    /// </summary>
-    private static long SortAndAggregate(RestoreNodeViewModel node)
-    {
-        if (!node.IsDirectory)
-            return node.SizeBytes;
-
-        var sorted = node.Children
-            .OrderByDescending(c => c.IsDirectory)
-            .ThenBy(c => c.Name, StringComparer.OrdinalIgnoreCase)
-            .ToList();
-        node.Children.Clear();
-
-        long total = 0;
-        foreach (var child in sorted)
-        {
-            total += SortAndAggregate(child);
-            node.Children.Add(child);
-        }
-        node.SizeBytes = total;
-        return total;
-    }
+    private Task<IReadOnlyList<RestoreTreeChild>> LoadChildrenFromCatalog(
+        string prefix, CancellationToken ct) =>
+        Task.Run(() => _catalog.GetRestoreChildrenAsync(_selectedBackupSet!.Id, prefix, ct), ct);
 
     private void OnNodeSelectionChanged()
     {
-        var selected = new List<RestorableFile>();
+        var dirPrefixes = new List<string>();
+        var filePaths = new List<string>();
         foreach (var root in Roots)
-            root.CollectSelectedFiles(selected);
-        SelectedFileCount = selected.Count;
-        _selectedDriveKeys = selected
-            .Select(f => GetDriveKey(f.Record.SourcePath))
+            root.CollectSelection(dirPrefixes, filePaths);
+
+        _hasSelection = dirPrefixes.Count > 0 || filePaths.Count > 0;
+
+        // Drive keys are derivable synchronously from the selected paths.
+        _selectedDriveKeys = dirPrefixes.Concat(filePaths)
+            .Select(GetDriveKey)
             .ToHashSet(StringComparer.OrdinalIgnoreCase);
+
         OnPropertyChanged(nameof(IsAllSelected));
         CommandManager.InvalidateRequerySuggested();
+
+        // The exact file count needs a catalog query per fully-selected directory,
+        // so compute it asynchronously (coalescing rapid toggles) rather than
+        // blocking the checkbox click.
+        _ = RecomputeSelectedCountAsync(dirPrefixes, filePaths);
+    }
+
+    private async Task RecomputeSelectedCountAsync(
+        List<string> dirPrefixes, List<string> filePaths)
+    {
+        _countCts?.Cancel();
+        var cts = new CancellationTokenSource();
+        _countCts = cts;
+        var ct = cts.Token;
+
+        try
+        {
+            int total = filePaths.Count;
+            foreach (var prefix in dirPrefixes)
+            {
+                ct.ThrowIfCancellationRequested();
+                if (!_subtreeCountCache.TryGetValue(prefix, out int count))
+                {
+                    // Off the UI thread (uncontended set-DB lock completes sync).
+                    var (fileCount, _) = await Task.Run(
+                        () => _catalog.GetActiveSubtreeStatsAsync(_selectedBackupSet!.Id, prefix, ct), ct);
+                    _subtreeCountCache[prefix] = count = fileCount;
+                }
+                total += count;
+            }
+
+            if (!ct.IsCancellationRequested)
+                SelectedFileCount = total;
+        }
+        catch (OperationCanceledException)
+        {
+            // Superseded by a newer selection change; ignore.
+        }
+        finally
+        {
+            if (ReferenceEquals(_countCts, cts))
+                _countCts = null;
+            cts.Dispose();
+        }
     }
 
     private bool CanRestore()
     {
-        if (IsRestoring || SelectedFileCount == 0)
+        if (IsRestoring || !_hasSelection)
             return false;
 
-        // Restoring to original locations needs no destinations; otherwise
-        // every drive that has selected files must have a destination set.
         if (RestoreToOriginal)
             return true;
 
@@ -374,9 +363,21 @@ public class RestoreViewModel : ViewModelBase
 
         try
         {
-            var filesToRestore = new List<RestorableFile>();
+            // Materialise the selection into concrete restorable files, reading only
+            // the selected subset of the catalog (never the whole set).
+            var dirPrefixes = new List<string>();
+            var filePaths = new List<string>();
             foreach (var root in Roots)
-                root.CollectSelectedFiles(filesToRestore);
+                root.CollectSelection(dirPrefixes, filePaths);
+
+            CurrentFile = "Preparing file list…";
+            var prepProgress = new Progress<int>(n =>
+                CurrentFile = $"Preparing file list… {n:N0}");
+
+            // Off the UI thread: materialisation issues catalog queries whose set-DB
+            // lock completes synchronously when uncontended.
+            var filesToRestore = await Task.Run(() => _restoreService.MaterializeSelectionAsync(
+                _selectedBackupSet!.Id, dirPrefixes, filePaths, _cts.Token, prepProgress), _cts.Token);
 
             // Build the per-drive destination map: original roots when restoring
             // in place, otherwise the user's chosen folder for each drive.
@@ -402,7 +403,6 @@ public class RestoreViewModel : ViewModelBase
             ResultDetail = $"Files restored: {result.FilesRestored:N0}\n" +
                            $"Data restored: {FormatBytes(result.BytesRestored)}";
 
-            // Show where files landed so they're easy to find.
             if (result.FilesRestored > 0)
             {
                 ResultDetail += "\n\nRestored to:";

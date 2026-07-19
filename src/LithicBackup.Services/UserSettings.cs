@@ -62,6 +62,14 @@ public class UserSettings
     /// </summary>
     public ReconcileAfterEditMode ReconcileMode { get; set; } = ReconcileAfterEditMode.Ask;
 
+    /// <summary>
+    /// Machine-global rules for continuous-mode backup timing: size-tiered
+    /// debounce windows and mask-tiered max-wait caps. Shared by every
+    /// continuous set (there are no per-set debounce/max-wait fields), so all
+    /// watched sources honor the same policy. See <see cref="ContinuousRules"/>.
+    /// </summary>
+    public ContinuousRules ContinuousRules { get; set; } = new();
+
     public static UserSettings Load()
     {
         try

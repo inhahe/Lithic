@@ -88,3 +88,17 @@ CREATE INDEX IF NOT EXISTS IX_Files_Active_Disc_Path
 CREATE INDEX IF NOT EXISTS IX_Files_Active_Hash
     ON Files(Hash)
     WHERE IsDeleted = 0;
+
+-- Case-insensitive active-path index for the lazy restore browser.  The restore
+-- tree lists a directory's *direct* children on expand via a loose-index
+-- skip-scan (seek to the first path under the prefix, emit the child, then jump
+-- the cursor past that child's whole subtree, repeat) so expanding a node costs
+-- O(direct children) index seeks, not O(subtree).  All path matching here is
+-- COLLATE NOCASE (the Windows filesystem is case-insensitive), so the seek/range
+-- (SourcePath > cursor / < upper) can only use an index whose key collation is
+-- NOCASE — the plain IX_Files_SourcePath is BINARY and would force a full scan.
+-- Partial (IsDeleted = 0) because the browser only ever shows live files, so the
+-- index stays small and its range scans skip tombstoned history for free.
+CREATE INDEX IF NOT EXISTS IX_Files_Active_SourcePath_NoCase
+    ON Files(SourcePath COLLATE NOCASE)
+    WHERE IsDeleted = 0;

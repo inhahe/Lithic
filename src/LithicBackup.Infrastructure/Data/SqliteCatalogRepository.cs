@@ -436,6 +436,18 @@ public class SqliteCatalogRepository : ICatalogRepository
     public Task<IReadOnlyList<FileRecord>> GetActiveRecordsByHashAsync(int backupSetId, string hash, CancellationToken ct = default)
         => GetSet(backupSetId).GetActiveRecordsByHashAsync(backupSetId, hash, ct);
 
+    public Task<IReadOnlyList<RestoreTreeChild>> GetRestoreChildrenAsync(int backupSetId, string parentPrefix, CancellationToken ct = default)
+        => GetSet(backupSetId).GetRestoreChildrenAsync(parentPrefix, ct);
+
+    public Task<(int FileCount, long TotalBytes)> GetActiveSubtreeStatsAsync(int backupSetId, string directoryPrefix, CancellationToken ct = default)
+        => GetSet(backupSetId).GetActiveSubtreeStatsAsync(directoryPrefix, ct);
+
+    public Task<IReadOnlyList<FileRecord>> GetActiveLatestRecordsUnderPrefixAsync(int backupSetId, string directoryPrefix, CancellationToken ct = default)
+        => GetSet(backupSetId).GetActiveLatestRecordsUnderPrefixAsync(directoryPrefix, ct);
+
+    public Task<FileRecord?> GetActiveLatestRecordByPathAsync(int backupSetId, string sourcePath, CancellationToken ct = default)
+        => GetSet(backupSetId).GetActiveLatestRecordByPathAsync(sourcePath, ct);
+
     public Task<int> MarkFilesDeletedByDirectoryAsync(int backupSetId, string directoryPrefix, CancellationToken ct = default)
         => GetSet(backupSetId).MarkFilesDeletedByDirectoryAsync(backupSetId, directoryPrefix, ct);
 

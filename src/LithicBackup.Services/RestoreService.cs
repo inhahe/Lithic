@@ -30,7 +30,7 @@ public class RestoreService : IRestoreService
     /// List all non-deleted files in a backup set with their disc locations.
     /// </summary>
     public async Task<IReadOnlyList<RestorableFile>> GetRestorableFilesAsync(
-        int backupSetId, CancellationToken ct = default)
+        int backupSetId, CancellationToken ct = default, IProgress<int>? rowProgress = null)
     {
         var discs = await _catalog.GetDiscsForBackupSetAsync(backupSetId, ct);
         var discLookup = discs.ToDictionary(d => d.Id);
@@ -56,9 +56,81 @@ public class RestoreService : IRestoreService
                     Disc = disc,
                     Chunks = chunks,
                 });
+
+                // Reporting every few thousand rows keeps a large-set load (which
+                // can read hundreds of thousands of records over many seconds)
+                // from looking like a hang, without per-row callback overhead.
+                if (rowProgress is not null && results.Count % 5000 == 0)
+                    rowProgress.Report(results.Count);
             }
         }
 
+        rowProgress?.Report(results.Count);
+        return results;
+    }
+
+    /// <summary>
+    /// Materialise a lazy restore-tree selection into concrete
+    /// <see cref="RestorableFile"/>s, reading only the selected subset of the
+    /// catalog. See <see cref="IRestoreService.MaterializeSelectionAsync"/>.
+    /// </summary>
+    public async Task<IReadOnlyList<RestorableFile>> MaterializeSelectionAsync(
+        int backupSetId,
+        IReadOnlyCollection<string> selectedDirectoryPrefixes,
+        IReadOnlyCollection<string> selectedFilePaths,
+        CancellationToken ct = default,
+        IProgress<int>? rowProgress = null)
+    {
+        var discs = await _catalog.GetDiscsForBackupSetAsync(backupSetId, ct);
+        var discLookup = discs.ToDictionary(d => d.Id);
+
+        // Collect the latest active record per distinct source path. Selecting a
+        // file both individually and via an enclosing directory (or via nested
+        // directories) must not restore it twice, so key on the source path.
+        var records = new Dictionary<string, FileRecord>(StringComparer.OrdinalIgnoreCase);
+
+        foreach (var prefix in selectedDirectoryPrefixes)
+        {
+            ct.ThrowIfCancellationRequested();
+            var under = await _catalog.GetActiveLatestRecordsUnderPrefixAsync(backupSetId, prefix, ct);
+            foreach (var rec in under)
+                records[rec.SourcePath] = rec;
+        }
+
+        foreach (var path in selectedFilePaths)
+        {
+            ct.ThrowIfCancellationRequested();
+            if (records.ContainsKey(path))
+                continue;
+            var rec = await _catalog.GetActiveLatestRecordByPathAsync(backupSetId, path, ct);
+            if (rec is not null)
+                records[rec.SourcePath] = rec;
+        }
+
+        var results = new List<RestorableFile>(records.Count);
+        foreach (var record in records.Values)
+        {
+            ct.ThrowIfCancellationRequested();
+
+            if (!discLookup.TryGetValue(record.DiscId, out var disc))
+                continue; // Orphaned record with no disc — skip rather than crash.
+
+            var chunks = record.IsSplit
+                ? await _catalog.GetChunksForFileAsync(record.DiscId, record.Id, ct)
+                : [];
+
+            results.Add(new RestorableFile
+            {
+                Record = record,
+                Disc = disc,
+                Chunks = chunks,
+            });
+
+            if (rowProgress is not null && results.Count % 5000 == 0)
+                rowProgress.Report(results.Count);
+        }
+
+        rowProgress?.Report(results.Count);
         return results;
     }
 

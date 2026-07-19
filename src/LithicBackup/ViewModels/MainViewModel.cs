@@ -486,6 +486,22 @@ public class MainViewModel : ViewModelBase
             : new List<Core.Models.SourceSelection>();
         bool savedThisSession = false;
 
+        // Baseline for the close prompt's real-change detection, so a no-touch
+        // open/close can't pop a bogus "unsaved changes" prompt off the racy
+        // event-based _needsSave flag (which fires on programmatic UI churn — lazy
+        // settings-tab realization, tree virtualization, catalog/size stamping).
+        // Captured once the initial load settles (Phase 3) and refreshed after every
+        // save.  Two orthogonal, cheap signals:
+        //   • settingsBaseline — a snapshot string of the name + JobOptions settings
+        //     (NO whole-tree walk); a real setting edit changes it.
+        //   • cleanSelectionMark — the count of user-toggled selection paths as of
+        //     the last clean point; ChangedSelectionPaths only grows on genuine
+        //     checkbox/auto-include toggles, so a later count above the mark means a
+        //     real selection edit.
+        // Left null/0 for brand-new sets, which always prompt (real unsaved record).
+        string? settingsBaseline = null;
+        int cleanSelectionMark = 0;
+
         // Completes once the deferred selection restore (Phase 3, below) has
         // finished.  The restore runs asynchronously AFTER the dialog is shown,
         // during which GetSelections() would return a partial/empty tree.  Every
@@ -539,6 +555,22 @@ public class MainViewModel : ViewModelBase
         sourceSelection.SetName = backupSet.Name;
         RestoreSourceSettings(sourceSelection, backupSet.JobOptions);
 
+        // Capture the clean baseline for the close prompt RIGHT NOW — synchronously,
+        // before the dialog is ever shown — so a fast open/close can't beat it.  The
+        // old capture point (the Phase 3 ContextIdle pass, after the multi-second
+        // selection restore) let a user who opened a set and closed it within ~1.6s
+        // hit a still-null baseline plus the true-by-default _needsSave flag → a
+        // bogus "unsaved changes" prompt (confirmed in the gui log).  At this point
+        // RestoreSourceSettings has set every settings field, and the selection tree
+        // hasn't been touched (programmatic restore writes node backing fields
+        // directly, never adding to ChangedSelectionPaths), so this IS the saved
+        // state.  New sets keep a null baseline (real unsaved record → always prompt).
+        if (_unsavedNewSetId is null)
+        {
+            settingsBaseline = SnapshotEditorSettings(backupSet, sourceSelection);
+            cleanSelectionMark = sourceSelection.ChangedSelectionPaths.Count;
+        }
+
         // Selection restore and size computation are deferred to after the
         // dialog is visible (see Phase 3 / PostShowInitAsync below).  The tree's
         // include checkboxes stay hidden until the restore completes so the user
@@ -564,6 +596,13 @@ public class MainViewModel : ViewModelBase
             backupSet.SourceSelections = sourceSelection.GetSelections();
             await Task.Run(() => _catalog.UpdateBackupSetAsync(backupSet));
             savedThisSession = true;
+
+            // The persisted state is now the new "clean" baseline, so a later
+            // stray dirty event (or the still-populated ChangedSelectionPaths from
+            // the toggles we just saved) followed by a close won't re-prompt to
+            // save changes that are already on disk.
+            settingsBaseline = SnapshotEditorSettings(backupSet, sourceSelection);
+            cleanSelectionMark = sourceSelection.ChangedSelectionPaths.Count;
         }
 
         // Register a pending save so settings are persisted on dialog close.
@@ -591,10 +630,42 @@ public class MainViewModel : ViewModelBase
         //   Cancel → stay open
         dialog.Closing += (_, e) =>
         {
-            if (!sourceSelection.HasUnsavedChanges)
+            // A forced shutdown (upgrade installer's Restart-Manager signal or a
+            // Windows session end) must not be blocked by a modal prompt: the
+            // installer waits only ~15s for LithicBackup.exe to exit, so stalling
+            // Application.Shutdown() on this dialog keeps the .exe locked and makes
+            // the upgrade fail with "unable to close all requested applications."
+            // Let the window close; the Closed handler still runs the pending
+            // best-effort save for existing sets (new sets discard their temp
+            // record, which is the right call for an unsaved set during shutdown).
+            if (Application.Current is App { IsForcedShutdown: true })
                 return;
 
             bool isNewSet = _unsavedNewSetId is not null;
+
+            // Cheap first gate: the event-based dirty flag never *misses* a real
+            // change (it errs the other way — firing on programmatic noise), so if
+            // it says clean, we truly are and can skip the prompt without any
+            // further work.
+            if (!sourceSelection.HasUnsavedChanges)
+                return;
+
+            // The flag says dirty, but it's prone to false positives.  For an
+            // existing set, confirm with the two precise, cheap signals: a genuine
+            // selection toggle (ChangedSelectionPaths grew past the last clean mark)
+            // or a genuine setting edit (settings snapshot differs from baseline).
+            // Neither walks the whole selection tree, so this stays fast even on
+            // huge sets.  If neither fired, only programmatic churn dirtied the flag
+            // and we must NOT prompt.  (New sets have no baseline and always prompt —
+            // there's an unsaved record to persist.)
+            if (!isNewSet && settingsBaseline is not null)
+            {
+                bool selectionChanged = sourceSelection.ChangedSelectionPaths.Count > cleanSelectionMark;
+                bool settingsChanged = SnapshotEditorSettings(backupSet, sourceSelection) != settingsBaseline;
+
+                if (!selectionChanged && !settingsChanged)
+                    return;
+            }
 
             var result = MessageBox.Show(
                 isNewSet
@@ -1003,14 +1074,47 @@ public class MainViewModel : ViewModelBase
         // selection-settle / AutoIncludeNew paths, so we MarkClean HERE (after they
         // land) rather than earlier; otherwise a no-touch open/close would prompt
         // to save.  New sets stay dirty (there's a real unsaved record to persist).
-        _ = Application.Current.Dispatcher.InvokeAsync(
+        //
+        // Crucially, AWAIT this ContextIdle pass before kicking off the
+        // multi-second PostShowInitAsync catalog/size/plan work below.  That work
+        // pumps a continuous stream of higher-than-ContextIdle dispatcher activity,
+        // so if it starts first it STARVES this clean-mark for several seconds —
+        // during which _needsSave sits at its `true` init-default and a user who
+        // opens the set and clicks Cancel within that window gets a bogus "unsaved
+        // changes" prompt.  Awaiting keeps the dispatcher quiet until the clean-mark
+        // fires (within milliseconds of the dialog appearing, right after the
+        // first-render write-backs settle), closing that window.
+        await Application.Current.Dispatcher.InvokeAsync(
             () =>
             {
                 if (_unsavedNewSetId is null)
-                    sourceSelection.MarkClean();
+                {
+                    // This delayed pass clears the racy dirty flag left by init /
+                    // first-render write-backs.  But it must NOT clobber a genuine
+                    // edit the user made during the (multi-second) load window — e.g.
+                    // ticking "Create subdirectory" right after open, which would
+                    // otherwise see Save disable ~half a second later when this pass
+                    // finally runs.  So only MarkClean when the current state still
+                    // matches the Phase-1 baseline (no real change); otherwise leave
+                    // _needsSave and the baseline intact so the edit sticks.
+                    string refreshed = SnapshotEditorSettings(backupSet, sourceSelection);
+                    bool selectionChanged =
+                        sourceSelection.ChangedSelectionPaths.Count > cleanSelectionMark;
+                    bool settingsChanged = refreshed != settingsBaseline;
+                    if (!selectionChanged && !settingsChanged)
+                    {
+                        // No real edit — clear first-render churn and fold any benign
+                        // settling into the clean baseline.
+                        sourceSelection.MarkClean();
+                        settingsBaseline = refreshed;
+                        cleanSelectionMark = sourceSelection.ChangedSelectionPaths.Count;
+                    }
+                    // Otherwise the user made a genuine edit during the load window —
+                    // leave _needsSave and the baseline intact so the edit sticks.
+                }
                 sourceSelection.ResumeDirtyTracking();
             },
-            System.Windows.Threading.DispatcherPriority.ContextIdle);
+            System.Windows.Threading.DispatcherPriority.ContextIdle).Task;
 
         _ = PostShowInitAsync();
 
@@ -3062,8 +3166,10 @@ public class MainViewModel : ViewModelBase
             vm.ScheduleMode = sched.Mode;
             vm.ScheduleIntervalHours = sched.IntervalHours.ToString(
                 System.Globalization.CultureInfo.InvariantCulture);
-            vm.ScheduleDailyHour = sched.DailyHour;
-            vm.ScheduleDailyMinute = sched.DailyMinute;
+            vm.ScheduleDailyHour = sched.DailyHour.ToString(
+                System.Globalization.CultureInfo.InvariantCulture);
+            vm.ScheduleDailyMinute = sched.DailyMinute.ToString(
+                "D2", System.Globalization.CultureInfo.InvariantCulture);
             vm.ScheduleDebounceSeconds = sched.DebounceSeconds.ToString();
             vm.ScheduleMaxWaitSeconds = sched.MaxWaitSeconds.ToString();
             vm.SchedulePollSeconds = sched.PollIntervalSeconds.ToString();
@@ -3075,6 +3181,34 @@ public class MainViewModel : ViewModelBase
     /// <see cref="JobOptions"/> so they survive a dialog close without Plan.
     /// This is the inverse of <see cref="RestoreSourceSettings"/>.
     /// </summary>
+    /// <summary>
+    /// Produce a string snapshot of the editor's <em>settings</em> — the set name
+    /// and everything that maps into <see cref="JobOptions"/> (target, disc/dir
+    /// options, exclusions, tier sets, schedule) — but deliberately NOT the source
+    /// selection tree.  Two calls compare equal iff no setting changed, so the close
+    /// prompt can detect real setting edits without trusting the racy event-based
+    /// dirty flag (which fires on programmatic UI churn).
+    /// </summary>
+    /// <remarks>
+    /// Selection changes are tracked separately and far more cheaply by
+    /// <see cref="SourceSelectionViewModel.ChangedSelectionPaths"/> (populated only
+    /// by genuine user checkbox/auto-include toggles — programmatic restore writes
+    /// the backing fields directly), so this snapshot avoids the expensive
+    /// whole-tree <c>GetSelections()</c> walk on the dialog-close path.  It builds a
+    /// throwaway clone of the set's <see cref="JobOptions"/> so the live set is
+    /// never mutated.
+    /// </remarks>
+    private string SnapshotEditorSettings(BackupSet backupSet, SourceSelectionViewModel vm)
+    {
+        var opts = backupSet.JobOptions is null
+            ? new JobOptions()
+            : JsonSerializer.Deserialize<JobOptions>(
+                JsonSerializer.Serialize(backupSet.JobOptions, _jsonOptions),
+                _jsonOptions) ?? new JobOptions();
+        ApplyVmSettingsToJobOptions(opts, vm);
+        return JsonSerializer.Serialize(new { Name = vm.SetName, JobOptions = opts }, _jsonOptions);
+    }
+
     private static void SyncSettingsToJobOptions(BackupSet backupSet, SourceSelectionViewModel vm)
     {
         var opts = backupSet.JobOptions ?? new JobOptions();
@@ -3088,6 +3222,19 @@ public class MainViewModel : ViewModelBase
         var selections = vm.GetSelections();
         backupSet.SourceRoots = selections.Select(s => s.Path).ToList();
 
+        ApplyVmSettingsToJobOptions(opts, vm);
+        backupSet.JobOptions = opts;
+    }
+
+    /// <summary>
+    /// Populate a <see cref="JobOptions"/> from the editor VM's settings fields —
+    /// everything except the name and source roots (which are set/derived by the
+    /// caller).  Shared by <see cref="SyncSettingsToJobOptions"/> (the real save)
+    /// and <see cref="SnapshotEditorSettings"/> (the close-prompt dirtiness check),
+    /// so the two can never drift out of agreement on what counts as a setting.
+    /// </summary>
+    private static void ApplyVmSettingsToJobOptions(JobOptions opts, SourceSelectionViewModel vm)
+    {
         // Target mode + directory.
         if (vm.IsDirectoryMode)
             opts.TargetDirectory = vm.TargetDirectory;
@@ -3135,8 +3282,10 @@ public class MainViewModel : ViewModelBase
                     System.Globalization.NumberStyles.Float,
                     System.Globalization.CultureInfo.InvariantCulture,
                     out var h) ? h : 24,
-                DailyHour = vm.ScheduleDailyHour,
-                DailyMinute = vm.ScheduleDailyMinute,
+                DailyHour = int.TryParse(vm.ScheduleDailyHour, out var dh)
+                    ? Math.Clamp(dh, 0, 23) : 2,
+                DailyMinute = int.TryParse(vm.ScheduleDailyMinute, out var dm)
+                    ? Math.Clamp(dm, 0, 59) : 0,
                 DebounceSeconds = int.TryParse(vm.ScheduleDebounceSeconds, out var s) ? s : 60,
                 MaxWaitSeconds = int.TryParse(vm.ScheduleMaxWaitSeconds, out var mw) && mw > 0 ? mw : 300,
                 PollIntervalSeconds = int.TryParse(vm.SchedulePollSeconds, out var p) && p > 0 ? p : 30,
@@ -3146,8 +3295,6 @@ public class MainViewModel : ViewModelBase
         {
             opts.Schedule.Enabled = false;
         }
-
-        backupSet.JobOptions = opts;
     }
 
     /// <summary>

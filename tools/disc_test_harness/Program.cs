@@ -66,6 +66,12 @@ await runner.Run("happy-multi-disc-span", async ws =>
     var r = await ws.RestoreAndVerify(burner, srcs);
     ws.Assert(r.Mismatches == 0, $"{r.Mismatches} restored file(s) had wrong content");
     ws.Assert(r.Restored == srcs.Count, $"restored {r.Restored}/{srcs.Count} files");
+
+    // Multi-disc restore must also work through the NEW lazy materialisation path.
+    var lz = await ws.RestoreAndVerifyLazy(burner, srcs, LazySelectionMode.ByDirectoryPrefix);
+    ws.Assert(lz.Mismatches == 0, $"lazy: {lz.Mismatches} restored file(s) had wrong content");
+    ws.Assert(lz.Restored == srcs.Count, $"lazy: restored {lz.Restored}/{srcs.Count} files");
+    ws.Assert(lz.Enumerated == srcs.Count, $"lazy: skip-scan enumerated {lz.Enumerated}/{srcs.Count} leaves");
 });
 
 await runner.Run("happy-file-dedup", async ws =>
@@ -80,6 +86,12 @@ await runner.Run("happy-file-dedup", async ws =>
     var r = await ws.RestoreAndVerify(burner, srcs);
     ws.Assert(r.Mismatches == 0, $"{r.Mismatches} restored file(s) had wrong content");
     ws.Assert(r.Restored == srcs.Count, $"restored {r.Restored}/{srcs.Count} files");
+
+    // The deduped .fileref must also resolve through the NEW lazy restore path.
+    var lz = await ws.RestoreAndVerifyLazy(burner, srcs, LazySelectionMode.ByDirectoryPrefix);
+    ws.Assert(lz.Mismatches == 0, $"lazy: {lz.Mismatches} restored file(s) had wrong content");
+    ws.Assert(lz.Restored == srcs.Count, $"lazy: restored {lz.Restored}/{srcs.Count} files");
+    ws.Assert(lz.Enumerated == srcs.Count, $"lazy: skip-scan enumerated {lz.Enumerated}/{srcs.Count} leaves");
 });
 
 await runner.Run("happy-zip-all", async ws =>
@@ -119,6 +131,59 @@ await runner.Run("happy-file-splitting", async ws =>
     // No disc may overflow its capacity now that chunks span discs.
     long overflow = ws.MaxDiscOverflowBytes(burner, 150_000);
     ws.Assert(overflow == 0, $"a disc overflowed capacity by {overflow} bytes");
+
+    // The split file must also round-trip through the NEW lazy restore path, whose
+    // MaterializeSelectionAsync hydrates chunks per-record on demand.
+    var lz = await ws.RestoreAndVerifyLazy(burner, srcs, LazySelectionMode.ByFilePath);
+    ws.Assert(lz.Mismatches == 0, $"lazy: {lz.Mismatches} restored file(s) had wrong content");
+    ws.Assert(lz.Restored == srcs.Count, $"lazy: restored {lz.Restored}/{srcs.Count} files");
+    ws.Assert(lz.Enumerated == srcs.Count, $"lazy: skip-scan enumerated {lz.Enumerated}/{srcs.Count} leaves");
+});
+
+// ------------------------------------------------------------------
+// Lazy catalog restore (v1.0.36): the GUI now reads the restore tree one
+// directory at a time via GetRestoreChildrenAsync and materialises only the
+// selected subset via MaterializeSelectionAsync. These cases drive that exact
+// path (skip-scan enumeration + on-demand materialisation) end to end.
+// ------------------------------------------------------------------
+
+await runner.Run("lazy-catalog-nested-tree-both-modes", async ws =>
+{
+    // A multi-level tree so the skip-scan must descend several directory levels and
+    // jump past whole subtrees between siblings.
+    var srcs = ws.MakeTree(
+        ("docs/2024/jan/report.txt", 40_000),
+        ("docs/2024/jan/notes.md", 6_000),
+        ("docs/2024/feb/summary.txt", 22_000),
+        ("docs/archive/old.bin", 90_000),
+        ("media/img/photo1.bin", 70_000),
+        ("media/img/photo2.bin", 55_000),
+        ("media/clip.dat", 30_000),
+        ("root-note.txt", 3_000));
+    var (burner, result) = await ws.Backup(srcs);
+    ws.Assert(result.Success, "backup should succeed");
+
+    // Selecting whole directories (prefix-range materialisation).
+    var byDir = await ws.RestoreAndVerifyLazy(burner, srcs, LazySelectionMode.ByDirectoryPrefix);
+    ws.Assert(byDir.Enumerated == srcs.Count,
+        $"by-dir: skip-scan enumerated {byDir.Enumerated}/{srcs.Count} leaves");
+    ws.Assert(byDir.Mismatches == 0, $"by-dir: {byDir.Mismatches} restored file(s) had wrong content");
+    ws.Assert(byDir.Restored == srcs.Count, $"by-dir: restored {byDir.Restored}/{srcs.Count} files");
+
+    // Selecting individual file leaves (exact-path materialisation).
+    var byFile = await ws.RestoreAndVerifyLazy(burner, srcs, LazySelectionMode.ByFilePath);
+    ws.Assert(byFile.Enumerated == srcs.Count,
+        $"by-file: skip-scan enumerated {byFile.Enumerated}/{srcs.Count} leaves");
+    ws.Assert(byFile.Mismatches == 0, $"by-file: {byFile.Mismatches} restored file(s) had wrong content");
+    ws.Assert(byFile.Restored == srcs.Count, $"by-file: restored {byFile.Restored}/{srcs.Count} files");
+
+    // GetActiveSubtreeStatsAsync (the lazy per-directory count) must agree with the
+    // real subtree contents — e.g. everything under docs/2024.
+    string src2024 = srcs.First(p => p.Replace('\\', '/').EndsWith("docs/2024/jan/report.txt"));
+    string prefix2024 = src2024[..src2024.LastIndexOf("2024", StringComparison.Ordinal)] + "2024";
+    var (cnt, bytes) = await ws.Catalog.GetActiveSubtreeStatsAsync(ws.BackupSetId, prefix2024);
+    ws.Assert(cnt == 3, $"expected 3 files under docs/2024, subtree stats reported {cnt}");
+    ws.Assert(bytes > 0, "expected non-zero aggregate size under docs/2024");
 });
 
 await runner.Run("verify-disc-integrity", async ws =>
@@ -765,6 +830,12 @@ return runner.Report();
 // Test framework
 // ======================================================================
 
+/// <summary>How a lazy restore selection is expressed to
+/// <see cref="RestoreService.MaterializeSelectionAsync"/>: as whole-directory
+/// prefixes (a checked directory) or as individual file paths (checked leaves).
+/// Testing both covers the prefix-range and exact-path branches of the materialiser.</summary>
+enum LazySelectionMode { ByDirectoryPrefix, ByFilePath }
+
 sealed class TestRunner
 {
     private readonly string _root;
@@ -1101,6 +1172,93 @@ sealed class Workspace : IDisposable
             if (!ok) mismatches++;
         }
         return (result.FilesRestored, mismatches);
+    }
+
+    /// <summary>
+    /// Restore + verify driving the NEW lazy catalog path the GUI now uses. Walks the
+    /// restore tree one directory at a time with the loose-index skip-scan
+    /// (<see cref="SqliteCatalogRepository.GetRestoreChildrenAsync"/>) exactly as the
+    /// GUI does on expand, expresses a "select everything" choice as either directory
+    /// prefixes or individual file paths, then materialises it with
+    /// <see cref="RestoreService.MaterializeSelectionAsync"/> — instead of the eager
+    /// whole-catalog <c>GetRestorableFilesAsync</c>. Returns the restored count, the
+    /// mismatch count, and how many leaf files the skip-scan enumerated (so a caller
+    /// can assert it saw exactly the set's distinct active source paths).
+    /// </summary>
+    public async Task<(int Restored, int Mismatches, int Enumerated)> RestoreAndVerifyLazy(
+        SimulatedDiscBurner burner, List<string> sources, LazySelectionMode mode,
+        IReadOnlyDictionary<string, byte[]>? expectedContentByPath = null)
+    {
+        var labelToRoot = await BuildLabelToRootAsync(burner);
+        var restore = new RestoreService(Catalog)
+        {
+            DiscInsertCallback = label => Task.FromResult(
+                labelToRoot.TryGetValue(label, out var root) ? root : null),
+        };
+
+        // Walk the whole tree lazily, one directory at a time — this exercises the
+        // skip-scan enumerator at every level rather than an eager whole-catalog read.
+        var rootPrefixes = new List<string>();
+        var leafPaths = new List<string>();
+        foreach (var child in await Catalog.GetRestoreChildrenAsync(BackupSetId, ""))
+        {
+            if (child.IsDirectory) { rootPrefixes.Add(child.FullPath); await WalkLazyLeaves(child, leafPaths); }
+            else leafPaths.Add(child.FullPath);
+        }
+
+        int enumerated = leafPaths.Count;
+
+        // Express the selection two different ways to cover both branches of
+        // MaterializeSelectionAsync (prefix-range query vs. exact-path lookup).
+        IReadOnlyCollection<string> dirPrefixes, filePaths;
+        if (mode == LazySelectionMode.ByDirectoryPrefix)
+        {
+            // "Select all" on each root drive/share = one prefix per root. Any leaf
+            // sitting directly at a root (not under one of those prefixes) is listed
+            // explicitly, mirroring how the tree collects a root-level file.
+            dirPrefixes = rootPrefixes;
+            filePaths = leafPaths.Where(p => rootPrefixes.All(
+                pr => !p.StartsWith(pr.TrimEnd('\\') + "\\", StringComparison.OrdinalIgnoreCase))).ToList();
+        }
+        else
+        {
+            dirPrefixes = System.Array.Empty<string>();
+            filePaths = leafPaths;
+        }
+
+        var restorable = await restore.MaterializeSelectionAsync(BackupSetId, dirPrefixes, filePaths);
+
+        var driveDests = restorable
+            .Select(rf => DriveKey(rf.Record.SourcePath))
+            .Distinct()
+            .ToDictionary(k => k, _ => _restoreDir, StringComparer.OrdinalIgnoreCase);
+
+        var result = await restore.RestoreAsync(restorable, driveDests);
+
+        int mismatches = 0;
+        foreach (var src in sources)
+        {
+            string restored = Path.Combine(_restoreDir, RelToDriveRoot(src));
+            if (!File.Exists(restored)) { mismatches++; continue; }
+
+            bool ok = expectedContentByPath is not null
+                      && expectedContentByPath.TryGetValue(src, out var expected)
+                ? HashEqualsBytes(restored, expected)
+                : HashEquals(src, restored);
+            if (!ok) mismatches++;
+        }
+        return (result.FilesRestored, mismatches, enumerated);
+    }
+
+    /// <summary>Recursively collect leaf (file) paths under a tree node using the same
+    /// skip-scan enumerator the GUI drives on expand.</summary>
+    private async Task WalkLazyLeaves(RestoreTreeChild node, List<string> leaves)
+    {
+        foreach (var child in await Catalog.GetRestoreChildrenAsync(BackupSetId, node.FullPath))
+        {
+            if (child.IsDirectory) await WalkLazyLeaves(child, leaves);
+            else leaves.Add(child.FullPath);
+        }
     }
 
     private static bool HashEqualsBytes(string filePath, byte[] expected)
