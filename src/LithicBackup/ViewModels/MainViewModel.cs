@@ -974,10 +974,6 @@ public class MainViewModel : ViewModelBase
                     root.SortChildren();
             }
 
-            // For existing sets, mark clean AFTER selections are restored so
-            // the restore itself doesn't count as a user change.
-            if (_unsavedNewSetId is null)
-                sourceSelection.MarkClean();
         }
         finally
         {
@@ -986,6 +982,35 @@ public class MainViewModel : ViewModelBase
             // restore to finish (including an auto-save queued by a fast close).
             selectionRestored.TrySetResult();
         }
+
+        // Arm dirty tracking (and mark clean for existing sets) as soon as the
+        // restore + first render settle — NOT after the potentially multi-second
+        // catalog/size computation in PostShowInitAsync below.  The dialog has
+        // been visible and interactive since Show() (well before this point), so
+        // a user who immediately edits a setting — e.g. the schedule fields —
+        // must have that edit tracked.  Previously the resume lived in
+        // PostShowInitAsync's finally, so during a slow ComputeAllUnknownSizesAsync
+        // the catch-all dirty handlers stayed suspended and those early edits were
+        // silently ignored (Save never enabled).  The catalog/size steps that run
+        // afterwards raise no dirtying VM event (SetCatalogInfo only touches node
+        // badges; ComputeAllUnknownSizesAsync only writes the excluded
+        // SelectedSizeText / SizeCalculationResult), so arming before them is safe.
+        //
+        // Scheduling at ContextIdle lets the tree's Include/Auto-include checkbox
+        // columns — revealed by the IsApplyingSelections=false flip just above —
+        // flush their first-render Mode=TwoWay write-backs first (Render priority,
+        // above ContextIdle).  Those write-backs dirty the set via the ungated
+        // selection-settle / AutoIncludeNew paths, so we MarkClean HERE (after they
+        // land) rather than earlier; otherwise a no-touch open/close would prompt
+        // to save.  New sets stay dirty (there's a real unsaved record to persist).
+        _ = Application.Current.Dispatcher.InvokeAsync(
+            () =>
+            {
+                if (_unsavedNewSetId is null)
+                    sourceSelection.MarkClean();
+                sourceSelection.ResumeDirtyTracking();
+            },
+            System.Windows.Threading.DispatcherPriority.ContextIdle);
 
         _ = PostShowInitAsync();
 
@@ -1018,36 +1043,12 @@ public class MainViewModel : ViewModelBase
 
                 await sourceSelection.ComputeAllUnknownSizesAsync();
             }
-            finally
+            catch
             {
-                // Re-arm dirty tracking once the programmatic init has settled,
-                // and — crucially — mark clean AT the same point rather than
-                // earlier.  The MarkClean at the end of Phase 3 (above) runs
-                // BEFORE IsApplyingSelections flips false, which is what reveals
-                // the tree's Include/Auto-include checkbox columns (they're
-                // Hidden while applying).  When those Mode=TwoWay checkboxes
-                // first render, their write-backs fire: AutoIncludeNew's setter
-                // always runs userInitiated (raising SelectionChanged) and
-                // IsSelected's setter calls RequestSelectionSettle, which sets
-                // _needsSave = true UNGATED (it deliberately ignores the suspend
-                // flag so a genuine click during init still dirties).  Those
-                // render-time write-backs land AFTER the Phase-3 MarkClean, so
-                // the dialog opens already "dirty" even when the user touched
-                // nothing.  Cleaning here — scheduled at ContextIdle, below the
-                // Render/Background priority of every init write-back and settle
-                // pass — guarantees we clean AFTER all of them have flushed, so a
-                // no-touch open/close prompts nothing.  New sets stay dirty
-                // (there's a real unsaved record to persist).  Done in a finally
-                // so a failed catalog/size load can never leave the dialog
-                // permanently unable to detect edits (and thus unable to save).
-                await Application.Current.Dispatcher.InvokeAsync(
-                    () =>
-                    {
-                        if (_unsavedNewSetId is null)
-                            sourceSelection.MarkClean();
-                        sourceSelection.ResumeDirtyTracking();
-                    },
-                    System.Windows.Threading.DispatcherPriority.ContextIdle);
+                // Catalog/size stamping is best-effort — a failure here must not
+                // crash the editor.  Dirty tracking is already armed above,
+                // independently of this work, so a failure can't leave the dialog
+                // unable to detect edits.
             }
 
             planCheckReady = true;
