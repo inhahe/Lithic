@@ -1,5 +1,32 @@
 # LithicBackup — Known Issues & Tech Debt
 
+## FIXED: Bogus "unsaved changes" prompt after viewing a settings tab in the backup-set editor (2026-07-19)
+
+**Symptom.** Open a backup set in the modify dialog, click one of the settings
+tabs (General/Options/Retention/Schedule) to look at it, change nothing, then
+press Cancel — a spurious "you have unsaved changes" confirmation appears.
+
+**Cause.** A regression from moving the editor's `TabControl` to the top level
+with the sources hierarchy as the first tab (v1.0.30). The VM's dirty tracking
+(`SourceSelectionViewModel`, `_needsSave`/`_dirtyTrackingArmed`) assumes **all**
+first-render `Mode=TwoWay` binding write-backs happen inside a short init window
+that ends at `ContextIdle` after load (MainViewModel post-restore MarkClean +
+ResumeDirtyTracking). Previously the General settings tab was always visible in
+the bottom card, so its write-backs fired at load and were absorbed. After the
+restructure the settings tabs are **lazily realized** by the top-level TabControl
+— their content isn't instantiated until first selected, so their first-render
+write-backs (radios, combos, tier-set pattern boxes) fire *after* the init window
+and mark the set dirty even though the user changed nothing.
+
+**Fix.** `SourceSelectionView.EditorTabs_SelectionChanged` mirrors the initial-load
+absorption per tab switch: `SuspendDirtyTracking()` on the switch, then
+`ResumeDirtyTracking()` one dispatcher cycle later (`ContextIdle`, below the
+Render-priority binding updates). It deliberately does **not** `MarkClean`, so a
+genuine unsaved edit made earlier on another tab still survives the switch. The
+handler is gated on `e.OriginalSource is TabControl` (ignore bubbled ComboBox
+SelectionChanged) and `IsLoaded` (skip the initial selection during construction,
+which the MainViewModel init window already owns).
+
 ## LIMITATION: Continuous mode cannot safely back up always-on databases (needs VSS / app-consistent snapshot) (2026-07-19)
 
 **What.** Continuous-mode backup (the USN/watcher-driven path in

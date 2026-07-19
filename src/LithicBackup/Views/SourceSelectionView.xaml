@@ -74,7 +74,8 @@
         </Grid>
 
         <!-- Top-level tabs: Sources hierarchy first, then the backup settings. -->
-        <TabControl x:Name="EditorTabs">
+        <TabControl x:Name="EditorTabs"
+                    SelectionChanged="EditorTabs_SelectionChanged">
 
             <!-- ===================== Sources ===================== -->
             <TabItem Header="Sources">
