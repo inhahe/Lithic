@@ -1,5 +1,33 @@
 # LithicBackup — Known Issues & Tech Debt
 
+## FIXED: Bogus "unsaved changes" prompt when opening Modify and clicking Cancel quickly (2026-07-19)
+
+**Symptom.** Open a set's Modify editor and click **Cancel** within a few seconds,
+without touching anything, and the "You have unsaved changes — save before
+closing?" prompt appears. Waiting longer before cancelling avoids it.
+
+**Cause (confirmed by instrumentation).** `SourceSelectionViewModel._needsSave`
+defaults to `true`. For an existing set the editor clears it via `MarkClean()`,
+scheduled at `DispatcherPriority.ContextIdle` right after the selection restore
+(MainViewModel, the `InvokeAsync(..., ContextIdle)` block in the Modify open flow).
+The clean-mark is deliberately at ContextIdle so it runs *after* the tree's
+first-render checkbox write-backs settle. But the code kicked off
+`PostShowInitAsync()` (catalog dictionary load + `ComputeAllUnknownSizesAsync` +
+the plan-check scan) immediately afterwards, and that work pumps a continuous
+stream of higher-than-ContextIdle dispatcher activity — **starving the ContextIdle
+queue for ~5 seconds** (measured: OPEN at 07:48:09 → MARKCLEAN at 07:48:14, with
+*zero* dirty transitions logged in between). During that whole window `_needsSave`
+sat at its `true` init-default, so a quick Cancel saw a "dirty" set. The set was
+never actually re-dirtied; the flag was simply never cleared in time.
+
+**Fix (v1.0.34).** `await` the ContextIdle clean-mark/resume pass *before* starting
+`PostShowInitAsync()`. With the dispatcher kept quiet until the clean-mark runs, it
+now fires within milliseconds of the dialog appearing (right after the first-render
+write-backs settle) instead of being starved for seconds. The multi-second catalog/
+size/plan work then starts afterwards as fire-and-forget. No behavior change for new
+sets (they legitimately stay dirty). Root-caused with a temporary
+`%TEMP%\lithic-dirty.log` stack-trace tracer that was removed once confirmed.
+
 ## FIXED: Upgrade "unable to close all requested applications" when the backup-set editor is open (2026-07-19)
 
 **Symptom.** Running the MSI to upgrade fails with "The setup was unable to

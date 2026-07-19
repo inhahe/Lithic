@@ -1014,14 +1014,24 @@ public class MainViewModel : ViewModelBase
         // selection-settle / AutoIncludeNew paths, so we MarkClean HERE (after they
         // land) rather than earlier; otherwise a no-touch open/close would prompt
         // to save.  New sets stay dirty (there's a real unsaved record to persist).
-        _ = Application.Current.Dispatcher.InvokeAsync(
+        //
+        // Crucially, AWAIT this ContextIdle pass before kicking off the
+        // multi-second PostShowInitAsync catalog/size/plan work below.  That work
+        // pumps a continuous stream of higher-than-ContextIdle dispatcher activity,
+        // so if it starts first it STARVES this clean-mark for several seconds —
+        // during which _needsSave sits at its `true` init-default and a user who
+        // opens the set and clicks Cancel within that window gets a bogus "unsaved
+        // changes" prompt.  Awaiting keeps the dispatcher quiet until the clean-mark
+        // fires (within milliseconds of the dialog appearing, right after the
+        // first-render write-backs settle), closing that window.
+        await Application.Current.Dispatcher.InvokeAsync(
             () =>
             {
                 if (_unsavedNewSetId is null)
                     sourceSelection.MarkClean();
                 sourceSelection.ResumeDirtyTracking();
             },
-            System.Windows.Threading.DispatcherPriority.ContextIdle);
+            System.Windows.Threading.DispatcherPriority.ContextIdle).Task;
 
         _ = PostShowInitAsync();
 
