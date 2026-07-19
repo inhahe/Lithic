@@ -50,8 +50,8 @@ public class SourceSelectionViewModel : ViewModelBase
     private bool _scheduleEnabled;
     private ScheduleMode _scheduleMode = ScheduleMode.Interval;
     private string _scheduleIntervalHours = "24";
-    private int _scheduleDailyHour = 2;
-    private int _scheduleDailyMinute;
+    private string _scheduleDailyHour = "2";
+    private string _scheduleDailyMinute = "00";
     private string _scheduleDebounceSeconds = "60";
     private string _scheduleMaxWaitSeconds = "300";
     private string _schedulePollSeconds = "30";
@@ -787,13 +787,15 @@ public class SourceSelectionViewModel : ViewModelBase
         set => SetProperty(ref _scheduleIntervalHours, value);
     }
 
-    public int ScheduleDailyHour
+    /// <summary>Hour of day for daily backups (0–23) as a text field.</summary>
+    public string ScheduleDailyHour
     {
         get => _scheduleDailyHour;
         set => SetProperty(ref _scheduleDailyHour, value);
     }
 
-    public int ScheduleDailyMinute
+    /// <summary>Minute of hour for daily backups (0–59) as a text field.</summary>
+    public string ScheduleDailyMinute
     {
         get => _scheduleDailyMinute;
         set => SetProperty(ref _scheduleDailyMinute, value);

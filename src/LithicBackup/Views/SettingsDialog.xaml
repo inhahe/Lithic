@@ -3,7 +3,7 @@
         xmlns:x="http://schemas.microsoft.com/winfx/2006/xaml"
         Title="Settings"
         Width="580" SizeToContent="Height"
-        MaxHeight="820"
+        MaxHeight="1100"
         WindowStartupLocation="CenterOwner"
         ResizeMode="NoResize"
         ShowInTaskbar="False"
@@ -19,7 +19,7 @@
 
             <!-- ================= General ================= -->
             <TabItem Header="General">
-                <ScrollViewer VerticalScrollBarVisibility="Auto" MaxHeight="640">
+                <ScrollViewer VerticalScrollBarVisibility="Auto" MaxHeight="1000">
                     <StackPanel Margin="0,0,4,0">
                         <TextBlock Text="Memory budget"
                                    FontSize="15" FontWeight="SemiBold"
@@ -187,7 +187,7 @@
 
             <!-- ================= Continuous ================= -->
             <TabItem Header="Continuous">
-                <ScrollViewer VerticalScrollBarVisibility="Auto" MaxHeight="640">
+                <ScrollViewer VerticalScrollBarVisibility="Auto" MaxHeight="1000">
                     <StackPanel Margin="0,0,4,0">
                         <TextBlock Text="Continuous backup rules"
                                    FontSize="15" FontWeight="SemiBold"

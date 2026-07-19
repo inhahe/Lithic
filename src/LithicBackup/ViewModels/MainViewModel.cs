@@ -3062,8 +3062,10 @@ public class MainViewModel : ViewModelBase
             vm.ScheduleMode = sched.Mode;
             vm.ScheduleIntervalHours = sched.IntervalHours.ToString(
                 System.Globalization.CultureInfo.InvariantCulture);
-            vm.ScheduleDailyHour = sched.DailyHour;
-            vm.ScheduleDailyMinute = sched.DailyMinute;
+            vm.ScheduleDailyHour = sched.DailyHour.ToString(
+                System.Globalization.CultureInfo.InvariantCulture);
+            vm.ScheduleDailyMinute = sched.DailyMinute.ToString(
+                "D2", System.Globalization.CultureInfo.InvariantCulture);
             vm.ScheduleDebounceSeconds = sched.DebounceSeconds.ToString();
             vm.ScheduleMaxWaitSeconds = sched.MaxWaitSeconds.ToString();
             vm.SchedulePollSeconds = sched.PollIntervalSeconds.ToString();
@@ -3135,8 +3137,10 @@ public class MainViewModel : ViewModelBase
                     System.Globalization.NumberStyles.Float,
                     System.Globalization.CultureInfo.InvariantCulture,
                     out var h) ? h : 24,
-                DailyHour = vm.ScheduleDailyHour,
-                DailyMinute = vm.ScheduleDailyMinute,
+                DailyHour = int.TryParse(vm.ScheduleDailyHour, out var dh)
+                    ? Math.Clamp(dh, 0, 23) : 2,
+                DailyMinute = int.TryParse(vm.ScheduleDailyMinute, out var dm)
+                    ? Math.Clamp(dm, 0, 59) : 0,
                 DebounceSeconds = int.TryParse(vm.ScheduleDebounceSeconds, out var s) ? s : 60,
                 MaxWaitSeconds = int.TryParse(vm.ScheduleMaxWaitSeconds, out var mw) && mw > 0 ? mw : 300,
                 PollIntervalSeconds = int.TryParse(vm.SchedulePollSeconds, out var p) && p > 0 ? p : 30,

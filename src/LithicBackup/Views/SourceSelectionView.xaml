@@ -80,7 +80,11 @@
                            VerticalAlignment="Center" Margin="0,0,12,0"
                            Visibility="{Binding IsEditMode, Converter={StaticResource BoolToVis}}" />
 
-                <!-- Edit mode: Save + Close -->
+                <!-- Edit mode: Cancel + Save (Save primary on the right, matching
+                     the Settings dialog and this window's own new-set footer) -->
+                <Button Content="Cancel" Command="{Binding CancelCommand}"
+                        Padding="16,8" Margin="0,0,8,0" Cursor="Hand"
+                        Visibility="{Binding IsEditMode, Converter={StaticResource BoolToVis}}" />
                 <Button Content="Save" Command="{Binding SaveCommand}"
                         Visibility="{Binding IsEditMode, Converter={StaticResource BoolToVis}}"
                         ToolTipService.ShowOnDisabled="True"
@@ -96,9 +100,6 @@
                         </Style>
                     </Button.Style>
                 </Button>
-                <Button Content="Close" Command="{Binding CancelCommand}"
-                        Padding="16,8" Margin="8,0,0,0" Cursor="Hand"
-                        Visibility="{Binding IsEditMode, Converter={StaticResource BoolToVis}}" />
 
                 <!-- New-set mode: Cancel + Next -->
                 <Button Content="Cancel" Command="{Binding CancelCommand}"
@@ -125,12 +126,17 @@
         <!-- Backup set settings -->
         <Border DockPanel.Dock="Bottom" Style="{StaticResource Card}"
                 Padding="12" Margin="0,10,0,0">
-            <ScrollViewer VerticalScrollBarVisibility="Auto"
-                          HorizontalScrollBarVisibility="Disabled"
-                          Focusable="False"
-                          Padding="0,0,4,0">
-            <StackPanel>
-                <TextBlock Text="Backup Settings" FontWeight="SemiBold" Margin="0,0,0,8" />
+            <DockPanel>
+                <TextBlock DockPanel.Dock="Top" Text="Backup Settings"
+                           FontWeight="SemiBold" Margin="0,0,0,8" />
+                <TabControl>
+
+                <!-- ===================== General ===================== -->
+                <TabItem Header="General">
+                <ScrollViewer VerticalScrollBarVisibility="Auto"
+                              HorizontalScrollBarVisibility="Disabled"
+                              Focusable="False" MaxHeight="320" Padding="2,10,6,0">
+                <StackPanel>
 
                 <!-- Name -->
                 <Grid Margin="0,0,0,8">
@@ -277,6 +283,16 @@
                         </TextBlock.Style>
                     </TextBlock>
                 </StackPanel>
+                </StackPanel>
+                </ScrollViewer>
+                </TabItem>
+
+                <!-- ===================== Options ===================== -->
+                <TabItem Header="Options">
+                <ScrollViewer VerticalScrollBarVisibility="Auto"
+                              HorizontalScrollBarVisibility="Disabled"
+                              Focusable="False" MaxHeight="320" Padding="2,10,6,0">
+                <StackPanel>
 
                 <!-- ====== Disc-mode options ====== -->
                 <StackPanel Visibility="{Binding IsDirectoryMode, Converter={StaticResource BoolToVis}, ConverterParameter=Invert}">
@@ -344,6 +360,22 @@
                                  IsEnabled="{Binding EnableBlockDeduplication}" />
                         <TextBlock Text="KB" VerticalAlignment="Center" Margin="4,0,0,0" />
                     </StackPanel>
+                </StackPanel>
+                </StackPanel>
+                </ScrollViewer>
+                </TabItem>
+
+                <!-- ===================== Retention ===================== -->
+                <TabItem Header="Retention">
+                <ScrollViewer VerticalScrollBarVisibility="Auto"
+                              HorizontalScrollBarVisibility="Disabled"
+                              Focusable="False" MaxHeight="320" Padding="2,10,6,0">
+                <StackPanel>
+                <TextBlock Text="Version retention tiers apply to directory backups only."
+                           Foreground="{StaticResource TextSecondaryBrush}" FontSize="11"
+                           TextWrapping="Wrap" Margin="0,0,0,4"
+                           Visibility="{Binding IsDirectoryMode, Converter={StaticResource BoolToVis}, ConverterParameter=Invert}" />
+                <StackPanel Visibility="{Binding IsDirectoryMode, Converter={StaticResource BoolToVis}}">
 
                     <!-- Version retention tier sets -->
                     <TextBlock Text="Version Retention Tier Sets" FontWeight="SemiBold"
@@ -537,6 +569,22 @@
                                 HorizontalAlignment="Left"
                                 Padding="8,4" Margin="0,2,0,6" Cursor="Hand" FontSize="11" />
                     </StackPanel>
+                </StackPanel>
+                </StackPanel>
+                </ScrollViewer>
+                </TabItem>
+
+                <!-- ===================== Schedule ===================== -->
+                <TabItem Header="Schedule">
+                <ScrollViewer VerticalScrollBarVisibility="Auto"
+                              HorizontalScrollBarVisibility="Disabled"
+                              Focusable="False" MaxHeight="320" Padding="2,10,6,0">
+                <StackPanel>
+                <TextBlock Text="Automated scheduling applies to directory backups only."
+                           Foreground="{StaticResource TextSecondaryBrush}" FontSize="11"
+                           TextWrapping="Wrap" Margin="0,0,0,4"
+                           Visibility="{Binding IsDirectoryMode, Converter={StaticResource BoolToVis}, ConverterParameter=Invert}" />
+                <StackPanel Visibility="{Binding IsDirectoryMode, Converter={StaticResource BoolToVis}}">
 
                     <!-- Schedule -->
                     <CheckBox Content="Enable automated backups"
@@ -585,7 +633,7 @@
                                      BorderBrush="{StaticResource BorderBrush}"
                                      ToolTip="Hour (0-23)" />
                             <TextBlock Text=":" VerticalAlignment="Center" Margin="2,0,2,0" />
-                            <TextBox Text="{Binding ScheduleDailyMinute, UpdateSourceTrigger=PropertyChanged, StringFormat='{}{0:D2}'}"
+                            <TextBox Text="{Binding ScheduleDailyMinute, UpdateSourceTrigger=PropertyChanged}"
                                      Padding="4,3" Width="40"
                                      BorderBrush="{StaticResource BorderBrush}"
                                      ToolTip="Minute (0-59)" />
@@ -608,30 +656,16 @@
                             </TextBlock.Style>
                             <Run Text="Settle time and the max-wait cap are configured globally in Settings ▸ Continuous (tiered by file size and by name/path mask)." />
                         </TextBlock>
-                        <!-- Continuous poll interval -->
-                        <StackPanel Orientation="Horizontal" Margin="0,0,0,4">
-                            <StackPanel.Style>
-                                <Style TargetType="StackPanel">
-                                    <Setter Property="Visibility" Value="Collapsed" />
-                                    <Style.Triggers>
-                                        <DataTrigger Binding="{Binding ScheduleMode}" Value="Continuous">
-                                            <Setter Property="Visibility" Value="Visible" />
-                                        </DataTrigger>
-                                    </Style.Triggers>
-                                </Style>
-                            </StackPanel.Style>
-                            <TextBlock Text="Check for changes every" VerticalAlignment="Center" Margin="0,0,6,0" />
-                            <TextBox Text="{Binding SchedulePollSeconds, UpdateSourceTrigger=PropertyChanged}"
-                                     Padding="4,3" Width="60"
-                                     BorderBrush="{StaticResource BorderBrush}"
-                                     ToolTip="How often the Worker polls the change journal for this set. The Worker uses the smallest value across all continuous sets. Minimum 5 seconds." />
-                            <TextBlock Text="seconds"
-                                       VerticalAlignment="Center" Margin="6,0,0,0" />
-                        </StackPanel>
+                        <!-- Continuous mode is driven by USN push notifications;
+                             the old per-set poll interval was removed. The Worker
+                             falls back to a global poll interval as a backstop. -->
                     </StackPanel>
                 </StackPanel>
-            </StackPanel>
-            </ScrollViewer>
+                </StackPanel>
+                </ScrollViewer>
+                </TabItem>
+                </TabControl>
+            </DockPanel>
         </Border>
 
         <Grid>
