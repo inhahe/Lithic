@@ -1020,15 +1020,33 @@ public class MainViewModel : ViewModelBase
             }
             finally
             {
-                // Re-arm dirty tracking once the programmatic init has settled.
-                // Scheduling at ContextIdle guarantees the settings panel's
-                // first-render binding write-backs (which run at Render priority,
-                // higher than ContextIdle) have flushed first, so none of them is
-                // mistaken for a user edit.  Done in a finally so a failed
-                // catalog/size load can never leave the dialog permanently unable
-                // to detect edits (and thus unable to save).
+                // Re-arm dirty tracking once the programmatic init has settled,
+                // and — crucially — mark clean AT the same point rather than
+                // earlier.  The MarkClean at the end of Phase 3 (above) runs
+                // BEFORE IsApplyingSelections flips false, which is what reveals
+                // the tree's Include/Auto-include checkbox columns (they're
+                // Hidden while applying).  When those Mode=TwoWay checkboxes
+                // first render, their write-backs fire: AutoIncludeNew's setter
+                // always runs userInitiated (raising SelectionChanged) and
+                // IsSelected's setter calls RequestSelectionSettle, which sets
+                // _needsSave = true UNGATED (it deliberately ignores the suspend
+                // flag so a genuine click during init still dirties).  Those
+                // render-time write-backs land AFTER the Phase-3 MarkClean, so
+                // the dialog opens already "dirty" even when the user touched
+                // nothing.  Cleaning here — scheduled at ContextIdle, below the
+                // Render/Background priority of every init write-back and settle
+                // pass — guarantees we clean AFTER all of them have flushed, so a
+                // no-touch open/close prompts nothing.  New sets stay dirty
+                // (there's a real unsaved record to persist).  Done in a finally
+                // so a failed catalog/size load can never leave the dialog
+                // permanently unable to detect edits (and thus unable to save).
                 await Application.Current.Dispatcher.InvokeAsync(
-                    sourceSelection.ResumeDirtyTracking,
+                    () =>
+                    {
+                        if (_unsavedNewSetId is null)
+                            sourceSelection.MarkClean();
+                        sourceSelection.ResumeDirtyTracking();
+                    },
                     System.Windows.Threading.DispatcherPriority.ContextIdle);
             }
 
