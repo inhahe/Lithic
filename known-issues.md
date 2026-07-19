@@ -59,9 +59,12 @@ already up). Fix: capture the baseline **synchronously in Phase 1**, right after
 settings field is restored and the selection tree is untouched (restore writes
 node backing fields directly, never adding to `ChangedSelectionPaths`), so it's
 the true saved state and a fast close can no longer beat it. The `ContextIdle`
-pass still *refreshes* the baseline once first-render write-backs settle. (This
-build also carries temporary `[dirty-debug]` logging to `%ProgramData%\LithicBackup\logs\lithic-gui-*.log`;
-remove it once the fix is confirmed in the field.)
+pass still *refreshes* the baseline once first-render write-backs settle, but only
+`MarkClean`s when the current state still matches the Phase-1 baseline — otherwise
+a genuine edit made during the multi-second load window (e.g. ticking "Create
+subdirectory" right after open) would be silently wiped, disabling Save ~half a
+second later (fixed v1.0.41). The temporary `[dirty-debug]` logging was removed in
+v1.0.42 once both fixes were confirmed.
 
 ## FIXED: Upgrade "unable to close all requested applications" — forced shutdown now has a hard-exit watchdog (2026-07-19)
 

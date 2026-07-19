@@ -6,7 +6,6 @@ using System.Windows.Input;
 using LithicBackup.Core.Interfaces;
 using LithicBackup.Core.Models;
 using LithicBackup.Infrastructure.Burning;
-using LithicBackup.Infrastructure.Diagnostics;
 using LithicBackup.Services;
 using LithicBackup.Views;
 
@@ -570,9 +569,6 @@ public class MainViewModel : ViewModelBase
         {
             settingsBaseline = SnapshotEditorSettings(backupSet, sourceSelection);
             cleanSelectionMark = sourceSelection.ChangedSelectionPaths.Count;
-            CrashLogger.Log(null,
-                $"[dirty-debug] Phase-1 baseline captured for set '{backupSet.Name}' " +
-                $"(id={backupSet.Id}). cleanSelectionMark={cleanSelectionMark}.");
         }
 
         // Selection restore and size computation are deferred to after the
@@ -652,11 +648,7 @@ public class MainViewModel : ViewModelBase
             // it says clean, we truly are and can skip the prompt without any
             // further work.
             if (!sourceSelection.HasUnsavedChanges)
-            {
-                CrashLogger.Log(null,
-                    $"[dirty-debug] Close: HasUnsavedChanges=false → no prompt (set '{backupSet.Name}').");
                 return;
-            }
 
             // The flag says dirty, but it's prone to false positives.  For an
             // existing set, confirm with the two precise, cheap signals: a genuine
@@ -668,29 +660,11 @@ public class MainViewModel : ViewModelBase
             // there's an unsaved record to persist.)
             if (!isNewSet && settingsBaseline is not null)
             {
-                var changedPaths = sourceSelection.ChangedSelectionPaths;
-                bool selectionChanged = changedPaths.Count > cleanSelectionMark;
-                string currentSettings = SnapshotEditorSettings(backupSet, sourceSelection);
-                bool settingsChanged = currentSettings != settingsBaseline;
-
-                CrashLogger.Log(null,
-                    $"[dirty-debug] Close for set '{backupSet.Name}' (id={backupSet.Id}): " +
-                    $"HasUnsavedChanges=true, selectionChanged={selectionChanged} " +
-                    $"(ChangedSelectionPaths.Count={changedPaths.Count}, cleanSelectionMark={cleanSelectionMark}, " +
-                    $"paths=[{string.Join(", ", changedPaths)}]), settingsChanged={settingsChanged}." +
-                    (settingsChanged
-                        ? $"\n--- baseline ---\n{settingsBaseline}\n--- current ---\n{currentSettings}\n--- end ---"
-                        : ""));
+                bool selectionChanged = sourceSelection.ChangedSelectionPaths.Count > cleanSelectionMark;
+                bool settingsChanged = SnapshotEditorSettings(backupSet, sourceSelection) != settingsBaseline;
 
                 if (!selectionChanged && !settingsChanged)
                     return;
-            }
-            else
-            {
-                CrashLogger.Log(null,
-                    $"[dirty-debug] Close for set '{backupSet.Name}': isNewSet={isNewSet}, " +
-                    $"settingsBaseline is {(settingsBaseline is null ? "NULL (baseline never captured!)" : "set")} " +
-                    "→ falling through to prompt.");
             }
 
             var result = MessageBox.Show(
@@ -1135,13 +1109,8 @@ public class MainViewModel : ViewModelBase
                         settingsBaseline = refreshed;
                         cleanSelectionMark = sourceSelection.ChangedSelectionPaths.Count;
                     }
-                    else
-                    {
-                        CrashLogger.Log(null,
-                            $"[dirty-debug] ContextIdle: real edit detected during load window " +
-                            $"for set '{backupSet.Name}' (selectionChanged={selectionChanged}, " +
-                            $"settingsChanged={settingsChanged}) — keeping _needsSave and baseline intact.");
-                    }
+                    // Otherwise the user made a genuine edit during the load window —
+                    // leave _needsSave and the baseline intact so the edit sticks.
                 }
                 sourceSelection.ResumeDirtyTracking();
             },
