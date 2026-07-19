@@ -556,6 +556,25 @@ public class MainViewModel : ViewModelBase
         sourceSelection.SetName = backupSet.Name;
         RestoreSourceSettings(sourceSelection, backupSet.JobOptions);
 
+        // Capture the clean baseline for the close prompt RIGHT NOW — synchronously,
+        // before the dialog is ever shown — so a fast open/close can't beat it.  The
+        // old capture point (the Phase 3 ContextIdle pass, after the multi-second
+        // selection restore) let a user who opened a set and closed it within ~1.6s
+        // hit a still-null baseline plus the true-by-default _needsSave flag → a
+        // bogus "unsaved changes" prompt (confirmed in the gui log).  At this point
+        // RestoreSourceSettings has set every settings field, and the selection tree
+        // hasn't been touched (programmatic restore writes node backing fields
+        // directly, never adding to ChangedSelectionPaths), so this IS the saved
+        // state.  New sets keep a null baseline (real unsaved record → always prompt).
+        if (_unsavedNewSetId is null)
+        {
+            settingsBaseline = SnapshotEditorSettings(backupSet, sourceSelection);
+            cleanSelectionMark = sourceSelection.ChangedSelectionPaths.Count;
+            CrashLogger.Log(null,
+                $"[dirty-debug] Phase-1 baseline captured for set '{backupSet.Name}' " +
+                $"(id={backupSet.Id}). cleanSelectionMark={cleanSelectionMark}.");
+        }
+
         // Selection restore and size computation are deferred to after the
         // dialog is visible (see Phase 3 / PostShowInitAsync below).  The tree's
         // include checkboxes stay hidden until the restore completes so the user
@@ -1097,20 +1116,21 @@ public class MainViewModel : ViewModelBase
                 if (_unsavedNewSetId is null)
                 {
                     sourceSelection.MarkClean();
-                    // Record the just-loaded state as the clean baseline the close
-                    // prompt compares against.  Captured here (not in
-                    // PostShowInitAsync) for the same reason as MarkClean: the
-                    // first-render write-backs have settled, and the later
-                    // catalog/size work raises no state-changing edit, so the
-                    // settings snapshot is stable.  ChangedSelectionPaths is empty
-                    // at this point (restore writes backing fields directly), but
-                    // capture the mark anyway for robustness.
-                    settingsBaseline = SnapshotEditorSettings(backupSet, sourceSelection);
+                    // Refresh the baseline (first captured synchronously in Phase 1)
+                    // now that the first-render binding write-backs have settled, so
+                    // any benign settling folds into the clean state rather than
+                    // reading as a change.  The later catalog/size work raises no
+                    // state-changing edit, so this snapshot is stable.  A fast close
+                    // that beats this pass still has the Phase-1 baseline to compare
+                    // against, so it no longer falls through to a bogus prompt.
+                    string refreshed = SnapshotEditorSettings(backupSet, sourceSelection);
+                    if (refreshed != settingsBaseline)
+                        CrashLogger.Log(null,
+                            $"[dirty-debug] Baseline drifted between Phase-1 and ContextIdle for " +
+                            $"set '{backupSet.Name}' (benign first-render settling):" +
+                            $"\n--- phase1 ---\n{settingsBaseline}\n--- settled ---\n{refreshed}\n--- end ---");
+                    settingsBaseline = refreshed;
                     cleanSelectionMark = sourceSelection.ChangedSelectionPaths.Count;
-                    CrashLogger.Log(null,
-                        $"[dirty-debug] Baseline captured for set '{backupSet.Name}' " +
-                        $"(id={backupSet.Id}). cleanSelectionMark={cleanSelectionMark}. " +
-                        $"settingsBaseline=\n{settingsBaseline}");
                 }
                 sourceSelection.ResumeDirtyTracking();
             },

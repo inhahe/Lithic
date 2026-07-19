@@ -48,6 +48,21 @@ Save button's CanExecute (over-enabling the button is harmless). This makes the
 close prompt immune to spurious `PropertyChanged`/selection events rather than
 playing whack-a-mole with each new source of them.
 
+**Follow-up (v1.0.40) — the baseline was captured too late.** The first cut of
+the above captured the baseline in the Phase-3 `ContextIdle` pass, *after* the
+multi-second selection restore. The GUI log proved a user who opened a set and
+closed it within ~1.6s hit the close handler while `settingsBaseline` was still
+**null** and `_needsSave` was still at its `true` init-default — so it fell
+straight through to the prompt (the baseline only landed while the MessageBox was
+already up). Fix: capture the baseline **synchronously in Phase 1**, right after
+`RestoreSourceSettings`, before the dialog is ever shown. At that point every
+settings field is restored and the selection tree is untouched (restore writes
+node backing fields directly, never adding to `ChangedSelectionPaths`), so it's
+the true saved state and a fast close can no longer beat it. The `ContextIdle`
+pass still *refreshes* the baseline once first-render write-backs settle. (This
+build also carries temporary `[dirty-debug]` logging to `%ProgramData%\LithicBackup\logs\lithic-gui-*.log`;
+remove it once the fix is confirmed in the field.)
+
 ## FIXED: Upgrade "unable to close all requested applications" — forced shutdown now has a hard-exit watchdog (2026-07-19)
 
 **Symptom.** Running the MSI to upgrade failed again with "The setup was unable to
