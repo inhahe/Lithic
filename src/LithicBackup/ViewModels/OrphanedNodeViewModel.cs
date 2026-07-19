@@ -253,9 +253,37 @@ public class OrphanedCategoryViewModel : ViewModelBase
         OrphanedReason.CatalogDeleted =>
             "Files marked as deleted in the catalog but still physically present on disk.",
         OrphanedReason.CatalogDuplicate =>
-            "Extra catalog rows pointing at the current copy of a file — usually left over from re-running 'Seed from existing backup' on the same destination. Cleaning these removes only the duplicate rows; the physical file on disk is left alone.",
+            "Extra catalog rows pointing at the current copy of a file — usually left over from re-running 'Seed from existing backup' on the same destination.",
         _ => "",
     };
+
+    /// <summary>
+    /// One-line statement of what purging this category actually does, so the
+    /// user can tell at a glance which sections physically delete backed-up
+    /// files from the destination and which only rewrite catalog records.
+    /// Shown as a coloured notice under the description in the view.
+    /// </summary>
+    public string PurgeEffect => Reason switch
+    {
+        OrphanedReason.CatalogDuplicate =>
+            "Purge effect: removes only the duplicate catalog rows \u2014 no files on disk are deleted.",
+        OrphanedReason.ExcessVersion =>
+            "Purge effect: deletes these older backed-up versions from the destination and marks their catalog rows deleted.",
+        OrphanedReason.UntrackedFile =>
+            "Purge effect: deletes these files from the destination (they have no catalog record).",
+        OrphanedReason.CatalogDeleted =>
+            "Purge effect: deletes these files from the destination (their catalog rows are already marked deleted).",
+        _ =>
+            "Purge effect: deletes these backed-up copies from the destination and marks their catalog rows deleted. Your source files are not touched.",
+    };
+
+    /// <summary>
+    /// True when purging this category physically deletes files from the
+    /// destination.  False only for <see cref="OrphanedReason.CatalogDuplicate"/>,
+    /// which rewrites catalog rows and leaves every file on disk alone.
+    /// Drives the colour of the purge-effect notice.
+    /// </summary>
+    public bool PurgeDeletesFiles => Reason != OrphanedReason.CatalogDuplicate;
 
     public int TotalFileCount => RootNodes.Sum(n => n.FileCount);
     public long TotalSize => RootNodes.Sum(n => n.SizeBytes);

@@ -288,6 +288,22 @@ public class OrphanedDirectoriesViewModel : ViewModelBase
         set => SetProperty(ref _reconcileStatusText, value);
     }
 
+    /// <summary>
+    /// True once <see cref="ReconcileAnalyzeAsync"/> has produced a dry-run
+    /// report with pending changes. The Apply button is hidden until then, so
+    /// it only appears after Analyze surfaces something to apply (mirroring the
+    /// other cards, whose action buttons/results appear only after a scan).
+    /// </summary>
+    public bool CanApplyReconcile => _reconcileReport?.HasChanges == true;
+
+    /// <summary>Assigns the reconcile report and notifies the Apply button's
+    /// enabled/visible state.</summary>
+    private void SetReconcileReport(ReconcileReport? report)
+    {
+        _reconcileReport = report;
+        OnPropertyChanged(nameof(CanApplyReconcile));
+    }
+
     public ICommand PurgeSelectedCommand { get; }
     public ICommand ScanCatalogCommand { get; }
     public ICommand ScanExcludedCommand { get; }
@@ -450,38 +466,15 @@ public class OrphanedDirectoriesViewModel : ViewModelBase
             progress.Bump(groupCount);
         }
 
-        // Collapse children of removed dirs into their highest ancestor.
-        // Sorted by length so parents (shorter paths) come first.
-        removedDirs.Sort((a, b) => a.DirectoryPath.Length.CompareTo(b.DirectoryPath.Length));
-        var collapsedRemoved = new List<OrphanedDirectoryItem>();
-        foreach (var item in removedDirs)
-        {
-            var parent = collapsedRemoved.FirstOrDefault(c =>
-                IsPathUnderRoot(item.DirectoryPath, c.DirectoryPath)
-                && !item.DirectoryPath.Equals(c.DirectoryPath, StringComparison.OrdinalIgnoreCase));
-            if (parent is not null)
-            {
-                parent.FileCount += item.FileCount;
-                parent.TotalSizeBytes += item.TotalSizeBytes;
-                // Merge child's file list into the parent so the displayed
-                // file rows include every file that would be purged.  The
-                // child item itself is discarded (not added to collapsedRemoved).
-                if (item.Files is not null)
-                {
-                    parent.Files ??= [];
-                    parent.Files.AddRange(item.Files);
-                }
-                if (item.DiscFilePaths is not null)
-                {
-                    parent.DiscFilePaths ??= [];
-                    parent.DiscFilePaths.AddRange(item.DiscFilePaths);
-                }
-            }
-            else
-            {
-                collapsedRemoved.Add(item);
-            }
-        }
+        // Keep every removed directory as its own item (no collapsing into the
+        // highest ancestor).  Collapsing merged all descendant files into one
+        // flat Files list on the top ancestor, so BuildTree could only render a
+        // single node with every file dumped in as a flat list — losing the
+        // directory hierarchy that all the other categories show.  With one item
+        // per directory, BuildTree nests files under their real subdirectories.
+        // Purge coverage is unchanged: checking a parent node cascades to all
+        // descendant items, and each item still carries its own DiscFilePaths.
+        var collapsedRemoved = removedDirs;
 
         // --- Phase 2: MatchesConfiguredExclusion ---
         progress.SetPhase("Detecting excluded files", totalFiles);
@@ -1726,7 +1719,21 @@ public class OrphanedDirectoriesViewModel : ViewModelBase
 
             int backupSetId = _backupSet.Id;
             string? targetDir = _targetDir;
-            var progress = new Progress<string>(status => PurgeStatusText = status);
+            // Route live progress into BOTH the transient action-row line
+            // (PurgeStatusText) and the prominent header subtitle
+            // (SummaryText, right under the "Cleanup" title).  The header is
+            // where the user's eye rests, so echoing progress there is what
+            // makes the purge visibly "doing something" instead of sitting on
+            // a static "Purging..." while the real updates hide in the small
+            // grey action-row text.
+            // Cleanup surfaces progress as text labels (not a percentage bar), so
+            // it only needs the report's Text; the shared DestinationFilePurger now
+            // speaks ProgressReport (text + optional percent).
+            var progress = new Progress<Services.ProgressReport>(report =>
+            {
+                PurgeStatusText = report.Text;
+                SummaryText = report.Text;
+            });
 
             // Run all DB work + disk deletion on a background thread — the
             // catalog methods are synchronous (ExecuteNonQuery /
@@ -1769,7 +1776,7 @@ public class OrphanedDirectoriesViewModel : ViewModelBase
                             var dirName = Path.GetFileName(wi.DirectoryPath.TrimEnd('\\'));
                             int pct = workItems.Count == 0
                                 ? 100 : (int)((i + 1) * 100L / workItems.Count);
-                            ((IProgress<string>)progress).Report(
+                            ((IProgress<Services.ProgressReport>)progress).Report(
                                 $"Updating catalog {i + 1:N0}/{workItems.Count:N0} ({pct}%): {dirName}");
                         }
 
@@ -1927,16 +1934,16 @@ public class OrphanedDirectoriesViewModel : ViewModelBase
             return;
 
         IsReconciling = true;
-        _reconcileReport = null;
+        SetReconcileReport(null);
         ReconcileStatusText = "Analyzing catalog against destination...";
 
         try
         {
-            var progress = new Progress<string>(msg => ReconcileStatusText = msg);
+            var progress = new Progress<Services.ProgressReport>(r => ReconcileStatusText = r.Text);
             var report = await Task.Run(() =>
                 _reconcile.AnalyzeAsync(_backupSet.Id, _targetDir, progress));
 
-            _reconcileReport = report;
+            SetReconcileReport(report);
 
             long flipBytes = report.Flips.Sum(f => f.SizeBytes);
             long pruneBytes = report.Prunes.Sum(p => p.SizeBytes);
@@ -1967,7 +1974,7 @@ public class OrphanedDirectoriesViewModel : ViewModelBase
         }
         catch (Exception ex)
         {
-            _reconcileReport = null;
+            SetReconcileReport(null);
             ReconcileStatusText = $"Analysis failed: {ex.Message}";
         }
         finally
@@ -1993,11 +2000,11 @@ public class OrphanedDirectoriesViewModel : ViewModelBase
 
         try
         {
-            var progress = new Progress<string>(msg => ReconcileStatusText = msg);
+            var progress = new Progress<Services.ProgressReport>(r => ReconcileStatusText = r.Text);
             var result = await Task.Run(() =>
                 _reconcile.ApplyAsync(_backupSet.Id, report, _targetDir, progress));
 
-            _reconcileReport = null;
+            SetReconcileReport(null);
 
             var parts = new List<string>();
             if (result.Flipped > 0)

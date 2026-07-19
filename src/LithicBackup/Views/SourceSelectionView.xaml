@@ -610,6 +610,26 @@
                             <TextBlock Text="seconds after last change"
                                        VerticalAlignment="Center" Margin="6,0,0,0" />
                         </StackPanel>
+                        <!-- Continuous max-wait cap -->
+                        <StackPanel Orientation="Horizontal" Margin="0,0,0,4">
+                            <StackPanel.Style>
+                                <Style TargetType="StackPanel">
+                                    <Setter Property="Visibility" Value="Collapsed" />
+                                    <Style.Triggers>
+                                        <DataTrigger Binding="{Binding ScheduleMode}" Value="Continuous">
+                                            <Setter Property="Visibility" Value="Visible" />
+                                        </DataTrigger>
+                                    </Style.Triggers>
+                                </Style>
+                            </StackPanel.Style>
+                            <TextBlock Text="But back up at least every" VerticalAlignment="Center" Margin="0,0,6,0" />
+                            <TextBox Text="{Binding ScheduleMaxWaitSeconds, UpdateSourceTrigger=PropertyChanged}"
+                                     Padding="4,3" Width="60"
+                                     BorderBrush="{StaticResource BorderBrush}"
+                                     ToolTip="Cap on how long an actively-changing file may go unversioned. The debounce above never fires while a file keeps changing, so this guarantees a file you keep editing still gets a version this often. If lower than the debounce it wins, giving one version this often during a long editing burst. Default 300 (5 minutes)." />
+                            <TextBlock Text="seconds while still changing"
+                                       VerticalAlignment="Center" Margin="6,0,0,0" />
+                        </StackPanel>
                         <!-- Continuous poll interval -->
                         <StackPanel Orientation="Horizontal" Margin="0,0,0,4">
                             <StackPanel.Style>
@@ -1003,12 +1023,24 @@
                 </Style>
             </TreeView.ItemContainerStyle>
 
-            <!-- Data template: just the name (checkboxes are in the ControlTemplate) -->
+            <!-- Data template: just the name (checkboxes are in the ControlTemplate).
+                 Hidden/System entries (e.g. C:\ProgramData) are shown but painted a
+                 distinct violet so it's clear they're special. -->
             <TreeView.ItemTemplate>
                 <HierarchicalDataTemplate ItemsSource="{Binding Children}">
-                    <TextBlock Text="{Binding Name}"
-                               VerticalAlignment="Center"
-                               Foreground="{StaticResource TextPrimaryBrush}" />
+                    <TextBlock Text="{Binding Name}" VerticalAlignment="Center">
+                        <TextBlock.Style>
+                            <Style TargetType="TextBlock">
+                                <Setter Property="Foreground" Value="{StaticResource TextPrimaryBrush}" />
+                                <Style.Triggers>
+                                    <DataTrigger Binding="{Binding IsHiddenOrSystem}" Value="True">
+                                        <Setter Property="Foreground" Value="{StaticResource HiddenSystemBrush}" />
+                                        <Setter Property="ToolTip" Value="Hidden or system item" />
+                                    </DataTrigger>
+                                </Style.Triggers>
+                            </Style>
+                        </TextBlock.Style>
+                    </TextBlock>
                 </HierarchicalDataTemplate>
             </TreeView.ItemTemplate>
         </TreeView>

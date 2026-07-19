@@ -17,7 +17,21 @@
     GitHub release tagged v<Version> with the MSI attached.
   -->
   <PropertyGroup>
-    <Version>1.0.12</Version>
+    <Version>1.0.26</Version>
+  </PropertyGroup>
+
+  <!--
+    Ship English only.  Lithic Backup has no localized UI, but a self-contained
+    publish otherwise drags in ~13 satellite resource folders (de, fr, ru,
+    zh-Hans, …) of framework localizations — ~220 extra .resources.dll files.
+    Those bloat the installer's file/component count, which is what an on-access
+    antivirus scan (e.g. Windows Defender) has to churn through the first time
+    the MSI is run — the main driver of the long one-time "Computing space
+    requirements" pause. Restricting satellite resources to English drops all of
+    them with zero user-visible change.
+  -->
+  <PropertyGroup>
+    <SatelliteResourceLanguages>en</SatelliteResourceLanguages>
   </PropertyGroup>
 
 </Project>

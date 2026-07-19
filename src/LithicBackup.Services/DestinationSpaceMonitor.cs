@@ -62,6 +62,18 @@ public sealed class DestinationSpaceMonitor : IDisposable
     /// </summary>
     public event Action<string>? DestinationFull;
 
+    /// <summary>
+    /// Raised (on a thread-pool thread) after every sweep with the current
+    /// destination-space status of <em>every</em> set that has a connected,
+    /// ready destination (keyed by set id). Unlike <see cref="DestinationFull"/>
+    /// — a one-shot, continuous-only alert — this reports the live full/not-full
+    /// state for all sets so the GUI can show (and clear) a persistent per-row
+    /// status. Sets whose destination is missing/offline are absent from the map;
+    /// subscribers should treat "absent" as "not full / unknown". Subscribers must
+    /// marshal to the UI thread themselves.
+    /// </summary>
+    public event Action<IReadOnlyDictionary<int, DestinationSpaceStatus>>? StatusUpdated;
+
     public DestinationSpaceMonitor(ICatalogRepository catalog, IDestinationResolver destinationResolver)
     {
         _catalog = catalog ?? throw new ArgumentNullException(nameof(catalog));
@@ -100,17 +112,19 @@ public sealed class DestinationSpaceMonitor : IDisposable
                 return; // catalog unavailable — try again next tick
             }
 
+            // Snapshot of every set's destination state, published to the GUI
+            // for the persistent per-row status after the sweep.
+            var statuses = new Dictionary<int, DestinationSpaceStatus>();
+
             foreach (var set in sets)
             {
                 var opts = set.JobOptions;
-
-                // Only sets that have continuous backup switched on are relevant.
-                if (opts?.Schedule is not { Enabled: true, Mode: ScheduleMode.Continuous })
+                if (opts is null)
                     continue;
 
                 string? root = ResolveDestinationRoot(opts);
                 if (root is null)
-                    continue; // no configured / connected destination
+                    continue; // no configured / connected destination — no row status
 
                 long free;
                 try
@@ -125,21 +139,39 @@ public sealed class DestinationSpaceMonitor : IDisposable
                     continue; // drive query failed — skip this one
                 }
 
-                if (free < LowSpaceThresholdBytes)
+                bool isFull = free < LowSpaceThresholdBytes;
+
+                // Record the live state for the per-row status (all sets, not
+                // just continuous ones).
+                statuses[set.Id] = new DestinationSpaceStatus(
+                    isFull, root.TrimEnd('\\'), FormatBytes(free));
+
+                // The one-shot "drive full" alert is only meaningful for
+                // continuous sets: they run under the headless Worker, so a full
+                // destination fails silently. Interactive sets surface the same
+                // condition through the persistent row status instead.
+                bool isContinuous =
+                    opts.Schedule is { Enabled: true, Mode: ScheduleMode.Continuous };
+                if (isContinuous)
                 {
-                    // Warn once per fill event.
-                    if (_warnedRoots.Add(root))
-                        DestinationFull?.Invoke(
-                            $"Backup destination \u201c{set.Name}\u201d is on drive " +
-                            $"{root.TrimEnd('\\')} which is full ({FormatBytes(free)} free).\n\n" +
-                            "Continuous backup can\u2019t save new file versions until you free up space.");
-                }
-                else if (free >= LowSpaceThresholdBytes + RecoveryMarginBytes)
-                {
-                    // Recovered comfortably — re-arm so a future fill warns again.
-                    _warnedRoots.Remove(root);
+                    if (isFull)
+                    {
+                        // Warn once per fill event.
+                        if (_warnedRoots.Add(root))
+                            DestinationFull?.Invoke(
+                                $"Backup destination \u201c{set.Name}\u201d is on drive " +
+                                $"{root.TrimEnd('\\')} which is full ({FormatBytes(free)} free).\n\n" +
+                                "Continuous backup can\u2019t save new file versions until you free up space.");
+                    }
+                    else if (free >= LowSpaceThresholdBytes + RecoveryMarginBytes)
+                    {
+                        // Recovered comfortably — re-arm so a future fill warns again.
+                        _warnedRoots.Remove(root);
+                    }
                 }
             }
+
+            StatusUpdated?.Invoke(statuses);
         }
         finally
         {
@@ -191,3 +223,12 @@ public sealed class DestinationSpaceMonitor : IDisposable
         GC.SuppressFinalize(this);
     }
 }
+
+/// <summary>
+/// Live destination free-space status for one backup set, published by
+/// <see cref="DestinationSpaceMonitor.StatusUpdated"/>.
+/// </summary>
+/// <param name="IsFull">True when free space is below the "full" threshold.</param>
+/// <param name="Root">Destination drive root without a trailing slash (e.g. <c>J:</c>).</param>
+/// <param name="FreeSpaceText">Human-readable free space (e.g. <c>512 MB</c>).</param>
+public sealed record DestinationSpaceStatus(bool IsFull, string Root, string FreeSpaceText);

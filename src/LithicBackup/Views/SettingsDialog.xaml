@@ -114,6 +114,30 @@
         <Border Height="1" Background="{StaticResource BorderBrush}"
                 Margin="0,20,0,16" />
 
+        <TextBlock Text="After editing a set's folders"
+                   FontSize="15" FontWeight="SemiBold"
+                   Foreground="{StaticResource TextPrimaryBrush}" />
+        <TextBlock Text="When you save a change to which folders a set backs up, the app can scan the affected folders to back up ones you added and remove copies of ones you dropped. (Merely browsing/expanding the tree never triggers a scan.)"
+                   Foreground="{StaticResource TextSecondaryBrush}"
+                   FontSize="11" TextWrapping="Wrap"
+                   Margin="0,4,0,12" />
+
+        <RadioButton GroupName="ReconcileMode"
+                     Content="Ask each time (recommended)"
+                     IsChecked="{Binding ReconcileAsk}"
+                     Margin="0,0,0,4" />
+        <RadioButton GroupName="ReconcileMode"
+                     Content="Always scan and sync automatically"
+                     IsChecked="{Binding ReconcileAlways}"
+                     Margin="0,4,0,4" />
+        <RadioButton GroupName="ReconcileMode"
+                     Content="Never — sync on the next full backup instead"
+                     IsChecked="{Binding ReconcileNever}"
+                     Margin="0,4,0,4" />
+
+        <Border Height="1" Background="{StaticResource BorderBrush}"
+                Margin="0,20,0,16" />
+
         <TextBlock Text="Disc staging"
                    FontSize="15" FontWeight="SemiBold"
                    Foreground="{StaticResource TextPrimaryBrush}" />

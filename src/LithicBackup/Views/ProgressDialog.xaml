@@ -35,10 +35,14 @@
                    Foreground="{StaticResource TextSecondaryBrush}"
                    Margin="0,8,0,0" />
 
-        <!-- Indeterminate activity bar -->
+        <!-- Progress bar: shows real per-stage completion when the running stage
+             reports a percentage, and falls back to a marquee for unbounded
+             steps (which report text only). -->
         <ProgressBar Grid.Row="2"
-                     Height="6" IsIndeterminate="True"
-                     Margin="0,14,0,0" />
+                     Height="6" Margin="0,14,0,0"
+                     Minimum="0" Maximum="100"
+                     Value="{Binding ProgressValue}"
+                     IsIndeterminate="{Binding IsIndeterminate}" />
 
         <!-- Cancel (only when the operation is cancellable) -->
         <Button Grid.Row="3"

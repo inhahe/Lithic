@@ -518,6 +518,15 @@ public class MainViewModel : ViewModelBase
             fileHashCache: _fileHashCache, scanner: _scanner);
         sourceSelection.IsEditMode = true;
 
+        // Mute dirty tracking across the whole programmatic init below (settings
+        // restore, selection restore, catalog/size stamping, and the settings
+        // panel's first-render binding write-backs).  Without this, that
+        // machinery trips the catch-all "mark dirty" handlers, so opening a set
+        // and immediately closing it — without touching anything — pops a bogus
+        // "You have unsaved changes" prompt.  Re-armed in PostShowInitAsync's
+        // finally once init has settled.
+        sourceSelection.SuspendDirtyTracking();
+
         // Selection restore is deferred to Phase 3 (after the window is visible),
         // so mark "applying" NOW — before the tree ever renders — so the include
         // checkboxes stay hidden until their real state loads from the catalog.
@@ -653,7 +662,9 @@ public class MainViewModel : ViewModelBase
             // If the edit actually saved, reconcile the destination with the new
             // source selection: offer to purge copies of removed folders and to
             // back up newly added ones.  Skipped entirely when nothing was saved
-            // (e.g. the user discarded changes on close).
+            // (e.g. the user discarded changes on close).  Whether the reconcile
+            // runs at all — and whether it prompts first — is governed inside
+            // ReconcileDestinationAfterEditAsync by the ReconcileMode setting.
             if (savedThisSession)
                 await ReconcileDestinationAfterEditAsync(
                     backupSet, originalSelections, sourceSelection.ChangedSelectionPaths);
@@ -963,10 +974,6 @@ public class MainViewModel : ViewModelBase
                     root.SortChildren();
             }
 
-            // For existing sets, mark clean AFTER selections are restored so
-            // the restore itself doesn't count as a user change.
-            if (_unsavedNewSetId is null)
-                sourceSelection.MarkClean();
         }
         finally
         {
@@ -976,34 +983,74 @@ public class MainViewModel : ViewModelBase
             selectionRestored.TrySetResult();
         }
 
+        // Arm dirty tracking (and mark clean for existing sets) as soon as the
+        // restore + first render settle — NOT after the potentially multi-second
+        // catalog/size computation in PostShowInitAsync below.  The dialog has
+        // been visible and interactive since Show() (well before this point), so
+        // a user who immediately edits a setting — e.g. the schedule fields —
+        // must have that edit tracked.  Previously the resume lived in
+        // PostShowInitAsync's finally, so during a slow ComputeAllUnknownSizesAsync
+        // the catch-all dirty handlers stayed suspended and those early edits were
+        // silently ignored (Save never enabled).  The catalog/size steps that run
+        // afterwards raise no dirtying VM event (SetCatalogInfo only touches node
+        // badges; ComputeAllUnknownSizesAsync only writes the excluded
+        // SelectedSizeText / SizeCalculationResult), so arming before them is safe.
+        //
+        // Scheduling at ContextIdle lets the tree's Include/Auto-include checkbox
+        // columns — revealed by the IsApplyingSelections=false flip just above —
+        // flush their first-render Mode=TwoWay write-backs first (Render priority,
+        // above ContextIdle).  Those write-backs dirty the set via the ungated
+        // selection-settle / AutoIncludeNew paths, so we MarkClean HERE (after they
+        // land) rather than earlier; otherwise a no-touch open/close would prompt
+        // to save.  New sets stay dirty (there's a real unsaved record to persist).
+        _ = Application.Current.Dispatcher.InvokeAsync(
+            () =>
+            {
+                if (_unsavedNewSetId is null)
+                    sourceSelection.MarkClean();
+                sourceSelection.ResumeDirtyTracking();
+            },
+            System.Windows.Threading.DispatcherPriority.ContextIdle);
+
         _ = PostShowInitAsync();
 
         async Task PostShowInitAsync()
         {
-            // Now that the tree is visible and interactive, load the big catalog
-            // dictionary on a background thread and stamp backup-status badges on
-            // the already-loaded (visible) nodes. Collapsed folders pick up their
-            // badges when expanded, since new child nodes read the shared catalog
-            // getter (which SetCatalogInfo populates here).
-            var catalogInfo = await Task.Run(() =>
+            try
             {
-                try { return _catalog.GetLatestVersionInfoAsync(backupSet.Id).GetAwaiter().GetResult(); }
-                catch { return null as Dictionary<string, Core.Models.FileVersionInfo>; }
-            });
-            sourceSelection.SetCatalogInfo(catalogInfo);
+                // Now that the tree is visible and interactive, load the big catalog
+                // dictionary on a background thread and stamp backup-status badges on
+                // the already-loaded (visible) nodes. Collapsed folders pick up their
+                // badges when expanded, since new child nodes read the shared catalog
+                // getter (which SetCatalogInfo populates here).
+                var catalogInfo = await Task.Run(() =>
+                {
+                    try { return _catalog.GetLatestVersionInfoAsync(backupSet.Id).GetAwaiter().GetResult(); }
+                    catch { return null as Dictionary<string, Core.Models.FileVersionInfo>; }
+                });
+                sourceSelection.SetCatalogInfo(catalogInfo);
 
-            // Show catalog summary so the user knows files are already tracked
-            // (e.g. from a previous seed or backup).
-            if (catalogInfo is { Count: > 0 })
+                // Show catalog summary so the user knows files are already tracked
+                // (e.g. from a previous seed or backup).
+                if (catalogInfo is { Count: > 0 })
+                {
+                    long totalBytes = 0;
+                    foreach (var fvi in catalogInfo.Values)
+                        totalBytes += fvi.SizeBytes;
+                    sourceSelection.SeedResult =
+                        $"{catalogInfo.Count:N0} files ({FormatBytes(totalBytes)}) in catalog.";
+                }
+
+                await sourceSelection.ComputeAllUnknownSizesAsync();
+            }
+            catch
             {
-                long totalBytes = 0;
-                foreach (var fvi in catalogInfo.Values)
-                    totalBytes += fvi.SizeBytes;
-                sourceSelection.SeedResult =
-                    $"{catalogInfo.Count:N0} files ({FormatBytes(totalBytes)}) in catalog.";
+                // Catalog/size stamping is best-effort — a failure here must not
+                // crash the editor.  Dirty tracking is already armed above,
+                // independently of this work, so a failure can't leave the dialog
+                // unable to detect edits.
             }
 
-            await sourceSelection.ComputeAllUnknownSizesAsync();
             planCheckReady = true;
             autoCheckCts = new CancellationTokenSource();
             await RunPlanCheckInEditorAsync(sourceSelection, backupSet, autoCheckCts.Token);
@@ -1050,6 +1097,49 @@ public class MainViewModel : ViewModelBase
         // and still runs the reconcile below.
         if (SelectionsEquivalent(originalSelections, newSelections))
             return;
+
+        // Second fast path: the serialized trees differ, but ONLY because of
+        // display-only state — the user expanded/collapsed folders while browsing,
+        // which ToModel persists as IsExpanded so the tree reopens the same way.
+        // Expansion can neither add nor remove a covered file, and every real
+        // coverage change (a checkbox toggle, or an auto-include-new toggle) is
+        // recorded into changedPaths at the moment it happens (see
+        // SourceSelectionViewModel.RequestSelectionSettle and the ApplyAutoIncludeNew
+        // -> _recordChangedPath wiring; a bulk select/deselect-all records the
+        // virtual root as an empty path).  So if nothing was recorded, the edit
+        // touched no selection at all — skip the (potentially huge, hundreds of
+        // thousands of files) catalog + filesystem scans that would otherwise fire
+        // just because the user opened a few folders to look around.
+        if (changedPaths.Count == 0)
+            return;
+
+        // A real coverage change was made and saved.  Whether we scan/reconcile
+        // now is up to the user's ReconcileMode setting:
+        //   Never  — skip; added/removed folders sync on the next full backup.
+        //   Always — reconcile silently.
+        //   Ask    — prompt first, so a large edit doesn't kick off a long scan
+        //            without consent (the default).
+        switch (_settings.ReconcileMode)
+        {
+            case Core.Models.ReconcileAfterEditMode.Never:
+                return;
+            case Core.Models.ReconcileAfterEditMode.Ask:
+                var answer = MessageBox.Show(
+                    $"You changed which folders \"{backupSet.Name}\" backs up.\n\n" +
+                    "Scan the affected folders now to back up ones you added and " +
+                    "remove copies of ones you dropped?\n\n" +
+                    "You can skip this and let the changes sync on the next full " +
+                    "backup instead.",
+                    "Update backup",
+                    MessageBoxButton.YesNo,
+                    MessageBoxImage.Question);
+                if (answer != MessageBoxResult.Yes)
+                    return;
+                break;
+            case Core.Models.ReconcileAfterEditMode.Always:
+            default:
+                break;
+        }
 
         // Show a cancellable progress dialog (instead of a busy cursor) while we
         // scan the catalog for dropped files: it says exactly what it's doing and
@@ -1140,7 +1230,7 @@ public class MainViewModel : ViewModelBase
         IReadOnlyList<Core.Models.SourceSelection> originalSelections,
         IReadOnlyList<Core.Models.SourceSelection> newSelections,
         IReadOnlyCollection<string> changedPaths,
-        IProgress<string>? progress,
+        IProgress<ProgressReport>? progress,
         CancellationToken ct)
     {
         // A bulk toggle can record the virtual "All Drives" root (empty path),
@@ -1150,13 +1240,13 @@ public class MainViewModel : ViewModelBase
         if (changedPaths.Any(string.IsNullOrEmpty))
             return ComputeRemovedFilesFull(backupSetId, originalSelections, newSelections, progress, ct);
 
-        // No checkbox was toggled, yet the JSON diff flagged a change — so the
-        // edit was purely cosmetic (expansion state) or an auto-include-new
-        // toggle.  Neither drops an already-backed-up file: existing children of
-        // a directory are always materialised as explicit selections, so
-        // auto-include only governs FUTURE entries, and expansion state is
-        // display-only.  Nothing can have been removed, so skip all catalog
-        // reads.
+        // Nothing was recorded as changed, yet the JSON diff flagged a change — so
+        // the edit was purely cosmetic (expansion state, which is display-only and
+        // can't drop a backed-up file).  Auto-include-new toggles DO record their
+        // directory path (see SourceSelectionNodeViewModel.ApplyAutoIncludeNew ->
+        // _recordChangedPath), precisely because turning the rule off can evict
+        // existing descendants that were covered only by it; so an auto-include
+        // change reaches the scan below rather than this no-op early-return.
         if (changedPaths.Count == 0)
             return new List<FileRecord>();
 
@@ -1210,7 +1300,7 @@ public class MainViewModel : ViewModelBase
         int backupSetId,
         IReadOnlyList<Core.Models.SourceSelection> originalSelections,
         IReadOnlyList<Core.Models.SourceSelection> newSelections,
-        IProgress<string>? progress,
+        IProgress<ProgressReport>? progress,
         CancellationToken ct)
     {
         progress?.Report("Loading backup catalog\u2026");
@@ -1232,7 +1322,10 @@ public class MainViewModel : ViewModelBase
             if (progress is not null && nowMs - lastReportMs >= ProgressUpdateIntervalMs)
             {
                 lastReportMs = nowMs;
-                progress.Report($"Checked {checkedCount:N0}/{total:N0} files, {removed.Count:N0} to remove\u2026");
+                int pct = total == 0 ? 100 : (int)(checkedCount * 100L / total);
+                progress.Report(new ProgressReport(
+                    $"Checked {checkedCount:N0}/{total:N0} files, {removed.Count:N0} to remove\u2026",
+                    pct));
             }
 
             if (!f.IsDeleted
@@ -1339,14 +1432,38 @@ public class MainViewModel : ViewModelBase
                 (progress, ct) =>
                 {
                     // Catalog marks inside a single transaction (mirrors Cleanup).
-                    progress.Report("Updating catalog\u2026");
+                    // Loop per source path so the marking shows live "x of y"
+                    // progress (throttled to ProgressUpdateIntervalMs) instead of a
+                    // single static "Updating catalog…" that looks frozen while
+                    // thousands of rows are updated — the user observed exactly this.
+                    var progressSw = System.Diagnostics.Stopwatch.StartNew();
+                    long lastReportMs = -ProgressUpdateIntervalMs; // fire first report immediately
                     var tx = _catalog.BeginTransactionAsync(backupSet.Id).GetAwaiter().GetResult();
-                    int purged;
+                    int purged = 0;
                     try
                     {
-                        purged = _catalog
-                            .MarkFilesDeletedBySourcePathsAsync(backupSet.Id, sourcePaths)
-                            .GetAwaiter().GetResult();
+                        for (int i = 0; i < sourcePaths.Count; i++)
+                        {
+                            var path = sourcePaths[i];
+                            long nowMs = progressSw.ElapsedMilliseconds;
+                            // Always report the final item so a "N/N" lands before
+                            // the disk-delete phase takes over; throttle the rest.
+                            if (nowMs - lastReportMs >= ProgressUpdateIntervalMs
+                                || i == sourcePaths.Count - 1)
+                            {
+                                lastReportMs = nowMs;
+                                int pct = sourcePaths.Count == 0
+                                    ? 100 : (int)((i + 1) * 100L / sourcePaths.Count);
+                                progress.Report(new ProgressReport(
+                                    $"Updating catalog {i + 1:N0}/{sourcePaths.Count:N0} ({pct}%): "
+                                    + Path.GetFileName(path.TrimEnd('\\')),
+                                    pct));
+                            }
+
+                            purged += _catalog
+                                .MarkFilesDeletedBySourcePathsAsync(backupSet.Id, new[] { path })
+                                .GetAwaiter().GetResult();
+                        }
                         tx.Complete();
                     }
                     finally
@@ -1369,10 +1486,10 @@ public class MainViewModel : ViewModelBase
                         // exactly as manual Cleanup's reconcile step does.
                         progress.Report("Repairing catalog references\u2026");
                         var reconcile = new CatalogReconcileService(_catalog);
-                        var report = reconcile.AnalyzeAsync(backupSet.Id, targetDir)
+                        var report = reconcile.AnalyzeAsync(backupSet.Id, targetDir, progress, ct)
                             .GetAwaiter().GetResult();
                         if (report.HasChanges)
-                            reconcile.ApplyAsync(backupSet.Id, report, targetDir)
+                            reconcile.ApplyAsync(backupSet.Id, report, targetDir, progress, ct)
                                 .GetAwaiter().GetResult();
                     }
                     return (purged, fd, ff, bytes);
@@ -1853,6 +1970,7 @@ public class MainViewModel : ViewModelBase
                         DailyHour = src.JobOptions.Schedule.DailyHour,
                         DailyMinute = src.JobOptions.Schedule.DailyMinute,
                         DebounceSeconds = src.JobOptions.Schedule.DebounceSeconds,
+                        MaxWaitSeconds = src.JobOptions.Schedule.MaxWaitSeconds,
                         PollIntervalSeconds = src.JobOptions.Schedule.PollIntervalSeconds,
                     };
                 }
@@ -2947,6 +3065,7 @@ public class MainViewModel : ViewModelBase
             vm.ScheduleDailyHour = sched.DailyHour;
             vm.ScheduleDailyMinute = sched.DailyMinute;
             vm.ScheduleDebounceSeconds = sched.DebounceSeconds.ToString();
+            vm.ScheduleMaxWaitSeconds = sched.MaxWaitSeconds.ToString();
             vm.SchedulePollSeconds = sched.PollIntervalSeconds.ToString();
         }
     }
@@ -3019,6 +3138,7 @@ public class MainViewModel : ViewModelBase
                 DailyHour = vm.ScheduleDailyHour,
                 DailyMinute = vm.ScheduleDailyMinute,
                 DebounceSeconds = int.TryParse(vm.ScheduleDebounceSeconds, out var s) ? s : 60,
+                MaxWaitSeconds = int.TryParse(vm.ScheduleMaxWaitSeconds, out var mw) && mw > 0 ? mw : 300,
                 PollIntervalSeconds = int.TryParse(vm.SchedulePollSeconds, out var p) && p > 0 ? p : 30,
             };
         }
@@ -3453,16 +3573,54 @@ public class MainViewModel : ViewModelBase
         if (SelectedBackupSet is null)
             return;
 
+        _ = StartOrphanedDirsFlowAsync(SelectedBackupSet.Id);
+    }
+
+    private async Task StartOrphanedDirsFlowAsync(int setId)
+    {
+        // CRITICAL: classify against a FRESH copy of the set reloaded from the
+        // catalog, never the live in-memory SelectedBackupSet.  The in-memory
+        // copy's SourceSelections can be stale (the worker persists auto-include
+        // materialisations out-of-process) or reflect a partial/mid-edit tree.
+        // Cleanup decides what to purge by asking whether each catalogued file is
+        // still covered by the selection tree (IsDirectoryInSources); handing it a
+        // selection tree that is missing branches makes it classify *in-scope*
+        // files as "removed from sources" and delete live backups.  That is
+        // exactly how a whole drive's backup ("it forgot my C: drive is backed
+        // up") got wrongly purged — see the cleanup-mass-purge entry in
+        // known-issues.md.  Reloading fresh guarantees the authoritative,
+        // fully-persisted tree drives the classification.
+        BackupSet? fresh;
+        try
+        {
+            fresh = await _catalog.GetBackupSetAsync(setId);
+        }
+        catch (Exception ex)
+        {
+            MessageBox.Show(
+                $"Couldn't load the backup set for cleanup:\n\n{ex.Message}",
+                "Cleanup", MessageBoxButton.OK, MessageBoxImage.Error);
+            return;
+        }
+
+        if (fresh is null)
+        {
+            MessageBox.Show(
+                "The backup set could not be found in the catalog.",
+                "Cleanup", MessageBoxButton.OK, MessageBoxImage.Error);
+            return;
+        }
+
         // The catalog load + classification can take several seconds on large
         // backup sets, but it runs on a background thread inside the view model
         // (see OrphanedDirectoriesViewModel.LoadAsync).  The view is switched in
-        // synchronously below and surfaces its own live progress via SummaryText
-        // ("Loading catalogue...", then a running record count), so the app stays
-        // fully responsive throughout.  We deliberately do NOT set a global wait
-        // cursor here: it would falsely signal "busy/unresponsive", and because
-        // the load outlives this method it would also linger as a busy pointer if
-        // the user navigated away before the load finished.
-        var vm = new OrphanedDirectoriesViewModel(_catalog, SelectedBackupSet);
+        // below and surfaces its own live progress via SummaryText ("Loading
+        // catalogue...", then a running record count), so the app stays fully
+        // responsive throughout.  We deliberately do NOT set a global wait cursor
+        // here: it would falsely signal "busy/unresponsive", and because the load
+        // outlives this method it would also linger as a busy pointer if the user
+        // navigated away before the load finished.
+        var vm = new OrphanedDirectoriesViewModel(_catalog, fresh);
         vm.DoneRequested += GoHome;
         CurrentView = vm;
         StatusText = "Review files and directories that can be cleaned up.";
@@ -3920,12 +4078,13 @@ public class MainViewModel : ViewModelBase
     }
 
     /// <summary>
-    /// Downloads the release installer (the self-elevating <c>.exe</c> bundle when
-    /// present, otherwise the <c>.msi</c>) and launches it, then shuts the app down
-    /// so the installer can replace the running files. The bundle elevates itself,
-    /// so its embedded MSI can close this (possibly elevated) GUI before the
-    /// file-in-use check. If the release has no installer asset, falls back to
-    /// opening the release page in the browser.
+    /// Downloads the release installer (the bare <c>.msi</c>; a legacy <c>.exe</c>
+    /// bundle is accepted only as a fallback) and launches it, then shuts this app
+    /// down so the installer can replace the running files. Closing the GUI here
+    /// means the upgrade never trips the file-in-use check on our own executables;
+    /// the MSI's <c>SignalLithicGuiShutdown</c> custom action covers the manual
+    /// (double-click-the-MSI-while-running) path too. If the release has no
+    /// installer asset, falls back to opening the release page in the browser.
     /// </summary>
     private async Task DownloadUpdateAsync()
     {
@@ -4076,6 +4235,31 @@ public class MainViewModel : ViewModelBase
         catch
         {
             StatusText = "Failed to load backup sets";
+        }
+    }
+
+    /// <summary>
+    /// Apply the latest destination free-space snapshot from the
+    /// <c>DestinationSpaceMonitor</c> to the loaded rows: flag each set whose
+    /// destination is full and clear the flag on any that recovered (or whose
+    /// destination is absent from the snapshot). Must be called on the UI thread.
+    /// </summary>
+    public void ApplyDestinationSpaceStatus(
+        IReadOnlyDictionary<int, Services.DestinationSpaceStatus> statuses)
+    {
+        foreach (var row in BackupSets)
+        {
+            if (statuses.TryGetValue(row.Id, out var st) && st.IsFull)
+            {
+                row.IsDestinationFull = true;
+                row.DestinationFullText =
+                    $"Destination drive {st.Root} is full ({st.FreeSpaceText} free)";
+            }
+            else
+            {
+                row.IsDestinationFull = false;
+                row.DestinationFullText = "";
+            }
         }
     }
 

@@ -1,5 +1,458 @@
 # LithicBackup — Known Issues & Tech Debt
 
+## FIXED: Source-tree selection bugs — "All Drives" auto-include reverting + stale full-check on restore (2026-07-18)
+
+**Symptoms (both reported together).**
+1. Turning **"auto-include new" off** on the **"All Drives"** row (and, by
+   propagation, its drives) never stuck — it was back **on** every time the editor
+   reopened.
+2. On reopen a directory could show a **full check** while a sibling with the same
+   "only some children selected" situation showed a **partial** check (e.g. `C:\`
+   full while `D:\` and "All Drives" were partial), even though all three had only
+   some descendants selected.
+
+**Root causes (confirmed by inspecting the persisted `SourceSelectionJson` and the
+restore path).**
+- **Auto-include revert.** `SourceSelectionViewModel.GetSelections()` **unwraps** the
+  virtual `Path=""` "All Drives" root and serialises only its drive children
+  (downstream consumers — scanner, DB — can't handle an empty path). The root's own
+  `AutoIncludeNewSubdirectories` is therefore **never persisted**, so on reload it
+  fell back to the `SourceSelection` constructor default (`true`). (Its drive children
+  *do* persist their flag, so this was specific to the aggregate root row.)
+- **Stale tristate.** `SourceSelectionNodeViewModel.ApplySelectionAsync` applies each
+  node's saved `IsSelected` **verbatim** and never recomputes a parent from its
+  materialised children. A directory saved as fully-checked that actually has some
+  children excluded kept showing a full check. Live editing preserves this invariant
+  via `UpdateFromChildren`; restore (and lazy deferred-expand) did not.
+
+**Fixes.**
+- Added `SourceSelectionNodeViewModel.RecomputeLoadedTristate()` — a depth-first,
+  bottom-up pass (never ripples to `Parent`, assignments suppressed so it neither
+  pushes state down nor marks the set dirty) run once on the root at the end of
+  `ApplySelectionsAsync`, so every loaded directory's check state matches the
+  aggregate of its children after a restore.
+- Added `UpdateFromChildren()` after the **deferred** child restore in
+  `LoadChildrenAsync`, so a collapsed-at-save node that only materialises its excluded
+  children when the user first expands it also reconciles its parent tristate.
+- Added `SourceSelectionNodeViewModel.UpdateAutoIncludeFromChildren()`, called on the
+  root in `ApplySelectionsAsync`, to **re-derive** the virtual root's auto-include
+  flag from its drives (the aggregate the row represents) instead of leaving it at the
+  constructor default. Since toggling the root propagates the flag to all drives — and
+  those *do* persist — the round-trip now sticks.
+
+**Note.** The virtual "All Drives" root is a UI aggregate with no persisted state of
+its own; its `IsSelected` was already re-derived from children on reload (so it always
+showed the correct partial state), and now its auto-include flag is too.
+
+## EXPLAINED: Duplicate "Lithic Backup 1.0.10" in Add/Remove Programs (orphaned Burn-bundle row) (2026-07-18)
+
+**Symptom.** Add/Remove Programs shows **two** Lithic Backup entries: the real MSI
+`1.0.20` and a stale `1.0.10`. `msiexec /x {C891C255-948E-4315-AC45-153A77ED9EB3}`
+returns "*this action is only valid for products that are currently installed*".
+
+**Root cause (confirmed by inspection).** The `1.0.10` row is **not an MSI product** —
+it's an orphaned **WiX Burn bundle** registration left over from the packaging
+transition:
+- The Windows Installer product database lists exactly one Lithic product:
+  `{7C29CC18-…}` = MSI `1.0.20`. The `1.0.10` GUID is a *bundle* ARP row
+  (`WindowsInstaller=` empty), whose `UninstallString` is
+  `"C:\ProgramData\Package Cache\{C891C255-…}\LithicBackup-1.0.10-x64.exe" /uninstall`
+  — the classic Burn package-cache/`/uninstall` shape. That's why `msiexec /x`
+  rejects it: there's no MSI ProductCode behind it.
+- **History:** v1.0.9 / v1.0.10 shipped as self-elevating **`.exe` Burn bundles**
+  (still present in `installer\`); v1.0.11+ ship a **bare `.msi`**. A Burn bundle
+  registers its *own* ARP entry (keyed on the bundle's Burn UpgradeCode) separate from
+  the MSI it wraps. When the bare 1.0.11+ MSI later installed, its `MajorUpgrade`
+  (keyed on the *MSI* `UpgradeCode` `7BC4E6C1-…`) removed the bundle's **inner** MSI
+  but had no knowledge of the **outer** bundle registration — Burn ARP rows can only
+  be removed by Burn. So the bundle's shell survived as a harmless orphan pointing at
+  a 1.2 MB cached bootstrapper.
+
+**Impact.** Cosmetic/confusing only. The inner MSI is long gone; nothing is installed
+under the orphan. It cannot recur for MSI→MSI upgrades — it's a one-time
+bundle→bare-MSI transition artifact affecting only machines that once ran the old
+`.exe` bundle.
+
+**Removal (for affected machines).** Either run the cached bootstrapper's uninstall —
+`"C:\ProgramData\Package Cache\{C891C255-948E-4315-AC45-153A77ED9EB3}\LithicBackup-1.0.10-x64.exe" /uninstall`
+(Burn finds its inner MSI already gone and just clears its own registration) — or, if
+that exe is missing, delete the orphan key
+`HKLM\SOFTWARE\Microsoft\Windows\CurrentVersion\Uninstall\{C891C255-948E-4315-AC45-153A77ED9EB3}`
+(elevated). Both are safe; the real install is untouched.
+
+**Related tech-debt fixed (2026-07-18).** `UpdateService` still **preferred** the
+retired `.exe` bundle over the `.msi` and its docs referenced the deleted
+`installer\Bundle.wxs`, claiming a bare MSI "cannot close an elevated GUI." That's
+obsolete: the bare MSI closes the GUI via the `SignalLithicGuiShutdown` custom action,
+and the in-app updater (`MainViewModel.DownloadUpdateAsync`) shuts the GUI down itself
+right after launching the installer. Flipped the asset preference to `.msi` (with the
+`.exe` kept only as a defensive fallback), fixed the default-filename fallback
+(`.exe`→`.msi`), and corrected the stale doc comments. `installer\Bundle.wxs` no longer
+exists — the Burn bundle is fully retired.
+
+## FIXED: Installer's long one-time "Computing space requirements" pause (2026-07-18)
+
+**Symptom.** Running the MSI paused for an "inordinately long time" on *Computing space
+requirements*.
+
+**Diagnosis (measured, not guessed).** A verbose-logged admin extract
+(`msiexec /a … /l*v`) timed each standard action: **`CostInitialize` took ~85 s on the
+first run and ~4 s on the second.** The 85 s was a single silent gap right at the start
+of `CostInitialize`, *before any files were written*. Per-drive `GetDiskFreeSpaceEx` /
+`GetVolumeInformation` timings were all <35 ms (so it was **not** the optical/removable
+drive volume-enumeration stall first suspected). The cold-vs-warm gap (85 s → 4 s) is
+the signature of **on-access antivirus (Windows Defender) scanning the large 62 MB
+self-contained, unsigned MSI on first touch** during costing. It's a one-time,
+per-download cost, not a package-logic bug and unrelated to recent code changes.
+
+**Fix (reduce what AV has to scan).** Set `<SatelliteResourceLanguages>en</SatelliteResourceLanguages>`
+in `src/Directory.Build.props` (inherited by every project). Lithic Backup has no
+localized UI, but a self-contained publish otherwise drags in ~13 framework satellite
+resource folders (~221 `.resources.dll` files). Dropping them cut the payload from
+**504 → 283 files (505 → 284 components)** and the MSI from **62.2 → 55.6 MB**, with
+zero user-visible change.
+
+**Not done (deliberately).** Single-file publish would cut file count further but
+duplicates the shared WPF/runtime assemblies into *both* the GUI and Worker exes,
+growing the total payload (and the MSI that AV scans) — a net loss for the
+scan-the-big-MSI cost, plus WPF single-file needs interactive testing. Framework-
+dependent publish would shrink it most but reintroduces a .NET runtime prerequisite,
+which the self-contained design intentionally avoids. Code signing the MSI would also
+reduce SmartScreen/AV scrutiny but is out of scope here.
+
+## FIXED: Hidden/System directories were invisible in the source-selection tree (2026-07-18)
+
+**Symptom.** The user could not find `C:\ProgramData` anywhere in the source-selection
+tree ("I can't see it in the selection tree at all"), yet the backup engine was still
+copying its contents. This is the *display* half of the ProgramData confusion: the
+folder was being backed up but the user had no way to see it or deselect it.
+
+**Root cause.** The editor tree deliberately **skipped** Hidden and System directories
+when enumerating children (`SourceSelectionNodeViewModel.EnumerateChildEntriesAsync`,
+plus the three recursive size-computation methods). `C:\ProgramData` is a Hidden
+directory, so it never appeared as a tree node. The backup engine (`FileScanner` /
+continuous backup) applies **no** such Hidden/System filter, so those directories were
+copied regardless — a "backed up but invisible" mismatch. The user couldn't uncheck
+something that was never drawn.
+
+**Fix (user chose visibility over silent exclusion).** Hidden/System directories and
+files are now **shown** in the tree so they can be seen and deselected, and rendered
+in a distinct violet (`HiddenSystemBrush`) with a "Hidden or system item" tooltip so
+it's clear they're special.
+- `SourceSelectionNodeViewModel`: added an `IsHiddenOrSystem` property and a matching
+  field on the private `ChildEntry` record. `EnumerateChildEntriesAsync` now records the
+  Hidden/System attribute as a flag instead of `continue`-skipping the entry (computed
+  for both directories and files); `CreateChildNode` copies the flag onto the node.
+- The three recursive size methods (`ComputeDirectorySizeFiltered`,
+  `ComputeDirectorySizeFilteredCached`, `ComputeDirectorySizeCached`) dropped their
+  Hidden/System skips so displayed sizes match what the engine actually copies.
+- `SourceSelectionView.xaml`: the tree `ItemTemplate` gained a `DataTrigger` on
+  `IsHiddenOrSystem` that paints the name violet; `Colors.xaml` defines
+  `HiddenSystemColor`/`HiddenSystemBrush` (`#8B5CF6`).
+
+**Files.** `SourceSelectionNodeViewModel.cs`, `SourceSelectionView.xaml`, `Colors.xaml`.
+
+## FIXED: App backed up its own data directory (C:\ProgramData\LithicBackup) (2026-07-18)
+
+**Symptom.** The user found `C:\ProgramData` being backed up by set 4 even though
+they "keep having to manually exclude and then delete" it, and it "didn't show up
+in the modify function" as selected. The Worker was also seen trying to back up its
+own live catalog files (`set-4.db-shm` → "File region is locked").
+
+**Root cause (two layers).**
+1. **The app never excluded its own data directory.** Set 4's C:\ root is *fully
+   selected* (`IsSelected=true`) with `AutoIncludeNewSubdirectories=true` — i.e.
+   "back up all of C:, minus the explicitly-excluded folders, and auto-include new
+   ones." `C:\ProgramData` was **not** among the excluded children (it sat at
+   `IsSelected=null`, partial), so via C:'s auto-include-new rule its unlisted
+   descendants — including `C:\ProgramData\LithicBackup` — were swept into the
+   backup. The Worker thus tried to copy its own open catalog/WAL/SHM files.
+2. **Why ProgramData looked un-selected in the editor.** `C:\ProgramData` is a
+   *Hidden* directory, and the editor tree skipped Hidden/System directories
+   entirely, so it never appeared as a node at all — the user couldn't see it,
+   let alone tell it was partial+auto-include (and therefore backing up unlisted
+   content). See the separate "Hidden/System directories were invisible" fix,
+   which now shows them (coloured violet) so they can be deselected.
+
+**Fix.** Added `CatalogLocation.IsInsideAppDataDirectory(path)` and enforced it as a
+**hard, unconditional exclusion** of the app's own data root
+(`C:\ProgramData\LithicBackup` and everything under it), independent of the
+selection tree and glob patterns:
+- `DirectoryBackupService.BuildExclusionFilter` now always returns a filter (even
+  with no user exclusions) that drops any path inside the app data dir. Covers both
+  the full-scan (`FileScanner`) and continuous (`ExecuteTargetedAsync`) paths, and
+  because the filter is checked *before* `FileInfo`, the open DB files are never
+  even touched (no more "File region is locked").
+- `BackupWorker.PathBelongsToSet` returns false for app-dir paths, so the Worker
+  neither queues its own DB writes for backup nor materializes
+  `C:\ProgramData\LithicBackup` into any set's selection tree.
+
+**Files.** `CatalogLocation.cs` (`RootDirectory` + `IsInsideAppDataDirectory`),
+`DirectoryBackupService.cs` (`BuildExclusionFilter`), `BackupWorker.cs`
+(`PathBelongsToSet`).
+
+**Not covered by this fix (user's choice).** The *rest* of `C:\ProgramData` is still
+included because C: is configured as "back up everything except excluded folders,
+auto-include new". Only the app's own subfolder is force-excluded. If the user wants
+all of `C:\ProgramData` gone from the set, they exclude it in the editor (exclusions
+now stick — see the "exclusions stick" fix). Possible future enhancement: surface
+partial+auto-include directories more clearly in the tree so "silently backing up
+new content" isn't mistaken for "not selected".
+
+## FIXED: "cleanup failed: sqlite error 5: 'database is locked'" (GUI vs Worker write collision) (2026-07-18)
+
+**Symptom.** A GUI operation (Cleanup, in this report) failed outright with
+`SQLite Error 5: 'database is locked'`. The user was emphatic: "this should never
+happen. we have to make sure this never happens."
+
+**Root cause.** The interactive GUI and the LocalSystem Worker service are separate
+processes that both open the *same* per-set database file
+(`C:\ProgramData\LithicBackup\sets\set-{id}.db`). WAL mode lets their **readers**
+run concurrently, but only one **writer** can hold SQLite's write lock at a time.
+The Worker runs *continuous* backups and, in `DirectoryBackupService`, holds a
+single write transaction for up to `CommitIntervalSeconds = 30`s per commit batch.
+The GUI's `PRAGMA busy_timeout` was only 15s — shorter than a Worker batch — so a
+GUI write that landed mid-batch waited out its timeout and threw
+`SQLITE_BUSY`/"database is locked". Bumping the timeout alone can never *guarantee*
+success: any timeout, however large, can still be exceeded under contention.
+
+**Fix — cross-process write serialization via a per-set lock file.** In
+`SqliteSetDatabase`, every **write** now takes a machine-wide exclusive lock before
+touching SQLite: it opens a marker file `set-{id}.db.writelock` with
+`FileShare.None`, so only one process can hold it. The wait
+(`AcquireCrossProcessWriteAsync`) polls (25 ms) and is **cancellable but unbounded**
+— there is no timeout that could re-manufacture the failure — and the OS releases
+the handle automatically if the holder crashes. Because writers on a given set now
+serialize across processes, SQLite's own write lock is never actually contended,
+so the busy-timeout race can't occur.
+
+- New `WriteLockAsync` (acquire file lock → then the in-process gate) wraps every
+  standalone write: `InsertDiscAsync`, `UpdateDiscAsync`, `MarkDiscAsBadAsync`,
+  `CreateFileRecordAsync`, `UpdateFileRecordAsync`, `MarkFilesDeletedByDirectoryAsync`,
+  `MarkFilesDeletedBySourcePathsAsync`, `RemapSourcePathPrefixAsync`,
+  `CreateFileChunkAsync`.
+- `BeginTransactionAsync` takes the file lock for the whole transaction (covering
+  `ClearCatalogAsync`, `ImportLegacyRecordsAsync`, and every batch commit), released
+  in `TransactionScope.Dispose` after the gate.
+- Reads deliberately **don't** take the file lock (WAL keeps them concurrent).
+- The `_inTransaction` reentrancy short-circuit is honored so inside-transaction
+  writes don't re-acquire either lock.
+- `busy_timeout` raised 15s → 30s purely as a backstop for brief WAL-checkpoint
+  edge cases.
+- `RemoveSetDatabaseFile` now also deletes `.writelock` so it isn't orphaned when a
+  set is deleted.
+
+**Files.** `SqliteSetDatabase.cs` (file-lock machinery + write methods),
+`SqliteCatalogRepository.cs` (`.writelock` cleanup).
+
+**Related, not yet fixed.** The Worker's set 4 sources include `C:\ProgramData`, so
+it backs up its own live catalog DB files (`set-4.db-shm` "File region is locked").
+`C:\ProgramData\LithicBackup` should be excluded from backups. See separate note.
+
+## FIXED: Spurious "scanning newly added folders" on save after only browsing the tree (2026-07-18)
+
+**Symptom.** The user edited a set, browsed around in the source treeview
+(expanding folders to look, but *not* toggling any checkbox), then saved/closed —
+and the app announced "Scanning newly added folders…" and began scanning hundreds
+of thousands of files. Nothing had actually been added.
+
+**Root cause.** `MainViewModel.ReconcileDestinationAfterEditAsync` had one
+fast-path skip: `SelectionsEquivalent(originalSelections, newSelections)`. But
+`ToModel` persists **display-only** `IsExpanded` state, and `SelectionsEquivalent`
+compares the full serialized JSON *including* `IsExpanded`. So merely expanding a
+folder makes the two trees differ, defeating the fast-path, and the reconcile
+proceeds to its added-roots scan — which (unlike the removed-files query) was
+**not** scoped to the set of folders the user actually toggled. Result: a huge
+filesystem walk fired purely because the user opened some folders to look.
+
+**Fix (two parts).**
+1. **Gate on real changes.** After the `SelectionsEquivalent` check, added a
+   second fast-path: `if (changedPaths.Count == 0) return;`. `changedPaths`
+   (`SourceSelectionViewModel.ChangedSelectionPaths`) is populated *only* when a
+   checkbox is genuinely toggled (`RequestSelectionSettle`) or auto-include-new is
+   flipped (`ApplyAutoIncludeNew → _recordChangedPath`); expanding/collapsing
+   never records anything. So if nothing was recorded, the edit changed no
+   coverage and the whole scan is skipped. This directly implements the agreed
+   design of "track which directories the user actually clicks on to know what to
+   scan."
+2. **Make the reconcile itself optional, defaulting to "ask".** Added a
+   `ReconcileMode` user setting (`ReconcileAfterEditMode` enum: `Ask` (default) /
+   `Always` / `Never`) exposed as three radio buttons in the Settings dialog.
+   After a real change, `ReconcileDestinationAfterEditAsync` consults the mode:
+   `Never` skips the scan (folders sync on the next full backup), `Always`
+   reconciles silently, and `Ask` shows a Yes/No prompt ("You changed which
+   folders … Scan now?") so a large edit never kicks off a long scan without
+   consent. The decision lives inside the method after the two fast-path returns,
+   so it's only reached when a checkbox was genuinely toggled.
+
+**Files.** `MainViewModel.cs` (second fast-path + `ReconcileMode` switch),
+`UserSettings.cs` (`ReconcileMode`), `ReconcileAfterEditMode.cs` (new enum),
+`SettingsDialog.xaml`/`.xaml.cs` (radio buttons).
+
+## FIXED: Cleanup wrongly purged in-scope backups ("it forgot my C: drive is backed up") (2026-07-18)
+
+**Symptom.** After a user removed `C:\Users` from the J: set's sources and ran
+Cleanup (catalog scan → purge, then destination-filesystem scan → purge), the
+app "somehow forgot that anything in my C drive is backed up." Live inspection of
+`set-4.db` confirmed the damage: of the C: catalog rows, only **2,867 were still
+active** and all of them were the junk the user *wanted gone*
+(`C:\Users` 1,395 + `C:\ProgramData` 1,472), while **612,663 C: rows were marked
+deleted — including 16,760 `C:\mIRC` files (Version 1, no active replacement)**
+even though `C:\mIRC` is explicitly selected (`IsSelected = true`) in the set's
+saved selection tree. The wrongly-purged rows also had their destination copies
+deleted from J:, so those backups are physically gone until re-run.
+
+**Root cause.** `MainViewModel.StartOrphanedDirsFlow` handed the cleanup view
+model the **live in-memory `SelectedBackupSet`** object. Cleanup decides what to
+purge by asking, for every catalogued file, whether it is still covered by the
+set's selection tree (`OrphanedDirectoriesViewModel.IsDirectoryInSources` →
+`SelectionCoversPath`). If the in-memory `SourceSelections` is ever stale (the
+worker persists auto-include materialisations to the catalog *out-of-process*, so
+the GUI's copy can drift) or partial/mid-edit, entire branches of the tree are
+missing — and every catalogued file under a missing branch classifies as
+`RemovedFromSources` and gets purged. That is how in-scope C: content
+(`C:\mIRC`, selected VirtualBox VMs, etc.) was mass-deleted while the current,
+correctly-saved tree still selects it. The classification logic itself
+(`SelectionCoversPath`, `SourceSelection.*`) is correct; the bug was feeding it a
+non-authoritative tree.
+
+**Fix.** `StartOrphanedDirsFlow` now reloads the set **fresh from the catalog**
+(`await _catalog.GetBackupSetAsync(setId)`) before constructing the cleanup view
+model, so classification always runs against the fully-persisted, authoritative
+selection tree — never a stale or mid-edit in-memory copy. This mirrors the
+worker's own `MaterializeDiscoveredDirectoriesAsync`, which already re-reads fresh
+"rather than persisting the worker's in-memory copy [which] can be stale."
+Note: a naive "refuse to purge if too many files are flagged" guard was rejected
+as the fix — a legitimate large exclusion (e.g. removing `C:\Users`, 581K files)
+would false-positive. Classifying against the true tree is the correct guard.
+
+**Recovery.** Source files are intact; the wrongly-purged J: backups are gone from
+disk but will be re-created on the next backup of the J: set (the sources still
+select them).
+
+## FIXED: Excluding a directory with materialised descendants never stuck (2026-07-18)
+
+**Symptom.** The user excluded `C:\ProgramData` from the J: set **several times**,
+including the last edit, yet the saved selection tree kept coming back as
+`IsSelected = null` (partial), auto-include on, with the worker-materialised
+system-junk leaves under it intact (e.g.
+`C:\ProgramData\Microsoft\Diagnosis\Temp`, `…\IDrive\…\Enum`) — so it kept being
+backed up and re-accumulating. `C:\Users`, excluded the same way, tombstoned fine.
+The one difference: `C:\ProgramData` had explicit `IsSelected = true` descendant
+leaves (pinned earlier by the worker's auto-include materialisation);
+`C:\Users` had none.
+
+**Root cause.** A collapsed directory restores its saved child selections lazily:
+`ApplySelectionAsync` stashes the saved subtree in `_restoredModel` and sets
+`_pendingDeferredRestore = true` instead of loading children. When the user then
+excluded the node, `IsSelected` was set to `false` — but the deferred restore was
+**not** invalidated. On the next expand or settle, `LoadChildrenAsync` re-applied
+`_restoredModel.Children` (restoring the `true` junk leaves), and
+`UpdateFromChildren` — which derives a node's tristate purely from its direct
+children — then re-derived the excluded parent from those restored children back
+to `null` (partial), silently undoing the exclusion before the save. On save,
+`ToModel` took its `_restoredModel`-verbatim fallback (reached only when
+`IsSelected != false`), persisting the original partial subtree, junk and all.
+`C:\Users` had no saved children to re-apply, so nothing dragged it back.
+
+**Fix.** In `SourceSelectionNodeViewModel`, a user-initiated exclusion now
+discards the node's deferred/saved subtree state so it can never be resurrected:
+- The `IsSelected` setter calls `DiscardSavedSubtreeSelections()` synchronously on
+  a `false` user edit (clears `_pendingDeferredRestore`, `_restoredModel`,
+  `_orphanedChildModels`) — synchronously, to beat a lazy expand racing the
+  coalesced settle pass.
+- `PropagateSelection` hard-excludes the whole subtree on `false`: it discards
+  this node's saved state and recurses into every loaded descendant via
+  `ExcludeSubtree()`, forcing each to excluded and clearing its deferred state
+  too. Nothing a later expand or `UpdateFromChildren` ripple can do will re-derive
+  the node to partial.
+
+Safe because `ToModel` serialises an excluded node as a bare tombstone (returns at
+its `IsSelected == false` branch before it would consult `_restoredModel`).
+
+**Recovery.** With the fix, re-excluding `C:\ProgramData` once persists a clean
+`{ Path: C:\ProgramData, IsSelected: false }` tombstone; the worker won't
+re-materialise under a `false` node (`MaterializeInNode` early-returns on
+`IsSelected == false`), so it stays excluded for good.
+
+## FIXED: Turning off "auto-include new subdirectories" left removed content undeleted (2026-07-16)
+
+**Symptom.** A user had 100+ GB of `C:\Users` data in the destination that they
+no longer wanted. They removed `C:\Users` from the set's sources, confirmed the
+post-edit "remove these from the destination?" dialog — yet the files stayed in
+the destination, and a subsequent "Scan Destination Filesystem" + purge also
+left them. Live inspection of `set-11.db` showed **664,314 `C:\Users\` records
+still marked active** (`IsDeleted = 0`), with only 16,942 ever marked deleted.
+
+**Root cause.** Two compounding issues:
+
+1. *The reconcile never saw the removal.* The set's `C:\` root is *partial*
+   (`IsSelected = null`) with `AutoIncludeNewSubdirectories = false` and only a
+   few explicit children (none of them `Users`). `C:\Users` had been covered
+   *only* by the drive root's auto-include-new rule. When the user turned that
+   rule **off**, every unlisted descendant (all of `C:\Users`) dropped out of the
+   selection — but the post-edit destination reconcile
+   (`MainViewModel.ComputeRemovedFilesTargeted`) scopes its catalog scan to the
+   paths in `SourceSelectionViewModel._changedSelectionPaths`, and **only the
+   `IsSelected` checkbox recorded into that set** (via `_requestSelectionSettle`).
+   `AutoIncludeNew`'s setter recorded nothing, so `changedPaths` was empty, the
+   method hit its `changedPaths.Count == 0` early-return, and reported zero
+   removed files. The old comment there wrongly assumed auto-include only governs
+   *future* entries — true only if every existing descendant is materialised as
+   an explicit selection node, which an unexpanded drive root's deep descendants
+   are not.
+
+2. *The destination scan can't catch active records.* `WalkDestination` skips any
+   on-disk file that still has an active catalog record, so once the rows stayed
+   active nothing downstream could remove them either.
+
+**Fix.** Added an `Action<string>? _recordChangedPath` delegate to
+`SourceSelectionNodeViewModel`, wired from `SourceSelectionViewModel` to
+`_changedSelectionPaths.Add`. `ApplyAutoIncludeNew` now records the toggled
+directory's path (on any user-initiated toggle) so the post-edit reconcile
+rescans that subtree. Turning auto-include **off** on `C:\` therefore now scans
+all `C:\` catalog files and the "included before AND excluded now" filter flags
+the dropped descendants for the removal-confirmation dialog + purge. Recording on
+turn-*on* is harmless (the filter yields no removals when coverage only grew).
+Updated the stale `changedPaths.Count == 0` comment.
+
+**Cleaning up the existing orphans (already-affected sets):** the fix only
+prevents recurrence. To purge the 664k rows that were already orphaned, run
+**Cleanup → Scan Catalog** (NOT "Scan Destination Filesystem"): the catalog scan's
+`RemovedFromSources` phase uses `IsDirectoryInSources`, which correctly returns
+false for `C:\Users\…` under the current selection, so those rows are flagged and
+**Clean Selected** marks them deleted and deletes their destination copies. No
+data was lost — the rows were still active, so nothing had been deleted; they
+simply were never cleaned.
+
+**Possible follow-up (not done):** make "Scan Destination Filesystem" also flag
+on-disk files whose active catalog record's `SourcePath` is no longer covered by
+the current selection, so the user's instinct ("scan the destination and purge
+everything that shouldn't be here") works without needing the catalog scan.
+`DestPathRecord` already carries `SourcePath`, so the selection check could be
+threaded into `WalkDestination`.
+
+## FIXED: Unobserved-task crash — empty path passed to DirectoryInfo during child reconcile (2026-07-16)
+
+**Symptom.** `crash-gui-*.log` showed
+`System.ArgumentException: The path is empty. (Parameter 'path')` at
+`Path.GetFullPath` → `DirectoryInfo..ctor` in
+`SourceSelectionNodeViewModel.EnumerateChildEntriesAsync`, surfaced via
+`TaskScheduler.UnobservedTaskException`.
+
+**Root cause.** The virtual "All Drives" root node has `Path == ""` (its children
+are the drive roots, populated by `SourceSelectionViewModel`, not enumerated from
+disk). `EnumerateChildEntriesAsync` built `new DirectoryInfo(Path)` *before* its
+`try`, so an empty path threw `ArgumentException`. When a re-expand triggered
+`ReconcileChildrenAsync` on the root, the faulted Task's result was discarded and
+the exception became an unobserved-task crash.
+
+**Fix.** `EnumerateChildEntriesAsync` now returns `(empty, ReadFailed: true)`
+immediately when `Path` is empty, before constructing `DirectoryInfo`. Callers
+already treat `readFailed && entries.Count == 0` as "couldn't read — leave the
+existing children intact", so the root's drive nodes are preserved and nothing
+throws.
+
 ## FIXED: "Scan Destination Filesystem" stalled for many minutes before the walk started (2026-07-15)
 
 **Symptom.** After the UI-thread fix below, the app stayed responsive but the

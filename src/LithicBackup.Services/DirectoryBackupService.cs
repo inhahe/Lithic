@@ -4,6 +4,7 @@ using System.Text.Json;
 using LithicBackup.Core;
 using LithicBackup.Core.Interfaces;
 using LithicBackup.Core.Models;
+using LithicBackup.Infrastructure.Data;
 
 namespace LithicBackup.Services;
 
@@ -1940,11 +1941,17 @@ public class DirectoryBackupService
                 tierResolver = resolver;
         }
 
-        if (globalFilter is null && tierResolver is null)
-            return null;
-
+        // Note: we always return a non-null filter (even with no user exclusions)
+        // because the app's own data directory is unconditionally excluded below.
         return path =>
         {
+            // Hard exclusion: never back up the app's own catalog/log/dump files.
+            // This is independent of the selection tree and glob patterns so an
+            // auto-include-new parent (e.g. all of C:\) can't sweep in
+            // C:\ProgramData\LithicBackup — the worker would otherwise try to back
+            // up its own live, open databases and fail with lock/sharing errors.
+            if (CatalogLocation.IsInsideAppDataDirectory(path))
+                return true;
             if (globalFilter?.Invoke(path) ?? false)
                 return true;
             if (tierResolver is not null && tierResolver(path).Tiers.Count == 0)

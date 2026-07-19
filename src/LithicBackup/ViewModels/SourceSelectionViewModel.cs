@@ -53,6 +53,7 @@ public class SourceSelectionViewModel : ViewModelBase
     private int _scheduleDailyHour = 2;
     private int _scheduleDailyMinute;
     private string _scheduleDebounceSeconds = "60";
+    private string _scheduleMaxWaitSeconds = "300";
     private string _schedulePollSeconds = "30";
     private readonly SizeComputeScheduler _scheduler = new();
     private Dictionary<string, FileVersionInfo>? _catalogInfo;
@@ -73,6 +74,21 @@ public class SourceSelectionViewModel : ViewModelBase
     private bool _seedSkipHashing = true;
     private CancellationTokenSource? _seedCts;
     private bool _needsSave = true;
+
+    /// <summary>
+    /// When false, the catch-all "mark dirty on any change" handlers are muted.
+    /// The modify/new-set dialog suspends tracking across its programmatic init
+    /// span (selection restore, catalog/size stamping, and the settings panel's
+    /// first-render binding write-backs) so none of that machinery is mistaken
+    /// for a user edit — which previously produced a spurious "unsaved changes"
+    /// prompt when a set was opened and closed without touching anything.
+    /// Genuine checkbox toggles still mark dirty during the span because they
+    /// set <see cref="_needsSave"/> directly (see <see cref="RequestSelectionSettle"/>),
+    /// bypassing these handlers.  Defaults true so any other host of this view
+    /// keeps immediate dirty tracking.
+    /// </summary>
+    private bool _dirtyTrackingArmed = true;
+
     private string _destinationSpaceText = "";
     private readonly FileHashCache? _fileHashCache;
     private readonly IFileScanner? _scanner;
@@ -246,6 +262,8 @@ public class SourceSelectionViewModel : ViewModelBase
                     or nameof(DestinationSpaceText)
                     or nameof(IsAnalyzingDedup) or nameof(DedupAnalysisResult)))
             {
+                if (!_dirtyTrackingArmed)
+                    return;
                 if (!string.IsNullOrEmpty(_saveStatusText))
                     SaveStatusText = "";
                 if (!_needsSave)
@@ -257,6 +275,8 @@ public class SourceSelectionViewModel : ViewModelBase
         };
         SelectionChanged += () =>
         {
+            if (!_dirtyTrackingArmed)
+                return;
             if (!string.IsNullOrEmpty(_saveStatusText))
                 SaveStatusText = "";
             if (!_needsSave)
@@ -388,6 +408,17 @@ public class SourceSelectionViewModel : ViewModelBase
 
     private void OnTierSetPropertyChanged(object? sender, PropertyChangedEventArgs e)
     {
+        // Honour the init-span dirty-tracking suspend, exactly like the VM's own
+        // PropertyChanged / SelectionChanged handlers.  The settings panel binds
+        // SelectedTierSet.FilePatternsText / FileExemptPatternsText two-way with
+        // UpdateSourceTrigger=PropertyChanged, so the panel's first-render binding
+        // write-backs raise PropertyChanged on the tier set while the modify dialog
+        // is still initialising.  Without this guard those write-backs mark the set
+        // dirty (and flag filters pending-apply), so opening a set and closing it
+        // without touching anything popped a bogus "unsaved changes" prompt.
+        if (!_dirtyTrackingArmed)
+            return;
+
         if (!string.IsNullOrEmpty(_saveStatusText))
             SaveStatusText = "";
         if (!_needsSave)
@@ -774,6 +805,17 @@ public class SourceSelectionViewModel : ViewModelBase
         set => SetProperty(ref _scheduleDebounceSeconds, value);
     }
 
+    /// <summary>
+    /// Max seconds an actively-changing file may stay pending before it is
+    /// versioned anyway (Continuous mode), as a text field. Guarantees an
+    /// endlessly-edited file still gets periodic versions.
+    /// </summary>
+    public string ScheduleMaxWaitSeconds
+    {
+        get => _scheduleMaxWaitSeconds;
+        set => SetProperty(ref _scheduleMaxWaitSeconds, value);
+    }
+
     /// <summary>Poll interval in seconds (Continuous mode) as a text field.</summary>
     public string SchedulePollSeconds
     {
@@ -911,6 +953,18 @@ public class SourceSelectionViewModel : ViewModelBase
         _needsSave = false;
         CommandManager.InvalidateRequerySuggested();
     }
+
+    /// <summary>
+    /// Mute the catch-all dirty handlers for the duration of the dialog's
+    /// programmatic initialisation (selection restore, catalog/size stamping,
+    /// and the settings panel's first-render binding write-backs).  Genuine
+    /// checkbox toggles still mark the set dirty while suspended.  Pair with
+    /// <see cref="ResumeDirtyTracking"/>.
+    /// </summary>
+    public void SuspendDirtyTracking() => _dirtyTrackingArmed = false;
+
+    /// <summary>Re-arm the catch-all dirty handlers once init has settled.</summary>
+    public void ResumeDirtyTracking() => _dirtyTrackingArmed = true;
 
     // --- Commands ---
 
@@ -1169,7 +1223,8 @@ public class SourceSelectionViewModel : ViewModelBase
             () => _catalogInfo,
             getExcludeFilter: () => GetExcludeFilter(),
             requestSelectionSettle: RequestSelectionSettle,
-            registerPendingWork: RegisterPendingWork);
+            registerPendingWork: RegisterPendingWork,
+            recordChangedPath: p => _changedSelectionPaths.Add(p));
         RootNode = root;
 
         // Mark as loaded BEFORE setting IsExpanded — otherwise the
@@ -1431,10 +1486,21 @@ public class SourceSelectionViewModel : ViewModelBase
                 }
             }
 
-            // ApplySelectionAsync bypasses the IsSelected setter, so the
-            // virtual root's tristate was never recomputed from its children.
-            RootNode.UpdateFromChildren();
         }
+
+        // ApplySelectionAsync applies each node's saved IsSelected verbatim and never
+        // recomputes a parent from its materialised children, so a directory saved as
+        // fully-checked that actually has some children excluded would keep showing a
+        // full check.  Walk the loaded tree bottom-up once, now that the whole restore
+        // has settled, to correct any such stale parent tristate (this also recomputes
+        // the virtual root from its drive children).
+        RootNode.RecomputeLoadedTristate();
+
+        // The virtual "All Drives" root isn't persisted (GetSelections unwraps it and
+        // saves only the drive children), so re-derive its auto-include-new flag from
+        // the restored drives instead of leaving it at the constructor default — that
+        // default is what made "turn off auto-include on All Drives" silently revert.
+        RootNode.UpdateAutoIncludeFromChildren();
 
         RefreshHasSelection();
         OnPropertyChanged(nameof(IsAllSelected));

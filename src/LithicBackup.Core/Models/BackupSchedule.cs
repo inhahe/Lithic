@@ -29,6 +29,19 @@ public class BackupSchedule
     public int DebounceSeconds { get; set; } = 60;
 
     /// <summary>
+    /// Upper bound (seconds) on how long a continuously-changing file may stay
+    /// pending before it is backed up regardless of ongoing edits (for
+    /// <see cref="ScheduleMode.Continuous"/>). The per-file debounce
+    /// (<see cref="DebounceSeconds"/>) never fires while a file keeps changing,
+    /// so this cap guarantees an actively-edited file (e.g. a document you save
+    /// repeatedly, or a busy log) still gets versioned periodically. When the
+    /// cap is lower than the debounce it dominates, yielding one version every
+    /// <see cref="MaxWaitSeconds"/> during a long editing burst. Defaults to 300
+    /// (5 minutes). Values &lt;= 0 fall back to that default in the Worker.
+    /// </summary>
+    public int MaxWaitSeconds { get; set; } = 300;
+
+    /// <summary>
     /// How often (seconds) the Worker polls the change journal / watcher for
     /// this set's sources in <see cref="ScheduleMode.Continuous"/> mode. Lower
     /// values detect changes sooner at the cost of more frequent journal reads.

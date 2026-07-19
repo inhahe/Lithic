@@ -127,6 +127,18 @@ public class SourceSelectionNodeViewModel : ViewModelBase
     /// serialising.  Null (e.g. in tests) means such work runs without a Save gate.
     /// </summary>
     private readonly Action<Task>? _registerPendingWork;
+    /// <summary>
+    /// When set, records a directory path whose <em>coverage</em> changed via
+    /// something other than a checkbox toggle — specifically an auto-include-new
+    /// flip — into the owning viewmodel's changed-paths set, so the post-edit
+    /// destination reconcile scans that subtree for files it just dropped.  The
+    /// checkbox <see cref="IsSelected"/> path already records via
+    /// <see cref="_requestSelectionSettle"/>; auto-include has no such hook, and
+    /// turning it OFF on a directory whose existing descendants were covered
+    /// only by the rule (e.g. an unexpanded <c>C:\</c>) silently evicts them —
+    /// which must trigger a reconcile.  Null (tests) means no recording.
+    /// </summary>
+    private readonly Action<string>? _recordChangedPath;
     // Catalog data is provided via a getter rather than a captured value so it
     // can arrive AFTER the tree is built.  The full catalog dictionary can hold
     // ~1M entries and take several seconds to query, so it is loaded in the
@@ -144,7 +156,8 @@ public class SourceSelectionNodeViewModel : ViewModelBase
         Func<Dictionary<string, FileVersionInfo>?>? getCatalogInfo = null,
         Func<Func<string, bool>?>? getExcludeFilter = null,
         Action<SourceSelectionNodeViewModel>? requestSelectionSettle = null,
-        Action<Task>? registerPendingWork = null)
+        Action<Task>? registerPendingWork = null,
+        Action<string>? recordChangedPath = null)
     {
         Path = path;
         Name = System.IO.Path.GetFileName(path);
@@ -160,6 +173,7 @@ public class SourceSelectionNodeViewModel : ViewModelBase
         _getExcludeFilter = getExcludeFilter ?? parent?._getExcludeFilter;
         _requestSelectionSettle = requestSelectionSettle ?? parent?._requestSelectionSettle;
         _registerPendingWork = registerPendingWork ?? parent?._registerPendingWork;
+        _recordChangedPath = recordChangedPath ?? parent?._recordChangedPath;
         _getCatalogInfo = getCatalogInfo ?? parent?._getCatalogInfo;
         Depth = parent is null ? 0 : parent.Depth + 1;
         Children = [];
@@ -184,6 +198,17 @@ public class SourceSelectionNodeViewModel : ViewModelBase
 
     /// <summary>Nesting depth (0 for root nodes). Used for indentation in the custom TreeViewItem template.</summary>
     public int Depth { get; }
+
+    /// <summary>
+    /// True when this entry is a Hidden or System directory/file. These used to be
+    /// omitted from the editor tree entirely, which meant a user could never see
+    /// (or deselect) something like <c>C:\ProgramData</c> even though the backup
+    /// engine happily included it — a confusing "backed up but invisible" mismatch.
+    /// They are now shown but rendered in a distinct (dimmer) colour so it's clear
+    /// they're special. Set by <see cref="CreateChildNode"/> from the enumerated
+    /// file-system attributes.
+    /// </summary>
+    public bool IsHiddenOrSystem { get; internal set; }
 
     /// <summary>Whether this directory's children have been loaded from the filesystem.</summary>
     public bool IsLoaded
@@ -505,6 +530,18 @@ public class SourceSelectionNodeViewModel : ViewModelBase
                 OnPropertyChanged(nameof(BackupStatus));
             }
 
+            // A user-initiated exclusion must invalidate this directory's deferred
+            // child restore *synchronously*, before the coalesced settle pass runs.
+            // Otherwise a lazy expand racing the settle would re-apply the saved
+            // child selections (and any worker-materialised auto-include leaves
+            // under them), and UpdateFromChildren would then re-derive this node
+            // from those children back to partial (null) — silently undoing the
+            // exclusion. That is exactly why excluding a directory that had
+            // materialised descendant selections (e.g. C:\ProgramData with pinned
+            // auto-include junk) never stuck, while a childless one (C:\Users) did.
+            if (value == false && IsDirectory && !_suppressPropagation)
+                DiscardSavedSubtreeSelections();
+
             if (_suppressPropagation)
                 return;
 
@@ -535,9 +572,22 @@ public class SourceSelectionNodeViewModel : ViewModelBase
     {
         var value = _isSelected;
 
-        // Propagate down: set all loaded children to the same definite state.
-        if (value.HasValue && IsDirectory && _isLoaded)
+        if (value == false && IsDirectory)
         {
+            // Exclusion: hard-exclude the entire subtree. Discard any saved or
+            // deferred child selections this node holds, then drive every loaded
+            // descendant to excluded (clearing *its* deferred state too). This is
+            // what makes an exclusion stick: no lazy expand's deferred restore and
+            // no UpdateFromChildren ripple from a materialised descendant can
+            // resurrect the old selection and re-derive this node to partial.
+            DiscardSavedSubtreeSelections();
+            if (_isLoaded)
+                foreach (var child in Children)
+                    child.ExcludeSubtree();
+        }
+        else if (value.HasValue && IsDirectory && _isLoaded)
+        {
+            // Inclusion: push the definite state down to loaded children.
             foreach (var child in Children)
             {
                 child._suppressPropagation = true;
@@ -548,6 +598,52 @@ public class SourceSelectionNodeViewModel : ViewModelBase
 
         // Propagate up: recalculate parent's tristate.
         Parent?.UpdateFromChildren();
+    }
+
+    /// <summary>
+    /// Recursively force this node and every loaded descendant into the excluded
+    /// state, discarding each one's saved/deferred child selections. Used when an
+    /// ancestor is excluded: the whole subtree is out, and any materialised or
+    /// deferred descendant selection must be dropped so a later expand — or an
+    /// <see cref="UpdateFromChildren"/> ripple — can't resurrect it and undo the
+    /// exclusion. Does not propagate up (the caller owns the excluded parent).
+    /// </summary>
+    private void ExcludeSubtree()
+    {
+        _suppressPropagation = true;
+        _isSelected = false;
+        _isAutoIncludeDerived = false;
+        _suppressPropagation = false;
+        OnPropertyChanged(nameof(IsSelected));
+        OnPropertyChanged(nameof(IsNodeEnabled));
+
+        if (_backupStatus != BackupStatus.Unknown)
+        {
+            _backupStatus = BackupStatus.Unknown;
+            OnPropertyChanged(nameof(BackupStatus));
+        }
+
+        DiscardSavedSubtreeSelections();
+
+        if (IsDirectory && _isLoaded)
+            foreach (var child in Children)
+                child.ExcludeSubtree();
+    }
+
+    /// <summary>
+    /// Drop any saved/deferred child-selection state this node is holding: the
+    /// deferred-restore flag, the restored-model fallback, and preserved orphan
+    /// child models. Called when the node becomes definitively excluded so none of
+    /// them can later re-apply the old subtree selection. Safe for an excluded
+    /// node because <see cref="ToModel"/> serialises it as a bare tombstone
+    /// (returning at its <c>IsSelected == false</c> branch before it would ever
+    /// consult <see cref="_restoredModel"/> or the orphan models).
+    /// </summary>
+    private void DiscardSavedSubtreeSelections()
+    {
+        _pendingDeferredRestore = false;
+        _restoredModel = null;
+        _orphanedChildModels = null;
     }
 
     /// <summary>
@@ -643,7 +739,22 @@ public class SourceSelectionNodeViewModel : ViewModelBase
         // Mark the set dirty (enable Save) for the user's own toggle — not for each
         // recursively-propagated child, which would fire the aggregate many times.
         if (userInitiated)
+        {
             _onSelectionChanged?.Invoke();
+
+            // Record this directory as a changed subtree so the post-edit
+            // destination reconcile rescans it.  Turning auto-include OFF on a
+            // directory whose existing descendants were covered ONLY by the rule
+            // (e.g. an unexpanded C:\ with a handful of explicit children) evicts
+            // those descendants from the selection, yet fires no checkbox toggle —
+            // so without this the reconcile's changed-paths set stays empty and the
+            // now-orphaned catalog rows are never marked deleted or purged from the
+            // destination.  Recording on turn-ON too is harmless: the reconcile's
+            // "included before AND excluded now" filter yields no removals when
+            // coverage only grew.
+            if (IsDirectory && !string.IsNullOrEmpty(Path))
+                _recordChangedPath?.Invoke(Path);
+        }
     }
 
     /// <summary>
@@ -992,6 +1103,18 @@ public class SourceSelectionNodeViewModel : ViewModelBase
                 _pendingDeferredRestore = false;
                 await ApplyChildModelsAsync(_restoredModel.Children);
                 SortChildren();
+
+                // Reconcile this node's tristate (and its ancestors') with the
+                // children that were just materialised.  The saved parent state can
+                // disagree with the restored subtree — e.g. a directory saved as
+                // fully-selected (a full check) that actually has some children
+                // excluded keeps showing a full check until its children load.  Now
+                // that every child exists (freshly enumerated, with saved overrides
+                // applied on top), recompute so the parent shows the correct
+                // partial/full state instead of a stale one.  Suppressed inside
+                // UpdateFromChildren, so this neither pushes state back down nor
+                // marks the set dirty.
+                UpdateFromChildren();
             }
 
             // Compute aggregate backup status for this directory.
@@ -1018,15 +1141,17 @@ public class SourceSelectionNodeViewModel : ViewModelBase
     }
 
     /// <summary>Shape of one enumerated child entry: its full path, whether it
-    /// is a directory, and any inline-computed (cached) size accounting.</summary>
+    /// is a directory, whether it is Hidden/System, and any inline-computed
+    /// (cached) size accounting.</summary>
     private readonly record struct ChildEntry(
-        string FullName, bool IsDirectory,
+        string FullName, bool IsDirectory, bool IsHiddenOrSystem,
         long Size, int FileCount, long FilteredSize, int FilteredFileCount);
 
     /// <summary>
     /// Enumerate this directory's immediate children on a background thread,
-    /// skipping System/Hidden subdirectories and precomputing cached recursive
-    /// (and, when a filter is active, filtered) sizes for directory entries.
+    /// flagging (but no longer hiding) System/Hidden subdirectories and
+    /// precomputing cached recursive (and, when a filter is active, filtered)
+    /// sizes for directory entries.
     /// Returns the sorted entries (directories first, then files, alphabetically)
     /// and a flag indicating whether the top-level enumeration failed (drive not
     /// ready, I/O error, access denied) — used by callers to avoid clobbering a
@@ -1057,6 +1182,17 @@ public class SourceSelectionNodeViewModel : ViewModelBase
             // genuinely-empty directory (no exception) from one we simply
             // could not read — the latter must NOT clobber a saved selection.
             bool failed = false;
+
+            // The virtual "All Drives" root has an empty Path and no real
+            // filesystem directory (its children are the drive roots, managed
+            // by SourceSelectionViewModel, not enumerated here).  `new
+            // DirectoryInfo("")` throws ArgumentException, and because this
+            // runs in a Task whose result may be discarded (e.g. a re-expand
+            // reconcile), that surfaced as an unobserved-task crash.  Report it
+            // as a read failure so callers leave the existing children intact.
+            if (string.IsNullOrEmpty(Path))
+                return (result, true);
+
             var dirInfo = new DirectoryInfo(Path);
 
             try
@@ -1065,8 +1201,10 @@ public class SourceSelectionNodeViewModel : ViewModelBase
                 {
                     try
                     {
-                        if ((subDir.Attributes & (FileAttributes.System | FileAttributes.Hidden)) != 0)
-                            continue;
+                        // Hidden/System directories are shown (so they can be
+                        // seen and deselected) but flagged for distinct colouring.
+                        bool hiddenOrSystem =
+                            (subDir.Attributes & (FileAttributes.System | FileAttributes.Hidden)) != 0;
 
                         long dirSize = -1;
                         int dirFileCount = -1;
@@ -1101,8 +1239,8 @@ public class SourceSelectionNodeViewModel : ViewModelBase
                             }
                         }
 
-                        result.Add(new ChildEntry(subDir.FullName, true, dirSize, dirFileCount,
-                                    filtDirSize, filtDirFileCount));
+                        result.Add(new ChildEntry(subDir.FullName, true, hiddenOrSystem,
+                                    dirSize, dirFileCount, filtDirSize, filtDirFileCount));
                     }
                     catch (UnauthorizedAccessException) { }
                 }
@@ -1119,7 +1257,9 @@ public class SourceSelectionNodeViewModel : ViewModelBase
                         long size = 0;
                         try { size = file.Length; }
                         catch { }
-                        result.Add(new ChildEntry(file.FullName, false, size, 1, size, 1));
+                        bool hiddenOrSystem =
+                            (file.Attributes & (FileAttributes.System | FileAttributes.Hidden)) != 0;
+                        result.Add(new ChildEntry(file.FullName, false, hiddenOrSystem, size, 1, size, 1));
                     }
                     catch (UnauthorizedAccessException) { }
                 }
@@ -1182,6 +1322,8 @@ public class SourceSelectionNodeViewModel : ViewModelBase
             // model, ApplyChildModelsAsync corrects it before the next render, so
             // its checkbox can be shown immediately without a wrong-state flash.
             _isSelectionRestored = true,
+            // Hidden/System entries are shown but coloured differently in the tree.
+            IsHiddenOrSystem = entry.IsHiddenOrSystem,
         };
 
         // Determine backup status for files from the catalog.
@@ -1484,13 +1626,8 @@ public class SourceSelectionNodeViewModel : ViewModelBase
         {
             foreach (var subDir in dir.EnumerateDirectories())
             {
-                try
-                {
-                    if ((subDir.Attributes & (FileAttributes.System | FileAttributes.Hidden)) != 0)
-                        continue;
-                }
-                catch { continue; }
-
+                // Hidden/System directories are included in size totals so the
+                // displayed size matches what the backup engine actually copies.
                 // Check if the directory itself is excluded (e.g. */node_modules/*)
                 // by testing a synthetic child path.
                 if (isExcluded(System.IO.Path.Combine(subDir.FullName, "_")))
@@ -1560,13 +1697,8 @@ public class SourceSelectionNodeViewModel : ViewModelBase
         {
             foreach (var subDir in dir.EnumerateDirectories())
             {
-                try
-                {
-                    if ((subDir.Attributes & (FileAttributes.System | FileAttributes.Hidden)) != 0)
-                        continue;
-                }
-                catch { continue; }
-
+                // Hidden/System directories are included in size totals so the
+                // displayed size matches what the backup engine actually copies.
                 if (isExcluded(System.IO.Path.Combine(subDir.FullName, "_")))
                     continue;
 
@@ -1696,13 +1828,8 @@ public class SourceSelectionNodeViewModel : ViewModelBase
         {
             foreach (var subDir in dir.EnumerateDirectories())
             {
-                try
-                {
-                    if ((subDir.Attributes & (FileAttributes.System | FileAttributes.Hidden)) != 0)
-                        continue;
-                }
-                catch { continue; }
-
+                // Hidden/System directories are included in size totals so the
+                // displayed size matches what the backup engine actually copies.
                 var (subSize, subCount) = ComputeDirectorySizeCached(subDir, cache);
                 subdirSizeTotal += subSize;
                 subdirFileTotal += subCount;
@@ -1909,13 +2036,90 @@ public class SourceSelectionNodeViewModel : ViewModelBase
     }
 
     /// <summary>
+    /// Depth-first, bottom-up: recompute every loaded directory's tristate from its
+    /// children so a node restored with a state that disagrees with its subtree is
+    /// corrected.  During a selection restore each node's <see cref="IsSelected"/> is
+    /// applied verbatim from the saved model (see <see cref="ApplySelectionAsync"/>),
+    /// which can leave a directory saved as fully-checked showing a full check even
+    /// though some of its children are excluded.  Unlike <see cref="UpdateFromChildren"/>
+    /// this walks <em>down</em> first (so children are settled before their parent) and
+    /// never ripples up to <see cref="Parent"/>, so it can be run once on the tree root
+    /// after a restore without racing concurrent sibling restores.  Assignments are
+    /// suppressed, so they don't push state back down or mark the set dirty.
+    /// </summary>
+    internal void RecomputeLoadedTristate()
+    {
+        if (!IsDirectory || !_isLoaded || Children.Count == 0)
+            return;
+
+        foreach (var child in Children)
+            child.RecomputeLoadedTristate();
+
+        bool allSelected = Children.All(c => c.IsSelected == true);
+        bool allDeselected = Children.All(c => c.IsSelected == false);
+
+        _suppressPropagation = true;
+        if (allSelected)
+            IsSelected = true;
+        else if (allDeselected)
+            IsSelected = false;
+        else
+            IsSelected = null; // Mixed — tristate indeterminate
+        _suppressPropagation = false;
+    }
+
+    /// <summary>
+    /// Re-derive this node's <see cref="AutoIncludeNew"/> flag from its directory
+    /// children.  Used for the virtual "All Drives" root, whose own state is never
+    /// persisted (GetSelections unwraps it and saves only the drive children).
+    /// Without this the root's auto-include flag reverts to the constructor default
+    /// (true) on every reload, silently undoing a user who turned it off.  The
+    /// backing field is set directly (not via the setter) so this restore-time
+    /// derivation neither propagates back down to the drives nor marks the set dirty.
+    /// </summary>
+    internal void UpdateAutoIncludeFromChildren()
+    {
+        var dirs = Children.Where(c => c.IsDirectory).ToList();
+        if (dirs.Count == 0)
+            return;
+
+        bool derived = dirs.All(c => c.AutoIncludeNew);
+        if (_autoIncludeNew != derived)
+        {
+            _autoIncludeNew = derived;
+            OnPropertyChanged(nameof(AutoIncludeNew));
+        }
+    }
+
+    /// <summary>
     /// Build a <see cref="Core.Models.SourceSelection"/> tree from this viewmodel tree.
     /// Only includes nodes that are at least partially selected.
     /// </summary>
     public Core.Models.SourceSelection? ToModel()
     {
         if (IsSelected == false)
-            return null;
+        {
+            // Normally a deselected node doesn't need saving — on reload it
+            // starts deselected by default.  BUT if the parent would auto-include
+            // this node (fully-selected parent, or partially-selected + auto-
+            // include-on), the exclusion must be persisted explicitly — otherwise
+            // on reload the node comes back selected and the user's exclusion is
+            // silently undone.
+            bool parentWouldAutoInclude =
+                Parent is not null &&
+                Parent.IsSelected != false &&
+                (Parent.IsSelected == true || Parent.AutoIncludeNew);
+            if (!parentWouldAutoInclude)
+                return null;
+
+            // Persist just the exclusion — no need to recurse into children.
+            return new Core.Models.SourceSelection
+            {
+                Path = Path,
+                IsDirectory = IsDirectory,
+                IsSelected = false,
+            };
+        }
 
         // Auto-include derivation: this node renders checked only because it's an
         // unlisted descendant of a partially-selected auto-include directory (see

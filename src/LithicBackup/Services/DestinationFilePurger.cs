@@ -37,7 +37,7 @@ internal static class DestinationFilePurger
     /// <returns>Count of files deleted, count of deletion failures, and bytes freed.</returns>
     public static (int FilesDeleted, int Failures, long BytesFreed) DeleteFilesAndSweep(
         string targetDir, IReadOnlyCollection<string> discRelPaths,
-        IProgress<string>? progress)
+        IProgress<ProgressReport>? progress)
     {
         int filesDeleted = 0;
         int failures = 0;
@@ -58,8 +58,9 @@ internal static class DestinationFilePurger
             {
                 lastProgressMs = nowMs;
                 int pct = total == 0 ? 100 : (int)(idx * 100L / total);
-                progress.Report(
-                    $"Deleting files {idx:N0}/{total:N0} ({pct}%): {Path.GetFileName(discRel)}");
+                progress.Report(new ProgressReport(
+                    $"Deleting backed-up files {idx:N0}/{total:N0} ({pct}%): {Path.GetFileName(discRel)}",
+                    pct));
             }
 
             string fullPath = Path.Combine(targetDir, discRel);
@@ -152,7 +153,7 @@ internal static class DestinationFilePurger
     /// reports at the same <see cref="ProgressIntervalMs"/> cadence as the rest
     /// of the operation.
     /// </summary>
-    private sealed class SweepProgress(IProgress<string>? progress, Stopwatch sw)
+    private sealed class SweepProgress(IProgress<ProgressReport>? progress, Stopwatch sw)
     {
         private int _scanned;
         private long _lastMs = long.MinValue;

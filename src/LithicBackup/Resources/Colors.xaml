@@ -36,6 +36,10 @@
     <Color x:Key="DisabledFillColor">#E8ECF1</Color>
     <Color x:Key="DisabledTextColor">#9AA6B6</Color>
 
+    <!-- Hidden/System filesystem entries: a distinct violet so folders like
+         C:\ProgramData read as "special" in the source-selection tree. -->
+    <Color x:Key="HiddenSystemColor">#8B5CF6</Color>
+
     <!-- Brushes -->
     <SolidColorBrush x:Key="PrimaryBrush" Color="{StaticResource PrimaryColor}" />
     <SolidColorBrush x:Key="PrimaryDarkBrush" Color="{StaticResource PrimaryDarkColor}" />
@@ -58,5 +62,6 @@
     <SolidColorBrush x:Key="DangerDarkBrush" Color="{StaticResource DangerDarkColor}" />
     <SolidColorBrush x:Key="DisabledFillBrush" Color="{StaticResource DisabledFillColor}" />
     <SolidColorBrush x:Key="DisabledTextBrush" Color="{StaticResource DisabledTextColor}" />
+    <SolidColorBrush x:Key="HiddenSystemBrush" Color="{StaticResource HiddenSystemColor}" />
 
 </ResourceDictionary>

@@ -32,13 +32,16 @@ public sealed record UpdateCheckResult(
 
 /// <summary>
 /// Checks GitHub Releases for a newer version of the app and locates the
-/// installer asset to download. Prefers the self-elevating Burn bundle
-/// (<c>.exe</c>) over the bare <c>.msi</c>: the bundle elevates up front so the
-/// upgrade can close a running, elevated GUI before InstallValidate (a
-/// double-clicked/launched bare .msi runs its kill step at Medium integrity and
-/// cannot terminate a High-integrity GUI — see installer\Bundle.wxs and the
-/// v1.0.10 entry in known-issues.md). Pure network/parse logic with no UI
-/// dependencies so it can be unit-tested and reused from the GUI or Worker.
+/// installer asset to download. Prefers the bare <c>.msi</c> (the only artifact
+/// current releases ship): the MSI closes a running — even elevated — GUI by
+/// <em>asking</em> it to exit via the <c>SignalLithicGuiShutdown</c> custom
+/// action before InstallValidate, and the in-app updater additionally shuts this
+/// GUI down itself right after launching the installer, so no self-elevating
+/// wrapper is needed. A legacy self-extracting <c>.exe</c> (the old WiX Burn
+/// bundle used up to v1.0.10, since retired — <c>installer\Bundle.wxs</c> no
+/// longer exists) is still accepted only as a fallback if a release happens to
+/// attach one. Pure network/parse logic with no UI dependencies so it can be
+/// unit-tested and reused from the GUI or Worker.
 /// </summary>
 public static class UpdateService
 {
@@ -102,10 +105,11 @@ public static class UpdateService
             var notes = root.TryGetProperty("body", out var b) ? b.GetString() ?? "" : "";
             var page = root.TryGetProperty("html_url", out var h) ? h.GetString() ?? "" : "";
 
-            // Prefer the self-elevating bundle (.exe); fall back to the bare .msi
-            // only if no .exe asset is attached. The .exe closes a running elevated
-            // GUI during upgrade without the "unable to close" dialog; the .msi
-            // cannot (see class summary).
+            // Prefer the bare .msi (what current releases ship); accept a legacy
+            // .exe bundle only as a fallback if that's the only asset attached. The
+            // MSI's SignalLithicGuiShutdown custom action (plus the updater closing
+            // this GUI itself) means the old self-elevating .exe is no longer
+            // required to beat the file-in-use check (see class summary).
             string? exeUrl = null, exeName = null;
             string? msiUrl = null, msiName = null;
             if (root.TryGetProperty("assets", out var assets) &&
@@ -131,8 +135,8 @@ public static class UpdateService
                 }
             }
 
-            var installerUrl = exeUrl ?? msiUrl;
-            var installerName = exeUrl is not null ? exeName : msiName;
+            var installerUrl = msiUrl ?? exeUrl;
+            var installerName = msiUrl is not null ? msiName : exeName;
 
             var info = new UpdateInfo(latest, tag, name, notes, page, installerUrl, installerName);
             return new UpdateCheckResult(info, currentVersion, latest, null);
@@ -158,7 +162,7 @@ public static class UpdateService
         if (string.IsNullOrEmpty(info.InstallerDownloadUrl))
             throw new InvalidOperationException("This release has no installer asset to download.");
 
-        var fileName = info.InstallerFileName ?? $"LithicBackup-{info.Version}-x64.exe";
+        var fileName = info.InstallerFileName ?? $"LithicBackup-{info.Version}-x64.msi";
         var dest = Path.Combine(Path.GetTempPath(), fileName);
 
         using var resp = await Http.GetAsync(

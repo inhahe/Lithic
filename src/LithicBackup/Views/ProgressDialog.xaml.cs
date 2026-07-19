@@ -3,6 +3,7 @@ using System.ComponentModel;
 using System.Threading;
 using System.Threading.Tasks;
 using System.Windows;
+using LithicBackup.Services;
 using LithicBackup.ViewModels;
 
 namespace LithicBackup.Views;
@@ -72,6 +73,7 @@ public partial class ProgressDialog : Window
         if (_cts is not null)
         {
             _vm.Detail = "Cancelling\u2026";
+            _vm.IsIndeterminate = true; // the work is unwinding — no measured progress
             _cts.Cancel();
         }
     }
@@ -109,7 +111,7 @@ public partial class ProgressDialog : Window
         string title,
         string message,
         bool cancellable,
-        Func<IProgress<string>, CancellationToken, T> work)
+        Func<IProgress<ProgressReport>, CancellationToken, T> work)
     {
         var cts = cancellable ? new CancellationTokenSource() : null;
         var vm = new ProgressDialogViewModel(title, message, cancellable);
@@ -119,8 +121,22 @@ public partial class ProgressDialog : Window
         };
 
         // Progress<T> captures the current (UI) SynchronizationContext, so the
-        // detail updates marshal back to the UI thread automatically.
-        var progress = new Progress<string>(s => vm.Detail = s);
+        // detail updates marshal back to the UI thread automatically. A report
+        // carrying a percent drives a determinate bar; a text-only report (null
+        // percent) falls back to the marquee for that step.
+        var progress = new Progress<ProgressReport>(r =>
+        {
+            vm.Detail = r.Text;
+            if (r.Percent is double pct)
+            {
+                vm.ProgressValue = Math.Clamp(pct, 0, 100);
+                vm.IsIndeterminate = false;
+            }
+            else
+            {
+                vm.IsIndeterminate = true;
+            }
+        });
         var token = cts?.Token ?? CancellationToken.None;
 
         T result = default!;

@@ -10,20 +10,37 @@ namespace LithicBackup.Infrastructure.Data;
 /// connection holding one backup set's discs, files, chunks, and dedup blocks.
 ///
 /// <para>
-/// <b>Concurrency.</b>  A single <see cref="SqliteConnection"/> is not safe for
-/// concurrent command execution, so every operation is serialised through a
-/// <see cref="SemaphoreSlim"/> gate.  A transaction holds the gate for its
-/// whole lifetime; calls made <i>inside</i> a transaction must not re-acquire
+/// <b>In-process concurrency.</b>  A single <see cref="SqliteConnection"/> is not
+/// safe for concurrent command execution, so every operation is serialised
+/// through a <see cref="SemaphoreSlim"/> gate.  A transaction holds the gate for
+/// its whole lifetime; calls made <i>inside</i> a transaction must not re-acquire
 /// the gate (the semaphore is not reentrant — that would self-deadlock), so a
-/// <see cref="_inTransaction"/> flag short-circuits the lock for them.
+/// <see cref="_inTransaction"/> flag short-circuits the lock for them.  The flag
+/// is only correct under the application's invariant that at most one logical
+/// operation touches a given set at a time <i>within one process</i> (the GUI
+/// gates per-set commands so a set that is backing up cannot also be
+/// restored/cleaned).
 /// </para>
 /// <para>
-/// The flag is only correct under the application's invariant that at most one
-/// logical operation touches a given set at a time (the GUI gates per-set
-/// commands so a set that is backing up cannot also be restored/cleaned).  The
-/// concurrency this split unlocks is <i>between</i> sets, which is inherently
-/// safe because each set has its own connection and its own SQLite write lock.
-/// Cross-process sharing (GUI + Worker) relies on WAL mode plus a busy timeout.
+/// <b>Cross-process concurrency (GUI + Worker).</b>  The interactive GUI and the
+/// LocalSystem Worker service are separate processes that open their own
+/// connections to the <i>same</i> set database file (both under
+/// <c>C:\ProgramData\LithicBackup\sets</c>).  WAL mode lets their readers run
+/// concurrently, but two <i>writers</i> on the same set would collide: the Worker
+/// holds a write transaction for up to ~30&#160;s per commit batch during a
+/// continuous backup, which is longer than any reasonable SQLite busy timeout, so
+/// a GUI write (cleanup, reconcile, clear) that landed mid-batch used to fail with
+/// "database is locked" (SQLITE_BUSY).  To make that impossible, every write —
+/// each transaction and each standalone write statement — first takes a
+/// <b>cross-process exclusive lock</b> on a per-set lock file
+/// (<see cref="_writeLockPath"/>) via <see cref="AcquireCrossProcessWriteAsync"/>.
+/// Only one process can hold that file open with <see cref="FileShare.None"/> at a
+/// time, so writers on a given set serialise across processes and the SQLite write
+/// lock is never actually contended.  The wait is cancellable and unbounded
+/// (the holder always releases when its transaction ends, and the OS releases the
+/// file automatically if a process crashes), so no arbitrary timeout can ever turn
+/// legitimate contention back into a failure.  Reads deliberately do <i>not</i>
+/// take the file lock, preserving WAL's concurrent-reader benefit.
 /// </para>
 /// </summary>
 internal sealed class SqliteSetDatabase : IDisposable
@@ -32,6 +49,15 @@ internal sealed class SqliteSetDatabase : IDisposable
     private readonly SemaphoreSlim _gate = new(1, 1);
     private volatile bool _inTransaction;
 
+    /// <summary>
+    /// Path of the per-set cross-process write-lock file.  A writer opens this
+    /// with <see cref="FileShare.None"/> for the duration of its transaction /
+    /// statement; a second process opening it fails until the first releases, so
+    /// writers on this set serialise machine-wide.  It lives beside the database
+    /// (not inside it) so holding it never touches SQLite's own locks.
+    /// </summary>
+    private readonly string _writeLockPath;
+
     public int SetId { get; }
     public string DatabasePath { get; }
 
@@ -39,6 +65,7 @@ internal sealed class SqliteSetDatabase : IDisposable
     {
         SetId = setId;
         DatabasePath = databasePath;
+        _writeLockPath = databasePath + ".writelock";
 
         // Pooling=False so the file handle is released promptly on Dispose,
         // which lets DeleteBackupSetAsync remove the set's .db file.
@@ -47,7 +74,10 @@ internal sealed class SqliteSetDatabase : IDisposable
 
         Execute("PRAGMA journal_mode=WAL");
         Execute("PRAGMA foreign_keys=ON");
-        Execute("PRAGMA busy_timeout=15000");
+        // Backstop only: the cross-process write-lock file (see class remarks)
+        // prevents writer-vs-writer contention, so this timeout just covers brief
+        // WAL-checkpoint edge cases rather than long transactions.
+        Execute("PRAGMA busy_timeout=30000");
 
         var assembly = typeof(SqliteSetDatabase).Assembly;
         using var stream = assembly.GetManifestResourceStream(
@@ -74,19 +104,97 @@ internal sealed class SqliteSetDatabase : IDisposable
         return new Releaser(this);
     }
 
+    /// <summary>
+    /// Acquire the in-process gate <b>plus</b> the cross-process write lock for a
+    /// standalone write statement.  Used by every method that mutates the set DB
+    /// (as opposed to <see cref="LockAsync"/>, used by reads).  When already inside
+    /// a transaction the flow already owns both locks, so this is a no-op.
+    /// </summary>
+    private async Task<WriteReleaser> WriteLockAsync(CancellationToken ct)
+    {
+        // Reentrant short-circuit: an inside-transaction write already holds both
+        // the file lock and the gate.
+        if (_inTransaction)
+            return default;
+
+        // Cross-process first, then in-process, so the release order (gate then
+        // file) is the exact reverse of acquisition.
+        var fileLock = await AcquireCrossProcessWriteAsync(ct).ConfigureAwait(false);
+        try
+        {
+            await _gate.WaitAsync(ct).ConfigureAwait(false);
+        }
+        catch
+        {
+            fileLock.Dispose();
+            throw;
+        }
+        return new WriteReleaser(this, fileLock);
+    }
+
+    /// <summary>
+    /// Open the per-set write-lock file with <see cref="FileShare.None"/>, waiting
+    /// (cancellably, without any timeout) until no other process holds it.  The OS
+    /// releases the handle automatically if the holder crashes, so this can never
+    /// dead-wait on a dead process.  Returns the owning stream; disposing it frees
+    /// the lock for the next writer.
+    /// </summary>
+    private async Task<FileStream> AcquireCrossProcessWriteAsync(CancellationToken ct)
+    {
+        while (true)
+        {
+            ct.ThrowIfCancellationRequested();
+            try
+            {
+                return new FileStream(
+                    _writeLockPath,
+                    FileMode.OpenOrCreate,
+                    FileAccess.ReadWrite,
+                    FileShare.None);
+            }
+            catch (IOException)
+            {
+                // Another process (or another writer in this one) holds the lock.
+                // Poll until it is released; the wait is unbounded by design so
+                // legitimate contention never degrades into a "database is locked".
+                await Task.Delay(25, ct).ConfigureAwait(false);
+            }
+            catch (UnauthorizedAccessException)
+            {
+                // Transient sharing/ACL race during creation — retry.
+                await Task.Delay(25, ct).ConfigureAwait(false);
+            }
+        }
+    }
+
     public async Task<ICatalogTransaction> BeginTransactionAsync(CancellationToken ct)
     {
         ct.ThrowIfCancellationRequested();
-        await _gate.WaitAsync(ct).ConfigureAwait(false);
+
+        // A transaction is a write: take the cross-process lock before the gate so
+        // no other process can be mid-write on this set while we hold SQLite's
+        // write lock for the whole transaction.
+        var fileLock = await AcquireCrossProcessWriteAsync(ct).ConfigureAwait(false);
+        try
+        {
+            await _gate.WaitAsync(ct).ConfigureAwait(false);
+        }
+        catch
+        {
+            fileLock.Dispose();
+            throw;
+        }
+
         try
         {
             var tx = _connection.BeginTransaction();
             _inTransaction = true;
-            return new TransactionScope(this, tx);
+            return new TransactionScope(this, tx, fileLock);
         }
         catch
         {
             _gate.Release();
+            fileLock.Dispose();
             throw;
         }
     }
@@ -97,6 +205,19 @@ internal sealed class SqliteSetDatabase : IDisposable
     }
 
     /// <summary>
+    /// Releases a standalone write: the in-process gate first, then the
+    /// cross-process file lock (reverse of acquisition order).
+    /// </summary>
+    private readonly struct WriteReleaser(SqliteSetDatabase? owner, FileStream? fileLock) : IDisposable
+    {
+        public void Dispose()
+        {
+            owner?._gate.Release();
+            fileLock?.Dispose();
+        }
+    }
+
+    /// <summary>
     /// Commits on <see cref="Complete"/> + Dispose, otherwise rolls back, then
     /// clears the in-transaction flag and releases the owning set's gate.
     /// </summary>
@@ -104,12 +225,14 @@ internal sealed class SqliteSetDatabase : IDisposable
     {
         private readonly SqliteSetDatabase _owner;
         private SqliteTransaction? _transaction;
+        private FileStream? _fileLock;
         private bool _completed;
 
-        public TransactionScope(SqliteSetDatabase owner, SqliteTransaction transaction)
+        public TransactionScope(SqliteSetDatabase owner, SqliteTransaction transaction, FileStream fileLock)
         {
             _owner = owner;
             _transaction = transaction;
+            _fileLock = fileLock;
         }
 
         public void Complete() => _completed = true;
@@ -132,6 +255,10 @@ internal sealed class SqliteSetDatabase : IDisposable
                 _transaction = null;
                 _owner._inTransaction = false;
                 _owner._gate.Release();
+                // Release the cross-process write lock last (reverse of the
+                // acquisition order in BeginTransactionAsync).
+                _fileLock?.Dispose();
+                _fileLock = null;
             }
         }
     }
@@ -147,7 +274,7 @@ internal sealed class SqliteSetDatabase : IDisposable
     public async Task InsertDiscAsync(DiscRecord disc, CancellationToken ct = default)
     {
         ct.ThrowIfCancellationRequested();
-        using var _ = await LockAsync(ct).ConfigureAwait(false);
+        using var _ = await WriteLockAsync(ct).ConfigureAwait(false);
 
         using var cmd = _connection.CreateCommand();
         cmd.CommandText = """
@@ -210,7 +337,7 @@ internal sealed class SqliteSetDatabase : IDisposable
     public async Task UpdateDiscAsync(DiscRecord disc, CancellationToken ct = default)
     {
         ct.ThrowIfCancellationRequested();
-        using var _ = await LockAsync(ct).ConfigureAwait(false);
+        using var _ = await WriteLockAsync(ct).ConfigureAwait(false);
 
         using var cmd = _connection.CreateCommand();
         cmd.CommandText = """
@@ -258,7 +385,7 @@ internal sealed class SqliteSetDatabase : IDisposable
     public async Task MarkDiscAsBadAsync(int discId, CancellationToken ct = default)
     {
         ct.ThrowIfCancellationRequested();
-        using var _ = await LockAsync(ct).ConfigureAwait(false);
+        using var _ = await WriteLockAsync(ct).ConfigureAwait(false);
 
         using var cmd = _connection.CreateCommand();
         cmd.CommandText = "UPDATE Discs SET IsBad = 1 WHERE Id = $id";
@@ -292,7 +419,7 @@ internal sealed class SqliteSetDatabase : IDisposable
     public async Task<FileRecord> CreateFileRecordAsync(FileRecord file, CancellationToken ct = default)
     {
         ct.ThrowIfCancellationRequested();
-        using var _ = await LockAsync(ct).ConfigureAwait(false);
+        using var _ = await WriteLockAsync(ct).ConfigureAwait(false);
 
         using var cmd = _connection.CreateCommand();
         cmd.CommandText = """
@@ -314,7 +441,7 @@ internal sealed class SqliteSetDatabase : IDisposable
     public async Task UpdateFileRecordAsync(FileRecord file, CancellationToken ct = default)
     {
         ct.ThrowIfCancellationRequested();
-        using var _ = await LockAsync(ct).ConfigureAwait(false);
+        using var _ = await WriteLockAsync(ct).ConfigureAwait(false);
 
         using var cmd = _connection.CreateCommand();
         cmd.CommandText = """
@@ -760,7 +887,7 @@ internal sealed class SqliteSetDatabase : IDisposable
     public async Task<int> MarkFilesDeletedByDirectoryAsync(int backupSetId, string directoryPrefix, CancellationToken ct = default)
     {
         ct.ThrowIfCancellationRequested();
-        using var _ = await LockAsync(ct).ConfigureAwait(false);
+        using var _ = await WriteLockAsync(ct).ConfigureAwait(false);
 
         var prefix = directoryPrefix.TrimEnd('\\') + "\\";
 
@@ -791,7 +918,7 @@ internal sealed class SqliteSetDatabase : IDisposable
         int backupSetId, IEnumerable<string> sourcePaths, CancellationToken ct = default)
     {
         ct.ThrowIfCancellationRequested();
-        using var _ = await LockAsync(ct).ConfigureAwait(false);
+        using var _ = await WriteLockAsync(ct).ConfigureAwait(false);
 
         int totalRows = 0;
         using var cmd = _connection.CreateCommand();
@@ -836,7 +963,7 @@ internal sealed class SqliteSetDatabase : IDisposable
         int backupSetId, string oldPrefix, string newPrefix, CancellationToken ct = default)
     {
         ct.ThrowIfCancellationRequested();
-        using var _ = await LockAsync(ct).ConfigureAwait(false);
+        using var _ = await WriteLockAsync(ct).ConfigureAwait(false);
 
         // Normalise both prefixes to a trailing separator so we replace whole
         // path segments only (a bare "E:" won't accidentally match "E:foo").
@@ -898,7 +1025,7 @@ internal sealed class SqliteSetDatabase : IDisposable
     public async Task CreateFileChunkAsync(FileChunk chunk, CancellationToken ct = default)
     {
         ct.ThrowIfCancellationRequested();
-        using var _ = await LockAsync(ct).ConfigureAwait(false);
+        using var _ = await WriteLockAsync(ct).ConfigureAwait(false);
 
         using var cmd = _connection.CreateCommand();
         cmd.CommandText = """

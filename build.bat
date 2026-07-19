@@ -59,7 +59,19 @@ if %WORKER_BUILD_RESULT% neq 0 (
 echo.
 echo Build succeeded.
 echo.
+
+REM --- Copy the freshly built executables into this folder for convenience ---
+set "GUI_EXE=%~dp0src\LithicBackup\bin\Release\net8.0-windows\LithicBackup.exe"
+set "WORKER_EXE=%~dp0src\LithicBackup.Worker\bin\Release\net8.0-windows\LithicBackup.Worker.exe"
+
+copy /y "%GUI_EXE%" "%~dp0LithicBackup.exe" >nul
+if errorlevel 1 echo WARNING: could not copy LithicBackup.exe here.
+copy /y "%WORKER_EXE%" "%~dp0LithicBackup.Worker.exe" >nul
+if errorlevel 1 echo WARNING: could not copy LithicBackup.Worker.exe here.
+
 echo Executables:
-echo   %~dp0src\LithicBackup\bin\Release\net8.0-windows\LithicBackup.exe
-echo   %~dp0src\LithicBackup.Worker\bin\Release\net8.0-windows\LithicBackup.Worker.exe
+echo   %~dp0LithicBackup.exe
+echo   %~dp0LithicBackup.Worker.exe
 echo.
+
+call build-msi.bat

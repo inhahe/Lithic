@@ -50,6 +50,18 @@ public class UserSettings
     /// </summary>
     public string? DismissedUpdateVersion { get; set; }
 
+    /// <summary>
+    /// What happens after you edit a set's source selection and save: whether to
+    /// reconcile the destination (offer to back up newly-added folders and purge
+    /// copies of removed ones), which requires scanning the affected folders.
+    /// <see cref="ReconcileAfterEditMode.Ask"/> (default) prompts after each
+    /// change; <see cref="ReconcileAfterEditMode.Always"/> reconciles silently;
+    /// <see cref="ReconcileAfterEditMode.Never"/> skips it (folders sync on the
+    /// next full backup instead). The reconcile only runs when a checkbox was
+    /// actually toggled — browsing/expanding the tree never triggers it.
+    /// </summary>
+    public ReconcileAfterEditMode ReconcileMode { get; set; } = ReconcileAfterEditMode.Ask;
+
     public static UserSettings Load()
     {
         try
