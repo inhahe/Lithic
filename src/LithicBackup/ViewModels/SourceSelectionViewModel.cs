@@ -408,6 +408,17 @@ public class SourceSelectionViewModel : ViewModelBase
 
     private void OnTierSetPropertyChanged(object? sender, PropertyChangedEventArgs e)
     {
+        // Honour the init-span dirty-tracking suspend, exactly like the VM's own
+        // PropertyChanged / SelectionChanged handlers.  The settings panel binds
+        // SelectedTierSet.FilePatternsText / FileExemptPatternsText two-way with
+        // UpdateSourceTrigger=PropertyChanged, so the panel's first-render binding
+        // write-backs raise PropertyChanged on the tier set while the modify dialog
+        // is still initialising.  Without this guard those write-backs mark the set
+        // dirty (and flag filters pending-apply), so opening a set and closing it
+        // without touching anything popped a bogus "unsaved changes" prompt.
+        if (!_dirtyTrackingArmed)
+            return;
+
         if (!string.IsNullOrEmpty(_saveStatusText))
             SaveStatusText = "";
         if (!_needsSave)
