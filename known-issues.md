@@ -1,5 +1,52 @@
 # LithicBackup — Known Issues & Tech Debt
 
+## FIXED: Upgrade "unable to close all requested applications" — forced shutdown now has a hard-exit watchdog (2026-07-19)
+
+**Symptom.** Running the MSI to upgrade failed again with "The setup was unable to
+automatically close all requested applications" — reported upgrading **from
+1.0.34** (which already has the shutdown listener *and* the v1.0.32 editor-modal
+suppression), with **no dialog the user could find** open.
+
+**Cause.** The upgrade closes the GUI by signalling `LithicBackup.Shutdown`, whose
+listener calls `App.ShutdownForRestartManager` → `Application.Shutdown()`. That
+graceful shutdown fires each window's `Closing` and runs `OnExit`, so it can be
+**blocked by any open modal** — not just the backup-set editor's unsaved-changes
+prompt that v1.0.32 already suppresses. The remaining culprits are **owner-less
+`MessageBox.Show` dialogs the user may never see**: the "Destination Drive Full"
+warning (`App.StartupCoreAsync` `DestinationFull` handler) and the
+`DispatcherUnhandledException` crash box can both be sitting behind other windows
+or on a second monitor. A modal runs its own message loop, so `Shutdown()` never
+returns, `LithicBackup.exe` stays locked, the installer's ~15s wait expires, and
+the file-in-use dialog appears. The v1.0.32 fix only closed the *editor* instance
+of this class; the underlying flaw is that a forced shutdown must never be
+*blockable* at all.
+
+**Fix (v1.0.37).** Added a forced-shutdown **watchdog** (`App.ArmForcedShutdownWatchdog`).
+The moment the installer's shutdown signal arrives — on the thread-pool wait
+callback, so it runs even if the UI dispatcher is wedged — the GUI arms a one-shot
+background thread and *then* requests the graceful shutdown. If the process is
+still alive after a 5s grace window (i.e. the graceful path is blocked by a modal
+or a busy dispatcher), the watchdog calls `Environment.Exit(0)` to release the
+`.exe`. A process can always terminate **itself** regardless of integrity level,
+so this needs no elevation, no taskkill, and no bundle — same principle as the
+signal-and-self-close design. It is armed **only** for forced shutdowns (installer
+signal, `OnSessionEnding`, and the `WM_ENDSESSION` path via
+`ShutdownForRestartManager`), never for a user File > Exit, so a normal quit and
+its unsaved-changes prompt are untouched. 5s sits comfortably under the installer
+custom action's 15s wait, and a normal graceful shutdown (sub-second) beats the
+timer so the watchdog is a no-op in the common case. It logs one INFO line to the
+crash log if it ever has to fire. **Bootstrap caveat:** as always, this only helps
+once the *running* build already contains it — the upgrade that first delivers
+1.0.37 onto a 1.0.36-or-earlier GUI still depends on that older build's own
+close-handling; every subsequent upgrade is bulletproof.
+
+**If it recurs anyway:** capture a verbose MSI log to see exactly which process/
+file RestartManager found in use — `msiexec /i LithicBackup-<ver>-x64.msi /l*v
+%TEMP%\lithic-upgrade.log` — and check the `RMFilesInUse`/`FilesInUse` entries. A
+non-GUI locker (e.g. the `Lithic Backup` Worker service holding a shared DLL if
+its `ServiceControl` stop somehow lands after `InstallValidate`) would need a
+different fix than the GUI watchdog.
+
 ## FIXED: Restore froze the UI (no cursor, no progress) while loading a large set (2026-07-19)
 
 **Symptom.** Clicking **Restore** on a backup set froze the whole window for
