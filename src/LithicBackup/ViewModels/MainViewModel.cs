@@ -741,7 +741,8 @@ public class MainViewModel : ViewModelBase
                     backupSet, originalSelections, sourceSelection.ChangedSelectionPaths);
         };
 
-        // Save button: persist everything and show confirmation.
+        // Save button: persist everything, then close the editor — matching the
+        // Settings dialog, where Save commits and dismisses in one action.
         sourceSelection.SaveRequested += async () =>
         {
             try
@@ -749,10 +750,17 @@ public class MainViewModel : ViewModelBase
                 await SaveAllAsync();
                 _unsavedNewSetId = null; // committed — don't delete on close
                 StatusText = $"Backup set \"{sourceSelection.SetName}\" saved. {DateTime.Now:HH:mm:ss}";
-                sourceSelection.SaveStatusText = "Saved";
                 await LoadBackupSetsAsync();
                 SelectedBackupSet = BackupSets.FirstOrDefault(s => s.Id == backupSet.Id)?.Model;
-                dialog.Title = $"Modify \u2014 {sourceSelection.SetName}";
+
+                // We just persisted everything, so clear the on-close pending save;
+                // otherwise the Closed handler would run SaveAllAsync a second time.
+                // (savedThisSession stays true, so the post-close reconcile still runs.)
+                _pendingSettingsSave = null;
+
+                // Close on save. SaveAllAsync just refreshed the dirty baseline, so
+                // the Closing handler sees a clean state and won't re-prompt to save.
+                dialog.Close();
             }
             catch (Exception ex)
             {
