@@ -1,3 +1,4 @@
+using System.Runtime;
 using System.Runtime.InteropServices;
 using LithicBackup.Core.Models;
 
@@ -88,28 +89,77 @@ public static class MemoryBudget
         if (incomingBytes <= 0)
             return true;
 
-        if (options.Mode == MemoryBudgetMode.Fixed)
-            return incomingBytes <= Math.Max(0, (long)(options.FixedGb * GiB));
-
-        var (total, available) = GetSystemMemory();
-        if (total <= 0)
-            return incomingBytes <= FallbackBytes;
-
-        // (1) Keep the whole process under the percentage cap, measured against the
-        // live working set — this is what the user sees the app "taking" in Task
-        // Manager, and it includes the buffer plus GC/LOH overhead.
-        long percentCap = (long)(total * (Math.Clamp(options.PercentOfTotal, 0, 100) / 100.0));
-        if (CurrentProcessBytes() + incomingBytes > percentCap)
+        // Both modes are enforced against the LIVE process working set (what Task
+        // Manager shows), so the cap bounds the whole backup's footprint — buffered
+        // file bytes plus GC/LOH overhead — cumulatively, not per-file. (An earlier
+        // version checked Fixed mode per-file only, which let unlimited sub-cap files
+        // all buffer at once.)
+        long cap = ProcessCap(options);
+        if (cap >= 0 && CurrentProcessBytes() + incomingBytes > cap)
             return false;
 
-        // (2) Never push live available memory below the reserve. 'available' is
-        // system-wide, so this also throttles the backup when OTHER programs are
-        // the ones eating RAM, honouring the reserve against the current state.
-        long reserve = (long)(Math.Max(0, options.ReserveGb) * GiB);
-        if (available - incomingBytes < reserve)
-            return false;
+        // Auto mode additionally honours the free-RAM reserve against the CURRENT
+        // system-wide figure, so the backup also backs off when OTHER programs are
+        // the ones eating RAM.
+        if (options.Mode != MemoryBudgetMode.Fixed)
+        {
+            var (total, available) = GetSystemMemory();
+            if (total > 0)
+            {
+                long reserve = (long)(Math.Max(0, options.ReserveGb) * GiB);
+                if (available - incomingBytes < reserve)
+                    return false;
+            }
+        }
 
         return true;
+    }
+
+    /// <summary>
+    /// True when the process working set already exceeds the policy's cap, i.e.
+    /// memory should be actively reclaimed (buffers dropped + heap compacted) —
+    /// e.g. after the user tightens the budget mid-backup. Returns false if no
+    /// finite cap applies.
+    /// </summary>
+    public static bool IsOverBudget(MemoryBudgetOptions options)
+    {
+        options ??= MemoryBudgetOptions.Default;
+        long cap = ProcessCap(options);
+        return cap >= 0 && CurrentProcessBytes() > cap;
+    }
+
+    /// <summary>
+    /// Force the .NET runtime to return freed memory (notably large byte[] file
+    /// buffers on the Large Object Heap) to the OS. A plain GC.Collect does not
+    /// compact the LOH, so freed large arrays leave the working set unchanged;
+    /// requesting a one-shot compaction is what actually shrinks the footprint
+    /// the user sees in Task Manager. Costs a blocking gen-2 collection, so only
+    /// call it when the budget is genuinely exceeded.
+    /// </summary>
+    public static void ReclaimNow()
+    {
+        try
+        {
+            GCSettings.LargeObjectHeapCompactionMode = GCLargeObjectHeapCompactionMode.CompactOnce;
+            GC.Collect(GC.MaxGeneration, GCCollectionMode.Forced, blocking: true, compacting: true);
+        }
+        catch { /* best-effort reclaim */ }
+    }
+
+    /// <summary>
+    /// The absolute working-set cap in bytes for a policy: the Fixed budget, or
+    /// the Auto percentage of total physical RAM. Returns -1 when no finite cap
+    /// can be determined (Auto with an unavailable memory query).
+    /// </summary>
+    private static long ProcessCap(MemoryBudgetOptions options)
+    {
+        if (options.Mode == MemoryBudgetMode.Fixed)
+            return Math.Max(0, (long)(options.FixedGb * GiB));
+
+        var (total, _) = GetSystemMemory();
+        if (total <= 0)
+            return -1;
+        return (long)(total * (Math.Clamp(options.PercentOfTotal, 0, 100) / 100.0));
     }
 
     /// <summary>

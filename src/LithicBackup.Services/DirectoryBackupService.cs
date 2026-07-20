@@ -238,7 +238,47 @@ public class DirectoryBackupService
         // percentage cap and the free-memory reserve hold continuously. See the
         // memory-runaway entry in known-issues.md. A policy that admits nothing
         // (e.g. Fixed 0 GB) simply disables buffering (still correct).
-        var memoryPolicy = job.MemoryBudget ?? MemoryBudgetOptions.Default;
+        // The policy is re-read from machine settings while the backup runs (at
+        // most ~once a second) so lowering the budget in the GUI mid-backup takes
+        // effect on a long-running job instead of being frozen at whatever it was
+        // when the job started. job.MemoryBudget is the seed and the fallback when
+        // settings can't be read. UserSettings.Load() is a cheap, exception-safe
+        // JSON read of the same file the GUI writes, so cross-process changes are
+        // visible. See the "memory not released after lowering budget mid-run"
+        // entry in known-issues.md.
+        var seedPolicy = job.MemoryBudget ?? MemoryBudgetOptions.Default;
+        var livePolicy = seedPolicy;
+        var policyClock = System.Diagnostics.Stopwatch.StartNew();
+        long lastPolicyReadMs = long.MinValue;
+        MemoryBudgetOptions CurrentPolicy()
+        {
+            long now = policyClock.ElapsedMilliseconds;
+            if (now - lastPolicyReadMs >= 1000)
+            {
+                lastPolicyReadMs = now;
+                try { livePolicy = UserSettings.Load().MemoryBudget ?? seedPolicy; }
+                catch { /* keep the last good policy */ }
+            }
+            return livePolicy;
+        }
+
+        // Reclaim (LOH-compacting GC) is throttled to at most once every few
+        // seconds: it's a blocking gen-2 collection, and if a Fixed cap is set
+        // below the process's irreducible baseline the budget stays "over" forever,
+        // so an unthrottled reclaim-per-file would grind the backup to a halt for no
+        // further benefit.
+        var reclaimClock = System.Diagnostics.Stopwatch.StartNew();
+        long lastReclaimMs = long.MinValue;
+        void MaybeReclaim()
+        {
+            if (!MemoryBudget.IsOverBudget(CurrentPolicy()))
+                return;
+            long now = reclaimClock.ElapsedMilliseconds;
+            if (now - lastReclaimMs < 3000)
+                return;
+            lastReclaimMs = now;
+            MemoryBudget.ReclaimNow();
+        }
         var bufferedContent = new Dictionary<string, byte[]>(StringComparer.OrdinalIgnoreCase);
 
         // 5b. Block-dedup pre-pass.
@@ -285,7 +325,7 @@ public class DirectoryBackupService
                     // the main loop can write its blocks / plain copy from the
                     // buffer without reading it again. Otherwise fall back to the
                     // streaming analysis (the main loop re-reads).
-                    if (MemoryBudget.CanBuffer(memoryPolicy, file.SizeBytes))
+                    if (MemoryBudget.CanBuffer(CurrentPolicy(), file.SizeBytes))
                     {
                         byte[] content = await File.ReadAllBytesAsync(file.FullPath, ct);
                         r = _dedup!.DeduplicateBytes(
@@ -296,6 +336,19 @@ public class DirectoryBackupService
                     {
                         r = await _dedup!.DeduplicateAsync(
                             blockStoreDir, file.FullPath, job.DeduplicationBlockSize, ct);
+
+                        // Refusing to buffer because the process is over budget (e.g.
+                        // the user just lowered the limit) means the buffers already
+                        // accumulated in this pre-pass are themselves the excess. Drop
+                        // them and hand the memory back to the OS now, rather than
+                        // holding them until the main loop slowly consumes them. The
+                        // main loop safely re-reads any file no longer in
+                        // bufferedContent, so this only costs re-reads, never data.
+                        if (bufferedContent.Count > 0 && MemoryBudget.IsOverBudget(CurrentPolicy()))
+                        {
+                            bufferedContent.Clear();
+                            MaybeReclaim();
+                        }
                     }
                     preRecipes[file.FullPath] = r;
                     wholeFileCount[r.OriginalHash] =
@@ -616,7 +669,7 @@ public class DirectoryBackupService
                             // scan size already matches the hashed content.
                             hash = cachedHash;
                         }
-                        else if (contentBuffer is null && MemoryBudget.CanBuffer(memoryPolicy, file.SizeBytes))
+                        else if (contentBuffer is null && MemoryBudget.CanBuffer(CurrentPolicy(), file.SizeBytes))
                         {
                             // File-level-dedup-only path (no block-dedup pre-pass):
                             // read the file once into memory and hash it there, so a
@@ -1183,6 +1236,14 @@ public class DirectoryBackupService
             // CanBuffer check reads) back for the files still ahead. Done here so
             // the bytes stay available across any retries above.
             bufferedContent.Remove(file.FullPath);
+
+            // Dropping a buffer frees managed memory but .NET keeps large arrays'
+            // pages in the working set until the LOH is compacted, so a mid-run
+            // budget cut wouldn't visibly shrink the process just by draining
+            // buffers. When we're over the (live) budget, hand the freed memory
+            // back to the OS (throttled inside MaybeReclaim so the blocking
+            // compaction only runs when needed, not on every file).
+            MaybeReclaim();
 
             // Commit when: batch is full, a large file just finished, or
             // enough wall-clock time has elapsed since the last commit.
