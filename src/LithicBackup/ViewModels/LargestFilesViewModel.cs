@@ -77,7 +77,7 @@ public class LargestFilesViewModel : ViewModelBase
             DoneRequested?.Invoke();
         });
 
-        SaveCommand = new RelayCommand(_ => OnSave());
+        SaveCommand = new RelayCommand(_ => OnSave(), _ => !IsLoading);
 
         SortByNameCommand = new RelayCommand(_ => ApplySort("Name"));
         SortByDirectoryCommand = new RelayCommand(_ => ApplySort("Directory"));
@@ -110,7 +110,11 @@ public class LargestFilesViewModel : ViewModelBase
     public bool IsLoading
     {
         get => _isLoading;
-        private set => SetProperty(ref _isLoading, value);
+        private set
+        {
+            if (SetProperty(ref _isLoading, value))
+                CommandManager.InvalidateRequerySuggested();
+        }
     }
 
     public bool IsProgressIndeterminate

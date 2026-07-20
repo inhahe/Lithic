@@ -7,17 +7,18 @@
              mc:Ignorable="d"
              d:DataContext="{d:DesignInstance Type=vm:RestoreViewModel, IsDesignTimeCreatable=False}">
 
-    <Grid Margin="8">
-        <Grid.RowDefinitions>
-            <RowDefinition Height="Auto" />
-            <RowDefinition Height="*" />
-            <RowDefinition Height="Auto" />
-            <RowDefinition Height="Auto" />
-            <RowDefinition Height="Auto" />
-        </Grid.RowDefinitions>
+    <!--
+        DockPanel (not a Grid) so the button bar — which holds the only way out of
+        this view ("Done") — is docked to the bottom and can NEVER be clipped off
+        screen, no matter how short the window is or how many source drives the
+        destinations list adds. Only the file tree (which scrolls internally)
+        yields space; every docked strip, including the exit bar, stays visible.
+        See known-issues.md "Restore view had no visible way out on short windows".
+    -->
+    <DockPanel Margin="8" LastChildFill="True">
 
         <!-- Header -->
-        <StackPanel Grid.Row="0" Margin="0,0,0,12">
+        <StackPanel DockPanel.Dock="Top" Margin="0,0,0,12">
             <TextBlock Style="{StaticResource H2}" Text="Restore Files" />
             <TextBlock Foreground="{StaticResource TextSecondaryBrush}"
                        FontSize="12" Margin="0,2,0,0">
@@ -27,8 +28,104 @@
             </TextBlock>
         </StackPanel>
 
-        <!-- File tree with tristate checkboxes -->
-        <Grid Grid.Row="1" Margin="0,0,0,12">
+        <!-- Buttons (docked to the bottom so the exit is always reachable) -->
+        <Border DockPanel.Dock="Bottom"
+                BorderBrush="{StaticResource BorderBrush}"
+                BorderThickness="0,1,0,0"
+                Padding="0,12,0,0" Margin="0,12,0,0">
+            <Grid>
+                <Grid.ColumnDefinitions>
+                    <ColumnDefinition Width="Auto" />
+                    <ColumnDefinition Width="*" />
+                    <ColumnDefinition Width="Auto" />
+                </Grid.ColumnDefinitions>
+
+                <!-- Left: primary action + selection count + cancel -->
+                <StackPanel Grid.Column="0" Orientation="Horizontal">
+                    <Button Style="{StaticResource PrimaryButton}"
+                            Content="Restore Selected"
+                            Command="{Binding RestoreCommand}"
+                            Margin="0,0,8,0" />
+                    <TextBlock VerticalAlignment="Center" Margin="0,0,12,0"
+                               Foreground="{StaticResource TextSecondaryBrush}" FontSize="12">
+                        <Run Text="{Binding SelectedFileCount, Mode=OneWay}" />
+                        <Run Text="file(s) selected" />
+                    </TextBlock>
+                    <Button Content="Cancel"
+                            Command="{Binding CancelCommand}"
+                            Padding="16,8"
+                            Visibility="{Binding IsRestoring, Converter={StaticResource BoolToVis}}" />
+                </StackPanel>
+
+                <!-- Right: the always-available exit -->
+                <Button Grid.Column="2" Content="Done"
+                        Command="{Binding DoneCommand}"
+                        Padding="24,8" Cursor="Hand"
+                        ToolTip="Close the restore view and return to the backup sets." />
+            </Grid>
+        </Border>
+
+        <!-- Status and result (shown after a restore completes) -->
+        <StackPanel DockPanel.Dock="Bottom" Margin="0,0,0,12"
+                    Visibility="{Binding IsComplete, Converter={StaticResource BoolToVis}}">
+            <TextBlock Text="{Binding StatusText}" FontWeight="SemiBold" Margin="0,0,0,4" />
+            <TextBlock Text="{Binding ResultDetail}"
+                       Foreground="{StaticResource TextSecondaryBrush}"
+                       TextWrapping="Wrap" />
+        </StackPanel>
+
+        <!-- Progress area (shown while restoring) -->
+        <StackPanel DockPanel.Dock="Bottom" Margin="0,0,0,12"
+                    Visibility="{Binding IsRestoring, Converter={StaticResource BoolToVis}}">
+            <ProgressBar Minimum="0" Maximum="100"
+                         Value="{Binding RestorePercentage, Mode=OneWay}"
+                         Height="20" Margin="0,0,0,4"
+                         Foreground="{StaticResource PrimaryBrush}" />
+            <TextBlock Style="{StaticResource SubText}" Text="{Binding ProgressText}" />
+            <TextBlock Foreground="{StaticResource TextSecondaryBrush}"
+                       TextTrimming="CharacterEllipsis"
+                       Text="{Binding CurrentFile}" />
+        </StackPanel>
+
+        <!-- Per-drive destinations -->
+        <StackPanel DockPanel.Dock="Bottom" Margin="0,0,0,12">
+            <TextBlock Text="Restore destination" FontSize="11"
+                       Foreground="{StaticResource TextSecondaryBrush}"
+                       Margin="0,0,0,4" />
+
+            <CheckBox Content="Restore to original locations"
+                      IsChecked="{Binding RestoreToOriginal, Mode=TwoWay}"
+                      Margin="0,0,0,6"
+                      ToolTip="Write each file back to the drive and folder it came from." />
+
+            <!-- One row per source drive; disabled when restoring in place -->
+            <ItemsControl ItemsSource="{Binding DriveDestinations}"
+                          IsEnabled="{Binding IsCustomDestination}">
+                <ItemsControl.ItemTemplate>
+                    <DataTemplate>
+                        <Grid Margin="0,0,0,4">
+                            <Grid.ColumnDefinitions>
+                                <ColumnDefinition Width="Auto" MinWidth="44" />
+                                <ColumnDefinition Width="*" />
+                                <ColumnDefinition Width="Auto" />
+                            </Grid.ColumnDefinitions>
+                            <TextBlock Grid.Column="0" Text="{Binding DriveLetter}"
+                                       FontWeight="SemiBold"
+                                       VerticalAlignment="Center" Margin="0,0,8,0" />
+                            <TextBox Grid.Column="1"
+                                     Text="{Binding DestinationPath, UpdateSourceTrigger=PropertyChanged}"
+                                     Padding="6,4" Margin="0,0,8,0" />
+                            <Button Grid.Column="2" Content="Browse..."
+                                    Command="{Binding BrowseCommand}"
+                                    Padding="12,4" />
+                        </Grid>
+                    </DataTemplate>
+                </ItemsControl.ItemTemplate>
+            </ItemsControl>
+        </StackPanel>
+
+        <!-- File tree with tristate checkboxes (fills remaining space, scrolls internally) -->
+        <Grid Margin="0,0,0,12">
             <!-- Loading indicator with live progress -->
             <StackPanel HorizontalAlignment="Center" VerticalAlignment="Center"
                         Panel.ZIndex="1"
@@ -246,84 +343,5 @@
                 </TreeView.ItemTemplate>
             </TreeView>
         </Grid>
-
-        <!-- Per-drive destinations -->
-        <StackPanel Grid.Row="2" Margin="0,0,0,12">
-            <TextBlock Text="Restore destination" FontSize="11"
-                       Foreground="{StaticResource TextSecondaryBrush}"
-                       Margin="0,0,0,4" />
-
-            <CheckBox Content="Restore to original locations"
-                      IsChecked="{Binding RestoreToOriginal, Mode=TwoWay}"
-                      Margin="0,0,0,6"
-                      ToolTip="Write each file back to the drive and folder it came from." />
-
-            <!-- One row per source drive; disabled when restoring in place -->
-            <ItemsControl ItemsSource="{Binding DriveDestinations}"
-                          IsEnabled="{Binding IsCustomDestination}">
-                <ItemsControl.ItemTemplate>
-                    <DataTemplate>
-                        <Grid Margin="0,0,0,4">
-                            <Grid.ColumnDefinitions>
-                                <ColumnDefinition Width="Auto" MinWidth="44" />
-                                <ColumnDefinition Width="*" />
-                                <ColumnDefinition Width="Auto" />
-                            </Grid.ColumnDefinitions>
-                            <TextBlock Grid.Column="0" Text="{Binding DriveLetter}"
-                                       FontWeight="SemiBold"
-                                       VerticalAlignment="Center" Margin="0,0,8,0" />
-                            <TextBox Grid.Column="1"
-                                     Text="{Binding DestinationPath, UpdateSourceTrigger=PropertyChanged}"
-                                     Padding="6,4" Margin="0,0,8,0" />
-                            <Button Grid.Column="2" Content="Browse..."
-                                    Command="{Binding BrowseCommand}"
-                                    Padding="12,4" />
-                        </Grid>
-                    </DataTemplate>
-                </ItemsControl.ItemTemplate>
-            </ItemsControl>
-        </StackPanel>
-
-        <!-- Progress area -->
-        <StackPanel Grid.Row="3" Margin="0,0,0,12"
-                    Visibility="{Binding IsRestoring, Converter={StaticResource BoolToVis}}">
-            <ProgressBar Minimum="0" Maximum="100"
-                         Value="{Binding RestorePercentage, Mode=OneWay}"
-                         Height="20" Margin="0,0,0,4"
-                         Foreground="{StaticResource PrimaryBrush}" />
-            <TextBlock Style="{StaticResource SubText}" Text="{Binding ProgressText}" />
-            <TextBlock Foreground="{StaticResource TextSecondaryBrush}"
-                       TextTrimming="CharacterEllipsis"
-                       Text="{Binding CurrentFile}" />
-        </StackPanel>
-
-        <!-- Status and result -->
-        <StackPanel Grid.Row="3" Margin="0,0,0,12"
-                    Visibility="{Binding IsComplete, Converter={StaticResource BoolToVis}}">
-            <TextBlock Text="{Binding StatusText}" FontWeight="SemiBold" Margin="0,0,0,4" />
-            <TextBlock Text="{Binding ResultDetail}"
-                       Foreground="{StaticResource TextSecondaryBrush}"
-                       TextWrapping="Wrap" />
-        </StackPanel>
-
-        <!-- Buttons -->
-        <StackPanel Grid.Row="4" Orientation="Horizontal">
-            <Button Style="{StaticResource PrimaryButton}"
-                    Content="Restore Selected"
-                    Command="{Binding RestoreCommand}"
-                    Margin="0,0,8,0" />
-            <TextBlock VerticalAlignment="Center" Margin="0,0,12,0"
-                       Foreground="{StaticResource TextSecondaryBrush}" FontSize="12">
-                <Run Text="{Binding SelectedFileCount, Mode=OneWay}" />
-                <Run Text="file(s) selected" />
-            </TextBlock>
-            <Button Content="Cancel"
-                    Command="{Binding CancelCommand}"
-                    Padding="16,8" Margin="0,0,8,0"
-                    Visibility="{Binding IsRestoring, Converter={StaticResource BoolToVis}}" />
-            <Button Content="Done"
-                    Command="{Binding DoneCommand}"
-                    Padding="16,8" Cursor="Hand" />
-        </StackPanel>
-    </Grid>
+    </DockPanel>
 </UserControl>

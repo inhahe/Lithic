@@ -210,7 +210,7 @@ public class SourceSelectionViewModel : ViewModelBase
         RetentionTiers = [];
         TierSets = [];
         NextCommand = new RelayCommand(_ => OnNext(), _ => HasSelection && !IsEditMode);
-        SaveCommand = new RelayCommand(_ => OnSave(), _ => _needsSave && IsEditMode && !_saving);
+        SaveCommand = new RelayCommand(_ => OnSave(), _ => _needsSave && IsEditMode && !_saving && !IsApplyingSelections);
         CancelCommand = new RelayCommand(_ => CancelRequested?.Invoke());
         LargestFilesCommand = new RelayCommand(
             _ => LargestFilesRequested?.Invoke(),
@@ -843,7 +843,11 @@ public class SourceSelectionViewModel : ViewModelBase
     public bool IsApplyingSelections
     {
         get => _isApplyingSelections;
-        internal set => SetProperty(ref _isApplyingSelections, value);
+        internal set
+        {
+            if (SetProperty(ref _isApplyingSelections, value))
+                CommandManager.InvalidateRequerySuggested();
+        }
     }
 
     /// <summary>
