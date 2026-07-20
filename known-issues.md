@@ -1,5 +1,42 @@
 # LithicBackup — Known Issues & Tech Debt
 
+## FIXED: Backup ran the machine out of RAM despite the "50% / leave N GB free" memory policy (2026-07-20)
+
+**Symptom.** During a directory backup the process climbed to ~40 GB working set
+on a 64-GB machine and drove the system to ~97% memory used — even with the
+memory policy set to **Auto, 50% of RAM, leave 2 GB free**. Both limits were
+being ignored in practice.
+
+**Cause.** `MemoryBudget.Resolve` was called **once** at the top of
+`DirectoryBackupService.BackupDirectoryAsync` and produced a single byte budget
+that governed **only** the in-memory file-content buffer, using
+`available − reserve` measured **at that instant**. Two failures followed:
+
+1. **The reserve was a stale snapshot.** The block-dedup pre-pass reads files
+   into `bufferedContent` and holds them until the main loop consumes them, so
+   the buffer can accumulate up to the whole percentage cap (50% of 64 GB =
+   32 GB) at once. As it filled, live available RAM fell far below the 2 GB
+   reserve, but nothing re-checked — the "leave 2 GB free" promise only ever
+   reflected the moment the backup started.
+2. **The percentage capped the buffer, not the process.** The cap was compared
+   against the buffer's tracked bytes only, ignoring .NET heap / large-object-
+   heap overhead from allocating many multi-GB `byte[]`s. So a "32 GB buffer"
+   showed up as a ~40 GB working set — past the 50% the user had asked for.
+
+**Fix (v1.0.47).** Replaced the once-per-run budget with a live per-file
+admission check, `MemoryBudget.CanBuffer(options, incomingBytes)`, called at both
+buffering sites (the block-dedup pre-pass and the file-level-dedup single-file
+read). On every call it re-queries memory and refuses to buffer when either:
+(1) the **live process working set** (`Environment.WorkingSet`, i.e. the figure
+Task Manager shows — buffer + heap + LOH) plus the incoming file would exceed
+`PercentOfTotal` of physical RAM, or (2) reading the file would push
+**currently-available** system RAM below `ReserveGb`. A refused file simply
+streams (read-twice) as before — always correct, just without the single-read
+speed-up. Both guarantees now hold continuously as RAM fills, and the system-wide
+`available` check also throttles the backup when *other* programs are the ones
+consuming memory. The old `bufferBudgetBytes`/`bufferedBytes` snapshot bookkeeping
+was removed.
+
 ## FIXED: Restore views could hide the only exit ("Done") button + Save enabled during tree restore (2026-07-20)
 
 **Symptom.** "I clicked on restore, and there's no way out of it." Both restore

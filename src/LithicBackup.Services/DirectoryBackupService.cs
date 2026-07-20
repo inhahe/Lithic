@@ -225,13 +225,21 @@ public class DirectoryBackupService
         // instead of reading it from disk a second time. Bounded by a total byte
         // budget so a backup larger than memory still works — files that don't
         // fit are read again the old way. Buffers are released as the main loop
-        // consumes them. The budget comes from the user's memory policy (default:
-        // min(50% of total RAM, available RAM minus a 2 GB reserve)), so the
-        // backup speeds up by trading RAM for disk reads without starving other
-        // programs. A 0 budget simply disables buffering (still correct).
-        long bufferBudgetBytes = MemoryBudget.Resolve(job.MemoryBudget ?? MemoryBudgetOptions.Default);
+        // consumes them.
+        //
+        // Whether a given file may be buffered is decided PER FILE against LIVE
+        // memory (MemoryBudget.CanBuffer), not a single budget snapshotted here:
+        // the pre-pass below accumulates buffers until the main loop consumes
+        // them, so a start-of-run budget would let the buffer fill to the whole
+        // percentage cap (e.g. 50% of 64 GB = 32 GB) and drive the machine into
+        // memory pressure — the "leave N GB free" reserve, evaluated only once at
+        // the start, would already be stale. CanBuffer re-checks the process
+        // working set and currently-available RAM on every call so both the
+        // percentage cap and the free-memory reserve hold continuously. See the
+        // memory-runaway entry in known-issues.md. A policy that admits nothing
+        // (e.g. Fixed 0 GB) simply disables buffering (still correct).
+        var memoryPolicy = job.MemoryBudget ?? MemoryBudgetOptions.Default;
         var bufferedContent = new Dictionary<string, byte[]>(StringComparer.OrdinalIgnoreCase);
-        long bufferedBytes = 0;
 
         // 5b. Block-dedup pre-pass.
         // Block-level dedup must decide, BEFORE writing anything, which files
@@ -273,17 +281,16 @@ public class DirectoryBackupService
                 try
                 {
                     DeduplicationRecipe r;
-                    // Read the file into memory once if it fits the remaining
-                    // budget, so the main loop can write its blocks / plain copy
-                    // from the buffer without reading it again. Otherwise fall
-                    // back to the streaming analysis (the main loop re-reads).
-                    if (file.SizeBytes <= bufferBudgetBytes - bufferedBytes)
+                    // Read the file into memory once if live memory allows it, so
+                    // the main loop can write its blocks / plain copy from the
+                    // buffer without reading it again. Otherwise fall back to the
+                    // streaming analysis (the main loop re-reads).
+                    if (MemoryBudget.CanBuffer(memoryPolicy, file.SizeBytes))
                     {
                         byte[] content = await File.ReadAllBytesAsync(file.FullPath, ct);
                         r = _dedup!.DeduplicateBytes(
                             blockStoreDir, file.FullPath, content, job.DeduplicationBlockSize);
                         bufferedContent[file.FullPath] = content;
-                        bufferedBytes += content.Length;
                     }
                     else
                     {
@@ -609,7 +616,7 @@ public class DirectoryBackupService
                             // scan size already matches the hashed content.
                             hash = cachedHash;
                         }
-                        else if (contentBuffer is null && file.SizeBytes <= bufferBudgetBytes)
+                        else if (contentBuffer is null && MemoryBudget.CanBuffer(memoryPolicy, file.SizeBytes))
                         {
                             // File-level-dedup-only path (no block-dedup pre-pass):
                             // read the file once into memory and hash it there, so a
@@ -1172,10 +1179,10 @@ public class DirectoryBackupService
                 break;
 
             // Release this file's cached buffer (if any) now that it has been
-            // written, freeing its memory back to the budget. Done here so the
-            // bytes stay available across any retries above.
-            if (bufferedContent.Remove(file.FullPath, out var releasedBuffer))
-                bufferedBytes -= releasedBuffer.Length;
+            // written, freeing its memory (and thus system RAM, which the live
+            // CanBuffer check reads) back for the files still ahead. Done here so
+            // the bytes stay available across any retries above.
+            bufferedContent.Remove(file.FullPath);
 
             // Commit when: batch is full, a large file just finished, or
             // enough wall-clock time has elapsed since the last commit.
