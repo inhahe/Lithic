@@ -1,5 +1,33 @@
 # LithicBackup — Known Issues & Tech Debt
 
+## FIXED: Modify "Save" appeared to do nothing, then the window closed by itself (2026-07-20)
+
+**Symptom.** In the Modify editor, clicking **Save** did nothing — several clicks,
+no visible effect. Then expanding a drive in the tree caused the window to close
+about a second later, seemingly on its own.
+
+**Cause.** `SourceSelectionViewModel.OnSave` awaited a *Background*-priority
+selection-settle pass (via the old `WaitForSelectionSettledAsync` → a
+`TaskCompletionSource` completed only inside the dispatcher callback). The
+post-show catalog/size/plan work (`PostShowInitAsync`) pumps a steady stream of
+higher-priority dispatcher activity that **starves** anything at Background
+priority, so the settle pass — and thus the awaited task — didn't run for
+seconds. Each Save click queued *another* `OnSave` blocked on the same task. When
+expanding a drive finally yielded the dispatcher (or the post-show work finished),
+the pass ran, every queued `OnSave` resumed at once, and — because Save now closes
+the editor (v1.0.43) — the first one shut the window. Pre-v1.0.43 the same stall
+existed but was invisible (Save just persisted silently and kept the window open).
+
+**Fix (v1.0.45).** `OnSave` now (1) drains the settle pass **synchronously**
+(`SettlePendingSelections()`) instead of awaiting the starvable Background pass,
+so Save acts immediately regardless of dispatcher load; (2) guards against
+re-entrant clicks with a `_saving` flag (also folded into `SaveCommand`'s
+`CanExecute`) so a burst of clicks can't queue multiple saves/closes; and (3)
+keeps a busy cursor over the whole operation for clear feedback. The genuinely
+async auto-include load-then-pin work is still awaited (it completes on its own,
+needing no user action). Removed the now-dead `WaitForSelectionSettledAsync` and
+`_selectionSettleTcs`.
+
 ## FIXED: Spurious "unsaved changes" prompt on closing Modify — close prompt now snapshot-diffs instead of trusting the racy dirty flag (2026-07-19)
 
 **Symptom.** Opening a backup set via **Modify**, changing nothing, and closing
