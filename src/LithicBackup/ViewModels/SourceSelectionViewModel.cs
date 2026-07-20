@@ -118,12 +118,6 @@ public class SourceSelectionViewModel : ViewModelBase
     /// <summary>True once a settle pass has been scheduled but not yet run.</summary>
     private bool _selectionSettleScheduled;
     /// <summary>
-    /// Completes when the currently-pending settle pass finishes.  Save awaits
-    /// this (with a busy cursor) so it never persists a half-propagated tree.
-    /// Null when nothing is pending.
-    /// </summary>
-    private TaskCompletionSource? _selectionSettleTcs;
-    /// <summary>
     /// In-flight async node work that Save must wait for — currently the
     /// load-then-pin task started when auto-include-new is toggled on a directory
     /// whose children weren't loaded yet (see
@@ -131,6 +125,11 @@ public class SourceSelectionViewModel : ViewModelBase
     /// Tasks self-remove on completion.
     /// </summary>
     private readonly List<Task> _pendingNodeWork = [];
+
+    /// <summary>Guards <see cref="OnSave"/> against re-entrant clicks: a save can
+    /// briefly wait on in-flight node work, and Save now closes the editor, so
+    /// without this a burst of clicks would queue several saves/closes.</summary>
+    private bool _saving;
 
     /// <summary>
     /// Raised just before a deferred selection-settle pass runs its
@@ -211,7 +210,7 @@ public class SourceSelectionViewModel : ViewModelBase
         RetentionTiers = [];
         TierSets = [];
         NextCommand = new RelayCommand(_ => OnNext(), _ => HasSelection && !IsEditMode);
-        SaveCommand = new RelayCommand(_ => OnSave(), _ => _needsSave && IsEditMode);
+        SaveCommand = new RelayCommand(_ => OnSave(), _ => _needsSave && IsEditMode && !_saving && !IsApplyingSelections);
         CancelCommand = new RelayCommand(_ => CancelRequested?.Invoke());
         LargestFilesCommand = new RelayCommand(
             _ => LargestFilesRequested?.Invoke(),
@@ -844,7 +843,11 @@ public class SourceSelectionViewModel : ViewModelBase
     public bool IsApplyingSelections
     {
         get => _isApplyingSelections;
-        internal set => SetProperty(ref _isApplyingSelections, value);
+        internal set
+        {
+            if (SetProperty(ref _isApplyingSelections, value))
+                CommandManager.InvalidateRequerySuggested();
+        }
     }
 
     /// <summary>
@@ -1122,8 +1125,6 @@ public class SourceSelectionViewModel : ViewModelBase
             return;
 
         _selectionSettleScheduled = true;
-        _selectionSettleTcs ??= new TaskCompletionSource(
-            TaskCreationOptions.RunContinuationsAsynchronously);
 
         var dispatcher = Application.Current?.Dispatcher;
         if (dispatcher is null)
@@ -1139,48 +1140,31 @@ public class SourceSelectionViewModel : ViewModelBase
 
     /// <summary>
     /// Drain the pending-selection set: propagate each toggled node's state to
-    /// its children/ancestors, then raise the aggregate notification once.
-    /// Completes the settle TCS so a waiting Save can proceed.
+    /// its children/ancestors, then raise the aggregate notification once.  Save
+    /// calls this directly so it never persists a half-propagated tree.
     /// </summary>
     private void SettlePendingSelections()
     {
         _selectionSettleScheduled = false;
 
-        if (_pendingSelectionNodes.Count > 0)
-        {
-            // Snapshot so re-entrant toggles during propagation queue a fresh
-            // pass rather than mutating the set we're iterating.
-            var nodes = _pendingSelectionNodes.ToList();
-            _pendingSelectionNodes.Clear();
+        if (_pendingSelectionNodes.Count == 0)
+            return;
 
-            // Let the view snapshot the scroll offset: propagation can trigger a
-            // layout re-measure that would otherwise nudge the tree's scroll.
-            SelectionSettleStarting?.Invoke();
+        // Snapshot so re-entrant toggles during propagation queue a fresh
+        // pass rather than mutating the set we're iterating.
+        var nodes = _pendingSelectionNodes.ToList();
+        _pendingSelectionNodes.Clear();
 
-            foreach (var node in nodes)
-                node.PropagateSelection();
+        // Let the view snapshot the scroll offset: propagation can trigger a
+        // layout re-measure that would otherwise nudge the tree's scroll.
+        SelectionSettleStarting?.Invoke();
 
-            HandleSelectionChanged();
+        foreach (var node in nodes)
+            node.PropagateSelection();
 
-            SelectionSettleCompleted?.Invoke();
-        }
+        HandleSelectionChanged();
 
-        var tcs = _selectionSettleTcs;
-        _selectionSettleTcs = null;
-        tcs?.TrySetResult();
-    }
-
-    /// <summary>
-    /// A task that completes when all pending selection work has settled.  If
-    /// nothing is pending, returns a completed task.  Save awaits this so it
-    /// never persists a half-propagated tree.
-    /// </summary>
-    private Task WaitForSelectionSettledAsync()
-    {
-        if (!_selectionSettleScheduled && _pendingSelectionNodes.Count == 0)
-            return Task.CompletedTask;
-        return (_selectionSettleTcs ??= new TaskCompletionSource(
-            TaskCreationOptions.RunContinuationsAsynchronously)).Task;
+        SelectionSettleCompleted?.Invoke();
     }
 
     /// <summary>
@@ -1205,7 +1189,8 @@ public class SourceSelectionViewModel : ViewModelBase
 
     /// <summary>
     /// A task that completes when all registered in-flight node work has finished.
-    /// Save awaits this alongside <see cref="WaitForSelectionSettledAsync"/>.
+    /// Save awaits this (after draining the selection settle synchronously) so it
+    /// never persists a not-yet-pinned tree.
     /// </summary>
     private Task WaitForPendingNodeWorkAsync()
     {
@@ -1548,37 +1533,47 @@ public class SourceSelectionViewModel : ViewModelBase
 
     private async void OnSave()
     {
-        // A checkbox toggle defers its propagation/aggregation work to a
-        // Background-priority settle pass; an auto-include-new toggle on an unloaded
-        // directory kicks off an async load-then-pin.  If either is still pending,
-        // wait (with a busy cursor) so we never serialise a half-propagated or
-        // not-yet-pinned tree.
-        var pending = Task.WhenAll(
-            WaitForSelectionSettledAsync(), WaitForPendingNodeWorkAsync());
-        if (!pending.IsCompleted)
+        // Ignore rapid re-clicks while a save is already running.  Without this,
+        // each click queued another OnSave that would fire once the waits below
+        // cleared; because Save now closes the editor, several piled-up saves made
+        // the window appear to shut "on its own" a moment later.
+        if (_saving)
+            return;
+
+        _saving = true;
+        CommandManager.InvalidateRequerySuggested();
+        Mouse.OverrideCursor = Cursors.Wait;
+        try
         {
-            Mouse.OverrideCursor = Cursors.Wait;
-            try
-            {
-                await pending;
-            }
-            finally
-            {
-                Mouse.OverrideCursor = null;
-            }
+            // A checkbox toggle defers its propagation/aggregation to a
+            // Background-priority settle pass.  That pass can be STARVED for
+            // seconds by the post-show catalog/size work (which pumps a steady
+            // stream of higher-priority dispatcher activity) — which is what made
+            // Save look like it "did nothing" until some unrelated interaction let
+            // the pass finally run.  Drain it synchronously here instead of
+            // awaiting it, so Save acts immediately regardless of dispatcher load.
+            if (_selectionSettleScheduled || _pendingSelectionNodes.Count > 0)
+                SettlePendingSelections();
+
+            // An auto-include-new toggle on an unloaded directory kicks off an
+            // async load-then-pin; that one is genuinely asynchronous, so await it
+            // (still under the busy cursor) to avoid serialising a not-yet-pinned
+            // tree.  It completes on its own — it doesn't need any user action.
+            await WaitForPendingNodeWorkAsync();
+
+            if (SaveRequested is not null)
+                await SaveRequested.Invoke();
         }
-
-        if (SaveRequested is not null)
-            await SaveRequested.Invoke();
-
-        // Mark clean after a successful save so the button disables.
-        if (SaveStatusText == "Saved")
+        finally
         {
-            _needsSave = false;
+            Mouse.OverrideCursor = null;
+            _saving = false;
             CommandManager.InvalidateRequerySuggested();
         }
 
-        // Auto-clear the status after a few seconds so it doesn't persist forever.
+        // On success the SaveRequested handler closed the editor, so this only
+        // runs when the save failed and the window stayed open — auto-clear the
+        // transient "Save failed" status after a few seconds.
         if (!string.IsNullOrEmpty(SaveStatusText))
         {
             await Task.Delay(3000);

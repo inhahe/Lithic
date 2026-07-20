@@ -15,7 +15,7 @@
             <RowDefinition Height="Auto" />
         </Grid.RowDefinitions>
 
-        <TabControl Grid.Row="0">
+        <TabControl x:Name="SettingsTabs" Grid.Row="0">
 
             <!-- ================= General ================= -->
             <TabItem Header="General">

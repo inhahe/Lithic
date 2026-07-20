@@ -1,5 +1,65 @@
 # LithicBackup — Known Issues & Tech Debt
 
+## FIXED: Restore views could hide the only exit ("Done") button + Save enabled during tree restore (2026-07-20)
+
+**Symptom.** "I clicked on restore, and there's no way out of it." Both restore
+screens (**Restore Files** and **Restore Without Catalog**) *do* have a "Done"
+button that returns home (`DoneCommand` → `DoneRequested` → `MainViewModel.GoHome`),
+but it lived in the **last row of a plain `Grid`** with a `*` (star) middle row
+and no scroll fallback. WPF gives every `Auto` row its full desired height first
+and lets only the star row shrink; once the fixed rows (header + per-drive
+destination inputs + progress/result + the button bar) summed to more than the
+available height — a short window, or a backup set spanning several source drives
+— the star tree row collapsed to zero and the **remaining `Auto` rows, including
+the button bar, were clipped off the bottom of the card with no scrollbar**. The
+exit existed but was unreachable, so the view looked like a dead end.
+
+**Fix (v1.0.46).** Rebuilt both views' outer container as a `DockPanel` (the same
+pattern `FindFileView` already uses): the button bar is `DockPanel.Dock="Bottom"`
+so it is laid out first and can **never** be clipped, and only the internally
+scrolling content (the restore file tree / the status-result area, now wrapped in
+its own `ScrollViewer`) yields space. The exit button was also pulled out to the
+far right of the bar, above a separator border, and given a tooltip, so it reads
+unmistakably as "leave this view" rather than being crammed after the primary
+action and the file-count label.
+
+Bundled in the same release: the Modify editor's **Save** button is now disabled
+while the selection tree is still being restored (`SaveCommand` CanExecute gained
+`&& !IsApplyingSelections`, and the `IsApplyingSelections` setter now calls
+`CommandManager.InvalidateRequerySuggested()` so the button re-queries when the
+restore finishes), and the **Largest Files and Directories** dialog's **Save**
+button is gated on `!IsLoading` the same way (its `IsLoading` setter now
+invalidates command state too). This applies the "don't let the user trigger an
+action button until the data it depends on has finished loading" rule uniformly.
+
+## FIXED: Modify "Save" appeared to do nothing, then the window closed by itself (2026-07-20)
+
+**Symptom.** In the Modify editor, clicking **Save** did nothing — several clicks,
+no visible effect. Then expanding a drive in the tree caused the window to close
+about a second later, seemingly on its own.
+
+**Cause.** `SourceSelectionViewModel.OnSave` awaited a *Background*-priority
+selection-settle pass (via the old `WaitForSelectionSettledAsync` → a
+`TaskCompletionSource` completed only inside the dispatcher callback). The
+post-show catalog/size/plan work (`PostShowInitAsync`) pumps a steady stream of
+higher-priority dispatcher activity that **starves** anything at Background
+priority, so the settle pass — and thus the awaited task — didn't run for
+seconds. Each Save click queued *another* `OnSave` blocked on the same task. When
+expanding a drive finally yielded the dispatcher (or the post-show work finished),
+the pass ran, every queued `OnSave` resumed at once, and — because Save now closes
+the editor (v1.0.43) — the first one shut the window. Pre-v1.0.43 the same stall
+existed but was invisible (Save just persisted silently and kept the window open).
+
+**Fix (v1.0.45).** `OnSave` now (1) drains the settle pass **synchronously**
+(`SettlePendingSelections()`) instead of awaiting the starvable Background pass,
+so Save acts immediately regardless of dispatcher load; (2) guards against
+re-entrant clicks with a `_saving` flag (also folded into `SaveCommand`'s
+`CanExecute`) so a burst of clicks can't queue multiple saves/closes; and (3)
+keeps a busy cursor over the whole operation for clear feedback. The genuinely
+async auto-include load-then-pin work is still awaited (it completes on its own,
+needing no user action). Removed the now-dead `WaitForSelectionSettledAsync` and
+`_selectionSettleTcs`.
+
 ## FIXED: Spurious "unsaved changes" prompt on closing Modify — close prompt now snapshot-diffs instead of trusting the racy dirty flag (2026-07-19)
 
 **Symptom.** Opening a backup set via **Modify**, changing nothing, and closing

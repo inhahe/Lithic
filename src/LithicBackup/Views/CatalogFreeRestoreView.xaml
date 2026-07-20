@@ -7,18 +7,16 @@
              mc:Ignorable="d"
              d:DataContext="{d:DesignInstance Type=vm:CatalogFreeRestoreViewModel, IsDesignTimeCreatable=False}">
 
-    <Grid Margin="8">
-        <Grid.RowDefinitions>
-            <RowDefinition Height="Auto" />
-            <RowDefinition Height="Auto" />
-            <RowDefinition Height="Auto" />
-            <RowDefinition Height="*" />
-            <RowDefinition Height="Auto" />
-            <RowDefinition Height="Auto" />
-        </Grid.RowDefinitions>
+    <!--
+        DockPanel (not a Grid) so the button bar — which holds the only way out of
+        this view ("Done") — is docked to the bottom and can never be clipped off
+        screen on a short window. Only the status/result area (which scrolls
+        internally) yields space; the exit bar always stays visible.
+    -->
+    <DockPanel Margin="8" LastChildFill="True">
 
         <!-- Header -->
-        <StackPanel Grid.Row="0" Margin="0,0,0,12">
+        <StackPanel DockPanel.Dock="Top" Margin="0,0,0,12">
             <TextBlock Style="{StaticResource H2}" Text="Restore Without Catalog" />
             <TextBlock Foreground="{StaticResource TextSecondaryBrush}"
                        FontSize="12" Margin="0,2,0,0"
@@ -27,7 +25,7 @@
         </StackPanel>
 
         <!-- Backup folder -->
-        <Grid Grid.Row="1" Margin="0,0,0,8">
+        <Grid DockPanel.Dock="Top" Margin="0,0,0,8">
             <Grid.RowDefinitions>
                 <RowDefinition Height="Auto" />
                 <RowDefinition Height="Auto" />
@@ -49,7 +47,7 @@
         </Grid>
 
         <!-- Output folder -->
-        <Grid Grid.Row="2" Margin="0,0,0,12">
+        <Grid DockPanel.Dock="Top" Margin="0,0,0,12">
             <Grid.RowDefinitions>
                 <RowDefinition Height="Auto" />
                 <RowDefinition Height="Auto" />
@@ -70,21 +68,38 @@
             </Grid>
         </Grid>
 
-        <!-- Status / result area (fills remaining space) -->
-        <Border Grid.Row="3" BorderBrush="{StaticResource BorderBrush}" BorderThickness="1"
-                CornerRadius="4" Padding="12" Margin="0,0,0,12">
-            <StackPanel>
-                <TextBlock Text="{Binding StatusText}" FontWeight="SemiBold"
-                           TextWrapping="Wrap" Margin="0,0,0,4" />
-                <TextBlock Text="{Binding ResultDetail}"
-                           Foreground="{StaticResource TextSecondaryBrush}"
-                           TextWrapping="Wrap"
-                           Visibility="{Binding IsComplete, Converter={StaticResource BoolToVis}}" />
-            </StackPanel>
+        <!-- Buttons (docked to the bottom so the exit is always reachable) -->
+        <Border DockPanel.Dock="Bottom"
+                BorderBrush="{StaticResource BorderBrush}"
+                BorderThickness="0,1,0,0"
+                Padding="0,12,0,0" Margin="0,12,0,0">
+            <Grid>
+                <Grid.ColumnDefinitions>
+                    <ColumnDefinition Width="Auto" />
+                    <ColumnDefinition Width="*" />
+                    <ColumnDefinition Width="Auto" />
+                </Grid.ColumnDefinitions>
+
+                <StackPanel Grid.Column="0" Orientation="Horizontal">
+                    <Button Style="{StaticResource PrimaryButton}"
+                            Content="Restore"
+                            Command="{Binding RestoreCommand}"
+                            Margin="0,0,8,0" />
+                    <Button Content="Cancel"
+                            Command="{Binding CancelCommand}"
+                            Padding="16,8"
+                            Visibility="{Binding IsRestoring, Converter={StaticResource BoolToVis}}" />
+                </StackPanel>
+
+                <Button Grid.Column="2" Content="Done"
+                        Command="{Binding DoneCommand}"
+                        Padding="24,8" Cursor="Hand"
+                        ToolTip="Close this view and return to the backup sets." />
+            </Grid>
         </Border>
 
-        <!-- Progress area -->
-        <StackPanel Grid.Row="4" Margin="0,0,0,12"
+        <!-- Progress area (docked above the buttons while restoring) -->
+        <StackPanel DockPanel.Dock="Bottom" Margin="0,0,0,12"
                     Visibility="{Binding IsRestoring, Converter={StaticResource BoolToVis}}">
             <ProgressBar Minimum="0" Maximum="100"
                          Value="{Binding RestorePercentage, Mode=OneWay}"
@@ -96,19 +111,20 @@
                        Text="{Binding CurrentFile}" />
         </StackPanel>
 
-        <!-- Buttons -->
-        <StackPanel Grid.Row="5" Orientation="Horizontal">
-            <Button Style="{StaticResource PrimaryButton}"
-                    Content="Restore"
-                    Command="{Binding RestoreCommand}"
-                    Margin="0,0,8,0" />
-            <Button Content="Cancel"
-                    Command="{Binding CancelCommand}"
-                    Padding="16,8" Margin="0,0,8,0"
-                    Visibility="{Binding IsRestoring, Converter={StaticResource BoolToVis}}" />
-            <Button Content="Done"
-                    Command="{Binding DoneCommand}"
-                    Padding="16,8" Cursor="Hand" />
-        </StackPanel>
-    </Grid>
+        <!-- Status / result area (fills remaining space) -->
+        <Border BorderBrush="{StaticResource BorderBrush}" BorderThickness="1"
+                CornerRadius="4" Padding="12" Margin="0,0,0,12">
+            <ScrollViewer VerticalScrollBarVisibility="Auto"
+                          HorizontalScrollBarVisibility="Disabled">
+                <StackPanel>
+                    <TextBlock Text="{Binding StatusText}" FontWeight="SemiBold"
+                               TextWrapping="Wrap" Margin="0,0,0,4" />
+                    <TextBlock Text="{Binding ResultDetail}"
+                               Foreground="{StaticResource TextSecondaryBrush}"
+                               TextWrapping="Wrap"
+                               Visibility="{Binding IsComplete, Converter={StaticResource BoolToVis}}" />
+                </StackPanel>
+            </ScrollViewer>
+        </Border>
+    </DockPanel>
 </UserControl>

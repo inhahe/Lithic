@@ -70,6 +70,14 @@ public class UserSettings
     /// </summary>
     public ContinuousRules ContinuousRules { get; set; } = new();
 
+    /// <summary>
+    /// Index of the tab last active in the Settings dialog. Remembered so the
+    /// dialog reopens where the user left off. Pure UI state (not a backup
+    /// setting), so it's persisted on close regardless of Save/Cancel and
+    /// clamped to the valid range in case the tab layout changes.
+    /// </summary>
+    public int LastSettingsTab { get; set; }
+
     public static UserSettings Load()
     {
         try

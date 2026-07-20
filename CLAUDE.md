@@ -2,7 +2,7 @@
 
 ## Versioning (Claude controls this)
 
-**Current version: `1.0.42`**
+**Current version: `1.0.46`**
 
 Claude owns the version number. Do not hand-edit it — ask Claude to bump it and
 Claude will keep every place in sync.
