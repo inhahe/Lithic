@@ -1,5 +1,87 @@
 # LithicBackup — Known Issues & Tech Debt
 
+## FIXED: Lowering the memory budget mid-backup didn't release any memory (2026-07-20)
+
+**Symptom.** "I changed the configuration to only take 1 GB, and it didn't
+release any memory." A backup already running kept its large working set even
+after the user tightened the memory policy in Settings.
+
+**Cause.** Two things:
+
+1. **The policy was a snapshot.** `DirectoryBackupService` captured
+   `job.MemoryBudget` once when the backup started, so a change written to
+   `settings.json` by the GUI mid-run was never seen by the in-flight job. Even
+   the v1.0.47 live `CanBuffer` check was being handed the frozen start-of-run
+   options.
+2. **Freed buffers stayed resident.** Even where buffers *were* dropped, the
+   large `byte[]` file buffers live on the .NET Large Object Heap, which a plain
+   GC does not compact — so the pages stay in the process working set and the
+   footprint the user watches in Task Manager doesn't fall.
+
+Additionally, the v1.0.47 `CanBuffer` **Fixed-mode** branch checked the incoming
+file against the cap **per file only** (not cumulatively), so Fixed mode failed
+to bound the total buffer at all.
+
+**Fix (v1.0.48).**
+- **Live policy.** The policy is now re-read from `UserSettings.Load()` (the same
+  JSON the GUI writes) at most ~once per second from inside the backup loop, via a
+  `CurrentPolicy()` local that seeds/falls back to `job.MemoryBudget`. A mid-run
+  budget change now takes effect on a long-running job.
+- **Cumulative Fixed cap.** `MemoryBudget.CanBuffer` now enforces **both** modes
+  against the live process working set (`ProcessCap`): Fixed → `FixedGb`, Auto →
+  `PercentOfTotal` of physical RAM (Auto also keeps the `ReserveGb` free-RAM
+  check). This makes the cap cumulative for both modes and fixes the per-file
+  Fixed bug.
+- **Active reclaim.** New `MemoryBudget.IsOverBudget(options)` and
+  `MemoryBudget.ReclaimNow()` (`GCLargeObjectHeapCompactionMode.CompactOnce` +
+  a blocking compacting `GC.Collect`) hand freed memory back to the OS. The
+  pre-pass drops its accumulated `bufferedContent` when it's over budget, and the
+  main loop reclaims as buffers drain — both via a throttled `MaybeReclaim()`
+  (≤ once / 3 s, only while `IsOverBudget`) so the blocking compaction can't grind
+  the backup if a Fixed cap is set below the process's irreducible baseline.
+
+**Caveat.** A Fixed budget can't push the process below its baseline footprint
+(the app/service itself plus in-flight I/O); asking for e.g. 1 GB when the
+baseline already exceeds that just means "buffer nothing and reclaim," not a
+literally-1-GB process.
+
+## FIXED: Backup ran the machine out of RAM despite the "50% / leave N GB free" memory policy (2026-07-20)
+
+**Symptom.** During a directory backup the process climbed to ~40 GB working set
+on a 64-GB machine and drove the system to ~97% memory used — even with the
+memory policy set to **Auto, 50% of RAM, leave 2 GB free**. Both limits were
+being ignored in practice.
+
+**Cause.** `MemoryBudget.Resolve` was called **once** at the top of
+`DirectoryBackupService.BackupDirectoryAsync` and produced a single byte budget
+that governed **only** the in-memory file-content buffer, using
+`available − reserve` measured **at that instant**. Two failures followed:
+
+1. **The reserve was a stale snapshot.** The block-dedup pre-pass reads files
+   into `bufferedContent` and holds them until the main loop consumes them, so
+   the buffer can accumulate up to the whole percentage cap (50% of 64 GB =
+   32 GB) at once. As it filled, live available RAM fell far below the 2 GB
+   reserve, but nothing re-checked — the "leave 2 GB free" promise only ever
+   reflected the moment the backup started.
+2. **The percentage capped the buffer, not the process.** The cap was compared
+   against the buffer's tracked bytes only, ignoring .NET heap / large-object-
+   heap overhead from allocating many multi-GB `byte[]`s. So a "32 GB buffer"
+   showed up as a ~40 GB working set — past the 50% the user had asked for.
+
+**Fix (v1.0.47).** Replaced the once-per-run budget with a live per-file
+admission check, `MemoryBudget.CanBuffer(options, incomingBytes)`, called at both
+buffering sites (the block-dedup pre-pass and the file-level-dedup single-file
+read). On every call it re-queries memory and refuses to buffer when either:
+(1) the **live process working set** (`Environment.WorkingSet`, i.e. the figure
+Task Manager shows — buffer + heap + LOH) plus the incoming file would exceed
+`PercentOfTotal` of physical RAM, or (2) reading the file would push
+**currently-available** system RAM below `ReserveGb`. A refused file simply
+streams (read-twice) as before — always correct, just without the single-read
+speed-up. Both guarantees now hold continuously as RAM fills, and the system-wide
+`available` check also throttles the backup when *other* programs are the ones
+consuming memory. The old `bufferBudgetBytes`/`bufferedBytes` snapshot bookkeeping
+was removed.
+
 ## FIXED: Restore views could hide the only exit ("Done") button + Save enabled during tree restore (2026-07-20)
 
 **Symptom.** "I clicked on restore, and there's no way out of it." Both restore

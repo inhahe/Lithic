@@ -28,7 +28,11 @@ public class MemoryBudgetOptions
     public MemoryBudgetMode Mode { get; set; } = MemoryBudgetMode.Auto;
 
     /// <summary>
-    /// Auto mode: the percentage of total physical RAM the buffer may use.
+    /// Auto mode: the percentage of total physical RAM the backup may use. The
+    /// per-file admission check (<c>MemoryBudget.CanBuffer</c>) enforces this
+    /// against the live process working set — the figure Task Manager shows — so
+    /// it bounds the whole backup's footprint (buffered file bytes plus GC/heap
+    /// overhead), not merely the raw buffer.
     /// </summary>
     public int PercentOfTotal { get; set; } = 50;
 
