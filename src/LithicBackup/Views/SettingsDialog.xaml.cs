@@ -37,6 +37,12 @@ public partial class SettingsDialog : Window, INotifyPropertyChanged
 
         // Seed the continuous-rule editors from the persisted (or default) rules.
         LoadContinuousRows(settings.ContinuousRules ?? new ContinuousRules());
+
+        // Reopen on the tab the user last used. Clamp in case the tab layout
+        // changed since the index was saved.
+        int tabCount = SettingsTabs.Items.Count;
+        if (tabCount > 0)
+            SettingsTabs.SelectedIndex = Math.Clamp(settings.LastSettingsTab, 0, tabCount - 1);
     }
 
     // ------------------------------------------------------------------
@@ -402,12 +408,31 @@ public partial class SettingsDialog : Window, INotifyPropertyChanged
             ? DiscStagingMode.InPlace
             : DiscStagingMode.TemporaryCopy;
         _settings.ContinuousRules = BuildContinuousRules();
+        _settings.LastSettingsTab = SettingsTabs.SelectedIndex;
         _settings.Save();
         DialogResult = true;
         Close();
     }
 
     private void Cancel_Click(object sender, RoutedEventArgs e) => Close();
+
+    /// <summary>
+    /// Persist the active tab regardless of how the dialog closed — it's UI
+    /// state, not a backup setting, so Cancel should remember it too. On Save
+    /// (OK_Click) the value already matches, so this writes nothing extra;
+    /// on Cancel it saves only when the tab actually changed. Cancel never
+    /// wrote the edited fields back to <c>_settings</c>, so persisting here
+    /// leaks no unsaved setting edits — only the tab index.
+    /// </summary>
+    protected override void OnClosed(EventArgs e)
+    {
+        base.OnClosed(e);
+        if (_settings.LastSettingsTab != SettingsTabs.SelectedIndex)
+        {
+            _settings.LastSettingsTab = SettingsTabs.SelectedIndex;
+            _settings.Save();
+        }
+    }
 
     public event PropertyChangedEventHandler? PropertyChanged;
 
