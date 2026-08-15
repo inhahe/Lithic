@@ -279,8 +279,47 @@ source treeview *either*, so this dialog is the user's only route to its leftove
 destination copies. `BuildExclusionFilter` gained an overload taking
 `(excludedExtensions, tierSets)` so `JobOptions` holders call the real thing, and
 the copy is gone. The existing Orphaned Directories cleanup is therefore how the
-~4.2 GB of already-stored `$Extend` data can now be found and removed — it is
-deliberately **not** auto-purged, since deleting backup data is the user's call.
+already-stored `$Extend` data can be found and removed — it is deliberately
+**not** auto-purged, since deleting backup data is the user's call.
+
+**Purged on request, 2026-08-15** (`tools\purge_extend.py`, `--dry-run` first,
+then `--commit`; swept and verified by `tools\purge_extend_verify.py`):
+
+| | set-4 (J:) | set-11 (I:) |
+|---|---|---|
+| catalog rows removed | 145 | 805 |
+| files deleted from destination | 5 | 757 |
+| rows whose bytes were already gone | 140 | 48 |
+| bytes reclaimed | 0.002 GB | 0.985 GB |
+
+950 rows / 762 files / **0.987 GB** total, 0 failures. Afterwards: 0 `$Extend`
+rows in either set, 0 leftover bytes, 62 empty directories removed, 0 orphan
+`FileChunks`, `PRAGMA quick_check = ok` on both databases, and the Worker kept
+running throughout with no errors.
+
+Two checks made it safe to hard-`DELETE` the rows rather than tombstone them —
+worth repeating before any similar purge:
+
+- **No shared-storage bookkeeping to unwind.** All 950 rows had
+  `IsDeduped = IsSplit = IsZipped = 0` and zero `FileChunks`, so there was no
+  `DeduplicationBlocks.ReferenceCount` to decrement and no orphan chunk rows.
+- **`.fileref` manifests orphan nothing.** A fileref's `ContentPath` names an
+  already-backed-up *real* file elsewhere in the destination, not a refcounted
+  `_filestore` blob, so deleting the manifest leaves the content owned by its
+  real record. (Had they pointed into `_filestore`, deleting manifests without
+  decrementing would have leaked blobs permanently.)
+
+The script deletes the physical file **first** and drops the row only on
+confirmed removal — the same ordering `a072e58` enforces for retention — so an
+interrupted run can only ever leave a live row whose bytes are gone, never the
+inverse. It also decrements `Discs.BytesUsed` per disc so capacity planning
+isn't skewed, and snapshots every row to
+`C:\ProgramData\LithicBackup\sets\purged-extend-set-<id>-<ts>.json` first, so the
+catalog side is reversible even though the bytes are not.
+
+A useful side finding: the 188 rows with no bytes on disk were *exactly* the
+`IsDeleted = 1` set, and every `IsDeleted = 0` row still had its file. That is
+independent confirmation that retention hardening never leaves bytes behind.
 
 `SourceSelectionViewModel.GetExcludeFilter` is intentionally NOT unified: it
 serves the treeview's filtered-size columns, and its null-when-no-user-exclusions
