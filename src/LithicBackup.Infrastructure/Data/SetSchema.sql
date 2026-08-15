@@ -102,3 +102,23 @@ CREATE INDEX IF NOT EXISTS IX_Files_Active_Hash
 CREATE INDEX IF NOT EXISTS IX_Files_Active_SourcePath_NoCase
     ON Files(SourcePath COLLATE NOCASE)
     WHERE IsDeleted = 0;
+
+-- Case-insensitive path index over ALL rows, including tombstones.
+--
+-- The partial index above cannot serve version-history lookups, because those
+-- must see deleted rows: GetFileRecordByPathAndVersionAsync (used to revive a
+-- tombstoned record and to fetch the previous version when writing a new one),
+-- GetFileRecordsByPathAsync and GetFileRecordsUnderDirectoryAsync all match on
+-- `SourcePath = ? COLLATE NOCASE` WITHOUT an `IsDeleted = 0` predicate, so
+-- SQLite may not use a `WHERE IsDeleted = 0` partial index, and the plain
+-- IX_Files_SourcePath is BINARY collation so it can't satisfy a NOCASE compare
+-- either. The result was a FULL TABLE SCAN per lookup — and the continuous
+-- backup path runs up to three of them PER CHANGED FILE, PER SET.
+--
+-- Measured on a real 2.35M-row / 2 GB set database: the three lookups cost
+-- ~3,100 ms combined before this index and ~0.3 ms after (~9,600x), which is
+-- what pinned a core and drove ~128 MB/s of pure reads with zero writes in the
+-- Worker service. The index costs ~275 MB on that database and ~11 s to build
+-- once. See the "Worker pegged a CPU core" entry in known-issues.md.
+CREATE INDEX IF NOT EXISTS IX_Files_SourcePath_NoCase
+    ON Files(SourcePath COLLATE NOCASE);

@@ -1,5 +1,67 @@
 # LithicBackup — Known Issues & Tech Debt
 
+## FIXED: Worker service pegged a CPU core — missing NOCASE path index caused a full table scan per file (2026-08-15)
+
+**Symptom.** `LithicBackup.Worker` was one of the top CPU consumers on the
+machine, more or less permanently. Measured: **one thread pinned at ~90–97% of a
+core**, **31,355 read ops/sec**, **~128 MB/s of reads**, and **zero writes** —
+i.e. it was reading enormous amounts and producing nothing. Continuous-backup
+cycles in the log took **60–100 seconds to handle as few as 2 changed files**.
+
+**Cause.** A missing index, not a loop bug. Three catalog lookups on the
+continuous-backup hot path match a path case-insensitively **without** an
+`IsDeleted = 0` predicate (they must be able to see tombstoned rows):
+
+- `GetFileRecordByPathAndVersionAsync` — revive a tombstoned record; fetch the
+  previous version (called at `DirectoryBackupService` lines ~750, ~780, ~945,
+  all inside the per-file loop)
+- `GetFileRecordsByPathAsync` — full version history
+- `GetFileRecordsUnderDirectoryAsync` — the rename/relocate path
+
+The only NOCASE index, `IX_Files_Active_SourcePath_NoCase`, is **partial**
+(`WHERE IsDeleted = 0`), so SQLite can't use it for queries lacking that
+predicate; and `IX_Files_SourcePath` is **BINARY** collation, so it can't satisfy
+a `COLLATE NOCASE` comparison. Both fall back to a full table scan.
+
+The set databases had grown to **2.35 M rows / ~2 GB**, so each scan read the
+whole table. With up to three lookups **per changed file, per set**, and two
+continuous sets, the worker did gigabytes of scanning for every trivial change —
+hence sustained reads with no writes.
+
+**Measured on the real 2.35 M-row set database** (`EXPLAIN QUERY PLAN` + timings
+on a consistent snapshot):
+
+| Lookup | Before | After |
+|---|---|---|
+| `GetFileRecordByPathAndVersionAsync` | 1086 ms (`SCAN f`) | 0.2 ms (index seek) |
+| `GetFileRecordsByPathAsync` | 1282 ms (`SCAN f`) | 0.1 ms (index seek) |
+| `GetFileRecordsUnderDirectoryAsync` | 727 ms (full index scan) | 0.1 ms (multi-index OR) |
+| **total per file** | **~3,094 ms** | **~0.3 ms** (~9,600×) |
+
+**Fix (v1.0.49).** Added a **non-partial** case-insensitive path index to
+`SetSchema.sql`:
+
+```sql
+CREATE INDEX IF NOT EXISTS IX_Files_SourcePath_NoCase
+    ON Files(SourcePath COLLATE NOCASE);
+```
+
+`SetSchema.sql` is executed on every set-database open and every statement is
+`IF NOT EXISTS`, so existing set databases pick the index up automatically on the
+next service start — no migration step. Cost: ~275 MB on a 2 GB set database and
+a **one-time ~11 s build** on first open after upgrade (service start may pause
+briefly once per set).
+
+Adding `IsDeleted = 0` to the queries instead would have been wrong — those call
+sites specifically need tombstoned rows (reviving a deleted record, full version
+history).
+
+**Possible follow-up (not done).** `IX_Files_Active_SourcePath_NoCase` is now
+largely — but not entirely — redundant: the partial index is still smaller and
+lets the restore browser's range scans skip tombstones for free. Dropping it
+would save ~200 MB per set database at some cost to the browser. Not changed
+without measuring the browser path.
+
 ## FIXED: Lowering the memory budget mid-backup didn't release any memory (2026-07-20)
 
 **Symptom.** "I changed the configuration to only take 1 GB, and it didn't
