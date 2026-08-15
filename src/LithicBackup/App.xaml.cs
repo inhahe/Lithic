@@ -41,10 +41,12 @@ public partial class App : Application
     // process), the installer just SIGNALS this named event and we close
     // ourselves gracefully. A process can always shut itself down regardless of
     // integrity level, so no elevation, taskkill, or Burn-bundle is needed — see
-    // installer\Package.wxs (SignalLithicGuiShutdown) and the MSI-upgrade entry in
+    // installer\Package.wxs (SignalLithicShutdown) and the MSI-upgrade entry in
     // known-issues.md. The event is session-local (matching the single-instance
     // primitives): the installer's pre-InstallValidate custom action runs in the
     // user's own msiexec client process, i.e. the same session as the GUI.
+    // (The Worker service needs the same treatment but a Global\ event, because it
+    // lives in session 0 — see LithicBackup.Worker\ShutdownSignalListener.cs.)
     private const string ShutdownSignalName = "LithicBackup.Shutdown";
     private EventWaitHandle? _shutdownSignalEvent;
     private RegisteredWaitHandle? _shutdownSignalWait;

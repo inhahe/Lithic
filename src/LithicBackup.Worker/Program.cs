@@ -47,6 +47,13 @@ var builder = Host.CreateDefaultBuilder(args)
         services.AddSingleton<DirectoryBackupService>();
 
         services.AddHostedService<BackupWorker>();
+
+        // Lets the MSI ask this service to stop itself BEFORE Windows
+        // Installer's file-in-use check. Registered after BackupWorker so its
+        // StopAsync runs first on shutdown (IHostedService stops in reverse
+        // registration order), but StartAsync order is irrelevant — the
+        // listener does no work until signalled. See ShutdownSignalListener.
+        services.AddHostedService<ShutdownSignalListener>();
     });
 
 try

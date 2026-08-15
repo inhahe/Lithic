@@ -4234,13 +4234,36 @@ public class MainViewModel : ViewModelBase
 
     /// <summary>
     /// Downloads the release installer (the bare <c>.msi</c>; a legacy <c>.exe</c>
-    /// bundle is accepted only as a fallback) and launches it, then shuts this app
-    /// down so the installer can replace the running files. Closing the GUI here
-    /// means the upgrade never trips the file-in-use check on our own executables;
-    /// the MSI's <c>SignalLithicGuiShutdown</c> custom action covers the manual
-    /// (double-click-the-MSI-while-running) path too. If the release has no
-    /// installer asset, falls back to opening the release page in the browser.
+    /// bundle is accepted only as a fallback) and launches it <em>elevated</em>,
+    /// then shuts this app down so the installer can replace the running files.
+    /// If the release has no installer asset, falls back to opening the release
+    /// page in the browser.
     /// </summary>
+    /// <remarks>
+    /// <para>
+    /// <b>Why elevated, and why via msiexec.</b> Everything an MSI does before
+    /// <c>InstallInitialize</c> — including the <c>InstallValidate</c> file-in-use
+    /// check and our <c>SignalLithicShutdown</c> custom action, which runs just
+    /// ahead of it — executes in the client process. Launch the package normally
+    /// and that process is unelevated, so the custom action cannot SCM-stop the
+    /// LocalSystem Worker service and has to fall back to asking the service to
+    /// stop itself. That fallback works, but only against a build that already
+    /// ships the listener. Launching <c>msiexec /i</c> through the <c>runas</c>
+    /// verb makes the client process elevated, so the SCM stop simply succeeds and
+    /// the upgrade works even against an older Worker with no listener.
+    /// </para>
+    /// <para>
+    /// It has to be <c>msiexec.exe</c> rather than the <c>.msi</c> itself: Windows
+    /// registers no <c>runas</c> verb for the <c>.msi</c> file type, so
+    /// ShellExecute-ing the package with that verb fails outright.
+    /// </para>
+    /// <para>
+    /// This is not the only line of defence — closing the GUI below, and the
+    /// custom action's signals, cover the manual double-click-the-MSI path where
+    /// we control neither. It is the one that makes the in-app update path
+    /// unconditionally safe.
+    /// </para>
+    /// </remarks>
     private async Task DownloadUpdateAsync()
     {
         if (AvailableUpdate is not { } update) return;
@@ -4257,10 +4280,26 @@ public class MainViewModel : ViewModelBase
             var installerPath = await UpdateService.DownloadInstallerAsync(update);
 
             StatusText = "Launching installer...";
-            System.Diagnostics.Process.Start(new System.Diagnostics.ProcessStartInfo(installerPath)
+
+            var isMsi = installerPath.EndsWith(".msi", StringComparison.OrdinalIgnoreCase);
+            var psi = isMsi
+                ? new System.Diagnostics.ProcessStartInfo("msiexec.exe", $"/i \"{installerPath}\"")
+                : new System.Diagnostics.ProcessStartInfo(installerPath);
+            psi.UseShellExecute = true;   // required for the "runas" verb
+            psi.Verb = "runas";
+
+            try
             {
-                UseShellExecute = true
-            });
+                System.Diagnostics.Process.Start(psi);
+            }
+            catch (System.ComponentModel.Win32Exception ex) when (ex.NativeErrorCode == 1223)
+            {
+                // ERROR_CANCELLED — the user dismissed the UAC prompt. Falling back
+                // to an unelevated launch would only prompt again later (and land in
+                // the weaker code path), so stop here and leave the app running.
+                StatusText = "Update cancelled.";
+                return;
+            }
 
             // Close the app so the installer can overwrite the running executables.
             Application.Current.Shutdown();

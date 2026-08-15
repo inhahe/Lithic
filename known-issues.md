@@ -1,5 +1,93 @@
 # LithicBackup — Known Issues & Tech Debt
 
+## FIXED: "Unable to automatically close all requested applications" (error 1611) — the *Worker service* was never closed before the file-in-use check (2026-08-15)
+
+**Symptom.** Installing 1.0.52 over 1.0.51 failed with:
+
+> The setup was unable to automatically close all requested applications. Please
+> ensure that the applications holding files in use are closed before continuing
+> with the installation.
+
+The GUI was not the problem — that had been solved in 1.0.4x by the
+`SignalLithicGuiShutdown` custom action. The **Worker service** was.
+
+**Root cause: sequencing.** Dumped straight out of the built MSI
+(`installer\dump-seq.ps1`, added with this fix):
+
+| Seq | Action | |
+|---:|---|---|
+| 1399 | `SignalLithicGuiShutdown` | closed the **GUI** only |
+| **1400** | **`InstallValidate`** | **file-in-use check — 1611 originates here** |
+| 1500 | `InstallInitialize` | UAC elevation happens here |
+| 1900 | `StopServices` | `<ServiceControl Stop="both">` ran here — **500 steps too late** |
+
+At 1400 the service is still up, still holding `LithicBackup.Worker.exe` and
+every self-contained DLL it loaded out of `C:\Program Files\Lithic Backup\`.
+Restart Manager sees them, tries to close them, and fails.
+
+`Package.wxs` carried a comment asserting the opposite — *"the elevated installer
+stops the service itself (via SCM) before touching files, so its exe is never
+locked"* — and `CustomAction.cs` matched it: *"the Worker service is handled
+separately via ServiceControl/StopServices."* Both were wrong, and had been since
+the `ServiceControl` element was written. Both are corrected.
+
+**Why it couldn't just stop the service there.** Everything before
+`InstallInitialize` runs in the *unelevated* client process at the invoking user's
+Medium integrity for a double-clicked per-machine MSI. From there, SCM-stopping a
+LocalSystem service is Access Denied — the same integrity wall that made
+*terminating* an elevated GUI impossible, which is what the signal design was
+invented for in the first place.
+
+**Fix — three layers, because each covers a case the others can't.**
+
+1. **Worker listens for a shutdown request** —
+   `src\LithicBackup.Worker\ShutdownSignalListener.cs`, an `IHostedService` that
+   creates `Global\LithicBackup.Worker.Shutdown` via `EventWaitHandleAcl.Create`
+   with an Authenticated Users → `Modify | Synchronize` ACE, and on signal calls
+   `IHostApplicationLifetime.StopApplication()`. `Global\` because the service is
+   in session 0 while the custom action is in the interactive session; the DACL
+   because the signaller is Medium integrity. A process can always shut *itself*
+   down whatever its integrity level, so no elevation is needed. Backed by a
+   20-second watchdog thread (`Environment.Exit(0)`) so a backup in flight cannot
+   leave the installer waiting — aborting mid-run is safe by design (orphan
+   destination writes are removed by the reconcile pass, uncommitted catalog
+   transactions are rolled back by the WAL).
+2. **Custom action signals both** — `SignalLithicGuiShutdown` is renamed
+   `SignalLithicShutdown` and now also (a) tries `ServiceController.Stop()`, which
+   succeeds whenever the MSI was launched already-elevated, (b) signals the
+   Worker's event as the no-privilege fallback, and (c) waits for the GUI and the
+   Worker **concurrently** (25 s total, not per-process).
+3. **In-app updater launches the MSI elevated** —
+   `MainViewModel.DownloadUpdateAsync` now starts `msiexec /i "<path>"` with
+   `Verb = "runas"` instead of ShellExecute-ing the package. That makes the client
+   process elevated, so layer (2)'s SCM stop simply succeeds — which is what makes
+   the *in-app* upgrade path safe even against an old Worker with no listener. It
+   must be `msiexec.exe`, not the `.msi`: Windows registers no `runas` verb for the
+   `.msi` file type.
+
+`<ServiceControl Stop="both">` is kept — it still holds the service down for the
+duration of the file transfer and unregisters it on uninstall. It just isn't what
+passes the check, and the comment now says so.
+
+**Bootstrap caveat (same shape as the GUI's, in 1.0.4x).** An upgrade can only
+signal a listener the **already-installed** build contains. 1.0.51/1.0.52 have no
+Worker listener, so upgrading *from* them by double-clicking the MSI still hits
+1611 unless the service is stopped first. Ways through, once only:
+
+- upgrade from inside the app (Help → Check for Updates) — layer 3 elevates, so
+  layer 2's SCM stop works regardless of the old build; or
+- run the MSI from an elevated prompt: `msiexec /i LithicBackup-1.0.53-x64.msi`; or
+- `sc stop "Lithic Backup"` from an admin prompt, then double-click.
+
+From 1.0.53 onward the plain double-click works unaided.
+
+**Regression guard.** `installer\dump-seq.ps1` dumps `InstallExecuteSequence` and
+`CustomAction` from a built MSI. Run it after touching `Package.wxs` and confirm
+`SignalLithicShutdown` still sits immediately before `InstallValidate` — that
+ordering *is* the fix, and nothing in the build fails if it silently regresses.
+
+---
+
 ## FIXED: Worker service pegged a CPU core, part 3 — the two remaining whole-set scans (2026-08-15)
 
 **Measured, after installing the part-2 fix (v1.0.51).** The user reinstalled and
