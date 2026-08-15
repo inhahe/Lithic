@@ -1,6 +1,97 @@
 # LithicBackup — Known Issues & Tech Debt
 
+## FIXED: Worker service pegged a CPU core, part 2 — whole-set catalog maps rebuilt on every continuous-backup wake-up (2026-08-15)
+
+**Symptom.** After v1.0.49 (the index fix below), the Worker was **still** taking
+~8% CPU continuously. Re-measured after a clean rebuild + MSI reinstall:
+**110.1% of one core, 109 MB/s of reads, 27,945 read ops/sec, ZERO writes,
+5,953 MB working set.** The v1.0.49 index was verified present in both live set
+databases, so that fix had applied — it was just not the dominant cost.
+
+**Cause.** Three catalog queries build a map for the **entire backup set**, and
+the continuous-backup path ran them constantly:
+
+| Call site | Query | Cost on the real 2.35 M-row / 1.9 GB set DB |
+|---|---|---|
+| `DirectoryBackupService.ExecuteTargetedAsync` | `GetLatestVersionInfoAsync` | **8.7–12.7 s**, 2,218,513 rows |
+| `DirectoryBackupService.ExecuteAsync` | `GetLatestVersionInfoAsync` | same |
+| `DirectoryBackupService.ExecuteAsync` | `GetOrphanedVersionInfoAsync` | **7.2 s** full scan |
+| `DirectoryBackupService.ExecuteAsync` | `GetActivePlainContentPathsAsync` | **31.7 s**, 1,619,051 rows |
+
+`GetLatestVersionInfo`/`GetOrphanedVersionInfo` use
+`ROW_NUMBER() OVER (PARTITION BY SourcePath COLLATE NOCASE ...)` + `WHERE rn = 1`,
+which *must* scan every row and sort it. `GetActivePlainContentPaths` GROUP BYs
+every active plain row in the set.
+
+The killer was `ExecuteTargetedAsync`: it is invoked on **every** continuous
+wake-up with the 1–30 paths the USN journal just reported, and it materialised
+the whole 2.2 M-entry manifest purely to do a handful of `TryGetValue` calls —
+*including* on the overwhelmingly common wake-up where the USN record was a
+metadata-only touch and **nothing was backed up at all**. Two continuous sets ×
+back-to-back cycles = a core pinned forever, ~4 KB-per-op page reads (the
+signature of SQLite scanning, not of file hashing), and a multi-GB working set
+holding the dictionaries.
+
+**Fix (v1.0.50).** Added path-scoped / hash-scoped variants and used them
+wherever the interesting keys are known up front:
+
+- `ICatalogRepository.GetLatestVersionInfoForPathsAsync(setId, paths, ct)`
+- `ICatalogRepository.GetOrphanedVersionInfoForPathsAsync(setId, paths, ct)`
+- `ICatalogRepository.GetActivePlainContentPathByHashAsync(setId, hash, ct)`
+
+Each resolves one key with an indexed seek —
+`WHERE SourcePath = $path COLLATE NOCASE ORDER BY Version DESC, Id DESC LIMIT 1`
+picks exactly the row the `rn = 1` window formulation picks, but through
+`IX_Files_SourcePath_NoCase` (added in v1.0.49 — that index is what makes this
+fix possible) instead of a scan-and-sort.
+
+Call sites changed:
+
+- `ExecuteTargetedAsync` — now stats the candidates **first**, then asks the
+  catalog about exactly those canonical `FileInfo.FullName` paths. (Statting
+  first matters: the map is keyed by the canonical path the comparison uses, not
+  the raw USN string.)
+- `ExecuteAsync` — `versionInfo` / `orphanedVersionInfo` scoped to
+  `filesToBackup`; both maps were only ever read or written for files in that
+  list, so this is exactly equivalent.
+- `ExecuteAsync` — `knownContentPaths` replaced by a lazy, memoised
+  hash→plain-copy resolver (`ContentPathForHashAsync` / `SetContentPath`).
+  Hashes written during the run are stamped into the cache exactly as they were
+  stamped into the preloaded map, so intra-run dedup is unchanged.
+
+`FileScanner`, `BackupOrchestrator`, `DedupSizeEstimator`, the GUI view models
+and the seed-from-destination import still use the whole-set forms — they
+genuinely need every row.
+
+**Measured (same snapshot, before → after):**
+
+| Query | Whole-set | Per-key |
+|---|---|---|
+| latest version info | 8.72 s | **26 µs**/path |
+| orphaned version info | 7.2 s | **21 µs**/path |
+| active plain content path | 31.73 s | **36 µs**/hash |
+
+A 30-path wake-up now costs **~2 ms** of catalog work instead of **~48 s**.
+
+**Verification.** No test project exists in this solution, so the new queries
+were differentially verified against the old whole-set queries on a consistent
+snapshot of the real `set-11.db`: **14,001 lookups** — 4,000 random live paths,
+500 uppercased case-variants, 500 absent paths, 4,000 random hashes plus a
+nonexistent one, checked against all three whole-set maps — **0 mismatches**.
+Query plans confirmed as `SEARCH ... USING INDEX` (not `SCAN`).
+
+**Lesson for future work here.** v1.0.49 was declared fixed on the strength of a
+real, measured 9,600× improvement to the *per-file* lookups — but the per-file
+lookups were never the dominant term, and that was never checked end-to-end. Any
+future CPU/IO fix in this area must be confirmed by **re-measuring the running
+Worker's CPU and read throughput after install**, not by the improvement to the
+one query that was being looked at.
+
 ## FIXED: Worker service pegged a CPU core — missing NOCASE path index caused a full table scan per file (2026-08-15)
+
+> Real but **insufficient** on its own — this fixed the per-file lookups while
+> the dominant cost was the whole-set maps; see the part-2 entry above. The index
+> added here is nevertheless what lets the part-2 fix do indexed seeks.
 
 **Symptom.** `LithicBackup.Worker` was one of the top CPU consumers on the
 machine, more or less permanently. Measured: **one thread pinned at ~90–97% of a

@@ -682,6 +682,113 @@ internal sealed class SqliteSetDatabase : IDisposable
         return dict;
     }
 
+    // ---------------------------------------------------------------------
+    // Path-scoped variants of the two "latest version per path" queries.
+    //
+    // GetLatestVersionInfoAsync / GetOrphanedVersionInfoAsync build a map for
+    // the WHOLE set. That means a full table scan plus a window-function sort
+    // over every row — measured at ~12.5 s / 2.2M rows on a real 1.9 GB set
+    // database. Continuous backup only ever needs the entries for the handful
+    // of paths the USN journal just reported (typically 1-30), so paying the
+    // whole-set cost once per wake-up pegged a CPU core and drove ~110 MB/s of
+    // pure reads in the Worker service. See the "Worker pegged a CPU core"
+    // entry in known-issues.md.
+    //
+    // These do one indexed seek per path instead:
+    //   ... WHERE SourcePath = $path COLLATE NOCASE ORDER BY Version DESC, Id DESC LIMIT 1
+    // which is the same row the ROW_NUMBER() ... rn = 1 formulation picks, but
+    // resolved through IX_Files_SourcePath_NoCase / the partial
+    // IX_Files_Active_SourcePath_NoCase rather than by scanning and sorting.
+    // Cost is O(paths x log n), so a 30-path wake-up is microseconds.
+    // ---------------------------------------------------------------------
+
+    public async Task<Dictionary<string, FileVersionInfo>> GetLatestVersionInfoForPathsAsync(
+        int backupSetId, IReadOnlyCollection<string> paths, CancellationToken ct = default)
+    {
+        ct.ThrowIfCancellationRequested();
+        var dict = new Dictionary<string, FileVersionInfo>(StringComparer.OrdinalIgnoreCase);
+        if (paths.Count == 0)
+            return dict;
+
+        using var _ = await LockAsync(ct).ConfigureAwait(false);
+
+        using var cmd = _connection.CreateCommand();
+        cmd.CommandText = """
+            SELECT f.SourcePath, f.Version, f.SizeBytes, f.SourceLastWriteUtc,
+                   f.IsDeduped, f.IsFileRef, f.Hash
+            FROM Files f
+            INNER JOIN Discs d ON f.DiscId = d.Id
+            WHERE d.BackupSetId = $setId
+              AND f.IsDeleted = 0
+              AND f.SourcePath = $path COLLATE NOCASE
+            ORDER BY f.Version DESC, f.Id DESC
+            LIMIT 1
+            """;
+        cmd.Parameters.AddWithValue("$setId", backupSetId);
+        var pathParam = cmd.Parameters.Add("$path", SqliteType.Text);
+
+        foreach (var path in paths)
+        {
+            ct.ThrowIfCancellationRequested();
+            if (dict.ContainsKey(path))
+                continue;
+            pathParam.Value = path;
+            using var r = cmd.ExecuteReader();
+            if (r.Read())
+                dict[r.GetString(0)] = ReadVersionInfo(r);
+        }
+        return dict;
+    }
+
+    public async Task<Dictionary<string, FileVersionInfo>> GetOrphanedVersionInfoForPathsAsync(
+        int backupSetId, IReadOnlyCollection<string> paths, CancellationToken ct = default)
+    {
+        ct.ThrowIfCancellationRequested();
+        var dict = new Dictionary<string, FileVersionInfo>(StringComparer.OrdinalIgnoreCase);
+        if (paths.Count == 0)
+            return dict;
+
+        using var _ = await LockAsync(ct).ConfigureAwait(false);
+
+        // Newest row for the path across ALL rows (tombstones included); the
+        // path is "orphaned history" only when that newest row is itself
+        // soft-deleted, exactly as the whole-set query's `rn = 1 AND
+        // IsDeleted = 1` filter decides.
+        using var cmd = _connection.CreateCommand();
+        cmd.CommandText = """
+            SELECT f.SourcePath, f.Version, f.SizeBytes, f.SourceLastWriteUtc,
+                   f.IsDeduped, f.IsFileRef, f.Hash, f.IsDeleted
+            FROM Files f
+            INNER JOIN Discs d ON f.DiscId = d.Id
+            WHERE d.BackupSetId = $setId
+              AND f.SourcePath = $path COLLATE NOCASE
+            ORDER BY f.Version DESC, f.Id DESC
+            LIMIT 1
+            """;
+        cmd.Parameters.AddWithValue("$setId", backupSetId);
+        var pathParam = cmd.Parameters.Add("$path", SqliteType.Text);
+
+        foreach (var path in paths)
+        {
+            ct.ThrowIfCancellationRequested();
+            if (dict.ContainsKey(path))
+                continue;
+            pathParam.Value = path;
+            using var r = cmd.ExecuteReader();
+            if (r.Read() && r.GetInt32(7) != 0)
+                dict[r.GetString(0)] = ReadVersionInfo(r);
+        }
+        return dict;
+    }
+
+    private static FileVersionInfo ReadVersionInfo(SqliteDataReader r) => new(
+        MaxVersion: r.GetInt32(1),
+        SizeBytes: r.GetInt64(2),
+        SourceLastWriteUtc: DateTime.Parse(r.GetString(3), null, DateTimeStyles.RoundtripKind),
+        IsDeduped: r.GetInt32(4) != 0,
+        IsFileRef: r.GetInt32(5) != 0,
+        Hash: r.IsDBNull(6) ? "" : r.GetString(6));
+
     public async Task<int> GetFileCountForBackupSetAsync(int backupSetId, CancellationToken ct = default)
     {
         ct.ThrowIfCancellationRequested();
@@ -1053,6 +1160,47 @@ internal sealed class SqliteSetDatabase : IDisposable
         while (r.Read())
             map[r.GetString(0)] = r.GetString(1);
         return map;
+    }
+
+    /// <summary>
+    /// Single-hash variant of <see cref="GetActivePlainContentPathsAsync"/>.
+    /// Returns the destination-relative path of an active PLAIN copy of the
+    /// given content hash, or null when no such copy exists.
+    /// </summary>
+    /// <remarks>
+    /// The whole-set version GROUP BYs every active plain row in the set — a
+    /// full scan of a multi-million-row table on every backup run. A directory
+    /// backup only asks about the hashes of the files it is actually writing,
+    /// so it looks them up one at a time through IX_DeduplicationBlocks-style
+    /// seeks on IX_Files_Active_Hash instead. MIN(DiscPath) matches the
+    /// whole-set query's choice of representative copy exactly.
+    /// </remarks>
+    public async Task<string?> GetActivePlainContentPathByHashAsync(
+        int backupSetId, string hash, CancellationToken ct = default)
+    {
+        ct.ThrowIfCancellationRequested();
+        if (string.IsNullOrEmpty(hash))
+            return null;
+
+        using var _ = await LockAsync(ct).ConfigureAwait(false);
+
+        using var cmd = _connection.CreateCommand();
+        cmd.CommandText = """
+            SELECT MIN(f.DiscPath) FROM Files f
+            INNER JOIN Discs d ON f.DiscId = d.Id
+            WHERE f.Hash = $hash
+              AND d.BackupSetId = $setId
+              AND f.IsDeleted = 0
+              AND f.IsFileRef = 0
+              AND f.IsDeduped = 0
+              AND f.IsSplit = 0
+              AND f.IsZipped = 0
+            """;
+        cmd.Parameters.AddWithValue("$setId", backupSetId);
+        cmd.Parameters.AddWithValue("$hash", hash);
+
+        var result = cmd.ExecuteScalar();
+        return result is string s ? s : null;
     }
 
     public async Task<HashSet<long>> GetActivePlainContentSizesAsync(int backupSetId, CancellationToken ct = default)
