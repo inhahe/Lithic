@@ -1,5 +1,445 @@
 # LithicBackup — Known Issues & Tech Debt
 
+## FIXED: "Unable to automatically close all requested applications" (error 1611) — the *Worker service* was never closed before the file-in-use check (2026-08-15)
+
+**Symptom.** Installing 1.0.52 over 1.0.51 failed with:
+
+> The setup was unable to automatically close all requested applications. Please
+> ensure that the applications holding files in use are closed before continuing
+> with the installation.
+
+The GUI was not the problem — that had been solved in 1.0.4x by the
+`SignalLithicGuiShutdown` custom action. The **Worker service** was.
+
+**Root cause: sequencing.** Dumped straight out of the built MSI
+(`installer\dump-seq.ps1`, added with this fix):
+
+| Seq | Action | |
+|---:|---|---|
+| 1399 | `SignalLithicGuiShutdown` | closed the **GUI** only |
+| **1400** | **`InstallValidate`** | **file-in-use check — 1611 originates here** |
+| 1500 | `InstallInitialize` | UAC elevation happens here |
+| 1900 | `StopServices` | `<ServiceControl Stop="both">` ran here — **500 steps too late** |
+
+At 1400 the service is still up, still holding `LithicBackup.Worker.exe` and
+every self-contained DLL it loaded out of `C:\Program Files\Lithic Backup\`.
+Restart Manager sees them, tries to close them, and fails.
+
+`Package.wxs` carried a comment asserting the opposite — *"the elevated installer
+stops the service itself (via SCM) before touching files, so its exe is never
+locked"* — and `CustomAction.cs` matched it: *"the Worker service is handled
+separately via ServiceControl/StopServices."* Both were wrong, and had been since
+the `ServiceControl` element was written. Both are corrected.
+
+**Why it couldn't just stop the service there.** Everything before
+`InstallInitialize` runs in the *unelevated* client process at the invoking user's
+Medium integrity for a double-clicked per-machine MSI. From there, SCM-stopping a
+LocalSystem service is Access Denied — the same integrity wall that made
+*terminating* an elevated GUI impossible, which is what the signal design was
+invented for in the first place.
+
+**Fix — three layers, because each covers a case the others can't.**
+
+1. **Worker listens for a shutdown request** —
+   `src\LithicBackup.Worker\ShutdownSignalListener.cs`, an `IHostedService` that
+   creates `Global\LithicBackup.Worker.Shutdown` via `EventWaitHandleAcl.Create`
+   with an Authenticated Users → `Modify | Synchronize` ACE, and on signal calls
+   `IHostApplicationLifetime.StopApplication()`. `Global\` because the service is
+   in session 0 while the custom action is in the interactive session; the DACL
+   because the signaller is Medium integrity. A process can always shut *itself*
+   down whatever its integrity level, so no elevation is needed. Backed by a
+   20-second watchdog thread (`Environment.Exit(0)`) so a backup in flight cannot
+   leave the installer waiting — aborting mid-run is safe by design (orphan
+   destination writes are removed by the reconcile pass, uncommitted catalog
+   transactions are rolled back by the WAL).
+2. **Custom action signals both** — `SignalLithicGuiShutdown` is renamed
+   `SignalLithicShutdown` and now also (a) tries `ServiceController.Stop()`, which
+   succeeds whenever the MSI was launched already-elevated, (b) signals the
+   Worker's event as the no-privilege fallback, and (c) waits for the GUI and the
+   Worker **concurrently** (25 s total, not per-process).
+3. **In-app updater launches the MSI elevated** —
+   `MainViewModel.DownloadUpdateAsync` now starts `msiexec /i "<path>"` with
+   `Verb = "runas"` instead of ShellExecute-ing the package. That makes the client
+   process elevated, so layer (2)'s SCM stop simply succeeds — which is what makes
+   the *in-app* upgrade path safe even against an old Worker with no listener. It
+   must be `msiexec.exe`, not the `.msi`: Windows registers no `runas` verb for the
+   `.msi` file type.
+
+`<ServiceControl Stop="both">` is kept — it still holds the service down for the
+duration of the file transfer and unregisters it on uninstall. It just isn't what
+passes the check, and the comment now says so.
+
+**Bootstrap caveat (same shape as the GUI's, in 1.0.4x).** An upgrade can only
+signal a listener the **already-installed** build contains. 1.0.51/1.0.52 have no
+Worker listener, so upgrading *from* them by double-clicking the MSI still hits
+1611 unless the service is stopped first. Ways through, once only:
+
+- upgrade from inside the app (Help → Check for Updates) — layer 3 elevates, so
+  layer 2's SCM stop works regardless of the old build; or
+- run the MSI from an elevated prompt: `msiexec /i LithicBackup-1.0.53-x64.msi`; or
+- `sc stop "Lithic Backup"` from an admin prompt, then double-click.
+
+From 1.0.53 onward the plain double-click works unaided.
+
+**Regression guard.** `installer\dump-seq.ps1` dumps `InstallExecuteSequence` and
+`CustomAction` from a built MSI. Run it after touching `Package.wxs` and confirm
+`SignalLithicShutdown` still sits immediately before `InstallValidate` — that
+ordering *is* the fix, and nothing in the build fails if it silently regresses.
+
+---
+
+## FIXED: Worker service pegged a CPU core, part 3 — the two remaining whole-set scans (2026-08-15)
+
+**Measured, after installing the part-2 fix (v1.0.51).** The user reinstalled and
+the Worker was still at **96.7% of a core** — 167.0 MB/s reads, 42,616 read ops/s,
+0.83 MB/s writes, 2,128 MB working set. Part 2 *did* help (from 444.6 MB/s /
+108,549 ops/s / 6,149 MB), but it did not stop the pegging.
+
+**How the remaining cost was found.** The Worker log makes it obvious once you
+read the timestamps rather than the messages:
+
+```
+02:28:53.179  j:  1 changed file(s).
+02:29:13.625  j:  10561536 bytes written.     <- 20.4 s
+02:26:06.548  j:  2 changed file(s).
+02:26:25.328  j:  15176 bytes written.        <- 18.8 s, for 15 KB
+```
+
+Every pass that backs up *anything* costs **19–22 s regardless of how many bytes
+it writes** — a fixed cost, two sets back to back, so the Worker never idles.
+(Passes where nothing needed backing up now return in <100 ms — that part of the
+part-2 fix works.)
+
+**The two culprits, both in `DirectoryBackupService.ExecuteAsync`, timed on a
+consistent snapshot of the real 2.35M-row / 2.3 GB `set-11.db`:**
+
+| Call | What it did | Cost |
+|---|---|---|
+| `GetActivePlainContentSizesAsync` (step 5c size pre-check) | `SELECT DISTINCT SizeBytes` over every active plain row — full index scan + temp B-tree, returning **252,289 sizes** | **6.58 s** |
+| `VersionRetentionService.ComputeRetentionAsync` → `GetAllFilesForBackupSetAsync` | `SELECT f.*` for the **entire set**, ordered, then materialised into 2.35M `FileRecord` objects | **10.36 s** (SQL alone) |
+
+Both ran on every pass, per set. Both were answering a question about the 1–3
+files actually being backed up. Confirmed active on the user's real sets:
+`EnableFileDeduplication=true` + block dedup off makes the size pre-check live,
+and non-empty `RetentionTiers` makes the retention pass live.
+
+**Fix.**
+
+1. **Size pre-check** — new `GetActivePlainSizesPresentAsync(setId, sizes)` probes
+   only the candidate sizes, backed by a new partial index
+   `IX_Files_ActivePlain_Size ON Files(SizeBytes, DiscId)` whose `WHERE` is exactly
+   the "active plain content" predicate, so a probe seeks straight to matching rows.
+   The whole-set form is kept for `DedupSizeEstimator`, which genuinely wants the
+   whole distribution.
+2. **Retention** — new `ComputeRetentionAsync(..., IReadOnlyCollection<string>? pathScope, ...)`
+   overload. Retention is computed per source path from that path's own version rows
+   and the clock, with no cross-path state, so evaluating a subset is exact for that
+   subset. Targeted/continuous backups pass the paths they just wrote
+   (`ExecuteAsync(..., scopeRetentionToBackedUpFiles: true)`); full backups pass null
+   and still sweep everything.
+
+**Deliberate trade in (2).** Retention is partly age-driven, so an untouched path
+can drift into a stricter tier purely by the passage of time. Scoped retention
+won't notice that until the next *full* backup. What must not be deferred — a path
+over quota *because this run just added a version to it* — is always in scope, by
+construction.
+
+**Verification** (no test project exists; done by differential test against the
+live-snapshot ground truth):
+
+| Query plan | Result |
+|---|---|
+| size probe | `SEARCH f USING INDEX IX_Files_ActivePlain_Size (SizeBytes=?)` |
+| per-path fetch | `SEARCH f USING INDEX IX_Files_SourcePath_NoCase (SourcePath=?)` |
+
+| Differential test | Probes | Mismatches |
+|---|---|---|
+| size probe vs whole-set `DISTINCT` (3,000 present + 1,003 absent) | 4,003 | **0** |
+| per-path fetch vs whole-set grouping (8,000 as-stored + 1,000 ASCII-uppercased) | 9,000 | **0** |
+
+| Per-pass catalog cost, 1 changed file | Before | After |
+|---|---|---|
+| size pre-check | 6.58 s | ~25 µs |
+| retention load | 10.36 s | ~69 µs |
+| **total** | **~17 s** | **~0.1 ms** |
+
+New index costs **+23 MB** on the 2.3 GB database and **2.6 s** to build once
+(auto-applied — `SetSchema.sql` is all `CREATE ... IF NOT EXISTS` and runs on
+every set-DB open).
+
+> **Method note, again.** Parts 1 and 2 were each declared plausible on the
+> strength of the one query being looked at, and each time the Worker was still
+> pegged afterwards. The only thing that actually located the cost this time was
+> reading the *elapsed time between log lines* in the running Worker and then
+> timing every whole-set query on a snapshot. Do that first, next time.
+
+## TECH DEBT: `COLLATE NOCASE` (ASCII-only) vs `StringComparer.OrdinalIgnoreCase` (Unicode-aware)
+
+Noticed while differential-testing the retention scoping above. SQLite's `NOCASE`
+collation folds **only ASCII A–Z**; .NET's `StringComparer.OrdinalIgnoreCase`
+folds the full Unicode range. On the real `set-11.db`, **42,131** distinct source
+paths contain non-ASCII characters (e.g.
+`d:\manuals\hoover uh74110_files\Ảnh chụp màn hình ….png`), and **197** of them
+differ between the two foldings.
+
+Consequence: a path whose casing changed *in a non-ASCII character* between
+backups would be treated as the same path by the in-memory grouping but as a
+different path by every indexed lookup (`GetLatestVersionInfoForPathsAsync`,
+`GetFileRecordByPathAndVersionAsync`, `GetFileRecordsByPathAsync`, and now the
+scoped retention fetch) — it would be re-backed-up as a new file rather than a new
+version. This is **pre-existing** (it arrived with `IX_Files_SourcePath_NoCase` in
+v1.0.49) and is not introduced by the retention scoping; NTFS also does not
+normally change the case of an existing name, so it has likely never fired.
+
+Proper fix: store a normalised (e.g. `ToLowerInvariant`) `SourcePathKey` column,
+index that with BINARY collation, and match on it — removing the dependence on
+SQLite's collation semantics entirely. Until then, do not assume the two agree.
+
+## FIXED: Backing up `$Extend` — files that were being DELETED, at paths no one can see (2026-08-15)
+
+**Symptom (as reported).** "`C:\$Extend` isn't showing up in my view of `C:\` in
+Lithic to exclude it, so Lithic must have detected it back when C: was on
+auto-include-new, but can't detect it for the backup set modify treeview."
+
+**What it actually was.** Much worse than an invisible tree node. `\$Extend\$Deleted`
+is NTFS's holding area for files deleted with POSIX semantics or deleted while a
+handle is still open — a file is moved there **because it is being deleted**.
+LithicBackup was backing that area up. Measured in the live catalogs:
+
+| Set | Paths under `$Extend` | Stored versions | Size |
+|---|---|---|---|
+| set-4 | 140 | 145 | **1.12 GB** |
+| set-11 | 548 | 805 | **3.09 GB** |
+
+~4.2 GB of data the user had explicitly thrown away, stored under opaque
+file-ID names, and re-stored on every recurrence: Windows Defender's 140.5 MB
+`mpasbase.vdm` appeared **8 separate times** in set-11 (it is deleted and
+replaced on every signature update). Confirmed no *live* path was hijacked — e.g.
+`D:\visual studio projects\keynote\Output\Dcu\kn_Main.dcu` still has its own
+active v13/v14 records alongside the junk `$Extend` copies.
+
+**Cause — two discovery mechanisms that see different filesystems.**
+
+- **Directory enumeration** (source-selection treeview + full scan) uses
+  `DirectoryInfo.EnumerateDirectories`. NTFS **never** reports its metadata
+  entries there. `C:\$Extend` isn't hidden or access-denied, it is *absent*.
+  (The treeview does show hidden/system entries, which is why the usual
+  suspects weren't the answer.)
+- **The USN change journal**, which continuous backup reads, reports records for
+  those entries **by name**, yielding a real, openable path like
+  `C:\$Extend\$Deleted\001400000008DD22385A431F\mpasbase.vdm`.
+
+So continuous backup could reach paths the GUI could never display, select, or
+exclude. Auto-include-new was a red herring — no enumeration ever "found"
+`$Extend`; the USN journal handed it over directly.
+
+**Full inventory of invisible-but-included paths** (what the user asked for —
+every catalog path whose top-level component is not enumerable on disk):
+
+| Set | Path | Active files | Verdict |
+|---|---|---|---|
+| set-4 | `C:\$Extend` | 5 | NTFS metadata — **fixed** |
+| set-11 | `C:\$Extend` | 316 | NTFS metadata — **fixed** |
+| set-11 | `D:\$Extend` | 232 | NTFS metadata — **fixed** |
+| set-4 | `D:\pic`, `D:\animals.jpg`, `D:\piics.jpg`, `D:\SyncTERM-1.7-setup.exe`, `D:\install_SBBS_v3.20d.exe`, `D:\dearer-to-mind.mp3` | 1 each | not this bug — ordinary files deleted from disk, catalog rows not yet reconciled |
+| set-11 | `D:\books_test` | 292 | same — deleted directory, awaiting reconcile |
+
+Only the `$Extend` rows are genuinely unreachable; the rest are normal
+deleted-source history and are handled by the existing reconcile / Orphaned
+Directories flow.
+
+**Fix (v1.0.51).** New `LithicBackup.Core.VolumeMetadataPaths` defines the set of
+NTFS volume-root metadata names (`$Extend`, `$MFT`, `$MFTMirr`, `$LogFile`,
+`$Volume`, `$AttrDef`, `$Bitmap`, `$Boot`, `$BadClus`, `$Secure`, `$UpCase`) and
+`IsVolumeMetadata(path)`. It matches only the **first component below the volume
+root**, so an ordinary user directory that merely shares the name
+(`D:\projects\$Extend\notes.txt`) is untouched, and it fast-rejects on a single
+`'$'` character test so the continuous hot path pays nothing. Handles drive
+paths, `\\?\` extended-length, and UNC.
+
+Applied at both gates, which is the point — **the invariant is "anything the
+treeview cannot display must not be backed up"**, and it now has one definition:
+
+- `DirectoryBackupService.BuildExclusionFilter` — covers the full scan *and*
+  `ExecuteTargetedAsync` (the USN path), next to the existing hard exclusion for
+  the app's own data directory.
+- `BackupWorker.PathBelongsToSet` — keeps such paths out of set membership and
+  out of auto-include-new's folder discovery, so an auto-include-new parent like
+  all of `C:\` can't sweep them in.
+
+Verified with 22 cases (real catalog paths, case/separator variants,
+`\\?\`/UNC forms, and near-miss negatives like `C:\$Extendo` and
+`D:\$money\report.xls`) — all pass.
+
+**Related duplication removed.** `OrphanedDirectoriesViewModel.DetectExcludedFiles`
+contained a hand-written copy of `BuildExclusionFilter` that had already drifted:
+it applied only the user's patterns, never the app's hard exclusions. That is
+exactly backwards for this dialog — a hard-excluded path can't be seen in the
+source treeview *either*, so this dialog is the user's only route to its leftover
+destination copies. `BuildExclusionFilter` gained an overload taking
+`(excludedExtensions, tierSets)` so `JobOptions` holders call the real thing, and
+the copy is gone. The existing Orphaned Directories cleanup is therefore how the
+~4.2 GB of already-stored `$Extend` data can now be found and removed — it is
+deliberately **not** auto-purged, since deleting backup data is the user's call.
+
+`SourceSelectionViewModel.GetExcludeFilter` is intentionally NOT unified: it
+serves the treeview's filtered-size columns, and its null-when-no-user-exclusions
+return is what lets the treeview skip that computation entirely. Its comment now
+says so instead of claiming to mirror the backup filter.
+
+## FIXED: Worker service pegged a CPU core, part 2 — whole-set catalog maps rebuilt on every continuous-backup wake-up (2026-08-15)
+
+**Symptom.** After v1.0.49 (the index fix below), the Worker was **still** taking
+~8% CPU continuously. Re-measured after a clean rebuild + MSI reinstall:
+**110.1% of one core, 109 MB/s of reads, 27,945 read ops/sec, ZERO writes,
+5,953 MB working set.** The v1.0.49 index was verified present in both live set
+databases, so that fix had applied — it was just not the dominant cost.
+
+**Cause.** Three catalog queries build a map for the **entire backup set**, and
+the continuous-backup path ran them constantly:
+
+| Call site | Query | Cost on the real 2.35 M-row / 1.9 GB set DB |
+|---|---|---|
+| `DirectoryBackupService.ExecuteTargetedAsync` | `GetLatestVersionInfoAsync` | **8.7–12.7 s**, 2,218,513 rows |
+| `DirectoryBackupService.ExecuteAsync` | `GetLatestVersionInfoAsync` | same |
+| `DirectoryBackupService.ExecuteAsync` | `GetOrphanedVersionInfoAsync` | **7.2 s** full scan |
+| `DirectoryBackupService.ExecuteAsync` | `GetActivePlainContentPathsAsync` | **31.7 s**, 1,619,051 rows |
+
+`GetLatestVersionInfo`/`GetOrphanedVersionInfo` use
+`ROW_NUMBER() OVER (PARTITION BY SourcePath COLLATE NOCASE ...)` + `WHERE rn = 1`,
+which *must* scan every row and sort it. `GetActivePlainContentPaths` GROUP BYs
+every active plain row in the set.
+
+The killer was `ExecuteTargetedAsync`: it is invoked on **every** continuous
+wake-up with the 1–30 paths the USN journal just reported, and it materialised
+the whole 2.2 M-entry manifest purely to do a handful of `TryGetValue` calls —
+*including* on the overwhelmingly common wake-up where the USN record was a
+metadata-only touch and **nothing was backed up at all**. Two continuous sets ×
+back-to-back cycles = a core pinned forever, ~4 KB-per-op page reads (the
+signature of SQLite scanning, not of file hashing), and a multi-GB working set
+holding the dictionaries.
+
+**Fix (v1.0.50).** Added path-scoped / hash-scoped variants and used them
+wherever the interesting keys are known up front:
+
+- `ICatalogRepository.GetLatestVersionInfoForPathsAsync(setId, paths, ct)`
+- `ICatalogRepository.GetOrphanedVersionInfoForPathsAsync(setId, paths, ct)`
+- `ICatalogRepository.GetActivePlainContentPathByHashAsync(setId, hash, ct)`
+
+Each resolves one key with an indexed seek —
+`WHERE SourcePath = $path COLLATE NOCASE ORDER BY Version DESC, Id DESC LIMIT 1`
+picks exactly the row the `rn = 1` window formulation picks, but through
+`IX_Files_SourcePath_NoCase` (added in v1.0.49 — that index is what makes this
+fix possible) instead of a scan-and-sort.
+
+Call sites changed:
+
+- `ExecuteTargetedAsync` — now stats the candidates **first**, then asks the
+  catalog about exactly those canonical `FileInfo.FullName` paths. (Statting
+  first matters: the map is keyed by the canonical path the comparison uses, not
+  the raw USN string.)
+- `ExecuteAsync` — `versionInfo` / `orphanedVersionInfo` scoped to
+  `filesToBackup`; both maps were only ever read or written for files in that
+  list, so this is exactly equivalent.
+- `ExecuteAsync` — `knownContentPaths` replaced by a lazy, memoised
+  hash→plain-copy resolver (`ContentPathForHashAsync` / `SetContentPath`).
+  Hashes written during the run are stamped into the cache exactly as they were
+  stamped into the preloaded map, so intra-run dedup is unchanged.
+
+`FileScanner`, `BackupOrchestrator`, `DedupSizeEstimator`, the GUI view models
+and the seed-from-destination import still use the whole-set forms — they
+genuinely need every row.
+
+**Measured (same snapshot, before → after):**
+
+| Query | Whole-set | Per-key |
+|---|---|---|
+| latest version info | 8.72 s | **26 µs**/path |
+| orphaned version info | 7.2 s | **21 µs**/path |
+| active plain content path | 31.73 s | **36 µs**/hash |
+
+A 30-path wake-up now costs **~2 ms** of catalog work instead of **~48 s**.
+
+**Verification.** No test project exists in this solution, so the new queries
+were differentially verified against the old whole-set queries on a consistent
+snapshot of the real `set-11.db`: **14,001 lookups** — 4,000 random live paths,
+500 uppercased case-variants, 500 absent paths, 4,000 random hashes plus a
+nonexistent one, checked against all three whole-set maps — **0 mismatches**.
+Query plans confirmed as `SEARCH ... USING INDEX` (not `SCAN`).
+
+**Lesson for future work here.** v1.0.49 was declared fixed on the strength of a
+real, measured 9,600× improvement to the *per-file* lookups — but the per-file
+lookups were never the dominant term, and that was never checked end-to-end. Any
+future CPU/IO fix in this area must be confirmed by **re-measuring the running
+Worker's CPU and read throughput after install**, not by the improvement to the
+one query that was being looked at.
+
+## FIXED: Worker service pegged a CPU core — missing NOCASE path index caused a full table scan per file (2026-08-15)
+
+> Real but **insufficient** on its own — this fixed the per-file lookups while
+> the dominant cost was the whole-set maps; see the part-2 entry above. The index
+> added here is nevertheless what lets the part-2 fix do indexed seeks.
+
+**Symptom.** `LithicBackup.Worker` was one of the top CPU consumers on the
+machine, more or less permanently. Measured: **one thread pinned at ~90–97% of a
+core**, **31,355 read ops/sec**, **~128 MB/s of reads**, and **zero writes** —
+i.e. it was reading enormous amounts and producing nothing. Continuous-backup
+cycles in the log took **60–100 seconds to handle as few as 2 changed files**.
+
+**Cause.** A missing index, not a loop bug. Three catalog lookups on the
+continuous-backup hot path match a path case-insensitively **without** an
+`IsDeleted = 0` predicate (they must be able to see tombstoned rows):
+
+- `GetFileRecordByPathAndVersionAsync` — revive a tombstoned record; fetch the
+  previous version (called at `DirectoryBackupService` lines ~750, ~780, ~945,
+  all inside the per-file loop)
+- `GetFileRecordsByPathAsync` — full version history
+- `GetFileRecordsUnderDirectoryAsync` — the rename/relocate path
+
+The only NOCASE index, `IX_Files_Active_SourcePath_NoCase`, is **partial**
+(`WHERE IsDeleted = 0`), so SQLite can't use it for queries lacking that
+predicate; and `IX_Files_SourcePath` is **BINARY** collation, so it can't satisfy
+a `COLLATE NOCASE` comparison. Both fall back to a full table scan.
+
+The set databases had grown to **2.35 M rows / ~2 GB**, so each scan read the
+whole table. With up to three lookups **per changed file, per set**, and two
+continuous sets, the worker did gigabytes of scanning for every trivial change —
+hence sustained reads with no writes.
+
+**Measured on the real 2.35 M-row set database** (`EXPLAIN QUERY PLAN` + timings
+on a consistent snapshot):
+
+| Lookup | Before | After |
+|---|---|---|
+| `GetFileRecordByPathAndVersionAsync` | 1086 ms (`SCAN f`) | 0.2 ms (index seek) |
+| `GetFileRecordsByPathAsync` | 1282 ms (`SCAN f`) | 0.1 ms (index seek) |
+| `GetFileRecordsUnderDirectoryAsync` | 727 ms (full index scan) | 0.1 ms (multi-index OR) |
+| **total per file** | **~3,094 ms** | **~0.3 ms** (~9,600×) |
+
+**Fix (v1.0.49).** Added a **non-partial** case-insensitive path index to
+`SetSchema.sql`:
+
+```sql
+CREATE INDEX IF NOT EXISTS IX_Files_SourcePath_NoCase
+    ON Files(SourcePath COLLATE NOCASE);
+```
+
+`SetSchema.sql` is executed on every set-database open and every statement is
+`IF NOT EXISTS`, so existing set databases pick the index up automatically on the
+next service start — no migration step. Cost: ~275 MB on a 2 GB set database and
+a **one-time ~11 s build** on first open after upgrade (service start may pause
+briefly once per set).
+
+Adding `IsDeleted = 0` to the queries instead would have been wrong — those call
+sites specifically need tombstoned rows (reviving a deleted record, full version
+history).
+
+**Possible follow-up (not done).** `IX_Files_Active_SourcePath_NoCase` is now
+largely — but not entirely — redundant: the partial index is still smaller and
+lets the restore browser's range scans skip tombstones for free. Dropping it
+would save ~200 MB per set database at some cost to the browser. Not changed
+without measuring the browser path.
+
 ## FIXED: Lowering the memory budget mid-backup didn't release any memory (2026-07-20)
 
 **Symptom.** "I changed the configuration to only take 1 GB, and it didn't

@@ -92,6 +92,15 @@ public class DirectoryBackupService
     /// When <paramref name="precomputedDiff"/> is supplied the scan/diff
     /// steps are skipped (they were already done during planning).
     /// </summary>
+    /// <param name="scopeRetentionToBackedUpFiles">
+    /// Restrict the retention pass to the paths this run actually wrote, instead
+    /// of re-evaluating every path in the set. Set by targeted/continuous backups,
+    /// where the whole-set pass costs orders of magnitude more than the backup it
+    /// follows; see
+    /// <see cref="VersionRetentionService.ComputeRetentionAsync(int, Func{string, IReadOnlyList{VersionRetentionTier}}, IReadOnlyCollection{string}, CancellationToken)"/>
+    /// for why that is safe and what it defers to the next full backup. A full
+    /// backup must leave this false.
+    /// </param>
     public async Task<BackupResult> ExecuteAsync(
         BackupJob job,
         string targetDirectory,
@@ -100,7 +109,8 @@ public class DirectoryBackupService
         CancellationToken ct,
         ManualResetEventSlim? pauseEvent = null,
         FailureCallback? onFailure = null,
-        BackupDiff? precomputedDiff = null)
+        BackupDiff? precomputedDiff = null,
+        bool scopeRetentionToBackedUpFiles = false)
     {
         BackupDiff diff;
         if (precomputedDiff is not null)
@@ -161,10 +171,20 @@ public class DirectoryBackupService
         }
 
         // 4. Build version lookup and storage format from existing catalog.
-        // Uses a lightweight SQL aggregate query that returns one row per
-        // unique source path instead of loading every FileRecord into memory.
+        //
+        // Scoped to exactly the paths this run will touch. Both maps below are
+        // only ever consulted (and extended) for files in filesToBackup, so a
+        // path-scoped lookup is equivalent to the whole-set form — but it costs
+        // one indexed seek per file instead of a full table scan plus a
+        // window-function sort over every row in the set. On a real 2.2M-row
+        // set the whole-set queries measured ~12.5 s EACH, and continuous
+        // backup runs them on every wake-up: that is what pegged a CPU core and
+        // drove ~110 MB/s of pure reads in the Worker service with nothing
+        // actually being written. See the "Worker pegged a CPU core" entry in
+        // known-issues.md.
+        var lookupPaths = filesToBackup.Select(f => f.FullPath).ToList();
         var versionInfo = job.BackupSetId.HasValue
-            ? await _catalog.GetLatestVersionInfoAsync(backupSetId, ct)
+            ? await _catalog.GetLatestVersionInfoForPathsAsync(backupSetId, lookupPaths, ct)
             : new Dictionary<string, FileVersionInfo>(StringComparer.OrdinalIgnoreCase);
 
         // Orphaned history: paths whose every catalog record is soft-deleted, so
@@ -175,7 +195,7 @@ public class DirectoryBackupService
         // delete-and-recreate the original on every save, tombstoning the record)
         // keep accumulating versions. Looked up lazily per file below.
         var orphanedVersionInfo = job.BackupSetId.HasValue
-            ? await _catalog.GetOrphanedVersionInfoAsync(backupSetId, ct)
+            ? await _catalog.GetOrphanedVersionInfoForPathsAsync(backupSetId, lookupPaths, ct)
             : new Dictionary<string, FileVersionInfo>(StringComparer.OrdinalIgnoreCase);
 
         // Map of content hash -> destination-relative path of an active PLAIN
@@ -189,9 +209,30 @@ public class DirectoryBackupService
         // stamps each new .fileref's ContentPath hint. Seeded from the catalog
         // and extended/updated as plain files are written and moved during this
         // run.
-        var knownContentPaths = job.BackupSetId.HasValue
-            ? await _catalog.GetActivePlainContentPathsAsync(backupSetId, ct)
-            : new Dictionary<string, string>(StringComparer.OrdinalIgnoreCase);
+        //
+        // Resolved LAZILY, one hash at a time, and memoised for the run. The
+        // whole-set form GROUP BYs every active plain row in the set — another
+        // full table scan on every single backup run, for a map whose only
+        // consumers are the handful of hashes this run actually writes. Hashes
+        // stored during the run are stamped straight into the cache
+        // (SetContentPath) exactly as they were stamped into the preloaded map,
+        // so intra-run dedup is unchanged.
+        var contentPathCache = new Dictionary<string, string?>(StringComparer.OrdinalIgnoreCase);
+
+        // Destination-relative path of an active plain copy of this content, or
+        // null when the set has none (so the content still needs real bytes).
+        async Task<string?> ContentPathForHashAsync(string? hash)
+        {
+            if (string.IsNullOrEmpty(hash) || !job.BackupSetId.HasValue)
+                return null;
+            if (contentPathCache.TryGetValue(hash, out string? cached))
+                return cached;
+            string? found = await _catalog.GetActivePlainContentPathByHashAsync(backupSetId, hash, ct);
+            contentPathCache[hash] = found;
+            return found;
+        }
+
+        void SetContentPath(string hash, string discPath) => contentPathCache[hash] = discPath;
 
         // Build a set of changed paths for quick lookup.
         var changedPaths = new HashSet<string>(
@@ -406,7 +447,19 @@ public class DirectoryBackupService
                     candidateSizeCounts.GetValueOrDefault(f.SizeBytes) + 1;
             if (job.BackupSetId.HasValue)
             {
-                try { existingPlainSizes = await _catalog.GetActivePlainContentSizesAsync(backupSetId, ct); }
+                // Ask only about the sizes this run is actually writing. The
+                // whole-set form has to DISTINCT every active plain row (252,289
+                // sizes over 2.35M rows on a real set database — full index scan
+                // plus a temp B-tree, ~6.6 s) to answer a question about the 1-3
+                // sizes below, and it ran on EVERY continuous-backup pass, per
+                // set, forever. That was the second half of the pegged CPU core
+                // (the first being the whole-set version lookups); see the
+                // "Worker pegged a CPU core" entry in known-issues.md.
+                try
+                {
+                    existingPlainSizes = await _catalog.GetActivePlainSizesPresentAsync(
+                        backupSetId, candidateSizeCounts.Keys, ct);
+                }
                 catch { /* fall back to "could be a duplicate" for safety */ existingPlainSizes = new HashSet<long>(); }
             }
         }
@@ -858,7 +911,10 @@ public class DirectoryBackupService
                 //      content AND files with no duplicate blocks. The file is
                 //      written under its own name with its real bytes, so it is a
                 //      normal, directly-usable file just like a non-dedup backup.
-                if (job.EnableFileDeduplication && knownContentPaths.ContainsKey(hash))
+                string? dupContentPath = job.EnableFileDeduplication
+                    ? await ContentPathForHashAsync(hash)
+                    : null;
+                if (dupContentPath is not null)
                 {
                     // (1) Genuine whole-file duplicate: byte-identical content
                     // already has a plain copy stored somewhere in the tree.
@@ -969,8 +1025,8 @@ public class DirectoryBackupService
                             await UpdateFileRefContentPathsAsync(
                                 backupSetId, existingInfo.Hash, prevDiscPath,
                                 targetDirectory, ct);
-                            if (knownContentPaths.ContainsKey(existingInfo.Hash))
-                                knownContentPaths[existingInfo.Hash] = prevDiscPath;
+                            if (await ContentPathForHashAsync(existingInfo.Hash) is not null)
+                                SetContentPath(existingInfo.Hash, prevDiscPath);
                         }
                     }
                 }
@@ -990,7 +1046,7 @@ public class DirectoryBackupService
                     // own source path) and ContentPath (where the bytes live) are
                     // self-describing extras for inspection and catalog-free
                     // restore; ContentPath is a hint, anchored by Hash.
-                    knownContentPaths.TryGetValue(hash, out string? contentDiscPath);
+                    string? contentDiscPath = await ContentPathForHashAsync(hash);
                     var manifest = new FileRefManifest
                     {
                         OriginalName = Path.GetFileName(file.FullPath),
@@ -1073,7 +1129,7 @@ public class DirectoryBackupService
                 // second plain copy. Only plain copies seed this map — .fileref
                 // and .dedup entries don't themselves hold the bytes.
                 if (!isFileRef && !isDeduped && !string.IsNullOrEmpty(hash))
-                    knownContentPaths[hash] = GetCurrentDiscPath(file.FullPath, false, false);
+                    SetContentPath(hash, GetCurrentDiscPath(file.FullPath, false, false));
 
                 // Register this plain copy's prefix hash so a LATER same-size file can
                 // be ruled out (or escalated) by the progressive prefix check. Keyed
@@ -1455,16 +1511,25 @@ public class DirectoryBackupService
         {
             try
             {
-                IReadOnlyList<FileRecord> toDelete;
-                if (tierResolver is not null)
-                {
-                    toDelete = await _retention.ComputeRetentionAsync(backupSetId,
-                        path => tierResolver(path).Tiers, ct);
-                }
-                else
-                {
-                    toDelete = await _retention.ComputeRetentionAsync(backupSetId, retentionTiers!, ct);
-                }
+                // A targeted run only added versions to the files it just wrote,
+                // so only those paths can have newly exceeded their quota. The
+                // whole-set alternative materialises every record in the set
+                // (2.35M rows / ~10.4 s of SQL on a real set database, plus the
+                // objects) after backing up, typically, one file — the largest
+                // single term in the Worker pegging a CPU core. Age-driven
+                // pruning of untouched paths still happens on the next full
+                // backup, which passes a null scope.
+                IReadOnlyCollection<string>? pathScope = scopeRetentionToBackedUpFiles
+                    ? filesToBackup.Select(f => f.FullPath).ToList()
+                    : null;
+
+                Func<string, IReadOnlyList<VersionRetentionTier>> tierSelector =
+                    tierResolver is not null
+                        ? path => tierResolver(path).Tiers
+                        : _ => retentionTiers!;
+
+                IReadOnlyList<FileRecord> toDelete =
+                    await _retention.ComputeRetentionAsync(backupSetId, tierSelector, pathScope, ct);
 
                 var toDeleteIds = toDelete.Select(f => f.Id).ToHashSet();
 
@@ -1634,11 +1699,11 @@ public class DirectoryBackupService
             throw new ArgumentException("Targeted backup requires an existing backup set.", nameof(job));
 
         var isExcluded = BuildExclusionFilter(job);
-        var versionInfo = await _catalog.GetLatestVersionInfoAsync(job.BackupSetId.Value, ct);
 
-        var newFiles = new List<ScannedFile>();
-        var changedFiles = new List<ScannedFile>();
-
+        // Stat the candidates first, so the catalog is asked about the SAME
+        // canonical paths the comparison below uses (FileInfo.FullName, not the
+        // raw USN-supplied string).
+        var scannedFiles = new List<ScannedFile>();
         foreach (var path in candidatePaths.Distinct(StringComparer.OrdinalIgnoreCase))
         {
             ct.ThrowIfCancellationRequested();
@@ -1658,23 +1723,47 @@ public class DirectoryBackupService
                 continue;
             }
 
-            var scanned = new ScannedFile
+            scannedFiles.Add(new ScannedFile
             {
                 FullPath = info.FullName,
                 SizeBytes = info.Length,
                 LastWriteUtc = info.LastWriteTimeUtc,
-            };
+            });
+        }
 
-            if (!versionInfo.TryGetValue(scanned.FullPath, out var last))
+        var newFiles = new List<ScannedFile>();
+        var changedFiles = new List<ScannedFile>();
+
+        if (scannedFiles.Count > 0)
+        {
+            // Only the candidate paths matter here, so look up exactly those
+            // rather than materialising the set's entire manifest. This method
+            // runs on EVERY continuous-backup wake-up — including the
+            // overwhelmingly common case where the USN journal reported a
+            // metadata-only touch and nothing ends up being backed up at all —
+            // so a whole-set query here cost a full 2.2M-row scan plus a
+            // window-function sort (~12.5 s, ~110 MB/s of reads) per wake-up,
+            // per set, forever. That is what pegged a CPU core in the Worker
+            // service; see the "Worker pegged a CPU core" entry in
+            // known-issues.md.
+            var versionInfo = await _catalog.GetLatestVersionInfoForPathsAsync(
+                job.BackupSetId.Value,
+                scannedFiles.Select(f => f.FullPath).ToList(),
+                ct);
+
+            foreach (var scanned in scannedFiles)
             {
-                newFiles.Add(scanned);
+                if (!versionInfo.TryGetValue(scanned.FullPath, out var last))
+                {
+                    newFiles.Add(scanned);
+                }
+                else if (scanned.SizeBytes != last.SizeBytes
+                         || scanned.LastWriteUtc > last.SourceLastWriteUtc)
+                {
+                    changedFiles.Add(scanned);
+                }
+                // else: catalog already has this exact version — nothing to do.
             }
-            else if (scanned.SizeBytes != last.SizeBytes
-                     || scanned.LastWriteUtc > last.SourceLastWriteUtc)
-            {
-                changedFiles.Add(scanned);
-            }
-            // else: catalog already has this exact version — nothing to do.
         }
 
         if (newFiles.Count == 0 && changedFiles.Count == 0)
@@ -1697,7 +1786,8 @@ public class DirectoryBackupService
 
         return await ExecuteAsync(
             job, targetDirectory, retentionTiers,
-            progress: null, ct, precomputedDiff: diff);
+            progress: null, ct, precomputedDiff: diff,
+            scopeRetentionToBackedUpFiles: true);
     }
 
     /// <summary>
@@ -1989,19 +2079,37 @@ public class DirectoryBackupService
     /// and tier-based exclusion (tier sets with 0 tiers = excluded from backup).
     /// </summary>
     public static Func<string, bool>? BuildExclusionFilter(BackupJob job)
+        => BuildExclusionFilter(job.ExcludedExtensions, job.TierSets);
+
+    /// <summary>
+    /// Overload taking the two settings the filter actually depends on, so
+    /// callers holding a <see cref="JobOptions"/> (which carries the same two
+    /// fields) rather than a <see cref="BackupJob"/> can use the REAL filter
+    /// instead of re-implementing it.
+    /// </summary>
+    /// <remarks>
+    /// This exists because a hand-written copy of this logic in the Orphaned
+    /// Directories view had already drifted from the original — it was missing
+    /// the unconditional hard exclusions, so anything excluded by the app rather
+    /// than by user patterns simply never showed up there. One definition, two
+    /// entry points.
+    /// </remarks>
+    public static Func<string, bool>? BuildExclusionFilter(
+        IReadOnlyList<string> excludedExtensions,
+        IReadOnlyList<VersionTierSet> tierSets)
     {
-        var globalFilter = job.ExcludedExtensions.Count > 0
-            ? GlobMatcher.CreateFilter(job.ExcludedExtensions) : null;
+        var globalFilter = excludedExtensions.Count > 0
+            ? GlobMatcher.CreateFilter(excludedExtensions) : null;
 
         // Tier sets with 0 tiers act as exclusion rules: matched files are
         // not backed up at all.  Build a resolver and check at scan time.
         Func<string, VersionTierSet>? tierResolver = null;
-        if (job.TierSets.Count > 0)
+        if (tierSets.Count > 0)
         {
-            var resolver = VersionTierSet.BuildTierResolver(job.TierSets);
+            var resolver = VersionTierSet.BuildTierResolver(tierSets);
             // Only pay the per-file cost if at least one non-default tier set
             // has 0 tiers (i.e. acts as an exclusion set).
-            bool hasExclusionTierSet = job.TierSets.Any(ts =>
+            bool hasExclusionTierSet = tierSets.Any(ts =>
                 ts.Tiers.Count == 0
                 && ts.FilePatterns.Count > 0
                 && !string.Equals(ts.Name, "Default", StringComparison.OrdinalIgnoreCase));
@@ -2020,6 +2128,19 @@ public class DirectoryBackupService
             // up its own live, open databases and fail with lock/sharing errors.
             if (CatalogLocation.IsInsideAppDataDirectory(path))
                 return true;
+
+            // Hard exclusion: NTFS volume metadata ($Extend and friends). The USN
+            // journal reports these by name, so continuous backup can resolve a
+            // real, openable path under them — but directory enumeration never
+            // returns them, so they can't appear in the selection treeview and the
+            // user has no way to see or exclude them. The largest of them,
+            // \$Extend\$Deleted, is NTFS's holding area for files that are IN THE
+            // PROCESS OF BEING DELETED, so backing it up stores exactly the data
+            // the user just discarded. See VolumeMetadataPaths and the "$Extend"
+            // entry in known-issues.md.
+            if (VolumeMetadataPaths.IsVolumeMetadata(path))
+                return true;
+
             if (globalFilter?.Invoke(path) ?? false)
                 return true;
             if (tierResolver is not null && tierResolver(path).Tiers.Count == 0)

@@ -2,7 +2,7 @@
 
 ## Versioning (Claude controls this)
 
-**Current version: `1.0.48`**
+**Current version: `1.0.53`**
 
 Claude owns the version number. Do not hand-edit it — ask Claude to bump it and
 Claude will keep every place in sync.
@@ -28,17 +28,34 @@ Claude will keep every place in sync.
 
 The tag must be `v` + the exact version so the update check matches it.
 
-**How upgrades close the running GUI (no elevation, no reboot):** the GUI can't
-be safely *killed* by the installer when it runs elevated (a Medium-integrity
-installer action can't terminate a High-integrity process — that's what caused
-the old "The setup was unable to automatically close all requested applications"
-failures). Instead the installer *asks* the GUI to exit: the managed custom
-action `SignalLithicGuiShutdown` (`installer\CustomActions\CustomAction.cs`) sets
-a named event the GUI listens on (`App.xaml.cs`, `LithicBackup.Shutdown`) and
-waits for `LithicBackup.exe` to exit, all before `InstallValidate`. A process can
-always close itself regardless of integrity level, so no `taskkill`, elevation,
-or self-elevating bundle is needed. **Bootstrap caveat:** this only works once the
-*running* build already contains the listener — the upgrade that first delivers
-it still relies on the in-app updater closing the old GUI itself (the custom
-action's wait removes the race) or on the user closing it manually. See the
-MSI-upgrade entry in `known-issues.md`.
+**How upgrades close the running GUI *and* Worker service (no elevation, no
+reboot):** neither can be safely *killed* or *stopped* by the installer's
+pre-validate work — everything before `InstallInitialize` runs unelevated at the
+invoking user's Medium integrity, which can't terminate a High-integrity GUI
+(UIPI) and can't SCM-stop a LocalSystem service. That's what caused the "The
+setup was unable to automatically close all requested applications" failures
+(error 1611). Instead the installer *asks* both processes to exit: the managed
+custom action `SignalLithicShutdown` (`installer\CustomActions\CustomAction.cs`)
+sets the named event each listens on and waits (bounded, concurrently) for both
+to exit, all before `InstallValidate`:
+
+| Process | Event | Listener |
+|---|---|---|
+| GUI | `LithicBackup.Shutdown` | `src\LithicBackup\App.xaml.cs` |
+| Worker service | `Global\LithicBackup.Worker.Shutdown` | `src\LithicBackup.Worker\ShutdownSignalListener.cs` |
+
+A process can always close itself regardless of integrity level, so no
+`taskkill`, elevation, or self-elevating bundle is needed. (`Global\` for the
+Worker because the service is in session 0 while the custom action is in the
+user's interactive session.)
+
+**Why `<ServiceControl Stop="both">` in `Package.wxs` does not cover this:** it
+executes at `StopServices` (sequence **1900**), while the file-in-use check is at
+`InstallValidate` (**1400**) — 500 steps earlier, with the service still running
+and still holding its exe and DLLs. It's kept for what it *does* do: hold the
+service down for the file transfer and unregister it on uninstall.
+
+**Bootstrap caveat:** this only works once the *running* build already contains
+the listener — the upgrade that first delivers one still falls back to Windows
+Installer's own handling for that process. See the MSI-upgrade entry in
+`known-issues.md`.

@@ -2,8 +2,9 @@
 
   <!--
     Managed (DTF) Windows Installer custom action that tells a running Lithic
-    Backup GUI to close itself before the MSI's file-in-use check. See
-    CustomAction.cs and installer\Package.wxs (SignalLithicGuiShutdown).
+    Backup GUI and Worker service to close themselves before the MSI's
+    file-in-use check. See CustomAction.cs and installer\Package.wxs
+    (SignalLithicShutdown).
 
     Built with `dotnet build` as part of installer\build-installer.ps1. Targets
     .NET Framework 4.7.2 (the runtime DTF's SfxCA host loads); the reference
@@ -23,6 +24,15 @@
     <GenerateAssemblyInfo>true</GenerateAssemblyInfo>
     <AppendTargetFrameworkToOutputPath>false</AppendTargetFrameworkToOutputPath>
   </PropertyGroup>
+
+  <ItemGroup>
+    <!--
+      ServiceController, used to ask the SCM to stop the Worker service when the
+      MSI happens to be running elevated. A framework assembly, so it needs no
+      package and adds nothing to the packed CA .dll.
+    -->
+    <Reference Include="System.ServiceProcess" />
+  </ItemGroup>
 
   <ItemGroup>
     <PackageReference Include="WixToolset.Dtf.CustomAction" Version="5.0.2" />

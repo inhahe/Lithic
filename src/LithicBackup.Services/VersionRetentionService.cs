@@ -50,8 +50,64 @@ public class VersionRetentionService : IVersionRetentionService
         int backupSetId,
         Func<string, IReadOnlyList<VersionRetentionTier>> tierSelector,
         CancellationToken ct = default)
+        => await ComputeRetentionAsync(backupSetId, tierSelector, pathScope: null, ct);
+
+    /// <summary>
+    /// As above, but optionally restricted to <paramref name="pathScope"/>.
+    /// </summary>
+    /// <param name="pathScope">
+    /// When null, every path in the set is evaluated. When non-null, only these
+    /// source paths are — used by continuous/targeted backups, which write a new
+    /// version for a handful of paths and would otherwise pay for the whole set.
+    /// </param>
+    /// <remarks>
+    /// <para>
+    /// Retention is computed per source path from that path's own version rows
+    /// and the current time — no cross-path state — so evaluating a subset of
+    /// paths yields exactly the same verdicts for those paths as evaluating all
+    /// of them.
+    /// </para>
+    /// <para>
+    /// The scoping is nonetheless a deliberate trade, because retention is partly
+    /// age-driven: a path nobody touched can drift into an older, stricter tier
+    /// purely by the passage of time. Those paths are pruned by the next
+    /// <em>full</em> backup, which always passes a null scope. What must not be
+    /// deferred — a path exceeding its quota <em>because this run just added a
+    /// version to it</em> — is always in scope, since the scope is precisely the
+    /// files this run wrote.
+    /// </para>
+    /// <para>
+    /// The whole-set form loads and materialises every record in the set:
+    /// 2.35M rows / ~10.4 s of SQL alone on a real set database, plus the objects
+    /// and the GC pressure of building them. Running that after every
+    /// continuous-backup pass — typically to retire versions of the single file
+    /// that changed — was the largest remaining term in the Worker service
+    /// pegging a CPU core. See the "Worker pegged a CPU core" entry in
+    /// known-issues.md.
+    /// </para>
+    /// </remarks>
+    public async Task<IReadOnlyList<FileRecord>> ComputeRetentionAsync(
+        int backupSetId,
+        Func<string, IReadOnlyList<VersionRetentionTier>> tierSelector,
+        IReadOnlyCollection<string>? pathScope,
+        CancellationToken ct = default)
     {
-        var allFiles = await _catalog.GetAllFilesForBackupSetAsync(backupSetId, ct);
+        IReadOnlyList<FileRecord> allFiles;
+        if (pathScope is null)
+        {
+            allFiles = await _catalog.GetAllFilesForBackupSetAsync(backupSetId, ct);
+        }
+        else
+        {
+            var scoped = new List<FileRecord>();
+            foreach (var path in pathScope.Distinct(StringComparer.OrdinalIgnoreCase))
+            {
+                ct.ThrowIfCancellationRequested();
+                scoped.AddRange(await _catalog.GetFileRecordsByPathAsync(backupSetId, path, ct));
+            }
+            allFiles = scoped;
+        }
+
         var now = DateTime.UtcNow;
 
         // Group by source path.

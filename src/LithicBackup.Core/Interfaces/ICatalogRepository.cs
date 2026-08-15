@@ -103,6 +103,26 @@ public interface ICatalogRepository : IDisposable
     Task<Dictionary<string, FileVersionInfo>> GetOrphanedVersionInfoAsync(int backupSetId, CancellationToken ct = default);
 
     /// <summary>
+    /// Path-scoped variants of <see cref="GetLatestVersionInfoAsync"/> and
+    /// <see cref="GetOrphanedVersionInfoAsync"/>: same semantics, but the result
+    /// is restricted to <paramref name="paths"/> (matched case-insensitively,
+    /// as the Windows filesystem does) and each path is resolved with an indexed
+    /// seek instead of a whole-set scan-and-sort.
+    ///
+    /// Prefer these whenever the set of interesting paths is known up front — a
+    /// continuous-backup wake-up, or any run working from a precomputed diff.
+    /// The whole-set forms cost a full table scan plus a window-function sort
+    /// over every row (~12.5 s on a 2.2M-row set), which is what pegged a CPU
+    /// core in the Worker service. See known-issues.md.
+    /// </summary>
+    Task<Dictionary<string, FileVersionInfo>> GetLatestVersionInfoForPathsAsync(
+        int backupSetId, IReadOnlyCollection<string> paths, CancellationToken ct = default);
+
+    /// <inheritdoc cref="GetLatestVersionInfoForPathsAsync"/>
+    Task<Dictionary<string, FileVersionInfo>> GetOrphanedVersionInfoForPathsAsync(
+        int backupSetId, IReadOnlyCollection<string> paths, CancellationToken ct = default);
+
+    /// <summary>
     /// Fast scalar count of distinct source paths in a backup set (non-deleted).
     /// Use for progress bar estimates instead of loading full file metadata.
     /// </summary>
@@ -151,6 +171,18 @@ public interface ICatalogRepository : IDisposable
     Task<Dictionary<string, string>> GetActivePlainContentPathsAsync(int backupSetId, CancellationToken ct = default);
 
     /// <summary>
+    /// Single-hash variant of <see cref="GetActivePlainContentPathsAsync"/>:
+    /// the destination-relative path of an active plain copy of
+    /// <paramref name="hash"/>, or null when the set has none.
+    ///
+    /// A backup only needs the entries for the content it is actually writing,
+    /// so it resolves them one hash at a time (an indexed seek) instead of
+    /// GROUP BY-ing every active plain row in a multi-million-row set on every
+    /// run. See the "Worker pegged a CPU core" entry in known-issues.md.
+    /// </summary>
+    Task<string?> GetActivePlainContentPathByHashAsync(int backupSetId, string hash, CancellationToken ct = default);
+
+    /// <summary>
     /// The distinct byte sizes of all content that currently has an active plain
     /// copy in the set (the same population as
     /// <see cref="GetActivePlainContentPathsAsync"/>). A directory backup uses
@@ -160,6 +192,25 @@ public interface ICatalogRepository : IDisposable
     /// instead of being read once to hash and again to copy.
     /// </summary>
     Task<HashSet<long>> GetActivePlainContentSizesAsync(int backupSetId, CancellationToken ct = default);
+
+    /// <summary>
+    /// Which of <paramref name="sizes"/> are present among the set's active plain
+    /// content — i.e. the intersection of <paramref name="sizes"/> with
+    /// <see cref="GetActivePlainContentSizesAsync"/>, computed without
+    /// materialising the whole set.
+    /// </summary>
+    /// <remarks>
+    /// The whole-set form has to DISTINCT every active plain row (252,289 sizes
+    /// over 2.35M rows on a real set database — a full index scan plus a temp
+    /// B-tree, ~6.6 s) purely so a backup can ask about the handful of sizes it
+    /// is actually writing. A backup pass therefore probes only its own candidate
+    /// sizes, one indexed seek each against <c>IX_Files_ActivePlain_Size</c>.
+    /// Only the estimator, which genuinely wants the whole distribution, still
+    /// uses the whole-set form. See the "Worker pegged a CPU core" entry in
+    /// known-issues.md.
+    /// </remarks>
+    Task<HashSet<long>> GetActivePlainSizesPresentAsync(
+        int backupSetId, IReadOnlyCollection<long> sizes, CancellationToken ct = default);
 
     /// <summary>
     /// All active (non-deleted) file records in a backup set whose content hash

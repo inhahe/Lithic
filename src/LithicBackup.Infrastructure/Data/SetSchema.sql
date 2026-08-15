@@ -102,3 +102,51 @@ CREATE INDEX IF NOT EXISTS IX_Files_Active_Hash
 CREATE INDEX IF NOT EXISTS IX_Files_Active_SourcePath_NoCase
     ON Files(SourcePath COLLATE NOCASE)
     WHERE IsDeleted = 0;
+
+-- Case-insensitive path index over ALL rows, including tombstones.
+--
+-- The partial index above cannot serve version-history lookups, because those
+-- must see deleted rows: GetFileRecordByPathAndVersionAsync (used to revive a
+-- tombstoned record and to fetch the previous version when writing a new one),
+-- GetFileRecordsByPathAsync and GetFileRecordsUnderDirectoryAsync all match on
+-- `SourcePath = ? COLLATE NOCASE` WITHOUT an `IsDeleted = 0` predicate, so
+-- SQLite may not use a `WHERE IsDeleted = 0` partial index, and the plain
+-- IX_Files_SourcePath is BINARY collation so it can't satisfy a NOCASE compare
+-- either. The result was a FULL TABLE SCAN per lookup — and the continuous
+-- backup path runs up to three of them PER CHANGED FILE, PER SET.
+--
+-- Measured on a real 2.35M-row / 2 GB set database: the three lookups cost
+-- ~3,100 ms combined before this index and ~0.3 ms after (~9,600x), which is
+-- what pinned a core and drove ~128 MB/s of pure reads with zero writes in the
+-- Worker service. The index costs ~275 MB on that database and ~11 s to build
+-- once. See the "Worker pegged a CPU core" entry in known-issues.md.
+CREATE INDEX IF NOT EXISTS IX_Files_SourcePath_NoCase
+    ON Files(SourcePath COLLATE NOCASE);
+
+-- Whole-file-duplicate size pre-check (DirectoryBackupService step 5c): "does any
+-- active plain copy in this set already have byte size N?".  Only files whose size
+-- collides with stored content can be whole-file duplicates, so this answers, per
+-- candidate file, whether the file must be hashed up front or can take the
+-- single-pass hash-while-copy path.
+--
+-- The predicate is exactly the "active plain content" definition, so the index is
+-- partial on all five flags.  That keeps it small (only live plain copies, not
+-- tombstones / .fileref / .dedup rows) and lets a size probe seek straight to the
+-- matching rows with all five flags already satisfied.  DiscId rides along as a
+-- second column so the Files->Discs join reads no table row; only the residual
+-- `Hash <> ''` check touches the table, and only for the first candidate row
+-- (each probe is LIMIT 1).
+--
+-- Measured on the real 2.35M-row / 2.3 GB set database: the previous
+-- GetActivePlainContentSizesAsync materialised a DISTINCT of every active plain
+-- size (252,289 of them) via a full index SCAN plus a temp B-tree, costing
+-- ~6.6 s — on EVERY backup pass, to answer a question about the 1-3 sizes
+-- actually being backed up.  Probing just those sizes against this index is an
+-- indexed seek each.  See the "Worker pegged a CPU core" entry in known-issues.md.
+CREATE INDEX IF NOT EXISTS IX_Files_ActivePlain_Size
+    ON Files(SizeBytes, DiscId)
+    WHERE IsDeleted = 0
+      AND IsFileRef = 0
+      AND IsDeduped = 0
+      AND IsSplit = 0
+      AND IsZipped = 0;

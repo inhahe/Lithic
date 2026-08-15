@@ -412,6 +412,14 @@ public class SqliteCatalogRepository : ICatalogRepository
     public Task<Dictionary<string, FileVersionInfo>> GetOrphanedVersionInfoAsync(int backupSetId, CancellationToken ct = default)
         => GetSet(backupSetId).GetOrphanedVersionInfoAsync(backupSetId, ct);
 
+    public Task<Dictionary<string, FileVersionInfo>> GetLatestVersionInfoForPathsAsync(
+        int backupSetId, IReadOnlyCollection<string> paths, CancellationToken ct = default)
+        => GetSet(backupSetId).GetLatestVersionInfoForPathsAsync(backupSetId, paths, ct);
+
+    public Task<Dictionary<string, FileVersionInfo>> GetOrphanedVersionInfoForPathsAsync(
+        int backupSetId, IReadOnlyCollection<string> paths, CancellationToken ct = default)
+        => GetSet(backupSetId).GetOrphanedVersionInfoForPathsAsync(backupSetId, paths, ct);
+
     public Task<int> GetFileCountForBackupSetAsync(int backupSetId, CancellationToken ct = default)
         => GetSet(backupSetId).GetFileCountForBackupSetAsync(backupSetId, ct);
 
@@ -430,8 +438,15 @@ public class SqliteCatalogRepository : ICatalogRepository
     public Task<Dictionary<string, string>> GetActivePlainContentPathsAsync(int backupSetId, CancellationToken ct = default)
         => GetSet(backupSetId).GetActivePlainContentPathsAsync(backupSetId, ct);
 
+    public Task<string?> GetActivePlainContentPathByHashAsync(int backupSetId, string hash, CancellationToken ct = default)
+        => GetSet(backupSetId).GetActivePlainContentPathByHashAsync(backupSetId, hash, ct);
+
     public Task<HashSet<long>> GetActivePlainContentSizesAsync(int backupSetId, CancellationToken ct = default)
         => GetSet(backupSetId).GetActivePlainContentSizesAsync(backupSetId, ct);
+
+    public Task<HashSet<long>> GetActivePlainSizesPresentAsync(
+        int backupSetId, IReadOnlyCollection<long> sizes, CancellationToken ct = default)
+        => GetSet(backupSetId).GetActivePlainSizesPresentAsync(backupSetId, sizes, ct);
 
     public Task<IReadOnlyList<FileRecord>> GetActiveRecordsByHashAsync(int backupSetId, string hash, CancellationToken ct = default)
         => GetSet(backupSetId).GetActiveRecordsByHashAsync(backupSetId, hash, ct);

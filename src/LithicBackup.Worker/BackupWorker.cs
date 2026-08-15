@@ -1,4 +1,5 @@
 using System.Collections.Concurrent;
+using LithicBackup.Core;
 using LithicBackup.Core.Interfaces;
 using LithicBackup.Core.Models;
 using LithicBackup.Infrastructure.Data;
@@ -1096,6 +1097,16 @@ public sealed class BackupWorker : BackgroundService
         // stops the worker from queuing its own live database writes for backup and
         // from materializing C:\ProgramData\LithicBackup into the selection tree.
         if (CatalogLocation.IsInsideAppDataDirectory(path))
+            return false;
+
+        // Hard exclusion: NTFS volume metadata ($Extend and friends). The USN
+        // journal names these, so they reach us here as ordinary-looking paths,
+        // but no directory enumeration will ever produce them — so they can't be
+        // shown in the selection treeview, can't be deselected, and must not be
+        // swept in by an auto-include-new parent such as all of C:\. Rejecting
+        // them here also keeps them out of auto-include-new's folder discovery.
+        // See VolumeMetadataPaths for the full rationale.
+        if (VolumeMetadataPaths.IsVolumeMetadata(path))
             return false;
 
         if (set.SourceSelections is { Count: > 0 })

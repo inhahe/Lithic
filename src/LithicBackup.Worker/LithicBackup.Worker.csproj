@@ -9,6 +9,14 @@
 
   <ItemGroup>
     <PackageReference Include="Microsoft.Extensions.Hosting.WindowsServices" Version="8.*" />
+    <!--
+      EventWaitHandleAcl / EventWaitHandleSecurity, used by ShutdownSignalListener
+      to create the Global\ shutdown event with a DACL the installer's unelevated
+      custom action can Set. The GUI gets these types for free from the Windows
+      Desktop shared framework; a plain Worker SDK project does not, so the
+      package is explicit here.
+    -->
+    <PackageReference Include="System.Threading.AccessControl" Version="8.*" />
   </ItemGroup>
 
   <ItemGroup>

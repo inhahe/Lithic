@@ -127,13 +127,21 @@
                       Vital="no" />
 
       <!--
-        Stop the running Worker on BOTH install and uninstall, and wait for it
-        to fully stop.  The "install" half is what matters for upgrades/reinstalls:
-        the elevated installer stops the service itself (via SCM) before touching
-        files, so its exe is never locked.  Without this the Restart Manager sees
-        the worker holding its own .exe, can't gracefully close a service, and
-        falls back to the "unable to automatically close all requested
-        applications" dialog.  Remove happens only on uninstall.
+        Stop the running Worker on BOTH install and uninstall, and wait for it to
+        fully stop.  Remove happens only on uninstall.
+
+        NOTE what this does NOT do: it does not prevent the "setup was unable to
+        automatically close all requested applications" dialog (error 1611).
+        ServiceControl runs at StopServices (sequence 1900), 500 steps AFTER
+        InstallValidate (1400), which is where the file-in-use check happens — so
+        at the moment that check runs, the service is still up and still holding
+        LithicBackup.Worker.exe and every self-contained DLL it loaded from this
+        folder.  Passing the check is the job of the SignalLithicShutdown custom
+        action below, which is sequenced Before InstallValidate.
+
+        This element still earns its place: it keeps the service stopped for the
+        duration of the file transfer (so nothing restarts it mid-copy) and
+        unregisters it on uninstall.
       -->
       <ServiceControl Id="WorkerServiceStopRemove"
                       Name="Lithic Backup"
@@ -208,39 +216,54 @@
           modify, or uninstall.
     -->
     <!--
-      Ask the running GUI to close itself before the file-in-use check.
+      Ask BOTH holders of the install folder — the GUI and the Worker service —
+      to close themselves before the file-in-use check.
 
       Managed (DTF) custom action, built by installer\CustomActions and embedded
-      as the LithicCustomActions binary.  SignalLithicGuiShutdown sets the named
-      event the GUI listens on and waits (bounded) for LithicBackup.exe to exit.
-      Scheduled Before InstallValidate (see InstallExecuteSequence below) so the
-      .exe is released before MSI looks for open files — this is what prevents the
-      "unable to automatically close all requested applications" upgrade dialog,
-      without needing to out-rank an elevated GUI.
+      as the LithicCustomActions binary.  SignalLithicShutdown sets the named
+      event each process listens on (LithicBackup.Shutdown for the GUI, see
+      src\LithicBackup\App.xaml.cs; Global\LithicBackup.Worker.Shutdown for the
+      service, see src\LithicBackup.Worker\ShutdownSignalListener.cs) and waits,
+      bounded and concurrently, for both processes to exit.
+
+      Scheduled Before InstallValidate (see InstallExecuteSequence below) so both
+      executables and all their self-contained DLLs are released before MSI looks
+      for open files.  This — not the ServiceControl element above — is what
+      prevents the "unable to automatically close all requested applications"
+      dialog (error 1611): ServiceControl runs at StopServices (1900), while the
+      check runs at InstallValidate (1400).
 
         * Execute="immediate"  — runs during sequence processing, before the
           file-in-use detection; a deferred action would run far too late.
-        * Impersonate="yes"    — runs as the invoking user (Medium).  Signalling a
-          same-user, unlabeled event needs no elevation even when the GUI is High.
+        * Impersonate="yes"    — runs as the invoking user (Medium).  That user
+          can neither terminate a High-integrity GUI nor SCM-stop a LocalSystem
+          service, which is exactly why the action ASKS instead: a process can
+          always shut itself down regardless of integrity level.  (It does still
+          try ServiceController.Stop first, which succeeds on the paths where the
+          MSI was launched already-elevated.)
         * Return="ignore"      — this is a best-effort convenience; the action also
-          returns Success internally.  A first-time install (no GUI running) is a
+          returns Success internally.  A first-time install (nothing running) is a
           harmless no-op.
 
       No condition: attempting the signal on every install/upgrade/uninstall is
-      harmless (a no-op when the GUI isn't running) and keeps behavior predictable.
+      harmless (a no-op when nothing is running) and keeps behavior predictable.
+
+      Bootstrap caveat: an upgrade can only signal a listener the ALREADY-INSTALLED
+      build contains.  The upgrade that first delivers a listener still falls back
+      to Windows Installer's own handling for that one process.
     -->
     <Binary Id="LithicCustomActions"
             SourceFile="CustomActions\bin\Release\LithicBackup.CustomActions.CA.dll" />
 
-    <CustomAction Id="SignalLithicGuiShutdown"
+    <CustomAction Id="SignalLithicShutdown"
                   BinaryRef="LithicCustomActions"
-                  DllEntry="SignalLithicGuiShutdown"
+                  DllEntry="SignalLithicShutdown"
                   Execute="immediate"
                   Impersonate="yes"
                   Return="ignore" />
 
     <InstallExecuteSequence>
-      <Custom Action="SignalLithicGuiShutdown" Before="InstallValidate" />
+      <Custom Action="SignalLithicShutdown" Before="InstallValidate" />
     </InstallExecuteSequence>
 
     <Property Id="WIXUI_EXITDIALOGOPTIONALCHECKBOXTEXT" Value="Launch Lithic Backup" />
