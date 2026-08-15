@@ -1,5 +1,97 @@
 # LithicBackup — Known Issues & Tech Debt
 
+## FIXED: Backing up `$Extend` — files that were being DELETED, at paths no one can see (2026-08-15)
+
+**Symptom (as reported).** "`C:\$Extend` isn't showing up in my view of `C:\` in
+Lithic to exclude it, so Lithic must have detected it back when C: was on
+auto-include-new, but can't detect it for the backup set modify treeview."
+
+**What it actually was.** Much worse than an invisible tree node. `\$Extend\$Deleted`
+is NTFS's holding area for files deleted with POSIX semantics or deleted while a
+handle is still open — a file is moved there **because it is being deleted**.
+LithicBackup was backing that area up. Measured in the live catalogs:
+
+| Set | Paths under `$Extend` | Stored versions | Size |
+|---|---|---|---|
+| set-4 | 140 | 145 | **1.12 GB** |
+| set-11 | 548 | 805 | **3.09 GB** |
+
+~4.2 GB of data the user had explicitly thrown away, stored under opaque
+file-ID names, and re-stored on every recurrence: Windows Defender's 140.5 MB
+`mpasbase.vdm` appeared **8 separate times** in set-11 (it is deleted and
+replaced on every signature update). Confirmed no *live* path was hijacked — e.g.
+`D:\visual studio projects\keynote\Output\Dcu\kn_Main.dcu` still has its own
+active v13/v14 records alongside the junk `$Extend` copies.
+
+**Cause — two discovery mechanisms that see different filesystems.**
+
+- **Directory enumeration** (source-selection treeview + full scan) uses
+  `DirectoryInfo.EnumerateDirectories`. NTFS **never** reports its metadata
+  entries there. `C:\$Extend` isn't hidden or access-denied, it is *absent*.
+  (The treeview does show hidden/system entries, which is why the usual
+  suspects weren't the answer.)
+- **The USN change journal**, which continuous backup reads, reports records for
+  those entries **by name**, yielding a real, openable path like
+  `C:\$Extend\$Deleted\001400000008DD22385A431F\mpasbase.vdm`.
+
+So continuous backup could reach paths the GUI could never display, select, or
+exclude. Auto-include-new was a red herring — no enumeration ever "found"
+`$Extend`; the USN journal handed it over directly.
+
+**Full inventory of invisible-but-included paths** (what the user asked for —
+every catalog path whose top-level component is not enumerable on disk):
+
+| Set | Path | Active files | Verdict |
+|---|---|---|---|
+| set-4 | `C:\$Extend` | 5 | NTFS metadata — **fixed** |
+| set-11 | `C:\$Extend` | 316 | NTFS metadata — **fixed** |
+| set-11 | `D:\$Extend` | 232 | NTFS metadata — **fixed** |
+| set-4 | `D:\pic`, `D:\animals.jpg`, `D:\piics.jpg`, `D:\SyncTERM-1.7-setup.exe`, `D:\install_SBBS_v3.20d.exe`, `D:\dearer-to-mind.mp3` | 1 each | not this bug — ordinary files deleted from disk, catalog rows not yet reconciled |
+| set-11 | `D:\books_test` | 292 | same — deleted directory, awaiting reconcile |
+
+Only the `$Extend` rows are genuinely unreachable; the rest are normal
+deleted-source history and are handled by the existing reconcile / Orphaned
+Directories flow.
+
+**Fix (v1.0.51).** New `LithicBackup.Core.VolumeMetadataPaths` defines the set of
+NTFS volume-root metadata names (`$Extend`, `$MFT`, `$MFTMirr`, `$LogFile`,
+`$Volume`, `$AttrDef`, `$Bitmap`, `$Boot`, `$BadClus`, `$Secure`, `$UpCase`) and
+`IsVolumeMetadata(path)`. It matches only the **first component below the volume
+root**, so an ordinary user directory that merely shares the name
+(`D:\projects\$Extend\notes.txt`) is untouched, and it fast-rejects on a single
+`'$'` character test so the continuous hot path pays nothing. Handles drive
+paths, `\\?\` extended-length, and UNC.
+
+Applied at both gates, which is the point — **the invariant is "anything the
+treeview cannot display must not be backed up"**, and it now has one definition:
+
+- `DirectoryBackupService.BuildExclusionFilter` — covers the full scan *and*
+  `ExecuteTargetedAsync` (the USN path), next to the existing hard exclusion for
+  the app's own data directory.
+- `BackupWorker.PathBelongsToSet` — keeps such paths out of set membership and
+  out of auto-include-new's folder discovery, so an auto-include-new parent like
+  all of `C:\` can't sweep them in.
+
+Verified with 22 cases (real catalog paths, case/separator variants,
+`\\?\`/UNC forms, and near-miss negatives like `C:\$Extendo` and
+`D:\$money\report.xls`) — all pass.
+
+**Related duplication removed.** `OrphanedDirectoriesViewModel.DetectExcludedFiles`
+contained a hand-written copy of `BuildExclusionFilter` that had already drifted:
+it applied only the user's patterns, never the app's hard exclusions. That is
+exactly backwards for this dialog — a hard-excluded path can't be seen in the
+source treeview *either*, so this dialog is the user's only route to its leftover
+destination copies. `BuildExclusionFilter` gained an overload taking
+`(excludedExtensions, tierSets)` so `JobOptions` holders call the real thing, and
+the copy is gone. The existing Orphaned Directories cleanup is therefore how the
+~4.2 GB of already-stored `$Extend` data can now be found and removed — it is
+deliberately **not** auto-purged, since deleting backup data is the user's call.
+
+`SourceSelectionViewModel.GetExcludeFilter` is intentionally NOT unified: it
+serves the treeview's filtered-size columns, and its null-when-no-user-exclusions
+return is what lets the treeview skip that computation entirely. Its comment now
+says so instead of claiming to mirror the backup filter.
+
 ## FIXED: Worker service pegged a CPU core, part 2 — whole-set catalog maps rebuilt on every continuous-backup wake-up (2026-08-15)
 
 **Symptom.** After v1.0.49 (the index fix below), the Worker was **still** taking

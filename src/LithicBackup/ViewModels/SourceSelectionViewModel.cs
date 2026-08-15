@@ -469,9 +469,19 @@ public class SourceSelectionViewModel : ViewModelBase
 
     /// <summary>
     /// Build the combined exclusion filter from tier sets with 0 tiers and
-    /// global excluded extensions.  Mirrors <c>DirectoryBackupService.BuildExclusionFilter</c>.
+    /// global excluded extensions, for the treeview's "filtered size" columns.
     /// The result is cached and rebuilt only when tier set patterns change.
     /// </summary>
+    /// <remarks>
+    /// Deliberately covers the USER's exclusions only — unlike
+    /// <c>DirectoryBackupService.BuildExclusionFilter</c>, it does NOT apply the
+    /// app's unconditional hard exclusions (own data directory, NTFS volume
+    /// metadata). That is correct here for two reasons: returning null when the
+    /// user has configured no exclusions is what lets the treeview skip
+    /// filtered-size computation entirely, and the hard-excluded paths are ones
+    /// directory enumeration never yields, so no treeview node can ever
+    /// represent them and no size total can ever include them.
+    /// </remarks>
     internal Func<string, bool>? GetExcludeFilter()
     {
         if (!_excludeFilterDirty)

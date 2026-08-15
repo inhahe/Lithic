@@ -740,10 +740,21 @@ public class OrphanedDirectoriesViewModel : ViewModelBase
     // ------------------------------------------------------------------
 
     /// <summary>
-    /// Detect files in the catalog that match the backup set's configured
-    /// exclusion patterns (global excluded extensions + tier sets with 0 tiers).
-    /// Mirrors the logic of DirectoryBackupService.BuildExclusionFilter.
+    /// Detect files in the catalog that the backup would no longer store — both
+    /// the set's configured exclusions (global excluded extensions + tier sets
+    /// with 0 tiers) and the app's unconditional hard exclusions (its own data
+    /// directory, NTFS volume metadata such as <c>$Extend</c>).
     /// </summary>
+    /// <remarks>
+    /// Calls <see cref="DirectoryBackupService.BuildExclusionFilter(IReadOnlyList{string}, IReadOnlyList{VersionTierSet})"/>
+    /// directly. This used to be a hand-written copy of that logic and had
+    /// drifted: it only ever applied the user's own patterns, so files the app
+    /// hard-excludes were invisible here — which is precisely the case that
+    /// matters, since a hard-excluded path (like anything under <c>C:\$Extend</c>)
+    /// cannot be seen in the source treeview either, leaving the user no way at
+    /// all to find its leftover destination copies. Now this dialog is the place
+    /// they surface.
+    /// </remarks>
     private List<OrphanedDirectoryItem> DetectExcludedFiles(
         List<OrphanedDirectoryItem> orphanedDirs,
         ClassifyProgress? progress = null)
@@ -753,33 +764,10 @@ public class OrphanedDirectoriesViewModel : ViewModelBase
         var jobOptions = _backupSet.JobOptions;
         if (jobOptions is null) return [];
 
-        // Build exclusion filter — same logic as DirectoryBackupService.BuildExclusionFilter.
-        var globalFilter = jobOptions.ExcludedExtensions.Count > 0
-            ? GlobMatcher.CreateFilter(jobOptions.ExcludedExtensions) : null;
-
-        Func<string, VersionTierSet>? tierResolver = null;
-        if (jobOptions.TierSets.Count > 0)
-        {
-            var resolver = VersionTierSet.BuildTierResolver(jobOptions.TierSets);
-            bool hasExclusionTierSet = jobOptions.TierSets.Any(ts =>
-                ts.Tiers.Count == 0
-                && ts.FilePatterns.Count > 0
-                && !string.Equals(ts.Name, "Default", StringComparison.OrdinalIgnoreCase));
-            if (hasExclusionTierSet)
-                tierResolver = resolver;
-        }
-
-        if (globalFilter is null && tierResolver is null)
+        var exclusionFilter = DirectoryBackupService.BuildExclusionFilter(
+            jobOptions.ExcludedExtensions, jobOptions.TierSets);
+        if (exclusionFilter is null)
             return [];
-
-        Func<string, bool> exclusionFilter = path =>
-        {
-            if (globalFilter?.Invoke(path) ?? false)
-                return true;
-            if (tierResolver is not null && tierResolver(path).Tiers.Count == 0)
-                return true;
-            return false;
-        };
 
         // Build list of orphaned directory paths to skip (files there are
         // already covered by orphaned directory items). IsPathUnderRoot

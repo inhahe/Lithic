@@ -2047,19 +2047,37 @@ public class DirectoryBackupService
     /// and tier-based exclusion (tier sets with 0 tiers = excluded from backup).
     /// </summary>
     public static Func<string, bool>? BuildExclusionFilter(BackupJob job)
+        => BuildExclusionFilter(job.ExcludedExtensions, job.TierSets);
+
+    /// <summary>
+    /// Overload taking the two settings the filter actually depends on, so
+    /// callers holding a <see cref="JobOptions"/> (which carries the same two
+    /// fields) rather than a <see cref="BackupJob"/> can use the REAL filter
+    /// instead of re-implementing it.
+    /// </summary>
+    /// <remarks>
+    /// This exists because a hand-written copy of this logic in the Orphaned
+    /// Directories view had already drifted from the original — it was missing
+    /// the unconditional hard exclusions, so anything excluded by the app rather
+    /// than by user patterns simply never showed up there. One definition, two
+    /// entry points.
+    /// </remarks>
+    public static Func<string, bool>? BuildExclusionFilter(
+        IReadOnlyList<string> excludedExtensions,
+        IReadOnlyList<VersionTierSet> tierSets)
     {
-        var globalFilter = job.ExcludedExtensions.Count > 0
-            ? GlobMatcher.CreateFilter(job.ExcludedExtensions) : null;
+        var globalFilter = excludedExtensions.Count > 0
+            ? GlobMatcher.CreateFilter(excludedExtensions) : null;
 
         // Tier sets with 0 tiers act as exclusion rules: matched files are
         // not backed up at all.  Build a resolver and check at scan time.
         Func<string, VersionTierSet>? tierResolver = null;
-        if (job.TierSets.Count > 0)
+        if (tierSets.Count > 0)
         {
-            var resolver = VersionTierSet.BuildTierResolver(job.TierSets);
+            var resolver = VersionTierSet.BuildTierResolver(tierSets);
             // Only pay the per-file cost if at least one non-default tier set
             // has 0 tiers (i.e. acts as an exclusion set).
-            bool hasExclusionTierSet = job.TierSets.Any(ts =>
+            bool hasExclusionTierSet = tierSets.Any(ts =>
                 ts.Tiers.Count == 0
                 && ts.FilePatterns.Count > 0
                 && !string.Equals(ts.Name, "Default", StringComparison.OrdinalIgnoreCase));
@@ -2078,6 +2096,19 @@ public class DirectoryBackupService
             // up its own live, open databases and fail with lock/sharing errors.
             if (CatalogLocation.IsInsideAppDataDirectory(path))
                 return true;
+
+            // Hard exclusion: NTFS volume metadata ($Extend and friends). The USN
+            // journal reports these by name, so continuous backup can resolve a
+            // real, openable path under them — but directory enumeration never
+            // returns them, so they can't appear in the selection treeview and the
+            // user has no way to see or exclude them. The largest of them,
+            // \$Extend\$Deleted, is NTFS's holding area for files that are IN THE
+            // PROCESS OF BEING DELETED, so backing it up stores exactly the data
+            // the user just discarded. See VolumeMetadataPaths and the "$Extend"
+            // entry in known-issues.md.
+            if (VolumeMetadataPaths.IsVolumeMetadata(path))
+                return true;
+
             if (globalFilter?.Invoke(path) ?? false)
                 return true;
             if (tierResolver is not null && tierResolver(path).Tiers.Count == 0)
