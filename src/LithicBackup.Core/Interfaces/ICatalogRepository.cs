@@ -194,6 +194,25 @@ public interface ICatalogRepository : IDisposable
     Task<HashSet<long>> GetActivePlainContentSizesAsync(int backupSetId, CancellationToken ct = default);
 
     /// <summary>
+    /// Which of <paramref name="sizes"/> are present among the set's active plain
+    /// content — i.e. the intersection of <paramref name="sizes"/> with
+    /// <see cref="GetActivePlainContentSizesAsync"/>, computed without
+    /// materialising the whole set.
+    /// </summary>
+    /// <remarks>
+    /// The whole-set form has to DISTINCT every active plain row (252,289 sizes
+    /// over 2.35M rows on a real set database — a full index scan plus a temp
+    /// B-tree, ~6.6 s) purely so a backup can ask about the handful of sizes it
+    /// is actually writing. A backup pass therefore probes only its own candidate
+    /// sizes, one indexed seek each against <c>IX_Files_ActivePlain_Size</c>.
+    /// Only the estimator, which genuinely wants the whole distribution, still
+    /// uses the whole-set form. See the "Worker pegged a CPU core" entry in
+    /// known-issues.md.
+    /// </remarks>
+    Task<HashSet<long>> GetActivePlainSizesPresentAsync(
+        int backupSetId, IReadOnlyCollection<long> sizes, CancellationToken ct = default);
+
+    /// <summary>
     /// All active (non-deleted) file records in a backup set whose content hash
     /// equals <paramref name="hash"/>.  Used to (a) resolve a <c>.fileref</c> to a
     /// concrete plain copy at restore/verify time, and (b) enforce the invariant

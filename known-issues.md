@@ -1,5 +1,112 @@
 # LithicBackup — Known Issues & Tech Debt
 
+## FIXED: Worker service pegged a CPU core, part 3 — the two remaining whole-set scans (2026-08-15)
+
+**Measured, after installing the part-2 fix (v1.0.51).** The user reinstalled and
+the Worker was still at **96.7% of a core** — 167.0 MB/s reads, 42,616 read ops/s,
+0.83 MB/s writes, 2,128 MB working set. Part 2 *did* help (from 444.6 MB/s /
+108,549 ops/s / 6,149 MB), but it did not stop the pegging.
+
+**How the remaining cost was found.** The Worker log makes it obvious once you
+read the timestamps rather than the messages:
+
+```
+02:28:53.179  j:  1 changed file(s).
+02:29:13.625  j:  10561536 bytes written.     <- 20.4 s
+02:26:06.548  j:  2 changed file(s).
+02:26:25.328  j:  15176 bytes written.        <- 18.8 s, for 15 KB
+```
+
+Every pass that backs up *anything* costs **19–22 s regardless of how many bytes
+it writes** — a fixed cost, two sets back to back, so the Worker never idles.
+(Passes where nothing needed backing up now return in <100 ms — that part of the
+part-2 fix works.)
+
+**The two culprits, both in `DirectoryBackupService.ExecuteAsync`, timed on a
+consistent snapshot of the real 2.35M-row / 2.3 GB `set-11.db`:**
+
+| Call | What it did | Cost |
+|---|---|---|
+| `GetActivePlainContentSizesAsync` (step 5c size pre-check) | `SELECT DISTINCT SizeBytes` over every active plain row — full index scan + temp B-tree, returning **252,289 sizes** | **6.58 s** |
+| `VersionRetentionService.ComputeRetentionAsync` → `GetAllFilesForBackupSetAsync` | `SELECT f.*` for the **entire set**, ordered, then materialised into 2.35M `FileRecord` objects | **10.36 s** (SQL alone) |
+
+Both ran on every pass, per set. Both were answering a question about the 1–3
+files actually being backed up. Confirmed active on the user's real sets:
+`EnableFileDeduplication=true` + block dedup off makes the size pre-check live,
+and non-empty `RetentionTiers` makes the retention pass live.
+
+**Fix.**
+
+1. **Size pre-check** — new `GetActivePlainSizesPresentAsync(setId, sizes)` probes
+   only the candidate sizes, backed by a new partial index
+   `IX_Files_ActivePlain_Size ON Files(SizeBytes, DiscId)` whose `WHERE` is exactly
+   the "active plain content" predicate, so a probe seeks straight to matching rows.
+   The whole-set form is kept for `DedupSizeEstimator`, which genuinely wants the
+   whole distribution.
+2. **Retention** — new `ComputeRetentionAsync(..., IReadOnlyCollection<string>? pathScope, ...)`
+   overload. Retention is computed per source path from that path's own version rows
+   and the clock, with no cross-path state, so evaluating a subset is exact for that
+   subset. Targeted/continuous backups pass the paths they just wrote
+   (`ExecuteAsync(..., scopeRetentionToBackedUpFiles: true)`); full backups pass null
+   and still sweep everything.
+
+**Deliberate trade in (2).** Retention is partly age-driven, so an untouched path
+can drift into a stricter tier purely by the passage of time. Scoped retention
+won't notice that until the next *full* backup. What must not be deferred — a path
+over quota *because this run just added a version to it* — is always in scope, by
+construction.
+
+**Verification** (no test project exists; done by differential test against the
+live-snapshot ground truth):
+
+| Query plan | Result |
+|---|---|
+| size probe | `SEARCH f USING INDEX IX_Files_ActivePlain_Size (SizeBytes=?)` |
+| per-path fetch | `SEARCH f USING INDEX IX_Files_SourcePath_NoCase (SourcePath=?)` |
+
+| Differential test | Probes | Mismatches |
+|---|---|---|
+| size probe vs whole-set `DISTINCT` (3,000 present + 1,003 absent) | 4,003 | **0** |
+| per-path fetch vs whole-set grouping (8,000 as-stored + 1,000 ASCII-uppercased) | 9,000 | **0** |
+
+| Per-pass catalog cost, 1 changed file | Before | After |
+|---|---|---|
+| size pre-check | 6.58 s | ~25 µs |
+| retention load | 10.36 s | ~69 µs |
+| **total** | **~17 s** | **~0.1 ms** |
+
+New index costs **+23 MB** on the 2.3 GB database and **2.6 s** to build once
+(auto-applied — `SetSchema.sql` is all `CREATE ... IF NOT EXISTS` and runs on
+every set-DB open).
+
+> **Method note, again.** Parts 1 and 2 were each declared plausible on the
+> strength of the one query being looked at, and each time the Worker was still
+> pegged afterwards. The only thing that actually located the cost this time was
+> reading the *elapsed time between log lines* in the running Worker and then
+> timing every whole-set query on a snapshot. Do that first, next time.
+
+## TECH DEBT: `COLLATE NOCASE` (ASCII-only) vs `StringComparer.OrdinalIgnoreCase` (Unicode-aware)
+
+Noticed while differential-testing the retention scoping above. SQLite's `NOCASE`
+collation folds **only ASCII A–Z**; .NET's `StringComparer.OrdinalIgnoreCase`
+folds the full Unicode range. On the real `set-11.db`, **42,131** distinct source
+paths contain non-ASCII characters (e.g.
+`d:\manuals\hoover uh74110_files\Ảnh chụp màn hình ….png`), and **197** of them
+differ between the two foldings.
+
+Consequence: a path whose casing changed *in a non-ASCII character* between
+backups would be treated as the same path by the in-memory grouping but as a
+different path by every indexed lookup (`GetLatestVersionInfoForPathsAsync`,
+`GetFileRecordByPathAndVersionAsync`, `GetFileRecordsByPathAsync`, and now the
+scoped retention fetch) — it would be re-backed-up as a new file rather than a new
+version. This is **pre-existing** (it arrived with `IX_Files_SourcePath_NoCase` in
+v1.0.49) and is not introduced by the retention scoping; NTFS also does not
+normally change the case of an existing name, so it has likely never fired.
+
+Proper fix: store a normalised (e.g. `ToLowerInvariant`) `SourcePathKey` column,
+index that with BINARY collation, and match on it — removing the dependence on
+SQLite's collation semantics entirely. Until then, do not assume the two agree.
+
 ## FIXED: Backing up `$Extend` — files that were being DELETED, at paths no one can see (2026-08-15)
 
 **Symptom (as reported).** "`C:\$Extend` isn't showing up in my view of `C:\` in

@@ -122,3 +122,31 @@ CREATE INDEX IF NOT EXISTS IX_Files_Active_SourcePath_NoCase
 -- once. See the "Worker pegged a CPU core" entry in known-issues.md.
 CREATE INDEX IF NOT EXISTS IX_Files_SourcePath_NoCase
     ON Files(SourcePath COLLATE NOCASE);
+
+-- Whole-file-duplicate size pre-check (DirectoryBackupService step 5c): "does any
+-- active plain copy in this set already have byte size N?".  Only files whose size
+-- collides with stored content can be whole-file duplicates, so this answers, per
+-- candidate file, whether the file must be hashed up front or can take the
+-- single-pass hash-while-copy path.
+--
+-- The predicate is exactly the "active plain content" definition, so the index is
+-- partial on all five flags.  That keeps it small (only live plain copies, not
+-- tombstones / .fileref / .dedup rows) and lets a size probe seek straight to the
+-- matching rows with all five flags already satisfied.  DiscId rides along as a
+-- second column so the Files->Discs join reads no table row; only the residual
+-- `Hash <> ''` check touches the table, and only for the first candidate row
+-- (each probe is LIMIT 1).
+--
+-- Measured on the real 2.35M-row / 2.3 GB set database: the previous
+-- GetActivePlainContentSizesAsync materialised a DISTINCT of every active plain
+-- size (252,289 of them) via a full index SCAN plus a temp B-tree, costing
+-- ~6.6 s — on EVERY backup pass, to answer a question about the 1-3 sizes
+-- actually being backed up.  Probing just those sizes against this index is an
+-- indexed seek each.  See the "Worker pegged a CPU core" entry in known-issues.md.
+CREATE INDEX IF NOT EXISTS IX_Files_ActivePlain_Size
+    ON Files(SizeBytes, DiscId)
+    WHERE IsDeleted = 0
+      AND IsFileRef = 0
+      AND IsDeduped = 0
+      AND IsSplit = 0
+      AND IsZipped = 0;

@@ -1229,6 +1229,53 @@ internal sealed class SqliteSetDatabase : IDisposable
         return sizes;
     }
 
+    /// <summary>
+    /// Probe just the sizes the caller cares about. See
+    /// <see cref="ICatalogRepository.GetActivePlainSizesPresentAsync"/> for why the
+    /// whole-set form above is unusable on the backup hot path.
+    /// </summary>
+    public async Task<HashSet<long>> GetActivePlainSizesPresentAsync(
+        int backupSetId, IReadOnlyCollection<long> sizes, CancellationToken ct = default)
+    {
+        ct.ThrowIfCancellationRequested();
+
+        var present = new HashSet<long>();
+        if (sizes.Count == 0)
+            return present;
+
+        using var _ = await LockAsync(ct).ConfigureAwait(false);
+
+        using var cmd = _connection.CreateCommand();
+        cmd.CommandText = """
+            SELECT 1 FROM Files f
+            INNER JOIN Discs d ON f.DiscId = d.Id
+            WHERE f.SizeBytes = $size
+              AND d.BackupSetId = $setId
+              AND f.IsDeleted = 0
+              AND f.IsFileRef = 0
+              AND f.IsDeduped = 0
+              AND f.IsSplit = 0
+              AND f.IsZipped = 0
+              AND f.Hash <> ''
+            LIMIT 1
+            """;
+        cmd.Parameters.AddWithValue("$setId", backupSetId);
+        var sizeParam = cmd.Parameters.Add("$size", SqliteType.Integer);
+
+        foreach (long size in sizes)
+        {
+            ct.ThrowIfCancellationRequested();
+            if (present.Contains(size))
+                continue;
+
+            sizeParam.Value = size;
+            if (cmd.ExecuteScalar() is not null)
+                present.Add(size);
+        }
+
+        return present;
+    }
+
     public async Task<IReadOnlyList<FileRecord>> GetActiveRecordsByHashAsync(int backupSetId, string hash, CancellationToken ct = default)
     {
         ct.ThrowIfCancellationRequested();

@@ -92,6 +92,15 @@ public class DirectoryBackupService
     /// When <paramref name="precomputedDiff"/> is supplied the scan/diff
     /// steps are skipped (they were already done during planning).
     /// </summary>
+    /// <param name="scopeRetentionToBackedUpFiles">
+    /// Restrict the retention pass to the paths this run actually wrote, instead
+    /// of re-evaluating every path in the set. Set by targeted/continuous backups,
+    /// where the whole-set pass costs orders of magnitude more than the backup it
+    /// follows; see
+    /// <see cref="VersionRetentionService.ComputeRetentionAsync(int, Func{string, IReadOnlyList{VersionRetentionTier}}, IReadOnlyCollection{string}, CancellationToken)"/>
+    /// for why that is safe and what it defers to the next full backup. A full
+    /// backup must leave this false.
+    /// </param>
     public async Task<BackupResult> ExecuteAsync(
         BackupJob job,
         string targetDirectory,
@@ -100,7 +109,8 @@ public class DirectoryBackupService
         CancellationToken ct,
         ManualResetEventSlim? pauseEvent = null,
         FailureCallback? onFailure = null,
-        BackupDiff? precomputedDiff = null)
+        BackupDiff? precomputedDiff = null,
+        bool scopeRetentionToBackedUpFiles = false)
     {
         BackupDiff diff;
         if (precomputedDiff is not null)
@@ -437,7 +447,19 @@ public class DirectoryBackupService
                     candidateSizeCounts.GetValueOrDefault(f.SizeBytes) + 1;
             if (job.BackupSetId.HasValue)
             {
-                try { existingPlainSizes = await _catalog.GetActivePlainContentSizesAsync(backupSetId, ct); }
+                // Ask only about the sizes this run is actually writing. The
+                // whole-set form has to DISTINCT every active plain row (252,289
+                // sizes over 2.35M rows on a real set database — full index scan
+                // plus a temp B-tree, ~6.6 s) to answer a question about the 1-3
+                // sizes below, and it ran on EVERY continuous-backup pass, per
+                // set, forever. That was the second half of the pegged CPU core
+                // (the first being the whole-set version lookups); see the
+                // "Worker pegged a CPU core" entry in known-issues.md.
+                try
+                {
+                    existingPlainSizes = await _catalog.GetActivePlainSizesPresentAsync(
+                        backupSetId, candidateSizeCounts.Keys, ct);
+                }
                 catch { /* fall back to "could be a duplicate" for safety */ existingPlainSizes = new HashSet<long>(); }
             }
         }
@@ -1489,16 +1511,25 @@ public class DirectoryBackupService
         {
             try
             {
-                IReadOnlyList<FileRecord> toDelete;
-                if (tierResolver is not null)
-                {
-                    toDelete = await _retention.ComputeRetentionAsync(backupSetId,
-                        path => tierResolver(path).Tiers, ct);
-                }
-                else
-                {
-                    toDelete = await _retention.ComputeRetentionAsync(backupSetId, retentionTiers!, ct);
-                }
+                // A targeted run only added versions to the files it just wrote,
+                // so only those paths can have newly exceeded their quota. The
+                // whole-set alternative materialises every record in the set
+                // (2.35M rows / ~10.4 s of SQL on a real set database, plus the
+                // objects) after backing up, typically, one file — the largest
+                // single term in the Worker pegging a CPU core. Age-driven
+                // pruning of untouched paths still happens on the next full
+                // backup, which passes a null scope.
+                IReadOnlyCollection<string>? pathScope = scopeRetentionToBackedUpFiles
+                    ? filesToBackup.Select(f => f.FullPath).ToList()
+                    : null;
+
+                Func<string, IReadOnlyList<VersionRetentionTier>> tierSelector =
+                    tierResolver is not null
+                        ? path => tierResolver(path).Tiers
+                        : _ => retentionTiers!;
+
+                IReadOnlyList<FileRecord> toDelete =
+                    await _retention.ComputeRetentionAsync(backupSetId, tierSelector, pathScope, ct);
 
                 var toDeleteIds = toDelete.Select(f => f.Id).ToHashSet();
 
@@ -1755,7 +1786,8 @@ public class DirectoryBackupService
 
         return await ExecuteAsync(
             job, targetDirectory, retentionTiers,
-            progress: null, ct, precomputedDiff: diff);
+            progress: null, ct, precomputedDiff: diff,
+            scopeRetentionToBackedUpFiles: true);
     }
 
     /// <summary>
