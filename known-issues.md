@@ -97,12 +97,30 @@ service.log.1    opens=7    closes=6    timeouts=7    leaked=1
 service.log.2    opens=1    closes=1    timeouts=1    leaked=0
 ```
 
-**Why the open times out** is visible too: the snapshot set spans **six volumes**
-(C, D, E, F, I, J) and freezing/thawing that many — two of them USB (I: a 6 TB HDD,
-J: a 2 TB SSD) — takes longer than 60 s. Note I: and J: are *Lithic's own backup
-destinations*, so CrashPlan is also uploading Lithic's archives to the cloud.
-Dropping them from CrashPlan's selection shrinks the snapshot set, which is the one
-change that attacks the timeout that causes the leak.
+**Why the open times out:** the snapshot set spans **every mounted volume**, and
+freezing/thawing that many — two of them USB (I: a 6 TB HDD, J: a 2 TB SSD) —
+takes longer than 60 s.
+
+**It is not driven by the backup selection**, which was checked and is a dead end:
+I: and J: are *not* selected in CrashPlan, yet every open requests them anyway —
+
+```
+VSS open: trigger=D:\limnoria\logs\messages.log, volumes=C:\,E:\,D:\,G:\,F:\,I:\,J:\, timeoutMs=60000
+```
+
+Note `G:\` in that list: it does not exist. `Get-Volume` reports only C, D, E, F,
+H, I, J, while `HKLM\SYSTEM\MountedDevices` still holds stale `\DosDevices\`
+entries for G:, K: and L:. CrashPlan enumerates drive letters, not the selection —
+which is why `IsVolumeSupported(G:\) failed … Volume G:\ not supported` precedes
+every open. (G: is correctly dropped from the resulting set — the `VSS shadow
+created` lines cover C/D/E/F/I/J only — so the phantom letter is noise, not the
+hang. The hang is the six real volumes.)
+
+CrashPlan does have self-protection —
+`DISABLING VSS for drive D:\ for the remainder of this session (hangs on this
+drive: 5)` — but it is per-session, and the counter resets when the service
+restarts. It restarted at 13:13 on 08/15 (`CrashPlan started, version 12.0.0`) and
+leaked the fatal snapshot five minutes later.
 * While a snapshot is live, every block **overwritten** on the volume has its old
   contents copied into `D:\System Volume Information`.
 
@@ -174,14 +192,23 @@ priority order:
    Volsnap aborts the snapshot at 20 GB (the `Volsnap/24`/`35` pair still appears
    in the log) and free space never craters. It costs CrashPlan a retried backup;
    its run was already being interrupted anyway.
-2. **Shrink the snapshot set** so the open stops timing out and the leak stops
-   happening: drop **I:** and **J:** from CrashPlan's file selection. They are
-   Lithic's backup destinations, so CrashPlan is re-uploading Lithic's archives —
-   almost certainly unintended, and it is two USB volumes' worth of freeze/thaw in
-   the 60 s budget that the leak depends on overrunning.
-3. **Move the churn.** The CoW cost is dominated by `os-lane-*` build/QEMU
+2. **Turn off open-file backup in CrashPlan** (Device Settings → Backup → Advanced
+   → "back up open files"). If VSS never opens, it cannot leak. The cost is that
+   CrashPlan skips locked files — tolerable here, since D: is already covered by
+   two Lithic sets. This is the only setting-level change that addresses the leak
+   itself; note it could not be verified from `C:\ProgramData\CrashPlan\conf`,
+   which is ACL'd against the interactive user.
+3. **Reclaim immediately when a leak is detected**, rather than waiting for Volsnap
+   to hit the wall: `vssadmin delete shadows /for=D: /oldest` (elevated). Pair it
+   with the stale-snapshot check in `tools\lowdisk-events.ps1`.
+4. **Move the churn.** The CoW cost is dominated by `os-lane-*` build/QEMU
    activity; hosting those worktrees on a volume nothing snapshots removes the
    cause rather than the symptom.
+
+**Ruled out: deselecting volumes in CrashPlan.** See above — the snapshot set is
+built from enumerated drive letters, not the backup selection, so I: and J: are
+snapshotted despite not being selected. Nothing in CrashPlan's file selection
+shrinks the snapshot set.
 
 What does **not** work, for the record:
 
