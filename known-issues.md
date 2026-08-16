@@ -71,15 +71,55 @@ high-churn volume, so the copy-on-write diff area ate the free space.**
   and did not stop until **19:46** (`3h:14m:26s`, "Reason for stopping backup: The
   manifest requires validation"), with archive maintenance finishing at 19:46.
 * While a snapshot is live, every block **overwritten** on the volume has its old
-  contents copied into `D:\System Volume Information`. Lithic's own per-set
-  catalogs are the write journal that shows how much that was
-  (`tools\catalog_writes.py`): **15.3 GB of file rewrites on D: between 13:16 and
-  19:03**, from the sets' point of view alone — i.e. excluding everything Lithic
-  doesn't back up. Block-level CoW is at least that and normally more.
-* The single worst offender is `D:\limnoria\logs\messages.log`: a **403 MB** IRC
-  log rewritten whole **19 times** in that window = **7.66 GB** of diff area from
-  one file. Second is `D:\visual studio projects\os-lane-a\rootfs.ext4` (268 MB,
-  rewritten by the OS lanes), then `D:\visual studio projects\irc bouncer` (1.7 GB).
+  contents copied into `D:\System Volume Information`.
+
+**Careful with the units here — this is where a first pass went wrong.** Lithic's
+per-set catalogs record 15.3 GB of file *versions* on D: between 13:16 and 19:03,
+and it is tempting to read that as diff-area growth. It is not. Lithic re-copies a
+whole file whenever its mtime moves, so a 403 MB log that gained 30 KB is recorded
+as another 403 MB version — while costing a shadow copy **nothing**, because
+appends land in newly allocated clusters that have no prior contents to preserve.
+`catalog_writes.py --cow` separates the two by walking each file's versions in
+order (grew ⇒ append; same size or smaller ⇒ in-place rewrite):
+
+```
+appended (free to a snapshot):      0.025 GB across 1,207 files
+rewritten in place (costs CoW):     2.025 GB across   711 files
+
+  1073.7 MB  D:\visual studio projects\os-lane-a\rootfs.ext4
+   194.8 MB  D:\visual studio projects\qtpyrc\me\history.db
+   193.6 MB  D:\youtube\...\redcup_s2\model.pth
+    81.0 MB  D:\visual studio projects\qtpyrc\me\history.db-wal
+    80.0 MB  D:\visual studio projects\irc bouncer\Wicket.log.1
+```
+
+So `D:\limnoria\logs\messages.log` — the apparent worst offender by raw version
+bytes, at 7.66 GB — drops out of the CoW ranking **entirely**. It is append-only
+(sizes grow monotonically: 403,016,517 → 403,265,514 over 14 versions), and it has
+been excluded from CrashPlan since 08/13 anyway (`backup_files.log.0` covers
+08/14 15:54 → 08/15 21:15 with zero hits). Neither fact had anything to do with
+the outage.
+
+**And 2.0 GB still does not explain ~40 GB, which is the real finding:** the bulk
+of the diff-area growth was churn the catalog **cannot see**. Two blind spots, both
+material on this volume:
+
+1. **Delete-then-reallocate.** Clusters freed by deleting a file still belong to
+   the live snapshot; when NTFS hands them to a new file, the old contents must be
+   copied out first. Builds, `obj\`/`bin\`, `__pycache__`, git repacks and QEMU
+   image rebuilds do this constantly, and it costs exactly as much as an in-place
+   rewrite while looking like "new files" to every file-level tool.
+2. **Files Lithic doesn't back up at all** — anything excluded from every set never
+   appears in a catalog, so it contributes zero to the estimate above regardless of
+   how much it writes.
+
+D: runs three SlateOS worktrees (`os-lane-a/b/c`) building and booting QEMU images,
+which is precisely that kind of churn. Closing the gap properly needs the **USN
+journal** (`fsutil usn readjournal D:`), which is the only record that sees creates
+and deletes rather than surviving files — but it requires **elevation**, and D:'s
+journal is capped at 32 MB and wraps (which is also why Lithic logs recurring
+"USN journal continuity lost" warnings). Nothing here was worth an elevated prompt
+once the cause was identified; if this recurs, that is the measurement to take.
 
 That is why free space "varies widely quickly" on D: and why it recovered on its
 own: Volsnap deleted the shadow copies at 19:03:20 and handed the entire diff area
@@ -90,9 +130,13 @@ later, with no deletions in between.
 "shadow" in the source hits only `BackupOrchestrator`'s disc-session *version*
 shadowing, which is unrelated. Lithic is a *victim* here (its destination happened
 to be on the squeezed volume) and, ironically, also a *contributor* to the churn
-that the snapshot had to preserve. The durable mitigation is outside Lithic:
-bound the diff area with `vssadmin resize shadowstorage /for=D: /on=D: /maxsize=…`
-(elevated), or exclude the churning log directories from CrashPlan. The in-app
+that the snapshot had to preserve. The durable mitigation is outside Lithic: **bound the
+diff area** with `vssadmin resize shadowstorage /for=D: /on=D: /maxsize=…`
+(elevated). Note that *excluding* files from CrashPlan does **not** help — the diff
+area is a volume-level, block-level mechanism, so once a snapshot of D: exists,
+every overwrite anywhere on D: is preserved whether or not CrashPlan reads that
+file. Exclusions only save upload bandwidth. The lever that would actually work is
+stopping CrashPlan from holding a snapshot open for hours. The in-app
 mitigation is the debounce above, which is exactly the right shape for this failure
 mode — the outage is real but self-healing, and lasted ~2.5 min against a ~90 s
 debounce, which is close enough that a longer streak may be worth considering if it
@@ -104,7 +148,7 @@ both need elevation, so none of them use it):
 | Tool | Answers |
 |---|---|
 | `tools\lowdisk-events.ps1` | did a volume run out, and *who* requested the snapshot (Volsnap 24/35 + VSS 8231 + `Win32_ShadowCopy`/`Win32_ShadowStorage`) |
-| `tools\catalog_writes.py` | what was rewritten on a volume in a window, per Lithic's own catalog — survives the file being deleted afterwards, which an mtime walk does not |
+| `tools\catalog_writes.py` | what was rewritten on a volume in a window, per Lithic's own catalog — survives the file being deleted afterwards, which an mtime walk does not. `--cow` splits appends from in-place rewrites, which is the difference between "Lithic re-copied it" and "a shadow copy paid for it" |
 | `tools\write_burst.py` | same question from the filesystem's mtimes, for volumes Lithic doesn't back up |
 | `tools\freespace_probe.py` | quota-aware vs total free bytes, straight from `GetDiskFreeSpaceExW` |
 | `tools\destinfo.py` | replays the per-set resolve-and-measure path (GUID → mount point → root → free) |
