@@ -343,7 +343,7 @@ public partial class App : Application
         // GUI-side monitor polls destination free space and raises DestinationFull
         // the moment a continuous destination can no longer accept writes.
         _destinationSpaceMonitor = new DestinationSpaceMonitor(_catalog, destinationResolver);
-        _destinationSpaceMonitor.DestinationFull += message =>
+        _destinationSpaceMonitor.DestinationFull += alert =>
         {
             // A tray balloon self-dismisses after a few seconds, so an
             // away-from-keyboard user would miss it. Use a modal dialog that stays
@@ -354,10 +354,20 @@ public partial class App : Application
             // (re-arming only after the drive recovers), so the dialog won't
             // reappear unless space is freed and that drive fills again, or a
             // different continuous destination fills.
+            var monitor = _destinationSpaceMonitor;
             Current.Dispatcher.BeginInvoke(() =>
             {
+                // Re-check before interrupting: BeginInvoke can run much later
+                // than the observation (busy dispatcher, another modal already
+                // up), and a drive that has recovered in the gap must not be
+                // announced as full — that turns a correct warning into one the
+                // user can immediately disprove in Explorer. See
+                // DestinationSpaceMonitor.IsStillFull.
+                if (monitor is null || !monitor.IsStillFull(alert.Root))
+                    return;
+
                 MessageBox.Show(
-                    message,
+                    alert.Message,
                     "Lithic Backup \u2014 Destination Drive Full",
                     MessageBoxButton.OK,
                     MessageBoxImage.Warning);

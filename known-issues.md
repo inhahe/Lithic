@@ -1,5 +1,82 @@
 # LithicBackup — Known Issues & Tech Debt
 
+## FIXED: "Destination drive full" warning fired on a transient dip and then sat on screen after the drive recovered (2026-08-15)
+
+**Symptom.** A modal appeared saying the continuous set **"test backup"** couldn't
+back up because its destination drive **D:** was full. D: had ~38 GB free when the
+user read it. It looked like a plain false alarm.
+
+**It was not a false alarm — it was a stale one.** Windows' own System event log:
+
+| Time | Event | Message |
+|---|---|---|
+| 19:00:48 | `Volsnap/24` | "There was insufficient disk space on volume **D:** to grow the shadow copy storage for shadow copies of D:. As a result of this failure all shadow copies of volume D: are at risk of being deleted." |
+| 19:03:20 | `Volsnap/35` | "The shadow copies of volume **D:** were aborted because the shadow copy storage failed to grow." |
+
+So D: genuinely hit zero free for ~2.5 minutes while VSS grew a diff area, and
+then recovered tens of GB the moment Windows discarded the shadow copies. The
+`DestinationSpaceMonitor` sweep (every 30 s, threshold 1 GB) sampled the drive
+inside that window and warned, correctly. Ruled out along the way, for the record:
+
+* **Not a disk quota.** `GetDiskFreeSpaceEx` returns `lpFreeBytesAvailable ==
+  lpTotalNumberOfFreeBytes` on D: (`tools\freespace_probe.py`), so the number the
+  monitor uses (`DriveInfo.AvailableFreeSpace`) is the same one Explorer shows.
+* **Not a misclassified error.** `BackupErrorClassifier.Classify` maps
+  `DirectoryNotFoundException` (HResult 3) to `NotFound`, never to `DiskFull`; and
+  the message wording exists only in `DestinationSpaceMonitor`.
+* **Not the wrong volume.** `mountvol` confirms the set's stored
+  `DestinationVolumeId` is D:, and `tools\destinfo.py` replays the whole
+  resolve-and-measure path per set.
+
+**The two real defects.**
+
+1. **No debounce.** One low sample armed a one-shot modal, so a dip that Windows
+   fixes by itself is enough to interrupt the user.
+2. **No re-check at display time, and no timestamp.** The alert is raised on a
+   pool thread and shown via `Dispatcher.BeginInvoke`, and the box is *owner-less*
+   — it can sit unnoticed behind another window (this is the same dialog blamed
+   in the MSI-1611 entry below for blocking a graceful shutdown). Read an hour
+   later, "is full" in the present tense is simply false.
+
+**Fix (v1.0.54).**
+
+* `DestinationSpaceMonitor.ConsecutiveLowSweepsBeforeAlert` (default **3**, i.e.
+  ~90 s at the GUI's 30 s cadence) — a per-root streak counter, reset by the first
+  reading at or above the threshold, and discarded outright if a sweep can't read
+  the drive at all (so an unplug can't silently complete a streak).
+* `DestinationFull` now carries a `DestinationFullAlert` record (set name, root,
+  free bytes, `ObservedAt`) instead of a bare string, and its `Message` reads
+  *"…which ran out of space at 7:01 PM (312 MB free)"* — past tense, timestamped.
+* `DestinationSpaceMonitor.IsStillFull(root)` re-samples the drive; `App.xaml.cs`
+  calls it inside the `BeginInvoke` and drops the dialog if the drive recovered.
+* The per-row status (`StatusUpdated`) is deliberately left **undebounced** — it's
+  a live readout, not an interruption, so it should track every sample.
+* The sweep was restructured into three passes so each distinct drive root is
+  queried **once** per sweep rather than once per set sharing it (previously two
+  sets on one drive meant two `DriveInfo` queries, and would have double-counted
+  the streak).
+* Free-space querying is now injectable (`Func<string, long?>` constructor
+  parameter, defaulting to `DriveInfo`), because none of the above can be tested
+  against a live disk.
+
+**Regression guard:** `tools\dest_space_test` — 22 assertions driving the monitor
+with a scripted free-space sequence: transient dip stays silent, sustained outage
+alerts exactly once, the message is timestamped, `IsStillFull` flips on recovery,
+the alert re-arms after a genuine recovery, interactive sets never raise the modal
+(but their row status still shows full), and an unreadable sweep restarts the
+streak. `dotnet run --project tools/dest_space_test/dest_space_test.csproj`.
+
+**Left open (a separate gap, not this bug): a continuous set whose destination
+*folder* has been deleted is not reported.** Set 12 "test backup" points at
+`D:\visual studio projects\backup\test_out`, which **does not exist** (deleted
+around 2026-06-13; only `test_out_new` remains). `DestinationResolver.Resolve`
+reports `IsConnected: true` because the *volume* is mounted, so the set shows an
+ordinary healthy destination while nothing ever backs up. That is exactly the
+silent-failure class this monitor exists to catch, so the monitor should grow a
+distinct "destination folder missing" status alongside "full" — checking
+`Directory.Exists(resolution.LivePath)`, but *not* treating it as an error for a
+set that has never run, where the backup would create the folder itself.
+
 ## FIXED: "Unable to automatically close all requested applications" (error 1611) — the *Worker service* was never closed before the file-in-use check (2026-08-15)
 
 **Symptom.** Installing 1.0.52 over 1.0.51 failed with:
