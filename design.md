@@ -38,12 +38,14 @@ when the other process is running.
   levels), so it *asks*: `SignalLithicShutdown` sets a named event each listens
   on. GUI: `Global\LithicBackup.Shutdown`, falling back to the session-local
   `LithicBackup.Shutdown` (`App.xaml.cs`). Worker:
-  `Global\LithicBackup.Worker.Shutdown` (`ShutdownSignalListener.cs`).
-  **Both are `Global\` because the action runs as LocalSystem in session 0**, not
-  in the user's session — it is scheduled in the `InstallExecuteSequence`, which
-  Windows Installer runs in its server process, so a session-local name is
-  invisible to it. (That is what made the GUI half of the handshake a silent
-  no-op from 1.0.11 through 1.0.55.) Full reasoning in `CLAUDE.md`.
+  `Global\LithicBackup.Worker.Shutdown` (`ShutdownSignalListener.cs`). The GUI is
+  tried on `Global\`, then `Session\<n>\` for each running GUI's session, then the
+  bare name, so the handshake also reaches GUIs older than the fix. The action
+  itself runs impersonated as the invoking user in that user's session.
+  **The action cannot load at all without
+  `installer\CustomActions\CustomAction.config`** — that file was missing from
+  1.0.11 through 1.0.55, so this whole mechanism was silently dead. Full reasoning
+  in `CLAUDE.md`.
 * **Settings** are machine-global and read by both, so a new setting has to be
   meaningful (or harmless) in a service with no UI.
 

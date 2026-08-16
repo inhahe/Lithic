@@ -226,6 +226,31 @@ public sealed class BackupWorker : BackgroundService
 
     protected override async Task ExecuteAsync(CancellationToken stoppingToken)
     {
+        // Hand control back to the host BEFORE doing any work. Not a nicety — a
+        // correctness requirement.
+        //
+        // BackgroundService.StartAsync calls ExecuteAsync and only stores the
+        // returned Task; it does not block on it. But "returns a Task" is not the
+        // same as "returns promptly": if the body runs to completion synchronously
+        // — which it does here, because the loop below is dominated by synchronous
+        // file I/O and awaits that complete synchronously — then the CALL itself
+        // does not return until the first genuinely-incomplete await. Host.StartAsync
+        // starts hosted services sequentially, so for as long as that takes, NO
+        // LATER HOSTED SERVICE IS STARTED.
+        //
+        // That is exactly what happened: a backup kept this method on the caller's
+        // stack for thirteen minutes, so ShutdownSignalListener.StartAsync was never
+        // reached and the Global\LithicBackup.Worker.Shutdown event did not exist
+        // while the service was running. The upgrade custom action duly logged
+        // "no listener on 'Global\LithicBackup.Worker.Shutdown'", and the log showed
+        // the listener registering only as the service shut down, immediately
+        // followed by "Application started" — startup completing at the moment of
+        // shutdown, the signature of this bug.
+        //
+        // Task.Yield forces an asynchronous continuation, so ExecuteAsync returns to
+        // the host at once and the loop resumes on a thread-pool thread.
+        await Task.Yield();
+
         _logger.LogInformation("LithicBackup Worker started.");
 
         try

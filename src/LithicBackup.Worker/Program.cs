@@ -46,14 +46,24 @@ var builder = Host.CreateDefaultBuilder(args)
         services.AddSingleton<VersionRetentionService>();
         services.AddSingleton<DirectoryBackupService>();
 
-        services.AddHostedService<BackupWorker>();
-
-        // Lets the MSI ask this service to stop itself BEFORE Windows
-        // Installer's file-in-use check. Registered after BackupWorker so its
-        // StopAsync runs first on shutdown (IHostedService stops in reverse
-        // registration order), but StartAsync order is irrelevant — the
-        // listener does no work until signalled. See ShutdownSignalListener.
+        // Lets the MSI ask this service to stop itself BEFORE Windows Installer's
+        // file-in-use check. See ShutdownSignalListener.
+        //
+        // REGISTERED FIRST, DELIBERATELY. Hosted services start sequentially, so a
+        // service that is slow to hand control back delays every one after it. This
+        // listener only creates an event and returns, while BackupWorker can hold
+        // the startup path for as long as a backup runs (see the Task.Yield at the
+        // top of BackupWorker.ExecuteAsync, which fixes that directly). Ordering the
+        // cheap, must-always-exist listener ahead of the heavy worker means the
+        // upgrade handshake cannot be starved again even if some future hosted
+        // service reintroduces the same stall.
+        //
+        // Stop order is the reverse, so the listener now stops LAST — which is what
+        // we want anyway: it stays able to observe a signal for as long as possible,
+        // and its StopAsync is a no-op.
         services.AddHostedService<ShutdownSignalListener>();
+
+        services.AddHostedService<BackupWorker>();
     });
 
 try

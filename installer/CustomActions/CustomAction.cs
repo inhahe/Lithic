@@ -17,21 +17,37 @@ namespace LithicBackup.CustomActions
         // GUI to close itself gracefully so the upgrade can replace
         // LithicBackup.exe.
         //
-        // The Global\ one is tried FIRST and is the one that normally works. This
-        // action is scheduled in the InstallExecuteSequence, which Windows Installer
-        // runs in its SERVER process — msiexec /V, LocalSystem, SESSION 0 — not in
-        // the client process the user launched. (Execute="immediate"
-        // Impersonate="yes" does not change that; it is the sequence the action is
-        // in that decides.) An unprefixed event name resolves per-session, so from
-        // session 0 we would look in \Sessions\0\BaseNamedObjects while the GUI's
-        // event lives in \Sessions\1\ — the session-local name is simply invisible
-        // here, which is why the GUI never got the message and every upgrade with an
-        // elevated GUI open failed with error 1611.
+        // Tried FIRST, but only 1.0.56+ GUIs publish it, so on an upgrade FROM an
+        // older build it is normally the Session\<n>\ name below that fires.
+        //
+        // Note for anyone tempted by the tidy theory: this action does NOT run as
+        // LocalSystem in session 0. It is a remote custom action hosted in
+        // rundll32, impersonated as the invoking user in that user's own session —
+        // measured, and logged by LogContext on every run:
+        //
+        //   SignalLithicShutdown: running as 'DOMAIN\user' in process rundll32
+        //   (pid 72736), session 1.
+        //
+        // The session-namespace story was a wrong diagnosis that briefly made it
+        // into the comments here; see known-issues.md. A Global\ name is still
+        // worth publishing because it is the one name that works from any session,
+        // including a genuine system-context (SCCM) install.
         private const string GlobalGuiShutdownEventName = @"Global\LithicBackup.Shutdown";
 
-        // Kept as a fallback for the case where this action DOES run in the user's
-        // own session, and for GUIs too old to publish the Global\ name.
+        // The session-local name every GUI publishes, including builds too old to
+        // know about the Global\ one. Reachable from here two ways: bare (only if
+        // this action happens to run in the GUI's own session) or, from any
+        // session, via the Session\<n>\ prefix below.
         private const string GuiShutdownEventName = "LithicBackup.Shutdown";
+
+        // Win32 resolves a "Session\<n>\" prefix against \Sessions\<n>\BaseNamedObjects
+        // regardless of which session the CALLER is in — the one documented way to
+        // reach into another session's namespace without dropping to NtOpenEvent and
+        // a hand-built OBJECT_ATTRIBUTES. This is what lets a session-0 action signal
+        // a GUI that only ever published the session-local name, i.e. every build up
+        // to and including 1.0.55. Without it the fix would only take effect on the
+        // upgrade AFTER the one that delivers it.
+        private const string GuiShutdownEventSessionFormat = @"Session\{0}\LithicBackup.Shutdown";
 
         // Global\ named event the running Worker service listens on (see
         // src\LithicBackup.Worker\ShutdownSignalListener.cs, ShutdownSignalName —
@@ -81,13 +97,15 @@ namespace LithicBackup.CustomActions
         /// </para>
         /// <para>
         /// <b>Why we ask rather than kill/stop.</b> For a double-clicked
-        /// per-machine MSI everything before <c>InstallInitialize</c> runs in the
-        /// unelevated client process at the invoking user's Medium integrity.
-        /// From there, terminating an elevated GUI is Access Denied (UIPI) and
-        /// stopping a LocalSystem service is Access Denied (SCM). But a process
-        /// can always shut ITSELF down whatever its integrity level — so we
-        /// signal, and they comply. No taskkill, no elevation, no self-elevating
-        /// bundle.
+        /// per-machine MSI, everything before <c>InstallInitialize</c> runs with
+        /// the invoking user's own unelevated rights (this action is hosted in
+        /// <c>rundll32</c>, impersonating that user). From there, terminating an
+        /// elevated GUI is Access Denied (UIPI) and stopping a LocalSystem service
+        /// is Access Denied (SCM) — the latter observed verbatim in the log as
+        /// "SCM stop unavailable (Cannot open Lithic Backup service on computer
+        /// '.')". But a process can always shut ITSELF down whatever its integrity
+        /// level — so we signal, and they comply. No taskkill, no elevation, no
+        /// self-elevating bundle.
         /// </para>
         /// <para>
         /// Always returns Success — a failure here must never break the install
@@ -155,27 +173,91 @@ namespace LithicBackup.CustomActions
         }
 
         /// <summary>
-        /// Ask the interactive GUI to close itself.
+        /// Ask the interactive GUI to close itself, by whichever of three names it
+        /// turns out to be listening on.
         /// </summary>
         /// <remarks>
-        /// Tries the cross-session <c>Global\</c> name first, then the session-local
-        /// one. Both are attempted because neither is guaranteed: an unelevated GUI
-        /// cannot create the <c>Global\</c> name (no SeCreateGlobalPrivilege), and
-        /// the session-local name is invisible from the session-0 server process this
-        /// action normally runs in. "Neither found" is a perfectly normal outcome —
-        /// no GUI is running, or it is an unelevated one that Restart Manager will
-        /// close by itself.
+        /// <para>
+        /// In order of preference:
+        /// </para>
+        /// <list type="number">
+        /// <item><description>
+        /// <c>Global\LithicBackup.Shutdown</c> — published by 1.0.56+ GUIs that are
+        /// running elevated. Visible from every session, so this is the clean path.
+        /// </description></item>
+        /// <item><description>
+        /// <c>Session\&lt;n&gt;\LithicBackup.Shutdown</c>, for the session of each
+        /// running GUI process — the only name an OLDER GUI (≤ 1.0.55) ever
+        /// published, and the only name an unelevated GUI of any version can
+        /// publish, since creating a <c>Global\</c> object needs
+        /// SeCreateGlobalPrivilege. The <c>Session\&lt;n&gt;\</c> prefix is resolved
+        /// against that session's object directory whoever is asking, which is what
+        /// makes it reachable from the session-0 server process.
+        /// </description></item>
+        /// <item><description>
+        /// The bare session-local name, for the case where this action does run in
+        /// the GUI's own session.
+        /// </description></item>
+        /// </list>
+        /// <para>
+        /// "None of them found" is a perfectly normal outcome — most often no GUI is
+        /// running at all.
+        /// </para>
         /// </remarks>
         private static void SignalGui(Session session)
         {
             if (TrySignal(session, GlobalGuiShutdownEventName, "GUI"))
                 return;
+
+            foreach (var sessionId in GuiSessionIds(session))
+            {
+                var name = string.Format(GuiShutdownEventSessionFormat, sessionId);
+                if (TrySignal(session, name, "GUI"))
+                    return;
+            }
+
             if (TrySignal(session, GuiShutdownEventName, "GUI"))
                 return;
 
-            session.Log("SignalLithicShutdown: no GUI shutdown listener found on either " +
-                        "'" + GlobalGuiShutdownEventName + "' or '" + GuiShutdownEventName +
-                        "' (GUI not running, not elevated, or predates signal support).");
+            session.Log("SignalLithicShutdown: no GUI shutdown listener found under any " +
+                        "known name (GUI not running, or predates signal support).");
+        }
+
+        /// <summary>
+        /// The distinct Windows session IDs that a GUI process is currently running
+        /// in, so <see cref="SignalGui"/> knows which namespaces to look in.
+        /// </summary>
+        /// <remarks>
+        /// Nearly always exactly one, but fast user switching can genuinely produce
+        /// two, and the upgrade has to free the files held by both.
+        /// </remarks>
+        private static int[] GuiSessionIds(Session session)
+        {
+            try
+            {
+                var seen = new System.Collections.Generic.List<int>();
+                foreach (var p in Process.GetProcessesByName(GuiProcessName))
+                {
+                    using (p)
+                    {
+                        if (!seen.Contains(p.SessionId))
+                            seen.Add(p.SessionId);
+                    }
+                }
+
+                if (seen.Count > 0)
+                {
+                    session.Log("SignalLithicShutdown: GUI is running in session(s) " +
+                                string.Join(", ", seen.ConvertAll(i => i.ToString()).ToArray()) + ".");
+                }
+
+                return seen.ToArray();
+            }
+            catch (Exception ex)
+            {
+                session.Log("SignalLithicShutdown: could not enumerate GUI sessions: " + ex.Message);
+                return new int[0];
+            }
         }
 
         /// <summary>

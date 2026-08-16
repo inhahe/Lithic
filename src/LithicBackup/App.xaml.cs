@@ -44,35 +44,30 @@ public partial class App : Application
     // installer\Package.wxs (SignalLithicShutdown) and the MSI-upgrade entry in
     // known-issues.md.
     //
-    // TWO names, because the custom action does not run where it looks like it
-    // runs. Windows Installer splits an install between a CLIENT process (which
-    // runs the InstallUISequence, in the user's session, unelevated) and a SERVER
-    // process (msiexec /V, which runs the InstallExecuteSequence as LocalSystem in
-    // SESSION 0). SignalLithicShutdown is scheduled in the InstallExecuteSequence,
-    // so despite Execute="immediate" Impersonate="yes" it executes in the session-0
-    // server process. An unprefixed event name resolves per-session — the installer
-    // would look in \Sessions\0\BaseNamedObjects while this GUI's event lives in
-    // \Sessions\1\ — so the session-local name ALONE can never be found, and the
-    // GUI was never actually being asked to close. Measured, not theorised: the
-    // Worker was SCM-stopped (which the Medium client cannot do) while the GUI's
-    // callback never ran. See the MSI-upgrade entry in known-issues.md.
+    // TWO names, for reach rather than for rights. For an ordinary double-click
+    // the custom action runs impersonated as the invoking user in that user's own
+    // session (measured: hosted in rundll32, session 1 — it logs this on every
+    // run), so the unprefixed name below is all it strictly needs. The Global\ one
+    // is published as well because it is the single name that resolves identically
+    // from ANY session, which matters for a system-context deployment (SCCM and
+    // friends) where the action really does run as SYSTEM in session 0.
     //
-    // So we also publish a Global\ event, which resolves identically from every
-    // session. Creating a global kernel object requires SeCreateGlobalPrivilege,
-    // which an UNELEVATED GUI does not hold — but that is exactly the case that
-    // does not need it: a Medium-integrity GUI can be closed by Restart Manager on
-    // its own (see ShutdownForRestartManager). The privilege boundary and the
-    // fallback boundary coincide, so between them every case is covered:
+    // Do NOT re-derive a story here about session namespaces being the reason the
+    // handshake used to fail. That was a wrong diagnosis, and it briefly replaced
+    // these comments with the opposite of the truth. The handshake used to fail
+    // because the custom action could not be LOADED at all — installer\CustomActions
+    // was missing CustomAction.config, so SfxCA bound CLR 2.0 and threw
+    // BadImageFormatException on the net472 assembly, which Return="ignore" then
+    // silently swallowed. See known-issues.md.
     //
-    //   elevated GUI      -> Global\ event created; installer signals it. RM alone
-    //                        would fail here (UIPI blocks a Medium client from
-    //                        closing a High-integrity window).
-    //   unelevated GUI    -> no Global\ event, but RM closes it unaided.
-    //
-    // The session-local name is kept as well: it costs nothing and still works for
-    // any signaller that runs in the user's own session.
-    // (The Worker service has the same problem and the same answer, except that as
-    // LocalSystem it can always create the Global\ name — see
+    // Both registrations are attempted independently and neither is required: if
+    // one throws we log it and keep the other. (Empirically an unelevated GUI on
+    // Windows 11 CAN create the Global\ name — the filtered token has no
+    // SeCreateGlobalPrivilege, yet creation succeeds — but that is not relied on.)
+    // Whatever happens here, Restart Manager remains the backstop for an
+    // unelevated GUI; only an ELEVATED one depends on this handshake, because UIPI
+    // blocks RM's unelevated client from closing a High-integrity window.
+    // (The Worker service publishes the same kind of Global\ name — see
     // LithicBackup.Worker\ShutdownSignalListener.cs.)
     private const string ShutdownSignalName = "LithicBackup.Shutdown";
     private const string GlobalShutdownSignalName = @"Global\LithicBackup.Shutdown";
@@ -227,10 +222,9 @@ public partial class App : Application
         // integrity, so a Medium signaller is not blocked by no-write-up. When set,
         // we perform the same graceful shutdown as a Restart Manager close, which
         // releases LithicBackup.exe so the upgrade can replace it.
-        // The Global\ name is the one the installer's custom action can actually
-        // reach (it runs in session 0). Expected to fail when this GUI is not
-        // elevated — see the GlobalShutdownSignalName comment for why that case
-        // needs no listener.
+        // The Global\ name additionally reaches a signaller in another session (a
+        // system-context install). Not required, and not always creatable, so a
+        // failure here is logged and shrugged off rather than treated as fatal.
         if (!TryRegisterShutdownSignal(
                 GlobalShutdownSignalName,
                 out _globalShutdownSignalEvent,
@@ -239,8 +233,8 @@ public partial class App : Application
         {
             CrashLogger.Log(null,
                 "Cross-session upgrade shutdown listener not registered (" + globalError +
-                "). This is expected when the app is not running elevated: an unelevated " +
-                "instance is closed by Restart Manager instead.");
+                "). Harmless: the session-local listener below still covers an ordinary " +
+                "interactive install, and Restart Manager remains the backstop.");
         }
 
         if (!TryRegisterShutdownSignal(

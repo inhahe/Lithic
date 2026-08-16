@@ -227,18 +227,26 @@
       service, see src\LithicBackup.Worker\ShutdownSignalListener.cs) and waits,
       bounded and concurrently, for both processes to exit.
 
-      WHICH PROCESS THIS RUNS IN — the detail that broke it.  An install is split
-      between a CLIENT process (runs the InstallUISequence, in the user's session,
-      unelevated) and a SERVER process (msiexec /V, LocalSystem, SESSION 0, runs
-      the InstallExecuteSequence).  This action is in the InstallExecuteSequence,
-      so it runs in the SERVER process — in session 0, as LocalSystem.  Both of
-      the notes that used to be here said the opposite, and that mistake is the
-      whole bug: unprefixed event names resolve per-session, so the GUI's
-      session-local event lives in \Sessions\1\BaseNamedObjects while this action
-      looks in \Sessions\0\, never finds it, and silently gives up (Return=ignore).
-      Hence the Global\ name for the GUI.  Verified by measurement, not by reading:
-      the Worker really was SCM-stopped, which the unelevated Medium client could
-      not have done.
+      WHAT ACTUALLY BROKE IT — and it is not in this file.  From 1.0.11 to 1.0.55
+      this action never executed a single line.  installer\CustomActions had no
+      CustomAction.config, so SfxCA.dll (the native stub around a DTF action,
+      which must choose a CLR before it can load any managed code) bound
+      CLR v2.0.50727 and threw BadImageFormatException on the net472 assembly.
+      Return="ignore" turned that 1603 into "success", and the install walked
+      straight into the 1611 this action exists to prevent.  If you ever see
+      "SFXCA: Binding to CLR version v2.0.50727" in a verbose log, that config
+      file has gone missing again.
+
+      WHICH PROCESS THIS RUNS IN.  Stated from measurement, because a
+      plausible-sounding guess about this once sent the diagnosis badly astray:
+      for an ordinary double-click it runs as a REMOTE custom action hosted in
+      rundll32, IMPERSONATED AS THE INVOKING USER IN THAT USER'S OWN SESSION.
+      The action logs this on every run, e.g. "running as 'DOMAIN\user' in
+      process rundll32 (pid 72736), session 1."  It does NOT run as LocalSystem
+      in session 0 — an earlier revision of this very comment asserted that, and
+      it was wrong.  Consistent with the measurement, it cannot SCM-stop the
+      LocalSystem service ("Cannot open Lithic Backup service on computer '.'"),
+      which is why the Worker is asked via its Global\ event instead.
 
       Scheduled Before InstallValidate (see InstallExecuteSequence below) so both
       executables and all their self-contained DLLs are released before MSI looks
@@ -249,16 +257,18 @@
 
         * Execute="immediate"  — runs during sequence processing, before the
           file-in-use detection; a deferred action would run far too late.
-        * Impersonate="yes"    — kept, but it does NOT put the action in the user's
-          session; only the sequence it lives in decides that (see above).  The
-          action ASKS both processes to exit rather than killing them because a
-          process can always shut itself down regardless of integrity level, which
-          is the only approach that works against a GUI running elevated.
+        * Impersonate="yes"    — runs as the invoking user, which is what puts the
+          action in that user's session and namespace (confirmed by its own log).
+          The action ASKS both processes to exit rather than killing them because
+          a process can always shut itself down regardless of integrity level,
+          which is the only approach that works against a GUI running elevated.
         * Return="ignore"      — this is a best-effort convenience; the action also
           returns Success internally.  A first-time install (nothing running) is a
-          harmless no-op.  NOTE that this is also what let the broken GUI signal go
-          unnoticed for so long, which is why the action now logs the process,
-          account and session it is running in.
+          harmless no-op.  NOTE that this is also what hid a custom action that
+          could not even LOAD for 45 releases, which is why the action now logs
+          the process, account and session it is running in — and why a verbose
+          log should be checked for "SignalLithicShutdown:" lines after any change
+          to the CustomActions project.
 
       No condition: attempting the signal on every install/upgrade/uninstall is
       harmless (a no-op when nothing is running) and keeps behavior predictable.

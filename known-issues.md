@@ -512,93 +512,178 @@ distinct "destination folder missing" status alongside "full" — checking
 `Directory.Exists(resolution.LivePath)`, but *not* treating it as an error for a
 set that has never run, where the backup would create the folder itself.
 
-## FIXED: Error 1611 again — the GUI shutdown signal was sent into the *wrong session* and had never once worked (2026-08-16)
+## FIXED: Error 1611 — the shutdown custom action never executed a single line, because SfxCA could not load it (2026-08-16)
 
 **Symptom.** Installing 1.0.55 over 1.0.53 failed with the same "setup was unable
 to automatically close all requested applications" dialog, even though 1.0.53
-contains both the GUI listener *and* the Worker listener that 1.0.53 was supposed
-to have finished this off. The user's instinct was right: *"I think it might be
-referring to the open LithicBackup window; I may not have this problem when
-there's no window open."*
+contains both the GUI listener *and* the Worker listener that were supposed to have
+finished this off. The user's instinct was right: *"I think it might be referring to
+the open LithicBackup window; I may not have this problem when there's no window
+open."*
 
-**Root cause 1 (the real one): an immediate custom action does not run where
-everybody assumed.** Windows Installer splits an install between two processes:
+**Root cause: the managed custom action was never loaded, so it never ran.** From
+the verbose MSI log of the failing install:
 
-| Process | Runs | Identity | **Session** |
-|---|---|---|---|
-| **client** `msiexec` (the one you launched) | `InstallUISequence` | invoking user, unelevated (Medium) | user's session (1) |
-| **server** `msiexec /V` | **`InstallExecuteSequence`** | **LocalSystem** | **0** |
+```
+SFXCA: Binding to CLR version v2.0.50727
+Calling custom action LithicBackup.CustomActions!...CustomActions.SignalLithicShutdown
+Error: could not load custom action class ... from assembly: LithicBackup.CustomActions
+System.BadImageFormatException: Could not load file or assembly
+  'LithicBackup.CustomActions' or one of its dependencies. This assembly is built
+  by a runtime newer than the currently loaded runtime and cannot be loaded.
+CustomAction SignalLithicShutdown returned actual error code 1603 but will be
+  translated to success due to continue marking
+```
 
-`SignalLithicShutdown` is scheduled in the **InstallExecuteSequence**, so it runs
-in the *server* process — LocalSystem, **session 0** — and `Execute="immediate"
-Impersonate="yes"` does not change that. Unprefixed kernel-object names resolve
-**per session**: the action looked for `LithicBackup.Shutdown` in
-`\Sessions\0\BaseNamedObjects\` while the GUI had published it in
-`\Sessions\1\`. `OpenExisting` therefore threw `WaitHandleCannotBeOpened`, the
-handler logged "no GUI shutdown listener found", `Return="ignore"` swallowed it,
-and **the GUI was never once actually asked to close** — not in 1.0.55, not in
-1.0.53, not since the mechanism was introduced in 1.0.11. Every previous
-occurrence got misattributed to the "bootstrap caveat" (the running build predates
-the listener), which is why it survived so many rounds of fixing.
+`SfxCA.dll` — the native stub `MakeSfxCA` wraps around a DTF action — must choose a
+CLR version *before* it can load any managed code, and it cannot infer it from the
+assembly. Its only input is a file named exactly **`CustomAction.config`** unpacked
+beside the assembly. This project never had one, so SfxCA fell back to its legacy
+default, **CLR v2.0.50727**, and loading the `net472` assembly threw
+`BadImageFormatException` every single time.
 
-*Proved by measurement, not by reading the code* — the code looks correct:
+`SignalLithicShutdown` therefore **never executed a single line** — not in 1.0.55,
+not in 1.0.53, not since the mechanism was introduced in 1.0.11. The whole
+machinery was dead on arrival. And it was *invisible*, because the action is
+authored `Return="ignore"`: Windows Installer dutifully logged "returned actual
+error code 1603 but will be translated to success due to continue marking" and
+carried straight on to `InstallValidate`, which raised the very 1611 the action
+existed to prevent. Every previous occurrence got misattributed to the "bootstrap
+caveat" (the running build predates the listener), which is why it survived so many
+rounds of fixing.
 
-- The Worker **was** SCM-stopped at 00:56:33 (`ServiceController.Stop()`), which an
-  unelevated Medium client **cannot** do to a LocalSystem service ⇒ the action ran
-  with LocalSystem rights, not as the user.
-- The Worker log never contains `Installer requested shutdown`, so its `Global\`
-  event wasn't what stopped it — the SCM route did.
-- The GUI's event *did* exist and *was* openable with `Modify` from an ordinary
-  Medium shell, so the DACL was fine; yet the GUI never ran its callback (it would
-  have hard-exited within 5 s via the watchdog and logged doing so).
-- `Win32_Process` reported `msiexec` client = session 1 Medium, `msiexec /V` =
-  session 0, GUI = session 1.
+**The fix is one file:** `installer\CustomActions\CustomAction.config`, packed via a
+`<Content>` item in the `.csproj`, containing
+`<supportedRuntime version="v4.0" />` plus
+`useLegacyV2RuntimeActivationPolicy="true"` (SfxCA activates the runtime through the
+legacy `CorBindToRuntimeEx` path, which refuses a v4 request without that flag).
+Verified by the `.CA.rsp` listing the config, and by the action actually logging on
+the next install.
 
-**Root cause 2 (why the safety net failed too): the app was running elevated when
-it had no business being.** `LithicBackup.exe`'s manifest is `asInvoker`, and the
-Start-menu shortcut does not request elevation — but the running GUI measured
-**High integrity (S-1-16-12288)**. It inherited that from the installer: the in-app
-updater launched `msiexec` with `Verb = "runas"`, making the *client* process
-elevated, and the wizard's "Launch Lithic Backup" exit checkbox (ticked by default)
-starts the GUI from that same elevated client. The app then stays elevated for its
-whole lifetime. At the next upgrade, Restart Manager — driven from an ordinary
-unelevated client — is blocked by **UIPI** from closing a High-integrity window.
+**Secondary issue, fixed as well: the app was running elevated when it had no
+business being.** `LithicBackup.exe`'s manifest is `asInvoker` and the Start-menu
+shortcut does not request elevation, yet the running GUI measured **High integrity
+(S-1-16-12288)**. It inherited that from the installer: the in-app updater launched
+`msiexec` with `Verb = "runas"`, making the *client* process elevated, and the
+wizard's "Launch Lithic Backup" exit checkbox (ticked by default) starts the GUI
+from that same elevated client, which then stays elevated for its whole lifetime.
+That matters because Restart Manager — the fallback when the handshake misses — is
+driven from an unelevated client and is blocked by **UIPI** from closing a
+High-integrity window. So the two faults composed: with the action dead, RM was the
+only remaining mechanism, and elevation disabled RM too. `Verb = "runas"` is gone
+(`MainViewModel.DownloadUpdateAsync`); Windows Installer still elevates itself at
+`InstallInitialize`, so the user sees the same single UAC prompt.
 
-The two faults compose exactly as observed: root cause 1 alone is *silent*, because
-RM quietly closes a normal Medium GUI; add root cause 2 and RM fails too, so the
-install dies with 1611. That is precisely the intermittency that made this look
-random.
+### A wrong diagnosis that got as far as being committed — worth recording
 
-**Fix (v1.0.56).**
+Before the log was read carefully, the failure was attributed to **kernel-object
+session namespaces**: the theory was that `SignalLithicShutdown`, living in the
+`InstallExecuteSequence`, runs in the `msiexec /V` *server* process as LocalSystem
+in **session 0**, and so could never see the GUI's session-local
+`LithicBackup.Shutdown` in `\Sessions\1\BaseNamedObjects\`. It is a tidy story, it
+explains the symptom perfectly, and it is **false**. Once the action could actually
+run, the first thing it logged was:
 
-1. **The GUI publishes `Global\LithicBackup.Shutdown` as well** (`App.xaml.cs`,
-   `TryRegisterShutdownSignal`), which resolves identically from every session, so
-   the session-0 action can find it. Creating a global object needs
-   `SeCreateGlobalPrivilege`, which an **unelevated** GUI lacks — but that is
-   exactly the case that doesn't need it, because Restart Manager can close an
-   unelevated GUI unaided. **The privilege boundary and the fallback boundary
-   coincide, so between them every case is covered.** The session-local name is
-   still published too (it costs nothing and works for same-session signallers).
-2. **The custom action tries `Global\` first, then the session-local name**, and
-   reports "no listener" only when *both* miss (`TrySignal`).
-3. **The in-app updater no longer elevates** (`MainViewModel.DownloadUpdateAsync`):
-   `Verb = "runas"` is gone. It was added in 1.0.53 on the false premise that the
-   custom action runs in the client process and so needed the client elevated to
-   SCM-stop the Worker; since the action actually runs as LocalSystem in session 0,
-   the SCM stop already succeeds from a plain double-click. Elevating bought
-   nothing and *caused* root cause 2. Windows Installer still elevates itself at
-   `InstallInitialize`, so the user sees the same single UAC prompt.
-4. **The action now logs its process, account and session** (`LogContext`). The
-   only reason this took an afternoon of process forensics is that `Return="ignore"`
-   plus a caught exception made a total failure indistinguishable from "nothing was
-   running". One line in the verbose log now names the session outright.
+```
+SignalLithicShutdown: running as 'LOGOPLEX3\inhah' in process rundll32 (pid 72736), session 1.
+```
 
-**Lesson worth keeping.** Three separate files (`Package.wxs`, `CustomAction.cs`,
-`App.xaml.cs`) all asserted in comments that the action "runs in the user's own
-msiexec client process, i.e. the same session as the GUI". That claim was never
-tested, it was wrong, and every subsequent fix was designed on top of it. All three
-are corrected. When a mechanism is best-effort and swallows its own errors, make it
-*say* what it did.
+It runs **impersonated as the invoking user, in the user's own session** — a
+*remote* custom action hosted in `rundll32`, exactly as the original comments in
+this repo had always claimed. Those comments were rewritten to assert the opposite,
+and had to be rewritten back. Two lessons:
+
+- **A theory that explains the symptom is not evidence.** The session-0 story was
+  built from `Win32_Process` session IDs of the *msiexec* processes, which say
+  nothing about where a remote CA is hosted. The one measurement that would have
+  settled it — having the action log its own account and session — was added as an
+  afterthought and immediately refuted the theory it was added to support.
+- **When a mechanism is best-effort and swallows its own errors, make it say what
+  it did.** `Return="ignore"` plus a caught `WaitHandleCannotBeOpenedException`
+  made *total failure to load* indistinguishable from *nothing was running*. That
+  ambiguity is what hid a dead custom action for 45 releases.
+
+### What was kept from the wrong turn
+
+The multi-name lookup added while chasing the session theory is retained, because
+it is genuinely useful even though the premise was wrong. `SignalGui` now tries, in
+order: `Global\LithicBackup.Shutdown` → `Session\<n>\LithicBackup.Shutdown` for the
+session of each running GUI process → the bare session-local name.
+
+- The `Session\<n>\` form is what **actually fired** on the verified 1.0.53 → 1.0.56
+  upgrade, because a 1.0.53 GUI does not publish the `Global\` name. It resolves
+  against another session's object directory whatever session the caller is in, so
+  it also covers a genuine system-context deployment (SCCM and friends), where the
+  action *would* run as SYSTEM in session 0.
+- It means the fix is **retroactive**: it works against GUIs that predate it, rather
+  than only from the upgrade after the one that delivers it.
+
+**Also measured, and contrary to what was briefly documented:** an ordinary
+*unelevated* interactive process **can** create `Global\` names on Windows 11 —
+verified directly (`whoami /priv` shows no `SeCreateGlobalPrivilege` in the filtered
+token, yet `Global\LithicProbeTest` was created successfully, and an unelevated
+1.0.56 GUI publishes all three names). Any claim that the `Global\` name is
+available only to elevated instances is wrong.
+
+**Verified end to end:**
+
+- Isolated handshake test, no installer and nobody touching the window: GUI launched,
+  `Session\1\LithicBackup.Shutdown` set at 01:44:39, **GUI exited by itself at
+  01:44:42** with exit code 0.
+- Real upgrade 1.0.53 → 1.0.56 over a running GUI: action signalled the GUI, logged
+  `GUI is not running; its files are free to replace`, and the install finished with
+  `Installation success or error status: 0`.
+
+## FIXED: the Worker's shutdown listener was never registered while the service was running (2026-08-16)
+
+**Found because the custom action could finally report.** On the first upgrade where
+`SignalLithicShutdown` actually ran (see the entry above), it logged:
+
+```
+SignalLithicShutdown: no listener on 'Global\LithicBackup.Worker.Shutdown'.
+SignalLithicShutdown: Worker still running after wait; deferring to Installer file-in-use handling.
+```
+
+…even though the Worker was running and `ShutdownSignalListener` was registered as a
+hosted service. So the Worker half of the handshake was dead too, for an unrelated
+reason, and had been hidden behind the dead custom action.
+
+**Root cause: a hosted service that does not hand control back starves every hosted
+service after it.** `BackupWorker` is a `BackgroundService`.
+`BackgroundService.StartAsync` does not *await* `ExecuteAsync` — but it does have to
+*call* it, and if the body runs synchronously (this one is dominated by synchronous
+file I/O and awaits that complete synchronously) the call does not return until the
+first genuinely-incomplete await. `Host.StartAsync` starts hosted services
+**sequentially**, so `ShutdownSignalListener.StartAsync` was never reached and the
+`Global\` event was never created.
+
+The worker log shows the signature unmistakably — startup completing at the instant
+of shutdown, thirteen minutes after the process began:
+
+```
+01:23:37.846  LithicBackup Worker started.          <- ExecuteAsync entered
+   ... a full backup runs, on the startup path ...
+01:36:42.718  Application is shutting down...
+01:36:42.755  LithicBackup Worker stopped.
+01:36:42.771  Installer shutdown listener registered on "Global\...".   <- only now
+01:36:42.782  Application started.                                      <- only now
+```
+
+**Fix (v1.0.56), two independent parts, both wanted:**
+
+1. `await Task.Yield();` as the first statement of `BackupWorker.ExecuteAsync`, which
+   forces an asynchronous continuation so the method returns to the host immediately
+   and the loop resumes on a thread-pool thread. This is the actual bug fix.
+2. `ShutdownSignalListener` is now registered **before** `BackupWorker` in
+   `Program.cs`. Cheap, must-always-exist services belong ahead of heavy ones, so the
+   handshake cannot be starved again if some future hosted service reintroduces a
+   stall. (Stop order reverses, so the listener now stops last — which is preferable
+   anyway, and its `StopAsync` is a no-op.)
+
+**Watch for the recurrence:** any verbose MSI log line reading `no listener on
+'Global\LithicBackup.Worker.Shutdown'` while the service is running means startup is
+being blocked again. Check hosted-service order and the startup path, not
+`ShutdownSignalListener`.
 
 ## FIXED: "Unable to automatically close all requested applications" (error 1611) — the *Worker service* was never closed before the file-in-use check (2026-08-15)
 
