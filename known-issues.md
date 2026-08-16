@@ -184,14 +184,31 @@ to be on the squeezed volume) and, ironically, also a *contributor* to the churn
 that the snapshot had to preserve. The durable mitigation is outside Lithic, in
 priority order:
 
-1. **Cap the diff area** (elevated, one-off, and the only change that makes the
-   failure mode *benign* rather than less likely):
+1. **Move D:'s diff area onto another volume** (elevated, one-off). A shadow copy's
+   diff area does *not* have to live on the volume it protects — for any non-system
+   volume it can be redirected, which makes D:'s free space structurally immune to
+   snapshots of D: no matter how much churn there is:
+
+   ```
+   vssadmin add shadowstorage /for=D: /on=E: /maxsize=100GB
+   ```
+
+   E: is NTFS with **600 GB free of 931 GB**, versus D:'s 82 GB — so it can absorb
+   a leak that D: cannot. Both volumes must be NTFS (they are) and D: must not be
+   the system volume (it isn't). Two caveats: redirecting deletes any existing
+   shadow copies on D: (there are none), and copy-on-write traffic for D: now lands
+   on E:, so a heavy overwrite burst on D: costs I/O on E: while a snapshot is
+   live. Keep the `maxsize` — redirected *and* unbounded just moves which volume
+   gets eaten.
+2. **Or just cap it in place**, if the extra I/O on E: is unwelcome:
    `vssadmin resize shadowstorage /for=D: /on=D: /maxsize=20GB`.
    `Win32_ShadowStorage` currently reports **no** allocated store on any volume,
    which means unbounded — a leaked snapshot may take the whole volume. With a cap,
    Volsnap aborts the snapshot at 20 GB (the `Volsnap/24`/`35` pair still appears
    in the log) and free space never craters. It costs CrashPlan a retried backup;
-   its run was already being interrupted anyway.
+   its run was already being interrupted anyway. Setting `maxsize` to the 320 MB
+   minimum effectively opts D: out of being snapshotted at all, at the cost of
+   CrashPlan never capturing an open file on D:.
 2. **Turn off open-file backup in CrashPlan** (Device Settings → Backup → Advanced
    → "back up open files"). If VSS never opens, it cannot leak. The cost is that
    CrashPlan skips locked files — tolerable here, since D: is already covered by
@@ -201,14 +218,20 @@ priority order:
 3. **Reclaim immediately when a leak is detected**, rather than waiting for Volsnap
    to hit the wall: `vssadmin delete shadows /for=D: /oldest` (elevated). Pair it
    with the stale-snapshot check in `tools\lowdisk-events.ps1`.
-4. **Move the churn.** The CoW cost is dominated by `os-lane-*` build/QEMU
-   activity; hosting those worktrees on a volume nothing snapshots removes the
-   cause rather than the symptom.
+4. **Move the churn** — but note the goal is *headroom*, not escaping snapshots.
+   Every mounted volume gets snapshotted (see above), so there is nowhere
+   "unsnapshotted" to put `os-lane-*`. Relocating them to E: would still work,
+   because E:'s 600 GB can absorb the diff area that D:'s 82 GB cannot — but
+   option 1 achieves the same thing without moving anything, so this is only worth
+   it for other reasons.
 
 **Ruled out: deselecting volumes in CrashPlan.** See above — the snapshot set is
 built from enumerated drive letters, not the backup selection, so I: and J: are
 snapshotted despite not being selected. Nothing in CrashPlan's file selection
 shrinks the snapshot set.
+
+**Ruled out: finding a volume that isn't snapshotted.** There isn't one, for the
+same reason. Any volume that is mounted when CrashPlan opens VSS is in the set.
 
 What does **not** work, for the record:
 
