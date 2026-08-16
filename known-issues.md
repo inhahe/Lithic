@@ -512,6 +512,94 @@ distinct "destination folder missing" status alongside "full" — checking
 `Directory.Exists(resolution.LivePath)`, but *not* treating it as an error for a
 set that has never run, where the backup would create the folder itself.
 
+## FIXED: Error 1611 again — the GUI shutdown signal was sent into the *wrong session* and had never once worked (2026-08-16)
+
+**Symptom.** Installing 1.0.55 over 1.0.53 failed with the same "setup was unable
+to automatically close all requested applications" dialog, even though 1.0.53
+contains both the GUI listener *and* the Worker listener that 1.0.53 was supposed
+to have finished this off. The user's instinct was right: *"I think it might be
+referring to the open LithicBackup window; I may not have this problem when
+there's no window open."*
+
+**Root cause 1 (the real one): an immediate custom action does not run where
+everybody assumed.** Windows Installer splits an install between two processes:
+
+| Process | Runs | Identity | **Session** |
+|---|---|---|---|
+| **client** `msiexec` (the one you launched) | `InstallUISequence` | invoking user, unelevated (Medium) | user's session (1) |
+| **server** `msiexec /V` | **`InstallExecuteSequence`** | **LocalSystem** | **0** |
+
+`SignalLithicShutdown` is scheduled in the **InstallExecuteSequence**, so it runs
+in the *server* process — LocalSystem, **session 0** — and `Execute="immediate"
+Impersonate="yes"` does not change that. Unprefixed kernel-object names resolve
+**per session**: the action looked for `LithicBackup.Shutdown` in
+`\Sessions\0\BaseNamedObjects\` while the GUI had published it in
+`\Sessions\1\`. `OpenExisting` therefore threw `WaitHandleCannotBeOpened`, the
+handler logged "no GUI shutdown listener found", `Return="ignore"` swallowed it,
+and **the GUI was never once actually asked to close** — not in 1.0.55, not in
+1.0.53, not since the mechanism was introduced in 1.0.11. Every previous
+occurrence got misattributed to the "bootstrap caveat" (the running build predates
+the listener), which is why it survived so many rounds of fixing.
+
+*Proved by measurement, not by reading the code* — the code looks correct:
+
+- The Worker **was** SCM-stopped at 00:56:33 (`ServiceController.Stop()`), which an
+  unelevated Medium client **cannot** do to a LocalSystem service ⇒ the action ran
+  with LocalSystem rights, not as the user.
+- The Worker log never contains `Installer requested shutdown`, so its `Global\`
+  event wasn't what stopped it — the SCM route did.
+- The GUI's event *did* exist and *was* openable with `Modify` from an ordinary
+  Medium shell, so the DACL was fine; yet the GUI never ran its callback (it would
+  have hard-exited within 5 s via the watchdog and logged doing so).
+- `Win32_Process` reported `msiexec` client = session 1 Medium, `msiexec /V` =
+  session 0, GUI = session 1.
+
+**Root cause 2 (why the safety net failed too): the app was running elevated when
+it had no business being.** `LithicBackup.exe`'s manifest is `asInvoker`, and the
+Start-menu shortcut does not request elevation — but the running GUI measured
+**High integrity (S-1-16-12288)**. It inherited that from the installer: the in-app
+updater launched `msiexec` with `Verb = "runas"`, making the *client* process
+elevated, and the wizard's "Launch Lithic Backup" exit checkbox (ticked by default)
+starts the GUI from that same elevated client. The app then stays elevated for its
+whole lifetime. At the next upgrade, Restart Manager — driven from an ordinary
+unelevated client — is blocked by **UIPI** from closing a High-integrity window.
+
+The two faults compose exactly as observed: root cause 1 alone is *silent*, because
+RM quietly closes a normal Medium GUI; add root cause 2 and RM fails too, so the
+install dies with 1611. That is precisely the intermittency that made this look
+random.
+
+**Fix (v1.0.56).**
+
+1. **The GUI publishes `Global\LithicBackup.Shutdown` as well** (`App.xaml.cs`,
+   `TryRegisterShutdownSignal`), which resolves identically from every session, so
+   the session-0 action can find it. Creating a global object needs
+   `SeCreateGlobalPrivilege`, which an **unelevated** GUI lacks — but that is
+   exactly the case that doesn't need it, because Restart Manager can close an
+   unelevated GUI unaided. **The privilege boundary and the fallback boundary
+   coincide, so between them every case is covered.** The session-local name is
+   still published too (it costs nothing and works for same-session signallers).
+2. **The custom action tries `Global\` first, then the session-local name**, and
+   reports "no listener" only when *both* miss (`TrySignal`).
+3. **The in-app updater no longer elevates** (`MainViewModel.DownloadUpdateAsync`):
+   `Verb = "runas"` is gone. It was added in 1.0.53 on the false premise that the
+   custom action runs in the client process and so needed the client elevated to
+   SCM-stop the Worker; since the action actually runs as LocalSystem in session 0,
+   the SCM stop already succeeds from a plain double-click. Elevating bought
+   nothing and *caused* root cause 2. Windows Installer still elevates itself at
+   `InstallInitialize`, so the user sees the same single UAC prompt.
+4. **The action now logs its process, account and session** (`LogContext`). The
+   only reason this took an afternoon of process forensics is that `Return="ignore"`
+   plus a caught exception made a total failure indistinguishable from "nothing was
+   running". One line in the verbose log now names the session outright.
+
+**Lesson worth keeping.** Three separate files (`Package.wxs`, `CustomAction.cs`,
+`App.xaml.cs`) all asserted in comments that the action "runs in the user's own
+msiexec client process, i.e. the same session as the GUI". That claim was never
+tested, it was wrong, and every subsequent fix was designed on top of it. All three
+are corrected. When a mechanism is best-effort and swallows its own errors, make it
+*say* what it did.
+
 ## FIXED: "Unable to automatically close all requested applications" (error 1611) — the *Worker service* was never closed before the file-in-use check (2026-08-15)
 
 **Symptom.** Installing 1.0.52 over 1.0.51 failed with:

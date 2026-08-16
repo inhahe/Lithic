@@ -221,10 +221,24 @@
 
       Managed (DTF) custom action, built by installer\CustomActions and embedded
       as the LithicCustomActions binary.  SignalLithicShutdown sets the named
-      event each process listens on (LithicBackup.Shutdown for the GUI, see
+      event each process listens on (Global\LithicBackup.Shutdown for the GUI,
+      falling back to the session-local LithicBackup.Shutdown, see
       src\LithicBackup\App.xaml.cs; Global\LithicBackup.Worker.Shutdown for the
       service, see src\LithicBackup.Worker\ShutdownSignalListener.cs) and waits,
       bounded and concurrently, for both processes to exit.
+
+      WHICH PROCESS THIS RUNS IN — the detail that broke it.  An install is split
+      between a CLIENT process (runs the InstallUISequence, in the user's session,
+      unelevated) and a SERVER process (msiexec /V, LocalSystem, SESSION 0, runs
+      the InstallExecuteSequence).  This action is in the InstallExecuteSequence,
+      so it runs in the SERVER process — in session 0, as LocalSystem.  Both of
+      the notes that used to be here said the opposite, and that mistake is the
+      whole bug: unprefixed event names resolve per-session, so the GUI's
+      session-local event lives in \Sessions\1\BaseNamedObjects while this action
+      looks in \Sessions\0\, never finds it, and silently gives up (Return=ignore).
+      Hence the Global\ name for the GUI.  Verified by measurement, not by reading:
+      the Worker really was SCM-stopped, which the unelevated Medium client could
+      not have done.
 
       Scheduled Before InstallValidate (see InstallExecuteSequence below) so both
       executables and all their self-contained DLLs are released before MSI looks
@@ -235,22 +249,26 @@
 
         * Execute="immediate"  — runs during sequence processing, before the
           file-in-use detection; a deferred action would run far too late.
-        * Impersonate="yes"    — runs as the invoking user (Medium).  That user
-          can neither terminate a High-integrity GUI nor SCM-stop a LocalSystem
-          service, which is exactly why the action ASKS instead: a process can
-          always shut itself down regardless of integrity level.  (It does still
-          try ServiceController.Stop first, which succeeds on the paths where the
-          MSI was launched already-elevated.)
+        * Impersonate="yes"    — kept, but it does NOT put the action in the user's
+          session; only the sequence it lives in decides that (see above).  The
+          action ASKS both processes to exit rather than killing them because a
+          process can always shut itself down regardless of integrity level, which
+          is the only approach that works against a GUI running elevated.
         * Return="ignore"      — this is a best-effort convenience; the action also
           returns Success internally.  A first-time install (nothing running) is a
-          harmless no-op.
+          harmless no-op.  NOTE that this is also what let the broken GUI signal go
+          unnoticed for so long, which is why the action now logs the process,
+          account and session it is running in.
 
       No condition: attempting the signal on every install/upgrade/uninstall is
       harmless (a no-op when nothing is running) and keeps behavior predictable.
 
       Bootstrap caveat: an upgrade can only signal a listener the ALREADY-INSTALLED
       build contains.  The upgrade that first delivers a listener still falls back
-      to Windows Installer's own handling for that one process.
+      to Windows Installer's own handling for that one process.  That fallback
+      (Restart Manager) closes an ordinary unelevated GUI fine; it cannot close an
+      elevated one, because UIPI blocks the unelevated client from posting to a
+      High-integrity window.
     -->
     <Binary Id="LithicCustomActions"
             SourceFile="CustomActions\bin\Release\LithicBackup.CustomActions.CA.dll" />

@@ -1,5 +1,6 @@
 using System;
 using System.Diagnostics;
+using System.Security.Principal;
 using System.ServiceProcess;
 using System.Threading;
 using WixToolset.Dtf.WindowsInstaller;
@@ -11,9 +12,25 @@ namespace LithicBackup.CustomActions
     /// </summary>
     public static class CustomActions
     {
-        // Session-local named event the running GUI listens on (see
-        // App.xaml.cs, ShutdownSignalName). Signalling it asks the GUI to close
-        // itself gracefully so the upgrade can replace LithicBackup.exe.
+        // Named events the running GUI listens on (see App.xaml.cs,
+        // ShutdownSignalName / GlobalShutdownSignalName). Signalling either asks the
+        // GUI to close itself gracefully so the upgrade can replace
+        // LithicBackup.exe.
+        //
+        // The Global\ one is tried FIRST and is the one that normally works. This
+        // action is scheduled in the InstallExecuteSequence, which Windows Installer
+        // runs in its SERVER process — msiexec /V, LocalSystem, SESSION 0 — not in
+        // the client process the user launched. (Execute="immediate"
+        // Impersonate="yes" does not change that; it is the sequence the action is
+        // in that decides.) An unprefixed event name resolves per-session, so from
+        // session 0 we would look in \Sessions\0\BaseNamedObjects while the GUI's
+        // event lives in \Sessions\1\ — the session-local name is simply invisible
+        // here, which is why the GUI never got the message and every upgrade with an
+        // elevated GUI open failed with error 1611.
+        private const string GlobalGuiShutdownEventName = @"Global\LithicBackup.Shutdown";
+
+        // Kept as a fallback for the case where this action DOES run in the user's
+        // own session, and for GUIs too old to publish the Global\ name.
         private const string GuiShutdownEventName = "LithicBackup.Shutdown";
 
         // Global\ named event the running Worker service listens on (see
@@ -82,6 +99,7 @@ namespace LithicBackup.CustomActions
         {
             try
             {
+                LogContext(session);
                 SignalGui(session);
                 StopWorker(session);
 
@@ -107,28 +125,87 @@ namespace LithicBackup.CustomActions
         }
 
         /// <summary>
-        /// Ask the interactive GUI to close itself.
+        /// Record which process, account and SESSION this action is actually running
+        /// in.
         /// </summary>
-        private static void SignalGui(Session session)
+        /// <remarks>
+        /// Not decoration. The whole reason the GUI handshake silently did nothing
+        /// for so long is that everyone (including the comments in this file) assumed
+        /// an immediate, impersonated custom action runs in the user's own client
+        /// process. It does not — it runs in msiexec's LocalSystem session-0 server
+        /// process, which is precisely why a session-local event name could never be
+        /// found. One log line makes that visible the first time anyone looks, rather
+        /// than after an afternoon of process forensics.
+        /// </remarks>
+        private static void LogContext(Session session)
         {
             try
             {
-                // OpenExisting throws WaitHandleCannotBeOpenedException when no
-                // GUI is running, or when the running GUI predates this signal
-                // support (no listener). Either way there's nothing to signal.
-                using (var ev = EventWaitHandle.OpenExisting(GuiShutdownEventName))
+                using (var p = Process.GetCurrentProcess())
+                {
+                    session.Log(string.Format(
+                        "SignalLithicShutdown: running as '{0}' in process {1} (pid {2}), session {3}.",
+                        WindowsIdentity.GetCurrent().Name, p.ProcessName, p.Id, p.SessionId));
+                }
+            }
+            catch (Exception ex)
+            {
+                session.Log("SignalLithicShutdown: could not determine execution context: " + ex.Message);
+            }
+        }
+
+        /// <summary>
+        /// Ask the interactive GUI to close itself.
+        /// </summary>
+        /// <remarks>
+        /// Tries the cross-session <c>Global\</c> name first, then the session-local
+        /// one. Both are attempted because neither is guaranteed: an unelevated GUI
+        /// cannot create the <c>Global\</c> name (no SeCreateGlobalPrivilege), and
+        /// the session-local name is invisible from the session-0 server process this
+        /// action normally runs in. "Neither found" is a perfectly normal outcome —
+        /// no GUI is running, or it is an unelevated one that Restart Manager will
+        /// close by itself.
+        /// </remarks>
+        private static void SignalGui(Session session)
+        {
+            if (TrySignal(session, GlobalGuiShutdownEventName, "GUI"))
+                return;
+            if (TrySignal(session, GuiShutdownEventName, "GUI"))
+                return;
+
+            session.Log("SignalLithicShutdown: no GUI shutdown listener found on either " +
+                        "'" + GlobalGuiShutdownEventName + "' or '" + GuiShutdownEventName +
+                        "' (GUI not running, not elevated, or predates signal support).");
+        }
+
+        /// <summary>
+        /// Set one named event if a listener has published it. Returns whether it was
+        /// signalled.
+        /// </summary>
+        private static bool TrySignal(Session session, string eventName, string label)
+        {
+            try
+            {
+                // OpenExisting throws WaitHandleCannotBeOpenedException when nothing
+                // has published this name in the namespace we can see.
+                using (var ev = EventWaitHandle.OpenExisting(eventName))
                 {
                     ev.Set();
-                    session.Log("SignalLithicShutdown: signalled '" + GuiShutdownEventName + "'.");
+                    session.Log("SignalLithicShutdown: signalled " + label + " on '" + eventName + "'.");
+                    return true;
                 }
             }
             catch (WaitHandleCannotBeOpenedException)
             {
-                session.Log("SignalLithicShutdown: no GUI shutdown listener found (GUI not running or predates signal support).");
+                session.Log("SignalLithicShutdown: no listener on '" + eventName + "'.");
+                return false;
             }
             catch (Exception ex)
             {
-                session.Log("SignalLithicShutdown: could not signal the GUI: " + ex.Message);
+                // e.g. UnauthorizedAccessException if the DACL ever stops granting
+                // Modify to this account — worth distinguishing from "not there".
+                session.Log("SignalLithicShutdown: could not signal '" + eventName + "': " + ex.Message);
+                return false;
             }
         }
 
@@ -172,22 +249,9 @@ namespace LithicBackup.CustomActions
                 session.Log("SignalLithicShutdown: SCM stop unavailable (" + ex.Message + "); falling back to the shutdown signal.");
             }
 
-            try
-            {
-                using (var ev = EventWaitHandle.OpenExisting(WorkerShutdownEventName))
-                {
-                    ev.Set();
-                    session.Log("SignalLithicShutdown: signalled '" + WorkerShutdownEventName + "'.");
-                }
-            }
-            catch (WaitHandleCannotBeOpenedException)
-            {
-                session.Log("SignalLithicShutdown: no Worker shutdown listener found (service not running or predates signal support).");
-            }
-            catch (Exception ex)
-            {
-                session.Log("SignalLithicShutdown: could not signal the Worker: " + ex.Message);
-            }
+            // Global\ by construction, so unlike the GUI's name this one is visible
+            // from whichever session we turn out to be running in.
+            TrySignal(session, WorkerShutdownEventName, "Worker");
         }
 
         private static void Report(Session session, string label, string processName)
