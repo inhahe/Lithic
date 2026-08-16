@@ -29,20 +29,31 @@ namespace LithicBackup.Worker;
 /// the install folder. Restart Manager sees them, tries to close them, and fails.
 /// </para>
 /// <para>
-/// <b>Why it fails rather than just stopping the service.</b> <c>InstallValidate</c>
-/// runs in the unelevated client process for a double-clicked per-machine MSI, at
-/// the invoking user's Medium integrity. Stopping a LocalSystem service from
-/// there is Access Denied. This is the same integrity wall that the GUI hit (see
-/// <c>App.xaml.cs</c>, <c>ShutdownSignalName</c>), and it has the same answer: a
-/// process can always shut ITSELF down, whatever its integrity level. So the
-/// installer asks, and we comply.
+/// <b>Why it fails rather than just stopping the service.</b> For a double-clicked
+/// per-machine MSI, everything before <c>InstallInitialize</c> runs with the
+/// invoking user's own unelevated rights. Stopping a LocalSystem service from
+/// there is Access Denied — observed verbatim in the MSI log as "Cannot open
+/// Lithic Backup service on computer '.'". This is the same wall the GUI hit (see
+/// <c>App.xaml.cs</c>), and it has the same answer: a process can always shut
+/// ITSELF down, whatever its integrity level. So the installer asks, and we comply.
+/// </para>
+/// <para>
+/// <b>This listener must be registered early, and it is not automatic.</b> It is
+/// registered as a hosted service AHEAD of <see cref="BackupWorker"/> in
+/// <c>Program.cs</c>. Hosted services start sequentially, and until 1.0.56
+/// <c>BackupWorker.ExecuteAsync</c> held the startup path for the entire duration
+/// of a backup, so this <c>StartAsync</c> was not reached and the event simply did
+/// not exist while the service was running — the installer logged "no listener on
+/// Global\LithicBackup.Worker.Shutdown" every time. If that symptom ever returns,
+/// look at hosted-service start order and at anything blocking on the startup path,
+/// not at this class.
 /// </para>
 /// <para>
 /// <b>Namespace and ACL.</b> The event is created in the <c>Global\</c> namespace
 /// because this service runs in session 0 while the installer's custom action runs
-/// in the user's interactive session — a session-local name would not be visible
-/// to both. Creating a <c>Global\</c> object needs SeCreateGlobalPrivilege, which
-/// LocalSystem has. The DACL grants Authenticated Users
+/// impersonated in the user's interactive session (measured) — a session-local name
+/// would not be visible to both. Creating a <c>Global\</c> object nominally needs
+/// SeCreateGlobalPrivilege, which LocalSystem has. The DACL grants Authenticated Users
 /// <see cref="EventWaitHandleRights.Modify"/> so that Medium-integrity custom
 /// action can actually Set it; the only capability this confers is "ask the backup
 /// service to stop", which is the same exposure the GUI's listener already carries.

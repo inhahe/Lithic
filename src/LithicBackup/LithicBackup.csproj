@@ -23,6 +23,13 @@
     <Using Remove="System.Windows.Forms" />
   </ItemGroup>
 
+  <!-- tools\cache_maint_test drives the real CacheMaintenance against a copy of
+       a cache database. It needs the directory-redirect seam, which stays
+       internal so the shipping app keeps exactly one cache location. -->
+  <ItemGroup>
+    <InternalsVisibleTo Include="CacheMaintTest" />
+  </ItemGroup>
+
   <ItemGroup>
     <ProjectReference Include="..\LithicBackup.Core\LithicBackup.Core.csproj" />
     <ProjectReference Include="..\LithicBackup.Services\LithicBackup.Services.csproj" />

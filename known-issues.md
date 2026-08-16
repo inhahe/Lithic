@@ -1,5 +1,690 @@
 # LithicBackup — Known Issues & Tech Debt
 
+## FIXED: expanding a drive in the source tree took ~6.6 s (2026-08-15)
+
+**Symptom.** Expanding `D:\` in a backup set's source-selection tree took several
+seconds before any row appeared, while `dir D:\` on the same directory is
+instantaneous. The tree already enumerated one level only, on a background
+thread, so the enumeration was not the suspect.
+
+**Measured, in this order** — the first two hypotheses were both wrong, and both
+would have led to rewriting XAML that was fine:
+
+| What | Time |
+|---|---|
+| Raw filesystem cost of `D:\` (249 dirs + 39 files: enumerate + attributes + length) | ~10 ms |
+| WPF layout of 249 rows in the real item template (`tools\treeview_bench`) | ~75 ms |
+| `SourceSelectionNodeViewModel` expansion of `D:\`, **"show sizes" off** (`tools\expand_probe`) | 39 ms |
+| Same expansion, **"show sizes" on** | **6,600 ms** |
+| `new DirectorySizeCache()` + one lookup, on its own | **5,908 ms** |
+
+**Cause: `DirectorySizeCache` read its entire SQLite table into a `Dictionary`
+before it would answer a single question.** The author's `sizecache.db` had grown
+to **1,493,915 rows / 538 MB**, and the load ran a `DateTime.Parse` per row. The
+previous version had already moved that load off the constructor onto a
+background task — but every lookup takes the same lock, so the first expansion
+after a set editor opened still waited for all of it. Moving a stall off the
+constructor and onto the first lookup does not remove it; the first lookup is
+precisely what the user is waiting for.
+
+`FileHashCache` had the identical shape and a worse placement: constructed
+**synchronously on the UI thread** in `App.OnStartup`, its 130 MB database cost
+**1.65 s** of dead time before the main window could appear.
+
+**Fix.** Both caches now do on-demand SQLite point lookups (`Path` / `FilePath`
+is the primary key, so each is an index seek) behind a bounded in-memory memo
+that records misses as well as hits, with the connection opened once on a
+background task and writes still batched. Nothing is read up front.
+
+| | before | after |
+|---|---|---|
+| expand `D:\`, show-sizes on | 6,600 ms | **~95 ms** |
+| directory sizes served from cache | 240 / 248 | 242 / 248 |
+| size-cache open | 6,432 ms | ~150 ms (off the lookup path) |
+| hash-cache load at startup | 1,654 ms | ~15 ms |
+
+Two smaller defects fixed alongside: the schema migration attempted six
+`ALTER TABLE ADD COLUMN`s on every open and swallowed six `SqliteException`s on
+an already-migrated database (~200 ms, and noise in any debugger) — it now asks
+`PRAGMA table_info` first; and the cache had **no eviction whatsoever**, so the
+file grew monotonically with every directory ever scanned. It is now pruned in
+background chunks by `rowid` (which `INSERT OR REPLACE` refreshes, making it a
+staleness proxy) above 3M rows.
+
+**Ruled out, for the record** — both were plausible enough that they were nearly
+"fixed" before anything was measured:
+
+* **The `TreeViewItem` template's root is a `StackPanel`** (`SourceSelectionView.xaml`),
+  which measures its child with infinite height and is the standard way to defeat
+  `VirtualizingStackPanel.IsVirtualizing`. It does not here: `tools\treeview_bench`
+  realizes **24** containers out of 249 with the StackPanel root, the same as with
+  the stock Grid root. WPF's hierarchical virtualization negotiates the viewport
+  through `TreeViewItem` itself, not through the template's panel.
+* **Four `SharedSizeGroup` columns per row inside one `Grid.IsSharedSizeScope`.**
+  Real but negligible: it costs ~5% of a 75 ms layout, not seconds.
+
+The trap in both cases was a cold-start measurement — the first variant the
+harness ran took 1.2–11.9 s and every later one took a fraction of that, which is
+JIT and font loading, not the thing under test. Warm up, repeat, take the minimum.
+
+### Follow-up: the prune gate was itself an O(file size) read (fixed same day)
+
+Having stopped reading the whole table on the lookup path, the only place the
+538 MB still mattered was the prune check — `SELECT COUNT(*)` on every open.
+SQLite answers that with a **full covering-index scan** (`EXPLAIN QUERY PLAN`
+confirms `SCAN … USING COVERING INDEX sqlite_autoindex_DirectorySizeCache_1`),
+measured at **580 ms**: reading most of the file, once per launch, purely to
+discover there was nothing to prune. It ran on a background thread and blocked no
+lookup, but it competed for disk with the expansion happening at that moment.
+
+The gate is now **used bytes**, from `pragma_page_count` / `pragma_freelist_count`
+/ `pragma_page_size` — all header fields, so the common nothing-to-do case is
+free (measured at the process-startup floor, ~7 ms).
+
+Two traps worth recording:
+
+* **`max(rowid)` looks like a cheap row-count proxy and is not.** It is O(1) (a
+  `SEARCH` — the last b-tree entry), but `INSERT OR REPLACE` assigns a *fresh*
+  rowid on every rewrite, so this database reports max rowid **28,184,153**
+  against **1,494,073** live rows: 19× over, i.e. useless as a bound.
+* **The prune loop must measure used bytes, not file bytes.** `page_count` never
+  falls after a delete (freed pages go to the freelist), so a loop waiting for
+  the *file* to shrink would never terminate. Subtracting `freelist_count` is
+  what makes the loop's own measure actually move.
+
+For the record, after the fix the file's size costs essentially nothing at
+runtime: a point lookup is an index seek at **~62 µs**, measured over 20,000
+scattered random keys, so a 249-child expansion spends ~15 ms in the cache — and
+that seek is O(log n), so shrinking the table would change the b-tree depth by
+about one page.
+
+### Remaining debt from this
+
+* **The 538 MB `sizecache.db` will not shrink**, even after pruning: SQLite reuses
+  freed pages rather than returning them, and reclaiming them needs a `VACUUM`
+  that rewrites the whole file under an exclusive lock. Not worth doing behind
+  the user's back; if it ever matters, offer it as an explicit maintenance action.
+  This is disk-space debt only — per the measurements above, the size no longer
+  costs runtime.
+* **Cache keys are now compared with `Ordinal`, not `OrdinalIgnoreCase`** — the
+  memo has to agree with the database's binary-collation primary key, or it would
+  remember a miss under one casing and serve it under another. Every key comes
+  from `DirectoryInfo`/`FileInfo.FullName`, so the filesystem supplies consistent
+  casing; a stray case variant costs one recomputation, not a wrong answer.
+
+## MOSTLY FIXED: `sizecache.db` is ~2× the size it needs to be, and a third of it caches backup *destinations* (2026-08-15)
+
+*Two of the three findings below are fixed (see **Resolution** at the end); the
+third — caching backup destinations — was left in place deliberately.*
+
+Follow-up audit of the 538 MB / 1,494,077-row `sizecache.db` after the perf fix
+above, asking whether the whole thing is earning its keep. It isn't, though not
+for the reason first guessed.
+
+**What the rows are for.** `ComputeDirectorySizeCached`
+(`SourceSelectionNodeViewModel.cs:1790`) walks an entire subtree, and writes a
+row for *every* directory it passes. Two distinct payoffs:
+* rows carrying `RecursiveSize` let `TryGetCachedRecursiveSize` display a total
+  with **no walk at all** (752,479 rows have one);
+* the deep rows make a *recompute* cheap — each directory's own
+  `LastWriteTimeUtc` is compared, and an unchanged one skips the file
+  enumeration, which is the expensive part. The traversal still happens; only
+  the per-file `Length` stats are avoided.
+
+So 1.5M rows is not "the user browsed 1.5M directories" — asking for the size of
+`D:\` **once** writes a row for every directory beneath it.
+
+**Findings, measured:**
+
+| | |
+|---|---|
+| Rows under `I:\lithicbackup` + `J:\backup4all` (backup **destinations**) | **518,642 (35%)** |
+| Random sample of 3,000 paths that **no longer exist on disk** | **24.7%** |
+| Rows that are strictly empty subtrees (`0/0` direct **and** `RecursiveSize=0`) | 77,985 (5%) |
+| Bytes per row | ~360 |
+
+1. **A third of the cache describes backup destinations.** Nothing needs a
+   per-directory size breakdown of the *inside* of a backup target. Worth
+   finding out how they get scanned (destination browsing UI? a status pass?)
+   and not caching subtree sizes for them.
+2. **A quarter of the rows are dead paths** — deleted projects, build dirs,
+   `photoprism.old`. Nothing ever removes a row for a path that vanished, so
+   they accumulate forever. The rowid-ordered prune added above is the only
+   eviction and it only fires on total size.
+3. **The schema stores every path twice.** `Path TEXT PRIMARY KEY` on a rowid
+   table means a table b-tree keyed by rowid *plus* `sqlite_autoindex_…` keyed by
+   Path — both holding the full path, which averages 106 chars (151 MB of raw
+   path text). Measured on 300,000 real rows copied into both shapes:
+
+   | schema | size | plan |
+   |---|---|---|
+   | `Path TEXT PRIMARY KEY` (today) | **108.0 MB** | `SEARCH … USING INDEX sqlite_autoindex_T_1` |
+   | same, `WITHOUT ROWID` | **71.0 MB** | `SEARCH … USING PRIMARY KEY` |
+
+   34% smaller, and marginally faster (2.21 s vs 2.58 s over 20,000 scattered
+   lookups) since the row lives *in* the index b-tree instead of behind a second
+   seek. Extrapolated to the full table: **538 MB → ~354 MB**.
+
+**Proper fix:** rebuild the table `WITHOUT ROWID` (a migration — copy, drop,
+rename, which is also a natural VACUUM), stop caching destination subtrees, and
+evict rows whose directory no longer exists. Note the prune added above orders by
+`rowid`, which a `WITHOUT ROWID` table does not have; it would need to order by
+something else, or the prune gate could become "drop rows whose path is gone"
+which is better targeted anyway.
+
+**Resolution (same day).** Findings 2 and 3 are fixed by **Settings ▸ Caches**
+(`CacheMaintenance.cs`): compaction sweeps out entries whose path no longer
+exists and rebuilds the table `WITHOUT ROWID`. Measured on this same 1.5M-row
+cache: **514 MB → 233 MB**, 382,939 rows dropped (25.6% — the 24.7% sample
+estimate held). New databases are created in the compact shape, so this is a
+one-time migration for existing ones.
+
+Finding 1 (destinations) is **deliberately not fixed**: the user may browse
+destinations, and 35% of a cache that now costs 233 MB is not worth losing the
+ability to show those sizes instantly. Left as a note rather than debt.
+
+Two traps found while building it, both now covered in `design.md`:
+
+* **An unplugged drive answers "missing" for every path on it**, so a sweep with
+  the backup drive disconnected would evict its entire cache — the most
+  expensive rows in the file to rebuild. Roots are checked for availability once
+  each and skipped if unreachable.
+* **`VACUUM` in WAL mode does not shrink anything by itself.** It rewrites the
+  database through the log, so the first full-scale run ended with a 233 MB file
+  and a **269 MB `-wal`** next to it, and honestly reported having freed 23.5 MB
+  of the 281 MB it had actually freed. `PRAGMA wal_checkpoint(TRUNCATE)` after
+  the VACUUM is required — disposing the connection is not enough, because
+  Microsoft.Data.Sqlite pools connections.
+
+**Corrected along the way, to save the next person the same wrong turn:** 49% of
+rows have `DirectFileSize=0 AND DirectFileCount=0`, which looks like "half the
+cache is empty directories". It isn't — 660,611 of those have `RecursiveSize IS
+NULL`, meaning *no direct files but a possibly-populated subtree* (e.g.
+`D:\visual studio projects` itself). Those are legitimate structural rows. Only
+the 77,985 with an explicit `RecursiveSize=0` are genuinely empty.
+
+## FIXED: "Destination drive full" warning fired on a transient dip and then sat on screen after the drive recovered (2026-08-15)
+
+**Symptom.** A modal appeared saying the continuous set **"test backup"** couldn't
+back up because its destination drive **D:** was full. D: had ~38 GB free when the
+user read it. It looked like a plain false alarm.
+
+**It was not a false alarm — it was a stale one.** Windows' own System event log:
+
+| Time | Event | Message |
+|---|---|---|
+| 19:00:48 | `Volsnap/24` | "There was insufficient disk space on volume **D:** to grow the shadow copy storage for shadow copies of D:. As a result of this failure all shadow copies of volume D: are at risk of being deleted." |
+| 19:03:20 | `Volsnap/35` | "The shadow copies of volume **D:** were aborted because the shadow copy storage failed to grow." |
+
+So D: genuinely hit zero free for ~2.5 minutes while VSS grew a diff area, and
+then recovered tens of GB the moment Windows discarded the shadow copies. The
+`DestinationSpaceMonitor` sweep (every 30 s, threshold 1 GB) sampled the drive
+inside that window and warned, correctly. Ruled out along the way, for the record:
+
+* **Not a disk quota.** `GetDiskFreeSpaceEx` returns `lpFreeBytesAvailable ==
+  lpTotalNumberOfFreeBytes` on D: (`tools\freespace_probe.py`), so the number the
+  monitor uses (`DriveInfo.AvailableFreeSpace`) is the same one Explorer shows.
+* **Not a misclassified error.** `BackupErrorClassifier.Classify` maps
+  `DirectoryNotFoundException` (HResult 3) to `NotFound`, never to `DiskFull`; and
+  the message wording exists only in `DestinationSpaceMonitor`.
+* **Not the wrong volume.** `mountvol` confirms the set's stored
+  `DestinationVolumeId` is D:, and `tools\destinfo.py` replays the whole
+  resolve-and-measure path per set.
+
+**The two real defects.**
+
+1. **No debounce.** One low sample armed a one-shot modal, so a dip that Windows
+   fixes by itself is enough to interrupt the user.
+2. **No re-check at display time, and no timestamp.** The alert is raised on a
+   pool thread and shown via `Dispatcher.BeginInvoke`, and the box is *owner-less*
+   — it can sit unnoticed behind another window (this is the same dialog blamed
+   in the MSI-1611 entry below for blocking a graceful shutdown). Read an hour
+   later, "is full" in the present tense is simply false.
+
+**Fix (v1.0.54).**
+
+* `DestinationSpaceMonitor.ConsecutiveLowSweepsBeforeAlert` (default **3**, i.e.
+  ~90 s at the GUI's 30 s cadence) — a per-root streak counter, reset by the first
+  reading at or above the threshold, and discarded outright if a sweep can't read
+  the drive at all (so an unplug can't silently complete a streak).
+* `DestinationFull` now carries a `DestinationFullAlert` record (set name, root,
+  free bytes, `ObservedAt`) instead of a bare string, and its `Message` reads
+  *"…which ran out of space at 7:01 PM (312 MB free)"* — past tense, timestamped.
+* `DestinationSpaceMonitor.IsStillFull(root)` re-samples the drive; `App.xaml.cs`
+  calls it inside the `BeginInvoke` and drops the dialog if the drive recovered.
+* The per-row status (`StatusUpdated`) is deliberately left **undebounced** — it's
+  a live readout, not an interruption, so it should track every sample.
+* The sweep was restructured into three passes so each distinct drive root is
+  queried **once** per sweep rather than once per set sharing it (previously two
+  sets on one drive meant two `DriveInfo` queries, and would have double-counted
+  the streak).
+* Free-space querying is now injectable (`Func<string, long?>` constructor
+  parameter, defaulting to `DriveInfo`), because none of the above can be tested
+  against a live disk.
+
+**What actually filled D: — for the record, since this will recur.** Nothing wrote
+38 GB of files. **CrashPlan held a VSS snapshot of D: open for hours, and D: is a
+high-churn volume, so the copy-on-write diff area ate the free space.**
+
+* `Application` log, `VSS/8231`: *"Snapshot creation initiated for Snapshot Set
+  {18223c46-…}. Process command line: "C:\Program Files\CrashPlan\CrashPlanService.exe""*
+  at **13:16**, and no further snapshot-creation event before Volsnap aborted at
+  19:03 — so that one snapshot was live for ~5h47m.
+* CrashPlan's own `history.log.0` shows the run it belonged to started **16:31**
+  and did not stop until **19:46** (`3h:14m:26s`, "Reason for stopping backup: The
+  manifest requires validation"), with archive maintenance finishing at 19:46.
+
+**The snapshot was *leaked*, not merely long-lived — this is a CrashPlan bug, and
+it is reproducible.** CrashPlan normally cycles VSS every few minutes: `VSS open`
+→ `OPEN VSS` → `CLOSE VSS`. Its `service.log.0` shows the cycle breaking:
+
+```
+12:33:42  CLOSE VSS                                        <-- last close, ever
+12:34:42  VSS open TIMED OUT after 60000ms; abandoning JNA call
+12:34:56  [OpenWatchdog] OPEN VSS                          <-- opened anyway
+13:17:56  VSS open TIMED OUT after 60002ms; abandoning JNA call
+13:18:42  [OpenWatchdog] VSS shadow created, C/D/E/F/I/J
+13:18:42  [OpenWatchdog] OPEN VSS                          <-- nobody owns this
+```
+
+There is a race between CrashPlan's **60-second timeout** on the VSS open and the
+`OpenWatchdog` thread that completes that open regardless. The requesting thread
+gives up ("abandoning JNA call") and moves on, so nothing ever calls close — but
+the shadow copy exists. It then lives until Volsnap destroys it: **13:18:42 →
+19:03:20, 5h45m.** The tell is that opens exceed closes by exactly the timeout
+count, in every log file:
+
+```
+service.log.0    opens=2    closes=1    timeouts=2    leaked=1
+service.log.1    opens=7    closes=6    timeouts=7    leaked=1
+service.log.2    opens=1    closes=1    timeouts=1    leaked=0
+```
+
+**Why the open times out:** the snapshot set spans **every mounted volume**, and
+freezing/thawing that many — two of them USB (I: a 6 TB HDD, J: a 2 TB SSD) —
+takes longer than 60 s.
+
+**It is not driven by the backup selection**, which was checked and is a dead end:
+I: and J: are *not* selected in CrashPlan, yet every open requests them anyway —
+
+```
+VSS open: trigger=D:\limnoria\logs\messages.log, volumes=C:\,E:\,D:\,G:\,F:\,I:\,J:\, timeoutMs=60000
+```
+
+Note `G:\` in that list: it does not exist. `Get-Volume` reports only C, D, E, F,
+H, I, J, while `HKLM\SYSTEM\MountedDevices` still holds stale `\DosDevices\`
+entries for G:, K: and L:. CrashPlan enumerates drive letters, not the selection —
+which is why `IsVolumeSupported(G:\) failed … Volume G:\ not supported` precedes
+every open. (G: is correctly dropped from the resulting set — the `VSS shadow
+created` lines cover C/D/E/F/I/J only — so the phantom letter is noise, not the
+hang. The hang is the six real volumes.)
+
+CrashPlan does have self-protection —
+`DISABLING VSS for drive D:\ for the remainder of this session (hangs on this
+drive: 5)` — but it is per-session, and the counter resets when the service
+restarts. It restarted at 13:13 on 08/15 (`CrashPlan started, version 12.0.0`) and
+leaked the fatal snapshot five minutes later.
+* While a snapshot is live, every block **overwritten** on the volume has its old
+  contents copied into `D:\System Volume Information`.
+
+**Careful with the units here — this is where a first pass went wrong.** Lithic's
+per-set catalogs record 15.3 GB of file *versions* on D: between 13:16 and 19:03,
+and it is tempting to read that as diff-area growth. It is not. Lithic re-copies a
+whole file whenever its mtime moves, so a 403 MB log that gained 30 KB is recorded
+as another 403 MB version — while costing a shadow copy **nothing**, because
+appends land in newly allocated clusters that have no prior contents to preserve.
+`catalog_writes.py --cow` separates the two by walking each file's versions in
+order (grew ⇒ append; same size or smaller ⇒ in-place rewrite):
+
+```
+appended (free to a snapshot):      0.025 GB across 1,207 files
+rewritten in place (costs CoW):     2.025 GB across   711 files
+
+  1073.7 MB  D:\visual studio projects\os-lane-a\rootfs.ext4
+   194.8 MB  D:\visual studio projects\qtpyrc\me\history.db
+   193.6 MB  D:\youtube\...\redcup_s2\model.pth
+    81.0 MB  D:\visual studio projects\qtpyrc\me\history.db-wal
+    80.0 MB  D:\visual studio projects\irc bouncer\Wicket.log.1
+```
+
+So `D:\limnoria\logs\messages.log` — the apparent worst offender by raw version
+bytes, at 7.66 GB — drops out of the CoW ranking **entirely**. It is append-only
+(sizes grow monotonically: 403,016,517 → 403,265,514 over 14 versions), and it has
+been excluded from CrashPlan since 08/13 anyway (`backup_files.log.0` covers
+08/14 15:54 → 08/15 21:15 with zero hits). Neither fact had anything to do with
+the outage.
+
+**And 2.0 GB still does not explain ~40 GB, which is the real finding:** the bulk
+of the diff-area growth was churn the catalog **cannot see**. Two blind spots, both
+material on this volume:
+
+1. **Delete-then-reallocate.** Clusters freed by deleting a file still belong to
+   the live snapshot; when NTFS hands them to a new file, the old contents must be
+   copied out first. Builds, `obj\`/`bin\`, `__pycache__`, git repacks and QEMU
+   image rebuilds do this constantly, and it costs exactly as much as an in-place
+   rewrite while looking like "new files" to every file-level tool.
+2. **Files Lithic doesn't back up at all** — anything excluded from every set never
+   appears in a catalog, so it contributes zero to the estimate above regardless of
+   how much it writes.
+
+D: runs three SlateOS worktrees (`os-lane-a/b/c`) building and booting QEMU images,
+which is precisely that kind of churn. Closing the gap properly needs the **USN
+journal** (`fsutil usn readjournal D:`), which is the only record that sees creates
+and deletes rather than surviving files — but it requires **elevation**, and D:'s
+journal is capped at 32 MB and wraps (which is also why Lithic logs recurring
+"USN journal continuity lost" warnings). Nothing here was worth an elevated prompt
+once the cause was identified; if this recurs, that is the measurement to take.
+
+That is why free space "varies widely quickly" on D: and why it recovered on its
+own: Volsnap deleted the shadow copies at 19:03:20 and handed the entire diff area
+back at once. D: read 45.6 GB free during the investigation and **76.7 GB** an hour
+later, with no deletions in between.
+
+**Lithic did not cause this and cannot see it.** Lithic never calls VSS — grep for
+"shadow" in the source hits only `BackupOrchestrator`'s disc-session *version*
+shadowing, which is unrelated. Lithic is a *victim* here (its destination happened
+to be on the squeezed volume) and, ironically, also a *contributor* to the churn
+that the snapshot had to preserve. The durable mitigation is outside Lithic, in
+priority order:
+
+1. **Move D:'s diff area onto another volume** (elevated, one-off). A shadow copy's
+   diff area does *not* have to live on the volume it protects — for any non-system
+   volume it can be redirected, which makes D:'s free space structurally immune to
+   snapshots of D: no matter how much churn there is:
+
+   **`vssadmin add shadowstorage` does not exist on client Windows** — on Windows
+   11 Pro vssadmin offers only `Delete Shadows`, the `List` verbs and
+   `Resize ShadowStorage`, and `resize` cannot create an association that does not
+   exist yet. The capability is still there, just not through vssadmin: the WMI
+   method it wraps, `Win32_ShadowStorage.Create(Volume, DiffVolume, MaxSpace)`, is
+   present on the client SKU. `tools\vss-limit.ps1` drives it (and falls back to
+   `vssadmin resize` when an association already exists):
+
+   ```
+   .\vss-limit.ps1 -For D: -On E: -MaxSizeGB 100    # redirect and cap
+   .\vss-limit.ps1 -For D: -MaxSizeGB 20            # cap in place
+   .\vss-limit.ps1                                  # report only
+   ```
+
+   E: is NTFS with **600 GB free of 931 GB**, versus D:'s 82 GB — so it can absorb
+   a leak that D: cannot. Both volumes must be NTFS (they are) and D: must not be
+   the system volume (it isn't). Two caveats: redirecting deletes any existing
+   shadow copies on D: (there are none), and copy-on-write traffic for D: now lands
+   on E:, so a heavy overwrite burst on D: costs I/O on E: while a snapshot is
+   live. Keep the `maxsize` — redirected *and* unbounded just moves which volume
+   gets eaten.
+2. **Or just cap it in place**, if the extra I/O on E: is unwelcome:
+   `.\vss-limit.ps1 -For D: -MaxSizeGB 20`.
+   Before the fix D: was effectively unbounded, so a leaked snapshot could take the
+   whole volume. With a cap, Volsnap aborts the snapshot at the limit (the
+   `Volsnap/24`/`35` pair still appears in the log) and free space never craters. It costs CrashPlan a retried backup;
+   its run was already being interrupted anyway. Setting `maxsize` to the 320 MB
+   minimum effectively opts D: out of being snapshotted at all, at the cost of
+   CrashPlan never capturing an open file on D:.
+2. **Turn off open-file backup in CrashPlan** (Device Settings → Backup → Advanced
+   → "back up open files"). If VSS never opens, it cannot leak. The cost is that
+   CrashPlan skips locked files — tolerable here, since D: is already covered by
+   two Lithic sets. This is the only setting-level change that addresses the leak
+   itself; note it could not be verified from `C:\ProgramData\CrashPlan\conf`,
+   which is ACL'd against the interactive user.
+3. **Reclaim immediately when a leak is detected**, rather than waiting for Volsnap
+   to hit the wall: `vssadmin delete shadows /for=D: /oldest` (elevated). Pair it
+   with the stale-snapshot check in `tools\lowdisk-events.ps1`.
+4. **Move the churn** — but note the goal is *headroom*, not escaping snapshots.
+   Every mounted volume gets snapshotted (see above), so there is nowhere
+   "unsnapshotted" to put `os-lane-*`. Relocating them to E: would still work,
+   because E:'s 600 GB can absorb the diff area that D:'s 82 GB cannot — but
+   option 1 achieves the same thing without moving anything, so this is only worth
+   it for other reasons.
+
+**Ruled out: deselecting volumes in CrashPlan.** See above — the snapshot set is
+built from enumerated drive letters, not the backup selection, so I: and J: are
+snapshotted despite not being selected. Nothing in CrashPlan's file selection
+shrinks the snapshot set.
+
+**Ruled out: finding a volume that isn't snapshotted.** There isn't one, for the
+same reason. Any volume that is mounted when CrashPlan opens VSS is in the set.
+
+What does **not** work, for the record:
+
+* **Excluding files from CrashPlan.** The diff area is a volume-level, block-level
+  mechanism — once a snapshot of D: exists, every overwrite anywhere on D: is
+  preserved whether or not CrashPlan reads that file. Exclusions only save upload
+  bandwidth. (`messages.log` had been excluded since 08/13 and the outage happened
+  anyway.)
+* **Telling VSS to ignore certain files.** VSS has no concept of a file; it
+  preserves blocks. `HKLM\SYSTEM\CurrentControlSet\Control\BackupRestore\FilesNotToSnapshot`
+  exists but only asks *requesters* to delete listed paths from a snapshot after it
+  is created — it is honored by some requesters and not others, and it does not
+  reduce copy-on-write for the volume.
+
+The in-app
+mitigation is the debounce above, which is exactly the right shape for this failure
+mode — the outage is real but self-healing, and lasted ~2.5 min against a ~90 s
+debounce, which is close enough that a longer streak may be worth considering if it
+recurs.
+
+**Diagnostics added** (all unelevated — `fsutil usn readjournal` and `vssadmin`
+both need elevation, so none of them use it):
+
+| Tool | Answers |
+|---|---|
+| `tools\lowdisk-events.ps1` | did a volume run out, and *who* requested the snapshot (Volsnap 24/35 + VSS 8231 + `Win32_ShadowCopy`/`Win32_ShadowStorage`). Also flags shadow copies older than 2 h as leaked, an unbounded diff area, and CrashPlan's opens-minus-closes — run it *before* a volume fills, not after |
+| `tools\catalog_writes.py` | what was rewritten on a volume in a window, per Lithic's own catalog — survives the file being deleted afterwards, which an mtime walk does not. `--cow` splits appends from in-place rewrites, which is the difference between "Lithic re-copied it" and "a shadow copy paid for it" |
+| `tools\write_burst.py` | same question from the filesystem's mtimes, for volumes Lithic doesn't back up |
+| `tools\freespace_probe.py` | quota-aware vs total free bytes, straight from `GetDiskFreeSpaceExW` |
+| `tools\destinfo.py` | replays the per-set resolve-and-measure path (GUID → mount point → root → free) |
+| `tools\vss-limit.ps1` | reports diff-area associations, and (elevated) caps or relocates one via `Win32_ShadowStorage.Create` — the client-Windows substitute for `vssadmin add shadowstorage` |
+
+**Methodology warning, learned the hard way: `Win32_ShadowCopy` and
+`Win32_ShadowStorage` throw `Initialization failure` for a non-admin — they do not
+return an empty set.** Both scripts originally queried them with
+`-ErrorAction SilentlyContinue`, which rendered "you are not allowed to look" as a
+confident `(none)`. That is the exact inversion of the truth, and it is worse than
+no output at all in a script whose purpose is to report whether a diff area is
+capped. Two claims made during this investigation rested on it and were withdrawn:
+that no shadow copies existed after the abort, and that no volume had an allocated
+diff area. (The first conclusion survives anyway — but on the `Volsnap/35` event
+*"the shadow copies of volume D: were aborted"*, which is real evidence, not on the
+empty readout.) Both scripts now distinguish `CANNOT READ` from genuinely empty.
+Anything reading these classes must be run **elevated** to be believed.
+
+Note `lowdisk-events.ps1`'s provider filter is anchored and spells out
+`Microsoft-Windows-Backup` rather than matching a bare `Backup` — the Worker logs
+under provider `LithicBackup.Worker`, and an unanchored match buries the two
+Volsnap lines that matter under hundreds of our own entries.
+
+**Regression guard:** `tools\dest_space_test` — 22 assertions driving the monitor
+with a scripted free-space sequence: transient dip stays silent, sustained outage
+alerts exactly once, the message is timestamped, `IsStillFull` flips on recovery,
+the alert re-arms after a genuine recovery, interactive sets never raise the modal
+(but their row status still shows full), and an unreadable sweep restarts the
+streak. `dotnet run --project tools/dest_space_test/dest_space_test.csproj`.
+
+**Left open (a separate gap, not this bug): a continuous set whose destination
+*folder* has been deleted is not reported.** Set 12 "test backup" points at
+`D:\visual studio projects\backup\test_out`, which **does not exist** (deleted
+around 2026-06-13; only `test_out_new` remains). `DestinationResolver.Resolve`
+reports `IsConnected: true` because the *volume* is mounted, so the set shows an
+ordinary healthy destination while nothing ever backs up. That is exactly the
+silent-failure class this monitor exists to catch, so the monitor should grow a
+distinct "destination folder missing" status alongside "full" — checking
+`Directory.Exists(resolution.LivePath)`, but *not* treating it as an error for a
+set that has never run, where the backup would create the folder itself.
+
+## FIXED: Error 1611 — the shutdown custom action never executed a single line, because SfxCA could not load it (2026-08-16)
+
+**Symptom.** Installing 1.0.55 over 1.0.53 failed with the same "setup was unable
+to automatically close all requested applications" dialog, even though 1.0.53
+contains both the GUI listener *and* the Worker listener that were supposed to have
+finished this off. The user's instinct was right: *"I think it might be referring to
+the open LithicBackup window; I may not have this problem when there's no window
+open."*
+
+**Root cause: the managed custom action was never loaded, so it never ran.** From
+the verbose MSI log of the failing install:
+
+```
+SFXCA: Binding to CLR version v2.0.50727
+Calling custom action LithicBackup.CustomActions!...CustomActions.SignalLithicShutdown
+Error: could not load custom action class ... from assembly: LithicBackup.CustomActions
+System.BadImageFormatException: Could not load file or assembly
+  'LithicBackup.CustomActions' or one of its dependencies. This assembly is built
+  by a runtime newer than the currently loaded runtime and cannot be loaded.
+CustomAction SignalLithicShutdown returned actual error code 1603 but will be
+  translated to success due to continue marking
+```
+
+`SfxCA.dll` — the native stub `MakeSfxCA` wraps around a DTF action — must choose a
+CLR version *before* it can load any managed code, and it cannot infer it from the
+assembly. Its only input is a file named exactly **`CustomAction.config`** unpacked
+beside the assembly. This project never had one, so SfxCA fell back to its legacy
+default, **CLR v2.0.50727**, and loading the `net472` assembly threw
+`BadImageFormatException` every single time.
+
+`SignalLithicShutdown` therefore **never executed a single line** — not in 1.0.55,
+not in 1.0.53, not since the mechanism was introduced in 1.0.11. The whole
+machinery was dead on arrival. And it was *invisible*, because the action is
+authored `Return="ignore"`: Windows Installer dutifully logged "returned actual
+error code 1603 but will be translated to success due to continue marking" and
+carried straight on to `InstallValidate`, which raised the very 1611 the action
+existed to prevent. Every previous occurrence got misattributed to the "bootstrap
+caveat" (the running build predates the listener), which is why it survived so many
+rounds of fixing.
+
+**The fix is one file:** `installer\CustomActions\CustomAction.config`, packed via a
+`<Content>` item in the `.csproj`, containing
+`<supportedRuntime version="v4.0" />` plus
+`useLegacyV2RuntimeActivationPolicy="true"` (SfxCA activates the runtime through the
+legacy `CorBindToRuntimeEx` path, which refuses a v4 request without that flag).
+Verified by the `.CA.rsp` listing the config, and by the action actually logging on
+the next install.
+
+**Secondary issue, fixed as well: the app was running elevated when it had no
+business being.** `LithicBackup.exe`'s manifest is `asInvoker` and the Start-menu
+shortcut does not request elevation, yet the running GUI measured **High integrity
+(S-1-16-12288)**. It inherited that from the installer: the in-app updater launched
+`msiexec` with `Verb = "runas"`, making the *client* process elevated, and the
+wizard's "Launch Lithic Backup" exit checkbox (ticked by default) starts the GUI
+from that same elevated client, which then stays elevated for its whole lifetime.
+That matters because Restart Manager — the fallback when the handshake misses — is
+driven from an unelevated client and is blocked by **UIPI** from closing a
+High-integrity window. So the two faults composed: with the action dead, RM was the
+only remaining mechanism, and elevation disabled RM too. `Verb = "runas"` is gone
+(`MainViewModel.DownloadUpdateAsync`); Windows Installer still elevates itself at
+`InstallInitialize`, so the user sees the same single UAC prompt.
+
+### A wrong diagnosis that got as far as being committed — worth recording
+
+Before the log was read carefully, the failure was attributed to **kernel-object
+session namespaces**: the theory was that `SignalLithicShutdown`, living in the
+`InstallExecuteSequence`, runs in the `msiexec /V` *server* process as LocalSystem
+in **session 0**, and so could never see the GUI's session-local
+`LithicBackup.Shutdown` in `\Sessions\1\BaseNamedObjects\`. It is a tidy story, it
+explains the symptom perfectly, and it is **false**. Once the action could actually
+run, the first thing it logged was:
+
+```
+SignalLithicShutdown: running as 'LOGOPLEX3\inhah' in process rundll32 (pid 72736), session 1.
+```
+
+It runs **impersonated as the invoking user, in the user's own session** — a
+*remote* custom action hosted in `rundll32`, exactly as the original comments in
+this repo had always claimed. Those comments were rewritten to assert the opposite,
+and had to be rewritten back. Two lessons:
+
+- **A theory that explains the symptom is not evidence.** The session-0 story was
+  built from `Win32_Process` session IDs of the *msiexec* processes, which say
+  nothing about where a remote CA is hosted. The one measurement that would have
+  settled it — having the action log its own account and session — was added as an
+  afterthought and immediately refuted the theory it was added to support.
+- **When a mechanism is best-effort and swallows its own errors, make it say what
+  it did.** `Return="ignore"` plus a caught `WaitHandleCannotBeOpenedException`
+  made *total failure to load* indistinguishable from *nothing was running*. That
+  ambiguity is what hid a dead custom action for 45 releases.
+
+### What was kept from the wrong turn
+
+The multi-name lookup added while chasing the session theory is retained, because
+it is genuinely useful even though the premise was wrong. `SignalGui` now tries, in
+order: `Global\LithicBackup.Shutdown` → `Session\<n>\LithicBackup.Shutdown` for the
+session of each running GUI process → the bare session-local name.
+
+- The `Session\<n>\` form is what **actually fired** on the verified 1.0.53 → 1.0.56
+  upgrade, because a 1.0.53 GUI does not publish the `Global\` name. It resolves
+  against another session's object directory whatever session the caller is in, so
+  it also covers a genuine system-context deployment (SCCM and friends), where the
+  action *would* run as SYSTEM in session 0.
+- It means the fix is **retroactive**: it works against GUIs that predate it, rather
+  than only from the upgrade after the one that delivers it.
+
+**Also measured, and contrary to what was briefly documented:** an ordinary
+*unelevated* interactive process **can** create `Global\` names on Windows 11 —
+verified directly (`whoami /priv` shows no `SeCreateGlobalPrivilege` in the filtered
+token, yet `Global\LithicProbeTest` was created successfully, and an unelevated
+1.0.56 GUI publishes all three names). Any claim that the `Global\` name is
+available only to elevated instances is wrong.
+
+**Verified end to end:**
+
+- Isolated handshake test, no installer and nobody touching the window: GUI launched,
+  `Session\1\LithicBackup.Shutdown` set at 01:44:39, **GUI exited by itself at
+  01:44:42** with exit code 0.
+- Real upgrade 1.0.53 → 1.0.56 over a running GUI: action signalled the GUI, logged
+  `GUI is not running; its files are free to replace`, and the install finished with
+  `Installation success or error status: 0`.
+
+## FIXED: the Worker's shutdown listener was never registered while the service was running (2026-08-16)
+
+**Found because the custom action could finally report.** On the first upgrade where
+`SignalLithicShutdown` actually ran (see the entry above), it logged:
+
+```
+SignalLithicShutdown: no listener on 'Global\LithicBackup.Worker.Shutdown'.
+SignalLithicShutdown: Worker still running after wait; deferring to Installer file-in-use handling.
+```
+
+…even though the Worker was running and `ShutdownSignalListener` was registered as a
+hosted service. So the Worker half of the handshake was dead too, for an unrelated
+reason, and had been hidden behind the dead custom action.
+
+**Root cause: a hosted service that does not hand control back starves every hosted
+service after it.** `BackupWorker` is a `BackgroundService`.
+`BackgroundService.StartAsync` does not *await* `ExecuteAsync` — but it does have to
+*call* it, and if the body runs synchronously (this one is dominated by synchronous
+file I/O and awaits that complete synchronously) the call does not return until the
+first genuinely-incomplete await. `Host.StartAsync` starts hosted services
+**sequentially**, so `ShutdownSignalListener.StartAsync` was never reached and the
+`Global\` event was never created.
+
+The worker log shows the signature unmistakably — startup completing at the instant
+of shutdown, thirteen minutes after the process began:
+
+```
+01:23:37.846  LithicBackup Worker started.          <- ExecuteAsync entered
+   ... a full backup runs, on the startup path ...
+01:36:42.718  Application is shutting down...
+01:36:42.755  LithicBackup Worker stopped.
+01:36:42.771  Installer shutdown listener registered on "Global\...".   <- only now
+01:36:42.782  Application started.                                      <- only now
+```
+
+**Fix (v1.0.56), two independent parts, both wanted:**
+
+1. `await Task.Yield();` as the first statement of `BackupWorker.ExecuteAsync`, which
+   forces an asynchronous continuation so the method returns to the host immediately
+   and the loop resumes on a thread-pool thread. This is the actual bug fix.
+2. `ShutdownSignalListener` is now registered **before** `BackupWorker` in
+   `Program.cs`. Cheap, must-always-exist services belong ahead of heavy ones, so the
+   handshake cannot be starved again if some future hosted service reintroduces a
+   stall. (Stop order reverses, so the listener now stops last — which is preferable
+   anyway, and its `StopAsync` is a no-op.)
+
+**Watch for the recurrence:** any verbose MSI log line reading `no listener on
+'Global\LithicBackup.Worker.Shutdown'` while the service is running means startup is
+being blocked again. Check hosted-service order and the startup path, not
+`ShutdownSignalListener`.
+
 ## FIXED: "Unable to automatically close all requested applications" (error 1611) — the *Worker service* was never closed before the file-in-use check (2026-08-15)
 
 **Symptom.** Installing 1.0.52 over 1.0.51 failed with:
@@ -279,8 +964,47 @@ source treeview *either*, so this dialog is the user's only route to its leftove
 destination copies. `BuildExclusionFilter` gained an overload taking
 `(excludedExtensions, tierSets)` so `JobOptions` holders call the real thing, and
 the copy is gone. The existing Orphaned Directories cleanup is therefore how the
-~4.2 GB of already-stored `$Extend` data can now be found and removed — it is
-deliberately **not** auto-purged, since deleting backup data is the user's call.
+already-stored `$Extend` data can be found and removed — it is deliberately
+**not** auto-purged, since deleting backup data is the user's call.
+
+**Purged on request, 2026-08-15** (`tools\purge_extend.py`, `--dry-run` first,
+then `--commit`; swept and verified by `tools\purge_extend_verify.py`):
+
+| | set-4 (J:) | set-11 (I:) |
+|---|---|---|
+| catalog rows removed | 145 | 805 |
+| files deleted from destination | 5 | 757 |
+| rows whose bytes were already gone | 140 | 48 |
+| bytes reclaimed | 0.002 GB | 0.985 GB |
+
+950 rows / 762 files / **0.987 GB** total, 0 failures. Afterwards: 0 `$Extend`
+rows in either set, 0 leftover bytes, 62 empty directories removed, 0 orphan
+`FileChunks`, `PRAGMA quick_check = ok` on both databases, and the Worker kept
+running throughout with no errors.
+
+Two checks made it safe to hard-`DELETE` the rows rather than tombstone them —
+worth repeating before any similar purge:
+
+- **No shared-storage bookkeeping to unwind.** All 950 rows had
+  `IsDeduped = IsSplit = IsZipped = 0` and zero `FileChunks`, so there was no
+  `DeduplicationBlocks.ReferenceCount` to decrement and no orphan chunk rows.
+- **`.fileref` manifests orphan nothing.** A fileref's `ContentPath` names an
+  already-backed-up *real* file elsewhere in the destination, not a refcounted
+  `_filestore` blob, so deleting the manifest leaves the content owned by its
+  real record. (Had they pointed into `_filestore`, deleting manifests without
+  decrementing would have leaked blobs permanently.)
+
+The script deletes the physical file **first** and drops the row only on
+confirmed removal — the same ordering `a072e58` enforces for retention — so an
+interrupted run can only ever leave a live row whose bytes are gone, never the
+inverse. It also decrements `Discs.BytesUsed` per disc so capacity planning
+isn't skewed, and snapshots every row to
+`C:\ProgramData\LithicBackup\sets\purged-extend-set-<id>-<ts>.json` first, so the
+catalog side is reversible even though the bytes are not.
+
+A useful side finding: the 188 rows with no bytes on disk were *exactly* the
+`IsDeleted = 1` set, and every `IsDeleted = 0` row still had its file. That is
+independent confirmation that retention hardening never leaves bytes behind.
 
 `SourceSelectionViewModel.GetExcludeFilter` is intentionally NOT unified: it
 serves the treeview's filtered-size columns, and its null-when-no-user-exclusions

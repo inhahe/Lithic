@@ -1,0 +1,24 @@
+<Project Sdk="Microsoft.NET.Sdk">
+
+  <PropertyGroup>
+    <OutputType>Exe</OutputType>
+    <TargetFramework>net8.0-windows</TargetFramework>
+    <UseWPF>true</UseWPF>
+    <Nullable>enable</Nullable>
+    <LangVersion>latest</LangVersion>
+    <AssemblyName>ExpandProbe</AssemblyName>
+    <RootNamespace>ExpandProbe</RootNamespace>
+    <!-- The app's Directory.Build.props stamps a product version and other
+         release metadata onto everything under src\; this harness is not part
+         of the product and must not inherit it. -->
+    <ImportDirectoryBuildProps>false</ImportDirectoryBuildProps>
+    <ImportDirectoryBuildTargets>false</ImportDirectoryBuildTargets>
+  </PropertyGroup>
+
+  <ItemGroup>
+    <!-- Times the real view model, not a copy of it: a reimplementation would
+         only prove something about the reimplementation. -->
+    <ProjectReference Include="..\..\src\LithicBackup\LithicBackup.csproj" />
+  </ItemGroup>
+
+</Project>

@@ -4,6 +4,7 @@
              xmlns:d="http://schemas.microsoft.com/expression/blend/2008"
              xmlns:mc="http://schemas.openxmlformats.org/markup-compatibility/2006"
              xmlns:vm="clr-namespace:LithicBackup.ViewModels"
+             xmlns:system="clr-namespace:System;assembly=mscorlib"
              mc:Ignorable="d"
              d:DataContext="{d:DesignInstance Type=vm:SourceSelectionViewModel, IsDesignTimeCreatable=False}">
 
@@ -126,11 +127,41 @@
                 </StackPanel>
 
                 <!-- Tree + exclusion patterns (share the vertical space) -->
-                <Grid>
+                <Grid x:Name="SourcesSplitGrid">
+                <Grid.Resources>
+                    <!--
+                      Ceiling on the exclusion panel, as a fraction of this Grid's
+                      height. At the cap the panel is exactly half the tree:
+                      panel = f, tree = 1 - f, and f = 1/3 gives panel = tree/2.
+                      Declared once because two different things enforce it (see
+                      the row and the Border below).
+                    -->
+                    <system:Double x:Key="ExclusionPanelMaxFraction">0.3333</system:Double>
+                </Grid.Resources>
                 <Grid.RowDefinitions>
                     <RowDefinition Height="*" MinHeight="120" />
                     <RowDefinition Height="Auto" />
-                    <RowDefinition Height="120" MinHeight="72" />
+                    <!--
+                      Auto, not a fixed height: the exclusion panel grows with the
+                      number of patterns instead of stranding them in a 3-line
+                      window while the tree keeps the rest of the tab.
+
+                      MaxHeight here is what stops the GridSplitter dragging the
+                      panel past the ceiling — it does NOT bound the content. A
+                      Grid measures an Auto row's child with infinite height, so a
+                      cap on the row alone lets the TextBox measure at its full
+                      content height and then merely layout-clips it: the text
+                      would be cut off with no scrollbar, because the box's own
+                      ScrollViewer still believes its viewport is the full extent.
+                      (Measured: row clamped to 200px, TextBox ActualHeight 417,
+                      ViewportHeight 415 = ExtentHeight, no scrollbar.) The cap
+                      that actually bounds the content is on the Border below.
+                    -->
+                    <RowDefinition Height="Auto" MinHeight="72"
+                                   MaxHeight="{Binding ActualHeight,
+                                               ElementName=SourcesSplitGrid,
+                                               Converter={StaticResource FractionOf},
+                                               ConverterParameter={StaticResource ExclusionPanelMaxFraction}}" />
                 </Grid.RowDefinitions>
 
                 <!-- TreeView with integrated column headers -->
@@ -522,8 +553,28 @@
                       Background="Transparent" Cursor="SizeNS"
                       ResizeBehavior="PreviousAndNext" ResizeDirection="Rows" />
 
-        <!-- Exclude-from-backup patterns (shares the tree's space). -->
+        <!--
+          Exclude-from-backup patterns (shares the tree's space).
+
+          MaxHeight is the cap that does the real work. Unlike the one on the row
+          definition it applies during MEASURE: MeasureCore clamps the constraint
+          before Border.MeasureOverride passes it down, so the TextBox is measured
+          against the ceiling, reports a truthful viewport, and shows its scrollbar
+          once the patterns outgrow the panel. Binding to this Grid's ActualHeight
+          (not to the TreeView's) is deliberate — the Grid's height comes from its
+          parent, so it can't be changed by the constraint; binding to the sibling
+          tree, whose height is precisely what this cap redistributes, would be a
+          layout feedback loop.
+
+          VerticalAlignment=Top so that if the row is ever taller than the cap the
+          slack falls below the panel instead of WPF centring it in the slot.
+        -->
         <Border Grid.Row="2"
+                MaxHeight="{Binding ActualHeight,
+                            ElementName=SourcesSplitGrid,
+                            Converter={StaticResource FractionOf},
+                            ConverterParameter={StaticResource ExclusionPanelMaxFraction}}"
+                VerticalAlignment="Top"
                 BorderThickness="1"
                 BorderBrush="{StaticResource BorderBrush}"
                 Background="{StaticResource SurfaceBrush}">
@@ -534,8 +585,24 @@
                            Text="Glob patterns, one per line. Matching files are not backed up."
                            Foreground="{StaticResource TextSecondaryBrush}"
                            FontSize="11" TextWrapping="Wrap" Margin="0,0,0,6" />
+                <!--
+                  MinLines makes this box size itself to the patterns it holds,
+                  which is the whole point: one exclusion should not reserve the
+                  space of ten, and ten should not be crammed into the space of
+                  three. Four lines is the floor, and it only applies downwards —
+                  the panel's proportional MaxHeight still wins over it, so an
+                  unusually short window narrows the box rather than squeezing the
+                  tree.
+
+                  There is deliberately no MaxLines. A line count is the wrong unit
+                  for the ceiling: ten lines is a third of a 500px window and a
+                  sixth of a maximised one, so a fixed count either crowds the tree
+                  on small windows or wastes the space on big ones. The ceiling is
+                  proportional instead, and lives on the Border above.
+                -->
                 <TextBox Text="{Binding ExcludedExtensions, UpdateSourceTrigger=PropertyChanged}"
                          AcceptsReturn="True"
+                         MinLines="4"
                          VerticalScrollBarVisibility="Auto"
                          HorizontalScrollBarVisibility="Auto"
                          TextWrapping="NoWrap"

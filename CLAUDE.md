@@ -2,7 +2,7 @@
 
 ## Versioning (Claude controls this)
 
-**Current version: `1.0.53`**
+**Current version: `1.0.59`**
 
 Claude owns the version number. Do not hand-edit it — ask Claude to bump it and
 Claude will keep every place in sync.
@@ -28,26 +28,49 @@ Claude will keep every place in sync.
 
 The tag must be `v` + the exact version so the update check matches it.
 
-**How upgrades close the running GUI *and* Worker service (no elevation, no
-reboot):** neither can be safely *killed* or *stopped* by the installer's
-pre-validate work — everything before `InstallInitialize` runs unelevated at the
-invoking user's Medium integrity, which can't terminate a High-integrity GUI
-(UIPI) and can't SCM-stop a LocalSystem service. That's what caused the "The
-setup was unable to automatically close all requested applications" failures
-(error 1611). Instead the installer *asks* both processes to exit: the managed
-custom action `SignalLithicShutdown` (`installer\CustomActions\CustomAction.cs`)
-sets the named event each listens on and waits (bounded, concurrently) for both
-to exit, all before `InstallValidate`:
+**How upgrades close the running GUI *and* Worker service (no reboot):** neither
+can be safely *killed* or *stopped* by the installer — Restart Manager, driven
+from the unelevated client process, can't terminate a High-integrity GUI (UIPI),
+and a `taskkill`/SCM-stop needs rights the installer shouldn't assume. That's
+what caused the "The setup was unable to automatically close all requested
+applications" failures (error 1611). Instead the installer *asks* both processes
+to exit: the managed custom action `SignalLithicShutdown`
+(`installer\CustomActions\CustomAction.cs`) sets the named event each listens on
+and waits (bounded, concurrently) for both to exit, all before `InstallValidate`.
+A process can always close itself regardless of integrity level, so no
+`taskkill`, elevation, or self-elevating bundle is needed.
 
 | Process | Event | Listener |
 |---|---|---|
-| GUI | `LithicBackup.Shutdown` | `src\LithicBackup\App.xaml.cs` |
+| GUI | `Global\LithicBackup.Shutdown`, falling back to `LithicBackup.Shutdown` | `src\LithicBackup\App.xaml.cs` |
 | Worker service | `Global\LithicBackup.Worker.Shutdown` | `src\LithicBackup.Worker\ShutdownSignalListener.cs` |
 
-A process can always close itself regardless of integrity level, so no
-`taskkill`, elevation, or self-elevating bundle is needed. (`Global\` for the
-Worker because the service is in session 0 while the custom action is in the
-user's interactive session.)
+**`installer\CustomActions\CustomAction.config` is load-bearing. Do not remove or
+rename it.** `SfxCA.dll` (the native stub `MakeSfxCA` wraps around the managed
+action) has to pick a CLR *before* it can load any managed code, and its only
+input is a file named exactly `CustomAction.config`. Without it, SfxCA binds
+**CLR v2.0.50727**, loading the `net472` assembly throws
+`BadImageFormatException`, and — because the action is authored `Return="ignore"`
+— Windows Installer logs "returned actual error code 1603 but will be translated
+to success due to continue marking" and carries on. That is not hypothetical: it
+is what happened from 1.0.11 to 1.0.55, during which `SignalLithicShutdown`
+**never executed a single line** and every 1611 was misattributed to the
+bootstrap caveat. The file is packed by a `<Content>` item in the `.csproj`;
+losing either the item or the exact filename silently returns the action to
+never running.
+
+**Why the GUI is asked on three names.** `SignalGui` tries `Global\…`, then
+`Session\<n>\…` for the session of each running GUI process, then the bare name.
+The `Session\<n>\` prefix resolves against that session's object directory
+whatever session the caller is in, which (a) makes the handshake work against
+**older GUIs that only ever published the session-local name**, so the fix is
+retroactive rather than taking effect one upgrade later, and (b) covers a
+system-context deployment where the action really would run as SYSTEM in session
+0. For an ordinary double-click the action runs **impersonated as the invoking
+user in the user's own session** — measured, `rundll32`, session 1 — so the bare
+name would do; the extra names cost microseconds and remove a whole class of
+guesswork. The action logs its own account/pid/session on every run, which is
+the only reason the earlier misdiagnosis was caught.
 
 **Why `<ServiceControl Stop="both">` in `Package.wxs` does not cover this:** it
 executes at `StopServices` (sequence **1900**), while the file-in-use check is at

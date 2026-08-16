@@ -35,6 +35,18 @@
   </ItemGroup>
 
   <ItemGroup>
+    <!--
+      Tells SfxCA.dll to host CLR v4 instead of its v2.0.50727 default, without
+      which this net472 assembly cannot be loaded at all and the custom action
+      silently never runs. The DTF targets pack every <Content> item into the
+      .CA.dll, and SfxCA looks the file up by the exact name
+      "CustomAction.config" — so neither the item nor the name is negotiable.
+      See the comment inside the file.
+    -->
+    <Content Include="CustomAction.config" />
+  </ItemGroup>
+
+  <ItemGroup>
     <PackageReference Include="WixToolset.Dtf.CustomAction" Version="5.0.2" />
     <PackageReference Include="Microsoft.NETFramework.ReferenceAssemblies" Version="1.0.3" PrivateAssets="all" />
   </ItemGroup>

@@ -42,14 +42,39 @@ public partial class App : Application
     // ourselves gracefully. A process can always shut itself down regardless of
     // integrity level, so no elevation, taskkill, or Burn-bundle is needed — see
     // installer\Package.wxs (SignalLithicShutdown) and the MSI-upgrade entry in
-    // known-issues.md. The event is session-local (matching the single-instance
-    // primitives): the installer's pre-InstallValidate custom action runs in the
-    // user's own msiexec client process, i.e. the same session as the GUI.
-    // (The Worker service needs the same treatment but a Global\ event, because it
-    // lives in session 0 — see LithicBackup.Worker\ShutdownSignalListener.cs.)
+    // known-issues.md.
+    //
+    // TWO names, for reach rather than for rights. For an ordinary double-click
+    // the custom action runs impersonated as the invoking user in that user's own
+    // session (measured: hosted in rundll32, session 1 — it logs this on every
+    // run), so the unprefixed name below is all it strictly needs. The Global\ one
+    // is published as well because it is the single name that resolves identically
+    // from ANY session, which matters for a system-context deployment (SCCM and
+    // friends) where the action really does run as SYSTEM in session 0.
+    //
+    // Do NOT re-derive a story here about session namespaces being the reason the
+    // handshake used to fail. That was a wrong diagnosis, and it briefly replaced
+    // these comments with the opposite of the truth. The handshake used to fail
+    // because the custom action could not be LOADED at all — installer\CustomActions
+    // was missing CustomAction.config, so SfxCA bound CLR 2.0 and threw
+    // BadImageFormatException on the net472 assembly, which Return="ignore" then
+    // silently swallowed. See known-issues.md.
+    //
+    // Both registrations are attempted independently and neither is required: if
+    // one throws we log it and keep the other. (Empirically an unelevated GUI on
+    // Windows 11 CAN create the Global\ name — the filtered token has no
+    // SeCreateGlobalPrivilege, yet creation succeeds — but that is not relied on.)
+    // Whatever happens here, Restart Manager remains the backstop for an
+    // unelevated GUI; only an ELEVATED one depends on this handshake, because UIPI
+    // blocks RM's unelevated client from closing a High-integrity window.
+    // (The Worker service publishes the same kind of Global\ name — see
+    // LithicBackup.Worker\ShutdownSignalListener.cs.)
     private const string ShutdownSignalName = "LithicBackup.Shutdown";
+    private const string GlobalShutdownSignalName = @"Global\LithicBackup.Shutdown";
     private EventWaitHandle? _shutdownSignalEvent;
     private RegisteredWaitHandle? _shutdownSignalWait;
+    private EventWaitHandle? _globalShutdownSignalEvent;
+    private RegisteredWaitHandle? _globalShutdownSignalWait;
 
     // --- Forced-shutdown watchdog ---
     // A graceful Application.Shutdown() can be blocked indefinitely by ANY open
@@ -197,40 +222,32 @@ public partial class App : Application
         // integrity, so a Medium signaller is not blocked by no-write-up. When set,
         // we perform the same graceful shutdown as a Restart Manager close, which
         // releases LithicBackup.exe so the upgrade can replace it.
-        try
+        // The Global\ name additionally reaches a signaller in another session (a
+        // system-context install). Not required, and not always creatable, so a
+        // failure here is logged and shrugged off rather than treated as fatal.
+        if (!TryRegisterShutdownSignal(
+                GlobalShutdownSignalName,
+                out _globalShutdownSignalEvent,
+                out _globalShutdownSignalWait,
+                out var globalError))
         {
-            var shutdownSecurity = new EventWaitHandleSecurity();
-            shutdownSecurity.AddAccessRule(new EventWaitHandleAccessRule(
-                new SecurityIdentifier(WellKnownSidType.AuthenticatedUserSid, null),
-                EventWaitHandleRights.Modify | EventWaitHandleRights.Synchronize,
-                AccessControlType.Allow));
-            _shutdownSignalEvent = EventWaitHandleAcl.Create(
-                initialState: false,
-                mode: EventResetMode.AutoReset,
-                name: ShutdownSignalName,
-                createdNew: out _,
-                eventSecurity: shutdownSecurity);
-            _shutdownSignalWait = ThreadPool.RegisterWaitForSingleObject(
-                _shutdownSignalEvent,
-                (_, _) =>
-                {
-                    // Runs on a thread-pool thread, so it fires even if the UI
-                    // dispatcher is wedged. Arm the hard-exit watchdog FIRST, then
-                    // request the graceful shutdown — the watchdog only fires if that
-                    // graceful path hasn't ended the process within the grace window.
-                    ArmForcedShutdownWatchdog();
-                    Current?.Dispatcher.BeginInvoke(new Action(ShutdownForRestartManager));
-                },
-                state: null,
-                millisecondsTimeOutInterval: Timeout.Infinite,
-                executeOnlyOnce: true);
+            CrashLogger.Log(null,
+                "Cross-session upgrade shutdown listener not registered (" + globalError +
+                "). Harmless: the session-local listener below still covers an ordinary " +
+                "interactive install, and Restart Manager remains the backstop.");
         }
-        catch (Exception ex)
+
+        if (!TryRegisterShutdownSignal(
+                ShutdownSignalName,
+                out _shutdownSignalEvent,
+                out _shutdownSignalWait,
+                out var localError))
         {
             // A missing shutdown listener only degrades upgrade UX (the installer
             // falls back to its wait/RestartManager handling); it must never stop
             // the app from starting.
-            CrashLogger.Log(ex, "Failed to register installer shutdown signal listener");
+            CrashLogger.Log(null,
+                "Failed to register installer shutdown signal listener: " + localError);
         }
 
         // Show splash screen immediately while services initialize.
@@ -343,7 +360,7 @@ public partial class App : Application
         // GUI-side monitor polls destination free space and raises DestinationFull
         // the moment a continuous destination can no longer accept writes.
         _destinationSpaceMonitor = new DestinationSpaceMonitor(_catalog, destinationResolver);
-        _destinationSpaceMonitor.DestinationFull += message =>
+        _destinationSpaceMonitor.DestinationFull += alert =>
         {
             // A tray balloon self-dismisses after a few seconds, so an
             // away-from-keyboard user would miss it. Use a modal dialog that stays
@@ -354,10 +371,20 @@ public partial class App : Application
             // (re-arming only after the drive recovers), so the dialog won't
             // reappear unless space is freed and that drive fills again, or a
             // different continuous destination fills.
+            var monitor = _destinationSpaceMonitor;
             Current.Dispatcher.BeginInvoke(() =>
             {
+                // Re-check before interrupting: BeginInvoke can run much later
+                // than the observation (busy dispatcher, another modal already
+                // up), and a drive that has recovered in the gap must not be
+                // announced as full — that turns a correct warning into one the
+                // user can immediately disprove in Explorer. See
+                // DestinationSpaceMonitor.IsStillFull.
+                if (monitor is null || !monitor.IsStillFull(alert.Root))
+                    return;
+
                 MessageBox.Show(
-                    message,
+                    alert.Message,
                     "Lithic Backup \u2014 Destination Drive Full",
                     MessageBoxButton.OK,
                     MessageBoxImage.Warning);
@@ -534,6 +561,72 @@ public partial class App : Application
     }
 
     /// <summary>
+    /// Create one named "please close yourself" event and start listening on it.
+    /// Returns false (with <paramref name="error"/> set) instead of throwing, because
+    /// one of the two names is EXPECTED to fail on an unelevated run — see the
+    /// comment on <see cref="GlobalShutdownSignalName"/>.
+    /// </summary>
+    /// <remarks>
+    /// The DACL grants Authenticated Users <see cref="EventWaitHandleRights.Modify"/>
+    /// so the installer can Set the event even though it runs at a different
+    /// integrity level (and, for the Global\ name, in a different session). Without
+    /// an explicit label the event is Medium integrity, so a Medium signaller is not
+    /// blocked by no-write-up. The only capability this grants anyone is "ask the
+    /// backup GUI to close", which is what the upgrade needs.
+    /// </remarks>
+    private bool TryRegisterShutdownSignal(
+        string name,
+        out EventWaitHandle? handle,
+        out RegisteredWaitHandle? registration,
+        out string error)
+    {
+        handle = null;
+        registration = null;
+        error = "";
+
+        try
+        {
+            var security = new EventWaitHandleSecurity();
+            security.AddAccessRule(new EventWaitHandleAccessRule(
+                new SecurityIdentifier(WellKnownSidType.AuthenticatedUserSid, null),
+                EventWaitHandleRights.Modify | EventWaitHandleRights.Synchronize,
+                AccessControlType.Allow));
+
+            handle = EventWaitHandleAcl.Create(
+                initialState: false,
+                mode: EventResetMode.AutoReset,
+                name: name,
+                createdNew: out _,
+                eventSecurity: security);
+
+            registration = ThreadPool.RegisterWaitForSingleObject(
+                handle,
+                (_, _) =>
+                {
+                    // Runs on a thread-pool thread, so it fires even if the UI
+                    // dispatcher is wedged. Arm the hard-exit watchdog FIRST, then
+                    // request the graceful shutdown — the watchdog only fires if that
+                    // graceful path hasn't ended the process within the grace window.
+                    ArmForcedShutdownWatchdog();
+                    Current?.Dispatcher.BeginInvoke(new Action(ShutdownForRestartManager));
+                },
+                state: null,
+                millisecondsTimeOutInterval: Timeout.Infinite,
+                executeOnlyOnce: true);
+
+            return true;
+        }
+        catch (Exception ex)
+        {
+            handle?.Dispose();
+            handle = null;
+            registration = null;
+            error = ex.GetType().Name + ": " + ex.Message;
+            return false;
+        }
+    }
+
+    /// <summary>
     /// Guarantee the process (and its lock on LithicBackup.exe) is released for an
     /// upgrade even if the graceful <see cref="Application.Shutdown()"/> is blocked
     /// by an open modal or a busy/wedged dispatcher. Starts a one-shot background
@@ -644,9 +737,11 @@ public partial class App : Application
         _destinationSpaceMonitor?.Dispose();
         _catalog?.Dispose();
 
-        // Release the installer shutdown-signal listener.
+        // Release the installer shutdown-signal listeners (both names).
         _shutdownSignalWait?.Unregister(null);
         _shutdownSignalEvent?.Dispose();
+        _globalShutdownSignalWait?.Unregister(null);
+        _globalShutdownSignalEvent?.Dispose();
 
         // Release single-instance primitives.
         _showInstanceWait?.Unregister(null);

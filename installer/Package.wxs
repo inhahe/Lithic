@@ -221,10 +221,32 @@
 
       Managed (DTF) custom action, built by installer\CustomActions and embedded
       as the LithicCustomActions binary.  SignalLithicShutdown sets the named
-      event each process listens on (LithicBackup.Shutdown for the GUI, see
+      event each process listens on (Global\LithicBackup.Shutdown for the GUI,
+      falling back to the session-local LithicBackup.Shutdown, see
       src\LithicBackup\App.xaml.cs; Global\LithicBackup.Worker.Shutdown for the
       service, see src\LithicBackup.Worker\ShutdownSignalListener.cs) and waits,
       bounded and concurrently, for both processes to exit.
+
+      WHAT ACTUALLY BROKE IT — and it is not in this file.  From 1.0.11 to 1.0.55
+      this action never executed a single line.  installer\CustomActions had no
+      CustomAction.config, so SfxCA.dll (the native stub around a DTF action,
+      which must choose a CLR before it can load any managed code) bound
+      CLR v2.0.50727 and threw BadImageFormatException on the net472 assembly.
+      Return="ignore" turned that 1603 into "success", and the install walked
+      straight into the 1611 this action exists to prevent.  If you ever see
+      "SFXCA: Binding to CLR version v2.0.50727" in a verbose log, that config
+      file has gone missing again.
+
+      WHICH PROCESS THIS RUNS IN.  Stated from measurement, because a
+      plausible-sounding guess about this once sent the diagnosis badly astray:
+      for an ordinary double-click it runs as a REMOTE custom action hosted in
+      rundll32, IMPERSONATED AS THE INVOKING USER IN THAT USER'S OWN SESSION.
+      The action logs this on every run, e.g. "running as 'DOMAIN\user' in
+      process rundll32 (pid 72736), session 1."  It does NOT run as LocalSystem
+      in session 0 — an earlier revision of this very comment asserted that, and
+      it was wrong.  Consistent with the measurement, it cannot SCM-stop the
+      LocalSystem service ("Cannot open Lithic Backup service on computer '.'"),
+      which is why the Worker is asked via its Global\ event instead.
 
       Scheduled Before InstallValidate (see InstallExecuteSequence below) so both
       executables and all their self-contained DLLs are released before MSI looks
@@ -235,22 +257,28 @@
 
         * Execute="immediate"  — runs during sequence processing, before the
           file-in-use detection; a deferred action would run far too late.
-        * Impersonate="yes"    — runs as the invoking user (Medium).  That user
-          can neither terminate a High-integrity GUI nor SCM-stop a LocalSystem
-          service, which is exactly why the action ASKS instead: a process can
-          always shut itself down regardless of integrity level.  (It does still
-          try ServiceController.Stop first, which succeeds on the paths where the
-          MSI was launched already-elevated.)
+        * Impersonate="yes"    — runs as the invoking user, which is what puts the
+          action in that user's session and namespace (confirmed by its own log).
+          The action ASKS both processes to exit rather than killing them because
+          a process can always shut itself down regardless of integrity level,
+          which is the only approach that works against a GUI running elevated.
         * Return="ignore"      — this is a best-effort convenience; the action also
           returns Success internally.  A first-time install (nothing running) is a
-          harmless no-op.
+          harmless no-op.  NOTE that this is also what hid a custom action that
+          could not even LOAD for 45 releases, which is why the action now logs
+          the process, account and session it is running in — and why a verbose
+          log should be checked for "SignalLithicShutdown:" lines after any change
+          to the CustomActions project.
 
       No condition: attempting the signal on every install/upgrade/uninstall is
       harmless (a no-op when nothing is running) and keeps behavior predictable.
 
       Bootstrap caveat: an upgrade can only signal a listener the ALREADY-INSTALLED
       build contains.  The upgrade that first delivers a listener still falls back
-      to Windows Installer's own handling for that one process.
+      to Windows Installer's own handling for that one process.  That fallback
+      (Restart Manager) closes an ordinary unelevated GUI fine; it cannot close an
+      elevated one, because UIPI blocks the unelevated client from posting to a
+      High-integrity window.
     -->
     <Binary Id="LithicCustomActions"
             SourceFile="CustomActions\bin\Release\LithicBackup.CustomActions.CA.dll" />

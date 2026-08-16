@@ -4234,34 +4234,42 @@ public class MainViewModel : ViewModelBase
 
     /// <summary>
     /// Downloads the release installer (the bare <c>.msi</c>; a legacy <c>.exe</c>
-    /// bundle is accepted only as a fallback) and launches it <em>elevated</em>,
-    /// then shuts this app down so the installer can replace the running files.
-    /// If the release has no installer asset, falls back to opening the release
-    /// page in the browser.
+    /// bundle is accepted only as a fallback) and launches it, then shuts this app
+    /// down so the installer can replace the running files. If the release has no
+    /// installer asset, falls back to opening the release page in the browser.
     /// </summary>
     /// <remarks>
     /// <para>
-    /// <b>Why elevated, and why via msiexec.</b> Everything an MSI does before
-    /// <c>InstallInitialize</c> — including the <c>InstallValidate</c> file-in-use
-    /// check and our <c>SignalLithicShutdown</c> custom action, which runs just
-    /// ahead of it — executes in the client process. Launch the package normally
-    /// and that process is unelevated, so the custom action cannot SCM-stop the
-    /// LocalSystem Worker service and has to fall back to asking the service to
-    /// stop itself. That fallback works, but only against a build that already
-    /// ships the listener. Launching <c>msiexec /i</c> through the <c>runas</c>
-    /// verb makes the client process elevated, so the SCM stop simply succeeds and
-    /// the upgrade works even against an older Worker with no listener.
+    /// <b>Deliberately NOT elevated.</b> This used to ShellExecute <c>msiexec /i</c>
+    /// with the <c>runas</c> verb, on the theory that the <c>SignalLithicShutdown</c>
+    /// custom action runs in the client process and therefore needed the client to be
+    /// elevated in order to SCM-stop the LocalSystem Worker service. That premise was
+    /// wrong: the action is scheduled in the <c>InstallExecuteSequence</c>, which
+    /// Windows Installer runs in its own LocalSystem server process in session 0, so
+    /// the SCM stop already succeeds from an ordinary double-click. Elevating here
+    /// bought nothing.
     /// </para>
     /// <para>
-    /// It has to be <c>msiexec.exe</c> rather than the <c>.msi</c> itself: Windows
-    /// registers no <c>runas</c> verb for the <c>.msi</c> file type, so
-    /// ShellExecute-ing the package with that verb fails outright.
+    /// It also actively caused harm, which is why this is not merely tidying.
+    /// Elevating the client process means the wizard's "Launch Lithic Backup" exit
+    /// checkbox — which is ticked by default and runs in that same client — starts
+    /// the GUI with High integrity. The app's manifest is <c>asInvoker</c>, so it had
+    /// no business running elevated, and it then stayed elevated for its whole
+    /// lifetime. At the NEXT upgrade, Restart Manager (driven from an ordinary
+    /// unelevated client) is blocked by UIPI from closing a High-integrity window, so
+    /// the fallback that would otherwise have quietly closed the app failed too and
+    /// the upgrade died with error 1611. See the MSI-upgrade entry in
+    /// <c>known-issues.md</c>.
     /// </para>
     /// <para>
-    /// This is not the only line of defence — closing the GUI below, and the
-    /// custom action's signals, cover the manual double-click-the-MSI path where
-    /// we control neither. It is the one that makes the in-app update path
-    /// unconditionally safe.
+    /// Windows Installer still elevates itself at <c>InstallInitialize</c>, so the
+    /// user sees exactly one UAC prompt either way — it is just raised by the
+    /// installer instead of by us, and the client (and anything it launches) stays at
+    /// the user's normal integrity level.
+    /// </para>
+    /// <para>
+    /// Closing the GUI below, and the custom action's signals, cover the manual
+    /// double-click-the-MSI path where we control neither.
     /// </para>
     /// </remarks>
     private async Task DownloadUpdateAsync()
@@ -4281,12 +4289,14 @@ public class MainViewModel : ViewModelBase
 
             StatusText = "Launching installer...";
 
+            // No Verb = "runas": the installer raises its own UAC prompt at
+            // InstallInitialize, and elevating the client here would leave the GUI it
+            // launches afterwards running elevated. See the remarks above.
             var isMsi = installerPath.EndsWith(".msi", StringComparison.OrdinalIgnoreCase);
             var psi = isMsi
                 ? new System.Diagnostics.ProcessStartInfo("msiexec.exe", $"/i \"{installerPath}\"")
                 : new System.Diagnostics.ProcessStartInfo(installerPath);
-            psi.UseShellExecute = true;   // required for the "runas" verb
-            psi.Verb = "runas";
+            psi.UseShellExecute = true;
 
             try
             {
@@ -4294,9 +4304,8 @@ public class MainViewModel : ViewModelBase
             }
             catch (System.ComponentModel.Win32Exception ex) when (ex.NativeErrorCode == 1223)
             {
-                // ERROR_CANCELLED — the user dismissed the UAC prompt. Falling back
-                // to an unelevated launch would only prompt again later (and land in
-                // the weaker code path), so stop here and leave the app running.
+                // ERROR_CANCELLED — the user dismissed a prompt (the installer's own
+                // elevation request can surface here when the shell raises it).
                 StatusText = "Update cancelled.";
                 return;
             }
