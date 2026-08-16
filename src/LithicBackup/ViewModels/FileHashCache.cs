@@ -58,13 +58,28 @@ public sealed class FileHashCache : IFileHashLookup, IDisposable
     private SqliteParameter? _selectPath;
     private bool _openFailed;
 
+    /// <summary>Bumped by <see cref="CacheMaintenance"/> when it has changed the
+    /// database underneath us; see the matching note in
+    /// <see cref="DirectorySizeCache"/>.</summary>
+    private static long s_generation;
+    private static long s_dropWritesGeneration;
+    private long _seenGeneration;
+    private long _seenDropWrites;
+
+    /// <summary>Tell every live instance the database changed beneath it, so it
+    /// drops its memo and re-opens.</summary>
+    /// <param name="dropPendingWrites">Also discard queued writes — right for a
+    /// clear, wrong for a compaction.</param>
+    internal static void InvalidateLiveInstances(bool dropPendingWrites)
+    {
+        if (dropPendingWrites)
+            Interlocked.Increment(ref s_dropWritesGeneration);
+        Interlocked.Increment(ref s_generation);
+    }
+
     public FileHashCache()
     {
-        var appDataDir = Path.Combine(
-            Environment.GetFolderPath(Environment.SpecialFolder.LocalApplicationData),
-            "LithicBackup");
-        Directory.CreateDirectory(appDataDir);
-        _dbPath = Path.Combine(appDataDir, "filehashcache.db");
+        _dbPath = CacheMaintenance.PathFor("filehashcache.db");
 
         // Ordinal so the memo agrees with the database's (binary) primary key —
         // see the matching note in DirectorySizeCache. Paths reach this class
@@ -106,6 +121,9 @@ public sealed class FileHashCache : IFileHashLookup, IDisposable
     {
         lock (_lock)
         {
+            // Set does not go through Read, so it needs its own check.
+            SyncGeneration();
+
             var entry = new CacheEntry(fileSize, lastWriteUtc, sha256Hex);
 
             if (_hot.Count >= HotLimit)
@@ -141,9 +159,41 @@ public sealed class FileHashCache : IFileHashLookup, IDisposable
 
     // -----------------------------------------------------------------
 
+    /// <summary>
+    /// Adopt any maintenance that happened since the last call: drop the memo
+    /// and close the connection, because a compaction replaces the table
+    /// wholesale and the prepared statement was made against the old one.
+    /// Caller holds the lock.
+    /// </summary>
+    private void SyncGeneration()
+    {
+        long gen = Interlocked.Read(ref s_generation);
+        if (gen == _seenGeneration)
+            return;
+        _seenGeneration = gen;
+
+        _hot.Clear();
+
+        long dropGen = Interlocked.Read(ref s_dropWritesGeneration);
+        if (dropGen != _seenDropWrites)
+        {
+            _seenDropWrites = dropGen;
+            _dirty.Clear();
+        }
+
+        _selectCmd?.Dispose();
+        _selectCmd = null;
+        _selectPath = null;
+        _conn?.Dispose();
+        _conn = null;
+        _openFailed = false;
+    }
+
     /// <summary>Read one row, memoising both hits and misses. Caller holds the lock.</summary>
     private CacheEntry? Read(string filePath)
     {
+        SyncGeneration();
+
         if (_hot.TryGetValue(filePath, out var memo))
             return memo;
 
@@ -276,7 +326,7 @@ public sealed class FileHashCache : IFileHashLookup, IDisposable
                 FileSize     INTEGER NOT NULL,
                 LastWriteUtc TEXT NOT NULL,
                 Sha256Hash   TEXT NOT NULL
-            )
+            ) WITHOUT ROWID
             """;
         cmd.ExecuteNonQuery();
     }

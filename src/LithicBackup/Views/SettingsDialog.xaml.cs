@@ -7,6 +7,7 @@ using System.Windows;
 using System.Windows.Controls;
 using LithicBackup.Core.Models;
 using LithicBackup.Services;
+using LithicBackup.ViewModels;
 
 namespace LithicBackup.Views;
 
@@ -43,6 +44,8 @@ public partial class SettingsDialog : Window, INotifyPropertyChanged
         int tabCount = SettingsTabs.Items.Count;
         if (tabCount > 0)
             SettingsTabs.SelectedIndex = Math.Clamp(settings.LastSettingsTab, 0, tabCount - 1);
+
+        LoadCacheReportAsync();
     }
 
     // ------------------------------------------------------------------
@@ -431,6 +434,212 @@ public partial class SettingsDialog : Window, INotifyPropertyChanged
         {
             _settings.LastSettingsTab = SettingsTabs.SelectedIndex;
             _settings.Save();
+        }
+    }
+
+    // ------------------------------------------------------------------
+    // Caches tab
+    // ------------------------------------------------------------------
+
+    /// <summary>One row per on-disk cache, as plain formatted strings — this is a
+    /// report, and nothing here is edited or saved with the rest of the dialog.</summary>
+    public ObservableCollection<CacheRow> CacheRows { get; } = new();
+
+    private CancellationTokenSource? _cacheCts;
+
+    private bool _cacheBusy;
+    /// <summary>True while a compaction or clear is running.</summary>
+    public bool CacheBusy
+    {
+        get => _cacheBusy;
+        private set
+        {
+            _cacheBusy = value;
+            OnPropertyChanged();
+            OnPropertyChanged(nameof(CacheIdle));
+        }
+    }
+
+    /// <summary>Inverse of <see cref="CacheBusy"/>, so the action buttons can
+    /// disable themselves without needing a converter.</summary>
+    public bool CacheIdle => !_cacheBusy;
+
+    private string _cacheStatus = "";
+    /// <summary>Progress line while working, result summary when finished.</summary>
+    public string CacheStatus
+    {
+        get => _cacheStatus;
+        private set
+        {
+            _cacheStatus = value;
+            OnPropertyChanged();
+            OnPropertyChanged(nameof(HasCacheStatus));
+        }
+    }
+
+    public bool HasCacheStatus => !string.IsNullOrEmpty(_cacheStatus);
+
+    /// <summary>
+    /// Read current cache sizes. Off the UI thread: the row count is a table
+    /// scan, which on a large cache is most of a second.
+    /// </summary>
+    private async void LoadCacheReportAsync()
+    {
+        var reports = await Task.Run(CacheMaintenance.Survey);
+
+        CacheRows.Clear();
+        foreach (var r in reports)
+            CacheRows.Add(CacheRow.From(r));
+    }
+
+    private void RefreshCaches_Click(object sender, RoutedEventArgs e) => LoadCacheReportAsync();
+
+    private void CancelCacheWork_Click(object sender, RoutedEventArgs e)
+    {
+        _cacheCts?.Cancel();
+        CacheStatus = "Stopping…";
+    }
+
+    private async void CompactCaches_Click(object sender, RoutedEventArgs e) =>
+        await RunCacheWorkAsync(
+            (progress, ct) => CacheMaintenance.CompactAsync(progress, ct),
+            "Nothing to compact.");
+
+    private async void ClearCaches_Click(object sender, RoutedEventArgs e)
+    {
+        // Destructive enough to confirm: nothing is lost permanently, but the
+        // next backup re-hashes every file and the next source tree recomputes
+        // every directory size, which on a large selection is a long wait the
+        // user should be choosing deliberately.
+        var answer = MessageBox.Show(this,
+            "Discard all cached directory sizes and file hashes?\n\n" +
+            "Nothing is lost permanently — Lithic recomputes what it needs. " +
+            "But the next backup will re-read files to hash them, and the source " +
+            "tree will recompute directory sizes from scratch, which can take a while.",
+            "Clear caches", MessageBoxButton.OKCancel, MessageBoxImage.Warning);
+        if (answer != MessageBoxResult.OK)
+            return;
+
+        await RunCacheWorkAsync(
+            (progress, ct) => CacheMaintenance.ClearAsync(progress, ct),
+            "Caches were already empty.");
+    }
+
+    private async Task RunCacheWorkAsync(
+        Func<IProgress<string>, CancellationToken, Task<IReadOnlyList<CacheMaintenanceResult>>> work,
+        string nothingToDoMessage)
+    {
+        if (CacheBusy)
+            return;
+
+        _cacheCts?.Dispose();
+        _cacheCts = new CancellationTokenSource();
+        CacheBusy = true;
+        CacheStatus = "Starting…";
+
+        // Progress<T> captures the current SynchronizationContext, so reports
+        // raised on the worker thread arrive back here on the UI thread.
+        var progress = new Progress<string>(line => CacheStatus = line);
+
+        bool cancelled = false;
+        IReadOnlyList<CacheMaintenanceResult> results = Array.Empty<CacheMaintenanceResult>();
+        try
+        {
+            results = await work(progress, _cacheCts.Token);
+        }
+        catch (OperationCanceledException)
+        {
+            cancelled = true;
+        }
+        catch (Exception ex)
+        {
+            CacheStatus = "Could not finish: " + ex.Message;
+            CacheBusy = false;
+            return;
+        }
+
+        CacheBusy = false;
+        CacheStatus = SummarizeCacheWork(results, cancelled, nothingToDoMessage);
+        LoadCacheReportAsync();
+    }
+
+    private static string SummarizeCacheWork(
+        IReadOnlyList<CacheMaintenanceResult> results, bool cancelled, string nothingToDoMessage)
+    {
+        long freed = 0, rows = 0;
+        var skipped = new SortedSet<string>(StringComparer.OrdinalIgnoreCase);
+        foreach (var r in results)
+        {
+            freed += r.BytesFreed;
+            rows += r.RowsRemoved;
+            foreach (var root in r.Unreachable)
+                skipped.Add(root);
+        }
+
+        // Worth saying out loud: with a backup drive unplugged, a run that
+        // deliberately kept that drive's entries otherwise just looks like one
+        // that failed to free anything.
+        string kept = skipped.Count == 0
+            ? ""
+            : $" Entries on {string.Join(", ", skipped)} were kept — " +
+              (skipped.Count == 1 ? "that drive is" : "those drives are") +
+              " not available right now.";
+
+        if (freed == 0 && rows == 0)
+            return (cancelled ? "Stopped before anything was freed." : nothingToDoMessage) + kept;
+
+        string summary = $"Freed {FormatBytes(freed)}" +
+                         (rows > 0 ? $" by dropping {rows:N0} stale entries." : ".");
+        return (cancelled ? "Stopped. " + summary : summary) + kept;
+    }
+
+    internal static string FormatBytes(long bytes)
+    {
+        string[] units = { "bytes", "KB", "MB", "GB", "TB" };
+        double value = bytes;
+        int unit = 0;
+        while (value >= 1024 && unit < units.Length - 1)
+        {
+            value /= 1024;
+            unit++;
+        }
+        return unit == 0
+            ? $"{bytes:N0} {units[unit]}"
+            : $"{value:N1} {units[unit]}";
+    }
+
+    /// <summary>A single cache's line in the Caches tab.</summary>
+    public sealed class CacheRow
+    {
+        public string Title { get; init; } = "";
+        public string Detail { get; init; } = "";
+        public string Note { get; init; } = "";
+        public bool HasNote => !string.IsNullOrEmpty(Note);
+
+        public static CacheRow From(CacheReport r)
+        {
+            if (!r.Exists)
+            {
+                return new CacheRow
+                {
+                    Title = r.DisplayName,
+                    Detail = "Empty — nothing cached yet.",
+                };
+            }
+
+            long reclaimable = Math.Max(0, r.FileBytes - r.UsedBytes);
+            string detail = $"{FormatBytes(r.FileBytes)} on disk, {r.Rows:N0} entries";
+            if (reclaimable > 1024 * 1024)
+                detail += $" ({FormatBytes(reclaimable)} already free inside the file)";
+
+            string note = "";
+            if (r.IsLegacyLayout && r.Rows > 0)
+            {
+                note = "Stored in the old layout, which keeps a second copy of every " +
+                       "path. Compacting rebuilds it and typically saves about a third.";
+            }
+
+            return new CacheRow { Title = r.DisplayName, Detail = detail, Note = note };
         }
     }
 

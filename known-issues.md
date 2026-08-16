@@ -112,7 +112,10 @@ about one page.
   from `DirectoryInfo`/`FileInfo.FullName`, so the filesystem supplies consistent
   casing; a stray case variant costs one recomputation, not a wrong answer.
 
-## OPEN (tech debt): `sizecache.db` is ~2× the size it needs to be, and a third of it caches backup *destinations* (2026-08-15)
+## MOSTLY FIXED: `sizecache.db` is ~2× the size it needs to be, and a third of it caches backup *destinations* (2026-08-15)
+
+*Two of the three findings below are fixed (see **Resolution** at the end); the
+third — caching backup destinations — was left in place deliberately.*
 
 Follow-up audit of the 538 MB / 1,494,077-row `sizecache.db` after the perf fix
 above, asking whether the whole thing is earning its keep. It isn't, though not
@@ -168,6 +171,30 @@ evict rows whose directory no longer exists. Note the prune added above orders b
 `rowid`, which a `WITHOUT ROWID` table does not have; it would need to order by
 something else, or the prune gate could become "drop rows whose path is gone"
 which is better targeted anyway.
+
+**Resolution (same day).** Findings 2 and 3 are fixed by **Settings ▸ Caches**
+(`CacheMaintenance.cs`): compaction sweeps out entries whose path no longer
+exists and rebuilds the table `WITHOUT ROWID`. Measured on this same 1.5M-row
+cache: **514 MB → 233 MB**, 382,939 rows dropped (25.6% — the 24.7% sample
+estimate held). New databases are created in the compact shape, so this is a
+one-time migration for existing ones.
+
+Finding 1 (destinations) is **deliberately not fixed**: the user may browse
+destinations, and 35% of a cache that now costs 233 MB is not worth losing the
+ability to show those sizes instantly. Left as a note rather than debt.
+
+Two traps found while building it, both now covered in `design.md`:
+
+* **An unplugged drive answers "missing" for every path on it**, so a sweep with
+  the backup drive disconnected would evict its entire cache — the most
+  expensive rows in the file to rebuild. Roots are checked for availability once
+  each and skipped if unreachable.
+* **`VACUUM` in WAL mode does not shrink anything by itself.** It rewrites the
+  database through the log, so the first full-scale run ended with a 233 MB file
+  and a **269 MB `-wal`** next to it, and honestly reported having freed 23.5 MB
+  of the 281 MB it had actually freed. `PRAGMA wal_checkpoint(TRUNCATE)` after
+  the VACUUM is required — disposing the connection is not enough, because
+  Microsoft.Data.Sqlite pools connections.
 
 **Corrected along the way, to save the next person the same wrong turn:** 49% of
 rows have `DirectFileSize=0 AND DirectFileCount=0`, which looks like "half the

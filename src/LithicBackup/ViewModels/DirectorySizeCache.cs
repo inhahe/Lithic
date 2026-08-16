@@ -104,13 +104,38 @@ public sealed class DirectorySizeCache : IDisposable
     private bool _openFailed;
     private bool _pruneStarted;
 
+    /// <summary>
+    /// Bumped by <see cref="CacheMaintenance"/> when it has changed the database
+    /// underneath us. There is no registry of live instances to notify because
+    /// there is no single owner: <see cref="SizeComputeScheduler"/> constructs
+    /// its own, and one exists per open backup-set editor. A counter every
+    /// instance checks under its own lock covers all of them without anyone
+    /// having to hold a reference.
+    /// </summary>
+    private static long s_generation;
+    private static long s_dropWritesGeneration;
+    private long _seenGeneration;
+    private long _seenDropWrites;
+
+    /// <summary>
+    /// Tell every live instance that the database has changed beneath it, so it
+    /// drops its memo and re-opens. Called after a compaction (which can delete
+    /// rows and replace the table) or a clear.
+    /// </summary>
+    /// <param name="dropPendingWrites">Also discard writes queued but not yet
+    /// flushed. Right for a clear — otherwise a queued row lands moments after
+    /// the user asked for an empty cache — and wrong for a compaction, where
+    /// those writes are live data that simply has not been persisted yet.</param>
+    internal static void InvalidateLiveInstances(bool dropPendingWrites)
+    {
+        if (dropPendingWrites)
+            Interlocked.Increment(ref s_dropWritesGeneration);
+        Interlocked.Increment(ref s_generation);
+    }
+
     public DirectorySizeCache()
     {
-        var appDataDir = Path.Combine(
-            Environment.GetFolderPath(Environment.SpecialFolder.LocalApplicationData),
-            "LithicBackup");
-        Directory.CreateDirectory(appDataDir);
-        _dbPath = Path.Combine(appDataDir, "sizecache.db");
+        _dbPath = CacheMaintenance.PathFor("sizecache.db");
 
         // Ordinal, not OrdinalIgnoreCase, and deliberately so: the memo has to
         // agree with the database, whose primary key uses SQLite's default
@@ -274,9 +299,46 @@ public sealed class DirectorySizeCache : IDisposable
 
     // -----------------------------------------------------------------
 
+    /// <summary>
+    /// Adopt any maintenance that happened since the last call: drop the memo
+    /// (rows may have been deleted) and close the connection, because a
+    /// compaction replaces the table wholesale and the prepared statement was
+    /// made against the old one. Caller holds the lock.
+    /// </summary>
+    private void SyncGeneration()
+    {
+        long gen = Interlocked.Read(ref s_generation);
+        if (gen == _seenGeneration)
+            return;
+        _seenGeneration = gen;
+
+        _hot.Clear();
+
+        long dropGen = Interlocked.Read(ref s_dropWritesGeneration);
+        if (dropGen != _seenDropWrites)
+        {
+            _seenDropWrites = dropGen;
+            _dirty.Clear();
+        }
+
+        _selectCmd?.Dispose();
+        _selectCmd = null;
+        _selectPath = null;
+        _conn?.Dispose();
+        _conn = null;
+
+        // A previous failure to open says nothing about the rebuilt file.
+        _openFailed = false;
+    }
+
     /// <summary>Read one row, memoising both hits and misses. Caller holds the lock.</summary>
     private CacheEntry? Read(string path)
     {
+        // Every public entry point reaches the database through here (the Set
+        // overloads all read first, to merge into the existing row), so this is
+        // the one place the maintenance check has to go.
+        SyncGeneration();
+
         if (_hot.TryGetValue(path, out var memo))
             return memo;
 
@@ -446,12 +508,21 @@ public sealed class DirectorySizeCache : IDisposable
     /// file grew monotonically with every directory ever scanned.
     ///
     /// <para>Runs on its own connection, on a background thread, holding no lock:
-    /// counting and deleting from a multi-million-row table takes seconds, and
-    /// doing it under <see cref="_lock"/> would resurrect exactly the stall this
-    /// class was rewritten to remove. Deletion is chunked and ordered by
-    /// <c>rowid</c>, which is both the cheapest possible scan (rowid *is* the
-    /// table's order) and a good proxy for staleness, because
-    /// <c>INSERT OR REPLACE</c> gives every rewritten row a fresh rowid.</para>
+    /// deleting from a multi-million-row table takes seconds, and doing it under
+    /// <see cref="_lock"/> would resurrect exactly the stall this class was
+    /// rewritten to remove.</para>
+    ///
+    /// <para><b>Eviction is random, deliberately.</b> The obvious cheap orderings
+    /// are both wrong here. <c>rowid</c> was a decent staleness proxy — every
+    /// <c>INSERT OR REPLACE</c> assigns a fresh one, so low rowids are old rows —
+    /// but the table is <c>WITHOUT ROWID</c> now and has none. Ordering by the
+    /// primary key instead would be the cheapest possible scan and the worst
+    /// possible policy: it would evict the same alphabetical prefix over and
+    /// over, so <c>C:\</c> would be permanently uncached while <c>Z:\</c> was
+    /// never touched. Random eviction needs no extra column or index, cannot
+    /// thrash one region, and is only ever reached in the pathological case this
+    /// exists to bound — a user who wants targeted cleanup has
+    /// Settings ▸ Caches, which drops entries whose directory is actually gone.</para>
     ///
     /// <para>The file itself will not shrink — freed pages go on the freelist to
     /// be reused by later inserts. Reclaiming them needs a VACUUM, which rewrites
@@ -484,9 +555,9 @@ public sealed class DirectorySizeCache : IDisposable
                     using (var del = conn.CreateCommand())
                     {
                         del.CommandText = $"""
-                            DELETE FROM DirectorySizeCache WHERE rowid IN (
-                                SELECT rowid FROM DirectorySizeCache
-                                ORDER BY rowid LIMIT {PruneChunkRows})
+                            DELETE FROM DirectorySizeCache WHERE Path IN (
+                                SELECT Path FROM DirectorySizeCache
+                                ORDER BY random() LIMIT {PruneChunkRows})
                             """;
                         deleted = del.ExecuteNonQuery();
                     }
@@ -546,7 +617,7 @@ public sealed class DirectorySizeCache : IDisposable
                 FilteredRecursiveSize INTEGER,
                 FilteredRecursiveFileCount INTEGER,
                 FilteredFilterSignature TEXT
-            )
+            ) WITHOUT ROWID
             """;
         cmd.ExecuteNonQuery();
 
