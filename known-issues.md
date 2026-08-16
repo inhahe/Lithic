@@ -189,8 +189,18 @@ priority order:
    volume it can be redirected, which makes D:'s free space structurally immune to
    snapshots of D: no matter how much churn there is:
 
+   **`vssadmin add shadowstorage` does not exist on client Windows** — on Windows
+   11 Pro vssadmin offers only `Delete Shadows`, the `List` verbs and
+   `Resize ShadowStorage`, and `resize` cannot create an association that does not
+   exist yet. The capability is still there, just not through vssadmin: the WMI
+   method it wraps, `Win32_ShadowStorage.Create(Volume, DiffVolume, MaxSpace)`, is
+   present on the client SKU. `tools\vss-limit.ps1` drives it (and falls back to
+   `vssadmin resize` when an association already exists):
+
    ```
-   vssadmin add shadowstorage /for=D: /on=E: /maxsize=100GB
+   .\vss-limit.ps1 -For D: -On E: -MaxSizeGB 100    # redirect and cap
+   .\vss-limit.ps1 -For D: -MaxSizeGB 20            # cap in place
+   .\vss-limit.ps1                                  # report only
    ```
 
    E: is NTFS with **600 GB free of 931 GB**, versus D:'s 82 GB — so it can absorb
@@ -201,7 +211,7 @@ priority order:
    live. Keep the `maxsize` — redirected *and* unbounded just moves which volume
    gets eaten.
 2. **Or just cap it in place**, if the extra I/O on E: is unwelcome:
-   `vssadmin resize shadowstorage /for=D: /on=D: /maxsize=20GB`.
+   `.\vss-limit.ps1 -For D: -MaxSizeGB 20`.
    `Win32_ShadowStorage` currently reports **no** allocated store on any volume,
    which means unbounded — a leaked snapshot may take the whole volume. With a cap,
    Volsnap aborts the snapshot at 20 GB (the `Volsnap/24`/`35` pair still appears
@@ -262,6 +272,7 @@ both need elevation, so none of them use it):
 | `tools\write_burst.py` | same question from the filesystem's mtimes, for volumes Lithic doesn't back up |
 | `tools\freespace_probe.py` | quota-aware vs total free bytes, straight from `GetDiskFreeSpaceExW` |
 | `tools\destinfo.py` | replays the per-set resolve-and-measure path (GUID → mount point → root → free) |
+| `tools\vss-limit.ps1` | reports diff-area associations, and (elevated) caps or relocates one via `Win32_ShadowStorage.Create` — the client-Windows substitute for `vssadmin add shadowstorage` |
 
 Note `lowdisk-events.ps1`'s provider filter is anchored and spells out
 `Microsoft-Windows-Backup` rather than matching a bare `Backup` — the Worker logs
