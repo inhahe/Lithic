@@ -130,7 +130,15 @@
                 <Grid.RowDefinitions>
                     <RowDefinition Height="*" MinHeight="120" />
                     <RowDefinition Height="Auto" />
-                    <RowDefinition Height="120" MinHeight="72" />
+                    <!--
+                      Auto, not a fixed height: the exclusion panel grows with the
+                      number of patterns instead of stranding them in a 3-line
+                      window while the tree keeps the rest of the tab. The growth
+                      is bounded by MinLines/MaxLines on the TextBox below (see
+                      there for why the ceiling is what it is), and the splitter
+                      above still lets the user override the split by hand.
+                    -->
+                    <RowDefinition Height="Auto" MinHeight="72" />
                 </Grid.RowDefinitions>
 
                 <!-- TreeView with integrated column headers -->
@@ -534,8 +542,25 @@
                            Text="Glob patterns, one per line. Matching files are not backed up."
                            Foreground="{StaticResource TextSecondaryBrush}"
                            FontSize="11" TextWrapping="Wrap" Margin="0,0,0,6" />
+                <!--
+                  MinLines/MaxLines make this box size itself to the patterns it
+                  holds, which is the whole point: one exclusion should not reserve
+                  the space of ten, and ten should not be crammed into the space of
+                  three.
+
+                  The ceiling is deliberately modest. This row is Auto-sized, and a
+                  Grid gives an Auto row its desired height before the "*" tree row
+                  gets what is left — so an unbounded box would push the tree past
+                  its MinHeight and clip the bottom of the tab on a small window.
+                  Ten lines keeps tree(120) + splitter(6) + panel(~236) inside the
+                  ~370px of tab content available at BackupSetEditorWindow's
+                  MinHeight of 500. Past ten patterns the box scrolls, and the
+                  splitter is there for anyone who wants to trade away tree space.
+                -->
                 <TextBox Text="{Binding ExcludedExtensions, UpdateSourceTrigger=PropertyChanged}"
                          AcceptsReturn="True"
+                         MinLines="4"
+                         MaxLines="10"
                          VerticalScrollBarVisibility="Auto"
                          HorizontalScrollBarVisibility="Auto"
                          TextWrapping="NoWrap"
