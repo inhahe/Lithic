@@ -137,6 +137,38 @@ the **button in the Backup Coverage view** behaves and that the number is believ
 
 ---
 
+## 7. Settings ▸ Caches (compact / clear)
+
+The maintenance code itself is pinned by `tools/cache_maint_test`, which runs the
+real `CacheMaintenance` against a copy of a real cache and compares surviving rows
+to the original field by field. What that harness cannot check is the dialog: it
+runs with no window attached.
+
+- [ ] Open **File → Settings → Caches**. Both caches are listed with a size on disk
+      and an entry count. A cache in the old layout says so.
+- [ ] Click **Compact now**. The status line updates as it goes ("checked N of M
+      entries"), the buttons are disabled, and **Stop** appears.
+- [ ] **The window stays responsive** and the rest of the app keeps working while it
+      runs — this takes about a quarter of an hour on a large cache, so a UI-thread
+      regression here would be a fifteen-minute freeze.
+- [ ] Click **Stop** part-way. It ends promptly, reports what it managed to free, and
+      the listed sizes refresh. Compacting again picks up from there.
+- [ ] Let one finish. The reported freed bytes should match the drop in the file size
+      shown after the refresh — if it claims a few MB after a long run, the WAL was
+      not checkpointed.
+- [ ] **With an external drive disconnected** (if you have one in the cache): compact
+      and confirm the status says its entries were *kept* because the drive is not
+      available. Reconnect it and confirm sizes for that drive still display instantly
+      — i.e. its rows really did survive.
+- [ ] **Clear caches** asks for confirmation first, and Cancel does nothing. After
+      confirming, both caches drop to (nearly) zero entries.
+- [ ] After a clear, expand the source tree: sizes recompute rather than erroring, and
+      the caches start growing again.
+- [ ] Compact **while a size scan is running** (open a backup-set editor, expand a big
+      drive, then compact). Neither should fail — the scan may recompute a little.
+
+---
+
 ## Pending hardware validation (from the roadmap's "Related ideas" section)
 
 All of this is IMAPI2 real-burner work that has **only ever run against the simulator**.
