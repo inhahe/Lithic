@@ -36,22 +36,38 @@ function Format-Max([uint64] $bytes) {
     if ($bytes -ge [uint64]::MaxValue) { 'UNBOUNDED' } else { '{0:N1} GB' -f ($bytes / 1GB) }
 }
 
+# Both VSS classes throw "Initialization failure" for a non-admin rather than
+# returning an empty set. Swallowing that with -ErrorAction SilentlyContinue is
+# actively dangerous here: it renders "you may not look" as "there is nothing
+# there", which is the opposite of the truth and exactly the wrong answer for a
+# script whose job is to tell you whether a diff area is capped.
+function Get-VssClass([string] $class) {
+    try { return @{ Ok = $true; Items = @(Get-CimInstance $class -ErrorAction Stop) } }
+    catch { return @{ Ok = $false; Error = $_.Exception.Message } }
+}
+
 function Show-State([string] $header) {
     '', "=== $header ==="
-    $stores = @(Get-CimInstance Win32_ShadowStorage -ErrorAction SilentlyContinue)
-    if (-not $stores) {
-        '  (no diff area allocated on any volume -- every volume is effectively UNBOUNDED)'
+
+    $stores = Get-VssClass 'Win32_ShadowStorage'
+    if (-not $stores.Ok) {
+        "  diff areas: CANNOT READ ($($stores.Error)) -- run elevated to see them"
     }
-    foreach ($s in $stores) {
-        # Volume/DiffVolume are references; resolve them to drive letters.
-        $vol = (Get-CimInstance -InputObject $s | Select-Object -ExpandProperty Volume)
-        $diff = (Get-CimInstance -InputObject $s | Select-Object -ExpandProperty DiffVolume)
-        '  for={0} on={1} used={2:N2} GB allocated={3:N2} GB max={4}' -f
-        $vol.DeviceID, $diff.DeviceID, ($s.UsedSpace / 1GB), ($s.AllocatedSpace / 1GB),
-        (Format-Max $s.MaxSpace)
+    elseif ($stores.Items.Count -eq 0) {
+        '  diff areas: none allocated on any volume -- every volume is UNBOUNDED'
     }
-    $copies = @(Get-CimInstance Win32_ShadowCopy -ErrorAction SilentlyContinue)
-    "  shadow copies present: $($copies.Count)"
+    else {
+        foreach ($s in $stores.Items) {
+            # Volume/DiffVolume are references; resolve them to drive letters.
+            '  for={0} on={1} used={2:N2} GB allocated={3:N2} GB max={4}' -f
+            $s.Volume.DeviceID, $s.DiffVolume.DeviceID,
+            ($s.UsedSpace / 1GB), ($s.AllocatedSpace / 1GB), (Format-Max $s.MaxSpace)
+        }
+    }
+
+    $copies = Get-VssClass 'Win32_ShadowCopy'
+    if (-not $copies.Ok) { '  shadow copies: CANNOT READ -- run elevated' }
+    else { "  shadow copies present: $($copies.Items.Count)" }
 }
 
 $elevated = ([Security.Principal.WindowsPrincipal] `

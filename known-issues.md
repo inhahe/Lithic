@@ -212,10 +212,9 @@ priority order:
    gets eaten.
 2. **Or just cap it in place**, if the extra I/O on E: is unwelcome:
    `.\vss-limit.ps1 -For D: -MaxSizeGB 20`.
-   `Win32_ShadowStorage` currently reports **no** allocated store on any volume,
-   which means unbounded — a leaked snapshot may take the whole volume. With a cap,
-   Volsnap aborts the snapshot at 20 GB (the `Volsnap/24`/`35` pair still appears
-   in the log) and free space never craters. It costs CrashPlan a retried backup;
+   Before the fix D: was effectively unbounded, so a leaked snapshot could take the
+   whole volume. With a cap, Volsnap aborts the snapshot at the limit (the
+   `Volsnap/24`/`35` pair still appears in the log) and free space never craters. It costs CrashPlan a retried backup;
    its run was already being interrupted anyway. Setting `maxsize` to the 320 MB
    minimum effectively opts D: out of being snapshotted at all, at the cost of
    CrashPlan never capturing an open file on D:.
@@ -273,6 +272,19 @@ both need elevation, so none of them use it):
 | `tools\freespace_probe.py` | quota-aware vs total free bytes, straight from `GetDiskFreeSpaceExW` |
 | `tools\destinfo.py` | replays the per-set resolve-and-measure path (GUID → mount point → root → free) |
 | `tools\vss-limit.ps1` | reports diff-area associations, and (elevated) caps or relocates one via `Win32_ShadowStorage.Create` — the client-Windows substitute for `vssadmin add shadowstorage` |
+
+**Methodology warning, learned the hard way: `Win32_ShadowCopy` and
+`Win32_ShadowStorage` throw `Initialization failure` for a non-admin — they do not
+return an empty set.** Both scripts originally queried them with
+`-ErrorAction SilentlyContinue`, which rendered "you are not allowed to look" as a
+confident `(none)`. That is the exact inversion of the truth, and it is worse than
+no output at all in a script whose purpose is to report whether a diff area is
+capped. Two claims made during this investigation rested on it and were withdrawn:
+that no shadow copies existed after the abort, and that no volume had an allocated
+diff area. (The first conclusion survives anyway — but on the `Volsnap/35` event
+*"the shadow copies of volume D: were aborted"*, which is real evidence, not on the
+empty readout.) Both scripts now distinguish `CANNOT READ` from genuinely empty.
+Anything reading these classes must be run **elevated** to be believed.
 
 Note `lowdisk-events.ps1`'s provider filter is anchored and spells out
 `Microsoft-Windows-Backup` rather than matching a bare `Backup` — the Worker logs

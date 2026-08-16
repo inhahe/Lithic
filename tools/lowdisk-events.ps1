@@ -31,9 +31,19 @@ foreach ($log in 'System', 'Application') {
 # check worth running *before* the volume fills, not after.
 $STALE_HOURS = 2
 
+# Both VSS classes throw "Initialization failure" for a non-admin instead of
+# returning nothing, so a swallowed error would print a confident "(none)" that
+# means "you are not allowed to look". Distinguish the two.
+function Get-VssClass([string] $class) {
+    try { return @{ Ok = $true; Items = @(Get-CimInstance $class -ErrorAction Stop) } }
+    catch { return @{ Ok = $false; Error = $_.Exception.Message } }
+}
+
 '', '=== existing shadow copies ==='
-$copies = @(Get-CimInstance Win32_ShadowCopy -ErrorAction SilentlyContinue)
-if (-not $copies) { '  (none)' }
+$q = Get-VssClass 'Win32_ShadowCopy'
+if (-not $q.Ok) { "  CANNOT READ ($($q.Error)) -- run this script elevated" }
+elseif ($q.Items.Count -eq 0) { '  (none)' }
+$copies = if ($q.Ok) { $q.Items } else { @() }
 foreach ($c in ($copies | Sort-Object InstallDate)) {
     $age = (Get-Date) - $c.InstallDate
     $warn = if ($age.TotalHours -ge $STALE_HOURS) { '  <-- STALE, likely leaked' } else { '' }
@@ -42,8 +52,10 @@ foreach ($c in ($copies | Sort-Object InstallDate)) {
 }
 
 '', '=== shadow storage areas ==='
-$stores = @(Get-CimInstance Win32_ShadowStorage -ErrorAction SilentlyContinue)
-if (-not $stores) { '  (none -- no diff area allocated on any volume)' }
+$qs = Get-VssClass 'Win32_ShadowStorage'
+if (-not $qs.Ok) { "  CANNOT READ ($($qs.Error)) -- run this script elevated" }
+elseif ($qs.Items.Count -eq 0) { '  (none -- no diff area allocated on any volume)' }
+$stores = if ($qs.Ok) { $qs.Items } else { @() }
 foreach ($s in $stores) {
     # An unbounded max is what lets a leaked snapshot consume the entire volume;
     # capping it turns "the disk filled up" into "the snapshot got aborted".
