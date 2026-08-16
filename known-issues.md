@@ -67,12 +67,45 @@ The trap in both cases was a cold-start measurement — the first variant the
 harness ran took 1.2–11.9 s and every later one took a fraction of that, which is
 JIT and font loading, not the thing under test. Warm up, repeat, take the minimum.
 
+### Follow-up: the prune gate was itself an O(file size) read (fixed same day)
+
+Having stopped reading the whole table on the lookup path, the only place the
+538 MB still mattered was the prune check — `SELECT COUNT(*)` on every open.
+SQLite answers that with a **full covering-index scan** (`EXPLAIN QUERY PLAN`
+confirms `SCAN … USING COVERING INDEX sqlite_autoindex_DirectorySizeCache_1`),
+measured at **580 ms**: reading most of the file, once per launch, purely to
+discover there was nothing to prune. It ran on a background thread and blocked no
+lookup, but it competed for disk with the expansion happening at that moment.
+
+The gate is now **used bytes**, from `pragma_page_count` / `pragma_freelist_count`
+/ `pragma_page_size` — all header fields, so the common nothing-to-do case is
+free (measured at the process-startup floor, ~7 ms).
+
+Two traps worth recording:
+
+* **`max(rowid)` looks like a cheap row-count proxy and is not.** It is O(1) (a
+  `SEARCH` — the last b-tree entry), but `INSERT OR REPLACE` assigns a *fresh*
+  rowid on every rewrite, so this database reports max rowid **28,184,153**
+  against **1,494,073** live rows: 19× over, i.e. useless as a bound.
+* **The prune loop must measure used bytes, not file bytes.** `page_count` never
+  falls after a delete (freed pages go to the freelist), so a loop waiting for
+  the *file* to shrink would never terminate. Subtracting `freelist_count` is
+  what makes the loop's own measure actually move.
+
+For the record, after the fix the file's size costs essentially nothing at
+runtime: a point lookup is an index seek at **~62 µs**, measured over 20,000
+scattered random keys, so a 249-child expansion spends ~15 ms in the cache — and
+that seek is O(log n), so shrinking the table would change the b-tree depth by
+about one page.
+
 ### Remaining debt from this
 
 * **The 538 MB `sizecache.db` will not shrink**, even after pruning: SQLite reuses
   freed pages rather than returning them, and reclaiming them needs a `VACUUM`
   that rewrites the whole file under an exclusive lock. Not worth doing behind
   the user's back; if it ever matters, offer it as an explicit maintenance action.
+  This is disk-space debt only — per the measurements above, the size no longer
+  costs runtime.
 * **Cache keys are now compared with `Ordinal`, not `OrdinalIgnoreCase`** — the
   memo has to agree with the database's binary-collation primary key, or it would
   remember a miss under one casing and serve it under another. Every key comes

@@ -55,14 +55,31 @@ public sealed class DirectorySizeCache : IDisposable
     private const int HotLimit = 100_000;
 
     /// <summary>
-    /// Row count above which the oldest entries are pruned. Set well above a
-    /// plausible working set (~1.5M rows covers every directory on this machine)
-    /// so pruning only ever fires on genuinely pathological growth: an evicted
-    /// row costs a full recursive rescan of that directory, which is far more
-    /// expensive than the disk space it frees.
+    /// Size above which the oldest entries are pruned, measured in <em>used</em>
+    /// bytes. Set well above a plausible working set (every directory on this
+    /// machine is ~1.5M rows / ~510 MB) so pruning only ever fires on genuinely
+    /// pathological growth: an evicted row costs a full recursive rescan of that
+    /// directory, which is far more expensive than the disk space it frees.
+    ///
+    /// <para>This gate used to be a row count, which cost a
+    /// <c>SELECT COUNT(*)</c> on every open. That is a full covering-index scan
+    /// — measured at <b>580 ms</b> on the 538 MB database, i.e. reading most of
+    /// the file, once per launch, purely to discover there was nothing to do.
+    /// Bytes are what "pathological growth" actually means anyway, and
+    /// <c>page_count</c>/<c>freelist_count</c> are header fields, so the common
+    /// (nothing-to-prune) case is now free.</para>
+    ///
+    /// <para><c>max(rowid)</c> would also have been O(1), but is useless as a
+    /// proxy: <c>INSERT OR REPLACE</c> assigns a fresh rowid on every rewrite,
+    /// so this database's max rowid is 28.2M against 1.49M live rows.</para>
     /// </summary>
-    private const long MaxRows = 3_000_000;
-    private const long PruneTargetRows = 2_000_000;
+    private const long MaxUsedBytes = 1_073_741_824;      // 1 GiB
+
+    /// <summary>Prune down to this before stopping. The gap from
+    /// <see cref="MaxUsedBytes"/> keeps a pruning run from being re-triggered by
+    /// the next launch.</summary>
+    private const long PruneTargetBytes = 750_000_000;    // ~715 MiB
+
     private const int PruneChunkRows = 20_000;
 
     private readonly object _lock = new();
@@ -436,10 +453,12 @@ public sealed class DirectorySizeCache : IDisposable
     /// table's order) and a good proxy for staleness, because
     /// <c>INSERT OR REPLACE</c> gives every rewritten row a fresh rowid.</para>
     ///
-    /// <para>The file itself will not shrink — freed pages are reused by later
-    /// inserts instead. Reclaiming them needs a VACUUM, which rewrites the whole
-    /// database under an exclusive lock and is not worth doing behind the user's
-    /// back.</para>
+    /// <para>The file itself will not shrink — freed pages go on the freelist to
+    /// be reused by later inserts. Reclaiming them needs a VACUUM, which rewrites
+    /// the whole database under an exclusive lock and is not worth doing behind
+    /// the user's back. That is also why the loop below measures <em>used</em>
+    /// bytes rather than file bytes: <c>page_count</c> alone never falls after a
+    /// delete, so a loop waiting for it to drop would never terminate.</para>
     /// </summary>
     private void StartPruneIfNeeded()
     {
@@ -456,16 +475,12 @@ public sealed class DirectorySizeCache : IDisposable
                 conn.Open();
                 Exec(conn, "PRAGMA busy_timeout=30000");
 
-                using (var count = conn.CreateCommand())
-                {
-                    count.CommandText = "SELECT COUNT(*) FROM DirectorySizeCache";
-                    if (Convert.ToInt64(count.ExecuteScalar()) <= MaxRows)
-                        return;
-                }
+                if (UsedBytes(conn) <= MaxUsedBytes)
+                    return;
 
-                long remaining;
-                do
+                while (true)
                 {
+                    int deleted;
                     using (var del = conn.CreateCommand())
                     {
                         del.CommandText = $"""
@@ -473,20 +488,41 @@ public sealed class DirectorySizeCache : IDisposable
                                 SELECT rowid FROM DirectorySizeCache
                                 ORDER BY rowid LIMIT {PruneChunkRows})
                             """;
-                        del.ExecuteNonQuery();
+                        deleted = del.ExecuteNonQuery();
                     }
 
-                    using var recount = conn.CreateCommand();
-                    recount.CommandText = "SELECT COUNT(*) FROM DirectorySizeCache";
-                    remaining = Convert.ToInt64(recount.ExecuteScalar());
+                    // Nothing left to give: stop rather than spin. Can only happen
+                    // if the table empties while still over budget, which would
+                    // mean the size is not coming from this table at all.
+                    if (deleted == 0)
+                        break;
+
+                    if (UsedBytes(conn) <= PruneTargetBytes)
+                        break;
                 }
-                while (remaining > PruneTargetRows);
             }
             catch
             {
                 // Housekeeping only — an over-sized cache is still a correct one.
             }
         });
+    }
+
+    /// <summary>
+    /// Bytes the database is actually using, i.e. excluding pages already freed
+    /// and waiting on the freelist to be reused. All three pragmas read fields
+    /// out of the file header, so this costs no scan at any table size — the
+    /// point of using it as the prune gate.
+    /// </summary>
+    private static long UsedBytes(SqliteConnection conn)
+    {
+        using var cmd = conn.CreateCommand();
+        cmd.CommandText = """
+            SELECT ((SELECT * FROM pragma_page_count())
+                  - (SELECT * FROM pragma_freelist_count()))
+                 * (SELECT * FROM pragma_page_size())
+            """;
+        return Convert.ToInt64(cmd.ExecuteScalar());
     }
 
     private static void Exec(SqliteConnection conn, string sql)
