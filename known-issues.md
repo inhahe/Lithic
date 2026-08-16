@@ -112,6 +112,70 @@ about one page.
   from `DirectoryInfo`/`FileInfo.FullName`, so the filesystem supplies consistent
   casing; a stray case variant costs one recomputation, not a wrong answer.
 
+## OPEN (tech debt): `sizecache.db` is ~2× the size it needs to be, and a third of it caches backup *destinations* (2026-08-15)
+
+Follow-up audit of the 538 MB / 1,494,077-row `sizecache.db` after the perf fix
+above, asking whether the whole thing is earning its keep. It isn't, though not
+for the reason first guessed.
+
+**What the rows are for.** `ComputeDirectorySizeCached`
+(`SourceSelectionNodeViewModel.cs:1790`) walks an entire subtree, and writes a
+row for *every* directory it passes. Two distinct payoffs:
+* rows carrying `RecursiveSize` let `TryGetCachedRecursiveSize` display a total
+  with **no walk at all** (752,479 rows have one);
+* the deep rows make a *recompute* cheap — each directory's own
+  `LastWriteTimeUtc` is compared, and an unchanged one skips the file
+  enumeration, which is the expensive part. The traversal still happens; only
+  the per-file `Length` stats are avoided.
+
+So 1.5M rows is not "the user browsed 1.5M directories" — asking for the size of
+`D:\` **once** writes a row for every directory beneath it.
+
+**Findings, measured:**
+
+| | |
+|---|---|
+| Rows under `I:\lithicbackup` + `J:\backup4all` (backup **destinations**) | **518,642 (35%)** |
+| Random sample of 3,000 paths that **no longer exist on disk** | **24.7%** |
+| Rows that are strictly empty subtrees (`0/0` direct **and** `RecursiveSize=0`) | 77,985 (5%) |
+| Bytes per row | ~360 |
+
+1. **A third of the cache describes backup destinations.** Nothing needs a
+   per-directory size breakdown of the *inside* of a backup target. Worth
+   finding out how they get scanned (destination browsing UI? a status pass?)
+   and not caching subtree sizes for them.
+2. **A quarter of the rows are dead paths** — deleted projects, build dirs,
+   `photoprism.old`. Nothing ever removes a row for a path that vanished, so
+   they accumulate forever. The rowid-ordered prune added above is the only
+   eviction and it only fires on total size.
+3. **The schema stores every path twice.** `Path TEXT PRIMARY KEY` on a rowid
+   table means a table b-tree keyed by rowid *plus* `sqlite_autoindex_…` keyed by
+   Path — both holding the full path, which averages 106 chars (151 MB of raw
+   path text). Measured on 300,000 real rows copied into both shapes:
+
+   | schema | size | plan |
+   |---|---|---|
+   | `Path TEXT PRIMARY KEY` (today) | **108.0 MB** | `SEARCH … USING INDEX sqlite_autoindex_T_1` |
+   | same, `WITHOUT ROWID` | **71.0 MB** | `SEARCH … USING PRIMARY KEY` |
+
+   34% smaller, and marginally faster (2.21 s vs 2.58 s over 20,000 scattered
+   lookups) since the row lives *in* the index b-tree instead of behind a second
+   seek. Extrapolated to the full table: **538 MB → ~354 MB**.
+
+**Proper fix:** rebuild the table `WITHOUT ROWID` (a migration — copy, drop,
+rename, which is also a natural VACUUM), stop caching destination subtrees, and
+evict rows whose directory no longer exists. Note the prune added above orders by
+`rowid`, which a `WITHOUT ROWID` table does not have; it would need to order by
+something else, or the prune gate could become "drop rows whose path is gone"
+which is better targeted anyway.
+
+**Corrected along the way, to save the next person the same wrong turn:** 49% of
+rows have `DirectFileSize=0 AND DirectFileCount=0`, which looks like "half the
+cache is empty directories". It isn't — 660,611 of those have `RecursiveSize IS
+NULL`, meaning *no direct files but a possibly-populated subtree* (e.g.
+`D:\visual studio projects` itself). Those are legitimate structural rows. Only
+the 77,985 with an explicit `RecursiveSize=0` are genuinely empty.
+
 ## FIXED: "Destination drive full" warning fired on a transient dip and then sat on screen after the drive recovered (2026-08-15)
 
 **Symptom.** A modal appeared saying the continuous set **"test backup"** couldn't
