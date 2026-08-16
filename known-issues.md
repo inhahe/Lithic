@@ -70,6 +70,39 @@ high-churn volume, so the copy-on-write diff area ate the free space.**
 * CrashPlan's own `history.log.0` shows the run it belonged to started **16:31**
   and did not stop until **19:46** (`3h:14m:26s`, "Reason for stopping backup: The
   manifest requires validation"), with archive maintenance finishing at 19:46.
+
+**The snapshot was *leaked*, not merely long-lived — this is a CrashPlan bug, and
+it is reproducible.** CrashPlan normally cycles VSS every few minutes: `VSS open`
+→ `OPEN VSS` → `CLOSE VSS`. Its `service.log.0` shows the cycle breaking:
+
+```
+12:33:42  CLOSE VSS                                        <-- last close, ever
+12:34:42  VSS open TIMED OUT after 60000ms; abandoning JNA call
+12:34:56  [OpenWatchdog] OPEN VSS                          <-- opened anyway
+13:17:56  VSS open TIMED OUT after 60002ms; abandoning JNA call
+13:18:42  [OpenWatchdog] VSS shadow created, C/D/E/F/I/J
+13:18:42  [OpenWatchdog] OPEN VSS                          <-- nobody owns this
+```
+
+There is a race between CrashPlan's **60-second timeout** on the VSS open and the
+`OpenWatchdog` thread that completes that open regardless. The requesting thread
+gives up ("abandoning JNA call") and moves on, so nothing ever calls close — but
+the shadow copy exists. It then lives until Volsnap destroys it: **13:18:42 →
+19:03:20, 5h45m.** The tell is that opens exceed closes by exactly the timeout
+count, in every log file:
+
+```
+service.log.0    opens=2    closes=1    timeouts=2    leaked=1
+service.log.1    opens=7    closes=6    timeouts=7    leaked=1
+service.log.2    opens=1    closes=1    timeouts=1    leaked=0
+```
+
+**Why the open times out** is visible too: the snapshot set spans **six volumes**
+(C, D, E, F, I, J) and freezing/thawing that many — two of them USB (I: a 6 TB HDD,
+J: a 2 TB SSD) — takes longer than 60 s. Note I: and J: are *Lithic's own backup
+destinations*, so CrashPlan is also uploading Lithic's archives to the cloud.
+Dropping them from CrashPlan's selection shrinks the snapshot set, which is the one
+change that attacks the timeout that causes the leak.
 * While a snapshot is live, every block **overwritten** on the volume has its old
   contents copied into `D:\System Volume Information`.
 
@@ -130,13 +163,40 @@ later, with no deletions in between.
 "shadow" in the source hits only `BackupOrchestrator`'s disc-session *version*
 shadowing, which is unrelated. Lithic is a *victim* here (its destination happened
 to be on the squeezed volume) and, ironically, also a *contributor* to the churn
-that the snapshot had to preserve. The durable mitigation is outside Lithic: **bound the
-diff area** with `vssadmin resize shadowstorage /for=D: /on=D: /maxsize=…`
-(elevated). Note that *excluding* files from CrashPlan does **not** help — the diff
-area is a volume-level, block-level mechanism, so once a snapshot of D: exists,
-every overwrite anywhere on D: is preserved whether or not CrashPlan reads that
-file. Exclusions only save upload bandwidth. The lever that would actually work is
-stopping CrashPlan from holding a snapshot open for hours. The in-app
+that the snapshot had to preserve. The durable mitigation is outside Lithic, in
+priority order:
+
+1. **Cap the diff area** (elevated, one-off, and the only change that makes the
+   failure mode *benign* rather than less likely):
+   `vssadmin resize shadowstorage /for=D: /on=D: /maxsize=20GB`.
+   `Win32_ShadowStorage` currently reports **no** allocated store on any volume,
+   which means unbounded — a leaked snapshot may take the whole volume. With a cap,
+   Volsnap aborts the snapshot at 20 GB (the `Volsnap/24`/`35` pair still appears
+   in the log) and free space never craters. It costs CrashPlan a retried backup;
+   its run was already being interrupted anyway.
+2. **Shrink the snapshot set** so the open stops timing out and the leak stops
+   happening: drop **I:** and **J:** from CrashPlan's file selection. They are
+   Lithic's backup destinations, so CrashPlan is re-uploading Lithic's archives —
+   almost certainly unintended, and it is two USB volumes' worth of freeze/thaw in
+   the 60 s budget that the leak depends on overrunning.
+3. **Move the churn.** The CoW cost is dominated by `os-lane-*` build/QEMU
+   activity; hosting those worktrees on a volume nothing snapshots removes the
+   cause rather than the symptom.
+
+What does **not** work, for the record:
+
+* **Excluding files from CrashPlan.** The diff area is a volume-level, block-level
+  mechanism — once a snapshot of D: exists, every overwrite anywhere on D: is
+  preserved whether or not CrashPlan reads that file. Exclusions only save upload
+  bandwidth. (`messages.log` had been excluded since 08/13 and the outage happened
+  anyway.)
+* **Telling VSS to ignore certain files.** VSS has no concept of a file; it
+  preserves blocks. `HKLM\SYSTEM\CurrentControlSet\Control\BackupRestore\FilesNotToSnapshot`
+  exists but only asks *requesters* to delete listed paths from a snapshot after it
+  is created — it is honored by some requesters and not others, and it does not
+  reduce copy-on-write for the volume.
+
+The in-app
 mitigation is the debounce above, which is exactly the right shape for this failure
 mode — the outage is real but self-healing, and lasted ~2.5 min against a ~90 s
 debounce, which is close enough that a longer streak may be worth considering if it
@@ -147,7 +207,7 @@ both need elevation, so none of them use it):
 
 | Tool | Answers |
 |---|---|
-| `tools\lowdisk-events.ps1` | did a volume run out, and *who* requested the snapshot (Volsnap 24/35 + VSS 8231 + `Win32_ShadowCopy`/`Win32_ShadowStorage`) |
+| `tools\lowdisk-events.ps1` | did a volume run out, and *who* requested the snapshot (Volsnap 24/35 + VSS 8231 + `Win32_ShadowCopy`/`Win32_ShadowStorage`). Also flags shadow copies older than 2 h as leaked, an unbounded diff area, and CrashPlan's opens-minus-closes — run it *before* a volume fills, not after |
 | `tools\catalog_writes.py` | what was rewritten on a volume in a window, per Lithic's own catalog — survives the file being deleted afterwards, which an mtime walk does not. `--cow` splits appends from in-place rewrites, which is the difference between "Lithic re-copied it" and "a shadow copy paid for it" |
 | `tools\write_burst.py` | same question from the filesystem's mtimes, for volumes Lithic doesn't back up |
 | `tools\freespace_probe.py` | quota-aware vs total free bytes, straight from `GetDiskFreeSpaceExW` |

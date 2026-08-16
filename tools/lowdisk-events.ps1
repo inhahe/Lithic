@@ -24,16 +24,49 @@ foreach ($log in 'System', 'Application') {
     }
 }
 
+# A shadow copy is meant to be short-lived: a backup opens one, reads the frozen
+# volume, and releases it. One that is still around hours later is almost always
+# leaked, and it is silently eating the volume the whole time -- every block
+# overwritten while it lives has to be copied into the diff area. This is the
+# check worth running *before* the volume fills, not after.
+$STALE_HOURS = 2
+
 '', '=== existing shadow copies ==='
-Get-CimInstance Win32_ShadowCopy -ErrorAction SilentlyContinue |
-Sort-Object InstallDate |
-ForEach-Object { '{0}  {1}  {2}' -f $_.InstallDate, $_.VolumeName, $_.ID }
+$copies = @(Get-CimInstance Win32_ShadowCopy -ErrorAction SilentlyContinue)
+if (-not $copies) { '  (none)' }
+foreach ($c in ($copies | Sort-Object InstallDate)) {
+    $age = (Get-Date) - $c.InstallDate
+    $warn = if ($age.TotalHours -ge $STALE_HOURS) { '  <-- STALE, likely leaked' } else { '' }
+    '{0}  age {1,5:N1} h  {2}  {3}{4}' -f $c.InstallDate, $age.TotalHours,
+    $c.VolumeName, $c.ID, $warn
+}
 
 '', '=== shadow storage areas ==='
-Get-CimInstance Win32_ShadowStorage -ErrorAction SilentlyContinue |
-ForEach-Object {
+$stores = @(Get-CimInstance Win32_ShadowStorage -ErrorAction SilentlyContinue)
+if (-not $stores) { '  (none -- no diff area allocated on any volume)' }
+foreach ($s in $stores) {
+    # An unbounded max is what lets a leaked snapshot consume the entire volume;
+    # capping it turns "the disk filled up" into "the snapshot got aborted".
+    $max = if ($s.MaxSpace -ge [uint64]::MaxValue) { 'UNBOUNDED <-- cap this' }
+    else { '{0:N1} GB' -f ($s.MaxSpace / 1GB) }
     '{0}  used={1:N1} GB  allocated={2:N1} GB  max={3}' -f
-    $_.Volume.DeviceID, ($_.UsedSpace / 1GB), ($_.AllocatedSpace / 1GB),
-    $(if ($_.MaxSpace -ge [uint64]::MaxValue) { 'unbounded' } else { '{0:N1} GB' -f ($_.MaxSpace / 1GB) })
+    $s.Volume.DeviceID, ($s.UsedSpace / 1GB), ($s.AllocatedSpace / 1GB), $max
 }
+
+# CrashPlan leaks snapshots when its own 60 s open timeout races the watchdog
+# thread that completes the open: the requester gives up and never calls close,
+# but the shadow copy exists anyway. Opens minus closes is the leak count.
+'', '=== CrashPlan VSS open/close balance ==='
+$cpLog = 'C:\ProgramData\CrashPlan\log'
+if (Test-Path $cpLog) {
+    foreach ($f in Get-ChildItem "$cpLog\service.log.*" -ErrorAction SilentlyContinue) {
+        $text = Select-String -Path $f.FullName -Pattern 'OPEN VSS|CLOSE VSS|VSS open TIMED OUT' -ErrorAction SilentlyContinue
+        $opens = @($text | Where-Object { $_.Line -match 'OPEN VSS' }).Count
+        $closes = @($text | Where-Object { $_.Line -match 'CLOSE VSS' }).Count
+        $timeouts = @($text | Where-Object { $_.Line -match 'TIMED OUT' }).Count
+        '{0,-16} opens={1,-4} closes={2,-4} timeouts={3,-4} leaked={4}' -f
+        $f.Name, $opens, $closes, $timeouts, ($opens - $closes)
+    }
+}
+else { '  (CrashPlan not installed)' }
 '--- done ---'
