@@ -1,5 +1,84 @@
 # LithicBackup — Known Issues & Tech Debt
 
+## FIXED: expanding a drive in the source tree took ~6.6 s (2026-08-15)
+
+**Symptom.** Expanding `D:\` in a backup set's source-selection tree took several
+seconds before any row appeared, while `dir D:\` on the same directory is
+instantaneous. The tree already enumerated one level only, on a background
+thread, so the enumeration was not the suspect.
+
+**Measured, in this order** — the first two hypotheses were both wrong, and both
+would have led to rewriting XAML that was fine:
+
+| What | Time |
+|---|---|
+| Raw filesystem cost of `D:\` (249 dirs + 39 files: enumerate + attributes + length) | ~10 ms |
+| WPF layout of 249 rows in the real item template (`tools\treeview_bench`) | ~75 ms |
+| `SourceSelectionNodeViewModel` expansion of `D:\`, **"show sizes" off** (`tools\expand_probe`) | 39 ms |
+| Same expansion, **"show sizes" on** | **6,600 ms** |
+| `new DirectorySizeCache()` + one lookup, on its own | **5,908 ms** |
+
+**Cause: `DirectorySizeCache` read its entire SQLite table into a `Dictionary`
+before it would answer a single question.** The author's `sizecache.db` had grown
+to **1,493,915 rows / 538 MB**, and the load ran a `DateTime.Parse` per row. The
+previous version had already moved that load off the constructor onto a
+background task — but every lookup takes the same lock, so the first expansion
+after a set editor opened still waited for all of it. Moving a stall off the
+constructor and onto the first lookup does not remove it; the first lookup is
+precisely what the user is waiting for.
+
+`FileHashCache` had the identical shape and a worse placement: constructed
+**synchronously on the UI thread** in `App.OnStartup`, its 130 MB database cost
+**1.65 s** of dead time before the main window could appear.
+
+**Fix.** Both caches now do on-demand SQLite point lookups (`Path` / `FilePath`
+is the primary key, so each is an index seek) behind a bounded in-memory memo
+that records misses as well as hits, with the connection opened once on a
+background task and writes still batched. Nothing is read up front.
+
+| | before | after |
+|---|---|---|
+| expand `D:\`, show-sizes on | 6,600 ms | **~95 ms** |
+| directory sizes served from cache | 240 / 248 | 242 / 248 |
+| size-cache open | 6,432 ms | ~150 ms (off the lookup path) |
+| hash-cache load at startup | 1,654 ms | ~15 ms |
+
+Two smaller defects fixed alongside: the schema migration attempted six
+`ALTER TABLE ADD COLUMN`s on every open and swallowed six `SqliteException`s on
+an already-migrated database (~200 ms, and noise in any debugger) — it now asks
+`PRAGMA table_info` first; and the cache had **no eviction whatsoever**, so the
+file grew monotonically with every directory ever scanned. It is now pruned in
+background chunks by `rowid` (which `INSERT OR REPLACE` refreshes, making it a
+staleness proxy) above 3M rows.
+
+**Ruled out, for the record** — both were plausible enough that they were nearly
+"fixed" before anything was measured:
+
+* **The `TreeViewItem` template's root is a `StackPanel`** (`SourceSelectionView.xaml`),
+  which measures its child with infinite height and is the standard way to defeat
+  `VirtualizingStackPanel.IsVirtualizing`. It does not here: `tools\treeview_bench`
+  realizes **24** containers out of 249 with the StackPanel root, the same as with
+  the stock Grid root. WPF's hierarchical virtualization negotiates the viewport
+  through `TreeViewItem` itself, not through the template's panel.
+* **Four `SharedSizeGroup` columns per row inside one `Grid.IsSharedSizeScope`.**
+  Real but negligible: it costs ~5% of a 75 ms layout, not seconds.
+
+The trap in both cases was a cold-start measurement — the first variant the
+harness ran took 1.2–11.9 s and every later one took a fraction of that, which is
+JIT and font loading, not the thing under test. Warm up, repeat, take the minimum.
+
+### Remaining debt from this
+
+* **The 538 MB `sizecache.db` will not shrink**, even after pruning: SQLite reuses
+  freed pages rather than returning them, and reclaiming them needs a `VACUUM`
+  that rewrites the whole file under an exclusive lock. Not worth doing behind
+  the user's back; if it ever matters, offer it as an explicit maintenance action.
+* **Cache keys are now compared with `Ordinal`, not `OrdinalIgnoreCase`** — the
+  memo has to agree with the database's binary-collation primary key, or it would
+  remember a miss under one casing and serve it under another. Every key comes
+  from `DirectoryInfo`/`FileInfo.FullName`, so the filesystem supplies consistent
+  casing; a stray case variant costs one recomputation, not a wrong answer.
+
 ## FIXED: "Destination drive full" warning fired on a transient dip and then sat on screen after the drive recovered (2026-08-15)
 
 **Symptom.** A modal appeared saying the continuous set **"test backup"** couldn't

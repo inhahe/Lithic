@@ -21,17 +21,71 @@ namespace LithicBackup.ViewModels;
 /// filter is active; otherwise the filtered size is recomputed.</item>
 /// </list>
 ///
-/// Storage: in-memory <see cref="Dictionary{TKey,TValue}"/> loaded from a
-/// SQLite database at construction time. Dirty entries are flushed to disk
-/// periodically (every 500 writes) and on <see cref="Flush"/>.
+/// <para><b>Storage: on-demand SQLite point lookups behind a bounded in-memory
+/// cache.</b> This class used to read the whole table into a
+/// <see cref="Dictionary{TKey,TValue}"/> at construction. That is fine for a
+/// small cache and ruinous for a real one: the author's database had grown to
+/// 1,493,915 rows / 538 MB, which took <b>~6 seconds</b> to load (a
+/// <c>DateTime.Parse</c> per row) and held a few hundred MB of managed memory
+/// for the lifetime of the process. Worse, every lookup takes the same lock, so
+/// the first directory expansion after a backup-set editor opened blocked on the
+/// whole load — measured 6.6 s to expand <c>D:\</c> with "show sizes" on versus
+/// 39 ms with it off (tools\expand_probe). Loading lazily on a background thread,
+/// as the previous version did, moved the stall off the constructor but not off
+/// the first lookup, which is the one the user is actually waiting for.
+///
+/// <para>Now nothing is loaded up front. <c>Path</c> is the table's primary key,
+/// so a single-row lookup is an index seek costing microseconds; results (and
+/// misses) are memoised in <see cref="_hot"/> so a recursive scan pays the DB
+/// once per directory. Writes are buffered in <see cref="_dirty"/> and flushed
+/// in batches, exactly as before.</para>
 /// </summary>
 public sealed class DirectorySizeCache : IDisposable
 {
+    /// <summary>Flush pending writes once this many are buffered.</summary>
+    private const int DirtyFlushThreshold = 500;
+
+    /// <summary>
+    /// Cap on memoised rows. A full scan of a large volume touches hundreds of
+    /// thousands of directories, and an unbounded memo would recreate exactly the
+    /// footprint this class exists to avoid. On overflow the memo is dropped
+    /// wholesale (pending writes are kept — they live in <see cref="_dirty"/>);
+    /// the cost of being wrong is one extra index seek per re-read.
+    /// </summary>
+    private const int HotLimit = 100_000;
+
+    /// <summary>
+    /// Row count above which the oldest entries are pruned. Set well above a
+    /// plausible working set (~1.5M rows covers every directory on this machine)
+    /// so pruning only ever fires on genuinely pathological growth: an evicted
+    /// row costs a full recursive rescan of that directory, which is far more
+    /// expensive than the disk space it frees.
+    /// </summary>
+    private const long MaxRows = 3_000_000;
+    private const long PruneTargetRows = 2_000_000;
+    private const int PruneChunkRows = 20_000;
+
     private readonly object _lock = new();
-    private readonly Dictionary<string, CacheEntry> _cache;
-    private readonly HashSet<string> _dirtyPaths;
+
+    /// <summary>
+    /// Memo of rows read from (or written to) the database this session.
+    /// A null value is a remembered <em>miss</em>, which matters: a cold scan
+    /// asks about directories that have never been cached, and without negative
+    /// caching each of those would re-query SQLite on every pass.
+    /// </summary>
+    private readonly Dictionary<string, CacheEntry?> _hot;
+
+    /// <summary>Rows written but not yet persisted. Separate from <see cref="_hot"/>
+    /// so dropping the memo can never lose a write.</summary>
+    private readonly Dictionary<string, CacheEntry> _dirty;
+
     private readonly string _dbPath;
-    private bool _loaded;
+
+    private SqliteConnection? _conn;
+    private SqliteCommand? _selectCmd;
+    private SqliteParameter? _selectPath;
+    private bool _openFailed;
+    private bool _pruneStarted;
 
     public DirectorySizeCache()
     {
@@ -41,35 +95,27 @@ public sealed class DirectorySizeCache : IDisposable
         Directory.CreateDirectory(appDataDir);
         _dbPath = Path.Combine(appDataDir, "sizecache.db");
 
-        _cache = new Dictionary<string, CacheEntry>(StringComparer.OrdinalIgnoreCase);
-        _dirtyPaths = new HashSet<string>(StringComparer.OrdinalIgnoreCase);
+        // Ordinal, not OrdinalIgnoreCase, and deliberately so: the memo has to
+        // agree with the database, whose primary key uses SQLite's default
+        // (binary) collation. A case-insensitive memo in front of a
+        // case-sensitive table would remember a miss under one casing and serve
+        // it under another, turning a harmless recompute into a wrong answer
+        // that persists for the session. Every key here comes from
+        // DirectoryInfo.FullName, so the filesystem's own canonical casing keeps
+        // them consistent; a stray case variant costs one recomputation.
+        _hot = new Dictionary<string, CacheEntry?>(StringComparer.Ordinal);
+        _dirty = new Dictionary<string, CacheEntry>(StringComparer.Ordinal);
 
-        // Load the persisted cache lazily on a background thread.  A fresh
-        // cache is constructed on the UI thread every time a backup-set editor
-        // opens, and the on-disk DB can hold hundreds of thousands of rows —
-        // reading it synchronously here blocked the editor from appearing for
-        // several seconds.  All real cache operations run on background scan
-        // threads and self-trigger EnsureLoaded under the lock, so deferring
-        // the load costs nothing but removes the UI-thread stall.
+        // Opening the connection (schema check, WAL setup, statement prepare)
+        // costs ~150 ms on a large database. That is small enough to absorb on a
+        // lookup, but there is no reason to make the user's first expansion the
+        // one that pays it: a fresh cache is constructed when a backup-set editor
+        // opens, seconds before anything is expanded.
         _ = Task.Run(() =>
         {
             lock (_lock)
-                EnsureLoaded();
+                EnsureOpen();
         });
-    }
-
-    /// <summary>
-    /// Ensure the on-disk cache has been read into memory.  The caller MUST
-    /// hold <see cref="_lock"/>.  Runs the (potentially slow) SQLite load
-    /// exactly once; every cache read/write funnels through here first so a
-    /// caller that races the background preload just performs the load itself.
-    /// </summary>
-    private void EnsureLoaded()
-    {
-        if (_loaded)
-            return;
-        _loaded = true;
-        LoadFromDisk();
     }
 
     /// <summary>
@@ -80,8 +126,7 @@ public sealed class DirectorySizeCache : IDisposable
     {
         lock (_lock)
         {
-            EnsureLoaded();
-            if (_cache.TryGetValue(path, out var entry))
+            if (Read(path) is { } entry)
                 return (entry.DirectFileSize, entry.DirectFileCount, entry.DirLastWriteUtc);
         }
         return null;
@@ -96,8 +141,7 @@ public sealed class DirectorySizeCache : IDisposable
     {
         lock (_lock)
         {
-            EnsureLoaded();
-            if (_cache.TryGetValue(path, out var entry) && entry.RecursiveSize >= 0)
+            if (Read(path) is { RecursiveSize: >= 0 } entry)
                 return (entry.RecursiveSize, entry.RecursiveFileCount);
         }
         return null;
@@ -113,9 +157,7 @@ public sealed class DirectorySizeCache : IDisposable
     {
         lock (_lock)
         {
-            EnsureLoaded();
-            if (_cache.TryGetValue(path, out var entry)
-                && entry.FilteredRecursiveSize >= 0
+            if (Read(path) is { FilteredRecursiveSize: >= 0 } entry
                 && entry.FilteredFilterSignature == filterSignature)
             {
                 return (entry.FilteredRecursiveSize, entry.FilteredRecursiveFileCount);
@@ -132,27 +174,17 @@ public sealed class DirectorySizeCache : IDisposable
     {
         lock (_lock)
         {
-            EnsureLoaded();
-            if (_cache.TryGetValue(path, out var existing))
-            {
-                // Preserve existing recursive totals when only updating direct sizes.
-                _cache[path] = existing with
+            // Preserve existing recursive totals when only updating direct sizes.
+            var existing = Read(path);
+            Write(path, existing is null
+                ? new CacheEntry(directFileSize, directFileCount, dirLastWriteUtc,
+                                 -1, -1, -1, -1, null)
+                : existing with
                 {
                     DirectFileSize = directFileSize,
                     DirectFileCount = directFileCount,
                     DirLastWriteUtc = dirLastWriteUtc,
-                };
-            }
-            else
-            {
-                _cache[path] = new CacheEntry(
-                    directFileSize, directFileCount, dirLastWriteUtc,
-                    -1, -1, -1, -1, null);
-            }
-            _dirtyPaths.Add(path);
-
-            if (_dirtyPaths.Count >= 500)
-                FlushInternal();
+                });
         }
     }
 
@@ -164,19 +196,19 @@ public sealed class DirectorySizeCache : IDisposable
     {
         lock (_lock)
         {
-            EnsureLoaded();
-            if (_cache.TryGetValue(path, out var existing))
-            {
-                _cache[path] = existing with
-                {
-                    RecursiveSize = recursiveSize,
-                    RecursiveFileCount = recursiveFileCount,
-                };
-                _dirtyPaths.Add(path);
+            // No direct-size row yet means nothing has established this
+            // directory's validity timestamp, and a recursive total with no
+            // timestamp to check it against can never be served
+            // (TryGetCachedRecursiveSize requires both). Dropping it matches the
+            // previous behaviour.
+            if (Read(path) is not { } existing)
+                return;
 
-                if (_dirtyPaths.Count >= 500)
-                    FlushInternal();
-            }
+            Write(path, existing with
+            {
+                RecursiveSize = recursiveSize,
+                RecursiveFileCount = recursiveFileCount,
+            });
         }
     }
 
@@ -191,27 +223,16 @@ public sealed class DirectorySizeCache : IDisposable
     {
         lock (_lock)
         {
-            EnsureLoaded();
-            if (_cache.TryGetValue(path, out var existing))
-            {
-                _cache[path] = existing with
+            var existing = Read(path);
+            Write(path, existing is null
+                ? new CacheEntry(0, 0, DateTime.MinValue, -1, -1,
+                                 filteredSize, filteredFileCount, filterSignature)
+                : existing with
                 {
                     FilteredRecursiveSize = filteredSize,
                     FilteredRecursiveFileCount = filteredFileCount,
                     FilteredFilterSignature = filterSignature,
-                };
-            }
-            else
-            {
-                _cache[path] = new CacheEntry(
-                    0, 0, DateTime.MinValue,
-                    -1, -1,
-                    filteredSize, filteredFileCount, filterSignature);
-            }
-            _dirtyPaths.Add(path);
-
-            if (_dirtyPaths.Count >= 500)
-                FlushInternal();
+                });
         }
     }
 
@@ -222,76 +243,143 @@ public sealed class DirectorySizeCache : IDisposable
             FlushInternal();
     }
 
-    public void Dispose() => Flush();
+    public void Dispose()
+    {
+        lock (_lock)
+        {
+            FlushInternal();
+            _selectCmd?.Dispose();
+            _selectCmd = null;
+            _conn?.Dispose();
+            _conn = null;
+        }
+    }
 
     // -----------------------------------------------------------------
 
-    private void LoadFromDisk()
+    /// <summary>Read one row, memoising both hits and misses. Caller holds the lock.</summary>
+    private CacheEntry? Read(string path)
     {
-        if (!File.Exists(_dbPath))
-            return;
+        if (_hot.TryGetValue(path, out var memo))
+            return memo;
+
+        CacheEntry? entry = null;
+        var conn = EnsureOpen();
+        if (conn is not null)
+        {
+            try
+            {
+                _selectPath!.Value = path;
+                using var reader = _selectCmd!.ExecuteReader();
+                if (reader.Read())
+                    entry = ReadEntry(reader);
+            }
+            catch
+            {
+                // A cache is never worth failing a backup over: treat any read
+                // error as a miss and let the value be recomputed.
+            }
+        }
+
+        // Dropped wholesale rather than evicted one-by-one: there is no
+        // recency information to evict by, and rebuilding a memo entry is a
+        // single index seek.
+        if (_hot.Count >= HotLimit)
+            _hot.Clear();
+
+        _hot[path] = entry;
+        return entry;
+    }
+
+    /// <summary>Record a row in the memo and queue it for persistence. Caller holds the lock.</summary>
+    private void Write(string path, CacheEntry entry)
+    {
+        _hot[path] = entry;
+        _dirty[path] = entry;
+
+        if (_dirty.Count >= DirtyFlushThreshold)
+            FlushInternal();
+    }
+
+    private static CacheEntry ReadEntry(SqliteDataReader reader)
+    {
+        var lastWrite = DateTime.Parse(
+            reader.GetString(2), null,
+            System.Globalization.DateTimeStyles.RoundtripKind);
+        return new CacheEntry(
+            reader.GetInt64(0),
+            reader.GetInt32(1),
+            lastWrite,
+            reader.IsDBNull(3) ? -1L : reader.GetInt64(3),
+            reader.IsDBNull(4) ? -1 : reader.GetInt32(4),
+            reader.IsDBNull(5) ? -1L : reader.GetInt64(5),
+            reader.IsDBNull(6) ? -1 : reader.GetInt32(6),
+            reader.IsDBNull(7) ? null : reader.GetString(7));
+    }
+
+    /// <summary>
+    /// Open the database (once) and prepare the point-lookup statement.
+    /// Returns <c>null</c> if the database cannot be opened, in which case the
+    /// cache degrades to a session-only memo rather than throwing.
+    /// Caller holds the lock.
+    /// </summary>
+    private SqliteConnection? EnsureOpen()
+    {
+        if (_conn is not null || _openFailed)
+            return _conn;
 
         try
         {
-            using var conn = Open();
+            var conn = new SqliteConnection($"Data Source={_dbPath}");
+            conn.Open();
+            // WAL so the background prune's deletes and this connection's
+            // flushes don't lock each other out; NORMAL because a lost cache
+            // entry after a crash costs a recompute, nothing more.
+            Exec(conn, "PRAGMA journal_mode=WAL");
+            Exec(conn, "PRAGMA synchronous=NORMAL");
+            Exec(conn, "PRAGMA busy_timeout=30000");
             EnsureTable(conn);
 
-            using var cmd = conn.CreateCommand();
-            cmd.CommandText = """
-                SELECT Path, DirectFileSize, DirectFileCount, DirLastWriteUtc,
+            var select = conn.CreateCommand();
+            select.CommandText = """
+                SELECT DirectFileSize, DirectFileCount, DirLastWriteUtc,
                        RecursiveSize, RecursiveFileCount,
                        FilteredRecursiveSize, FilteredRecursiveFileCount,
                        FilteredFilterSignature
-                FROM DirectorySizeCache
+                FROM DirectorySizeCache WHERE Path = $path
                 """;
+            _selectPath = select.Parameters.Add("$path", SqliteType.Text);
+            select.Prepare();
 
-            using var reader = cmd.ExecuteReader();
-            while (reader.Read())
-            {
-                var path = reader.GetString(0);
-                var size = reader.GetInt64(1);
-                var count = reader.GetInt32(2);
-                var lastWrite = DateTime.Parse(
-                    reader.GetString(3), null,
-                    System.Globalization.DateTimeStyles.RoundtripKind);
-                var recSize = reader.IsDBNull(4) ? -1L : reader.GetInt64(4);
-                var recCount = reader.IsDBNull(5) ? -1 : reader.GetInt32(5);
-                var filtSize = reader.IsDBNull(6) ? -1L : reader.GetInt64(6);
-                var filtCount = reader.IsDBNull(7) ? -1 : reader.GetInt32(7);
-                var filtSig = reader.IsDBNull(8) ? null : reader.GetString(8);
-                _cache[path] = new CacheEntry(
-                    size, count, lastWrite,
-                    recSize, recCount,
-                    filtSize, filtCount, filtSig);
-            }
+            _conn = conn;
+            _selectCmd = select;
+            StartPruneIfNeeded();
         }
         catch
         {
-            // Cache is non-critical — if load fails, start fresh.
-            _cache.Clear();
+            _openFailed = true;
         }
+
+        return _conn;
     }
 
     private void FlushInternal()
     {
-        if (_dirtyPaths.Count == 0)
+        if (_dirty.Count == 0)
             return;
 
-        var toSave = new List<(string Path, CacheEntry Entry)>();
-        foreach (var path in _dirtyPaths)
-        {
-            if (_cache.TryGetValue(path, out var entry))
-                toSave.Add((path, entry));
-        }
-        _dirtyPaths.Clear();
+        var toSave = new List<KeyValuePair<string, CacheEntry>>(_dirty);
+        _dirty.Clear();
+
+        var conn = EnsureOpen();
+        if (conn is null)
+            return;
 
         try
         {
-            using var conn = Open();
-            EnsureTable(conn);
-
             using var tx = conn.BeginTransaction();
             using var cmd = conn.CreateCommand();
+            cmd.Transaction = tx;
             cmd.CommandText = """
                 INSERT OR REPLACE INTO DirectorySizeCache
                     (Path, DirectFileSize, DirectFileCount, DirLastWriteUtc,
@@ -336,11 +424,76 @@ public sealed class DirectorySizeCache : IDisposable
         }
     }
 
-    private SqliteConnection Open()
+    /// <summary>
+    /// Bound the database's growth. Nothing ever deleted rows before, so the
+    /// file grew monotonically with every directory ever scanned.
+    ///
+    /// <para>Runs on its own connection, on a background thread, holding no lock:
+    /// counting and deleting from a multi-million-row table takes seconds, and
+    /// doing it under <see cref="_lock"/> would resurrect exactly the stall this
+    /// class was rewritten to remove. Deletion is chunked and ordered by
+    /// <c>rowid</c>, which is both the cheapest possible scan (rowid *is* the
+    /// table's order) and a good proxy for staleness, because
+    /// <c>INSERT OR REPLACE</c> gives every rewritten row a fresh rowid.</para>
+    ///
+    /// <para>The file itself will not shrink — freed pages are reused by later
+    /// inserts instead. Reclaiming them needs a VACUUM, which rewrites the whole
+    /// database under an exclusive lock and is not worth doing behind the user's
+    /// back.</para>
+    /// </summary>
+    private void StartPruneIfNeeded()
     {
-        var conn = new SqliteConnection($"Data Source={_dbPath}");
-        conn.Open();
-        return conn;
+        if (_pruneStarted)
+            return;
+        _pruneStarted = true;
+
+        var dbPath = _dbPath;
+        _ = Task.Run(() =>
+        {
+            try
+            {
+                using var conn = new SqliteConnection($"Data Source={dbPath}");
+                conn.Open();
+                Exec(conn, "PRAGMA busy_timeout=30000");
+
+                using (var count = conn.CreateCommand())
+                {
+                    count.CommandText = "SELECT COUNT(*) FROM DirectorySizeCache";
+                    if (Convert.ToInt64(count.ExecuteScalar()) <= MaxRows)
+                        return;
+                }
+
+                long remaining;
+                do
+                {
+                    using (var del = conn.CreateCommand())
+                    {
+                        del.CommandText = $"""
+                            DELETE FROM DirectorySizeCache WHERE rowid IN (
+                                SELECT rowid FROM DirectorySizeCache
+                                ORDER BY rowid LIMIT {PruneChunkRows})
+                            """;
+                        del.ExecuteNonQuery();
+                    }
+
+                    using var recount = conn.CreateCommand();
+                    recount.CommandText = "SELECT COUNT(*) FROM DirectorySizeCache";
+                    remaining = Convert.ToInt64(recount.ExecuteScalar());
+                }
+                while (remaining > PruneTargetRows);
+            }
+            catch
+            {
+                // Housekeeping only — an over-sized cache is still a correct one.
+            }
+        });
+    }
+
+    private static void Exec(SqliteConnection conn, string sql)
+    {
+        using var cmd = conn.CreateCommand();
+        cmd.CommandText = sql;
+        cmd.ExecuteNonQuery();
     }
 
     private static void EnsureTable(SqliteConnection conn)
@@ -361,27 +514,37 @@ public sealed class DirectorySizeCache : IDisposable
             """;
         cmd.ExecuteNonQuery();
 
-        // Migrate existing databases that lack newer columns.
-        TryAddColumn(conn, "DirectFileCount", "INTEGER NOT NULL DEFAULT 0");
-        TryAddColumn(conn, "RecursiveSize", "INTEGER");
-        TryAddColumn(conn, "RecursiveFileCount", "INTEGER");
-        TryAddColumn(conn, "FilteredRecursiveSize", "INTEGER");
-        TryAddColumn(conn, "FilteredRecursiveFileCount", "INTEGER");
-        TryAddColumn(conn, "FilteredFilterSignature", "TEXT");
+        // Migrate existing databases that lack newer columns.  Ask which columns
+        // exist rather than attempting each ALTER and swallowing the failure:
+        // on an already-migrated database that threw six SqliteExceptions on
+        // every open, which is both slow and indistinguishable in a debugger
+        // from a real schema problem.
+        var existing = new HashSet<string>(StringComparer.OrdinalIgnoreCase);
+        using (var info = conn.CreateCommand())
+        {
+            info.CommandText = "PRAGMA table_info(DirectorySizeCache)";
+            using var reader = info.ExecuteReader();
+            while (reader.Read())
+                existing.Add(reader.GetString(1));
+        }
+
+        AddColumnIfMissing(conn, existing, "DirectFileCount", "INTEGER NOT NULL DEFAULT 0");
+        AddColumnIfMissing(conn, existing, "RecursiveSize", "INTEGER");
+        AddColumnIfMissing(conn, existing, "RecursiveFileCount", "INTEGER");
+        AddColumnIfMissing(conn, existing, "FilteredRecursiveSize", "INTEGER");
+        AddColumnIfMissing(conn, existing, "FilteredRecursiveFileCount", "INTEGER");
+        AddColumnIfMissing(conn, existing, "FilteredFilterSignature", "TEXT");
     }
 
-    private static void TryAddColumn(SqliteConnection conn, string column, string type)
+    private static void AddColumnIfMissing(
+        SqliteConnection conn, HashSet<string> existing, string column, string type)
     {
-        try
-        {
-            using var alter = conn.CreateCommand();
-            alter.CommandText = $"ALTER TABLE DirectorySizeCache ADD COLUMN {column} {type}";
-            alter.ExecuteNonQuery();
-        }
-        catch
-        {
-            // Column already exists — ignore.
-        }
+        if (existing.Contains(column))
+            return;
+
+        using var alter = conn.CreateCommand();
+        alter.CommandText = $"ALTER TABLE DirectorySizeCache ADD COLUMN {column} {type}";
+        alter.ExecuteNonQuery();
     }
 
     private sealed record CacheEntry(
