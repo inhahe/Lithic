@@ -69,6 +69,28 @@ every catalogued file against them:
   the fix.
 * **Probed 16-way concurrently**, because this is latency, not work.
 
+**Scale of what was invisible.** Replaying the fixed algorithm over the whole J:
+set (all 1,422,824 active rows, 139,470 directories), in C# so the probe really
+is 16-way concurrent:
+
+| | files | size |
+|---|---|---|
+| what the OLD directory-only test finds | 53 | 0.00 GB |
+| what the NEW file-level test finds | **79,364** | **171.90 GB** |
+| ...of which still physically on the destination | 79,364 | 171.90 GB |
+
+Every single one was still on the drive, because an active catalog row is what
+makes the destination scan skip a file. The largest stranded trees were
+`D:\visual studio projects\forward raytracer` (18.26 GB), `D:\visual studio
+projects\os` (7.26 GB in 55,483 files), and a long tail of individual multi-GB
+ISOs under `D:\new_save` — all cases of files removed from a directory that is
+still there. The probe took **379.8 s** (367 dirs/s), against an extrapolated
+8,930 s if it had been serial.
+
+These are backups of *deleted sources*, which the product keeps on purpose until
+Cleanup is run — the defect was never that they existed, but that no category
+would name them, so the user could not act on them either way.
+
 **Cost, measured over 3,000 real directories of this set:**
 
 | step | per directory | extrapolated to 139,470, serial |
