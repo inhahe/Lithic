@@ -1,5 +1,65 @@
 # LithicBackup — Known Issues & Tech Debt
 
+## FIXED: cleaning one missing file tombstoned its whole directory subtree (2026-09-05)
+
+**Introduced and found the same day, by the fix immediately below it.** Teaching
+"Deleted from Disk" to report individual missing files made the purge's catalog
+write wrong, because that write had always been by DIRECTORY:
+
+```csharp
+// SqliteSetDatabase.MarkFilesDeletedByDirectoryAsync
+UPDATE Files SET IsDeleted = 1
+WHERE IsDeleted = 0
+  AND SourcePath LIKE $prefix ESCAPE '\'      // 'dir\%'  -- the whole subtree
+```
+
+That was correct while a `DeletedFromDisk` item could only ever mean *the entire
+directory is gone* — everything beneath it was gone too, so marking the subtree
+marked exactly the right rows. The new per-file detection made an item possible
+for a directory that **still exists**, holding a mixture of files that are gone
+and files that are not. The purge then condemned every catalogued file beneath
+it. One missing file under a high-level directory took out everything below.
+
+**Measured on the real J: set:** 79,364 genuinely-missing files became
+**1,203,628** tombstoned rows. Active rows fell 1,422,824 -> 219,196.
+
+The physical deletion was NOT affected — it uses each item's `DiscFilePaths`,
+i.e. exactly the files the item listed — so only the ~182 GB it was right about
+left the drive, and ~965 GiB of live backups were left in place with their
+catalog rows tombstoned. That asymmetry is the whole signature of the bug: a
+purge that marks far more than it deletes.
+
+**Fix.** Every category now carries the explicit source paths it is offering
+(`MatchingSourcePaths`, previously populated only for the exclusion categories),
+and the purge routes on the presence of that list rather than on the category:
+
+```csharp
+else if (wi.MatchingSourcePaths is not null)
+    MarkFilesDeletedBySourcePathsAsync(backupSetId, wi.MatchingSourcePaths);
+else
+    MarkFilesDeletedByDirectoryAsync(backupSetId, wi.DirectoryPath);  // fallback
+```
+
+`MarkFilesDeletedBySourcePathsAsync` is one indexed UPDATE per path
+(`IX_Files_Active_SourcePath_NoCase` matches its `= $path COLLATE NOCASE`), so
+the cost is proportional to what was actually selected. The directory version
+survives only as a fallback nothing should reach, now carrying a comment saying
+why it is dangerous.
+
+**The rule this violated: a purge must write exactly what it displayed.** The UI
+listed the files; the catalog write used a path prefix. Any time those two can
+disagree, they eventually will.
+
+**Recovery** for a catalog already damaged by this is not automatic. The pre-purge
+state is not recoverable from the database (the purge had already been
+checkpointed into the main file, so opening it without its `-wal` shows the
+damaged state too). What makes repair possible is the same asymmetry above: the
+content of a wrongly-tombstoned row is still on the destination, because the
+purge only deleted the files it listed. Before the purge the set held one active
+row per destination file (1,422,824 active rows against 1,423,344 files), so the
+repair is to restore that 1:1 mapping — one active row per surviving destination
+file, preferring a row whose source path still exists.
+
 ## FIXED: a file moved out of a folder that still exists was invisible to every cleanup category (2026-09-05)
 
 **Symptom.** Most of `D:\youtube` was moved to `C:\youtube`, leaving one
