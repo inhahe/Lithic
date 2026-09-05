@@ -1,5 +1,77 @@
 # LithicBackup — Known Issues & Tech Debt
 
+## FIXED: a file renamed into an excluded directory stayed backed up (2026-09-05)
+
+**Symptom.** Cleanup ▸ "Matches Exclusion Filter" listed three files that the
+set's own rules say are not backed up at all:
+
+    D:\visual studio projects\os\build\session-tools\session-extract.py
+    D:\visual studio projects\os\build\session-tools\session-repair.py
+    D:\visual studio projects\os\target\dvscratch\dup-case-backup.sh
+
+The first two match `**/build/**` in `ExcludedExtensions`; the third matches
+`d:\visual studio projects\**\target*\*` in the zero-tier "None" tier set. So the
+backup engine and the Cleanup scan disagreed about the same three paths.
+
+**The reported theory was that retention overrode exclusion on the way in.** It
+does not — both ends call the same `DirectoryBackupService.BuildExclusionFilter`,
+and running it against the set's real saved `JobOptions` returns *excluded* for
+all three paths. The disagreement was real, but it was not about precedence.
+
+**Measured, before touching anything:**
+
+| Question | Answer |
+|---|---|
+| Do the current rules exclude these paths? | Yes — all three, via the real filter |
+| Were the rules different when the files were backed up? | **No.** A `catalog.db` snapshot from 2026-07-12 — three weeks before the earliest of the three — already contains `**/build/**` and `target*\*`, character for character |
+| How did they get in, then? | The worker log has them written by ordinary continuous backup **at a different path**, followed hours later by `relocated 37 moved item(s) in place` |
+| Is it widespread? | No — 3 files out of a 52,928-file set. Moves *into* an excluded directory are rare, which is why it took months to notice |
+
+**Cause: the rename fast path never consulted the exclusion filter.** When the
+USN journal reports a move, `BackupWorker.RunMovesAsync` classifies the two
+endpoints with `PathBelongsToSet` and, if both are in the set, calls
+`MoveTargetedAsync` to rename the destination copy in place and repoint the
+catalog rows — a pure metadata operation. Nothing on that path applies the
+exclusion rules:
+
+* `PathBelongsToSet` answers a *different* question — is the path inside the
+  **selection tree** — and knows nothing about exclusion globs or tier sets;
+* `ExecuteTargetedAsync`'s per-candidate filter is never reached, because a
+  relocation copies no bytes and so never goes near the copy path.
+
+So a file that was legitimately backed up at an included path and then *moved*
+into an excluded one kept its backup and its catalog row, now pointing at a path
+the set excludes. Creating the same file at the same path would have been
+refused; moving it there was not. The Cleanup scan, which re-applies the filter
+to every catalogued path, then reported the contradiction with no clue as to how
+it arose.
+
+**Fix.** `MoveTargetedAsync` now builds the job's exclusion filter and tests
+every record's *landing* path (`RemapPathPrefix`-ed for a directory move, the new
+path for a file). If any is excluded it returns the new
+`TargetedMoveOutcome.ExcludedAtDestination`, and the worker releases the item
+exactly as for a move out of the selection: tombstone the old record, and
+re-enqueue the new path so that a directory move whose files are only *partly*
+excluded still copies the rest — the copy path re-applies the same filter per
+file. Any single excluded landing path releases the whole move rather than
+splitting one atomic catalog transaction in two.
+
+**Verified** against the real saved config and the real move, through the built
+assemblies (`RemapPathPrefix` reached by reflection):
+
+    directory move into build\  -> lands on ...\build\session-tools\session-repair.py  excluded     -> released
+    file move into target\      -> lands on ...\target\dvscratch\dup-case-backup.sh    excluded     -> released
+    ordinary rename main.rs -> kernel.rs                                               not excluded -> relocated
+
+**The three catalogued files above are pre-existing residue** — the fix stops new
+ones appearing but does not retroactively remove them. Purge them with Cleanup
+▸ Matches Exclusion Filter ▸ Clean Selected.
+
+**Watch for the general shape:** any future code that makes a path tracked by
+rewriting a `SourcePath` rather than copying bytes will bypass the filter the
+same way, and the omission is invisible until a Cleanup scan contradicts the
+backup. The invariant is written down in `design.md`.
+
 ## FIXED: expanding a drive in the source tree took ~6.6 s (2026-08-15)
 
 **Symptom.** Expanding `D:\` in a backup set's source-selection tree took several

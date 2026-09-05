@@ -17,6 +17,17 @@ public enum TargetedMoveOutcome
     Relocated,
 
     /// <summary>
+    /// The old path was tracked, but the move lands it on a path the set
+    /// EXCLUDES (a user glob, a zero-tier tier set, or a hard exclusion such as
+    /// the app's own data directory).  Relocating would keep a backup of a file
+    /// the set says it does not back up, so the item is released instead: the
+    /// caller should reconcile the vacated old path exactly as for a move out of
+    /// the selection, and re-offer the new path for backup so that any siblings
+    /// that are NOT excluded are still copied.
+    /// </summary>
+    ExcludedAtDestination,
+
+    /// <summary>
     /// The old path had nothing tracked in the catalog, so there was no destination
     /// copy to relocate — the new path is simply a fresh source (the common
     /// atomic-save pattern: write <c>foo.tmp</c>, rename it over <c>foo</c>). The
@@ -1813,7 +1824,9 @@ public class DirectoryBackupService
     /// moved and the catalog updated; <see cref="TargetedMoveOutcome.NothingToRelocate"/>
     /// when the old path was never tracked (no destination copy exists — back up the
     /// new path as a fresh source, nothing to reconcile);
-    /// <see cref="TargetedMoveOutcome.FellBack"/> when a tracked item could not be
+    /// <see cref="TargetedMoveOutcome.ExcludedAtDestination"/> when the move lands the
+    /// item on a path the set excludes, so its backup is released rather than carried
+    /// along; <see cref="TargetedMoveOutcome.FellBack"/> when a tracked item could not be
     /// relocated safely and the caller should back up the new path as fresh files and
     /// reconcile the vacated old path.
     /// </returns>
@@ -1843,6 +1856,42 @@ public class DirectoryBackupService
         {
             trace?.Invoke("no records under old path -> NothingToRelocate (old name was never backed up).");
             return TargetedMoveOutcome.NothingToRelocate;
+        }
+
+        // A rename can carry a tracked file INTO a path the set excludes — move
+        // foo.py into a build\ directory, or rename src\ to debug\ — and the
+        // exclusion rules must apply to it exactly as they would to a file
+        // created there. Nothing else on the rename fast path consults them: the
+        // worker's endpoint test (PathBelongsToSet) only asks whether the path is
+        // inside the SELECTION, and the copy path's filter (see
+        // ExecuteTargetedAsync) is never reached because a relocation copies
+        // nothing. Without this check the destination copy is renamed into place
+        // and the catalog row repointed at the excluded path, leaving a file
+        // backed up that the set says it does not back up — which then surfaces
+        // in Cleanup under "Matches Exclusion Filter" with no explanation of how
+        // it got there. See the exclusion-vs-rename entry in known-issues.md.
+        //
+        // ANY excluded landing path releases the whole move, not just the
+        // excluded records: falling back re-offers every file individually to the
+        // copy path, where the same filter drops exactly the excluded ones and
+        // keeps the rest. Relocating the remainder and releasing only some would
+        // have to split one atomic catalog transaction into two.
+        var isExcluded = BuildExclusionFilter(job);
+        if (isExcluded is not null)
+        {
+            string? excludedLanding = records
+                .Select(r => isDirectory
+                    ? RemapPathPrefix(r.SourcePath, oldPath, newPath)
+                    : newPath)
+                .FirstOrDefault(isExcluded);
+
+            if (excludedLanding is not null)
+            {
+                trace?.Invoke(
+                    $"new path '{excludedLanding}' matches the set's exclusion rules -> " +
+                    "ExcludedAtDestination (releasing the backup instead of relocating it).");
+                return TargetedMoveOutcome.ExcludedAtDestination;
+            }
         }
 
         // Directory backups only ever produce plain / .dedup / .fileref records

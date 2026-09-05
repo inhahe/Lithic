@@ -164,6 +164,38 @@ every directory beneath it. Two separate payoffs, worth keeping straight:
 directory's *own* mtime, which does not change when a file deep inside a
 descendant grows. Totals can therefore lag until the scheduler recomputes.
 
+## Exclusion rules are an invariant of the catalog, not a step in one code path
+
+A file is excluded from a set by any of: a user glob in `ExcludedExtensions`, a
+tier set with **zero** tiers, or a hard exclusion (the app's own data directory,
+NTFS volume metadata). All three live in one place —
+`DirectoryBackupService.BuildExclusionFilter` — because a second copy of the
+logic in the Cleanup view had already drifted from it once.
+
+**The invariant: no path may enter or stay in the catalog without passing that
+filter.** Every route by which a path can become tracked must apply it:
+
+| Route | Where the filter is applied |
+|---|---|
+| Full scan (manual, scheduled, verify) | `FileScanner.ScanAsync(…, isExcluded)` |
+| Continuous backup of changed paths | `ExecuteTargetedAsync`, per candidate |
+| **Rename/move fast path** | `MoveTargetedAsync`, per landing path |
+
+The third one is easy to miss and was missed: a relocation *copies nothing*, so
+it never reaches the copy path's filter, and the worker's own endpoint test
+(`PathBelongsToSet`) answers a different question — is this inside the
+**selection** — which has nothing to say about exclusion globs. A file renamed
+into an excluded directory was therefore relocated on the destination and its
+catalog row repointed at the excluded path, leaving it backed up in defiance of
+the rule. It now returns `TargetedMoveOutcome.ExcludedAtDestination` and is
+released like a move out of the selection. See the exclusion-vs-rename entry in
+`known-issues.md`.
+
+**So: if you add a fourth route by which a path can be tracked, it applies the
+filter too** — including routes that only rewrite a `SourcePath` without copying
+bytes, which are exactly the ones where the omission is invisible until a
+Cleanup scan contradicts the backup.
+
 ## Threading rules that bite
 
 * **Nothing on the UI thread may do I/O at startup.** `App.OnStartup` constructs

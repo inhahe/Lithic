@@ -1299,7 +1299,7 @@ public sealed class BackupWorker : BackgroundService
                 set.Name, moves.Count, targetDir);
 
             var now = DateTime.UtcNow;
-            int relocated = 0, recopied = 0, freshNames = 0;
+            int relocated = 0, recopied = 0, freshNames = 0, excludedDest = 0;
 
             foreach (var move in moves)
             {
@@ -1340,6 +1340,30 @@ public sealed class BackupWorker : BackgroundService
                             // record to reconcile — just back up the new name.
                             freshNames++;
                             EnqueueForBackup(state, move.NewPath, move.IsDirectory, now);
+                            break;
+
+                        case TargetedMoveOutcome.ExcludedAtDestination:
+                            // The move landed the item on a path this set excludes.
+                            // Both endpoints are in the SELECTION, so PathBelongsToSet
+                            // saw an ordinary in-set move — only the service, which
+                            // holds the job's exclusion rules, can tell the difference.
+                            // Release it exactly as for a move out of the selection:
+                            // tombstone the old record so the destination copy stops
+                            // being tracked at a path the set does not back up.
+                            //
+                            // The new path is still enqueued, and deliberately: for a
+                            // DIRECTORY move only some of the moved files may match an
+                            // exclusion rule, and the copy path re-applies the same
+                            // filter per file — so this drops exactly the excluded ones
+                            // and still backs up their siblings. When everything under
+                            // the move is excluded the enqueue costs one filtered pass
+                            // and copies nothing.
+                            excludedDest++;
+                            EnqueueForBackup(state, move.NewPath, move.IsDirectory, now);
+                            if (!await MarkMovedOutAsync(set, move.OldPath, move.IsDirectory, ct))
+                                // A file was re-created at the old path (atomic-save
+                                // replace): it wasn't tombstoned, so back it up in place.
+                                EnqueueForBackup(state, move.OldPath, move.IsDirectory, now);
                             break;
 
                         default: // FellBack — tracked, but couldn't relocate cleanly.
@@ -1383,7 +1407,7 @@ public sealed class BackupWorker : BackgroundService
                 }
             }
 
-            if (relocated > 0 || recopied > 0)
+            if (relocated > 0 || recopied > 0 || excludedDest > 0)
             {
                 state.LastRunUtc = DateTime.UtcNow;
                 _logger.LogInformation(
@@ -1391,6 +1415,12 @@ public sealed class BackupWorker : BackgroundService
                     "{Recopied} tracked item(s) could not be relocated and will be re-copied.",
                     set.Name, relocated, recopied);
             }
+
+            if (excludedDest > 0)
+                _logger.LogInformation(
+                    "Continuous backup for \"{Name}\": {Count} moved item(s) landed on excluded " +
+                    "path(s); their backups were released rather than relocated.",
+                    set.Name, excludedDest);
 
             if (freshNames > 0)
                 _logger.LogDebug(
