@@ -50,15 +50,62 @@ why it is dangerous.
 listed the files; the catalog write used a path prefix. Any time those two can
 disagree, they eventually will.
 
-**Recovery** for a catalog already damaged by this is not automatic. The pre-purge
-state is not recoverable from the database (the purge had already been
-checkpointed into the main file, so opening it without its `-wal` shows the
-damaged state too). What makes repair possible is the same asymmetry above: the
-content of a wrongly-tombstoned row is still on the destination, because the
-purge only deleted the files it listed. Before the purge the set held one active
-row per destination file (1,422,824 active rows against 1,423,344 files), so the
-repair is to restore that 1:1 mapping — one active row per surviving destination
-file, preferring a row whose source path still exists.
+### Recovering a catalog already damaged by it
+
+Done once, on the real J: set, 2026-09-05. Worth keeping because the reasoning
+generalises to any bulk mis-tombstoning.
+
+**The pre-purge state is NOT recoverable from the database.** The obvious trick —
+open the main `.db` without its `-wal`, on the theory that the purge is still
+only in the log — does not work: the purge had already been checkpointed into the
+main file, so opening it alone reported the same 219,196 active rows. Neither is
+there a manifest (Cleanup writes none) nor a catalog copy on the destination.
+
+**What makes repair possible is the bug's own asymmetry.** The purge marked
+1,203,628 rows but deleted only ~182 GB of files, because the physical delete
+used each item's `DiscFilePaths` — exactly what was listed — while the catalog
+write used a path prefix. So the content of a wrongly-tombstoned row is still on
+the destination.
+
+**Do NOT repair by "restore every tombstoned row whose file still exists".** That
+over-restores badly: 1,651,374 rows matched, against only 1,203,628 actually
+flipped. Several rows can share one disc path (retention versions,
+`.dedup`/`.fileref` manifests, re-seed duplicates), so file existence does not
+identify a row.
+
+**Repair by rebuilding the invariant instead: ONE active row per file on the
+destination.** Before the purge the set held 1,422,824 active rows against
+1,423,344 files — a 1:1 mapping, and that is what to restore:
+
+1. Stop the worker (set `Global\LithicBackup.Worker.Shutdown`; the service cannot
+   be stopped without elevation, but a process may always close itself). A
+   scheduled full backup against the damaged catalog would see every tombstoned
+   file as new and re-copy it — here, 965 GiB.
+2. Copy `set-4.db` and `set-4.db-wal` aside before touching anything.
+3. Enumerate the destination; export `Id, IsDeleted, Version, DiscPath, SourcePath`.
+4. For each disc path present on disk: if a row is already active, leave it;
+   otherwise activate exactly ONE — preferring a row whose `SourcePath` still
+   exists, then the highest `Version`, then the highest `Id`.
+5. Rows whose disc path is absent stay tombstoned: their content really is gone,
+   which is the half of the purge that was correct.
+
+**Result, with three independent checks that all landed within ~500 rows:**
+
+| | |
+|---|---|
+| active rows restored | 219,196 -> **1,343,962** |
+| files on the destination | 1,343,980 (difference = 18 untracked files) |
+| rows restored vs rows flipped | 1,124,766 vs 1,203,628; gap 78,862 against the 79,364 genuinely-missing files |
+| tombstoned after | 2,095,960 vs expected 2,017,098 + 79,364 = 2,096,462 |
+
+`PRAGMA quick_check` returned `ok`. Spot checks confirmed the right rows moved:
+a live source file went back to active, while files moved to `C:\youtube` and the
+220,809 rows under `D:\AI\` (moved to `E:\AI`) correctly stayed tombstoned.
+
+**The lesson for the next bulk catalog operation:** three different ways of
+counting the same repair agreed to within 500 rows out of 3.4 million. If they
+had not agreed, the repair would have been wrong — and a repair that cannot be
+cross-checked against an independent measurement should not be applied.
 
 ## FIXED: a file moved out of a folder that still exists was invisible to every cleanup category (2026-09-05)
 
