@@ -274,6 +274,22 @@
                        Text="{Binding SummaryText}"
                        TextWrapping="Wrap" />
 
+            <!-- Destination-not-connected banner.  The set's target is only a
+                 saved path string, so a configured destination says nothing
+                 about whether the drive is plugged in.  Without this the two
+                 destination actions just failed quietly and the purge did its
+                 catalog half against a drive that wasn't there. -->
+            <Border Margin="0,8,0,0" Padding="10,7"
+                    CornerRadius="3"
+                    Background="{StaticResource DangerTintBrush}"
+                    BorderBrush="{StaticResource WarningBrush}"
+                    BorderThickness="1"
+                    Visibility="{Binding IsDestinationUnavailable, Converter={StaticResource BoolToVis}}">
+                <TextBlock Text="{Binding DestinationUnavailableText}"
+                           Foreground="{StaticResource DangerDarkBrush}"
+                           TextWrapping="Wrap" FontSize="12" />
+            </Border>
+
             <!-- Scan / maintenance actions laid out as a uniform 2×2 grid so
                  every card is the same width and height regardless of content.
                  The two destination-dependent cards (Reconcile, Scan
@@ -305,7 +321,7 @@
                     <Border.Style>
                         <Style TargetType="Border" BasedOn="{StaticResource InsetCard}">
                             <Style.Triggers>
-                                <DataTrigger Binding="{Binding CanScanDestination}" Value="False">
+                                <DataTrigger Binding="{Binding HasDestination}" Value="False">
                                     <Setter Property="Visibility" Value="Collapsed" />
                                 </DataTrigger>
                             </Style.Triggers>
@@ -368,7 +384,7 @@
                     <Border.Style>
                         <Style TargetType="Border" BasedOn="{StaticResource InsetCard}">
                             <Style.Triggers>
-                                <DataTrigger Binding="{Binding CanScanDestination}" Value="False">
+                                <DataTrigger Binding="{Binding HasDestination}" Value="False">
                                     <Setter Property="Visibility" Value="Collapsed" />
                                 </DataTrigger>
                             </Style.Triggers>

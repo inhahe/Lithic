@@ -1518,6 +1518,19 @@ public class MainViewModel : ViewModelBase
         }
 
         string? targetDir = backupSet.JobOptions?.TargetDirectory;
+
+        // Refuse if the set HAS a destination but it isn't reachable. Marking the
+        // catalog without deleting the files would free nothing and would drop the
+        // rows out of every catalog-side view (they classify active files only),
+        // leaving the copies on the drive with nothing pointing at them. Same rule
+        // as Cleanup's purge; see DestinationFilePurger.IsAvailable.
+        if (targetDir is not null && !Services.DestinationFilePurger.IsAvailable(targetDir))
+        {
+            StatusText = $"Destination not connected ({targetDir}) — left the removed-source "
+                + "files in place. Connect it and remove them via Cleanup.";
+            return;
+        }
+
         var sourcePaths = byPath.Select(p => p.SourcePath).ToList();
         // Every version's destination file must be deleted, de-duplicated so a
         // shared disc path is never deleted (or counted) twice.
@@ -1525,7 +1538,7 @@ public class MainViewModel : ViewModelBase
             removed.Select(f => f.DiscPath.Replace('/', '\\')),
             StringComparer.OrdinalIgnoreCase);
 
-        int catPurged = 0, filesDeleted = 0, delFailures = 0;
+        int catPurged = 0, filesDeleted = 0, delFailures = 0, alreadyAbsent = 0;
         long bytesFreed = 0;
         try
         {
@@ -1536,7 +1549,7 @@ public class MainViewModel : ViewModelBase
             // Not cancellable: the user already confirmed the deletion, and
             // aborting mid-purge would leave the catalog and destination out of
             // step (Cleanup can always finish a partial purge later).
-            var (_, purge) = await Views.ProgressDialog.RunAsync<(int Cat, int Files, int Fail, long Bytes)>(
+            var (_, purge) = await Views.ProgressDialog.RunAsync<(int Cat, int Files, int Fail, long Bytes, int Absent)>(
                 Application.Current.MainWindow,
                 "Removing files from destination",
                 "Deleting backed-up copies of the removed folders\u2026",
@@ -1585,13 +1598,13 @@ public class MainViewModel : ViewModelBase
 
                     // Physical deletion outside the tx so file errors can't roll
                     // the catalog back.  Skipped entirely if no destination is set.
-                    int fd = 0, ff = 0;
+                    int fd = 0, ff = 0, absent = 0;
                     long bytes = 0;
                     if (targetDir is not null)
                     {
-                        var (d, f, b) = Services.DestinationFilePurger
+                        var (d, f, b, a) = Services.DestinationFilePurger
                             .DeleteFilesAndSweep(targetDir, discPaths, progress);
-                        fd = d; ff = f; bytes = b;
+                        fd = d; ff = f; bytes = b; absent = a;
 
                         // Repair any references left stale by the deletions (a
                         // plain copy other rows referenced may now be gone),
@@ -1604,10 +1617,10 @@ public class MainViewModel : ViewModelBase
                             reconcile.ApplyAsync(backupSet.Id, report, targetDir, progress, ct)
                                 .GetAwaiter().GetResult();
                     }
-                    return (purged, fd, ff, bytes);
+                    return (purged, fd, ff, bytes, absent);
                 });
 
-            (catPurged, filesDeleted, delFailures, bytesFreed) = purge;
+            (catPurged, filesDeleted, delFailures, bytesFreed, alreadyAbsent) = purge;
         }
         catch (Exception ex)
         {
@@ -1622,6 +1635,8 @@ public class MainViewModel : ViewModelBase
             parts.Add($"deleted {filesDeleted:N0} file{(filesDeleted == 1 ? "" : "s")} ({FormatBytes(bytesFreed)})");
         if (delFailures > 0)
             parts.Add($"{delFailures:N0} deletion failure{(delFailures == 1 ? "" : "s")}");
+        if (alreadyAbsent > 0)
+            parts.Add($"{alreadyAbsent:N0} already absent");
         StatusText = parts.Count > 0
             ? "Removed sources: " + string.Join(", ", parts) + "."
             : "No destination files needed removal.";

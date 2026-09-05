@@ -196,6 +196,31 @@ filter too** — including routes that only rewrite a `SourcePath` without copyi
 bytes, which are exactly the ones where the omission is invisible until a
 Cleanup scan contradicts the backup.
 
+## A configured destination is not a present one
+
+A backup set's destination is a saved **path string** (`JobOptions.TargetDirectory`).
+Having one configured says nothing about whether the removable drive is plugged
+in, the share is up, or the letter still points at the same volume. Anything that
+is about to change the catalog on the strength of what the destination contains
+must ask `DestinationFilePurger.IsAvailable` first.
+
+This matters because **absence is not an error** down at the filesystem: `File.Delete`
+on a path under an unplugged drive raises nothing that a caller distinguishes
+from "already gone", so a purge against a missing destination completes with zero
+deletions **and zero failures** — the exact signature of a purge that had nothing
+to do. The catalog half, meanwhile, succeeds unconditionally, because it is local.
+
+The failure mode is therefore not "an error was swallowed" but "half a two-part
+operation ran and reported success". And it is not symmetric: the surviving half
+tombstones rows, and every catalog-side category classifies only ACTIVE files, so
+those files leave the catalog scan permanently and remain visible only to the
+destination scan's catalog-deleted category.
+
+`CatalogReconcileService` had guarded this since it was written; the purge did
+not, for months. **When adding an operation that pairs a catalog write with a
+destination write, the guard goes at the top of the operation, not inside the
+destination half.**
+
 ## Threading rules that bite
 
 * **Nothing on the UI thread may do I/O at startup.** `App.OnStartup` constructs

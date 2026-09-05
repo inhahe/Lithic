@@ -24,6 +24,18 @@ public class OrphanedDirectoriesViewModel : ViewModelBase
     private readonly BackupSet _backupSet;
     /// <summary>Destination directory for physical deletion. Null when the backup set has no target configured.</summary>
     private readonly string? _targetDir;
+
+    /// <summary>
+    /// Whether <see cref="_targetDir"/> was reachable at the last check.  This
+    /// is CACHED rather than tested on demand because it is read from command
+    /// CanExecute predicates, which WPF re-evaluates on every
+    /// <c>CommandManager.RequerySuggested</c> — testing the filesystem there
+    /// would put disk I/O (and, for a disconnected network target, a multi-second
+    /// stall) on the UI thread many times a second.  Refreshed by
+    /// <see cref="RefreshDestinationAvailability"/> at the start of every action
+    /// that needs the destination, which is the moment the answer has to be right.
+    /// </summary>
+    private bool _destinationAvailable;
     private bool _isLoading;
     private bool _isPurging;
     private bool _isScanningDestination;
@@ -54,6 +66,7 @@ public class OrphanedDirectoriesViewModel : ViewModelBase
         _backupSet = backupSet;
         _targetDir = backupSet.JobOptions?.TargetDirectory;
         _reconcile = new CatalogReconcileService(catalog);
+        RefreshDestinationAvailability();
 
         Items = [];
         Categories = [];
@@ -66,17 +79,17 @@ public class OrphanedDirectoriesViewModel : ViewModelBase
         ScanExcludedCommand = new RelayCommand(_ => _ = ScanForExcludedAsync(), _ => !IsLoading && !IsPurging);
         ScanDestinationCommand = new RelayCommand(
             _ => _ = ScanDestinationAsync(),
-            _ => !IsLoading && !IsPurging && !IsScanningDestination && _targetDir is not null);
+            _ => !IsLoading && !IsPurging && !IsScanningDestination && _destinationAvailable);
         SortByNameCommand = new RelayCommand(_ => ToggleSort(CleanupSortColumn.Name));
         SortByFilesCommand = new RelayCommand(_ => ToggleSort(CleanupSortColumn.Files));
         SortBySizeCommand = new RelayCommand(_ => ToggleSort(CleanupSortColumn.Size));
         ReconcileAnalyzeCommand = new RelayCommand(
             _ => _ = ReconcileAnalyzeAsync(),
-            _ => !IsLoading && !IsPurging && !IsReconciling && _targetDir is not null);
+            _ => !IsLoading && !IsPurging && !IsReconciling && _destinationAvailable);
         ReconcileApplyCommand = new RelayCommand(
             _ => _ = ReconcileApplyAsync(),
             _ => !IsLoading && !IsPurging && !IsReconciling
-                 && _targetDir is not null && _reconcileReport?.HasChanges == true);
+                 && _destinationAvailable && _reconcileReport?.HasChanges == true);
         CloseCommand = new RelayCommand(_ => DoneRequested?.Invoke());
 
         // The catalog classification (read every record + group/classify into
@@ -187,8 +200,66 @@ public class OrphanedDirectoriesViewModel : ViewModelBase
         }
     }
 
-    /// <summary>True when the backup set has a target directory and so destination scanning is possible.</summary>
-    public bool CanScanDestination => _targetDir is not null;
+    /// <summary>
+    /// True when the backup set has a target directory AND that directory is
+    /// currently reachable, so destination scanning is possible.
+    /// </summary>
+    public bool CanScanDestination => _destinationAvailable;
+
+    /// <summary>
+    /// True when the set has a destination CONFIGURED, regardless of whether it
+    /// is reachable. Drives the visibility of the destination-dependent cards:
+    /// they must stay on screen (and simply not work) when the drive is
+    /// unplugged, rather than vanishing and leaving the user to wonder where the
+    /// destination scan went.
+    /// </summary>
+    public bool HasDestination => _targetDir is not null;
+
+    /// <summary>
+    /// True when the set has a destination configured but it isn't reachable —
+    /// the removable drive is unplugged, the network share is down, or the drive
+    /// letter has changed. Drives the warning banner.
+    /// </summary>
+    public bool IsDestinationUnavailable => _targetDir is not null && !_destinationAvailable;
+
+    /// <summary>Banner text naming the destination that could not be reached.</summary>
+    public string DestinationUnavailableText =>
+        $"Destination not connected: {_targetDir}  —  nothing can be deleted from the " +
+        "backup and the destination cannot be scanned until it is available.";
+
+    /// <summary>
+    /// Re-test whether the destination is reachable and republish the properties
+    /// that depend on it.
+    ///
+    /// Called at the start of every action that needs the destination rather
+    /// than from a property getter, because the answer can change while the
+    /// dialog is open (this is a removable drive) and because a getter is the
+    /// wrong place for I/O — see <see cref="_destinationAvailable"/>.
+    ///
+    /// <para><b>Why this exists at all:</b> the destination used to be treated
+    /// as present whenever the backup set merely had one CONFIGURED, since
+    /// <c>_targetDir</c> is just the saved path string. With the drive
+    /// unplugged, a purge would mark catalog rows deleted, then find
+    /// <c>File.Exists</c> false for every one of them, delete nothing, count
+    /// zero failures, and report success. That is worse than doing nothing: the
+    /// rows are now deleted rows, so the catalog-side categories (which only
+    /// classify ACTIVE files) will never list those files again, and the only
+    /// thing that can still find them is the destination scan's
+    /// "catalog-deleted" category.</para>
+    /// </summary>
+    private void RefreshDestinationAvailability()
+    {
+        bool available = Services.DestinationFilePurger.IsAvailable(_targetDir);
+
+        if (available == _destinationAvailable)
+            return;
+
+        _destinationAvailable = available;
+        OnPropertyChanged(nameof(CanScanDestination));
+        OnPropertyChanged(nameof(IsDestinationUnavailable));
+        OnPropertyChanged(nameof(DestinationUnavailableText));
+        CommandManager.InvalidateRequerySuggested();
+    }
 
     /// <summary>
     /// Live progress text shown next to the "Scan destination filesystem"
@@ -1273,9 +1344,20 @@ public class OrphanedDirectoriesViewModel : ViewModelBase
     {
         // The destination walk loads its own catalog snapshot (below), so it no
         // longer depends on the on-demand catalog classification having run —
-        // only on the set having a destination directory.
+        // only on the set having a destination directory that is actually there.
+        // Checking here as well as in CanExecute matters because the drive can be
+        // unplugged while the dialog sits open; without it the walk would get as
+        // far as throwing DirectoryNotFoundException and report the failure as if
+        // it were an unexpected error rather than a disconnected drive.
+        RefreshDestinationAvailability();
         if (_targetDir is null)
             return;
+        if (!_destinationAvailable)
+        {
+            DestinationScanStatusText =
+                $"Destination not connected: {_targetDir} — connect it and scan again.";
+            return;
+        }
 
         // Give immediate feedback the moment the button is pressed: flip the
         // busy flag (greys the Scan button via CanExecute) and show a wait
@@ -1685,6 +1767,32 @@ public class OrphanedDirectoriesViewModel : ViewModelBase
             .ToList();
         if (selected.Count == 0) return;
 
+        // Refuse outright if the set has a destination that isn't reachable.
+        //
+        // Cleaning is two halves — mark the catalog rows deleted, then delete the
+        // backed-up files — and only the first half can run without the drive.
+        // Doing that half alone is strictly worse than doing nothing: not one byte
+        // is freed, and because every catalog-side category classifies only ACTIVE
+        // files, the rows it just tombstoned drop out of the catalog scan forever.
+        // The files would then be findable only through the destination scan's
+        // "catalog-deleted" category, which is not where anyone would think to look
+        // for them. Previously this ran silently: _targetDir is only the CONFIGURED
+        // path, so with the drive unplugged the purge marked the rows, found
+        // File.Exists false for every path, counted zero deletions AND zero
+        // failures, and reported plain success.
+        RefreshDestinationAvailability();
+        if (IsDestinationUnavailable)
+        {
+            string msg =
+                $"Destination not connected ({_targetDir}) — nothing was cleaned. " +
+                "Connect the drive and run the cleanup again; marking the catalog " +
+                "without deleting the backed-up files would free no space and would " +
+                "hide those files from the catalog scan.";
+            SummaryText = msg;
+            LastCleanupResultText = $"Last cleanup at {DateTime.Now:HH:mm:ss}: {msg}";
+            return;
+        }
+
         IsPurging = true;
         SummaryText = "Purging...";
         PurgeStatusText = "";
@@ -1727,11 +1835,12 @@ public class OrphanedDirectoriesViewModel : ViewModelBase
             // catalog methods are synchronous (ExecuteNonQuery /
             // Task.FromResult) and the filesystem walk for empty-dir
             // cleanup can iterate thousands of directories.
-            var (catalogPurged, filesDeleted, deleteFailures, bytesFreed) = await Task.Run(() =>
+            var (catalogPurged, filesDeleted, deleteFailures, bytesFreed, alreadyAbsent) = await Task.Run(() =>
             {
                 int catPurged = 0;
                 int fDeleted = 0;
                 int fFailed = 0;
+                int fAbsent = 0;
                 long bytes = 0;
 
                 // Shared throttle for both progress phases — matches the
@@ -1829,12 +1938,13 @@ public class OrphanedDirectoriesViewModel : ViewModelBase
                                  .SelectMany(w => w.DiscFilePaths!),
                         StringComparer.OrdinalIgnoreCase);
 
-                    var (deleted, delFailed, delBytes) =
+                    var (deleted, delFailed, delBytes, delAbsent) =
                         Services.DestinationFilePurger.DeleteFilesAndSweep(
                             targetDir, allDiscPaths, progress);
                     fDeleted += deleted;
                     fFailed += delFailed;
                     bytes += delBytes;
+                    fAbsent += delAbsent;
                 }
 
                 // -- 3. Drop the purged files from the in-memory active-file
@@ -1861,7 +1971,7 @@ public class OrphanedDirectoriesViewModel : ViewModelBase
                         || purgedRecordIds.Contains(f.Id));
                 }
 
-                return (catPurged, fDeleted, fFailed, bytes);
+                return (catPurged, fDeleted, fFailed, bytes, fAbsent);
             });
 
             // Back on the UI thread — update the observable collection.
@@ -1878,6 +1988,13 @@ public class OrphanedDirectoriesViewModel : ViewModelBase
                 summary.Add($"deleted {filesDeleted:N0} file{(filesDeleted == 1 ? "" : "s")} ({FormatSizeText(bytesFreed)})");
             if (deleteFailures > 0)
                 summary.Add($"{deleteFailures:N0} deletion failure{(deleteFailures == 1 ? "" : "s")}");
+            // Reported rather than ignored: a file the catalog expects but the
+            // destination doesn't have is how a half-completed earlier purge — or
+            // a destination that isn't really the one the catalog describes —
+            // shows itself. Silence here is what let an offline purge look like a
+            // successful one.
+            if (alreadyAbsent > 0)
+                summary.Add($"{alreadyAbsent:N0} already absent from the destination");
             if (summary.Count == 0)
                 summary.Add("nothing to clean");
 
@@ -1920,6 +2037,16 @@ public class OrphanedDirectoriesViewModel : ViewModelBase
     {
         if (_targetDir is null || IsReconciling || IsPurging)
             return;
+
+        // Reconcile compares the catalog against the destination, so an absent
+        // destination would make every active row look like missing content.
+        RefreshDestinationAvailability();
+        if (!_destinationAvailable)
+        {
+            ReconcileStatusText =
+                $"Destination not connected: {_targetDir} - connect it and analyze again.";
+            return;
+        }
 
         IsReconciling = true;
         SetReconcileReport(null);
@@ -1982,6 +2109,17 @@ public class OrphanedDirectoriesViewModel : ViewModelBase
         var report = _reconcileReport;
         if (_targetDir is null || report is null || !report.HasChanges || IsReconciling || IsPurging)
             return;
+
+        // The report was computed against a destination that may since have been
+        // unplugged; applying it then would prune rows whose content is merely
+        // unreachable.
+        RefreshDestinationAvailability();
+        if (!_destinationAvailable)
+        {
+            ReconcileStatusText =
+                $"Destination not connected: {_targetDir} - connect it and analyze again.";
+            return;
+        }
 
         IsReconciling = true;
         ReconcileStatusText = "Applying reconcile...";
