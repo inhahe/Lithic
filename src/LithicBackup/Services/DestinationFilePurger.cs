@@ -22,6 +22,34 @@ internal static class DestinationFilePurger
     private const int ProgressIntervalMs = 500;
 
     /// <summary>
+    /// Whether a configured destination directory is actually reachable right
+    /// now. A backup set's target is a saved PATH STRING, so having one
+    /// configured says nothing about whether the removable drive is plugged in,
+    /// the share is up, or the letter still points at the same volume.
+    ///
+    /// <para>Every caller that is about to mark catalog rows deleted must ask
+    /// this FIRST. The deletion loop below skips a path that isn't there without
+    /// raising anything, which is correct for a file an earlier pass already
+    /// removed, but means an absent destination looks exactly like a completed
+    /// no-op — and by then the catalog has already been rewritten.</para>
+    /// </summary>
+    public static bool IsAvailable(string? targetDir)
+    {
+        if (string.IsNullOrWhiteSpace(targetDir))
+            return false;
+        try
+        {
+            return Directory.Exists(targetDir);
+        }
+        catch
+        {
+            // Malformed path, unmapped letter, or a share that throws rather
+            // than returning false — all "not usable".
+            return false;
+        }
+    }
+
+    /// <summary>
     /// Physically delete the given destination-relative files under
     /// <paramref name="targetDir"/>, clearing the read-only attribute first,
     /// then sweep away any subdirectories left empty.  Best-effort: permission
@@ -34,13 +62,25 @@ internal static class DestinationFilePurger
     /// caller is responsible for de-duplication if a file might appear twice.
     /// </param>
     /// <param name="progress">Optional throttled status reporter.</param>
-    /// <returns>Count of files deleted, count of deletion failures, and bytes freed.</returns>
-    public static (int FilesDeleted, int Failures, long BytesFreed) DeleteFilesAndSweep(
+    /// <returns>
+    /// Count of files deleted, count of deletion failures, bytes freed, and the
+    /// count that were ALREADY ABSENT from the destination.
+    ///
+    /// <para>That last one is reported rather than ignored because it is the
+    /// only externally visible symptom of a destination that is not really
+    /// there: <see cref="File.Exists"/> answers false for every path under an
+    /// unplugged drive, so without it a purge that deleted nothing at all is
+    /// indistinguishable from one that had nothing to do. A caller that has
+    /// verified the destination is present can still treat a nonzero count as
+    /// benign (the file was cleaned by an earlier pass).</para>
+    /// </returns>
+    public static (int FilesDeleted, int Failures, long BytesFreed, int AlreadyAbsent) DeleteFilesAndSweep(
         string targetDir, IReadOnlyCollection<string> discRelPaths,
         IProgress<ProgressReport>? progress)
     {
         int filesDeleted = 0;
         int failures = 0;
+        int alreadyAbsent = 0;
         long bytesFreed = 0;
 
         var sw = Stopwatch.StartNew();
@@ -83,6 +123,10 @@ internal static class DestinationFilePurger
                     bytesFreed += size;
                     filesDeleted++;
                 }
+                else
+                {
+                    alreadyAbsent++;
+                }
             }
             catch
             {
@@ -109,7 +153,7 @@ internal static class DestinationFilePurger
             // Best-effort — don't fail the whole purge over this.
         }
 
-        return (filesDeleted, failures, bytesFreed);
+        return (filesDeleted, failures, bytesFreed, alreadyAbsent);
     }
 
     /// <summary>

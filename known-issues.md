@@ -1,5 +1,211 @@
 # LithicBackup — Known Issues & Tech Debt
 
+## FIXED: a file moved out of a folder that still exists was invisible to every cleanup category (2026-09-05)
+
+**Symptom.** Most of `D:\youtube` was moved to `C:\youtube`, leaving one
+subfolder (`philosophy`) behind. The backups of the moved files stayed on the J:
+destination, and neither the catalog scan nor the destination scan mentioned
+them.
+
+**Cause: "Deleted from Disk" tested the DIRECTORY, never the file.**
+
+```csharp
+bool inSources = IsDirectoryInSources(dir);
+if (!inSources || Directory.Exists(dir))   // <- directory still there: skip it all
+{ progress.Bump(groupCount); continue; }
+```
+
+`D:\youtube` still exists — it holds `philosophy` — so every catalogued file
+that used to sit directly in it was skipped. Those rows therefore stayed
+**active**, and an active row is exactly what makes the destination scan skip a
+file as "properly tracked". Two scans, and the file fell between them:
+
+| scan | sees | blind to |
+|---|---|---|
+| catalog scan | active rows, classified against the sources | a file whose directory survived it |
+| destination scan | destination files with no active row | anything still active |
+
+Nothing else would ever have caught it either: the full backup does compute
+`diff.DeletedFiles`, but `FileScanner` says so in as many words — *"Only the
+count is used downstream"* — the number is logged and no row is touched. That is
+deliberate (a deleted source keeps its backup until the user asks), which means
+Cleanup is the ONLY route by which a backup is released, and this gap made that
+route unable to see the files at all.
+
+**Measured on the real J: set:**
+
+| | |
+|---|---|
+| active rows under `D:\youtube` outside `philosophy` | 174 |
+| ...whose source file no longer exists | **174** |
+| ...whose backup copy is still on J: | **174 (4.80 GB)** |
+| where the files went | `C:\youtube` (1,634 files) |
+
+**A wrong turn worth recording: my own first analysis had the identical blind
+spot.** Asked whether anything was hiding on J:, I grouped active rows by parent
+directory and tested `os.path.isdir` — 139,470 directories, 10 missing, "no
+large orphan is hiding". That reproduced the product's bug in the verification
+meant to find it, and I reported the wrong conclusion to the user, who corrected
+it with a concrete counter-example. **A directory-level test does not establish a
+file-level fact** — in the analysis any more than in the app.
+
+**Fix.** Phase 3 now reads each candidate directory's file names once and tests
+every catalogued file against them:
+
+* **One enumeration per directory, not one stat per file** — the catalog holds
+  ten times more files than directories.
+* **Confirmed before it is offered.** A name missing from the listing is checked
+  with `File.Exists` before the file is reported. The listing and the catalog
+  path reach us by different routes (live directory vs, possibly, a USN journal
+  record), so a difference in form — an 8.3 short name, a differently normalised
+  Unicode name — would otherwise read as "missing" and put a good backup on the
+  deletion list. The confirming stat costs one call per file already believed
+  missing, on a directory the probe just warmed.
+* **Unreachable is not deleted.** Each source root is probed once and an
+  unavailable one is skipped wholesale and named in the summary. Without this an
+  unplugged source volume would offer its ENTIRE contents for deletion — the
+  same rule `CacheMaintenance` applies to its sweep and `CatalogReconcileService`
+  to the destination, now applied to the source side too. This hazard predates
+  the fix.
+* **Probed 16-way concurrently**, because this is latency, not work.
+
+**Scale of what was invisible.** Replaying the fixed algorithm over the whole J:
+set (all 1,422,824 active rows, 139,470 directories), in C# so the probe really
+is 16-way concurrent:
+
+| | files | size |
+|---|---|---|
+| what the OLD directory-only test finds | 53 | 0.00 GB |
+| what the NEW file-level test finds | **79,364** | **171.90 GB** |
+| ...of which still physically on the destination | 79,364 | 171.90 GB |
+
+Every single one was still on the drive, because an active catalog row is what
+makes the destination scan skip a file. The largest stranded trees were
+`D:\visual studio projects\forward raytracer` (18.26 GB), `D:\visual studio
+projects\os` (7.26 GB in 55,483 files), and a long tail of individual multi-GB
+ISOs under `D:\new_save` — all cases of files removed from a directory that is
+still there. The probe took **379.8 s** (367 dirs/s), against an extrapolated
+8,930 s if it had been serial.
+
+These are backups of *deleted sources*, which the product keeps on purpose until
+Cleanup is run — the defect was never that they existed, but that no category
+would name them, so the user could not act on them either way.
+
+**Cost, measured over 3,000 real directories of this set:**
+
+| step | per directory | extrapolated to 139,470, serial |
+|---|---|---|
+| old: `Directory.Exists` | 58.6 ms | 8,177 s |
+| new: `EnumerateFiles` + `HashSet` | 64.0 ms | 8,930 s |
+
+Reading the names costs **+9%** over merely asking whether the directory exists,
+which is what makes per-file detection affordable at all. The serial figures are
+also why the probe is now concurrent: 16 at a time is the value
+`CacheMaintenance` measured for the same kind of cold-metadata work (235
+probes/s against 21 single-threaded), so the pass drops from hours to minutes.
+
+## FIXED: Cleanup purged the catalog against a destination that wasn't plugged in (2026-09-05)
+
+**Symptom.** Large directories were moved from one drive to another; a Cleanup
+was run for the J: set **while J: was unplugged**, and it reported success
+without mentioning the drive. A later destination scan didn't list the moved
+directories and they appeared to still be on the destination.
+
+**Cause: `_targetDir` is only the CONFIGURED path string, and nothing ever
+checked it.**
+
+```csharp
+_targetDir = backupSet.JobOptions?.TargetDirectory;   // no existence test
+```
+
+So with the drive unplugged, `_targetDir` is non-null and everything downstream
+believes the destination is present. A purge then ran in this order:
+
+1. **Catalog half** — mark every selected row deleted, in one transaction. This
+   succeeds; it only touches the local catalog.
+2. **Disk half** — `DestinationFilePurger.DeleteFilesAndSweep` walks the same
+   paths under `J:\…`. `File.Exists` answers **false** for every one of them, so
+   the loop deletes nothing, counts **zero deletions and zero failures**, and the
+   empty-directory sweep throws into a `catch {}`.
+3. **Report** — "Purged N catalog records." Nothing about the drive.
+
+That is worse than doing nothing. Every catalog-side category classifies only
+**active** files, so the rows it just tombstoned can never appear in a catalog
+scan again; the files themselves are then reachable only through the destination
+scan's "catalog-deleted" category, which is not where anyone would look. The
+same silent half-run existed in the post-edit "remove deleted sources" flow in
+`MainViewModel`.
+
+**The protection already existed — in exactly one place.** `CatalogReconcileService`
+has guarded against this since it was written ("a disconnected/empty destination
+must never look like mass deletion"), and the README already promised it *for
+reconcile*. Nothing carried the rule across to the purge, which is the operation
+that actually deletes.
+
+**Measured.** Calling the real `DeleteFilesAndSweep` through the built assembly:
+
+    real destination, 5 paths (3 present, 2 not) -> deleted=3 failures=0 alreadyAbsent=2
+    absent destination, same 5 paths             -> deleted=0 failures=0 alreadyAbsent=5
+
+The second line is the whole bug: a complete no-op is indistinguishable from a
+completed purge, because "not there" is not an error.
+
+**Fix.**
+
+* `DestinationFilePurger.IsAvailable(targetDir)` — one definition of "is the
+  destination actually reachable", used by both callers.
+* Cleanup refuses to purge when the destination is configured but unreachable,
+  and says which path it couldn't reach. It no longer touches the catalog first
+  and discovers the problem afterwards.
+* A warning banner names the disconnected destination; the destination scan and
+  reconcile are disabled while it is unreachable, but their cards stay visible
+  (`HasDestination`) instead of silently vanishing (`CanScanDestination`).
+* Availability is re-tested at the start of every action, not cached from when
+  the dialog opened — this is a removable drive and the dialog stays open. It is
+  deliberately NOT a property getter: `CanExecute` runs on every
+  `CommandManager.RequerySuggested`, so a getter would put disk I/O (and, for a
+  dead network share, a multi-second stall) on the UI thread many times a second.
+* `DeleteFilesAndSweep` now returns an `AlreadyAbsent` count and both callers
+  report it, so "the catalog expected files the destination doesn't have" is
+  visible even when the drive *is* connected.
+* The post-edit removal flow declines the same way.
+
+**What the J: destination actually contained**, checked by replaying
+`WalkDestination`'s exact classification offline over all 1,423,344 files on the
+drive against the real set-4 catalog:
+
+| | |
+|---|---|
+| tracked (active catalog record) | 1,422,823 |
+| catalog-deleted (would be reported) | 504 |
+| untracked (would be reported) | 4 |
+| leaf-empty directories | 14 |
+
+Total reclaimable: **1.01 GB**. The moved trees' old copies were genuinely gone
+(`D\AI` absent; `D\warez` present but containing zero files — an empty shell,
+which the destination scan cannot report because it reports files, not
+directories). So no large orphan was hiding; the offline purge is the real
+defect, and an emptied directory tree that no scan mentions is the cosmetic one.
+
+**Still open:** the destination scan reports files only, so a directory tree
+emptied by a purge whose sweep failed stays on the drive and nothing surfaces it.
+14 such directories exist on J:. Low priority — they cost directory entries, not
+space — but see the tech-debt entry below.
+
+## TECH DEBT: nothing reports destination directories that are empty but not swept
+
+`DestinationFilePurger.DeleteFilesAndSweep` sweeps empty directories after a
+purge, but the sweep is best-effort inside a bare `catch {}`, and any other route
+that deletes destination files (or a purge whose sweep was interrupted) leaves
+the tree behind. `WalkDestination` only classifies files, so an empty tree is
+invisible to Cleanup forever.
+
+Measured on the J: destination: 14 leaf-empty directories, 2 of which are the
+protected `_blocks`/`_filestore` roots and must stay. The proper fix is for the
+destination scan to collect directories that contain no files anywhere beneath
+them (excluding the protected stores) and offer them as a category, with the
+purge removing them bottom-up.
+
 ## FIXED: a file renamed into an excluded directory stayed backed up (2026-09-05)
 
 **Symptom.** Cleanup ▸ "Matches Exclusion Filter" listed three files that the

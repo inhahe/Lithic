@@ -2,7 +2,7 @@
 
 ## Versioning (Claude controls this)
 
-**Current version: `1.0.60`**
+**Current version: `1.0.62`**
 
 Claude owns the version number. Do not hand-edit it — ask Claude to bump it and
 Claude will keep every place in sync.
@@ -25,6 +25,18 @@ Claude will keep every place in sync.
    (`installer\CustomActions`) and compiles `LithicBackup-<version>-x64.msi`.
 3. Publish a GitHub release on `inhahe/Lithic` tagged **`v<version>`** (e.g.
    `v1.0.11`) with the `installer\LithicBackup-<version>-x64.msi` attached.
+
+`build-msi.bat` is a convenience wrapper around step 2: it runs the same
+script and then **deletes** every older `LithicBackup-*-x64.msi` from
+`installer\` and the repo root, so only the just-built one is in view and a
+stale installer cannot be launched by mistake. It used to *move* them into
+`installer\archive\`, which quietly accumulated 57 installers / 3.2 GB before
+anyone noticed; deleting is safe because every version's `<Version>` is
+stamped in a committed `src/Directory.Build.props`, so any earlier installer
+can be rebuilt with `git checkout <commit>` + `build-installer.ps1` (the same
+build, though not the same bytes - an MSI carries a fresh package code and
+timestamps each time). The one workflow that wants an older MSI is testing an
+upgrade against the shutdown handshake; rebuild it from its commit for that.
 
 The tag must be `v` + the exact version so the update check matches it.
 

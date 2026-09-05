@@ -1,3 +1,4 @@
+using System.Collections.Concurrent;
 using System.Collections.ObjectModel;
 using System.IO;
 using System.Windows.Input;
@@ -24,6 +25,18 @@ public class OrphanedDirectoriesViewModel : ViewModelBase
     private readonly BackupSet _backupSet;
     /// <summary>Destination directory for physical deletion. Null when the backup set has no target configured.</summary>
     private readonly string? _targetDir;
+
+    /// <summary>
+    /// Whether <see cref="_targetDir"/> was reachable at the last check.  This
+    /// is CACHED rather than tested on demand because it is read from command
+    /// CanExecute predicates, which WPF re-evaluates on every
+    /// <c>CommandManager.RequerySuggested</c> — testing the filesystem there
+    /// would put disk I/O (and, for a disconnected network target, a multi-second
+    /// stall) on the UI thread many times a second.  Refreshed by
+    /// <see cref="RefreshDestinationAvailability"/> at the start of every action
+    /// that needs the destination, which is the moment the answer has to be right.
+    /// </summary>
+    private bool _destinationAvailable;
     private bool _isLoading;
     private bool _isPurging;
     private bool _isScanningDestination;
@@ -54,6 +67,7 @@ public class OrphanedDirectoriesViewModel : ViewModelBase
         _backupSet = backupSet;
         _targetDir = backupSet.JobOptions?.TargetDirectory;
         _reconcile = new CatalogReconcileService(catalog);
+        RefreshDestinationAvailability();
 
         Items = [];
         Categories = [];
@@ -66,17 +80,17 @@ public class OrphanedDirectoriesViewModel : ViewModelBase
         ScanExcludedCommand = new RelayCommand(_ => _ = ScanForExcludedAsync(), _ => !IsLoading && !IsPurging);
         ScanDestinationCommand = new RelayCommand(
             _ => _ = ScanDestinationAsync(),
-            _ => !IsLoading && !IsPurging && !IsScanningDestination && _targetDir is not null);
+            _ => !IsLoading && !IsPurging && !IsScanningDestination && _destinationAvailable);
         SortByNameCommand = new RelayCommand(_ => ToggleSort(CleanupSortColumn.Name));
         SortByFilesCommand = new RelayCommand(_ => ToggleSort(CleanupSortColumn.Files));
         SortBySizeCommand = new RelayCommand(_ => ToggleSort(CleanupSortColumn.Size));
         ReconcileAnalyzeCommand = new RelayCommand(
             _ => _ = ReconcileAnalyzeAsync(),
-            _ => !IsLoading && !IsPurging && !IsReconciling && _targetDir is not null);
+            _ => !IsLoading && !IsPurging && !IsReconciling && _destinationAvailable);
         ReconcileApplyCommand = new RelayCommand(
             _ => _ = ReconcileApplyAsync(),
             _ => !IsLoading && !IsPurging && !IsReconciling
-                 && _targetDir is not null && _reconcileReport?.HasChanges == true);
+                 && _destinationAvailable && _reconcileReport?.HasChanges == true);
         CloseCommand = new RelayCommand(_ => DoneRequested?.Invoke());
 
         // The catalog classification (read every record + group/classify into
@@ -187,8 +201,66 @@ public class OrphanedDirectoriesViewModel : ViewModelBase
         }
     }
 
-    /// <summary>True when the backup set has a target directory and so destination scanning is possible.</summary>
-    public bool CanScanDestination => _targetDir is not null;
+    /// <summary>
+    /// True when the backup set has a target directory AND that directory is
+    /// currently reachable, so destination scanning is possible.
+    /// </summary>
+    public bool CanScanDestination => _destinationAvailable;
+
+    /// <summary>
+    /// True when the set has a destination CONFIGURED, regardless of whether it
+    /// is reachable. Drives the visibility of the destination-dependent cards:
+    /// they must stay on screen (and simply not work) when the drive is
+    /// unplugged, rather than vanishing and leaving the user to wonder where the
+    /// destination scan went.
+    /// </summary>
+    public bool HasDestination => _targetDir is not null;
+
+    /// <summary>
+    /// True when the set has a destination configured but it isn't reachable —
+    /// the removable drive is unplugged, the network share is down, or the drive
+    /// letter has changed. Drives the warning banner.
+    /// </summary>
+    public bool IsDestinationUnavailable => _targetDir is not null && !_destinationAvailable;
+
+    /// <summary>Banner text naming the destination that could not be reached.</summary>
+    public string DestinationUnavailableText =>
+        $"Destination not connected: {_targetDir}  —  nothing can be deleted from the " +
+        "backup and the destination cannot be scanned until it is available.";
+
+    /// <summary>
+    /// Re-test whether the destination is reachable and republish the properties
+    /// that depend on it.
+    ///
+    /// Called at the start of every action that needs the destination rather
+    /// than from a property getter, because the answer can change while the
+    /// dialog is open (this is a removable drive) and because a getter is the
+    /// wrong place for I/O — see <see cref="_destinationAvailable"/>.
+    ///
+    /// <para><b>Why this exists at all:</b> the destination used to be treated
+    /// as present whenever the backup set merely had one CONFIGURED, since
+    /// <c>_targetDir</c> is just the saved path string. With the drive
+    /// unplugged, a purge would mark catalog rows deleted, then find
+    /// <c>File.Exists</c> false for every one of them, delete nothing, count
+    /// zero failures, and report success. That is worse than doing nothing: the
+    /// rows are now deleted rows, so the catalog-side categories (which only
+    /// classify ACTIVE files) will never list those files again, and the only
+    /// thing that can still find them is the destination scan's
+    /// "catalog-deleted" category.</para>
+    /// </summary>
+    private void RefreshDestinationAvailability()
+    {
+        bool available = Services.DestinationFilePurger.IsAvailable(_targetDir);
+
+        if (available == _destinationAvailable)
+            return;
+
+        _destinationAvailable = available;
+        OnPropertyChanged(nameof(CanScanDestination));
+        OnPropertyChanged(nameof(IsDestinationUnavailable));
+        OnPropertyChanged(nameof(DestinationUnavailableText));
+        CommandManager.InvalidateRequerySuggested();
+    }
 
     /// <summary>
     /// Live progress text shown next to the "Scan destination filesystem"
@@ -411,6 +483,9 @@ public class OrphanedDirectoriesViewModel : ViewModelBase
     {
         int totalFiles = _activeFiles!.Count;
 
+        // Fresh volume probes each pass: a drive can be plugged in between scans.
+        _rootAvailability.Clear();
+
         progress.SetPhase("Grouping files by directory", totalFiles);
 
         // Group files by parent directory.
@@ -425,7 +500,9 @@ public class OrphanedDirectoriesViewModel : ViewModelBase
         // Classification precedence (strongest reason wins):
         //   1. RemovedFromSources       (parent dir lies outside every source root)
         //   2. MatchesConfiguredExclusion (file path matches an exclusion filter)
-        //   3. DeletedFromDisk          (parent dir is under a source root but no longer exists)
+        //   3. DeletedFromDisk          (the source file is gone: either its directory
+        //                                no longer exists, or the directory is still there
+        //                                but the file itself has been moved or deleted)
         //   4. ExcessVersion            (extra versions beyond retention tier limits)
         //
         // A file that matches multiple reasons appears under the strongest
@@ -455,6 +532,9 @@ public class OrphanedDirectoriesViewModel : ViewModelBase
                     Reason = OrphanedReason.RemovedFromSources,
                     FileCount = byPath.Count,
                     TotalSizeBytes = group.Sum(f => f.SizeBytes),
+                    // The exact paths this item is offering, so the purge marks
+                    // THESE rows and not everything sharing the directory prefix.
+                    MatchingSourcePaths = byPath.Select(g => g.Key).ToList(),
                     Files = byPath
                         .Select(g => new OrphanedFileInfo(
                             Path.GetFileName(g.Key), g.Key, g.Sum(f => f.SizeBytes)))
@@ -491,31 +571,84 @@ public class OrphanedDirectoriesViewModel : ViewModelBase
         var collapsedRemovedPaths = collapsedRemoved
             .Select(r => r.DirectoryPath).ToList();
 
-        progress.SetPhase("Checking deleted directories", totalFiles);
+        progress.SetPhase("Checking deleted files and directories", totalFiles);
         var deletedDirs = new List<OrphanedDirectoryItem>();
+        _unavailableRoots.Clear();
+        _rootAvailability.Clear();
+
+        // Narrow to the groups phases 1-2 have not already claimed, so the
+        // expensive probe below runs over as few directories as possible.
+        var candidates = new List<IGrouping<string, FileRecord>>();
         foreach (var group in dirGroups)
         {
             string dir = group.Key;
             int groupCount = group.Count();
-            if (collapsedRemovedPaths.Any(p => IsPathUnderRoot(dir, p)))
+            if (collapsedRemovedPaths.Any(p => IsPathUnderRoot(dir, p))
+                || !IsDirectoryInSources(dir)
+                // UNREACHABLE IS NOT DELETED. A drive that is merely unplugged
+                // answers "missing" for every path on it, so without this an
+                // unmounted source volume would present its ENTIRE contents as
+                // deleted-from-disk, and cleaning that would delete live backups
+                // of files that still exist. Each root is probed once - serially,
+                // before the parallel pass, so the bookkeeping needs no locking -
+                // and an unavailable one is skipped wholesale and reported to the
+                // user. Same rule CacheMaintenance already applies to its sweep;
+                // see design.md.
+                || !IsRootAvailable(dir))
             {
                 progress.Bump(groupCount);
                 continue;
             }
-            bool inSources = IsDirectoryInSources(dir);
-            if (!inSources || Directory.Exists(dir))
+            candidates.Add(group);
+        }
+
+        // Probe the surviving directories CONCURRENTLY.
+        //
+        // This is pure disk latency, not work: a cold directory open measured
+        // 58.6 ms on this machine's volumes, and 139,470 of them serially is over
+        // two hours. Sixteen at a time is the figure CacheMaintenance arrived at
+        // by measurement (235 probes/s against 21 single-threaded); more makes
+        // the drive unresponsive to everything else for no real gain.
+        //
+        // Reading the NAMES costs almost nothing on top of the open - measured
+        // 64.0 ms against 58.6 ms for a bare Directory.Exists, i.e. +9% - which
+        // is what makes per-file detection affordable at all. And it is needed,
+        // because a directory that still exists says NOTHING about the files that
+        // used to be in it: move a folder's contents elsewhere and leave the
+        // folder (or one remaining subfolder) behind, and every one of those
+        // files keeps an ACTIVE catalog row. The destination scan skips them as
+        // properly tracked, and this phase used to skip them too because it asked
+        // only Directory.Exists, so their backups sat on the destination reported
+        // by no category at all. Measured on a real set: 174 files / 4.8 GB
+        // stranded in a single folder that way.
+        var probes = new ConcurrentDictionary<string, DirProbe>(StringComparer.OrdinalIgnoreCase);
+        System.Threading.Tasks.Parallel.ForEach(
+            candidates,
+            new System.Threading.Tasks.ParallelOptions
             {
-                progress.Bump(groupCount);
+                MaxDegreeOfParallelism = DirectoryProbeParallelism,
+            },
+            group =>
+            {
+                probes[group.Key] = ProbeDirectory(group.Key);
+                progress.Bump(group.Count());
+            });
+
+        // Classify from the probe results: CPU only, and in the original order so
+        // the output does not shuffle between runs.
+        foreach (var group in candidates)
+        {
+            string dir = group.Key;
+            if (!probes.TryGetValue(dir, out var probe) || probe.Skip)
                 continue;
-            }
+            var presentNames = probe.PresentNames;
+
             var remaining = group
                 .Where(f => !excludedPaths.Contains(f.SourcePath))
+                .Where(f => IsSourceGone(f.SourcePath, presentNames))
                 .ToList();
             if (remaining.Count == 0)
-            {
-                progress.Bump(groupCount);
                 continue;
-            }
             // Dedupe by SourcePath so retention versions collapse to one row.
             var remainingByPath = remaining
                 .GroupBy(f => f.SourcePath, StringComparer.OrdinalIgnoreCase)
@@ -526,6 +659,14 @@ public class OrphanedDirectoriesViewModel : ViewModelBase
                 Reason = OrphanedReason.DeletedFromDisk,
                 FileCount = remainingByPath.Count,
                 TotalSizeBytes = remaining.Sum(f => f.SizeBytes),
+                // CRITICAL. This item can now be a directory that still EXISTS,
+                // holding a mixture of files that are gone and files that are
+                // not, so the purge must mark exactly the gone ones. Marking by
+                // directory prefix instead tombstoned the entire subtree: on a
+                // real set that turned 79,364 genuinely-missing files into
+                // 1,203,628 tombstoned rows, because one missing file under a
+                // high-level directory condemned everything beneath it.
+                MatchingSourcePaths = remainingByPath.Select(g => g.Key).ToList(),
                 Files = remainingByPath
                     .Select(g => new OrphanedFileInfo(
                         Path.GetFileName(g.Key), g.Key, g.Sum(f => f.SizeBytes)))
@@ -533,7 +674,6 @@ public class OrphanedDirectoriesViewModel : ViewModelBase
                 DiscFilePaths = _targetDir is null ? null
                     : remaining.Select(f => f.DiscPath.Replace('/', '\\')).ToList(),
             });
-            progress.Bump(groupCount);
         }
 
         // --- Phase 4: ExcessVersion ---
@@ -1273,9 +1413,20 @@ public class OrphanedDirectoriesViewModel : ViewModelBase
     {
         // The destination walk loads its own catalog snapshot (below), so it no
         // longer depends on the on-demand catalog classification having run —
-        // only on the set having a destination directory.
+        // only on the set having a destination directory that is actually there.
+        // Checking here as well as in CanExecute matters because the drive can be
+        // unplugged while the dialog sits open; without it the walk would get as
+        // far as throwing DirectoryNotFoundException and report the failure as if
+        // it were an unexpected error rather than a disconnected drive.
+        RefreshDestinationAvailability();
         if (_targetDir is null)
             return;
+        if (!_destinationAvailable)
+        {
+            DestinationScanStatusText =
+                $"Destination not connected: {_targetDir} — connect it and scan again.";
+            return;
+        }
 
         // Give immediate feedback the moment the button is pressed: flip the
         // busy flag (greys the Scan button via CanExecute) and show a wait
@@ -1417,6 +1568,142 @@ public class OrphanedDirectoriesViewModel : ViewModelBase
         {
             IsScanningDestination = false;
         }
+    }
+
+    /// <summary>
+    /// Whether a catalogued source file is really gone, given the set of file
+    /// names its directory was found to contain (<c>null</c> when the directory
+    /// itself is gone).
+    ///
+    /// <para>A name missing from the directory listing is CONFIRMED with a direct
+    /// <see cref="File.Exists"/> before the file is reported. The name test is
+    /// what makes the scan affordable — one directory read instead of a stat per
+    /// catalogued file — but it compares two strings that reached us by different
+    /// routes: the listing comes from the live directory, while the catalog path
+    /// may have been recorded from a USN journal record. Any disagreement in form
+    /// (an 8.3 short name, a differently normalised Unicode name) would read as
+    /// "missing" and put a perfectly good backup on the deletion list. The
+    /// confirming stat costs one call per file ALREADY believed missing, on a
+    /// directory the probe just warmed, and it removes that entire class of false
+    /// positive. A directory that is itself gone needs no confirmation.</para>
+    /// </summary>
+    private static bool IsSourceGone(string sourcePath, HashSet<string>? presentNames)
+    {
+        if (presentNames is null)
+            return true;    // the whole directory is gone
+
+        if (presentNames.Contains(Path.GetFileName(sourcePath)))
+            return false;
+
+        try
+        {
+            return !File.Exists(sourcePath);
+        }
+        catch
+        {
+            // Cannot tell: treat as present, because the cost of being wrong in
+            // that direction is one uncleaned file, and in the other direction is
+            // a deleted backup.
+            return false;
+        }
+    }
+
+    /// <summary>
+    /// How many directories to probe at once in the deleted-file check. Matches
+    /// the value CacheMaintenance measured for the same kind of work (cold NTFS
+    /// metadata lookups): 16 gave 235 probes/s against 21 single-threaded, and 32
+    /// bought only ~20% more while making the drive unresponsive to everything
+    /// else.
+    /// </summary>
+    private const int DirectoryProbeParallelism = 16;
+
+    /// <summary>
+    /// One directory's probe result.
+    /// <list type="bullet">
+    /// <item><c>Skip</c> - the directory could not be read, so nothing about it
+    /// can be proven and none of its files may be offered for deletion.</item>
+    /// <item><c>PresentNames == null</c> (and not skipped) - the directory itself
+    /// is gone, so every catalogued file under it is gone with it.</item>
+    /// <item>otherwise - the file names that ARE present, to test each catalogued
+    /// file against.</item>
+    /// </list>
+    /// </summary>
+    private readonly record struct DirProbe(bool Skip, HashSet<string>? PresentNames);
+
+    /// <summary>
+    /// Read one directory's file names, or classify it as gone/unreadable.
+    /// Static and self-contained so it is safe to call from many threads at once.
+    /// </summary>
+    private static DirProbe ProbeDirectory(string dir)
+    {
+        try
+        {
+            if (!Directory.Exists(dir))
+                return new DirProbe(false, null);
+
+            var names = new HashSet<string>(StringComparer.OrdinalIgnoreCase);
+            foreach (var file in Directory.EnumerateFiles(dir))
+                names.Add(Path.GetFileName(file));
+            return new DirProbe(false, names);
+        }
+        catch
+        {
+            // Permission denied, a reparse point that will not open, a share that
+            // dropped mid-walk. We cannot prove anything here is missing, and an
+            // unverifiable claim must never become an offer to delete a backup.
+            return new DirProbe(true, null);
+        }
+    }
+
+    /// <summary>
+    /// Per-root availability results for one classification pass, so each volume
+    /// is probed once rather than once per directory. Keyed by path root
+    /// (e.g. <c>D:\</c>).
+    /// </summary>
+    private readonly Dictionary<string, bool> _rootAvailability =
+        new(StringComparer.OrdinalIgnoreCase);
+
+    /// <summary>Roots found unavailable during the last pass, for reporting.</summary>
+    private readonly List<string> _unavailableRoots = [];
+
+    /// <summary>
+    /// Whether the volume <paramref name="path"/> lives on is currently
+    /// reachable. An unreachable root must never be classified: every path on it
+    /// answers "missing", so an unplugged source drive would otherwise present
+    /// its whole contents as deleted-from-disk, and cleaning that would delete
+    /// live backups.
+    /// </summary>
+    private bool IsRootAvailable(string path)
+    {
+        string root;
+        try
+        {
+            root = Path.GetPathRoot(path) ?? "";
+        }
+        catch
+        {
+            return false;
+        }
+        if (root.Length == 0)
+            return false;
+
+        if (_rootAvailability.TryGetValue(root, out bool known))
+            return known;
+
+        bool available;
+        try
+        {
+            available = Directory.Exists(root);
+        }
+        catch
+        {
+            available = false;
+        }
+
+        _rootAvailability[root] = available;
+        if (!available)
+            _unavailableRoots.Add(root);
+        return available;
     }
 
     /// <summary>
@@ -1685,6 +1972,32 @@ public class OrphanedDirectoriesViewModel : ViewModelBase
             .ToList();
         if (selected.Count == 0) return;
 
+        // Refuse outright if the set has a destination that isn't reachable.
+        //
+        // Cleaning is two halves — mark the catalog rows deleted, then delete the
+        // backed-up files — and only the first half can run without the drive.
+        // Doing that half alone is strictly worse than doing nothing: not one byte
+        // is freed, and because every catalog-side category classifies only ACTIVE
+        // files, the rows it just tombstoned drop out of the catalog scan forever.
+        // The files would then be findable only through the destination scan's
+        // "catalog-deleted" category, which is not where anyone would think to look
+        // for them. Previously this ran silently: _targetDir is only the CONFIGURED
+        // path, so with the drive unplugged the purge marked the rows, found
+        // File.Exists false for every path, counted zero deletions AND zero
+        // failures, and reported plain success.
+        RefreshDestinationAvailability();
+        if (IsDestinationUnavailable)
+        {
+            string msg =
+                $"Destination not connected ({_targetDir}) — nothing was cleaned. " +
+                "Connect the drive and run the cleanup again; marking the catalog " +
+                "without deleting the backed-up files would free no space and would " +
+                "hide those files from the catalog scan.";
+            SummaryText = msg;
+            LastCleanupResultText = $"Last cleanup at {DateTime.Now:HH:mm:ss}: {msg}";
+            return;
+        }
+
         IsPurging = true;
         SummaryText = "Purging...";
         PurgeStatusText = "";
@@ -1727,11 +2040,12 @@ public class OrphanedDirectoriesViewModel : ViewModelBase
             // catalog methods are synchronous (ExecuteNonQuery /
             // Task.FromResult) and the filesystem walk for empty-dir
             // cleanup can iterate thousands of directories.
-            var (catalogPurged, filesDeleted, deleteFailures, bytesFreed) = await Task.Run(() =>
+            var (catalogPurged, filesDeleted, deleteFailures, bytesFreed, alreadyAbsent) = await Task.Run(() =>
             {
                 int catPurged = 0;
                 int fDeleted = 0;
                 int fFailed = 0;
+                int fAbsent = 0;
                 long bytes = 0;
 
                 // Shared throttle for both progress phases — matches the
@@ -1794,15 +2108,28 @@ public class OrphanedDirectoriesViewModel : ViewModelBase
                                 catPurged++;
                             }
                         }
-                        else if (wi.Reason is OrphanedReason.MatchesExclusionPattern
-                                           or OrphanedReason.MatchesConfiguredExclusion
-                            && wi.MatchingSourcePaths is not null)
+                        else if (wi.MatchingSourcePaths is not null)
                         {
+                            // Mark exactly the paths this item listed. Every
+                            // category that reaches here now carries its own
+                            // path list, which is the only way the catalog write
+                            // can be guaranteed to match what the user saw and
+                            // ticked.
                             catPurged += _catalog.MarkFilesDeletedBySourcePathsAsync(
                                 backupSetId, wi.MatchingSourcePaths).GetAwaiter().GetResult();
                         }
                         else
                         {
+                            // FALLBACK ONLY, and a dangerous one: this marks
+                            // every row under the directory prefix, RECURSIVELY,
+                            // whether or not the item listed it. That was safe
+                            // only while "deleted from disk" could not mean
+                            // anything but "the whole directory is gone". It no
+                            // longer can, so nothing should be reaching this
+                            // branch; it is kept solely so an item that somehow
+                            // has no path list still purges something rather
+                            // than silently doing nothing. If you add a category,
+                            // give it MatchingSourcePaths.
                             catPurged += _catalog.MarkFilesDeletedByDirectoryAsync(
                                 backupSetId, wi.DirectoryPath).GetAwaiter().GetResult();
                         }
@@ -1829,12 +2156,13 @@ public class OrphanedDirectoriesViewModel : ViewModelBase
                                  .SelectMany(w => w.DiscFilePaths!),
                         StringComparer.OrdinalIgnoreCase);
 
-                    var (deleted, delFailed, delBytes) =
+                    var (deleted, delFailed, delBytes, delAbsent) =
                         Services.DestinationFilePurger.DeleteFilesAndSweep(
                             targetDir, allDiscPaths, progress);
                     fDeleted += deleted;
                     fFailed += delFailed;
                     bytes += delBytes;
+                    fAbsent += delAbsent;
                 }
 
                 // -- 3. Drop the purged files from the in-memory active-file
@@ -1861,7 +2189,7 @@ public class OrphanedDirectoriesViewModel : ViewModelBase
                         || purgedRecordIds.Contains(f.Id));
                 }
 
-                return (catPurged, fDeleted, fFailed, bytes);
+                return (catPurged, fDeleted, fFailed, bytes, fAbsent);
             });
 
             // Back on the UI thread — update the observable collection.
@@ -1878,6 +2206,13 @@ public class OrphanedDirectoriesViewModel : ViewModelBase
                 summary.Add($"deleted {filesDeleted:N0} file{(filesDeleted == 1 ? "" : "s")} ({FormatSizeText(bytesFreed)})");
             if (deleteFailures > 0)
                 summary.Add($"{deleteFailures:N0} deletion failure{(deleteFailures == 1 ? "" : "s")}");
+            // Reported rather than ignored: a file the catalog expects but the
+            // destination doesn't have is how a half-completed earlier purge — or
+            // a destination that isn't really the one the catalog describes —
+            // shows itself. Silence here is what let an offline purge look like a
+            // successful one.
+            if (alreadyAbsent > 0)
+                summary.Add($"{alreadyAbsent:N0} already absent from the destination");
             if (summary.Count == 0)
                 summary.Add("nothing to clean");
 
@@ -1920,6 +2255,16 @@ public class OrphanedDirectoriesViewModel : ViewModelBase
     {
         if (_targetDir is null || IsReconciling || IsPurging)
             return;
+
+        // Reconcile compares the catalog against the destination, so an absent
+        // destination would make every active row look like missing content.
+        RefreshDestinationAvailability();
+        if (!_destinationAvailable)
+        {
+            ReconcileStatusText =
+                $"Destination not connected: {_targetDir} - connect it and analyze again.";
+            return;
+        }
 
         IsReconciling = true;
         SetReconcileReport(null);
@@ -1983,6 +2328,17 @@ public class OrphanedDirectoriesViewModel : ViewModelBase
         if (_targetDir is null || report is null || !report.HasChanges || IsReconciling || IsPurging)
             return;
 
+        // The report was computed against a destination that may since have been
+        // unplugged; applying it then would prune rows whose content is merely
+        // unreachable.
+        RefreshDestinationAvailability();
+        if (!_destinationAvailable)
+        {
+            ReconcileStatusText =
+                $"Destination not connected: {_targetDir} - connect it and analyze again.";
+            return;
+        }
+
         IsReconciling = true;
         ReconcileStatusText = "Applying reconcile...";
 
@@ -2028,9 +2384,20 @@ public class OrphanedDirectoriesViewModel : ViewModelBase
 
     private void UpdateSummaryText()
     {
+        // Skipped roots are reported whether or not anything was found: a scan
+        // that silently omitted an unplugged drive is a scan whose "nothing to
+        // clean up" is not true of the whole set.
+        string skipped = _unavailableRoots.Count == 0
+            ? ""
+            : $"  Skipped {_unavailableRoots.Count} unavailable source "
+              + $"root{(_unavailableRoots.Count == 1 ? "" : "s")} "
+              + $"({string.Join(", ", _unavailableRoots)}) — files there were not "
+              + "classified, because an unreachable drive is not a deleted one.";
+
         if (Items.Count == 0)
         {
-            SummaryText = "Nothing to clean up — the catalog and destination are consistent.";
+            SummaryText = "Nothing to clean up — the catalog and destination are consistent."
+                + skipped;
             return;
         }
 
@@ -2080,7 +2447,7 @@ public class OrphanedDirectoriesViewModel : ViewModelBase
             parts.Add($"{totalDuplicates:N0} duplicate catalog row{(totalDuplicates == 1 ? "" : "s")} in {duplicateCount} director{(duplicateCount == 1 ? "y" : "ies")}");
         }
 
-        SummaryText = string.Join(", ", parts) + " found.";
+        SummaryText = string.Join(", ", parts) + " found." + skipped;
     }
 
     /// <summary>
