@@ -1,5 +1,87 @@
 # LithicBackup — Known Issues & Tech Debt
 
+## FIXED: a file moved out of a folder that still exists was invisible to every cleanup category (2026-09-05)
+
+**Symptom.** Most of `D:\youtube` was moved to `C:\youtube`, leaving one
+subfolder (`philosophy`) behind. The backups of the moved files stayed on the J:
+destination, and neither the catalog scan nor the destination scan mentioned
+them.
+
+**Cause: "Deleted from Disk" tested the DIRECTORY, never the file.**
+
+```csharp
+bool inSources = IsDirectoryInSources(dir);
+if (!inSources || Directory.Exists(dir))   // <- directory still there: skip it all
+{ progress.Bump(groupCount); continue; }
+```
+
+`D:\youtube` still exists — it holds `philosophy` — so every catalogued file
+that used to sit directly in it was skipped. Those rows therefore stayed
+**active**, and an active row is exactly what makes the destination scan skip a
+file as "properly tracked". Two scans, and the file fell between them:
+
+| scan | sees | blind to |
+|---|---|---|
+| catalog scan | active rows, classified against the sources | a file whose directory survived it |
+| destination scan | destination files with no active row | anything still active |
+
+Nothing else would ever have caught it either: the full backup does compute
+`diff.DeletedFiles`, but `FileScanner` says so in as many words — *"Only the
+count is used downstream"* — the number is logged and no row is touched. That is
+deliberate (a deleted source keeps its backup until the user asks), which means
+Cleanup is the ONLY route by which a backup is released, and this gap made that
+route unable to see the files at all.
+
+**Measured on the real J: set:**
+
+| | |
+|---|---|
+| active rows under `D:\youtube` outside `philosophy` | 174 |
+| ...whose source file no longer exists | **174** |
+| ...whose backup copy is still on J: | **174 (4.80 GB)** |
+| where the files went | `C:\youtube` (1,634 files) |
+
+**A wrong turn worth recording: my own first analysis had the identical blind
+spot.** Asked whether anything was hiding on J:, I grouped active rows by parent
+directory and tested `os.path.isdir` — 139,470 directories, 10 missing, "no
+large orphan is hiding". That reproduced the product's bug in the verification
+meant to find it, and I reported the wrong conclusion to the user, who corrected
+it with a concrete counter-example. **A directory-level test does not establish a
+file-level fact** — in the analysis any more than in the app.
+
+**Fix.** Phase 3 now reads each candidate directory's file names once and tests
+every catalogued file against them:
+
+* **One enumeration per directory, not one stat per file** — the catalog holds
+  ten times more files than directories.
+* **Confirmed before it is offered.** A name missing from the listing is checked
+  with `File.Exists` before the file is reported. The listing and the catalog
+  path reach us by different routes (live directory vs, possibly, a USN journal
+  record), so a difference in form — an 8.3 short name, a differently normalised
+  Unicode name — would otherwise read as "missing" and put a good backup on the
+  deletion list. The confirming stat costs one call per file already believed
+  missing, on a directory the probe just warmed.
+* **Unreachable is not deleted.** Each source root is probed once and an
+  unavailable one is skipped wholesale and named in the summary. Without this an
+  unplugged source volume would offer its ENTIRE contents for deletion — the
+  same rule `CacheMaintenance` applies to its sweep and `CatalogReconcileService`
+  to the destination, now applied to the source side too. This hazard predates
+  the fix.
+* **Probed 16-way concurrently**, because this is latency, not work.
+
+**Cost, measured over 3,000 real directories of this set:**
+
+| step | per directory | extrapolated to 139,470, serial |
+|---|---|---|
+| old: `Directory.Exists` | 58.6 ms | 8,177 s |
+| new: `EnumerateFiles` + `HashSet` | 64.0 ms | 8,930 s |
+
+Reading the names costs **+9%** over merely asking whether the directory exists,
+which is what makes per-file detection affordable at all. The serial figures are
+also why the probe is now concurrent: 16 at a time is the value
+`CacheMaintenance` measured for the same kind of cold-metadata work (235
+probes/s against 21 single-threaded), so the pass drops from hours to minutes.
+
 ## FIXED: Cleanup purged the catalog against a destination that wasn't plugged in (2026-09-05)
 
 **Symptom.** Large directories were moved from one drive to another; a Cleanup

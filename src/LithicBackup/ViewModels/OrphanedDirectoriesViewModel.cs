@@ -1,3 +1,4 @@
+using System.Collections.Concurrent;
 using System.Collections.ObjectModel;
 using System.IO;
 using System.Windows.Input;
@@ -482,6 +483,9 @@ public class OrphanedDirectoriesViewModel : ViewModelBase
     {
         int totalFiles = _activeFiles!.Count;
 
+        // Fresh volume probes each pass: a drive can be plugged in between scans.
+        _rootAvailability.Clear();
+
         progress.SetPhase("Grouping files by directory", totalFiles);
 
         // Group files by parent directory.
@@ -496,7 +500,9 @@ public class OrphanedDirectoriesViewModel : ViewModelBase
         // Classification precedence (strongest reason wins):
         //   1. RemovedFromSources       (parent dir lies outside every source root)
         //   2. MatchesConfiguredExclusion (file path matches an exclusion filter)
-        //   3. DeletedFromDisk          (parent dir is under a source root but no longer exists)
+        //   3. DeletedFromDisk          (the source file is gone: either its directory
+        //                                no longer exists, or the directory is still there
+        //                                but the file itself has been moved or deleted)
         //   4. ExcessVersion            (extra versions beyond retention tier limits)
         //
         // A file that matches multiple reasons appears under the strongest
@@ -562,31 +568,84 @@ public class OrphanedDirectoriesViewModel : ViewModelBase
         var collapsedRemovedPaths = collapsedRemoved
             .Select(r => r.DirectoryPath).ToList();
 
-        progress.SetPhase("Checking deleted directories", totalFiles);
+        progress.SetPhase("Checking deleted files and directories", totalFiles);
         var deletedDirs = new List<OrphanedDirectoryItem>();
+        _unavailableRoots.Clear();
+        _rootAvailability.Clear();
+
+        // Narrow to the groups phases 1-2 have not already claimed, so the
+        // expensive probe below runs over as few directories as possible.
+        var candidates = new List<IGrouping<string, FileRecord>>();
         foreach (var group in dirGroups)
         {
             string dir = group.Key;
             int groupCount = group.Count();
-            if (collapsedRemovedPaths.Any(p => IsPathUnderRoot(dir, p)))
+            if (collapsedRemovedPaths.Any(p => IsPathUnderRoot(dir, p))
+                || !IsDirectoryInSources(dir)
+                // UNREACHABLE IS NOT DELETED. A drive that is merely unplugged
+                // answers "missing" for every path on it, so without this an
+                // unmounted source volume would present its ENTIRE contents as
+                // deleted-from-disk, and cleaning that would delete live backups
+                // of files that still exist. Each root is probed once - serially,
+                // before the parallel pass, so the bookkeeping needs no locking -
+                // and an unavailable one is skipped wholesale and reported to the
+                // user. Same rule CacheMaintenance already applies to its sweep;
+                // see design.md.
+                || !IsRootAvailable(dir))
             {
                 progress.Bump(groupCount);
                 continue;
             }
-            bool inSources = IsDirectoryInSources(dir);
-            if (!inSources || Directory.Exists(dir))
+            candidates.Add(group);
+        }
+
+        // Probe the surviving directories CONCURRENTLY.
+        //
+        // This is pure disk latency, not work: a cold directory open measured
+        // 58.6 ms on this machine's volumes, and 139,470 of them serially is over
+        // two hours. Sixteen at a time is the figure CacheMaintenance arrived at
+        // by measurement (235 probes/s against 21 single-threaded); more makes
+        // the drive unresponsive to everything else for no real gain.
+        //
+        // Reading the NAMES costs almost nothing on top of the open - measured
+        // 64.0 ms against 58.6 ms for a bare Directory.Exists, i.e. +9% - which
+        // is what makes per-file detection affordable at all. And it is needed,
+        // because a directory that still exists says NOTHING about the files that
+        // used to be in it: move a folder's contents elsewhere and leave the
+        // folder (or one remaining subfolder) behind, and every one of those
+        // files keeps an ACTIVE catalog row. The destination scan skips them as
+        // properly tracked, and this phase used to skip them too because it asked
+        // only Directory.Exists, so their backups sat on the destination reported
+        // by no category at all. Measured on a real set: 174 files / 4.8 GB
+        // stranded in a single folder that way.
+        var probes = new ConcurrentDictionary<string, DirProbe>(StringComparer.OrdinalIgnoreCase);
+        System.Threading.Tasks.Parallel.ForEach(
+            candidates,
+            new System.Threading.Tasks.ParallelOptions
             {
-                progress.Bump(groupCount);
+                MaxDegreeOfParallelism = DirectoryProbeParallelism,
+            },
+            group =>
+            {
+                probes[group.Key] = ProbeDirectory(group.Key);
+                progress.Bump(group.Count());
+            });
+
+        // Classify from the probe results: CPU only, and in the original order so
+        // the output does not shuffle between runs.
+        foreach (var group in candidates)
+        {
+            string dir = group.Key;
+            if (!probes.TryGetValue(dir, out var probe) || probe.Skip)
                 continue;
-            }
+            var presentNames = probe.PresentNames;
+
             var remaining = group
                 .Where(f => !excludedPaths.Contains(f.SourcePath))
+                .Where(f => IsSourceGone(f.SourcePath, presentNames))
                 .ToList();
             if (remaining.Count == 0)
-            {
-                progress.Bump(groupCount);
                 continue;
-            }
             // Dedupe by SourcePath so retention versions collapse to one row.
             var remainingByPath = remaining
                 .GroupBy(f => f.SourcePath, StringComparer.OrdinalIgnoreCase)
@@ -604,7 +663,6 @@ public class OrphanedDirectoriesViewModel : ViewModelBase
                 DiscFilePaths = _targetDir is null ? null
                     : remaining.Select(f => f.DiscPath.Replace('/', '\\')).ToList(),
             });
-            progress.Bump(groupCount);
         }
 
         // --- Phase 4: ExcessVersion ---
@@ -1502,6 +1560,142 @@ public class OrphanedDirectoriesViewModel : ViewModelBase
     }
 
     /// <summary>
+    /// Whether a catalogued source file is really gone, given the set of file
+    /// names its directory was found to contain (<c>null</c> when the directory
+    /// itself is gone).
+    ///
+    /// <para>A name missing from the directory listing is CONFIRMED with a direct
+    /// <see cref="File.Exists"/> before the file is reported. The name test is
+    /// what makes the scan affordable — one directory read instead of a stat per
+    /// catalogued file — but it compares two strings that reached us by different
+    /// routes: the listing comes from the live directory, while the catalog path
+    /// may have been recorded from a USN journal record. Any disagreement in form
+    /// (an 8.3 short name, a differently normalised Unicode name) would read as
+    /// "missing" and put a perfectly good backup on the deletion list. The
+    /// confirming stat costs one call per file ALREADY believed missing, on a
+    /// directory the probe just warmed, and it removes that entire class of false
+    /// positive. A directory that is itself gone needs no confirmation.</para>
+    /// </summary>
+    private static bool IsSourceGone(string sourcePath, HashSet<string>? presentNames)
+    {
+        if (presentNames is null)
+            return true;    // the whole directory is gone
+
+        if (presentNames.Contains(Path.GetFileName(sourcePath)))
+            return false;
+
+        try
+        {
+            return !File.Exists(sourcePath);
+        }
+        catch
+        {
+            // Cannot tell: treat as present, because the cost of being wrong in
+            // that direction is one uncleaned file, and in the other direction is
+            // a deleted backup.
+            return false;
+        }
+    }
+
+    /// <summary>
+    /// How many directories to probe at once in the deleted-file check. Matches
+    /// the value CacheMaintenance measured for the same kind of work (cold NTFS
+    /// metadata lookups): 16 gave 235 probes/s against 21 single-threaded, and 32
+    /// bought only ~20% more while making the drive unresponsive to everything
+    /// else.
+    /// </summary>
+    private const int DirectoryProbeParallelism = 16;
+
+    /// <summary>
+    /// One directory's probe result.
+    /// <list type="bullet">
+    /// <item><c>Skip</c> - the directory could not be read, so nothing about it
+    /// can be proven and none of its files may be offered for deletion.</item>
+    /// <item><c>PresentNames == null</c> (and not skipped) - the directory itself
+    /// is gone, so every catalogued file under it is gone with it.</item>
+    /// <item>otherwise - the file names that ARE present, to test each catalogued
+    /// file against.</item>
+    /// </list>
+    /// </summary>
+    private readonly record struct DirProbe(bool Skip, HashSet<string>? PresentNames);
+
+    /// <summary>
+    /// Read one directory's file names, or classify it as gone/unreadable.
+    /// Static and self-contained so it is safe to call from many threads at once.
+    /// </summary>
+    private static DirProbe ProbeDirectory(string dir)
+    {
+        try
+        {
+            if (!Directory.Exists(dir))
+                return new DirProbe(false, null);
+
+            var names = new HashSet<string>(StringComparer.OrdinalIgnoreCase);
+            foreach (var file in Directory.EnumerateFiles(dir))
+                names.Add(Path.GetFileName(file));
+            return new DirProbe(false, names);
+        }
+        catch
+        {
+            // Permission denied, a reparse point that will not open, a share that
+            // dropped mid-walk. We cannot prove anything here is missing, and an
+            // unverifiable claim must never become an offer to delete a backup.
+            return new DirProbe(true, null);
+        }
+    }
+
+    /// <summary>
+    /// Per-root availability results for one classification pass, so each volume
+    /// is probed once rather than once per directory. Keyed by path root
+    /// (e.g. <c>D:\</c>).
+    /// </summary>
+    private readonly Dictionary<string, bool> _rootAvailability =
+        new(StringComparer.OrdinalIgnoreCase);
+
+    /// <summary>Roots found unavailable during the last pass, for reporting.</summary>
+    private readonly List<string> _unavailableRoots = [];
+
+    /// <summary>
+    /// Whether the volume <paramref name="path"/> lives on is currently
+    /// reachable. An unreachable root must never be classified: every path on it
+    /// answers "missing", so an unplugged source drive would otherwise present
+    /// its whole contents as deleted-from-disk, and cleaning that would delete
+    /// live backups.
+    /// </summary>
+    private bool IsRootAvailable(string path)
+    {
+        string root;
+        try
+        {
+            root = Path.GetPathRoot(path) ?? "";
+        }
+        catch
+        {
+            return false;
+        }
+        if (root.Length == 0)
+            return false;
+
+        if (_rootAvailability.TryGetValue(root, out bool known))
+            return known;
+
+        bool available;
+        try
+        {
+            available = Directory.Exists(root);
+        }
+        catch
+        {
+            available = false;
+        }
+
+        _rootAvailability[root] = available;
+        if (!available)
+            _unavailableRoots.Add(root);
+        return available;
+    }
+
+    /// <summary>
     /// Minimal catalog projection the destination walk needs per disc-path: is
     /// there a still-active record (so the on-disk file is properly tracked and
     /// should be skipped), and the source path for display when only deleted
@@ -2166,9 +2360,20 @@ public class OrphanedDirectoriesViewModel : ViewModelBase
 
     private void UpdateSummaryText()
     {
+        // Skipped roots are reported whether or not anything was found: a scan
+        // that silently omitted an unplugged drive is a scan whose "nothing to
+        // clean up" is not true of the whole set.
+        string skipped = _unavailableRoots.Count == 0
+            ? ""
+            : $"  Skipped {_unavailableRoots.Count} unavailable source "
+              + $"root{(_unavailableRoots.Count == 1 ? "" : "s")} "
+              + $"({string.Join(", ", _unavailableRoots)}) — files there were not "
+              + "classified, because an unreachable drive is not a deleted one.";
+
         if (Items.Count == 0)
         {
-            SummaryText = "Nothing to clean up — the catalog and destination are consistent.";
+            SummaryText = "Nothing to clean up — the catalog and destination are consistent."
+                + skipped;
             return;
         }
 
@@ -2218,7 +2423,7 @@ public class OrphanedDirectoriesViewModel : ViewModelBase
             parts.Add($"{totalDuplicates:N0} duplicate catalog row{(totalDuplicates == 1 ? "" : "s")} in {duplicateCount} director{(duplicateCount == 1 ? "y" : "ies")}");
         }
 
-        SummaryText = string.Join(", ", parts) + " found.";
+        SummaryText = string.Join(", ", parts) + " found." + skipped;
     }
 
     /// <summary>

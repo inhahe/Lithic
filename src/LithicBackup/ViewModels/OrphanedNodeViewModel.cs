@@ -241,7 +241,8 @@ public class OrphanedCategoryViewModel : ViewModelBase
         OrphanedReason.RemovedFromSources =>
             "Catalogued directories whose paths are no longer covered by any source root.",
         OrphanedReason.DeletedFromDisk =>
-            "Catalogued directories that no longer exist on disk.",
+            "Catalogued files that no longer exist on disk — either their directory is "
+            + "gone, or the directory is still there but the file has been moved or deleted.",
         OrphanedReason.MatchesExclusionPattern =>
             "Files matching the manual exclusion patterns entered above.",
         OrphanedReason.MatchesConfiguredExclusion =>

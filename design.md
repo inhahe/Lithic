@@ -196,6 +196,49 @@ filter too** — including routes that only rewrite a `SourcePath` without copyi
 bytes, which are exactly the ones where the omission is invisible until a
 Cleanup scan contradicts the backup.
 
+## Cleanup's categories have to cover every way a backup becomes garbage
+
+Nothing removes a backup automatically. The full backup computes
+`diff.DeletedFiles` — catalogued source paths the scan didn't find — but
+**only its count is used**: the number is logged and shown, and no row is
+touched. That is deliberate (a deleted source keeps its backup and version
+history until the user asks), and it makes **Cleanup the only route by which a
+backup is ever released**. So a gap in Cleanup's categories is not cosmetic: it
+is backup content that nothing in the product can ever find.
+
+The categories divide the work between two scans, and the division is the trap:
+
+| scan | sees | blind to |
+|---|---|---|
+| catalog scan | **active** rows, classified against the sources | anything whose row is already deleted |
+| destination scan | files on the destination with **no active row** | anything whose row is still active |
+
+A file with an **active row whose source is gone** must therefore be caught by
+the catalog scan, because the destination scan skips it by design — an active
+row means "properly tracked".
+
+**A directory-level test does not establish a file-level fact.** "Deleted from
+disk" used to ask only `Directory.Exists(parentDir)`, so moving a folder's
+*contents* elsewhere and leaving the folder behind (even just one remaining
+subfolder) left every one of those files with an active row, a live copy on the
+destination, and no category willing to name it. Measured on a real set: 174
+files / 4.8 GB in one folder. The check now reads the directory's file names
+once and tests each catalogued file against them, confirming a miss with
+`File.Exists` before offering anything for deletion.
+
+**Unreachable is not deleted — and this rule now has three sites.** A drive that
+is merely unplugged answers "missing" for every path on it, so a source-side
+classification must probe each root once and skip unavailable ones wholesale
+(reporting them), exactly as `CacheMaintenance` does for its sweep and
+`CatalogReconcileService` does for the destination. Getting this wrong on the
+source side would offer the whole volume for deletion.
+
+**Probing is latency, so probe concurrently.** A cold directory open measured
+58.6 ms on this machine's volumes; 139,470 of them serially is over two hours.
+Reading the names as well costs 64.0 ms — **+9%** — which is what makes per-file
+detection affordable. Sixteen at a time, the same figure `CacheMaintenance`
+measured for the same kind of work.
+
 ## A configured destination is not a present one
 
 A backup set's destination is a saved **path string** (`JobOptions.TargetDirectory`).
