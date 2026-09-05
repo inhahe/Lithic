@@ -532,6 +532,9 @@ public class OrphanedDirectoriesViewModel : ViewModelBase
                     Reason = OrphanedReason.RemovedFromSources,
                     FileCount = byPath.Count,
                     TotalSizeBytes = group.Sum(f => f.SizeBytes),
+                    // The exact paths this item is offering, so the purge marks
+                    // THESE rows and not everything sharing the directory prefix.
+                    MatchingSourcePaths = byPath.Select(g => g.Key).ToList(),
                     Files = byPath
                         .Select(g => new OrphanedFileInfo(
                             Path.GetFileName(g.Key), g.Key, g.Sum(f => f.SizeBytes)))
@@ -656,6 +659,14 @@ public class OrphanedDirectoriesViewModel : ViewModelBase
                 Reason = OrphanedReason.DeletedFromDisk,
                 FileCount = remainingByPath.Count,
                 TotalSizeBytes = remaining.Sum(f => f.SizeBytes),
+                // CRITICAL. This item can now be a directory that still EXISTS,
+                // holding a mixture of files that are gone and files that are
+                // not, so the purge must mark exactly the gone ones. Marking by
+                // directory prefix instead tombstoned the entire subtree: on a
+                // real set that turned 79,364 genuinely-missing files into
+                // 1,203,628 tombstoned rows, because one missing file under a
+                // high-level directory condemned everything beneath it.
+                MatchingSourcePaths = remainingByPath.Select(g => g.Key).ToList(),
                 Files = remainingByPath
                     .Select(g => new OrphanedFileInfo(
                         Path.GetFileName(g.Key), g.Key, g.Sum(f => f.SizeBytes)))
@@ -2097,15 +2108,28 @@ public class OrphanedDirectoriesViewModel : ViewModelBase
                                 catPurged++;
                             }
                         }
-                        else if (wi.Reason is OrphanedReason.MatchesExclusionPattern
-                                           or OrphanedReason.MatchesConfiguredExclusion
-                            && wi.MatchingSourcePaths is not null)
+                        else if (wi.MatchingSourcePaths is not null)
                         {
+                            // Mark exactly the paths this item listed. Every
+                            // category that reaches here now carries its own
+                            // path list, which is the only way the catalog write
+                            // can be guaranteed to match what the user saw and
+                            // ticked.
                             catPurged += _catalog.MarkFilesDeletedBySourcePathsAsync(
                                 backupSetId, wi.MatchingSourcePaths).GetAwaiter().GetResult();
                         }
                         else
                         {
+                            // FALLBACK ONLY, and a dangerous one: this marks
+                            // every row under the directory prefix, RECURSIVELY,
+                            // whether or not the item listed it. That was safe
+                            // only while "deleted from disk" could not mean
+                            // anything but "the whole directory is gone". It no
+                            // longer can, so nothing should be reaching this
+                            // branch; it is kept solely so an item that somehow
+                            // has no path list still purges something rather
+                            // than silently doing nothing. If you add a category,
+                            // give it MatchingSourcePaths.
                             catPurged += _catalog.MarkFilesDeletedByDirectoryAsync(
                                 backupSetId, wi.DirectoryPath).GetAwaiter().GetResult();
                         }
