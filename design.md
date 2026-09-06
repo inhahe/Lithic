@@ -164,6 +164,165 @@ every directory beneath it. Two separate payoffs, worth keeping straight:
 directory's *own* mtime, which does not change when a file deep inside a
 descendant grows. Totals can therefore lag until the scheduler recomputes.
 
+## Cleanup's results are resizable in three ways, and the reason matters
+
+Reading a path in the results tree is a width problem, and there are three levers,
+all now user-controlled:
+
+* **The Files and Size columns are draggable** (splitters on their left edges in
+  the header; widths shared with every row through the `CleanupColumnLayout`
+  resource object, persisted). Directory is a star column, so whatever they give
+  up it takes.
+* **The dividers between category cards are draggable** — the cards flow in a
+  `WrapPanel` with a per-card `WidthOverride`, so widening one pushes its
+  neighbour along. Double-click a divider to return that card to its share.
+* **Categories per row (1-3)** as a quick preset, persisted.
+
+**Measure the space that is actually left, not the column total.** The first
+attempt at this dismissed column resizing on the grounds that reclaiming Files
+and Size buys "only ~136px" of a ~160px name column — an 85% gain, seemingly not
+worth building. That was the wrong quantity. The tree indents **19px per level**,
+so at five levels deep the name column has ~65px of *usable* width, and handing
+back 136px takes it to ~201px: **three times** the readable space. A gain that
+looks marginal against the whole column is decisive against what remains after
+the indent.
+
+**Horizontal scrolling inside a card was rejected for a reason that only applies
+to one implementation of it.** Content-sizing the name column and sharing it with
+`SharedSizeGroup` would jitter under virtualization, because a shared group
+measures only *realised* rows. But an explicitly-sized name column has nothing to
+measure, so a row wider than the card would simply scroll. It is not implemented
+because the two levers above cover the cases seen so far — not because it cannot
+work. If deep trees still run out of room, that is the next thing to build.
+
+## A source scan must not walk what it will never back up
+
+Exclusions were applied per FILE, and the scanner recursed into every
+subdirectory regardless — so a set excluding `**/build/**`, `**/debug/**`,
+`**/target*/*` still walked every directory of every build tree, rejecting the
+files one at a time. On a spinning disk at ~3.4 ms per directory operation, that
+was the bulk of the scan.
+
+`GlobMatcher.CreateDirectorySubtreeFilter` answers the stricter question — is
+EVERY file anywhere beneath this directory excluded — and `FileScanner` skips
+those subtrees. Measured on a real tree with the real pattern set: **69.4 s ->
+10.8 s, 6.4x**, with the resulting file list **identical** (0 lost, 0 gained).
+
+**Being wrong here means a file is silently never backed up, so the predicate is
+conservative by construction:**
+
+* only patterns ending `/*` or `/**` qualify; the part before becomes an anchored
+  regex matched against the directory. `**/debug/**` prunes a `debug` directory;
+  `**/debug/*.obj` prunes nothing, because it excludes only some of the files.
+* filename-only patterns (`*.raw`) never prune — a directory can hold any name.
+* zero-tier tier sets prune only when they have no `FileExemptPatterns`, since an
+  exemption can re-include a file deep inside.
+* `/**` alone is refused rather than pruning everything.
+* **Soundness depends on `*` crossing separators** in this GlobMatcher (`*` ->
+  `.*`). That is what makes `dir/*` cover `dir/a/b/c`. If `*` is ever changed to
+  stop at a separator, this must change with it or it will prune subtrees whose
+  deeper files are not excluded.
+
+**And the progress counter must not be able to look stopped.** `FilesFound`
+counts only files that will be backed up, so crossing a large excluded tree pins
+it at one number for hours; that is what "stuck at 657,774 files scanned" was —
+a healthy scan with nothing to report. `ScanProgress` now carries
+`DirectoriesScanned` and the UI shows it alongside. A progress indicator that can
+legitimately freeze is not a progress indicator.
+
+## Build the answer, not a copy of the question
+
+The destination scan needs, per disc path, one bit — is any record still active,
+meaning the file on disk is properly tracked — and, only for paths where every
+record is deleted, one source path to display. It used to get there by
+materialising every row (`List<(DiscPath, IsDeleted, SourcePath)>`) and then
+building a `Dictionary<string, List<DestPathRecord>>` on top, so the rows were
+held twice over and a `List` object existed per path.
+
+Measured on a real 2,810,190-row set:
+
+| shape | peak |
+|---|---|
+| rows materialised + a record list per path | **1,751 MB** |
+| aggregated as the rows arrive | 754 MB |
+| …and keyed by a 128-bit path hash | **164 MB** |
+
+with identical verdicts on every path at each step.
+`ICatalogRepository.ForEachDiscPathEntryAsync` streams the rows to a callback and
+`DestPathState` holds the aggregate, whose source-path field is nulled the moment
+an active record appears — so most of the strings become garbage as they are read.
+`Services/DiscPathKey` then removes the path strings themselves.
+
+**Hashing a key you will make deletion decisions from needs an argument, and
+"the odds are tiny" is the weakest one available.** The real argument here is
+that the aggregation is *collision-safe by construction*: active wins, and
+nothing ever clears it, so a file whose own path has an active record reads back
+as active whatever collides with it. Every collision outcome is "miss an orphan",
+never "offer a real backup for deletion". The birthday bound (≈1.2e-26 at 128
+bits over 2.8M paths) is then a footnote, and measurement confirmed 0 collisions
+and 0 changed verdicts across 2,803,602 real paths.
+
+**What that argument depends on, so do not break it:** if a future change ever
+lets a *deleted* record overwrite an active one for the same key, collisions stop
+being safe and this becomes a way to delete live backups. Keep "active wins"
+unconditional.
+
+**The general shape: a lookup should hold what the question reduces to.** If you
+find yourself keeping records so a later pass can reduce them, reduce them on the
+way in — and if what remains is still mostly the keys, ask whether the keys
+themselves need to be there.
+
+## Anything that can move while nobody is watching must log
+
+Only the Worker logged its backups, so a backup started from the GUI left no
+trace on disk. When a task window vanished during one, there was no record that a
+backup had even started, and the cause had to be inferred from reading the code
+rather than read off a log line. `MainViewModel` now writes start, finish
+(flagging errors) and nothing-to-do through `CrashLogger.Log`, into the same
+daily log the Worker uses.
+
+## Each task owns a window; nothing may navigate on the user's behalf
+
+Task flows — Cleanup, Restore, Verify, Coverage, Test Disc, Largest Files, Find
+File, Catalog-free Restore — each open in their **own non-modal top-level
+window** (`Views/TaskWindow`, opened and tracked by
+`Services/TaskWindowManager`). They set no `Owner` and do appear in the taskbar,
+so a multi-hour scan can sit behind the main window and survives it being
+minimised.
+
+**Why, and what it replaced.** They used to be swapped into the main window's
+`CurrentView`. That made the current task a piece of *global* state, so any code
+that assigned `CurrentView` destroyed whatever the user was doing — and two
+places did, as part of a backup's lifecycle rather than a navigation:
+`StartBurn` reset the view so the row's progress panel would be visible, and
+`ShowNoOpCompletion` did the same. Starting a backup therefore silently
+discarded a running Cleanup destination scan; observed once, after several
+hours of scanning.
+
+**The rule: a backup starting or finishing must never change what the user is
+looking at.** More generally, no background event may navigate. If a piece of UI
+needs to be seen, it appears where it belongs and waits.
+
+`CurrentView` and `GoHome` still exist but nothing assigns a flow to them. If you
+add a task flow, give it a window — do not reintroduce an inline view, because
+the moment one exists the global-state hazard is back.
+
+**Concurrency between windows is policed, not assumed.** Several task windows may
+be open at once, which means two of them can act on one backup set.
+`TaskKind` records what each flow does (`WritesCatalog`, `WritesDestination`,
+`ReadsDestination`) and `TaskWindowManager` uses it to:
+
+* refuse a **second window of the same task on the same set** — it focuses the
+  existing one instead, since two Cleanups purging one catalog is not something
+  the catalog is built for;
+* **warn and ask** before opening a task whose access conflicts with another
+  window already open on that set, or with a **backup running** for it (a
+  running backup is a writer too, even though it has no window).
+
+Read-only pairs (Coverage alongside Cleanup) open silently. Adding a flow means
+declaring its access honestly; understating it is how you get two writers on one
+catalog with no warning.
+
 ## Exclusion rules are an invariant of the catalog, not a step in one code path
 
 A file is excluded from a set by any of: a user glob in `ExcludedExtensions`, a

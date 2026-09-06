@@ -71,7 +71,9 @@ public class VerifyService : IVerifyService
         // --- Check 1: every current source file is represented in the backup. ---
         progress?.Report(new VerifyProgress { StatusMessage = "Scanning source files..." });
         var isExcluded = DirectoryBackupService.BuildExclusionFilter(job);
-        var scanned = await _scanner.ScanAsync(job.Sources, progress: null, ct, isExcluded);
+        var scanned = await _scanner.ScanAsync(
+            job.Sources, progress: null, ct, isExcluded,
+            DirectoryBackupService.BuildDirectoryPruneFilter(job));
 
         int sourceChecked = 0;
         foreach (var file in scanned)

@@ -1,5 +1,128 @@
 # LithicBackup — Known Issues & Tech Debt
 
+## FIXED: the destination scan held the catalog twice over (2026-09-06)
+
+**Symptom.** After a destination scan of a 2.8M-row set, the GUI process had a
+peak working set of **5,037 MB** and was still holding 2,983 MB. Nothing failed,
+but an allocation failure at that size was close enough to be worth removing —
+and it was noticed only because the process was still running while a different
+bug was being investigated.
+
+**Cause.** The scan materialised every catalog row and *then* built its lookup on
+top, so the rows were held twice and a `List` object existed per disc path — for
+a question that reduces to one bit for all but a handful of paths.
+
+**Fix.** `ForEachDiscPathEntryAsync` streams rows to a callback, and
+`DestPathState` aggregates as they arrive: an active record sets the bit and
+nulls the stored source path, so the strings for the (vast majority) active paths
+become garbage immediately instead of being retained.
+
+**Measured on the real 2,810,190-row set-11 catalog:**
+
+| | |
+|---|---|
+| before | 1,751 MB |
+| after | **754 MB** (57% less) |
+| verdicts changed | **0** of 2,803,380 paths |
+
+Confirmed end-to-end by driving the shipped `ForEachDiscPathEntryAsync` against
+the live catalog: 2,810,310 rows to 2,803,500 paths, managed heap +754.0 MB,
+matching the prediction exactly.
+
+**Follow-up the same day: the paths are now hashed, and 750 MB became 164 MB.**
+
+The paragraph that stood here said hashing was rejected because "a collision
+would mean either failing to report a file or offering a real backup for
+deletion". **The second half of that was wrong**, and it was the half doing the
+work. The lookup aggregates with *active wins* — any active record for a path
+sets `HasActive` and nothing ever clears it — so a file whose own path has an
+active record reads back as active no matter what collides with it. Every
+possible collision outcome is therefore the safe direction: something that should
+have been reported as untracked or catalog-deleted is skipped. **"Miss an
+orphan", never "delete a real backup."** The design was already collision-safe by
+construction; the objection was to a hazard that could not occur.
+
+With that settled, the odds are a footnote rather than the argument: 128 bits
+over 2.8M paths gives a birthday bound of about N²/2^129 ≈ **1.2e-26**, far below
+the chance of an undetected memory error during the same scan. And there is
+precedent — file-level dedup already keeps ONE copy when two files' SHA-256
+match, which stakes far more on hash equality than a lookup does.
+
+`Services/DiscPathKey` hashes with SHA-256 truncated to 128 bits, upper-casing
+per character with `char.ToUpperInvariant` and mapping `/` to `\` as it goes.
+That per-character step is not incidental: `OrdinalIgnoreCase` is defined as
+comparing per-character invariant uppercase forms, and getting it wrong is the
+one genuinely dangerous mistake available here — a path that stopped matching its
+own catalog entry would be reported as untracked and offered for deletion.
+
+**Measured against the real 2.81M-row catalog, through the shipped code:**
+
+| | |
+|---|---|
+| original (rows materialised + a list per path) | 1,751 MB |
+| streamed, string-keyed | 754 MB |
+| streamed, 128-bit-keyed | **164 MB** (91% below the original) |
+| collisions among 2,803,602 distinct paths | **0** |
+| verdict disagreements vs the string-keyed lookup | **0** |
+
+## FIXED: starting a backup silently discarded whatever task was open (2026-09-06)
+
+**Symptom.** A Cleanup destination scan was left running on the I: set. Hours
+later the app was sitting on the main screen with no scan and no error, and a J:
+backup had run in the meantime.
+
+**Ruled out first, by evidence rather than by guess:**
+
+| Suspicion | Verdict |
+|---|---|
+| The app crashed and restarted | **No.** No crash log since July, and the GUI process was the *same PID*, started hours earlier |
+| An unhandled exception reset the view | **No.** `App.DispatcherUnhandledException` writes a crash log, shows a modal error box, and leaves `Handled = false` so WPF terminates the process. None of the three happened |
+| Out of memory during the scan | **No**, for the same reason — and the process was still alive, holding 2.9 GB with a 5.0 GB peak |
+| The Cleanup view closed itself | **No.** Its `DoneRequested` is raised only by the Close button |
+
+**Cause.** Task flows were swapped into the main window's `CurrentView`, making
+"what the user is looking at" a piece of global state that any code could
+overwrite. Two places did, as part of a backup's lifecycle rather than as
+navigation:
+
+```csharp
+// StartBurn - when a backup STARTS
+CurrentView = null;        // return to home screen
+row.Progress = progressVm; // show this row's inline progress panel
+
+// ShowNoOpCompletion - when a run finds nothing to do
+CurrentView = null;        // return to the home screen
+```
+
+Neither asked what was on screen. The row's progress panel lives on the home
+screen, so starting a backup navigated there — discarding the open task and any
+work inside it. A Cleanup destination scan is the worst case: hours of walking
+1.3M destination files, thrown away with no message.
+
+**Fix: each task owns a non-modal top-level window** (`Views/TaskWindow`,
+managed by `Services/TaskWindowManager`). A window that belongs to a task cannot
+be discarded by an unrelated part of the app, so the whole class of bug goes
+away rather than this one instance of it. `CurrentView` still exists but nothing
+assigns a flow to it, and the two lines above are gone.
+
+Several windows may now be open at once, so `TaskKind` records what each flow
+does (`WritesCatalog` / `WritesDestination` / `ReadsDestination`) and the manager
+refuses a second window of the same task on one set (it focuses the existing
+one), and warns before opening a task that conflicts with another window on that
+set — or with a backup running for it, since a running backup is a writer too.
+
+**Verified** against the built assembly: all 11 flow templates resolve from the
+application resources, `TaskWindow` renders with no owner and its own taskbar
+button, and the policy fires exactly where intended with a Cleanup window open on
+set 1:
+
+    Coverage on set 1      -> quiet     LargestFiles on set 1 -> quiet
+    Verify on set 1        -> WARN      Restore on set 1      -> WARN
+    Verify on set 2        -> quiet     Cleanup, backup running -> WARN
+
+**The general rule, now in design.md:** no background event may navigate. A
+backup starting or finishing must never change what the user is looking at.
+
 ## FIXED: cleaning one missing file tombstoned its whole directory subtree (2026-09-05)
 
 **Introduced and found the same day, by the fix immediately below it.** Teaching
@@ -50,15 +173,62 @@ why it is dangerous.
 listed the files; the catalog write used a path prefix. Any time those two can
 disagree, they eventually will.
 
-**Recovery** for a catalog already damaged by this is not automatic. The pre-purge
-state is not recoverable from the database (the purge had already been
-checkpointed into the main file, so opening it without its `-wal` shows the
-damaged state too). What makes repair possible is the same asymmetry above: the
-content of a wrongly-tombstoned row is still on the destination, because the
-purge only deleted the files it listed. Before the purge the set held one active
-row per destination file (1,422,824 active rows against 1,423,344 files), so the
-repair is to restore that 1:1 mapping — one active row per surviving destination
-file, preferring a row whose source path still exists.
+### Recovering a catalog already damaged by it
+
+Done once, on the real J: set, 2026-09-05. Worth keeping because the reasoning
+generalises to any bulk mis-tombstoning.
+
+**The pre-purge state is NOT recoverable from the database.** The obvious trick —
+open the main `.db` without its `-wal`, on the theory that the purge is still
+only in the log — does not work: the purge had already been checkpointed into the
+main file, so opening it alone reported the same 219,196 active rows. Neither is
+there a manifest (Cleanup writes none) nor a catalog copy on the destination.
+
+**What makes repair possible is the bug's own asymmetry.** The purge marked
+1,203,628 rows but deleted only ~182 GB of files, because the physical delete
+used each item's `DiscFilePaths` — exactly what was listed — while the catalog
+write used a path prefix. So the content of a wrongly-tombstoned row is still on
+the destination.
+
+**Do NOT repair by "restore every tombstoned row whose file still exists".** That
+over-restores badly: 1,651,374 rows matched, against only 1,203,628 actually
+flipped. Several rows can share one disc path (retention versions,
+`.dedup`/`.fileref` manifests, re-seed duplicates), so file existence does not
+identify a row.
+
+**Repair by rebuilding the invariant instead: ONE active row per file on the
+destination.** Before the purge the set held 1,422,824 active rows against
+1,423,344 files — a 1:1 mapping, and that is what to restore:
+
+1. Stop the worker (set `Global\LithicBackup.Worker.Shutdown`; the service cannot
+   be stopped without elevation, but a process may always close itself). A
+   scheduled full backup against the damaged catalog would see every tombstoned
+   file as new and re-copy it — here, 965 GiB.
+2. Copy `set-4.db` and `set-4.db-wal` aside before touching anything.
+3. Enumerate the destination; export `Id, IsDeleted, Version, DiscPath, SourcePath`.
+4. For each disc path present on disk: if a row is already active, leave it;
+   otherwise activate exactly ONE — preferring a row whose `SourcePath` still
+   exists, then the highest `Version`, then the highest `Id`.
+5. Rows whose disc path is absent stay tombstoned: their content really is gone,
+   which is the half of the purge that was correct.
+
+**Result, with three independent checks that all landed within ~500 rows:**
+
+| | |
+|---|---|
+| active rows restored | 219,196 -> **1,343,962** |
+| files on the destination | 1,343,980 (difference = 18 untracked files) |
+| rows restored vs rows flipped | 1,124,766 vs 1,203,628; gap 78,862 against the 79,364 genuinely-missing files |
+| tombstoned after | 2,095,960 vs expected 2,017,098 + 79,364 = 2,096,462 |
+
+`PRAGMA quick_check` returned `ok`. Spot checks confirmed the right rows moved:
+a live source file went back to active, while files moved to `C:\youtube` and the
+220,809 rows under `D:\AI\` (moved to `E:\AI`) correctly stayed tombstoned.
+
+**The lesson for the next bulk catalog operation:** three different ways of
+counting the same repair agreed to within 500 rows out of 3.4 million. If they
+had not agreed, the repair would have been wrong — and a repair that cannot be
+cross-checked against an independent measurement should not be applied.
 
 ## FIXED: a file moved out of a folder that still exists was invisible to every cleanup category (2026-09-05)
 

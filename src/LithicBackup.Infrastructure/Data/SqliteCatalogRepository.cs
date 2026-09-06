@@ -403,8 +403,12 @@ public class SqliteCatalogRepository : ICatalogRepository
     public Task<IReadOnlyList<FileRecord>> GetAllFilesForBackupSetAsync(int backupSetId, CancellationToken ct = default, IProgress<int>? rowProgress = null)
         => GetSet(backupSetId).GetAllFilesForBackupSetAsync(backupSetId, ct, rowProgress);
 
-    public Task<IReadOnlyList<(string DiscPath, bool IsDeleted, string SourcePath)>> GetDiscPathEntriesForBackupSetAsync(int backupSetId, CancellationToken ct = default, IProgress<int>? rowProgress = null)
-        => GetSet(backupSetId).GetDiscPathEntriesForBackupSetAsync(backupSetId, ct, rowProgress);
+    public Task ForEachDiscPathEntryAsync(
+        int backupSetId,
+        Action<string, bool, string> onEntry,
+        CancellationToken ct = default,
+        IProgress<int>? rowProgress = null)
+        => GetSet(backupSetId).ForEachDiscPathEntryAsync(backupSetId, onEntry, ct, rowProgress);
 
     public Task<Dictionary<string, FileVersionInfo>> GetLatestVersionInfoAsync(int backupSetId, CancellationToken ct = default)
         => GetSet(backupSetId).GetLatestVersionInfoAsync(backupSetId, ct);

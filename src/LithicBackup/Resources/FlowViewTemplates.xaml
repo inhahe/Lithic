@@ -1,0 +1,54 @@
+<!--
+    One place that maps a flow view model to its view.
+
+    These used to be duplicated inside MainWindow.xaml and
+    BackupSetEditorWindow.xaml, which meant a window could only host the flows
+    whose templates someone had remembered to paste into it. Now that every task
+    opens in its own TaskWindow, the mapping has to be reachable from ANY window,
+    so it lives in the application resources and each host just binds Content.
+
+    Adding a flow = add its DataTemplate here, and nowhere else.
+-->
+<ResourceDictionary xmlns="http://schemas.microsoft.com/winfx/2006/xaml/presentation"
+                    xmlns:x="http://schemas.microsoft.com/winfx/2006/xaml"
+                    xmlns:vm="clr-namespace:LithicBackup.ViewModels"
+                    xmlns:views="clr-namespace:LithicBackup.Views">
+
+    <!-- Backup-set editor flows (hosted by BackupSetEditorWindow) -->
+    <DataTemplate DataType="{x:Type vm:SourceSelectionViewModel}">
+        <views:SourceSelectionView />
+    </DataTemplate>
+    <DataTemplate DataType="{x:Type vm:BackupJobViewModel}">
+        <views:BackupJobView />
+    </DataTemplate>
+    <DataTemplate DataType="{x:Type vm:BackupReviewViewModel}">
+        <views:BackupReviewView />
+    </DataTemplate>
+
+    <!-- Task flows (each hosted by its own TaskWindow) -->
+    <DataTemplate DataType="{x:Type vm:RestoreViewModel}">
+        <views:RestoreView />
+    </DataTemplate>
+    <DataTemplate DataType="{x:Type vm:CatalogFreeRestoreViewModel}">
+        <views:CatalogFreeRestoreView />
+    </DataTemplate>
+    <DataTemplate DataType="{x:Type vm:OrphanedDirectoriesViewModel}">
+        <views:OrphanedDirectoriesView />
+    </DataTemplate>
+    <DataTemplate DataType="{x:Type vm:FindFileViewModel}">
+        <views:FindFileView />
+    </DataTemplate>
+    <DataTemplate DataType="{x:Type vm:BackupCoverageViewModel}">
+        <views:BackupCoverageView />
+    </DataTemplate>
+    <DataTemplate DataType="{x:Type vm:VerifyIntegrityViewModel}">
+        <views:VerifyIntegrityView />
+    </DataTemplate>
+    <DataTemplate DataType="{x:Type vm:TestDiscViewModel}">
+        <views:TestDiscView />
+    </DataTemplate>
+    <DataTemplate DataType="{x:Type vm:LargestFilesViewModel}">
+        <views:LargestFilesView />
+    </DataTemplate>
+
+</ResourceDictionary>

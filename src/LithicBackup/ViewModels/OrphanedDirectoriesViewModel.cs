@@ -37,6 +37,9 @@ public class OrphanedDirectoriesViewModel : ViewModelBase
     /// that needs the destination, which is the moment the answer has to be right.
     /// </summary>
     private bool _destinationAvailable;
+
+    /// <summary>Category cards per row; see <see cref="CategoryColumns"/>.</summary>
+    private int _categoryColumns = 3;
     private bool _isLoading;
     private bool _isPurging;
     private bool _isScanningDestination;
@@ -68,6 +71,16 @@ public class OrphanedDirectoriesViewModel : ViewModelBase
         _targetDir = backupSet.JobOptions?.TargetDirectory;
         _reconcile = new CatalogReconcileService(catalog);
         RefreshDestinationAvailability();
+
+        try
+        {
+            int saved = UserSettings.Load().CleanupCategoryColumns;
+            _categoryColumns = saved < 1 ? 1 : (saved > 3 ? 3 : saved);
+        }
+        catch
+        {
+            // Keep the default of three.
+        }
 
         Items = [];
         Categories = [];
@@ -199,6 +212,62 @@ public class OrphanedDirectoriesViewModel : ViewModelBase
             if (SetProperty(ref _isScanningDestination, value))
                 CommandManager.InvalidateRequerySuggested();
         }
+    }
+
+    /// <summary>
+    /// Category cards per row (1-3). Persisted, because it is a working
+    /// preference rather than a per-scan choice: someone cleaning a deep tree
+    /// wants the wide layout every time they open Cleanup, not once.
+    ///
+    /// <para>Three fits the most categories on screen, but gives each card a
+    /// third of the window; with the tree indenting 19px per level, a deep path
+    /// is squeezed out of the name column entirely. One column trades seeing
+    /// several categories at once for being able to read the paths.</para>
+    /// </summary>
+    public int CategoryColumns
+    {
+        get => _categoryColumns;
+        set
+        {
+            int clamped = value < 1 ? 1 : (value > 3 ? 3 : value);
+            if (!SetProperty(ref _categoryColumns, clamped))
+                return;
+
+            OnPropertyChanged(nameof(IsOneColumn));
+            OnPropertyChanged(nameof(IsTwoColumn));
+            OnPropertyChanged(nameof(IsThreeColumn));
+            try
+            {
+                var settings = UserSettings.Load();
+                settings.CleanupCategoryColumns = clamped;
+                settings.Save();
+            }
+            catch
+            {
+                // A preference that cannot be saved is not worth failing over.
+            }
+        }
+    }
+
+    /// <summary>Radio-style bindings for the 1 / 2 / 3 selector.</summary>
+    public bool IsOneColumn
+    {
+        get => _categoryColumns == 1;
+        set { if (value) CategoryColumns = 1; }
+    }
+
+    /// <inheritdoc cref="IsOneColumn"/>
+    public bool IsTwoColumn
+    {
+        get => _categoryColumns == 2;
+        set { if (value) CategoryColumns = 2; }
+    }
+
+    /// <inheritdoc cref="IsOneColumn"/>
+    public bool IsThreeColumn
+    {
+        get => _categoryColumns == 3;
+        set { if (value) CategoryColumns = 3; }
     }
 
     /// <summary>
@@ -1480,23 +1549,50 @@ public class OrphanedDirectoriesViewModel : ViewModelBase
                 // streaming read advances the counter from the first batch.
                 var loadProgress = new Progress<int>(
                     n => DestinationScanStatusText = $"Loading catalog: {n:N0} records\u2026");
-                var entries = await _catalog
-                    .GetDiscPathEntriesForBackupSetAsync(setId, CancellationToken.None, loadProgress)
-                    .ConfigureAwait(false);
 
-                // Build disc-path → records lookup, separating deleted from active.
-                var discPathLookup = new Dictionary<string, List<DestPathRecord>>(
-                    StringComparer.OrdinalIgnoreCase);
-                foreach (var (discPath, isDeleted, sourcePath) in entries)
-                {
-                    string normalised = discPath.Replace('/', '\\');
-                    if (!discPathLookup.TryGetValue(normalised, out var list))
+                // Aggregate as the rows arrive rather than materialising them.
+                // The walk needs one bit per disc path (is anything still
+                // active?) and, only for paths where everything is deleted, one
+                // source path for display - so a list of records per path, on top
+                // of a list of every row, costs about as much again as the answer.
+                // Measured on a 2,810,190-row set: 1,751 MB the old way, 754 MB
+                // this way, with identical verdicts on all 2,803,380 paths.
+                // Keyed by a 128-bit hash of the path rather than the path
+                // itself: the strings are the whole cost at this scale, and
+                // Services.DiscPathKey documents why hashing cannot cause a
+                // wrongful deletion here (a collision can only make a file look
+                // MORE tracked, never less).
+                var discPathLookup = new Dictionary<UInt128, DestPathState>();
+
+                await _catalog.ForEachDiscPathEntryAsync(
+                    setId,
+                    (discPath, isDeleted, sourcePath) =>
                     {
-                        list = [];
-                        discPathLookup[normalised] = list;
-                    }
-                    list.Add(new DestPathRecord(isDeleted, sourcePath));
-                }
+                        // DiscPathKey normalises separators and case itself, so
+                        // no per-row string is built here either.
+                        var normalised = Services.DiscPathKey.From(discPath);
+                        discPathLookup.TryGetValue(normalised, out var current);
+
+                        if (!isDeleted)
+                        {
+                            // An active record settles the question, and drops
+                            // the source path we were holding for display: it is
+                            // only ever shown when nothing active remains. This
+                            // is where most of the memory goes - the vast
+                            // majority of paths are active.
+                            discPathLookup[normalised] = new DestPathState(true, null);
+                        }
+                        else if (!current.HasActive && current.SourcePathWhenAllDeleted is null)
+                        {
+                            // First deleted record for a path not yet claimed by
+                            // an active one: keep its source path in case none
+                            // ever arrives.
+                            discPathLookup[normalised] = new DestPathState(false, sourcePath);
+                        }
+                        // Otherwise the path is already answered; store nothing.
+                    },
+                    CancellationToken.None,
+                    loadProgress).ConfigureAwait(false);
 
                 return WalkDestination(targetDir, discPathLookup, progress);
             });
@@ -1707,13 +1803,25 @@ public class OrphanedDirectoriesViewModel : ViewModelBase
     }
 
     /// <summary>
-    /// Minimal catalog projection the destination walk needs per disc-path: is
-    /// there a still-active record (so the on-disk file is properly tracked and
-    /// should be skipped), and the source path for display when only deleted
-    /// records remain. Far cheaper to build than a full <c>FileRecord</c>, which
-    /// is why the walk loads these via <c>GetDiscPathEntriesForBackupSetAsync</c>.
+    /// What the destination walk needs to know about one disc path, ALREADY
+    /// AGGREGATED across every catalog row that mentions it.
+    ///
+    /// <para>Holding the rows themselves would mean a <c>List</c> object per
+    /// path plus a source-path string per row, for a question that reduces to a
+    /// single bit for all but a handful of paths. <c>SourcePathWhenAllDeleted</c>
+    /// is null whenever <c>HasActive</c> is true, so the strings for the
+    /// overwhelming majority of paths become garbage as soon as they are read.
+    /// See <c>ICatalogRepository.ForEachDiscPathEntryAsync</c> for the numbers.</para>
     /// </summary>
-    private readonly record struct DestPathRecord(bool IsDeleted, string SourcePath);
+    /// <param name="HasActive">
+    /// True if any record for this disc path is still active, meaning the file on
+    /// disk is properly tracked and the walk should skip it.
+    /// </param>
+    /// <param name="SourcePathWhenAllDeleted">
+    /// Source path to show for a file whose records are ALL deleted; null when
+    /// <paramref name="HasActive"/> is true.
+    /// </param>
+    private readonly record struct DestPathState(bool HasActive, string? SourcePathWhenAllDeleted);
 
     /// <summary>
     /// Background-thread destination walk.  For every file under
@@ -1729,7 +1837,7 @@ public class OrphanedDirectoriesViewModel : ViewModelBase
                     int FilesScanned)
         WalkDestination(
             string targetDir,
-            Dictionary<string, List<DestPathRecord>> discPathLookup,
+            Dictionary<UInt128, DestPathState> discPathLookup,
             IProgress<string> progress)
     {
         var untracked = new List<(string, long, string?)>();
@@ -1840,19 +1948,14 @@ public class OrphanedDirectoriesViewModel : ViewModelBase
                     // backup data (and it reappears once the worker
                     // re-materialises the reference).  Exact match wins; the
                     // manifest-suffix fallbacks only fire for suffix-less files.
-                    if (discPathLookup.TryGetValue(relativePath, out var records)
-                        || discPathLookup.TryGetValue(relativePath + ".fileref", out records)
-                        || discPathLookup.TryGetValue(relativePath + ".dedup", out records))
+                    if (discPathLookup.TryGetValue(Services.DiscPathKey.From(relativePath), out var state)
+                        || discPathLookup.TryGetValue(Services.DiscPathKey.From(relativePath + ".fileref"), out state)
+                        || discPathLookup.TryGetValue(Services.DiscPathKey.From(relativePath + ".dedup"), out state))
                     {
-                        bool hasActive = false;
-                        for (int r = 0; r < records.Count; r++)
-                        {
-                            if (!records[r].IsDeleted) { hasActive = true; break; }
-                        }
-                        if (hasActive) continue; // Active record exists — file is properly tracked.
+                        if (state.HasActive)
+                            continue; // Active record exists — file is properly tracked.
 
-                        string? src = records.Count > 0 ? records[0].SourcePath : null;
-                        catalogDeleted.Add((relativePath, size, src));
+                        catalogDeleted.Add((relativePath, size, state.SourcePathWhenAllDeleted));
                     }
                     else
                     {

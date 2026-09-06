@@ -12,21 +12,9 @@
         Opacity="0">
 
     <Border Style="{StaticResource Card}" Margin="12">
-        <ContentControl x:Name="ContentArea" Focusable="False">
-            <ContentControl.Resources>
-                <DataTemplate DataType="{x:Type vm:SourceSelectionViewModel}">
-                    <views:SourceSelectionView />
-                </DataTemplate>
-                <DataTemplate DataType="{x:Type vm:BackupJobViewModel}">
-                    <views:BackupJobView />
-                </DataTemplate>
-                <DataTemplate DataType="{x:Type vm:LargestFilesViewModel}">
-                    <views:LargestFilesView />
-                </DataTemplate>
-                <DataTemplate DataType="{x:Type vm:BackupReviewViewModel}">
-                    <views:BackupReviewView />
-                </DataTemplate>
-            </ContentControl.Resources>
-        </ContentControl>
+        <!-- Templates come from Resources/FlowViewTemplates.xaml via the
+             application resources, so this window no longer needs its own copy
+             of the mapping (and can no longer drift from the main window's). -->
+        <ContentControl x:Name="ContentArea" Focusable="False" />
     </Border>
 </Window>

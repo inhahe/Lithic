@@ -134,8 +134,17 @@ public partial class MainWindow : Window
         {
             e.Cancel = true;
             app.MinimizeToTray();
+            // Task windows are deliberately NOT hidden here. They are
+            // independent top-level windows with their own taskbar buttons, so
+            // a long Cleanup scan stays watchable after the main window is
+            // tucked away - which is the point of them being independent.
             return;
         }
+
+        // Genuinely exiting. Nothing else owns these windows, and the app runs
+        // with ShutdownMode.OnExplicitShutdown, so a stray task window would
+        // keep the process alive with no way back to the main UI.
+        (DataContext as ViewModels.MainViewModel)?.CloseTaskWindows();
 
         base.OnClosing(e);
     }

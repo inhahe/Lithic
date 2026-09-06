@@ -64,20 +64,32 @@ public interface ICatalogRepository : IDisposable
         int backupSetId, CancellationToken ct = default, IProgress<int>? rowProgress = null);
 
     /// <summary>
-    /// Lightweight streaming query for the destination filesystem scan: returns
-    /// only (DiscPath, IsDeleted, SourcePath) for every file row in the set,
-    /// skipping the full 14-column record hydration AND the ORDER BY sort of
-    /// <see cref="GetAllFilesForBackupSetAsync"/>. Because it is unsorted, SQLite
-    /// streams rows straight off the disc/file indexes instead of materialising
-    /// and sorting the entire result set before returning the first row — so a
-    /// large set no longer stalls for minutes with no progress before the read
-    /// begins, and <paramref name="rowProgress"/> advances from the first batch.
-    /// This is all the destination walk needs (to know whether an on-disk file
-    /// matches a catalog path and whether any matching record is still active).
+    /// Lightweight query for the destination filesystem scan: every file row's
+    /// (DiscPath, IsDeleted, SourcePath) and nothing else, handed to
+    /// <paramref name="onEntry"/> one row at a time.
+    ///
+    /// <para>It skips the full 14-column record hydration AND the ORDER BY sort
+    /// of <see cref="GetAllFilesForBackupSetAsync"/>. Being unsorted matters:
+    /// SQLite streams rows straight off the disc/file indexes instead of
+    /// materialising and sorting the whole result before returning the first
+    /// row, so a large set no longer stalls for minutes with no progress before
+    /// the read begins, and <paramref name="rowProgress"/> advances from the
+    /// first batch.</para>
+    ///
+    /// <para>The destination scan needs one bit and (rarely) one string per disc
+    /// path, not a record per row, so materialising the rows first costs about
+    /// as much memory again as the structure being built. Measured on a
+    /// 2,810,190-row set: list + per-path record lists = 1,751 MB, aggregating
+    /// as the rows arrive = 754 MB for the same answers.</para>
+    ///
+    /// <para><paramref name="onEntry"/> runs on the reader's thread while the
+    /// catalog lock is held, so it must not call back into the repository.</para>
     /// </summary>
-    Task<IReadOnlyList<(string DiscPath, bool IsDeleted, string SourcePath)>>
-        GetDiscPathEntriesForBackupSetAsync(
-            int backupSetId, CancellationToken ct = default, IProgress<int>? rowProgress = null);
+    Task ForEachDiscPathEntryAsync(
+        int backupSetId,
+        Action<string, bool, string> onEntry,
+        CancellationToken ct = default,
+        IProgress<int>? rowProgress = null);
 
     /// <summary>
     /// Get lightweight version info for the latest version of each file in a

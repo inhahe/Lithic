@@ -9,6 +9,11 @@
              d:DataContext="{d:DesignInstance Type=vm:OrphanedDirectoriesViewModel, IsDesignTimeCreatable=False}">
 
     <UserControl.Resources>
+        <!-- Shared column widths: the header's splitters write here and every
+             tree row reads from here, which is what keeps them lined up. Declared
+             first because StaticResource resolves in declaration order. -->
+        <vm:CleanupColumnLayout x:Key="CleanupColumns" />
+
         <!-- ===========================================================
              Custom TreeViewItem template for the cleanup tree.
 
@@ -34,9 +39,11 @@
                             <Grid MinHeight="22">
                                 <Grid.ColumnDefinitions>
                                     <ColumnDefinition Width="Auto" SharedSizeGroup="CleanupCheckCol" />
+                                    <!-- Directory takes what the other two leave,
+                                         so dragging them narrower widens it. -->
                                     <ColumnDefinition Width="*" />
-                                    <ColumnDefinition Width="Auto" MinWidth="56" SharedSizeGroup="CleanupFilesCol" />
-                                    <ColumnDefinition Width="Auto" MinWidth="80" SharedSizeGroup="CleanupSizeCol" />
+                                    <ColumnDefinition Width="{Binding FilesWidth, Source={StaticResource CleanupColumns}}" />
+                                    <ColumnDefinition Width="{Binding SizeWidth, Source={StaticResource CleanupColumns}}" />
                                 </Grid.ColumnDefinitions>
 
                                 <!-- Col 0: Check.
@@ -167,11 +174,42 @@
                                     <Grid.ColumnDefinitions>
                                         <ColumnDefinition Width="Auto" SharedSizeGroup="CleanupCheckCol" />
                                         <ColumnDefinition Width="*" />
-                                        <ColumnDefinition Width="Auto" MinWidth="56" SharedSizeGroup="CleanupFilesCol" />
-                                        <ColumnDefinition Width="Auto" MinWidth="80" SharedSizeGroup="CleanupSizeCol" />
+                                        <ColumnDefinition MinWidth="18"
+                                                          Width="{Binding FilesWidth, Source={StaticResource CleanupColumns}, Mode=TwoWay}" />
+                                        <ColumnDefinition MinWidth="18"
+                                                          Width="{Binding SizeWidth, Source={StaticResource CleanupColumns}, Mode=TwoWay}" />
                                     </Grid.ColumnDefinitions>
 
                                     <!-- (Col 0 header is blank — that's the checkbox column.) -->
+
+                                    <!-- Column dividers. Sitting on the left edge
+                                         of the Files and Size cells, they are the
+                                         boundary the user actually points at, and
+                                         ResizeBehavior=PreviousAndNext means a drag
+                                         moves the boundary rather than pushing the
+                                         whole row. Directory is a star column, so
+                                         whatever these give up it takes.
+                                         Grid.ZIndex keeps them above the header
+                                         borders so the grab area is not stolen by
+                                         the sort-click handlers. -->
+                                    <GridSplitter Grid.Column="2" Grid.ZIndex="10"
+                                                  Width="5"
+                                                  HorizontalAlignment="Left"
+                                                  VerticalAlignment="Stretch"
+                                                  Background="Transparent"
+                                                  Cursor="SizeWE"
+                                                  ResizeBehavior="PreviousAndNext"
+                                                  ResizeDirection="Columns"
+                                                  ToolTip="Drag to resize — the Directory column takes the space you free up." />
+                                    <GridSplitter Grid.Column="3" Grid.ZIndex="10"
+                                                  Width="5"
+                                                  HorizontalAlignment="Left"
+                                                  VerticalAlignment="Stretch"
+                                                  Background="Transparent"
+                                                  Cursor="SizeWE"
+                                                  ResizeBehavior="PreviousAndNext"
+                                                  ResizeDirection="Columns"
+                                                  ToolTip="Drag to resize — the Directory column takes the space you free up." />
 
                                     <!-- Name header (clickable) -->
                                     <Border Grid.Column="1"
@@ -289,6 +327,29 @@
                            Foreground="{StaticResource DangerDarkBrush}"
                            TextWrapping="Wrap" FontSize="12" />
             </Border>
+
+            <!-- Category layout: fewer columns = wider cards = readable paths in
+                 deep trees. Persisted via UserSettings.CleanupCategoryColumns. -->
+            <StackPanel Orientation="Horizontal" Margin="0,10,0,0"
+                        HorizontalAlignment="Right"
+                        VerticalAlignment="Center">
+                <TextBlock Text="Categories per row:"
+                           Foreground="{StaticResource TextSecondaryBrush}"
+                           FontSize="11"
+                           VerticalAlignment="Center"
+                           Margin="0,0,6,0" />
+                <RadioButton Content="1" GroupName="CleanupCols"
+                             IsChecked="{Binding IsOneColumn, Mode=TwoWay}"
+                             VerticalAlignment="Center" Margin="0,0,6,0"
+                             ToolTip="One category per row — widest tree, best for deep paths." />
+                <RadioButton Content="2" GroupName="CleanupCols"
+                             IsChecked="{Binding IsTwoColumn, Mode=TwoWay}"
+                             VerticalAlignment="Center" Margin="0,0,6,0" />
+                <RadioButton Content="3" GroupName="CleanupCols"
+                             IsChecked="{Binding IsThreeColumn, Mode=TwoWay}"
+                             VerticalAlignment="Center"
+                             ToolTip="Three per row — most categories visible at once." />
+            </StackPanel>
 
             <!-- Scan / maintenance actions laid out as a uniform 2×2 grid so
                  every card is the same width and height regardless of content.
@@ -454,19 +515,56 @@
         <ScrollViewer VerticalScrollBarVisibility="Auto"
                       HorizontalScrollBarVisibility="Disabled"
                       Padding="0,0,4,0">
-            <ItemsControl ItemsSource="{Binding Categories}">
+            <ItemsControl x:Name="CategoryHost" ItemsSource="{Binding Categories}">
                 <ItemsControl.ItemsPanel>
                     <ItemsPanelTemplate>
-                        <!-- 3-column uniform grid: cards flow row-by-row,
-                             empty categories don't appear, remaining cards
-                             reflow to fill rows. -->
-                        <UniformGrid Columns="3" />
+                        <!-- Cards flow row-by-row; empty categories don't
+                             appear and the rest reflow. The column count is the
+                             user's, because it is the only thing that decides
+                             how much width a path tree gets: at three columns a
+                             card is a third of the window, and the tree indents
+                             19px per level, so a deep path runs out of name
+                             column. Resizing the Files/Size columns would not
+                             have helped - they are already Auto with 56/80px
+                             minimums, so reclaiming both buys ~136px. -->
+                        <WrapPanel Orientation="Horizontal" />
                     </ItemsPanelTemplate>
                 </ItemsControl.ItemsPanel>
                 <ItemsControl.ItemTemplate>
                     <DataTemplate DataType="{x:Type vm:OrphanedCategoryViewModel}">
                         <Border Style="{StaticResource InsetCard}"
                                 Padding="10" Margin="0,0,8,8">
+                            <Border.Width>
+                                <MultiBinding Converter="{StaticResource CategoryCardWidth}">
+                                    <Binding Path="ActualWidth" ElementName="CategoryHost" />
+                                    <Binding Path="DataContext.CategoryColumns"
+                                             RelativeSource="{RelativeSource AncestorType=UserControl}" />
+                                    <Binding Path="WidthOverride" />
+                                </MultiBinding>
+                            </Border.Width>
+                            <DockPanel>
+                                <!-- Divider between this card and the next. Dragging
+                                     it sets this card's width, and because the cards
+                                     wrap rather than sit in fixed cells, the
+                                     neighbour moves along with it. Double-click
+                                     returns the card to its share of the row. -->
+                                <Thumb DockPanel.Dock="Right"
+                                       Width="6"
+                                       Cursor="SizeWE"
+                                       Margin="6,0,-8,0"
+                                       DragDelta="CategoryDivider_DragDelta"
+                                       MouseDoubleClick="CategoryDivider_Reset"
+                                       ToolTip="Drag to resize this panel — double-click to reset.">
+                                    <Thumb.Template>
+                                        <ControlTemplate TargetType="Thumb">
+                                            <Border Background="Transparent">
+                                                <Rectangle Width="1"
+                                                           HorizontalAlignment="Center"
+                                                           Fill="{StaticResource BorderBrush}" />
+                                            </Border>
+                                        </ControlTemplate>
+                                    </Thumb.Template>
+                                </Thumb>
                             <StackPanel>
                                 <!-- Category header -->
                                 <DockPanel>
@@ -630,6 +728,7 @@
                                     </TreeView>
                                 </Border>
                             </StackPanel>
+                            </DockPanel>
                         </Border>
                     </DataTemplate>
                 </ItemsControl.ItemTemplate>

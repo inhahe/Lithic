@@ -460,7 +460,7 @@ public class BackupJobViewModel : ViewModelBase
                 if (now - lastScanUpdate >= ProgressUpdateIntervalMs)
                 {
                     lastScanUpdate = now;
-                    PlanSummary = $"Scanning... {sp.FilesFound:N0} files found";
+                    PlanSummary = $"Scanning... {sp.FilesFound:N0} files found, {sp.DirectoriesScanned:N0} folders";
                 }
             });
 

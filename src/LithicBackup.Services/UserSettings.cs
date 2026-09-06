@@ -78,6 +78,26 @@ public class UserSettings
     /// </summary>
     public int LastSettingsTab { get; set; }
 
+    /// <summary>
+    /// How many category cards Cleanup lays out per row (1-3).
+    ///
+    /// <para>Three fits the most categories on screen but gives each card a
+    /// third of the window, and the path tree indents 19px per level - so on a
+    /// deep tree the path is squeezed out of a ~160px name column. One column
+    /// trades seeing several categories at once for being able to read the
+    /// paths in the one you are working on.</para>
+    /// </summary>
+    public int CleanupCategoryColumns { get; set; } = 3;
+
+    /// <summary>
+    /// Width of Cleanup's "Files" column. Narrowing it widens the Directory
+    /// column, which is a star column taking whatever is left.
+    /// </summary>
+    public double CleanupFilesColumnWidth { get; set; } = 56;
+
+    /// <summary>Width of Cleanup's "Size" column. See <see cref="CleanupFilesColumnWidth"/>.</summary>
+    public double CleanupSizeColumnWidth { get; set; } = 80;
+
     public static UserSettings Load()
     {
         try
