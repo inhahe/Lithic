@@ -47,7 +47,9 @@ public class BackupOrchestrator : IBackupOrchestrator
     {
         // 1. Scan source directories (global + tier-set exclusions).
         var isExcluded = DirectoryBackupService.BuildExclusionFilter(job);
-        var scanned = await _scanner.ScanAsync(job.Sources, progress: scanProgress, ct, isExcluded);
+        var pruneDirs = DirectoryBackupService.BuildDirectoryPruneFilter(job);
+        var scanned = await _scanner.ScanAsync(
+            job.Sources, progress: scanProgress, ct, isExcluded, pruneDirs);
 
         // 2. Compute diff against existing catalog (if this is an existing set).
         BackupDiff diff;

@@ -133,7 +133,8 @@ public class DirectoryBackupService
             // No pre-computed diff — scan and compute from scratch.
             progress?.Report(new BackupProgress { StatusMessage = "Scanning source files..." });
             var isExcluded = BuildExclusionFilter(job);
-            var scanned = await _scanner.ScanAsync(job.Sources, progress: null, ct, isExcluded);
+            var scanned = await _scanner.ScanAsync(
+                job.Sources, progress: null, ct, isExcluded, BuildDirectoryPruneFilter(job));
 
             progress?.Report(new BackupProgress { StatusMessage = "Computing changes..." });
             if (job.BackupSetId.HasValue)
@@ -1662,7 +1663,8 @@ public class DirectoryBackupService
         IProgress<ScanProgress>? scanProgress = null)
     {
         var isExcluded = BuildExclusionFilter(job);
-        var scanned = await _scanner.ScanAsync(job.Sources, progress: scanProgress, ct, isExcluded);
+        var scanned = await _scanner.ScanAsync(
+            job.Sources, progress: scanProgress, ct, isExcluded, BuildDirectoryPruneFilter(job));
 
         BackupDiff diff;
         if (job.BackupSetId.HasValue)
@@ -2193,6 +2195,71 @@ public class DirectoryBackupService
             if (globalFilter?.Invoke(path) ?? false)
                 return true;
             if (tierResolver is not null && tierResolver(path).Tiers.Count == 0)
+                return true;
+            return false;
+        };
+    }
+
+    /// <summary>
+    /// Companion to <see cref="BuildExclusionFilter(BackupJob)"/> that answers
+    /// the stricter question: is every file anywhere beneath this DIRECTORY
+    /// excluded, so the scan can skip the subtree entirely?
+    ///
+    /// <para>Without it a scan walks every directory of an excluded tree and
+    /// rejects the files one at a time. Measured symptom: a scan sitting on the
+    /// same file count for hours while it enumerated build/, debug/ and target/
+    /// trees on a spinning disk at ~3.4 ms per directory, unable to contribute a
+    /// single file.</para>
+    ///
+    /// <para>Conservative by construction, because a wrong answer here means a
+    /// file is silently never backed up. It only trusts:</para>
+    /// <list type="bullet">
+    /// <item>glob patterns that cover a whole subtree (see
+    /// <see cref="GlobMatcher.CreateDirectorySubtreeFilter"/>);</item>
+    /// <item>zero-tier tier sets, and only those with NO
+    /// <see cref="VersionTierSet.FileExemptPatterns"/> — an exempt pattern can
+    /// re-include a file deep inside, so the subtree is not uniformly
+    /// excluded;</item>
+    /// <item>the app's own data directory, which is excluded wholesale.</item>
+    /// </list>
+    /// Anything it cannot prove, it declines to prune: the cost is a slower scan,
+    /// never a missing file.
+    /// </summary>
+    public static Func<string, bool>? BuildDirectoryPruneFilter(BackupJob job)
+        => BuildDirectoryPruneFilter(job.ExcludedExtensions, job.TierSets);
+
+    /// <inheritdoc cref="BuildDirectoryPruneFilter(BackupJob)"/>
+    public static Func<string, bool>? BuildDirectoryPruneFilter(
+        IReadOnlyList<string> excludedExtensions,
+        IReadOnlyList<VersionTierSet> tierSets)
+    {
+        var globPrune = GlobMatcher.CreateDirectorySubtreeFilter(excludedExtensions);
+
+        var zeroTierPatterns = new List<string>();
+        foreach (var ts in tierSets)
+        {
+            if (ts.Tiers.Count != 0)
+                continue;
+            if (ts.FilePatterns.Count == 0)
+                continue;
+            if (ts.FileExemptPatterns.Count > 0)
+                continue;   // an exemption can re-include a file below; cannot prune
+            if (string.Equals(ts.Name, "Default", StringComparison.OrdinalIgnoreCase))
+                continue;
+            zeroTierPatterns.AddRange(ts.FilePatterns);
+        }
+
+        var tierPrune = zeroTierPatterns.Count > 0
+            ? GlobMatcher.CreateDirectorySubtreeFilter(zeroTierPatterns)
+            : null;
+
+        return directoryPath =>
+        {
+            if (CatalogLocation.IsInsideAppDataDirectory(directoryPath))
+                return true;
+            if (globPrune?.Invoke(directoryPath) ?? false)
+                return true;
+            if (tierPrune?.Invoke(directoryPath) ?? false)
                 return true;
             return false;
         };

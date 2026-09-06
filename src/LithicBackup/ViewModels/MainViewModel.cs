@@ -2288,7 +2288,8 @@ public class MainViewModel : ViewModelBase
                 if (now - lastScanUpdate >= ProgressUpdateIntervalMs)
                 {
                     lastScanUpdate = now;
-                    StatusText = $"Checking \"{backupSet.Name}\"... {sp.FilesFound:N0} files scanned";
+                    StatusText = $"Checking \"{backupSet.Name}\"... {sp.FilesFound:N0} files scanned, "
+                        + $"{sp.DirectoriesScanned:N0} folders";
                 }
             });
 
@@ -2585,7 +2586,13 @@ public class MainViewModel : ViewModelBase
                 if (now - lastUpdate >= ProgressUpdateIntervalMs)
                 {
                     lastUpdate = now;
-                    string line = $"Scanning for changes... {sp.FilesFound:N0} files checked";
+                    // Directories as well as files: FilesFound counts only files
+                    // that will be backed up, so crossing a large excluded tree
+                    // pins it at one number for a long time and reads as a hang.
+                    // The directory count is what shows the scan is alive.
+                    string line =
+                        $"Scanning for changes... {sp.FilesFound:N0} files checked, "
+                        + $"{sp.DirectoriesScanned:N0} folders";
                     sourceVm.SizeCalculationResult = string.IsNullOrEmpty(baseReport)
                         ? line : baseReport + "\n" + line;
                 }

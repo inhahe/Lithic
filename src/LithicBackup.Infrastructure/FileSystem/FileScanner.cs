@@ -20,16 +20,19 @@ public class FileScanner : IFileScanner
         IReadOnlyList<SourceSelection> sources,
         IProgress<ScanProgress>? progress = null,
         CancellationToken ct = default,
-        Func<string, bool>? isExcluded = null)
+        Func<string, bool>? isExcluded = null,
+        Func<string, bool>? isDirectoryExcluded = null)
     {
         var results = new List<ScannedFile>();
         int filesFound = 0;
+        int dirsScanned = 0;
         long totalBytes = 0;
 
         foreach (var source in sources)
         {
             if (ct.IsCancellationRequested) break;
-            ScanNode(source, results, ref filesFound, ref totalBytes, progress, ct, isExcluded);
+            ScanNode(source, results, ref filesFound, ref dirsScanned, ref totalBytes,
+                     progress, ct, isExcluded, isDirectoryExcluded);
         }
 
         return Task.FromResult<IReadOnlyList<ScannedFile>>(results);
@@ -39,10 +42,12 @@ public class FileScanner : IFileScanner
         SourceSelection node,
         List<ScannedFile> results,
         ref int filesFound,
+        ref int dirsScanned,
         ref long totalBytes,
         IProgress<ScanProgress>? progress,
         CancellationToken ct,
-        Func<string, bool>? isExcluded = null)
+        Func<string, bool>? isExcluded = null,
+        Func<string, bool>? isDirectoryExcluded = null)
     {
         // Fully excluded — skip this entire subtree.
         if (node.IsSelected == false || ct.IsCancellationRequested)
@@ -53,10 +58,16 @@ public class FileScanner : IFileScanner
             if (!Directory.Exists(node.Path))
                 return;
 
+            // Nothing beneath this directory can be backed up — don't walk it.
+            if (isDirectoryExcluded is not null && isDirectoryExcluded(node.Path))
+                return;
+
+            dirsScanned++;
             progress?.Report(new ScanProgress
             {
                 CurrentDirectory = node.Path,
                 FilesFound = filesFound,
+                DirectoriesScanned = dirsScanned,
                 TotalBytes = totalBytes,
             });
 
@@ -65,7 +76,8 @@ public class FileScanner : IFileScanner
             {
                 // Has explicit child selections — follow those.
                 foreach (var child in node.Children)
-                    ScanNode(child, results, ref filesFound, ref totalBytes, progress, ct, isExcluded);
+                    ScanNode(child, results, ref filesFound, ref dirsScanned, ref totalBytes,
+                             progress, ct, isExcluded, isDirectoryExcluded);
 
                 // Pick up any children on disk that aren't in the selection tree
                 // when this directory auto-includes new entries — for a fully- or
@@ -77,14 +89,16 @@ public class FileScanner : IFileScanner
                         StringComparer.OrdinalIgnoreCase);
 
                     ScanUnlistedEntries(node.Path, knownChildren, results,
-                        ref filesFound, ref totalBytes, progress, ct, isExcluded);
+                        ref filesFound, ref dirsScanned, ref totalBytes,
+                        progress, ct, isExcluded, isDirectoryExcluded);
                 }
             }
             else if (node.IsSelected == true)
             {
                 // Fully selected directory with no child overrides — include everything.
                 ScanDirectoryRecursive(node.Path, results,
-                    ref filesFound, ref totalBytes, progress, ct, isExcluded);
+                    ref filesFound, ref dirsScanned, ref totalBytes,
+                    progress, ct, isExcluded, isDirectoryExcluded);
             }
         }
         else
@@ -102,17 +116,21 @@ public class FileScanner : IFileScanner
         string directoryPath,
         List<ScannedFile> results,
         ref int filesFound,
+        ref int dirsScanned,
         ref long totalBytes,
         IProgress<ScanProgress>? progress,
         CancellationToken ct,
-        Func<string, bool>? isExcluded = null)
+        Func<string, bool>? isExcluded = null,
+        Func<string, bool>? isDirectoryExcluded = null)
     {
         if (ct.IsCancellationRequested) return;
 
+        dirsScanned++;
         progress?.Report(new ScanProgress
         {
             CurrentDirectory = directoryPath,
             FilesFound = filesFound,
+            DirectoriesScanned = dirsScanned,
             TotalBytes = totalBytes,
         });
 
@@ -130,6 +148,7 @@ public class FileScanner : IFileScanner
                     {
                         CurrentDirectory = directoryPath,
                         FilesFound = filesFound,
+                        DirectoriesScanned = dirsScanned,
                         TotalBytes = totalBytes,
                     });
                 }
@@ -137,8 +156,16 @@ public class FileScanner : IFileScanner
 
             foreach (var subDir in Directory.EnumerateDirectories(directoryPath))
             {
+                // Skip a subtree that cannot contribute a file. This is the
+                // difference between a scan that walks hundreds of thousands of
+                // build/ and debug/ directories rejecting every file one at a
+                // time, and one that never opens them.
+                if (isDirectoryExcluded is not null && isDirectoryExcluded(subDir))
+                    continue;
+
                 ScanDirectoryRecursive(subDir, results,
-                    ref filesFound, ref totalBytes, progress, ct, isExcluded);
+                    ref filesFound, ref dirsScanned, ref totalBytes,
+                    progress, ct, isExcluded, isDirectoryExcluded);
             }
         }
         catch (UnauthorizedAccessException)
@@ -160,10 +187,12 @@ public class FileScanner : IFileScanner
         HashSet<string> knownChildren,
         List<ScannedFile> results,
         ref int filesFound,
+        ref int dirsScanned,
         ref long totalBytes,
         IProgress<ScanProgress>? progress,
         CancellationToken ct,
-        Func<string, bool>? isExcluded = null)
+        Func<string, bool>? isExcluded = null,
+        Func<string, bool>? isDirectoryExcluded = null)
     {
         try
         {
@@ -179,8 +208,12 @@ public class FileScanner : IFileScanner
                 if (ct.IsCancellationRequested) return;
                 if (!knownChildren.Contains(subDir))
                 {
+                    if (isDirectoryExcluded is not null && isDirectoryExcluded(subDir))
+                        continue;
+
                     ScanDirectoryRecursive(subDir, results,
-                        ref filesFound, ref totalBytes, progress, ct, isExcluded);
+                        ref filesFound, ref dirsScanned, ref totalBytes,
+                        progress, ct, isExcluded, isDirectoryExcluded);
                 }
             }
         }

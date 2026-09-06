@@ -211,7 +211,10 @@ public class BackupCoverageViewModel : ViewModelBase
 
             ScanProgressText = "Scanning source directories...";
             var scanTask = Task.Run(
-                () => _scanner.ScanAsync(sources, scanProgress, ct, isExcluded));
+                () => _scanner.ScanAsync(sources, scanProgress, ct, isExcluded,
+                    Services.DirectoryBackupService.BuildDirectoryPruneFilter(
+                        _backupSet.JobOptions?.ExcludedExtensions ?? [],
+                        _backupSet.JobOptions?.TierSets ?? [])));
 
             while (!scanTask.IsCompleted && !ct.IsCancellationRequested)
             {

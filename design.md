@@ -195,6 +195,41 @@ measure, so a row wider than the card would simply scroll. It is not implemented
 because the two levers above cover the cases seen so far — not because it cannot
 work. If deep trees still run out of room, that is the next thing to build.
 
+## A source scan must not walk what it will never back up
+
+Exclusions were applied per FILE, and the scanner recursed into every
+subdirectory regardless — so a set excluding `**/build/**`, `**/debug/**`,
+`**/target*/*` still walked every directory of every build tree, rejecting the
+files one at a time. On a spinning disk at ~3.4 ms per directory operation, that
+was the bulk of the scan.
+
+`GlobMatcher.CreateDirectorySubtreeFilter` answers the stricter question — is
+EVERY file anywhere beneath this directory excluded — and `FileScanner` skips
+those subtrees. Measured on a real tree with the real pattern set: **69.4 s ->
+10.8 s, 6.4x**, with the resulting file list **identical** (0 lost, 0 gained).
+
+**Being wrong here means a file is silently never backed up, so the predicate is
+conservative by construction:**
+
+* only patterns ending `/*` or `/**` qualify; the part before becomes an anchored
+  regex matched against the directory. `**/debug/**` prunes a `debug` directory;
+  `**/debug/*.obj` prunes nothing, because it excludes only some of the files.
+* filename-only patterns (`*.raw`) never prune — a directory can hold any name.
+* zero-tier tier sets prune only when they have no `FileExemptPatterns`, since an
+  exemption can re-include a file deep inside.
+* `/**` alone is refused rather than pruning everything.
+* **Soundness depends on `*` crossing separators** in this GlobMatcher (`*` ->
+  `.*`). That is what makes `dir/*` cover `dir/a/b/c`. If `*` is ever changed to
+  stop at a separator, this must change with it or it will prune subtrees whose
+  deeper files are not excluded.
+
+**And the progress counter must not be able to look stopped.** `FilesFound`
+counts only files that will be backed up, so crossing a large excluded tree pins
+it at one number for hours; that is what "stuck at 657,774 files scanned" was —
+a healthy scan with nothing to report. `ScanProgress` now carries
+`DirectoriesScanned` and the UI shows it alongside. A progress indicator that can
+legitimately freeze is not a progress indicator.
+
 ## Build the answer, not a copy of the question
 
 The destination scan needs, per disc path, one bit — is any record still active,

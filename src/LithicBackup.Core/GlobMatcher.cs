@@ -91,6 +91,93 @@ public static class GlobMatcher
     }
 
     /// <summary>
+    /// Build a predicate that answers a STRICTER question than
+    /// <see cref="CreateFilter"/>: is <em>every file anywhere beneath this
+    /// directory</em> excluded? Returns null when no pattern can promise that.
+    ///
+    /// <para>It exists so a scan can skip an excluded subtree instead of walking
+    /// it and rejecting the files one at a time. On a real set that walk was the
+    /// bulk of the scan: hundreds of thousands of directories under build/,
+    /// debug/ and target/ trees, on a spinning disk, none of which could
+    /// contribute a single file.</para>
+    ///
+    /// <para><b>It has to be conservative, because being wrong means files are
+    /// silently not backed up.</b> Only patterns that end in <c>/*</c> or
+    /// <c>/**</c> qualify: the part before that suffix becomes an anchored regex
+    /// matched against the directory itself, so <c>**/debug/**</c> prunes a
+    /// directory named <c>debug</c> while <c>**/debug/*.obj</c> prunes nothing —
+    /// it only excludes SOME of the files there. Filename-only patterns
+    /// (<c>*.raw</c>) can never prune, because a directory may hold files of any
+    /// name.</para>
+    ///
+    /// <para><b>It answers only about the directory it is given.</b> With
+    /// <c>**/build/**</c> it returns true for <c>...uild</c> but FALSE for
+    /// <c>...uild\sub</c>, whose files are equally excluded — the prefix
+    /// regex is anchored, so the nested path does not match it. That is not a
+    /// bug and needs no fix: the scan tests every directory before descending,
+    /// so it prunes at <c>build</c> and never asks about anything beneath it.
+    /// Only widen this if some caller starts asking bottom-up.</para>
+    ///
+    /// <para><b>Soundness depends on <c>*</c> crossing separators here</b>
+    /// (see <see cref="GlobToRegexPattern"/>: <c>*</c> becomes <c>.*</c>). That
+    /// is what makes <c>dir/*</c> cover <c>dir/a/b/c</c> and not just
+    /// <c>dir/a</c>. If <c>*</c> is ever changed to stop at a separator, this
+    /// method must change with it or it will prune subtrees whose deeper files
+    /// are NOT excluded.</para>
+    /// </summary>
+    public static Func<string, bool>? CreateDirectorySubtreeFilter(IReadOnlyList<string> patterns)
+    {
+        if (patterns.Count == 0)
+            return null;
+
+        var prefixRegexes = new List<Regex>();
+
+        foreach (var pattern in patterns)
+        {
+            string trimmed = pattern.Trim();
+            if (trimmed.Length == 0)
+                continue;
+            if (trimmed.StartsWith("~nv:"))
+                trimmed = trimmed[4..];
+            if (!IsPathPattern(trimmed))
+                continue;   // a filename pattern says nothing about a whole directory
+
+            string normalised = trimmed.Replace('\\', '/');
+
+            string prefix;
+            if (normalised.EndsWith("/**", StringComparison.Ordinal))
+                prefix = normalised[..^3];
+            else if (normalised.EndsWith("/*", StringComparison.Ordinal))
+                prefix = normalised[..^2];
+            else
+                continue;   // does not cover a whole subtree
+
+            prefix = prefix.TrimEnd('/');
+            if (prefix.Length == 0)
+                continue;   // "/**" would prune everything; refuse
+
+            prefixRegexes.Add(new Regex(
+                "^" + GlobToRegexPattern(prefix) + "$",
+                RegexOptions.IgnoreCase | RegexOptions.Compiled | RegexOptions.Singleline));
+        }
+
+        if (prefixRegexes.Count == 0)
+            return null;
+
+        var arr = prefixRegexes.ToArray();
+        return directoryPath =>
+        {
+            string normalised = directoryPath.Replace('\\', '/').TrimEnd('/');
+            for (int i = 0; i < arr.Length; i++)
+            {
+                if (arr[i].IsMatch(normalised))
+                    return true;
+            }
+            return false;
+        };
+    }
+
+    /// <summary>
     /// A pattern is path-based if it contains a directory separator.
     /// </summary>
     private static bool IsPathPattern(string pattern)
