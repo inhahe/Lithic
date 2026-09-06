@@ -6,6 +6,7 @@ using System.Windows.Input;
 using LithicBackup.Core.Interfaces;
 using LithicBackup.Core.Models;
 using LithicBackup.Infrastructure.Burning;
+using LithicBackup.Infrastructure.Diagnostics;
 using LithicBackup.Services;
 using LithicBackup.Views;
 
@@ -2680,6 +2681,7 @@ public class MainViewModel : ViewModelBase
         row.IsRunning = false;
         row.LastResultIsError = false;
         row.LastResultText = message;
+        CrashLogger.Log(null, $"GUI: nothing to back up for \"{row.Name}\": {message}");
         // Deliberately does NOT touch the current view. Task flows own their own
         // windows now; a backup finishing must never reach over and close work
         // the user is in the middle of, which is exactly what resetting the view
@@ -3531,6 +3533,26 @@ public class MainViewModel : ViewModelBase
         }
 
         bool isDir = plan.Job.TargetDirectory is not null;
+
+        // Log the lifecycle of a GUI-initiated backup to the same daily log the
+        // Worker writes to.
+        //
+        // Only the Worker used to log its runs, so a backup started from the GUI
+        // left no trace on disk at all. When one of them coincided with a task
+        // window disappearing, there was no record of it having started, let
+        // alone when it finished - the cause had to be inferred from the code
+        // rather than read off a log line. Anything that can move while the user
+        // is not watching should say so somewhere durable.
+        string destination = isDir
+            ? plan.Job.TargetDirectory ?? "(no destination)"
+            : $"{plan.TotalDiscsRequired} disc(s)";
+        CrashLogger.Log(null,
+            $"GUI: starting backup for \"{row.Name}\" \u2192 {destination}: "
+            + $"{plan.Diff.NewFiles.Count + plan.Diff.ChangedFiles.Count:N0} file(s), "
+            + $"{plan.TotalBytes:N0} bytes "
+            + $"({plan.Diff.NewFiles.Count:N0} new, {plan.Diff.ChangedFiles.Count:N0} changed, "
+            + $"{plan.Diff.DeletedFiles.Count:N0} deleted).");
+
         var progressVm = new BurnProgressViewModel { IsDirectoryMode = isDir };
         // The row's progress panel lives on the home screen, but starting a
         // backup must not NAVIGATE there: doing so silently destroyed whatever
@@ -3547,6 +3569,11 @@ public class MainViewModel : ViewModelBase
             row.LastResultIsError = progressVm.HasFailedFiles
                 || progressVm.StatusText.Contains("failed", StringComparison.OrdinalIgnoreCase);
             row.LastResultText = progressVm.StatusText;
+
+            CrashLogger.Log(null,
+                $"GUI: backup for \"{row.Name}\" finished"
+                + (row.LastResultIsError ? " WITH ERRORS" : "")
+                + $": {progressVm.StatusText}");
             row.Progress = null;                // dismiss this row's progress panel
             row.IsRunning = false;
             _ = LoadBackupSetsAsync();

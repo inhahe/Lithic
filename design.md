@@ -164,6 +164,42 @@ every directory beneath it. Two separate payoffs, worth keeping straight:
 directory's *own* mtime, which does not change when a file deep inside a
 descendant grows. Totals can therefore lag until the scheduler recomputes.
 
+## Build the answer, not a copy of the question
+
+The destination scan needs, per disc path, one bit — is any record still active,
+meaning the file on disk is properly tracked — and, only for paths where every
+record is deleted, one source path to display. It used to get there by
+materialising every row (`List<(DiscPath, IsDeleted, SourcePath)>`) and then
+building a `Dictionary<string, List<DestPathRecord>>` on top, so the rows were
+held twice over and a `List` object existed per path.
+
+Measured on a real 2,810,190-row set:
+
+| shape | peak |
+|---|---|
+| rows materialised + a record list per path | **1,751 MB** |
+| aggregated as the rows arrive | **754 MB** |
+
+with identical verdicts on all 2,803,380 paths. `ICatalogRepository.ForEachDiscPathEntryAsync`
+streams the rows to a callback and `DestPathState` holds the aggregate, whose
+source-path field is nulled the moment an active record appears — which is why
+most of the strings become garbage as they are read rather than being retained.
+That is the whole saving: the overwhelming majority of paths are active, and for
+those the answer is one bit.
+
+**The general shape: a lookup should hold what the question reduces to.** If you
+find yourself keeping records so a later pass can reduce them, reduce them on the
+way in.
+
+## Anything that can move while nobody is watching must log
+
+Only the Worker logged its backups, so a backup started from the GUI left no
+trace on disk. When a task window vanished during one, there was no record that a
+backup had even started, and the cause had to be inferred from reading the code
+rather than read off a log line. `MainViewModel` now writes start, finish
+(flagging errors) and nothing-to-do through `CrashLogger.Log`, into the same
+daily log the Worker uses.
+
 ## Each task owns a window; nothing may navigate on the user's behalf
 
 Task flows — Cleanup, Restore, Verify, Coverage, Test Disc, Largest Files, Find

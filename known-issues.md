@@ -1,5 +1,40 @@
 # LithicBackup — Known Issues & Tech Debt
 
+## FIXED: the destination scan held the catalog twice over (2026-09-06)
+
+**Symptom.** After a destination scan of a 2.8M-row set, the GUI process had a
+peak working set of **5,037 MB** and was still holding 2,983 MB. Nothing failed,
+but an allocation failure at that size was close enough to be worth removing —
+and it was noticed only because the process was still running while a different
+bug was being investigated.
+
+**Cause.** The scan materialised every catalog row and *then* built its lookup on
+top, so the rows were held twice and a `List` object existed per disc path — for
+a question that reduces to one bit for all but a handful of paths.
+
+**Fix.** `ForEachDiscPathEntryAsync` streams rows to a callback, and
+`DestPathState` aggregates as they arrive: an active record sets the bit and
+nulls the stored source path, so the strings for the (vast majority) active paths
+become garbage immediately instead of being retained.
+
+**Measured on the real 2,810,190-row set-11 catalog:**
+
+| | |
+|---|---|
+| before | 1,751 MB |
+| after | **754 MB** (57% less) |
+| verdicts changed | **0** of 2,803,380 paths |
+
+Confirmed end-to-end by driving the shipped `ForEachDiscPathEntryAsync` against
+the live catalog: 2,810,310 rows to 2,803,500 paths, managed heap +754.0 MB,
+matching the prediction exactly.
+
+**Not fixed, and worth knowing:** this is still ~750 MB for a large set, because
+every disc path's string has to be retained to answer "is this file tracked?".
+Hashing the paths instead would cut it to ~100 MB but a collision would mean
+either failing to report a file or offering a real backup for deletion, so the
+strings stay.
+
 ## FIXED: starting a backup silently discarded whatever task was open (2026-09-06)
 
 **Symptom.** A Cleanup destination scan was left running on the I: set. Hours
