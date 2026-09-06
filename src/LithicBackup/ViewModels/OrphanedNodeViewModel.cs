@@ -208,6 +208,24 @@ public class OrphanedNodeViewModel : ViewModelBase
 public class OrphanedCategoryViewModel : ViewModelBase
 {
     private bool _isExpanded = true;
+    private double _widthOverride = double.NaN;
+
+    /// <summary>
+    /// Width this card has been dragged to, or <see cref="double.NaN"/> while it
+    /// still follows the "categories per row" default.
+    ///
+    /// <para>Per card rather than per column: the cards flow in a wrap layout, so
+    /// widening one pushes its neighbour along and the boundary between them is
+    /// what the user is actually dragging.</para>
+    /// </summary>
+    public double WidthOverride
+    {
+        get => _widthOverride;
+        set => SetProperty(ref _widthOverride, value);
+    }
+
+    /// <summary>True once this card has been dragged off the default width.</summary>
+    public bool HasWidthOverride => !double.IsNaN(_widthOverride);
 
     public OrphanedCategoryViewModel(
         OrphanedReason reason,

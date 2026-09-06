@@ -20,6 +20,7 @@
             <converters:IntEqualsVisibilityConverter x:Key="IntEqualsVis" />
             <converters:NonEmptyStringToVisibilityConverter x:Key="NonEmptyVis" />
             <converters:FractionOfConverter x:Key="FractionOf" />
+            <converters:CategoryCardWidthConverter x:Key="CategoryCardWidth" />
         </ResourceDictionary>
     </Application.Resources>
 </Application>

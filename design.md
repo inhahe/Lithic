@@ -164,24 +164,36 @@ every directory beneath it. Two separate payoffs, worth keeping straight:
 directory's *own* mtime, which does not change when a file deep inside a
 descendant grows. Totals can therefore lag until the scheduler recomputes.
 
-## Cleanup's layout is a width problem, not a column-width problem
+## Cleanup's results are resizable in three ways, and the reason matters
 
-The category cards lay out in a `UniformGrid` whose column count is the user's
-(`UserSettings.CleanupCategoryColumns`, 1-3, default 3). That setting exists
-because it is the only thing that meaningfully changes how much room a path gets:
-at three columns a card is a third of the window, and the tree indents **19px per
-level**, so five levels deep consumes ~95px of a ~160px name column and the path
-disappears.
+Reading a path in the results tree is a width problem, and there are three levers,
+all now user-controlled:
 
-**Making the Files/Size columns resizable would not have fixed it** — they are
-already `Auto` with 56px/80px minimums, so reclaiming both buys about 136px, once.
-Worth knowing before someone implements column dragging in response to the same
-complaint.
+* **The Files and Size columns are draggable** (splitters on their left edges in
+  the header; widths shared with every row through the `CleanupColumnLayout`
+  resource object, persisted). Directory is a star column, so whatever they give
+  up it takes.
+* **The dividers between category cards are draggable** — the cards flow in a
+  `WrapPanel` with a per-card `WidthOverride`, so widening one pushes its
+  neighbour along. Double-click a divider to return that card to its share.
+* **Categories per row (1-3)** as a quick preset, persisted.
 
-Horizontal scrolling inside a card was considered and rejected: it needs the name
-column to be content-sized and shared across rows, and `SharedSizeGroup` only
-sees *realised* rows, so with virtualization on a large tree the columns would
-resize as you scroll. Nodes already carry the full path as a tooltip.
+**Measure the space that is actually left, not the column total.** The first
+attempt at this dismissed column resizing on the grounds that reclaiming Files
+and Size buys "only ~136px" of a ~160px name column — an 85% gain, seemingly not
+worth building. That was the wrong quantity. The tree indents **19px per level**,
+so at five levels deep the name column has ~65px of *usable* width, and handing
+back 136px takes it to ~201px: **three times** the readable space. A gain that
+looks marginal against the whole column is decisive against what remains after
+the indent.
+
+**Horizontal scrolling inside a card was rejected for a reason that only applies
+to one implementation of it.** Content-sizing the name column and sharing it with
+`SharedSizeGroup` would jitter under virtualization, because a shared group
+measures only *realised* rows. But an explicitly-sized name column has nothing to
+measure, so a row wider than the card would simply scroll. It is not implemented
+because the two levers above cover the cases seen so far — not because it cannot
+work. If deep trees still run out of room, that is the next thing to build.
 
 ## Build the answer, not a copy of the question
 

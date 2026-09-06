@@ -89,6 +89,15 @@ public class UserSettings
     /// </summary>
     public int CleanupCategoryColumns { get; set; } = 3;
 
+    /// <summary>
+    /// Width of Cleanup's "Files" column. Narrowing it widens the Directory
+    /// column, which is a star column taking whatever is left.
+    /// </summary>
+    public double CleanupFilesColumnWidth { get; set; } = 56;
+
+    /// <summary>Width of Cleanup's "Size" column. See <see cref="CleanupFilesColumnWidth"/>.</summary>
+    public double CleanupSizeColumnWidth { get; set; } = 80;
+
     public static UserSettings Load()
     {
         try
