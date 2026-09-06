@@ -1488,14 +1488,20 @@ public class OrphanedDirectoriesViewModel : ViewModelBase
                 // of a list of every row, costs about as much again as the answer.
                 // Measured on a 2,810,190-row set: 1,751 MB the old way, 754 MB
                 // this way, with identical verdicts on all 2,803,380 paths.
-                var discPathLookup = new Dictionary<string, DestPathState>(
-                    StringComparer.OrdinalIgnoreCase);
+                // Keyed by a 128-bit hash of the path rather than the path
+                // itself: the strings are the whole cost at this scale, and
+                // Services.DiscPathKey documents why hashing cannot cause a
+                // wrongful deletion here (a collision can only make a file look
+                // MORE tracked, never less).
+                var discPathLookup = new Dictionary<UInt128, DestPathState>();
 
                 await _catalog.ForEachDiscPathEntryAsync(
                     setId,
                     (discPath, isDeleted, sourcePath) =>
                     {
-                        string normalised = discPath.Replace('/', '\\');
+                        // DiscPathKey normalises separators and case itself, so
+                        // no per-row string is built here either.
+                        var normalised = Services.DiscPathKey.From(discPath);
                         discPathLookup.TryGetValue(normalised, out var current);
 
                         if (!isDeleted)
@@ -1762,7 +1768,7 @@ public class OrphanedDirectoriesViewModel : ViewModelBase
                     int FilesScanned)
         WalkDestination(
             string targetDir,
-            Dictionary<string, DestPathState> discPathLookup,
+            Dictionary<UInt128, DestPathState> discPathLookup,
             IProgress<string> progress)
     {
         var untracked = new List<(string, long, string?)>();
@@ -1873,9 +1879,9 @@ public class OrphanedDirectoriesViewModel : ViewModelBase
                     // backup data (and it reappears once the worker
                     // re-materialises the reference).  Exact match wins; the
                     // manifest-suffix fallbacks only fire for suffix-less files.
-                    if (discPathLookup.TryGetValue(relativePath, out var state)
-                        || discPathLookup.TryGetValue(relativePath + ".fileref", out state)
-                        || discPathLookup.TryGetValue(relativePath + ".dedup", out state))
+                    if (discPathLookup.TryGetValue(Services.DiscPathKey.From(relativePath), out var state)
+                        || discPathLookup.TryGetValue(Services.DiscPathKey.From(relativePath + ".fileref"), out state)
+                        || discPathLookup.TryGetValue(Services.DiscPathKey.From(relativePath + ".dedup"), out state))
                     {
                         if (state.HasActive)
                             continue; // Active record exists — file is properly tracked.

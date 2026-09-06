@@ -29,11 +29,41 @@ Confirmed end-to-end by driving the shipped `ForEachDiscPathEntryAsync` against
 the live catalog: 2,810,310 rows to 2,803,500 paths, managed heap +754.0 MB,
 matching the prediction exactly.
 
-**Not fixed, and worth knowing:** this is still ~750 MB for a large set, because
-every disc path's string has to be retained to answer "is this file tracked?".
-Hashing the paths instead would cut it to ~100 MB but a collision would mean
-either failing to report a file or offering a real backup for deletion, so the
-strings stay.
+**Follow-up the same day: the paths are now hashed, and 750 MB became 164 MB.**
+
+The paragraph that stood here said hashing was rejected because "a collision
+would mean either failing to report a file or offering a real backup for
+deletion". **The second half of that was wrong**, and it was the half doing the
+work. The lookup aggregates with *active wins* — any active record for a path
+sets `HasActive` and nothing ever clears it — so a file whose own path has an
+active record reads back as active no matter what collides with it. Every
+possible collision outcome is therefore the safe direction: something that should
+have been reported as untracked or catalog-deleted is skipped. **"Miss an
+orphan", never "delete a real backup."** The design was already collision-safe by
+construction; the objection was to a hazard that could not occur.
+
+With that settled, the odds are a footnote rather than the argument: 128 bits
+over 2.8M paths gives a birthday bound of about N²/2^129 ≈ **1.2e-26**, far below
+the chance of an undetected memory error during the same scan. And there is
+precedent — file-level dedup already keeps ONE copy when two files' SHA-256
+match, which stakes far more on hash equality than a lookup does.
+
+`Services/DiscPathKey` hashes with SHA-256 truncated to 128 bits, upper-casing
+per character with `char.ToUpperInvariant` and mapping `/` to `\` as it goes.
+That per-character step is not incidental: `OrdinalIgnoreCase` is defined as
+comparing per-character invariant uppercase forms, and getting it wrong is the
+one genuinely dangerous mistake available here — a path that stopped matching its
+own catalog entry would be reported as untracked and offered for deletion.
+
+**Measured against the real 2.81M-row catalog, through the shipped code:**
+
+| | |
+|---|---|
+| original (rows materialised + a list per path) | 1,751 MB |
+| streamed, string-keyed | 754 MB |
+| streamed, 128-bit-keyed | **164 MB** (91% below the original) |
+| collisions among 2,803,602 distinct paths | **0** |
+| verdict disagreements vs the string-keyed lookup | **0** |
 
 ## FIXED: starting a backup silently discarded whatever task was open (2026-09-06)
 

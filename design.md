@@ -178,18 +178,33 @@ Measured on a real 2,810,190-row set:
 | shape | peak |
 |---|---|
 | rows materialised + a record list per path | **1,751 MB** |
-| aggregated as the rows arrive | **754 MB** |
+| aggregated as the rows arrive | 754 MB |
+| …and keyed by a 128-bit path hash | **164 MB** |
 
-with identical verdicts on all 2,803,380 paths. `ICatalogRepository.ForEachDiscPathEntryAsync`
-streams the rows to a callback and `DestPathState` holds the aggregate, whose
-source-path field is nulled the moment an active record appears — which is why
-most of the strings become garbage as they are read rather than being retained.
-That is the whole saving: the overwhelming majority of paths are active, and for
-those the answer is one bit.
+with identical verdicts on every path at each step.
+`ICatalogRepository.ForEachDiscPathEntryAsync` streams the rows to a callback and
+`DestPathState` holds the aggregate, whose source-path field is nulled the moment
+an active record appears — so most of the strings become garbage as they are read.
+`Services/DiscPathKey` then removes the path strings themselves.
+
+**Hashing a key you will make deletion decisions from needs an argument, and
+"the odds are tiny" is the weakest one available.** The real argument here is
+that the aggregation is *collision-safe by construction*: active wins, and
+nothing ever clears it, so a file whose own path has an active record reads back
+as active whatever collides with it. Every collision outcome is "miss an orphan",
+never "offer a real backup for deletion". The birthday bound (≈1.2e-26 at 128
+bits over 2.8M paths) is then a footnote, and measurement confirmed 0 collisions
+and 0 changed verdicts across 2,803,602 real paths.
+
+**What that argument depends on, so do not break it:** if a future change ever
+lets a *deleted* record overwrite an active one for the same key, collisions stop
+being safe and this becomes a way to delete live backups. Keep "active wins"
+unconditional.
 
 **The general shape: a lookup should hold what the question reduces to.** If you
 find yourself keeping records so a later pass can reduce them, reduce them on the
-way in.
+way in — and if what remains is still mostly the keys, ask whether the keys
+themselves need to be there.
 
 ## Anything that can move while nobody is watching must log
 
