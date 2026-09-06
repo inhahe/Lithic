@@ -37,6 +37,9 @@ public class OrphanedDirectoriesViewModel : ViewModelBase
     /// that needs the destination, which is the moment the answer has to be right.
     /// </summary>
     private bool _destinationAvailable;
+
+    /// <summary>Category cards per row; see <see cref="CategoryColumns"/>.</summary>
+    private int _categoryColumns = 3;
     private bool _isLoading;
     private bool _isPurging;
     private bool _isScanningDestination;
@@ -68,6 +71,16 @@ public class OrphanedDirectoriesViewModel : ViewModelBase
         _targetDir = backupSet.JobOptions?.TargetDirectory;
         _reconcile = new CatalogReconcileService(catalog);
         RefreshDestinationAvailability();
+
+        try
+        {
+            int saved = UserSettings.Load().CleanupCategoryColumns;
+            _categoryColumns = saved < 1 ? 1 : (saved > 3 ? 3 : saved);
+        }
+        catch
+        {
+            // Keep the default of three.
+        }
 
         Items = [];
         Categories = [];
@@ -199,6 +212,62 @@ public class OrphanedDirectoriesViewModel : ViewModelBase
             if (SetProperty(ref _isScanningDestination, value))
                 CommandManager.InvalidateRequerySuggested();
         }
+    }
+
+    /// <summary>
+    /// Category cards per row (1-3). Persisted, because it is a working
+    /// preference rather than a per-scan choice: someone cleaning a deep tree
+    /// wants the wide layout every time they open Cleanup, not once.
+    ///
+    /// <para>Three fits the most categories on screen, but gives each card a
+    /// third of the window; with the tree indenting 19px per level, a deep path
+    /// is squeezed out of the name column entirely. One column trades seeing
+    /// several categories at once for being able to read the paths.</para>
+    /// </summary>
+    public int CategoryColumns
+    {
+        get => _categoryColumns;
+        set
+        {
+            int clamped = value < 1 ? 1 : (value > 3 ? 3 : value);
+            if (!SetProperty(ref _categoryColumns, clamped))
+                return;
+
+            OnPropertyChanged(nameof(IsOneColumn));
+            OnPropertyChanged(nameof(IsTwoColumn));
+            OnPropertyChanged(nameof(IsThreeColumn));
+            try
+            {
+                var settings = UserSettings.Load();
+                settings.CleanupCategoryColumns = clamped;
+                settings.Save();
+            }
+            catch
+            {
+                // A preference that cannot be saved is not worth failing over.
+            }
+        }
+    }
+
+    /// <summary>Radio-style bindings for the 1 / 2 / 3 selector.</summary>
+    public bool IsOneColumn
+    {
+        get => _categoryColumns == 1;
+        set { if (value) CategoryColumns = 1; }
+    }
+
+    /// <inheritdoc cref="IsOneColumn"/>
+    public bool IsTwoColumn
+    {
+        get => _categoryColumns == 2;
+        set { if (value) CategoryColumns = 2; }
+    }
+
+    /// <inheritdoc cref="IsOneColumn"/>
+    public bool IsThreeColumn
+    {
+        get => _categoryColumns == 3;
+        set { if (value) CategoryColumns = 3; }
     }
 
     /// <summary>

@@ -164,6 +164,25 @@ every directory beneath it. Two separate payoffs, worth keeping straight:
 directory's *own* mtime, which does not change when a file deep inside a
 descendant grows. Totals can therefore lag until the scheduler recomputes.
 
+## Cleanup's layout is a width problem, not a column-width problem
+
+The category cards lay out in a `UniformGrid` whose column count is the user's
+(`UserSettings.CleanupCategoryColumns`, 1-3, default 3). That setting exists
+because it is the only thing that meaningfully changes how much room a path gets:
+at three columns a card is a third of the window, and the tree indents **19px per
+level**, so five levels deep consumes ~95px of a ~160px name column and the path
+disappears.
+
+**Making the Files/Size columns resizable would not have fixed it** — they are
+already `Auto` with 56px/80px minimums, so reclaiming both buys about 136px, once.
+Worth knowing before someone implements column dragging in response to the same
+complaint.
+
+Horizontal scrolling inside a card was considered and rejected: it needs the name
+column to be content-sized and shared across rows, and `SharedSizeGroup` only
+sees *realised* rows, so with virtualization on a large tree the columns would
+resize as you scroll. Nodes already carry the full path as a tooltip.
+
 ## Build the answer, not a copy of the question
 
 The destination scan needs, per disc path, one bit — is any record still active,

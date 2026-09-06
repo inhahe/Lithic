@@ -290,6 +290,29 @@
                            TextWrapping="Wrap" FontSize="12" />
             </Border>
 
+            <!-- Category layout: fewer columns = wider cards = readable paths in
+                 deep trees. Persisted via UserSettings.CleanupCategoryColumns. -->
+            <StackPanel Orientation="Horizontal" Margin="0,10,0,0"
+                        HorizontalAlignment="Right"
+                        VerticalAlignment="Center">
+                <TextBlock Text="Categories per row:"
+                           Foreground="{StaticResource TextSecondaryBrush}"
+                           FontSize="11"
+                           VerticalAlignment="Center"
+                           Margin="0,0,6,0" />
+                <RadioButton Content="1" GroupName="CleanupCols"
+                             IsChecked="{Binding IsOneColumn, Mode=TwoWay}"
+                             VerticalAlignment="Center" Margin="0,0,6,0"
+                             ToolTip="One category per row — widest tree, best for deep paths." />
+                <RadioButton Content="2" GroupName="CleanupCols"
+                             IsChecked="{Binding IsTwoColumn, Mode=TwoWay}"
+                             VerticalAlignment="Center" Margin="0,0,6,0" />
+                <RadioButton Content="3" GroupName="CleanupCols"
+                             IsChecked="{Binding IsThreeColumn, Mode=TwoWay}"
+                             VerticalAlignment="Center"
+                             ToolTip="Three per row — most categories visible at once." />
+            </StackPanel>
+
             <!-- Scan / maintenance actions laid out as a uniform 2×2 grid so
                  every card is the same width and height regardless of content.
                  The two destination-dependent cards (Reconcile, Scan
@@ -457,10 +480,16 @@
             <ItemsControl ItemsSource="{Binding Categories}">
                 <ItemsControl.ItemsPanel>
                     <ItemsPanelTemplate>
-                        <!-- 3-column uniform grid: cards flow row-by-row,
-                             empty categories don't appear, remaining cards
-                             reflow to fill rows. -->
-                        <UniformGrid Columns="3" />
+                        <!-- Cards flow row-by-row; empty categories don't
+                             appear and the rest reflow. The column count is the
+                             user's, because it is the only thing that decides
+                             how much width a path tree gets: at three columns a
+                             card is a third of the window, and the tree indents
+                             19px per level, so a deep path runs out of name
+                             column. Resizing the Files/Size columns would not
+                             have helped - they are already Auto with 56/80px
+                             minimums, so reclaiming both buys ~136px. -->
+                        <UniformGrid Columns="{Binding CategoryColumns}" />
                     </ItemsPanelTemplate>
                 </ItemsControl.ItemsPanel>
                 <ItemsControl.ItemTemplate>
