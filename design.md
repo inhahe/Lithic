@@ -164,6 +164,48 @@ every directory beneath it. Two separate payoffs, worth keeping straight:
 directory's *own* mtime, which does not change when a file deep inside a
 descendant grows. Totals can therefore lag until the scheduler recomputes.
 
+## Each task owns a window; nothing may navigate on the user's behalf
+
+Task flows — Cleanup, Restore, Verify, Coverage, Test Disc, Largest Files, Find
+File, Catalog-free Restore — each open in their **own non-modal top-level
+window** (`Views/TaskWindow`, opened and tracked by
+`Services/TaskWindowManager`). They set no `Owner` and do appear in the taskbar,
+so a multi-hour scan can sit behind the main window and survives it being
+minimised.
+
+**Why, and what it replaced.** They used to be swapped into the main window's
+`CurrentView`. That made the current task a piece of *global* state, so any code
+that assigned `CurrentView` destroyed whatever the user was doing — and two
+places did, as part of a backup's lifecycle rather than a navigation:
+`StartBurn` reset the view so the row's progress panel would be visible, and
+`ShowNoOpCompletion` did the same. Starting a backup therefore silently
+discarded a running Cleanup destination scan; observed once, after several
+hours of scanning.
+
+**The rule: a backup starting or finishing must never change what the user is
+looking at.** More generally, no background event may navigate. If a piece of UI
+needs to be seen, it appears where it belongs and waits.
+
+`CurrentView` and `GoHome` still exist but nothing assigns a flow to them. If you
+add a task flow, give it a window — do not reintroduce an inline view, because
+the moment one exists the global-state hazard is back.
+
+**Concurrency between windows is policed, not assumed.** Several task windows may
+be open at once, which means two of them can act on one backup set.
+`TaskKind` records what each flow does (`WritesCatalog`, `WritesDestination`,
+`ReadsDestination`) and `TaskWindowManager` uses it to:
+
+* refuse a **second window of the same task on the same set** — it focuses the
+  existing one instead, since two Cleanups purging one catalog is not something
+  the catalog is built for;
+* **warn and ask** before opening a task whose access conflicts with another
+  window already open on that set, or with a **backup running** for it (a
+  running backup is a writer too, even though it has no window).
+
+Read-only pairs (Coverage alongside Cleanup) open silently. Adding a flow means
+declaring its access honestly; understating it is how you get two writers on one
+catalog with no warning.
+
 ## Exclusion rules are an invariant of the catalog, not a step in one code path
 
 A file is excluded from a set by any of: a user glob in `ExcludedExtensions`, a

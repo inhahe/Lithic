@@ -78,39 +78,6 @@
             <!-- Main content area (full width) -->
             <Border Grid.Row="1" Style="{StaticResource Card}">
                 <ContentControl Content="{Binding CurrentView}">
-                    <ContentControl.Resources>
-                        <!-- Map viewmodel types to views -->
-                        <DataTemplate DataType="{x:Type vm:SourceSelectionViewModel}">
-                            <views:SourceSelectionView />
-                        </DataTemplate>
-                        <DataTemplate DataType="{x:Type vm:BackupJobViewModel}">
-                            <views:BackupJobView />
-                        </DataTemplate>
-                        <DataTemplate DataType="{x:Type vm:RestoreViewModel}">
-                            <views:RestoreView />
-                        </DataTemplate>
-                        <DataTemplate DataType="{x:Type vm:CatalogFreeRestoreViewModel}">
-                            <views:CatalogFreeRestoreView />
-                        </DataTemplate>
-                        <DataTemplate DataType="{x:Type vm:OrphanedDirectoriesViewModel}">
-                            <views:OrphanedDirectoriesView />
-                        </DataTemplate>
-                        <DataTemplate DataType="{x:Type vm:FindFileViewModel}">
-                            <views:FindFileView />
-                        </DataTemplate>
-                        <DataTemplate DataType="{x:Type vm:BackupCoverageViewModel}">
-                            <views:BackupCoverageView />
-                        </DataTemplate>
-                        <DataTemplate DataType="{x:Type vm:VerifyIntegrityViewModel}">
-                            <views:VerifyIntegrityView />
-                        </DataTemplate>
-                        <DataTemplate DataType="{x:Type vm:TestDiscViewModel}">
-                            <views:TestDiscView />
-                        </DataTemplate>
-                        <DataTemplate DataType="{x:Type vm:LargestFilesViewModel}">
-                            <views:LargestFilesView />
-                        </DataTemplate>
-                    </ContentControl.Resources>
 
                     <!-- Default content when CurrentView is null (home screen = set list) -->
                     <ContentControl.Style>

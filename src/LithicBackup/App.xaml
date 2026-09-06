@@ -8,6 +8,9 @@
         <ResourceDictionary>
             <ResourceDictionary.MergedDictionaries>
                 <ResourceDictionary Source="Resources/Styles.xaml" />
+                <!-- Flow view model -> view mapping, reachable from every window
+                     (the main window, the set editor, and each TaskWindow). -->
+                <ResourceDictionary Source="Resources/FlowViewTemplates.xaml" />
             </ResourceDictionary.MergedDictionaries>
 
             <!-- Global converters -->

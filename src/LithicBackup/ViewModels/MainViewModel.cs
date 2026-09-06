@@ -39,6 +39,14 @@ public class MainViewModel : ViewModelBase
     /// polling loops.  See <see cref="PollWhileServicePendingAsync"/>.</summary>
     private bool _servicePollActive;
     private BackupSetEditorWindow? _editorWindow;
+
+    /// <summary>
+    /// Opens and tracks the non-modal task windows (Cleanup, Restore, Verify,
+    /// ...). Each task owns a window, so nothing in the main window can discard
+    /// work in progress - which is exactly what used to happen when a backup
+    /// starting reset CurrentView out from under a running Cleanup scan.
+    /// </summary>
+    private readonly Services.TaskWindowManager _taskWindows;
     private Window? _largestFilesWindow;
     private Func<Task>? _pendingSettingsSave;
     private int? _unsavedNewSetId;
@@ -77,6 +85,12 @@ public class MainViewModel : ViewModelBase
         _sourceResolver = sourceResolver;
         _switchableBurner = burner as SwitchableDiscBurner;
         _simulatedBurner = _switchableBurner?.Simulated;
+
+        // The row VMs are the authority on whether a set is mid-run, and the
+        // main window is resolved lazily because it does not exist yet here.
+        _taskWindows = new Services.TaskWindowManager(
+            isBackupRunning: setId => RowFor(setId)?.IsRunning == true,
+            mainWindow: () => Application.Current?.MainWindow);
 
         BackupSets = [];
 
@@ -2666,7 +2680,10 @@ public class MainViewModel : ViewModelBase
         row.IsRunning = false;
         row.LastResultIsError = false;
         row.LastResultText = message;
-        CurrentView = null;                   // return to the home screen
+        // Deliberately does NOT touch the current view. Task flows own their own
+        // windows now; a backup finishing must never reach over and close work
+        // the user is in the middle of, which is exactly what resetting the view
+        // here used to do.
         StatusText = "";
     }
 
@@ -3489,7 +3506,6 @@ public class MainViewModel : ViewModelBase
         if (row is null)
         {
             StatusText = "Unable to locate the saved backup set to run.";
-            CurrentView = null;
             return;
         }
         if (row.IsRunning)
@@ -3516,7 +3532,11 @@ public class MainViewModel : ViewModelBase
 
         bool isDir = plan.Job.TargetDirectory is not null;
         var progressVm = new BurnProgressViewModel { IsDirectoryMode = isDir };
-        CurrentView = null;                     // return to home screen
+        // The row's progress panel lives on the home screen, but starting a
+        // backup must not NAVIGATE there: doing so silently destroyed whatever
+        // task the user had open, including multi-hour Cleanup scans. Task
+        // flows are separate windows now, so the panel simply appears behind
+        // whatever else is open.
         row.Progress = progressVm;              // show this row's inline progress panel
         // row.IsRunning is already true from the scan phase.
 
@@ -3726,12 +3746,12 @@ public class MainViewModel : ViewModelBase
         if (SelectedBackupSet is null)
             return;
 
-        var restoreVm = new RestoreViewModel(_catalog, _restoreService, SelectedBackupSet);
-
-        restoreVm.DoneRequested += GoHome;
-
-        CurrentView = restoreVm;
-        StatusText = $"Restore files from \"{SelectedBackupSet.Name}\".";
+        var set = SelectedBackupSet;
+        _taskWindows.Show(
+            Services.TaskKinds.Restore, set.Id, set.Name,
+            () => new RestoreViewModel(_catalog, _restoreService, set),
+            (vm, close) => ((RestoreViewModel)vm).DoneRequested += close);
+        StatusText = $"Restore files from \"{set.Name}\".";
     }
 
     // -------------------------------------------------------------------
@@ -3790,9 +3810,10 @@ public class MainViewModel : ViewModelBase
         // here: it would falsely signal "busy/unresponsive", and because the load
         // outlives this method it would also linger as a busy pointer if the user
         // navigated away before the load finished.
-        var vm = new OrphanedDirectoriesViewModel(_catalog, fresh);
-        vm.DoneRequested += GoHome;
-        CurrentView = vm;
+        _taskWindows.Show(
+            Services.TaskKinds.Cleanup, fresh.Id, fresh.Name,
+            () => new OrphanedDirectoriesViewModel(_catalog, fresh),
+            (vm, close) => ((OrphanedDirectoriesViewModel)vm).DoneRequested += close);
         StatusText = "Review files and directories that can be cleaned up.";
     }
 
@@ -3802,10 +3823,25 @@ public class MainViewModel : ViewModelBase
 
     private void StartFindFileFlow()
     {
-        var vm = new FindFileViewModel(_catalog);
-        vm.DoneRequested += GoHome;
+        FindFileViewModel? created = null;
 
-        vm.RestoreRequested += async setId =>
+        _taskWindows.Show(
+            Services.TaskKinds.FindFile, null, null,
+            () =>
+            {
+                created = new FindFileViewModel(_catalog);
+                return created;
+            },
+            (vm, close) => ((FindFileViewModel)vm).DoneRequested += close);
+
+        // Null when the window was already open and simply got focused - its
+        // hand-off is already wired, so there is nothing to subscribe again.
+        if (created is null)
+            return;
+
+        // Restoring from a search result opens Restore in ITS OWN window rather
+        // than replacing the search, so the result list survives the restore.
+        created.RestoreRequested += async setId =>
         {
             var backupSet = await _catalog.GetBackupSetAsync(setId);
             if (backupSet is null)
@@ -3814,13 +3850,13 @@ public class MainViewModel : ViewModelBase
                 return;
             }
 
-            var restoreVm = new RestoreViewModel(_catalog, _restoreService, backupSet);
-            restoreVm.DoneRequested += GoHome;
-            CurrentView = restoreVm;
+            _taskWindows.Show(
+                Services.TaskKinds.Restore, backupSet.Id, backupSet.Name,
+                () => new RestoreViewModel(_catalog, _restoreService, backupSet),
+                (vm, close) => ((RestoreViewModel)vm).DoneRequested += close);
             StatusText = $"Restore files from \"{backupSet.Name}\".";
         };
 
-        CurrentView = vm;
         StatusText = "Search for files or directories across all backup sets.";
     }
 
@@ -3830,10 +3866,10 @@ public class MainViewModel : ViewModelBase
 
     private void StartCatalogFreeRestoreFlow()
     {
-        var vm = new CatalogFreeRestoreViewModel(_catalogFreeRestoreService);
-        vm.DoneRequested += GoHome;
-
-        CurrentView = vm;
+        _taskWindows.Show(
+            Services.TaskKinds.CatalogFreeRestore, null, null,
+            () => new CatalogFreeRestoreViewModel(_catalogFreeRestoreService),
+            (vm, close) => ((CatalogFreeRestoreViewModel)vm).DoneRequested += close);
         StatusText = "Rebuild files directly from a backup folder, without the catalog.";
     }
 
@@ -3854,11 +3890,12 @@ public class MainViewModel : ViewModelBase
             new LithicBackup.Infrastructure.Deduplication.BlockDeduplicationEngine(),
             _fileHashCache);
 
-        var vm = new BackupCoverageViewModel(_catalog, _scanner, SelectedBackupSet, estimator);
-        vm.DoneRequested += GoHome;
-
-        CurrentView = vm;
-        StatusText = $"Analyzing backup coverage for \"{SelectedBackupSet.Name}\".";
+        var set = SelectedBackupSet;
+        _taskWindows.Show(
+            Services.TaskKinds.Coverage, set.Id, set.Name,
+            () => new BackupCoverageViewModel(_catalog, _scanner, set, estimator),
+            (vm, close) => ((BackupCoverageViewModel)vm).DoneRequested += close);
+        StatusText = $"Analyzing backup coverage for \"{set.Name}\".";
     }
 
     // -------------------------------------------------------------------
@@ -3869,11 +3906,12 @@ public class MainViewModel : ViewModelBase
     {
         if (SelectedBackupSet is null) return;
 
-        var vm = new VerifyIntegrityViewModel(_catalog, _scanner, SelectedBackupSet);
-        vm.DoneRequested += GoHome;
-
-        CurrentView = vm;
-        StatusText = $"Verifying backup integrity for \"{SelectedBackupSet.Name}\".";
+        var set = SelectedBackupSet;
+        _taskWindows.Show(
+            Services.TaskKinds.Verify, set.Id, set.Name,
+            () => new VerifyIntegrityViewModel(_catalog, _scanner, set),
+            (vm, close) => ((VerifyIntegrityViewModel)vm).DoneRequested += close);
+        StatusText = $"Verifying backup integrity for \"{set.Name}\".";
     }
 
     // -------------------------------------------------------------------
@@ -3884,12 +3922,12 @@ public class MainViewModel : ViewModelBase
     {
         if (SelectedBackupSet is null) return;
 
-        var vm = new TestDiscViewModel(
-            _catalog, _restoreService, _orchestrator, _burner, SelectedBackupSet);
-        vm.DoneRequested += GoHome;
-
-        CurrentView = vm;
-        StatusText = $"Test a backup disc from \"{SelectedBackupSet.Name}\".";
+        var set = SelectedBackupSet;
+        _taskWindows.Show(
+            Services.TaskKinds.TestDisc, set.Id, set.Name,
+            () => new TestDiscViewModel(_catalog, _restoreService, _orchestrator, _burner, set),
+            (vm, close) => ((TestDiscViewModel)vm).DoneRequested += close);
+        StatusText = $"Test a backup disc from \"{set.Name}\".";
     }
 
     // -------------------------------------------------------------------
@@ -3899,14 +3937,36 @@ public class MainViewModel : ViewModelBase
     private async void StartLargestFilesFlow()
     {
         if (SelectedBackupSet is null) return;
-        await ShowLargestFilesAsync(SelectedBackupSet, GoHome);
+
+        // Ask BEFORE constructing: the view model starts a full source scan as
+        // soon as it exists, so building one only to find the window already
+        // open would run that scan for nothing.
+        if (_taskWindows.TryFocusExisting(Services.TaskKinds.LargestFiles, SelectedBackupSet.Id))
+            return;
+
+        // ShowLargestFilesAsync already takes a "where do I put the view?" hook
+        // (the set editor uses it to host this inline); pass one that opens a
+        // task window instead of replacing the main view.
+        var set = SelectedBackupSet;
+        Views.TaskWindow? window = null;
+        await ShowLargestFilesAsync(
+            set,
+            onDone: () => window?.Close(),
+            setView: vm => window = _taskWindows.Show(
+                Services.TaskKinds.LargestFiles, set.Id, set.Name,
+                () => vm,
+                (created, close) => ((LargestFilesViewModel)created).DoneRequested += close));
     }
 
+    /// <param name="setView">
+    /// Where to put the view. Required: both callers host it explicitly (a task
+    /// window from the main screen, inline from the set editor), and defaulting
+    /// to the main window's CurrentView is what this refactor removed.
+    /// </param>
     private async Task<LargestFilesViewModel> ShowLargestFilesAsync(
         BackupSet backupSet, Action onDone,
-        Action<ViewModelBase>? setView = null)
+        Action<ViewModelBase> setView)
     {
-        setView ??= vm => CurrentView = vm;
 
         // Fast scalar count from the catalog for the progress bar.
         int estimatedCount = 0;
@@ -4482,6 +4542,13 @@ public class MainViewModel : ViewModelBase
     }
 
     /// <summary>Find the row VM wrapping the given backup set, if loaded.</summary>
+    /// <summary>
+    /// Close every open task window. Called when the main window closes: the app
+    /// runs with ShutdownMode.OnExplicitShutdown, so a task window left open
+    /// would keep the process alive with no way back to the main UI.
+    /// </summary>
+    public void CloseTaskWindows() => _taskWindows.CloseAll();
+
     private BackupSetRowViewModel? RowFor(int setId) =>
         BackupSets.FirstOrDefault(r => r.Id == setId);
 

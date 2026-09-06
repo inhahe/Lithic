@@ -1,5 +1,63 @@
 # LithicBackup — Known Issues & Tech Debt
 
+## FIXED: starting a backup silently discarded whatever task was open (2026-09-06)
+
+**Symptom.** A Cleanup destination scan was left running on the I: set. Hours
+later the app was sitting on the main screen with no scan and no error, and a J:
+backup had run in the meantime.
+
+**Ruled out first, by evidence rather than by guess:**
+
+| Suspicion | Verdict |
+|---|---|
+| The app crashed and restarted | **No.** No crash log since July, and the GUI process was the *same PID*, started hours earlier |
+| An unhandled exception reset the view | **No.** `App.DispatcherUnhandledException` writes a crash log, shows a modal error box, and leaves `Handled = false` so WPF terminates the process. None of the three happened |
+| Out of memory during the scan | **No**, for the same reason — and the process was still alive, holding 2.9 GB with a 5.0 GB peak |
+| The Cleanup view closed itself | **No.** Its `DoneRequested` is raised only by the Close button |
+
+**Cause.** Task flows were swapped into the main window's `CurrentView`, making
+"what the user is looking at" a piece of global state that any code could
+overwrite. Two places did, as part of a backup's lifecycle rather than as
+navigation:
+
+```csharp
+// StartBurn - when a backup STARTS
+CurrentView = null;        // return to home screen
+row.Progress = progressVm; // show this row's inline progress panel
+
+// ShowNoOpCompletion - when a run finds nothing to do
+CurrentView = null;        // return to the home screen
+```
+
+Neither asked what was on screen. The row's progress panel lives on the home
+screen, so starting a backup navigated there — discarding the open task and any
+work inside it. A Cleanup destination scan is the worst case: hours of walking
+1.3M destination files, thrown away with no message.
+
+**Fix: each task owns a non-modal top-level window** (`Views/TaskWindow`,
+managed by `Services/TaskWindowManager`). A window that belongs to a task cannot
+be discarded by an unrelated part of the app, so the whole class of bug goes
+away rather than this one instance of it. `CurrentView` still exists but nothing
+assigns a flow to it, and the two lines above are gone.
+
+Several windows may now be open at once, so `TaskKind` records what each flow
+does (`WritesCatalog` / `WritesDestination` / `ReadsDestination`) and the manager
+refuses a second window of the same task on one set (it focuses the existing
+one), and warns before opening a task that conflicts with another window on that
+set — or with a backup running for it, since a running backup is a writer too.
+
+**Verified** against the built assembly: all 11 flow templates resolve from the
+application resources, `TaskWindow` renders with no owner and its own taskbar
+button, and the policy fires exactly where intended with a Cleanup window open on
+set 1:
+
+    Coverage on set 1      -> quiet     LargestFiles on set 1 -> quiet
+    Verify on set 1        -> WARN      Restore on set 1      -> WARN
+    Verify on set 2        -> quiet     Cleanup, backup running -> WARN
+
+**The general rule, now in design.md:** no background event may navigate. A
+backup starting or finishing must never change what the user is looking at.
+
 ## FIXED: cleaning one missing file tombstoned its whole directory subtree (2026-09-05)
 
 **Introduced and found the same day, by the fix immediately below it.** Teaching

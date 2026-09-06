@@ -1,0 +1,27 @@
+<!--
+    Generic host for one task flow (Cleanup, Restore, Verify, Coverage, ...).
+
+    Deliberately an INDEPENDENT top-level window: it sets no Owner and does show
+    in the taskbar, so a long-running scan can sit behind the main window while
+    other work carries on, and it survives the main window being minimised. That
+    is the whole point of the change - these tasks already run concurrently, so
+    the UI should let them be looked at concurrently.
+
+    The content is a flow view model, rendered through the application-wide
+    templates in Resources/FlowViewTemplates.xaml.
+-->
+<Window x:Class="LithicBackup.Views.TaskWindow"
+        xmlns="http://schemas.microsoft.com/winfx/2006/xaml/presentation"
+        xmlns:x="http://schemas.microsoft.com/winfx/2006/xaml"
+        Style="{StaticResource MainWindowStyle}"
+        Title="{Binding WindowTitle, RelativeSource={RelativeSource Self}}"
+        Height="950" Width="1000"
+        MinHeight="500" MinWidth="700"
+        WindowStartupLocation="Manual"
+        ShowInTaskbar="True">
+
+    <Border Style="{StaticResource Card}" Margin="12">
+        <ContentControl Content="{Binding Flow, RelativeSource={RelativeSource AncestorType=Window}}"
+                        Focusable="False" />
+    </Border>
+</Window>
