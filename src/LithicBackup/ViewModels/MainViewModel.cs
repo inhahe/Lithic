@@ -2293,7 +2293,20 @@ public class MainViewModel : ViewModelBase
         }
         catch (Exception ex)
         {
+            // Report a FAILED delete in a dialog, not only the status bar.
+            // The user just confirmed a permanent, destructive action in a modal
+            // dialog; if it then fails, having the set quietly reappear with the
+            // sole explanation on a status line nobody is looking at reads as
+            // "delete is broken", not "delete failed, and here is why". That is
+            // precisely how the FOREIGN KEY failure on legacy Discs rows stayed
+            // invisible across several attempts.
             StatusText = $"Failed to delete backup set: {ex.Message}";
+            CrashLogger.Log(ex, $"Delete of backup set {backupSet.Id} (\"{backupSet.Name}\")");
+            MessageBox.Show(
+                $"Could not delete \"{backupSet.Name}\".\n\n{ex.Message}",
+                "Delete Backup Set",
+                MessageBoxButton.OK,
+                MessageBoxImage.Error);
         }
     }
 
