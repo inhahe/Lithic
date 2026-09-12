@@ -215,6 +215,40 @@ which is the UI thread in the app but is not guaranteed to be. Verified both
 orderings, including the race where the work finishes before `Show()`: each
 returns the right result and leaves zero windows open.
 
+## After a selection edit, back up what was named — do not go looking for it again
+
+The post-edit flow walks the folders you just ticked and knows every file in them.
+It used to hand that list to the ordinary Backup entry point, which threw it away
+and re-derived the same answer by scanning the whole selection and diffing against
+the catalog. Measured across 41 full runs in one month, "Starting backup" ->
+"Plan for":
+
+| set | runs | median | min | max |
+|---|---|---|---|---|
+| I: | 21 | **699 s** | 195 s | 18,539 s |
+| J: | 20 | **1,086 s** | 289 s | 16,810 s |
+
+So adding a folder meant a median ~12-minute wait (worst case over five hours)
+before the files started copying, to rediscover a list already in hand.
+
+`RunIncrementalFlowAsync` now takes an optional `onlyThesePaths`. Everything
+before the scan is unchanged — drive-letter following, source and destination
+availability, job construction — and then it calls
+`DirectoryBackupService.ExecuteTargetedAsync`, the same entry point continuous
+backup uses for USN-reported changes. That still applies the set's exclusion rules
+and still compares every candidate against the catalog; it simply does not hunt
+for candidates.
+
+**A targeted run is scoped, and the prompt must say so.** It copies the listed
+files and nothing else; other pending changes wait for continuous backup or the
+next scheduled run. Both review prompts now state their scope explicitly ("Back up
+ONLY these files", "Delete ONLY these backed-up copies … your source files are not
+touched"), because a button that does less than its name suggests is only safe if
+it says which less.
+
+The ordinary **Backup** button still means everything: it passes no path list and
+takes the full scan.
+
 ## "What does this selection cover" has two answers, and only one is precise
 
 `SourceSelection` offers two collectors, and picking the wrong one is silent:
