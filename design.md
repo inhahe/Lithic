@@ -195,6 +195,60 @@ measure, so a row wider than the card would simply scroll. It is not implemented
 because the two levers above cover the cases seen so far — not because it cannot
 work. If deep trees still run out of room, that is the next thing to build.
 
+## Modality is a concurrency decision, not a cosmetic one
+
+`ProgressDialog.RunAsync` takes `modal` (default true). In WPF `ShowDialog`
+disables **every other window in the application** — including the task windows
+that exist precisely so work can run side by side — so a modal progress dialog
+silently reverses that design for as long as it is up.
+
+The rule: **read-only phases pass `modal: false`; anything that mutates the
+catalog or the destination stays modal.** The post-edit diff scan and the
+added-folders walk only read, so they no longer freeze the app. The purge that
+follows ("Removing files from destination") stays modal, because letting the user
+start a second operation on the same set while files are being deleted is exactly
+the hazard the modality is preventing.
+
+The modeless path closes its dialog after awaiting the work, marshalled through
+the dispatcher — the continuation resumes on whatever context captured the await,
+which is the UI thread in the app but is not guaranteed to be. Verified both
+orderings, including the race where the work finishes before `Show()`: each
+returns the right result and leaves zero windows open.
+
+## "What does this selection cover" has two answers, and only one is precise
+
+`SourceSelection` offers two collectors, and picking the wrong one is silent:
+
+| | selected FILE becomes | for |
+|---|---|---|
+| `CollectSelectedRoots` | its **containing directory** | file-system watchers — you can only watch a directory |
+| `CollectCoveredEntries` | **the file itself** | anything asking what the selection actually covers |
+
+The coarsening is lossy in a way that compounds, because both then reduce to
+*minimal* roots. One ticked file at `D:\registrybackup.reg` yields the root
+`D:\`, which absorbs every other `D:\…` entry as "already covered". Measured on
+a real set: **299 entries instead of 2,546 — 88% of the selection swallowed by a
+single stale file node**, for a file that no longer existed on disk.
+
+The post-edit diff used the coarsening collector, so `newRoots` and `oldRoots`
+were identical no matter which folders were ticked, `added` was always empty, and
+the "back up what you just added" flow was never called. Adding a 12 GB folder
+produced a scan and then nothing. It now uses `CollectCoveredEntries`; a file path
+can swallow nothing, since nothing is prefixed by `"somefile.ext\"`.
+
+**A separate, genuine difference worth knowing** (it was my first and wrong
+explanation for the above, so it is recorded to stop it being reached for again):
+`CollectSelectedRoots`/`CollectCoveredEntries` only collect **fully**-selected
+nodes, while `IsPathIncluded` additionally covers unlisted descendants of a
+**partially**-selected directory whose auto-include-new is on. That can make a
+newly-added root whose files were already considered included — a real case, just
+not this one, since `D:\` here is partial with auto-include **off**. The flow now
+reports that case instead of returning silently.
+
+**If you add a third place that decides coverage, say which of the two questions
+it is answering** — "where do I watch" or "what is in the set" — because they
+give different answers and neither is wrong.
+
 ## A source scan must not walk what it will never back up
 
 Exclusions were applied per FILE, and the scanner recursed into every

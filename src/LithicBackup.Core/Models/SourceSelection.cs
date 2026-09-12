@@ -48,11 +48,39 @@ public class SourceSelection
     ///   <item><c>IsSelected == true</c> on a file — add its containing directory.</item>
     ///   <item><c>IsSelected == null</c> (partial) — descend into children.</item>
     /// </list>
+    ///
+    /// <para><b>Coarsening a selected file to its directory is lossy, and only
+    /// appropriate for watching.</b> One ticked file at <c>D:\registrybackup.reg</c>
+    /// yields the root <c>D:\</c>, and the minimal-root reduction below then drops
+    /// EVERY other <c>D:\…</c> entry as "already covered" — so the result claims
+    /// the whole drive is covered when almost none of it is. That is harmless for
+    /// a file-system watcher (it just watches more than it needs) and wrong for
+    /// anything asking "what does this selection actually cover".
+    /// Use <see cref="CollectCoveredEntries"/> for that.</para>
     /// </remarks>
     public static List<string> CollectSelectedRoots(IEnumerable<SourceSelection> roots)
+        => Collect(roots, coarsenFilesToDirectories: true);
+
+    /// <summary>
+    /// The entries this selection actually covers, with a selected FILE returned
+    /// as the file itself rather than its directory.
+    ///
+    /// <para>This is what a coverage diff needs. <see cref="CollectSelectedRoots"/>
+    /// coarsens a file to its parent, which made one stale ticked file at the root
+    /// of a drive absorb every folder on it: comparing the before/after trees then
+    /// produced NO added roots however many folders were ticked, and the
+    /// "back up what you just added" prompt never appeared. A file path cannot
+    /// swallow anything here, because nothing is prefixed by
+    /// <c>"somefile.ext\"</c>.</para>
+    /// </summary>
+    public static List<string> CollectCoveredEntries(IEnumerable<SourceSelection> roots)
+        => Collect(roots, coarsenFilesToDirectories: false);
+
+    private static List<string> Collect(
+        IEnumerable<SourceSelection> roots, bool coarsenFilesToDirectories)
     {
         var result = new List<string>();
-        CollectSelectedRootsRecursive(roots, result);
+        CollectSelectedRootsRecursive(roots, result, coarsenFilesToDirectories);
 
         // De-duplicate and drop any directory already covered by an ancestor in
         // the result (e.g. a watched file's parent that sits under a watched dir).
@@ -78,7 +106,8 @@ public class SourceSelection
     }
 
     private static void CollectSelectedRootsRecursive(
-        IEnumerable<SourceSelection> nodes, List<string> result)
+        IEnumerable<SourceSelection> nodes, List<string> result,
+        bool coarsenFilesToDirectories)
     {
         foreach (var node in nodes)
         {
@@ -91,11 +120,17 @@ public class SourceSelection
                 {
                     result.Add(node.Path);
                 }
-                else
+                else if (coarsenFilesToDirectories)
                 {
                     var dir = System.IO.Path.GetDirectoryName(node.Path);
                     if (!string.IsNullOrEmpty(dir))
                         result.Add(dir);
+                }
+                else
+                {
+                    // The file itself: coarsening it to its parent would claim
+                    // the whole parent is covered. See CollectCoveredEntries.
+                    result.Add(node.Path);
                 }
 
                 // Fully-selected subtree — no need to descend further.
@@ -104,7 +139,7 @@ public class SourceSelection
 
             // IsSelected == null → partially selected; descend into children.
             if (node.IsDirectory)
-                CollectSelectedRootsRecursive(node.Children, result);
+                CollectSelectedRootsRecursive(node.Children, result, coarsenFilesToDirectories);
         }
     }
 

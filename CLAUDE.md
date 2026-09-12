@@ -2,10 +2,24 @@
 
 ## Versioning (Claude controls this)
 
-**Current version: `1.0.69`**
+**Current version: `1.0.72`**
 
 Claude owns the version number. Do not hand-edit it — ask Claude to bump it and
 Claude will keep every place in sync.
+
+**Which component to bump depends on what actually changed** — use SemVer judgement:
+
+- **patch** (`1.0.69` → `1.0.70`) — bug fixes, internal refactors, or a plain rebuild
+  with no user-visible change in behaviour.
+- **minor** (`1.0.69` → `1.1.0`) — a new user-facing feature or option, or a noticeable
+  change to how an existing feature works.
+- **major** (`1.0.69` → `2.0.0`) — either a **breaking change** — anything that alters the
+  catalog or on-disc backup format, changes the restore path, or invalidates existing
+  backup sets or settings — **or a milestone overhaul**: a redesign of the main window or
+  the backup/restore workflow, or a body of work large enough that you would describe the
+  app as a new generation rather than an update. Backwards compatibility is not the only
+  trigger; a release that changes what using LithicBackup *feels* like earns a major bump
+  even when every old backup set still restores.
 
 - **Authoritative source:** `src/Directory.Build.props` (`<Version>` element).
   Every project under `src\` inherits it, so the GUI, Worker, and all libraries

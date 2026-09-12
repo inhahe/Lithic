@@ -1291,15 +1291,27 @@ public class MainViewModel : ViewModelBase
                     backupSet.Id, originalSelections, newSelections, changedPaths,
                     progress, ct);
 
-                // Added: new covering roots not already covered by an old root.
-                var oldRoots = SourceSelection.CollectSelectedRoots(originalSelections);
-                var newRoots = SourceSelection.CollectSelectedRoots(newSelections);
+                // Added: new covering entries not already covered by an old one.
+                //
+                // CollectCoveredEntries, NOT CollectSelectedRoots: the latter
+                // coarsens a selected FILE to its containing directory, so one
+                // ticked file at D:\registrybackup.reg produced the root "D:\",
+                // whose minimal-root reduction then dropped every other D:\…
+                // entry as already covered. The diff therefore reported ZERO
+                // added roots no matter how many folders were ticked, and this
+                // flow silently did nothing — observed with a 12 GB folder.
+                var oldRoots = SourceSelection.CollectCoveredEntries(originalSelections);
+                var newRoots = SourceSelection.CollectCoveredEntries(newSelections);
                 var added = newRoots
                     .Where(r => !IsCoveredBy(oldRoots, r))
                     .ToList();
 
                 return (Removed: rem, AddedRoots: added);
-            });
+            },
+            // Read-only: it inspects the catalog and the selection trees and
+            // changes nothing, so there is no reason to disable every other
+            // window while it runs.
+            modal: false);
 
         if (!completed)
         {
@@ -1317,6 +1329,16 @@ public class MainViewModel : ViewModelBase
 
         if (addedRoots.Count > 0)
             await PromptAndBackupAddedAsync(backupSet, addedRoots, originalSelections, newSelections);
+
+        // Say so when the scan found nothing. A toggle that nets out to no change
+        // (untick a folder, tick it again before closing) legitimately produces
+        // removed=0 and added=0, and staying silent after a visible scan is
+        // indistinguishable from the app having ignored the edit -- which is
+        // exactly how the genuine bug above was experienced.
+        if (removed.Count == 0 && addedRoots.Count == 0)
+            StatusText =
+                $"No coverage changes to reconcile for \"{backupSet.Name}\" — "
+                + "nothing was added or dropped.";
     }
 
     /// <summary>
@@ -1674,7 +1696,7 @@ public class MainViewModel : ViewModelBase
     {
         // Cancellable progress dialog while walking the added folders on disk;
         // closing it aborts the scan and skips the add prompt entirely.
-        var (completed, addedFiles) = await Views.ProgressDialog.RunAsync(
+        var (completed, scan) = await Views.ProgressDialog.RunAsync(
             Application.Current.MainWindow,
             "Updating backup",
             "Scanning newly added folders\u2026",
@@ -1686,6 +1708,8 @@ public class MainViewModel : ViewModelBase
                 // the removal diff, so partial (de)selections are respected.
                 var result = new List<(string SourcePath, long SizeBytes)>();
                 long scanned = 0;
+                long alreadyCovered = 0;
+                long coveredBytes = 0;
                 var sw = System.Diagnostics.Stopwatch.StartNew();
                 long lastReportMs = -ProgressUpdateIntervalMs;
                 foreach (var (path, size) in EnumerateFilesUnderRoots(addedRoots))
@@ -1700,21 +1724,85 @@ public class MainViewModel : ViewModelBase
                         progress.Report($"Scanned {scanned:N0} files, {result.Count:N0} new\u2026");
                     }
 
-                    if (SourceSelection.IsPathIncluded(newSelections, path)
-                        && !SourceSelection.IsPathIncluded(originalSelections, path))
-                        result.Add((path, size));
+                    if (!SourceSelection.IsPathIncluded(newSelections, path))
+                        continue;
+
+                    if (SourceSelection.IsPathIncluded(originalSelections, path))
+                    {
+                        // Counted, not discarded: this is the case that used to
+                        // end in a silent return. See below.
+                        alreadyCovered++;
+                        coveredBytes += size;
+                        continue;
+                    }
+
+                    result.Add((path, size));
                 }
-                return result;
-            });
+                return (Added: result, Scanned: scanned,
+                        AlreadyCovered: alreadyCovered, CoveredBytes: coveredBytes);
+            },
+            // Read-only walk of the added folders — nothing to protect by
+            // disabling the rest of the app.
+            modal: false);
 
         // Cancelled the scan — leave the added folders for the next backup.
         if (!completed)
             return;
 
-        // Nothing newly covered actually exists on disk (e.g. empty folders were
-        // added) — there's nothing to preview or back up right now.
+        var addedFiles = scan.Added;
+
         if (addedFiles.Count == 0)
+        {
+            // NEVER return silently here. The user has just watched a scan run;
+            // saying nothing reads as "the app ignored my 12 GB".
+            //
+            // The interesting case is AlreadyCovered > 0, and it comes from two
+            // predicates that disagree by design:
+            //   CollectSelectedRoots (which decided a root was ADDED) collects
+            //     only fully-selected (IsSelected == true) nodes;
+            //   IsPathIncluded (which decides a file is NEW) returns true for an
+            //     unlisted descendant of a PARTIALLY-selected directory whose
+            //     auto-include-new is on.
+            // So ticking a folder under an auto-include parent yields a new root
+            // whose every file was already considered covered. Nothing is lost —
+            // the next run backs them up — but the user has to be told that,
+            // and offered the run they plainly wanted.
+            if (scan.AlreadyCovered > 0)
+            {
+                var answer = MessageBox.Show(
+                    $"The {scan.AlreadyCovered:N0} file(s) ({FormatBytes(scan.CoveredBytes)}) in the "
+                    + "folder(s) you added were already covered by this set's existing selection — a "
+                    + "parent folder is set to include new subfolders automatically — so they are not "
+                    + "listed as newly added.\n\n"
+                    + "They will be backed up by the next run. Back up now?",
+                    "Updating backup",
+                    MessageBoxButton.YesNo,
+                    MessageBoxImage.Question,
+                    MessageBoxResult.Yes);
+
+                if (answer == MessageBoxResult.Yes)
+                {
+                    var coveredRow = BackupSets.FirstOrDefault(s => s.Id == backupSet.Id);
+                    if (coveredRow is not null)
+                        _ = RunIncrementalFlowAsync(coveredRow, forceReview: false);
+                    else
+                        StatusText = "Couldn't start backup — the set is no longer listed.";
+                }
+                else
+                {
+                    StatusText =
+                        $"{scan.AlreadyCovered:N0} file(s) in the added folder(s) were already "
+                        + "covered — they'll be included in the next backup.";
+                }
+                return;
+            }
+
+            StatusText = scan.Scanned == 0
+                ? "The folder(s) you added contain no files yet — nothing to back up."
+                : $"Scanned {scan.Scanned:N0} file(s) in the added folder(s); none of them are "
+                  + "covered by the set's selection, so there is nothing to back up.";
             return;
+        }
 
         var reviewVm = ReviewTreeViewModel.ForAdditions(addedFiles);
         var dialog = new ReviewTreeDialog
@@ -1747,8 +1835,8 @@ public class MainViewModel : ViewModelBase
         var stack = new Stack<string>();
         foreach (var r in roots)
         {
-            // A "root" is always a directory (CollectSelectedRoots maps a selected
-            // file to its containing directory), but guard for a stray file path.
+            // An entry may be a file: CollectCoveredEntries returns a selected
+            // file as itself rather than as its containing directory.
             if (File.Exists(r))
             {
                 long fsize = 0;

@@ -1,5 +1,45 @@
 # LithicBackup — Known Issues & Tech Debt
 
+## FIXED: one stale ticked file stopped every "you added a folder" prompt (2026-09-12)
+
+**Symptom.** A 12 GB folder (`D:\mom's phone`, 1,297 files) was added to the I:
+set. The post-edit scan ran for a few seconds and then **nothing happened at
+all** — no review tree, no backup, no message. The folder had zero catalog rows,
+so it genuinely had never been backed up.
+
+**Two wrong explanations, both mine, both killed by the user's own evidence:**
+
+1. *"The files were already covered by auto-include-new."* Rebutted in one line:
+   if they were, the folder would have been ticked automatically and would not
+   have needed adding. And `D:\` has auto-include **off** — confirmed in the
+   stored tree (`IsSelected=null, AutoIncludeNewSubdirectories=false`).
+2. *"The per-file filter rejected them."* Replaying the shipped
+   `IsPathIncluded` against the real tree said the opposite: `inNew=True,
+   inOld=False` for every sampled file — they **would** have counted.
+
+**Actual cause.** The diff asks `CollectSelectedRoots` what each tree covers, and
+that method maps a selected **file** to its **containing directory**. The
+selection held one ticked file, `D:\registrybackup.reg` (which no longer exists
+on disk), so the collector emitted the root `D:\` — and the minimal-root
+reduction then discarded every other `D:\…` entry as already covered:
+
+    CollectSelectedRoots   old: 299 roots   new: 299 roots   added: 0
+    CollectCoveredEntries  old: 2,546       new: 2,547       added: 1  (D:\mom's phone)
+
+299 against 2,546 — **88% of the selection absorbed by one stale file node**. With
+`added` empty the flow that offers to back up what you added was never invoked,
+which is why there was no message of any kind: nothing ran to produce one.
+
+**Fix.** `CollectCoveredEntries` returns a selected file as itself, and the diff
+uses it. `CollectSelectedRoots` keeps the coarsening for its one legitimate
+caller, the worker's file-system watch roots, where watching a directory rather
+than a file is correct — verified unchanged at 299/299 after the change.
+
+**Why it hid for so long:** it needs a ticked *file* directly under a directory
+that also holds ticked *folders*, and it fails by doing nothing rather than by
+erroring. Any set with such a file has had the added-folder prompt silently
+disabled for that whole subtree.
+
 ## FIXED: the destination scan held the catalog twice over (2026-09-06)
 
 **Symptom.** After a destination scan of a 2.8M-row set, the GUI process had a
