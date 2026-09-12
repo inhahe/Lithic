@@ -1329,6 +1329,16 @@ public class MainViewModel : ViewModelBase
 
         if (addedRoots.Count > 0)
             await PromptAndBackupAddedAsync(backupSet, addedRoots, originalSelections, newSelections);
+
+        // Say so when the scan found nothing. A toggle that nets out to no change
+        // (untick a folder, tick it again before closing) legitimately produces
+        // removed=0 and added=0, and staying silent after a visible scan is
+        // indistinguishable from the app having ignored the edit -- which is
+        // exactly how the genuine bug above was experienced.
+        if (removed.Count == 0 && addedRoots.Count == 0)
+            StatusText =
+                $"No coverage changes to reconcile for \"{backupSet.Name}\" — "
+                + "nothing was added or dropped.";
     }
 
     /// <summary>
