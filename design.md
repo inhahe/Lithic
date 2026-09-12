@@ -195,6 +195,45 @@ measure, so a row wider than the card would simply scroll. It is not implemented
 because the two levers above cover the cases seen so far — not because it cannot
 work. If deep trees still run out of room, that is the next thing to build.
 
+## Modality is a concurrency decision, not a cosmetic one
+
+`ProgressDialog.RunAsync` takes `modal` (default true). In WPF `ShowDialog`
+disables **every other window in the application** — including the task windows
+that exist precisely so work can run side by side — so a modal progress dialog
+silently reverses that design for as long as it is up.
+
+The rule: **read-only phases pass `modal: false`; anything that mutates the
+catalog or the destination stays modal.** The post-edit diff scan and the
+added-folders walk only read, so they no longer freeze the app. The purge that
+follows ("Removing files from destination") stays modal, because letting the user
+start a second operation on the same set while files are being deleted is exactly
+the hazard the modality is preventing.
+
+The modeless path closes its dialog after awaiting the work, marshalled through
+the dispatcher — the continuation resumes on whatever context captured the await,
+which is the UI thread in the app but is not guaranteed to be. Verified both
+orderings, including the race where the work finishes before `Show()`: each
+returns the right result and leaves zero windows open.
+
+## Two predicates decide "is this file covered", and they do not agree
+
+`SourceSelection.CollectSelectedRoots` collects only **fully**-selected
+(`IsSelected == true`) nodes. `SourceSelection.IsPathIncluded` additionally
+returns true for an unlisted descendant of a **partially**-selected directory
+whose auto-include-new is on (`IncludesUnlistedDescendants`).
+
+That difference is deliberate, but it means the post-edit "added folders" flow can
+compute a newly-added ROOT whose every FILE was already considered included — tick
+a folder under an auto-include parent and you get exactly that. The flow used to
+`return` silently in that case, so adding 12 GB produced a scan and then nothing
+at all. It now reports what it found and offers to run the backup, because
+"already covered by the selection" is not the same as "already in the catalog":
+those files may well not be backed up yet.
+
+**If you add a third place that decides coverage, reconcile it with both of
+these** — or at minimum make sure a disagreement surfaces to the user instead of
+becoming a silent no-op.
+
 ## A source scan must not walk what it will never back up
 
 Exclusions were applied per FILE, and the scanner recursed into every

@@ -80,9 +80,17 @@ public partial class ProgressDialog : Window
 
     private void ForceClose()
     {
+        // Safe to call more than once: the modeless path closes defensively
+        // after awaiting the work, because the continuation that normally closes
+        // the dialog can run BEFORE Show() when the work finishes quickly.
+        if (_closed)
+            return;
+        _closed = true;
         _allowClose = true;
         Close();
     }
+
+    private bool _closed;
 
     /// <summary>
     /// Run <paramref name="work"/> on a background thread while showing this
@@ -106,12 +114,22 @@ public partial class ProgressDialog : Window
     /// <c>(Completed: true, Result)</c> when the work ran to completion, or
     /// <c>(Completed: false, default)</c> when it was cancelled.
     /// </returns>
+    /// <param name="modal">
+    /// When true (the default) the dialog is shown with <c>ShowDialog</c>, which
+    /// in WPF disables EVERY other window in the app — including the task windows
+    /// that exist precisely so work can run side by side. Pass false for
+    /// READ-ONLY phases, where there is no reason to freeze the rest of the app
+    /// while a directory walk runs. Leave it true for anything that mutates the
+    /// catalog or the destination, where letting the user start a second
+    /// operation on the same set mid-flight is the hazard the modality prevents.
+    /// </param>
     public static async Task<(bool Completed, T Result)> RunAsync<T>(
         Window? owner,
         string title,
         string message,
         bool cancellable,
-        Func<IProgress<ProgressReport>, CancellationToken, T> work)
+        Func<IProgress<ProgressReport>, CancellationToken, T> work,
+        bool modal = true)
     {
         var cts = cancellable ? new CancellationTokenSource() : null;
         var vm = new ProgressDialogViewModel(title, message, cancellable);
@@ -166,11 +184,30 @@ public partial class ProgressDialog : Window
             _ => dlg.Dispatcher.BeginInvoke(new Action(dlg.ForceClose)),
             TaskScheduler.Default);
 
-        dlg.ShowDialog();
+        if (modal)
+        {
+            dlg.ShowDialog();
+        }
+        else
+        {
+            dlg.Show();
+        }
 
         // Work is essentially already finished here (its continuation is what
         // closed the dialog), but await to observe its outcome / rethrow.
         await workTask;
+
+        // ShowDialog only returns once the dialog has closed, so the modal path
+        // needs nothing more. Show() returns immediately, so close it here: the
+        // continuation above may still be queued, or may have run before the
+        // window existed. ForceClose is idempotent.
+        //
+        // Marshalled rather than called directly: this resumes on whatever
+        // context captured the await, which is the UI thread in the app but is
+        // NOT guaranteed to be (with no SynchronizationContext the continuation
+        // runs on the thread pool, and touching the Window from there throws).
+        if (!modal)
+            dlg.Dispatcher.Invoke(dlg.ForceClose);
 
         if (error is not null)
             throw error;
