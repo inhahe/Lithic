@@ -175,10 +175,13 @@ public sealed class ReviewTreeViewModel : ViewModelBase
         var (roots, fileCount, totalBytes) = BuildTree(removedFiles);
         string loc = roots.Count == 1 ? "location" : "locations";
         string files = fileCount == 1 ? "file" : "files";
+        // Same promise on the removal side: only the listed copies are deleted,
+        // and only from the backup -- the source files are not touched.
         string header =
             $"{fileCount:N0} {files} ({totalBytes:N0} bytes) in {roots.Count} {loc} "
-            + "are no longer covered by this set's sources. "
-            + "Remove their backed-up copies from the destination?";
+            + "are no longer covered by this set's sources.\n\n"
+            + "Delete ONLY these backed-up copies from the destination? Your source "
+            + "files are not touched, and nothing else in the backup is removed.";
         return new ReviewTreeViewModel(
             roots, header, "Remove Files No Longer in Sources", "Remove");
     }
@@ -193,10 +196,16 @@ public sealed class ReviewTreeViewModel : ViewModelBase
         var (roots, fileCount, totalBytes) = BuildTree(addedFiles);
         string loc = roots.Count == 1 ? "location" : "locations";
         string files = fileCount == 1 ? "file" : "files";
+        // Say exactly what will happen: ONLY these files are copied. The backup
+        // this launches is targeted -- it does not scan the rest of the set, so
+        // anything else that changed since the last run waits for continuous
+        // backup or the next scheduled run.
         string header =
             $"{fileCount:N0} {files} ({totalBytes:N0} bytes) in {roots.Count} {loc} "
-            + "were added to this set's sources. Back them up now? "
-            + "(Exclusion filters still apply when the backup actually runs.)";
+            + "were added to this set's sources.\n\n"
+            + "Back up ONLY these files now? Nothing else in the set is scanned or "
+            + "copied — other changes are picked up by the next scheduled or "
+            + "continuous backup. Exclusion filters still apply.";
         return new ReviewTreeViewModel(
             roots, header, "Back Up Added Sources", "Back up");
     }

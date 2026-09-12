@@ -1820,7 +1820,12 @@ public class MainViewModel : ViewModelBase
             StatusText = "Couldn't start backup — the set is no longer listed.";
             return;
         }
-        _ = RunIncrementalFlowAsync(row, forceReview: false);
+
+        // Back up exactly the files just enumerated, rather than re-scanning every
+        // source to rediscover them.
+        _ = RunIncrementalFlowAsync(
+            row, forceReview: false,
+            onlyThesePaths: addedFiles.Select(f => f.SourcePath).ToList());
     }
 
     /// <summary>
@@ -2288,7 +2293,20 @@ public class MainViewModel : ViewModelBase
         }
         catch (Exception ex)
         {
+            // Report a FAILED delete in a dialog, not only the status bar.
+            // The user just confirmed a permanent, destructive action in a modal
+            // dialog; if it then fails, having the set quietly reappear with the
+            // sole explanation on a status line nobody is looking at reads as
+            // "delete is broken", not "delete failed, and here is why". That is
+            // precisely how the FOREIGN KEY failure on legacy Discs rows stayed
+            // invisible across several attempts.
             StatusText = $"Failed to delete backup set: {ex.Message}";
+            CrashLogger.Log(ex, $"Delete of backup set {backupSet.Id} (\"{backupSet.Name}\")");
+            MessageBox.Show(
+                $"Could not delete \"{backupSet.Name}\".\n\n{ex.Message}",
+                "Delete Backup Set",
+                MessageBoxButton.OK,
+                MessageBoxImage.Error);
         }
     }
 
@@ -2853,8 +2871,107 @@ public class MainViewModel : ViewModelBase
     /// post-scan file-review dialog is shown first so the user can inspect and
     /// deselect files before the backup runs.
     /// </summary>
+    /// <summary>
+    /// Copy an explicit list of files to the destination, with no scan.
+    ///
+    /// <para>Uses <c>DirectoryBackupService.ExecuteTargetedAsync</c> — the same
+    /// entry point continuous backup uses for USN-reported changes — which still
+    /// applies the set's exclusion rules and still compares each candidate against
+    /// the catalog, so it copies only what genuinely needs copying. It just does
+    /// not go looking for candidates.</para>
+    ///
+    /// <para>Deliberately scoped: this backs up the listed files and nothing else.
+    /// Other changes pending elsewhere in the set are left to continuous backup
+    /// and the scheduled full runs, and the prompt that leads here says so.</para>
+    /// </summary>
+    private async Task RunTargetedBackupAsync(
+        BackupSetRowViewModel row, BackupJob job, IReadOnlyList<string> paths)
+    {
+        if (job.TargetDirectory is null)
+        {
+            // Optical sets plan whole discs; there is no "copy these few files".
+            StatusText = "Backing up just the added files needs a folder destination — "
+                + "run a normal backup instead.";
+            return;
+        }
+
+        row.Progress = null;
+        row.LastResultText = "";
+        row.IsRunning = true;
+        row.RunningStatusText = $"Backing up {paths.Count:N0} added file(s)\u2026";
+
+        CrashLogger.Log(null,
+            $"GUI: targeted backup for \"{row.Name}\" \u2192 {job.TargetDirectory}: "
+            + $"{paths.Count:N0} file(s) from a source-selection edit.");
+
+        try
+        {
+            var targetDir = job.TargetDirectory;
+            var tiers = job.RetentionTiers;
+
+            var (completed, result) = await Views.ProgressDialog.RunAsync(
+                Application.Current.MainWindow,
+                "Backing up added files",
+                $"Copying {paths.Count:N0} file(s) to {targetDir}\u2026",
+                cancellable: true,
+                (progress, ct) =>
+                {
+                    // ExecuteTargetedAsync is async; this lambda already runs on a
+                    // background thread, so blocking on it here is safe.
+                    return _directoryBackupService
+                        .ExecuteTargetedAsync(job, targetDir, paths, tiers, ct)
+                        .GetAwaiter().GetResult();
+                },
+                // Read/write of ONE set, and the user may well want to look at
+                // something else while 12 GB copies.
+                modal: false);
+
+            if (!completed)
+            {
+                row.LastResultText = "Cancelled — some added files may not be backed up yet.";
+                StatusText = row.LastResultText;
+                CrashLogger.Log(null, $"GUI: targeted backup for \"{row.Name}\" cancelled.");
+                return;
+            }
+
+            int failed = result?.FailedFiles.Count ?? 0;
+            long bytes = result?.BytesWritten ?? 0;
+            row.LastResultIsError = failed > 0;
+            row.LastResultText = failed > 0
+                ? $"Backed up {FormatBytes(bytes)} of added files, {failed:N0} failed."
+                : $"Backed up {paths.Count:N0} added file(s) ({FormatBytes(bytes)}).";
+            StatusText = row.LastResultText;
+            CrashLogger.Log(null,
+                $"GUI: targeted backup for \"{row.Name}\" finished"
+                + (failed > 0 ? " WITH ERRORS" : "") + $": {row.LastResultText}");
+        }
+        catch (Exception ex)
+        {
+            row.LastResultIsError = true;
+            row.LastResultText = $"Backing up the added files failed: {ex.Message}";
+            StatusText = row.LastResultText;
+            CrashLogger.Log(ex, $"GUI: targeted backup for \"{row.Name}\" threw.");
+        }
+        finally
+        {
+            row.IsRunning = false;
+            row.RunningStatusText = "";
+            _ = LoadBackupSetsAsync();
+        }
+    }
+
+    /// <param name="onlyThesePaths">
+    /// When supplied, back up EXACTLY these files instead of scanning the whole
+    /// selection. Used by the post-edit "you added folders" flow, which has just
+    /// walked those folders and already knows every file — re-deriving the same
+    /// list by scanning every source costs a median of 699 s on a real set (max
+    /// 18,539 s measured), for an answer already in hand. Everything above this
+    /// point still runs: drive-letter following, source/destination availability
+    /// and job construction are identical either way.
+    /// </param>
     private async Task RunIncrementalFlowAsync(
-        BackupSetRowViewModel row, bool forceReview)
+        BackupSetRowViewModel row, bool forceReview,
+        IReadOnlyList<string>? onlyThesePaths = null)
     {
         if (row.IsRunning)
             return;
@@ -2983,6 +3100,14 @@ public class MainViewModel : ViewModelBase
         };
 
         bool isDir = job.TargetDirectory is not null;
+
+        // Targeted run: the caller already knows exactly which files to copy, so
+        // skip the scan-and-diff entirely.
+        if (onlyThesePaths is not null)
+        {
+            await RunTargetedBackupAsync(row, job, onlyThesePaths);
+            return;
+        }
 
         // Mark THIS set as running immediately so its per-set buttons switch
         // from Backup/Restore/Modify to Pause/Abort right away. Other rows are

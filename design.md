@@ -56,9 +56,50 @@ hazard when touching storage code.
 
 | File | Location | Role | Losable? |
 |---|---|---|---|
-| `catalog.db` | `%LOCALAPPDATA%\LithicBackup` | **Real data.** What has been backed up, where, in what form, at what version. | **No** — losing it means the backup can't be restored or extended incrementally |
-| `sizecache.db` | same | Per-directory sizes, for the source tree | Yes — pure cache |
+| `catalog.db` + `sets\set-<id>.db` | `C:\ProgramData\LithicBackup` | **Real data.** What has been backed up, where, in what form, at what version. | **No** — losing it means the backup can't be restored or extended incrementally |
+| `sizecache.db` | `%LOCALAPPDATA%\LithicBackup` | Per-directory sizes, for the source tree | Yes — pure cache |
 | `filehashcache.db` | same | Per-file SHA-256, keyed by path+size+mtime | Yes — pure cache |
+
+**The catalog is shared, the caches are per-user.** The catalog sits under
+`CommonApplicationData` (`CatalogLocation.RootDirectory`) because the GUI and the
+Worker service must see the *same* one; when both used `LocalApplicationData` the
+service, running as LocalSystem, quietly kept its own. `Resolve()` migrates a
+pre-existing per-user catalog on first run, and `IsInsideAppDataDirectory` makes
+the backup engine skip that whole directory unconditionally — the databases are
+open for writing by the running process, so backing them up both wastes space and
+fails on file locks.
+
+### The catalog is a master plus one database per set
+
+`catalog.db` is a small **master**: `BackupSets`, `DiscOwners` (which set owns
+which disc), `UsnCursors` (per *volume*, not per set), and the schema version.
+Each set's bulk records — its files — live in their own `sets\set-<id>.db`, so a
+set's data can be dropped, copied, or repaired by the file, and one enormous set
+does not slow queries for the others. `SqliteCatalogRepository` routes per-set
+calls through `GetSet(id)` and holds `_masterGate` only for master work.
+
+**The master still carries the pre-split tables**, and this is a live trap rather
+than dead weight: `001_InitialSchema` creates `Discs`, `Files`, `FileChunks` and
+`DeduplicationBlocks` in *every* catalog, new ones included, and `Discs` declares
+`BackupSetId INTEGER NOT NULL REFERENCES BackupSets(Id)`. Any set old enough to
+have rows there is anchored by a real foreign key.
+
+Two rules follow, both learned from a set that could not be deleted at all:
+
+* **Deleting a set must clear the legacy rows first**, children before parents
+  (`FileChunks`/`DeduplicationBlocks` → `Files` → `Discs` → `DiscOwners` →
+  `BackupSets`), all in one transaction. Miss them and the delete dies on
+  `SQLite Error 19: FOREIGN KEY constraint failed`.
+* **Drop `sets\set-<id>.db` only after that transaction commits.** The reverse
+  order destroys data on failure: the file is already gone when the master delete
+  throws, leaving a set that still appears in the list but has lost its entire
+  catalog. Failing *after* the commit merely orphans a file, which is harmless —
+  set ids come from `AUTOINCREMENT` and are never reused.
+
+And a UI rule, because this stayed invisible for several attempts: **a delete
+that fails must say so in a dialog.** The user confirmed a permanent, destructive
+action in a modal dialog; answering Yes and watching the set reappear, with the
+only explanation on a status line, reads as "delete is broken".
 
 The two caches are **derived state and must always be treated as such**: any
 entry may be missing, stale, or wrong-but-validatable, and the code must recompute
@@ -214,6 +255,40 @@ the dispatcher — the continuation resumes on whatever context captured the awa
 which is the UI thread in the app but is not guaranteed to be. Verified both
 orderings, including the race where the work finishes before `Show()`: each
 returns the right result and leaves zero windows open.
+
+## After a selection edit, back up what was named — do not go looking for it again
+
+The post-edit flow walks the folders you just ticked and knows every file in them.
+It used to hand that list to the ordinary Backup entry point, which threw it away
+and re-derived the same answer by scanning the whole selection and diffing against
+the catalog. Measured across 41 full runs in one month, "Starting backup" ->
+"Plan for":
+
+| set | runs | median | min | max |
+|---|---|---|---|---|
+| I: | 21 | **699 s** | 195 s | 18,539 s |
+| J: | 20 | **1,086 s** | 289 s | 16,810 s |
+
+So adding a folder meant a median ~12-minute wait (worst case over five hours)
+before the files started copying, to rediscover a list already in hand.
+
+`RunIncrementalFlowAsync` now takes an optional `onlyThesePaths`. Everything
+before the scan is unchanged — drive-letter following, source and destination
+availability, job construction — and then it calls
+`DirectoryBackupService.ExecuteTargetedAsync`, the same entry point continuous
+backup uses for USN-reported changes. That still applies the set's exclusion rules
+and still compares every candidate against the catalog; it simply does not hunt
+for candidates.
+
+**A targeted run is scoped, and the prompt must say so.** It copies the listed
+files and nothing else; other pending changes wait for continuous backup or the
+next scheduled run. Both review prompts now state their scope explicitly ("Back up
+ONLY these files", "Delete ONLY these backed-up copies … your source files are not
+touched"), because a button that does less than its name suggests is only safe if
+it says which less.
+
+The ordinary **Backup** button still means everything: it passes no path list and
+takes the full scan.
 
 ## "What does this selection cover" has two answers, and only one is precise
 

@@ -545,20 +545,74 @@ public class SqliteCatalogRepository : ICatalogRepository
     {
         ct.ThrowIfCancellationRequested();
 
-        // Drop the per-set database file (close its connection first), then
-        // remove the master's routing rows and the set record itself.
-        RemoveSetDatabaseFile(backupSetId);
-
+        // Remove the master's rows FIRST and only drop the per-set database file
+        // once they are committed. The reverse order — which this used to use —
+        // destroys data on failure: the set's entire catalog file is deleted, and
+        // if the master delete then throws, the set is still listed but is now
+        // empty and unrecoverable. That is not hypothetical; it is the likely
+        // reason the one set that hit the FOREIGN KEY error below had already
+        // lost its set-NN.db by the time the failure was diagnosed.
+        //
+        // This way round, a failed delete changes nothing at all, and the only
+        // cost of failing after the commit is an orphaned file on disk - which
+        // is harmless, since set ids come from AUTOINCREMENT and are never
+        // reused, so no future set can collide with it.
         await _masterGate.WaitAsync(ct).ConfigureAwait(false);
         try
         {
+            using var tx = _master.BeginTransaction();
             using var cmd = _master.CreateCommand();
-            cmd.CommandText = "DELETE FROM DiscOwners WHERE SetId = $setId";
+            cmd.Transaction = tx;
             cmd.Parameters.AddWithValue("$setId", backupSetId);
+
+            // Clear the master's LEGACY per-file tables for this set first.
+            //
+            // Discs/Files/FileChunks/DeduplicationBlocks live in the master from
+            // before catalog data moved into per-set databases, and
+            // 001_InitialSchema still creates them in every catalog — including
+            // "Discs.BackupSetId INTEGER NOT NULL REFERENCES BackupSets(Id)".
+            // A set old enough to have rows there therefore could not be deleted
+            // at all: the final DELETE hit "SQLite Error 19: FOREIGN KEY
+            // constraint failed", the view model turned that into a status-bar
+            // line, and the set came back every time. Measured on a real
+            // catalog, one such set still held 3 discs and 33 files.
+            //
+            // Order matters — children before parents, or the same FK bites:
+            //   FileChunks/DeduplicationBlocks -> Files -> Discs -> BackupSets.
+            // Harmless for sets with no legacy rows, which delete nothing here.
+            cmd.CommandText = """
+                DELETE FROM FileChunks
+                WHERE DiscId IN (SELECT Id FROM Discs WHERE BackupSetId = $setId)
+                """;
+            cmd.ExecuteNonQuery();
+
+            cmd.CommandText = """
+                DELETE FROM DeduplicationBlocks
+                WHERE DiscId IN (SELECT Id FROM Discs WHERE BackupSetId = $setId)
+                """;
+            cmd.ExecuteNonQuery();
+
+            cmd.CommandText = """
+                DELETE FROM Files
+                WHERE DiscId IN (SELECT Id FROM Discs WHERE BackupSetId = $setId)
+                """;
+            cmd.ExecuteNonQuery();
+
+            cmd.CommandText = "DELETE FROM Discs WHERE BackupSetId = $setId";
+            cmd.ExecuteNonQuery();
+
+            cmd.CommandText = "DELETE FROM DiscOwners WHERE SetId = $setId";
             cmd.ExecuteNonQuery();
 
             cmd.CommandText = "DELETE FROM BackupSets WHERE Id = $setId";
             cmd.ExecuteNonQuery();
+
+            // One transaction, so a failure part-way cannot strand a set's discs
+            // with no set, or a set with half its records gone.
+            tx.Commit();
+
+            // Committed - the set no longer exists, so its database can go.
+            RemoveSetDatabaseFile(backupSetId);
         }
         finally
         {
