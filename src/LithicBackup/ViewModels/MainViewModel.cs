@@ -1291,9 +1291,17 @@ public class MainViewModel : ViewModelBase
                     backupSet.Id, originalSelections, newSelections, changedPaths,
                     progress, ct);
 
-                // Added: new covering roots not already covered by an old root.
-                var oldRoots = SourceSelection.CollectSelectedRoots(originalSelections);
-                var newRoots = SourceSelection.CollectSelectedRoots(newSelections);
+                // Added: new covering entries not already covered by an old one.
+                //
+                // CollectCoveredEntries, NOT CollectSelectedRoots: the latter
+                // coarsens a selected FILE to its containing directory, so one
+                // ticked file at D:\registrybackup.reg produced the root "D:\",
+                // whose minimal-root reduction then dropped every other D:\…
+                // entry as already covered. The diff therefore reported ZERO
+                // added roots no matter how many folders were ticked, and this
+                // flow silently did nothing — observed with a 12 GB folder.
+                var oldRoots = SourceSelection.CollectCoveredEntries(originalSelections);
+                var newRoots = SourceSelection.CollectCoveredEntries(newSelections);
                 var added = newRoots
                     .Where(r => !IsCoveredBy(oldRoots, r))
                     .ToList();
@@ -1817,8 +1825,8 @@ public class MainViewModel : ViewModelBase
         var stack = new Stack<string>();
         foreach (var r in roots)
         {
-            // A "root" is always a directory (CollectSelectedRoots maps a selected
-            // file to its containing directory), but guard for a stray file path.
+            // An entry may be a file: CollectCoveredEntries returns a selected
+            // file as itself rather than as its containing directory.
             if (File.Exists(r))
             {
                 long fsize = 0;

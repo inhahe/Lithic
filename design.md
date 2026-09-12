@@ -215,24 +215,39 @@ which is the UI thread in the app but is not guaranteed to be. Verified both
 orderings, including the race where the work finishes before `Show()`: each
 returns the right result and leaves zero windows open.
 
-## Two predicates decide "is this file covered", and they do not agree
+## "What does this selection cover" has two answers, and only one is precise
 
-`SourceSelection.CollectSelectedRoots` collects only **fully**-selected
-(`IsSelected == true`) nodes. `SourceSelection.IsPathIncluded` additionally
-returns true for an unlisted descendant of a **partially**-selected directory
-whose auto-include-new is on (`IncludesUnlistedDescendants`).
+`SourceSelection` offers two collectors, and picking the wrong one is silent:
 
-That difference is deliberate, but it means the post-edit "added folders" flow can
-compute a newly-added ROOT whose every FILE was already considered included — tick
-a folder under an auto-include parent and you get exactly that. The flow used to
-`return` silently in that case, so adding 12 GB produced a scan and then nothing
-at all. It now reports what it found and offers to run the backup, because
-"already covered by the selection" is not the same as "already in the catalog":
-those files may well not be backed up yet.
+| | selected FILE becomes | for |
+|---|---|---|
+| `CollectSelectedRoots` | its **containing directory** | file-system watchers — you can only watch a directory |
+| `CollectCoveredEntries` | **the file itself** | anything asking what the selection actually covers |
 
-**If you add a third place that decides coverage, reconcile it with both of
-these** — or at minimum make sure a disagreement surfaces to the user instead of
-becoming a silent no-op.
+The coarsening is lossy in a way that compounds, because both then reduce to
+*minimal* roots. One ticked file at `D:\registrybackup.reg` yields the root
+`D:\`, which absorbs every other `D:\…` entry as "already covered". Measured on
+a real set: **299 entries instead of 2,546 — 88% of the selection swallowed by a
+single stale file node**, for a file that no longer existed on disk.
+
+The post-edit diff used the coarsening collector, so `newRoots` and `oldRoots`
+were identical no matter which folders were ticked, `added` was always empty, and
+the "back up what you just added" flow was never called. Adding a 12 GB folder
+produced a scan and then nothing. It now uses `CollectCoveredEntries`; a file path
+can swallow nothing, since nothing is prefixed by `"somefile.ext\"`.
+
+**A separate, genuine difference worth knowing** (it was my first and wrong
+explanation for the above, so it is recorded to stop it being reached for again):
+`CollectSelectedRoots`/`CollectCoveredEntries` only collect **fully**-selected
+nodes, while `IsPathIncluded` additionally covers unlisted descendants of a
+**partially**-selected directory whose auto-include-new is on. That can make a
+newly-added root whose files were already considered included — a real case, just
+not this one, since `D:\` here is partial with auto-include **off**. The flow now
+reports that case instead of returning silently.
+
+**If you add a third place that decides coverage, say which of the two questions
+it is answering** — "where do I watch" or "what is in the set" — because they
+give different answers and neither is wrong.
 
 ## A source scan must not walk what it will never back up
 
