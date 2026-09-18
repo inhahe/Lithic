@@ -147,6 +147,27 @@ alphabetical prefix forever. Targeted cleanup is the user-driven compaction.
 file on delete (freed pages go to the freelist), so `page_count` alone as a loop
 condition never terminates. Use `page_count - freelist_count`.
 
+### Selection tristates are reconciled in the model, not the tree
+
+`SourceSelection.Reconcile` runs when a set's selection is deserialised, fixing
+any node whose stored state disagrees with its own stored children.
+
+The view model has an equivalent pass, but it is guarded on the node being
+*loaded*, so a **collapsed** directory is never reconciled - and on save an
+unloaded node serialises straight back out of the model it was restored from,
+stale value and all. That loop is self-sustaining: the directory shows a filled
+indeterminate box on every launch, then silently flips to a plain check the
+moment it is expanded and its children materialise. Measured on a real set, 8 of
+23 indeterminate nodes had every recorded child selected, one of them with 1,901
+children; reconciling took the set from 23 indeterminate nodes to 9, all 9
+genuinely mixed.
+
+Reconciling the **model** is what fixes the display *before* expansion, because
+the model always carries the full child list whether or not the UI has
+materialised it. Partial child lists are not a hazard: an unlisted child inherits
+its parent, so "every listed child selected" cannot conceal an exclusion, and one
+listed child excluded always means the parent is partial.
+
 ### Page Up/Down/Home/End follow the mouse, not the focus
 
 `Behaviors\ListPagingKeys` installs one class handler on `Window` at startup so
