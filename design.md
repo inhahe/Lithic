@@ -147,6 +147,34 @@ alphabetical prefix forever. Targeted cleanup is the user-driven compaction.
 file on delete (freed pages go to the freelist), so `page_count` alone as a loop
 condition never terminates. Use `page_count - freelist_count`.
 
+### Page Up/Down/Home/End follow the mouse, not the focus
+
+`Behaviors\ListPagingKeys` installs one class handler on `Window` at startup so
+those four keys scroll whichever list the cursor is over. WPF gives them only to
+the keyboard-focused control, which suits editors and not this app: most of its
+lists are read, not edited, and clicking into a results tree to gain focus also
+changes the selection - not what someone who just wants to scroll is asking for.
+
+**It adds behaviour and never replaces it**, which is the whole reason it is safe
+to register app-wide. Two guards do that work:
+
+* **Focus in a text editor - do nothing.** All four keys are caret keys there.
+* **Focus inside an `ItemsControl` - do nothing**, and let WPF run. That moves
+  the *selection*, which is right for a focused list and deliberately not what
+  the hover path does (hovering scrolls, like the wheel).
+
+Modified combinations (Ctrl+Home, Shift+PageDown) are left alone entirely.
+
+Target resolution walks **outwards** from the cursor to the first ScrollViewer
+that still has somewhere to scroll, so an inner list beats the page around it and
+a list at its limit hands off to its container - the same rule `BubbleScrollWheel`
+applies to the wheel. If the cursor is over no list, it falls back to the only
+scrollable list in the window, and does nothing when there are two or more:
+guessing is worse than no response.
+
+A class handler, not a per-control attached property, because there are nineteen
+views and the twentieth would have been forgotten.
+
 ### Long phases must name what they are doing
 
 The catalog scan's deleted-file check was reported as a hang. It was not hung:

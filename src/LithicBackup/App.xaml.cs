@@ -132,6 +132,13 @@ public partial class App : Application
         // in case the GUI is ever run elevated.
         NativeCrashDumps.TryEnableLocalDumps();
 
+        // Page Up/Down/Home/End scroll the list under the mouse. Registered as
+        // a class handler here rather than opted into per control, because
+        // there are nineteen views and the next list added would be forgotten.
+        // It defers to focused text editors and focused lists, so it only ever
+        // fills in behaviour that was previously absent.
+        Behaviors.ListPagingKeys.Install();
+
         DispatcherUnhandledException += (_, args) =>
         {
             CrashLogger.LogFatal(args.Exception, "Dispatcher.UnhandledException");
