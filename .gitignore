@@ -49,3 +49,29 @@ installer/*.exe
 installer/*.wixpdb
 /LithicBackup-*-x64.msi
 /LithicBackup-*-x64.exe
+
+# Local-only. We publish straight from this directory now instead of mirroring a
+# filtered copy into D:\github (copy_to_github.bat). Also purged from history.
+CLAUDE.md
+todo.txt
+todo2.txt
+todo3.txt
+go.bat
+upgradelithick.bat
+# Test fixtures / run output / crash logs that had been committed by accident
+test_source/
+test_source_orig/
+test_source_reference/
+test_out_new/
+_restore_newfmt/
+_newfmt_catalog/
+crash/
+catalog.db
+button-style-preview.html
+*.pyc
+__pycache__/
+# Build output -- these got committed by accident more than once
+*.exe
+*.dll
+*.msi
+*.pdb

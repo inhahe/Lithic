@@ -73,3 +73,5 @@ echo Executables:
 echo   %~dp0LithicBackup.exe
 echo   %~dp0LithicBackup.Worker.exe
 echo.
+
+call build-msi.bat
