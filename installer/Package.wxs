@@ -175,11 +175,52 @@
                      KeyPath="yes" />
     </Component>
 
+    <!--
+      Remove the WER LocalDumps registration on uninstall.
+
+      Both executables register themselves at startup under
+      HKLM\SOFTWARE\Microsoft\Windows\Windows Error Reporting\LocalDumps\<image>.exe
+      (see Diagnostics.NativeCrashDumps) so that native crashes leave a .dmp
+      behind. Nothing ever removed them again, so uninstalling left two
+      machine-wide keys pointing a dump policy at executables that no longer
+      exist - and at a DumpFolder under ProgramData that the user may well have
+      deleted. Harmless day to day, but it is litter in an OS key, and if any
+      other program ever shipped an executable with the same name it would
+      silently inherit this dump configuration.
+
+      That key is full of exactly this kind of debris from other uninstalled
+      software, which is the argument for not adding to it.
+
+      ForceDeleteOnUninstall removes the key and everything under it. The
+      component is KeyPath'd on a value of our own so the installer has
+      something to reference-count; it is deliberately under our own
+      SOFTWARE\Lithic key rather than inside the WER key, so removing it can
+      never take neighbouring registrations with it.
+    -->
+    <Component Id="WerLocalDumpsCleanup"
+               Directory="INSTALLFOLDER"
+               Guid="213D9A78-B9DE-48FC-A484-64C2099054BC"
+               Bitness="always64">
+      <RegistryKey Root="HKLM"
+                   Key="SOFTWARE\Microsoft\Windows\Windows Error Reporting\LocalDumps\LithicBackup.exe"
+                   ForceDeleteOnUninstall="yes" />
+      <RegistryKey Root="HKLM"
+                   Key="SOFTWARE\Microsoft\Windows\Windows Error Reporting\LocalDumps\LithicBackup.Worker.exe"
+                   ForceDeleteOnUninstall="yes" />
+      <RegistryValue Root="HKLM"
+                     Key="SOFTWARE\Lithic\LithicBackup"
+                     Name="werLocalDumpsRegistered"
+                     Type="integer"
+                     Value="1"
+                     KeyPath="yes" />
+    </Component>
+
     <Feature Id="Main" Title="Lithic Backup" Level="1">
       <ComponentGroupRef Id="AppFiles" />
       <ComponentRef Id="AppExeComponent" />
       <ComponentRef Id="WorkerService" />
       <ComponentRef Id="AppShortcut" />
+      <ComponentRef Id="WerLocalDumpsCleanup" />
     </Feature>
 
     <!-- Classic install wizard with directory chooser + license page. -->
