@@ -147,6 +147,45 @@ alphabetical prefix forever. Targeted cleanup is the user-driven compaction.
 file on delete (freed pages go to the freelist), so `page_count` alone as a loop
 condition never terminates. Use `page_count - freelist_count`.
 
+### Long phases must name what they are doing
+
+The catalog scan's deleted-file check was reported as a hang. It was not hung:
+it was running a phase that reported nothing, so the UI sat on a finished-looking
+`(2,583,781 of 2,583,781)` for minutes while real work continued. Measured on the
+live process at the time: 1,829 metadata ops/s sustained, i.e. plainly busy.
+
+Three rules came out of it, and they generalise to any phase here:
+
+* **Never leave a gap between the last `Bump` and the next `SetPhase`.** That gap
+  is indistinguishable from a freeze, and the more expensive the gap the more
+  convincing the illusion.
+* **Count the thing the user is waiting on.** This phase now counts *files
+  checked*, not directories probed, because files are the unit that takes the
+  time.
+* **Name the current path.** `ClassifyProgress.SetCurrent` is written by every
+  worker without a lock (a reference store is atomic; which thread wins does not
+  matter) and shown by the UI timer. A phase that genuinely does stall then names
+  the path it stalled on, instead of leaving a number to be interpreted.
+
+### Probe and classify in one pass, one directory per work item
+
+The deleted-file check probes a directory and classifies it in the same work
+item, 16 at a time. Splitting those into "probe everything, then classify
+everything" is the obvious refactor and is wrong three ways: it holds every
+directory's filename set alive at once (the largest transient in the scan), it
+puts all the reporting in the first half and all the cost in the second, and it
+invites hoisting the per-file `File.Exists` fallback into a flat parallel pool.
+
+That last one is the subtle one. The fallback must stay **inside** its
+directory's work item. Each thread then walks one directory whose index it has
+just read, so its metadata is already in cache; a flat pool would scatter 16
+threads across the volume instead. Measured live: **1,829 metadata ops/s against
+76 physical read ops/s**, so ~96% of checks never reach the platter — the cost is
+per-call overhead (syscall, filter drivers, path parsing) on the calling thread,
+not head movement. That is why this parallelises well even though `D:` is a
+spinning disk, and for the few checks that do miss cache, SATA NCQ reorders a
+16-deep queue into a shorter sweep than 16 serial requests would produce.
+
 ### Cache maintenance (Settings ▸ Caches)
 
 User-driven compaction: drop entries whose path is gone, rebuild the table

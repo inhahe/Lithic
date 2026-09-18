@@ -671,13 +671,44 @@ public class OrphanedDirectoriesViewModel : ViewModelBase
             candidates.Add(group);
         }
 
-        // Probe the surviving directories CONCURRENTLY.
+        // Probe each surviving directory and classify it IN THE SAME PASS,
+        // concurrently, one directory per work item.
         //
-        // This is pure disk latency, not work: a cold directory open measured
-        // 58.6 ms on this machine's volumes, and 139,470 of them serially is over
-        // two hours. Sixteen at a time is the figure CacheMaintenance arrived at
-        // by measurement (235 probes/s against 21 single-threaded); more makes
-        // the drive unresponsive to everything else for no real gain.
+        // Three things forced this shape, and all three are easy to undo by
+        // accident:
+        //
+        // 1. MEMORY. Probing everything first into a dictionary of
+        //    directory -> set-of-filenames keeps every name of every candidate
+        //    directory alive at once, purely so a second loop can read them
+        //    back. On a 2.6M-file catalog that dictionary is the single largest
+        //    allocation in the scan. Classifying immediately lets each name set
+        //    die with its iteration, so peak memory is set by the 16 in-flight
+        //    directories rather than by all ~139,000 of them.
+        //
+        // 2. REPORTING. The classify half used to run after the counter had
+        //    already been bumped to its maximum, with no phase of its own and no
+        //    bumps, so the UI sat on a finished-looking "(N of N)" for minutes
+        //    while real work continued. It read as a hang, and was reported as
+        //    one. Fusing gives every file exactly one bump at the moment it is
+        //    actually checked.
+        //
+        // 3. LOCALITY. The per-file fallback below (File.Exists, for names not
+        //    in the listing) must stay INSIDE the directory's work item. Hoisting
+        //    those calls into a flat parallel pool would scatter 16 threads at
+        //    random across the volume; keeping them here means each thread walks
+        //    one directory whose index it has just read, so the metadata it needs
+        //    is already in cache. Measured live during a real scan: 1,829
+        //    metadata ops/s against only 76 physical read ops/s, i.e. ~96% of the
+        //    checks never reach the platter at all. That is why this parallelizes
+        //    well even though D: is a spinning disk - the cost is per-call
+        //    overhead (syscall, filter drivers, path parsing) on the calling
+        //    thread, not head movement. For the few that do miss cache, SATA NCQ
+        //    reorders a 16-deep queue into a shorter sweep than 16 serial
+        //    requests would produce, so concurrency does not thrash the head.
+        //
+        // Sixteen at a time is CacheMaintenance's measured figure for this same
+        // kind of work (235 probes/s against 21 single-threaded); 32 bought ~20%
+        // more while making the drive unresponsive to everything else.
         //
         // Reading the NAMES costs almost nothing on top of the open - measured
         // 64.0 ms against 58.6 ms for a bare Directory.Exists, i.e. +9% - which
@@ -690,59 +721,83 @@ public class OrphanedDirectoriesViewModel : ViewModelBase
         // only Directory.Exists, so their backups sat on the destination reported
         // by no category at all. Measured on a real set: 174 files / 4.8 GB
         // stranded in a single folder that way.
-        var probes = new ConcurrentDictionary<string, DirProbe>(StringComparer.OrdinalIgnoreCase);
-        System.Threading.Tasks.Parallel.ForEach(
-            candidates,
+        int candidateFiles = candidates.Sum(g => g.Count());
+        progress.SetPhase("Confirming deleted files", candidateFiles);
+
+        // Results are written by index, not appended, so the output order stays
+        // identical run to run despite the work completing out of order.
+        var classified = new OrphanedDirectoryItem?[candidates.Count];
+
+        System.Threading.Tasks.Parallel.For(
+            0, candidates.Count,
             new System.Threading.Tasks.ParallelOptions
             {
                 MaxDegreeOfParallelism = DirectoryProbeParallelism,
             },
-            group =>
+            i =>
             {
-                probes[group.Key] = ProbeDirectory(group.Key);
-                progress.Bump(group.Count());
+                var group = candidates[i];
+                string dir = group.Key;
+
+                var probe = ProbeDirectory(dir);
+                if (probe.Skip)
+                {
+                    progress.Bump(group.Count());
+                    return;
+                }
+                var presentNames = probe.PresentNames;
+
+                var remaining = new List<FileRecord>();
+                foreach (var f in group)
+                {
+                    // Report before the check, not after, so a path that blocks
+                    // is the one left on screen rather than the one before it.
+                    progress.SetCurrent(f.SourcePath);
+                    if (!excludedPaths.Contains(f.SourcePath)
+                        && IsSourceGone(f.SourcePath, presentNames))
+                    {
+                        remaining.Add(f);
+                    }
+                    progress.Bump();
+                }
+
+                if (remaining.Count == 0)
+                    return;
+
+                // Dedupe by SourcePath so retention versions collapse to one row.
+                var remainingByPath = remaining
+                    .GroupBy(f => f.SourcePath, StringComparer.OrdinalIgnoreCase)
+                    .ToList();
+
+                classified[i] = new OrphanedDirectoryItem
+                {
+                    DirectoryPath = dir,
+                    Reason = OrphanedReason.DeletedFromDisk,
+                    FileCount = remainingByPath.Count,
+                    TotalSizeBytes = remaining.Sum(f => f.SizeBytes),
+                    // CRITICAL. This item can now be a directory that still
+                    // EXISTS, holding a mixture of files that are gone and files
+                    // that are not, so the purge must mark exactly the gone ones.
+                    // Marking by directory prefix instead tombstoned the entire
+                    // subtree: on a real set that turned 79,364 genuinely-missing
+                    // files into 1,203,628 tombstoned rows, because one missing
+                    // file under a high-level directory condemned everything
+                    // beneath it.
+                    MatchingSourcePaths = remainingByPath.Select(g => g.Key).ToList(),
+                    Files = remainingByPath
+                        .Select(g => new OrphanedFileInfo(
+                            Path.GetFileName(g.Key), g.Key, g.Sum(f => f.SizeBytes)))
+                        .ToList(),
+                    DiscFilePaths = _targetDir is null ? null
+                        : remaining.Select(f => f.DiscPath.Replace('/', '\\')).ToList(),
+                };
             });
 
-        // Classify from the probe results: CPU only, and in the original order so
-        // the output does not shuffle between runs.
-        foreach (var group in candidates)
+        progress.SetCurrent(null);
+        foreach (var item in classified)
         {
-            string dir = group.Key;
-            if (!probes.TryGetValue(dir, out var probe) || probe.Skip)
-                continue;
-            var presentNames = probe.PresentNames;
-
-            var remaining = group
-                .Where(f => !excludedPaths.Contains(f.SourcePath))
-                .Where(f => IsSourceGone(f.SourcePath, presentNames))
-                .ToList();
-            if (remaining.Count == 0)
-                continue;
-            // Dedupe by SourcePath so retention versions collapse to one row.
-            var remainingByPath = remaining
-                .GroupBy(f => f.SourcePath, StringComparer.OrdinalIgnoreCase)
-                .ToList();
-            deletedDirs.Add(new OrphanedDirectoryItem
-            {
-                DirectoryPath = dir,
-                Reason = OrphanedReason.DeletedFromDisk,
-                FileCount = remainingByPath.Count,
-                TotalSizeBytes = remaining.Sum(f => f.SizeBytes),
-                // CRITICAL. This item can now be a directory that still EXISTS,
-                // holding a mixture of files that are gone and files that are
-                // not, so the purge must mark exactly the gone ones. Marking by
-                // directory prefix instead tombstoned the entire subtree: on a
-                // real set that turned 79,364 genuinely-missing files into
-                // 1,203,628 tombstoned rows, because one missing file under a
-                // high-level directory condemned everything beneath it.
-                MatchingSourcePaths = remainingByPath.Select(g => g.Key).ToList(),
-                Files = remainingByPath
-                    .Select(g => new OrphanedFileInfo(
-                        Path.GetFileName(g.Key), g.Key, g.Sum(f => f.SizeBytes)))
-                    .ToList(),
-                DiscFilePaths = _targetDir is null ? null
-                    : remaining.Select(f => f.DiscPath.Replace('/', '\\')).ToList(),
-            });
+            if (item is not null)
+                deletedDirs.Add(item);
         }
 
         // --- Phase 4: ExcessVersion ---
@@ -2640,12 +2695,23 @@ public class OrphanedDirectoriesViewModel : ViewModelBase
         private int _done;
         private int _total;
 
+        // The item being worked on right now, for display. Written by every
+        // worker thread and read by the UI timer, but deliberately NOT locked:
+        // a reference assignment is atomic on all CLR targets, so a reader sees
+        // some thread's most recent path rather than a torn one. Which thread
+        // wins is unimportant - this exists so a long phase visibly moves, and
+        // so a phase that stalls names the path it stalled on.
+        private volatile string? _current;
+
         public void SetPhase(string name, int total)
         {
             lock (_phaseLock) _phase = name;
             System.Threading.Interlocked.Exchange(ref _total, total);
             System.Threading.Interlocked.Exchange(ref _done, 0);
+            _current = null;
         }
+
+        public void SetCurrent(string? path) => _current = path;
 
         public void Bump() => System.Threading.Interlocked.Increment(ref _done);
 
@@ -2654,25 +2720,48 @@ public class OrphanedDirectoriesViewModel : ViewModelBase
         public void SetDone(int value) =>
             System.Threading.Interlocked.Exchange(ref _done, value);
 
-        public (string Phase, int Done, int Total) Snapshot()
+        public (string Phase, int Done, int Total, string? Current) Snapshot()
         {
             string phase;
             lock (_phaseLock) phase = _phase;
-            return (phase, _done, _total);
+            return (phase, _done, _total, _current);
         }
     }
 
-    private static string FormatProgress((string Phase, int Done, int Total) snap)
+    private static string FormatProgress((string Phase, int Done, int Total, string? Current) snap)
     {
         if (string.IsNullOrEmpty(snap.Phase))
             return "Classifying...";
+
+        string head;
         if (snap.Total <= 0)
             // Unknown total (e.g. the DB read): show the running count once we
             // have one so the phase still visibly ticks rather than sitting on
             // a static "...".
-            return snap.Done > 0 ? $"{snap.Phase} ({snap.Done:N0})..." : $"{snap.Phase}...";
-        int done = Math.Min(snap.Done, snap.Total);
-        return $"{snap.Phase} ({done:N0} of {snap.Total:N0})...";
+            head = snap.Done > 0 ? $"{snap.Phase} ({snap.Done:N0})..." : $"{snap.Phase}...";
+        else
+        {
+            int done = Math.Min(snap.Done, snap.Total);
+            head = $"{snap.Phase} ({done:N0} of {snap.Total:N0})...";
+        }
+
+        // Name the path being worked on. Without this a slow phase is
+        // indistinguishable from a hung one - which is exactly how the
+        // deleted-file check was read as a freeze.
+        return string.IsNullOrEmpty(snap.Current)
+            ? head
+            : head + "  " + Ellipsize(snap.Current, 70);
+    }
+
+    /// <summary>
+    /// Shortens a path for status display, keeping the end (the filename), which
+    /// is the part that identifies what is happening.
+    /// </summary>
+    private static string Ellipsize(string path, int max)
+    {
+        if (path.Length <= max)
+            return path;
+        return "..." + path[^(max - 3)..];
     }
 
     /// <summary>
