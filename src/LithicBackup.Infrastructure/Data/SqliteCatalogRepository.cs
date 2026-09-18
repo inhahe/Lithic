@@ -410,6 +410,12 @@ public class SqliteCatalogRepository : ICatalogRepository
         IProgress<int>? rowProgress = null)
         => GetSet(backupSetId).ForEachDiscPathEntryAsync(backupSetId, onEntry, ct, rowProgress);
 
+    public Task<IReadOnlyList<FileRecord>> GetActiveFilesForClassificationAsync(
+        int backupSetId,
+        CancellationToken ct = default,
+        IProgress<int>? rowProgress = null)
+        => GetSet(backupSetId).GetActiveFilesForClassificationAsync(backupSetId, ct, rowProgress);
+
     public Task<Dictionary<string, FileVersionInfo>> GetLatestVersionInfoAsync(int backupSetId, CancellationToken ct = default)
         => GetSet(backupSetId).GetLatestVersionInfoAsync(backupSetId, ct);
 

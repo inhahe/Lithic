@@ -92,6 +92,28 @@ public interface ICatalogRepository : IDisposable
         IProgress<int>? rowProgress = null);
 
     /// <summary>
+    /// Active (non-tombstoned) file records for classification, carrying ONLY the
+    /// columns the classifier reads: Id, SourcePath, DiscPath, SizeBytes and
+    /// BackedUpUtc. Hash in particular is a 64-character string per row that the
+    /// classifier never looks at.
+    /// <para>
+    /// Prefer this over <see cref="GetAllFilesForBackupSetAsync"/> for any
+    /// whole-set analysis. On a real 3.1M-row set that method loads every
+    /// tombstone as well (325,566 of them) and every hash, for about 600 MB of
+    /// records nothing goes on to read.
+    /// </para>
+    /// <para>
+    /// Rows arrive ordered by SourcePath then Version descending, so all records
+    /// for one directory are contiguous and all versions of one path are
+    /// adjacent, newest first. Callers rely on that ordering.
+    /// </para>
+    /// </summary>
+    Task<IReadOnlyList<FileRecord>> GetActiveFilesForClassificationAsync(
+        int backupSetId,
+        CancellationToken ct = default,
+        IProgress<int>? rowProgress = null);
+
+    /// <summary>
     /// Get lightweight version info for the latest version of each file in a
     /// backup set. Returns one entry per unique SourcePath with the max version
     /// and its metadata. Much cheaper than <see cref="GetAllFilesForBackupSetAsync"/>.

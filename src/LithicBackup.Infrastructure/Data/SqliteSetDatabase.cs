@@ -544,6 +544,51 @@ internal sealed class SqliteSetDatabase : IDisposable
         return list;
     }
 
+    public async Task<IReadOnlyList<FileRecord>> GetActiveFilesForClassificationAsync(
+        int backupSetId, CancellationToken ct = default, IProgress<int>? rowProgress = null)
+    {
+        ct.ThrowIfCancellationRequested();
+        using var _ = await LockAsync(ct).ConfigureAwait(false);
+
+        using var cmd = _connection.CreateCommand();
+        // Only the columns the classifier reads, and tombstones filtered in SQL
+        // rather than in memory. The old path selected f.* for every row and then
+        // did .Where(!IsDeleted) on the result, so both the tombstones and every
+        // 64-character Hash were materialised and held for the whole scan.
+        //
+        // ORDER BY is load-bearing, not cosmetic: callers depend on rows for one
+        // directory being contiguous and versions of one path being adjacent.
+        cmd.CommandText = """
+            SELECT f.Id, f.SourcePath, f.DiscPath, f.SizeBytes, f.BackedUpUtc
+            FROM Files f
+            INNER JOIN Discs d ON f.DiscId = d.Id
+            WHERE d.BackupSetId = $setId AND f.IsDeleted = 0
+            ORDER BY f.SourcePath, f.Version DESC
+            """;
+        cmd.Parameters.AddWithValue("$setId", backupSetId);
+
+        var list = new List<FileRecord>();
+        using var r = cmd.ExecuteReader();
+        while (r.Read())
+        {
+            list.Add(new FileRecord
+            {
+                Id = r.GetInt64(0),
+                SourcePath = r.GetString(1),
+                DiscPath = r.GetString(2),
+                SizeBytes = r.GetInt64(3),
+                BackedUpUtc = DateTime.TryParse(
+                    r.GetString(4), null,
+                    System.Globalization.DateTimeStyles.RoundtripKind, out var b)
+                        ? b : default,
+            });
+            if (rowProgress is not null && list.Count % 5000 == 0)
+                rowProgress.Report(list.Count);
+        }
+        rowProgress?.Report(list.Count);
+        return list;
+    }
+
     public async Task ForEachDiscPathEntryAsync(
         int backupSetId,
         Action<string, bool, string> onEntry,
