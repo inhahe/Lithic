@@ -147,26 +147,27 @@ alphabetical prefix forever. Targeted cleanup is the user-driven compaction.
 file on delete (freed pages go to the freelist), so `page_count` alone as a loop
 condition never terminates. Use `page_count - freelist_count`.
 
-### Selection tristates are reconciled in the model, not the tree
+### Never widen a selection to "repair" a tristate
 
-`SourceSelection.Reconcile` runs when a set's selection is deserialised, fixing
-any node whose stored state disagrees with its own stored children.
+1.3.1 added a model-level pass that promoted a partial directory to
+fully-selected when every child it *listed* was selected. It was withdrawn the
+same day.
 
-The view model has an equivalent pass, but it is guarded on the node being
-*loaded*, so a **collapsed** directory is never reconciled - and on save an
-unloaded node serialises straight back out of the model it was restored from,
-stale value and all. That loop is self-sustaining: the directory shows a filled
-indeterminate box on every launch, then silently flips to a plain check the
-moment it is expanded and its children materialise. Measured on a real set, 8 of
-23 indeterminate nodes had every recorded child selected, one of them with 1,901
-children; reconciling took the set from 23 indeterminate nodes to 9, all 9
-genuinely mixed.
+The saved model contains only nodes the user has touched, so a partial parent's
+listed children are **not** the complete set. `C:\` was stored partial with six
+listed children, all selected, against 64 actual subdirectories on the volume -
+so the "repair" quietly added the whole drive to a backup set.
 
-Reconciling the **model** is what fixes the display *before* expansion, because
-the model always carries the full child list whether or not the UI has
-materialised it. Partial child lists are not a hazard: an unlisted child inherits
-its parent, so "every listed child selected" cannot conceal an exclusion, and one
-listed child excluded always means the parent is partial.
+The reasoning behind it ("an unlisted child inherits its parent, so
+every-listed-child-selected cannot conceal an exclusion") is exactly backwards
+under a *partial* parent, where unlisted children are excluded by definition.
+
+The rule this leaves behind: **a tristate correction may only ever narrow a
+selection** - selected to partial when a listed child is excluded - never widen
+it. Over-selecting a source is a data-volume and privacy problem, not a cosmetic
+one, and it is strictly worse than the checkbox-flip it was trying to fix. Any
+future attempt must be tested against a node whose recorded children are a
+strict subset of what is on disk.
 
 ### Page Up/Down/Home/End follow the mouse, not the focus
 

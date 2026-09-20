@@ -304,15 +304,8 @@ public class SqliteCatalogRepository : ICatalogRepository
         {
             int selOrd = r.GetOrdinal("SourceSelectionJson");
             if (!r.IsDBNull(selOrd))
-            {
                 set.SourceSelections = JsonSerializer.Deserialize<List<SourceSelection>>(
                     r.GetString(selOrd));
-
-                // Repair stale tristates at the point of load, so a checkbox
-                // never shows one state before a directory is expanded and a
-                // different one after. See SourceSelection.Reconcile.
-                SourceSelection.Reconcile(set.SourceSelections);
-            }
         }
         catch (IndexOutOfRangeException) { }
 
