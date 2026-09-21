@@ -387,7 +387,14 @@ public class SqliteCatalogRepository : ICatalogRepository
         ct.ThrowIfCancellationRequested();
         var setId = await ResolveSetForDiscAsync(file.DiscId, ct).ConfigureAwait(false)
                     ?? throw new InvalidOperationException(
-                        $"Cannot update file record: disc {file.DiscId} has no owning set.");
+                        $"Cannot update file record {file.Id}: disc {file.DiscId} has no owning set."
+                        + (file.DiscId == 0
+                            ? " DiscId is 0, which usually means this record was not read in full"
+                              + " (e.g. it came from GetActiveFilesForClassificationAsync, which"
+                              + " loads five columns). UpdateFileRecordAsync rewrites every column,"
+                              + " so a partial record must never be passed to it — use"
+                              + " MarkFileRecordsDeletedByIdsAsync or re-read the row first."
+                            : string.Empty));
         await GetSet(setId).UpdateFileRecordAsync(file, ct).ConfigureAwait(false);
     }
 
@@ -478,6 +485,10 @@ public class SqliteCatalogRepository : ICatalogRepository
 
     public Task<int> MarkFilesDeletedBySourcePathsAsync(int backupSetId, IEnumerable<string> sourcePaths, CancellationToken ct = default)
         => GetSet(backupSetId).MarkFilesDeletedBySourcePathsAsync(backupSetId, sourcePaths, ct);
+
+    public Task<int> MarkFileRecordsDeletedByIdsAsync(
+        int backupSetId, IReadOnlyList<long> fileIds, CancellationToken ct = default)
+        => GetSet(backupSetId).MarkFileRecordsDeletedByIdsAsync(backupSetId, fileIds, ct);
 
     public Task<int> CountFilesUnderSourcePrefixAsync(int backupSetId, string sourcePrefix, CancellationToken ct = default)
         => GetSet(backupSetId).CountFilesUnderSourcePrefixAsync(backupSetId, sourcePrefix, ct);

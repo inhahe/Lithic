@@ -194,13 +194,22 @@ public sealed class DirectorySizeCache : IDisposable
     /// Returns <c>null</c> if no value is cached, or if the cached value was
     /// computed under a different filter (i.e. the signatures don't match).
     /// </summary>
+    /// <param name="currentLastWriteUtc">
+    /// The directory's mtime right now.  A hit requires the stored filtered
+    /// stamp to be at least this recent, so the staleness check lives here
+    /// rather than being repeated (and previously got wrong) at each call site.
+    /// A row with no filtered stamp — every row written before this column
+    /// existed — reads as a miss and is recomputed once, which then stamps it.
+    /// </param>
     public (long FilteredSize, int FilteredFileCount)? TryGetFilteredRecursive(
-        string path, string filterSignature)
+        string path, string filterSignature, DateTime currentLastWriteUtc)
     {
         lock (_lock)
         {
             if (Read(path) is { FilteredRecursiveSize: >= 0 } entry
-                && entry.FilteredFilterSignature == filterSignature)
+                && entry.FilteredFilterSignature == filterSignature
+                && entry.FilteredDirLastWriteUtc is { } stamp
+                && stamp >= currentLastWriteUtc)
             {
                 return (entry.FilteredRecursiveSize, entry.FilteredRecursiveFileCount);
             }
@@ -260,20 +269,44 @@ public sealed class DirectorySizeCache : IDisposable
     /// <see cref="TryGetFilteredRecursive"/> so a cached value is reused
     /// only when the filter hasn't changed.
     /// </summary>
+    /// <param name="dirLastWriteUtc">
+    /// The directory's mtime as read <b>before</b> the walk that produced these
+    /// totals.  Stored in <c>FilteredDirLastWriteUtc</c>, which is what
+    /// <see cref="TryGetFilteredRecursive"/> validates against.
+    ///
+    /// <para>This parameter is the fix for a cache that could never hit. The
+    /// filtered walk is the only writer on this path and it does not compute the
+    /// direct-file figures, so it used to stamp <c>DirLastWriteUtc</c> —
+    /// the timestamp that validates those figures — with
+    /// <see cref="DateTime.MinValue"/> on a new row, and the <c>with</c>
+    /// expression then preserved that MinValue forever. Validation asks
+    /// <c>stamp &gt;= currentLastWrite</c>, which MinValue never satisfies, so
+    /// every directory first seen by the filtered pass was re-enumerated in full
+    /// on every subsequent pass, permanently. Measured on a real 2,515,306-row
+    /// cache: <b>814,458 rows (32.4%)</b> were stamped MinValue and could never
+    /// be served.</para>
+    ///
+    /// <para>Writing the real mtime into <c>DirLastWriteUtc</c> instead would
+    /// have been the wrong fix — it would validate direct-file figures this pass
+    /// never measured. Hence the separate column.</para>
+    /// </param>
     public void SetFilteredRecursive(
-        string path, long filteredSize, int filteredFileCount, string filterSignature)
+        string path, long filteredSize, int filteredFileCount, string filterSignature,
+        DateTime dirLastWriteUtc)
     {
         lock (_lock)
         {
             var existing = Read(path);
             Write(path, existing is null
                 ? new CacheEntry(0, 0, DateTime.MinValue, -1, -1,
-                                 filteredSize, filteredFileCount, filterSignature)
+                                 filteredSize, filteredFileCount, filterSignature,
+                                 dirLastWriteUtc)
                 : existing with
                 {
                     FilteredRecursiveSize = filteredSize,
                     FilteredRecursiveFileCount = filteredFileCount,
                     FilteredFilterSignature = filterSignature,
+                    FilteredDirLastWriteUtc = dirLastWriteUtc,
                 });
         }
     }
@@ -393,7 +426,11 @@ public sealed class DirectorySizeCache : IDisposable
             reader.IsDBNull(4) ? -1 : reader.GetInt32(4),
             reader.IsDBNull(5) ? -1L : reader.GetInt64(5),
             reader.IsDBNull(6) ? -1 : reader.GetInt32(6),
-            reader.IsDBNull(7) ? null : reader.GetString(7));
+            reader.IsDBNull(7) ? null : reader.GetString(7),
+            reader.IsDBNull(8)
+                ? null
+                : DateTime.Parse(reader.GetString(8), null,
+                                 System.Globalization.DateTimeStyles.RoundtripKind));
     }
 
     /// <summary>
@@ -417,14 +454,14 @@ public sealed class DirectorySizeCache : IDisposable
             Exec(conn, "PRAGMA journal_mode=WAL");
             Exec(conn, "PRAGMA synchronous=NORMAL");
             Exec(conn, "PRAGMA busy_timeout=30000");
-            EnsureTable(conn);
+            bool addedFilteredStamp = EnsureTable(conn);
 
             var select = conn.CreateCommand();
             select.CommandText = """
                 SELECT DirectFileSize, DirectFileCount, DirLastWriteUtc,
                        RecursiveSize, RecursiveFileCount,
                        FilteredRecursiveSize, FilteredRecursiveFileCount,
-                       FilteredFilterSignature
+                       FilteredFilterSignature, FilteredDirLastWriteUtc
                 FROM DirectorySizeCache WHERE Path = $path
                 """;
             _selectPath = select.Parameters.Add("$path", SqliteType.Text);
@@ -432,6 +469,8 @@ public sealed class DirectorySizeCache : IDisposable
 
             _conn = conn;
             _selectCmd = select;
+            if (addedFilteredStamp)
+                StartFilteredStampBackfill(_dbPath);
             StartPruneIfNeeded();
         }
         catch
@@ -464,9 +503,9 @@ public sealed class DirectorySizeCache : IDisposable
                     (Path, DirectFileSize, DirectFileCount, DirLastWriteUtc,
                      RecursiveSize, RecursiveFileCount,
                      FilteredRecursiveSize, FilteredRecursiveFileCount,
-                     FilteredFilterSignature)
+                     FilteredFilterSignature, FilteredDirLastWriteUtc)
                 VALUES ($path, $size, $count, $lastWrite, $recSize, $recCount,
-                        $filtSize, $filtCount, $filtSig)
+                        $filtSize, $filtCount, $filtSig, $filtLw)
                 """;
             var pPath = cmd.Parameters.Add("$path", SqliteType.Text);
             var pSize = cmd.Parameters.Add("$size", SqliteType.Integer);
@@ -477,6 +516,7 @@ public sealed class DirectorySizeCache : IDisposable
             var pFiltSize = cmd.Parameters.Add("$filtSize", SqliteType.Integer);
             var pFiltCount = cmd.Parameters.Add("$filtCount", SqliteType.Integer);
             var pFiltSig = cmd.Parameters.Add("$filtSig", SqliteType.Text);
+            var pFiltLw = cmd.Parameters.Add("$filtLw", SqliteType.Text);
 
             foreach (var (path, entry) in toSave)
             {
@@ -492,6 +532,8 @@ public sealed class DirectorySizeCache : IDisposable
                     ? entry.FilteredRecursiveFileCount : DBNull.Value;
                 pFiltSig.Value = entry.FilteredFilterSignature is not null
                     ? entry.FilteredFilterSignature : DBNull.Value;
+                pFiltLw.Value = entry.FilteredDirLastWriteUtc is { } flw
+                    ? flw.ToString("O") : (object)DBNull.Value;
                 cmd.ExecuteNonQuery();
             }
 
@@ -501,6 +543,61 @@ public sealed class DirectorySizeCache : IDisposable
         {
             // Non-critical — worst case we recompute next session.
         }
+    }
+
+    /// <summary>
+    /// One-time migration for databases that predate <c>FilteredDirLastWriteUtc</c>:
+    /// copy <c>DirLastWriteUtc</c> into it for every row that already holds a
+    /// filtered total and carries a real timestamp.
+    ///
+    /// <para><b>Why bother rather than let them recompute.</b> Without this every
+    /// filtered row reads as a miss exactly once — correct, but on the author's
+    /// cache that is 909,664 directories each needing a full recursive walk to
+    /// restore a value that is already sitting in the row. Copying the stamp
+    /// reproduces precisely the validation the old code performed for those rows
+    /// (it checked the filtered total against <c>DirLastWriteUtc</c>), so this is
+    /// not a new guarantee, just the old one written down where the new check can
+    /// see it. Each row is re-stamped properly the next time it is genuinely
+    /// recomputed.</para>
+    ///
+    /// <para>Rows stamped <see cref="DateTime.MinValue"/> are deliberately left
+    /// NULL. Those are the broken ones — 814,362 of them — and they have never
+    /// held a servable value, so they must recompute once.</para>
+    ///
+    /// <para><b>On a background thread, on its own connection, holding no lock</b>
+    /// — measured at 5.85 s over 2.5M rows. Doing that inside
+    /// <see cref="EnsureOpen"/> would block the first lookup, which is the exact
+    /// six-second stall this class was rewritten to remove (see the type
+    /// remarks). Until it finishes, lookups simply miss and recompute, which is
+    /// the cache's normal degraded mode rather than a wrong answer.</para>
+    /// </summary>
+    private static void StartFilteredStampBackfill(string dbPath)
+    {
+        _ = Task.Run(() =>
+        {
+            try
+            {
+                using var conn = new SqliteConnection($"Data Source={dbPath}");
+                conn.Open();
+                Exec(conn, "PRAGMA busy_timeout=30000");
+
+                using var cmd = conn.CreateCommand();
+                cmd.CommandText = """
+                    UPDATE DirectorySizeCache
+                    SET FilteredDirLastWriteUtc = DirLastWriteUtc
+                    WHERE FilteredRecursiveSize IS NOT NULL
+                      AND FilteredDirLastWriteUtc IS NULL
+                      AND DirLastWriteUtc <> $minValue
+                    """;
+                cmd.Parameters.AddWithValue("$minValue", DateTime.MinValue.ToString("O"));
+                cmd.ExecuteNonQuery();
+            }
+            catch
+            {
+                // Best effort. Failing here costs a recompute per row, never a
+                // wrong answer: an un-backfilled row reads as a miss.
+            }
+        });
     }
 
     /// <summary>
@@ -603,7 +700,12 @@ public sealed class DirectorySizeCache : IDisposable
         cmd.ExecuteNonQuery();
     }
 
-    private static void EnsureTable(SqliteConnection conn)
+    /// <returns>
+    /// <c>true</c> when <c>FilteredDirLastWriteUtc</c> was added by THIS call,
+    /// i.e. the database predates the column.  The caller uses that to run the
+    /// one-time backfill exactly once instead of on every open.
+    /// </returns>
+    private static bool EnsureTable(SqliteConnection conn)
     {
         using var cmd = conn.CreateCommand();
         cmd.CommandText = """
@@ -616,7 +718,8 @@ public sealed class DirectorySizeCache : IDisposable
                 RecursiveFileCount INTEGER,
                 FilteredRecursiveSize INTEGER,
                 FilteredRecursiveFileCount INTEGER,
-                FilteredFilterSignature TEXT
+                FilteredFilterSignature TEXT,
+                FilteredDirLastWriteUtc TEXT
             ) WITHOUT ROWID
             """;
         cmd.ExecuteNonQuery();
@@ -641,6 +744,10 @@ public sealed class DirectorySizeCache : IDisposable
         AddColumnIfMissing(conn, existing, "FilteredRecursiveSize", "INTEGER");
         AddColumnIfMissing(conn, existing, "FilteredRecursiveFileCount", "INTEGER");
         AddColumnIfMissing(conn, existing, "FilteredFilterSignature", "TEXT");
+
+        bool addedFilteredStamp = !existing.Contains("FilteredDirLastWriteUtc");
+        AddColumnIfMissing(conn, existing, "FilteredDirLastWriteUtc", "TEXT");
+        return addedFilteredStamp;
     }
 
     private static void AddColumnIfMissing(
@@ -654,9 +761,18 @@ public sealed class DirectorySizeCache : IDisposable
         alter.ExecuteNonQuery();
     }
 
+    /// <param name="FilteredDirLastWriteUtc">
+    /// Validity timestamp for the FILTERED totals only, and deliberately
+    /// separate from <paramref name="DirLastWriteUtc"/>.  The two halves of a row
+    /// are written by different passes: the filtered walk never establishes the
+    /// direct-file figures, so it must not stamp the timestamp that validates
+    /// them — doing so would serve stale direct sizes as current.  Null means
+    /// "filtered total present but never validated", which reads as a miss.
+    /// </param>
     private sealed record CacheEntry(
         long DirectFileSize, int DirectFileCount, DateTime DirLastWriteUtc,
         long RecursiveSize, int RecursiveFileCount,
         long FilteredRecursiveSize, int FilteredRecursiveFileCount,
-        string? FilteredFilterSignature);
+        string? FilteredFilterSignature,
+        DateTime? FilteredDirLastWriteUtc = null);
 }

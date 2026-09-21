@@ -42,6 +42,12 @@ public class OrphanedDirectoriesViewModel : ViewModelBase
     private int _categoryColumns = 3;
     private bool _isLoading;
     private bool _isPurging;
+
+    /// <summary>
+    /// Cancellation for the running purge.  Lives for exactly one
+    /// <see cref="PurgeSelected"/> call and is disposed in its finally.
+    /// </summary>
+    private CancellationTokenSource? _purgeCts;
     private bool _isScanningDestination;
     private string _summaryText = "Loading...";
     private string _exclusionPatterns = "";
@@ -84,9 +90,25 @@ public class OrphanedDirectoriesViewModel : ViewModelBase
 
         Items = [];
         Categories = [];
+
+        // Drive HasCategories off the collection itself rather than notifying at
+        // each mutation site. There are two independent ones — the catalog scan
+        // builds its categories off-thread and assigns them straight onto the
+        // collection, while the purge and edit paths go through
+        // RebuildCategories — and the scan is the one that matters most here, so
+        // a per-site notification that missed it would leave the layout control
+        // hidden exactly when results appeared. A third such path would be easy
+        // to add and easy to forget; this cannot miss one.
+        Categories.CollectionChanged += (_, _) => OnPropertyChanged(nameof(HasCategories));
         PurgeSelectedCommand = new RelayCommand(
             _ => PurgeSelected(),
             _ => !IsPurging && Categories.Any(c => c.HasCheckedItems));
+        // Enabled only while a purge is actually running, and only once — a
+        // second press has nothing left to do and the disabled button is the
+        // feedback that the first one registered.
+        CancelPurgeCommand = new RelayCommand(
+            _ => CancelPurge(),
+            _ => IsPurging && _purgeCts is { IsCancellationRequested: false });
         ScanCatalogCommand = new RelayCommand(
             _ => _ = LoadAsync(),
             _ => !IsLoading && !IsPurging);
@@ -179,6 +201,14 @@ public class OrphanedDirectoriesViewModel : ViewModelBase
     /// a tree of <see cref="OrphanedNodeViewModel"/>s built from its items.
     /// </summary>
     public ObservableCollection<OrphanedCategoryViewModel> Categories { get; }
+
+    /// <summary>
+    /// Whether any results are on screen. Gates the "Categories per row" control,
+    /// which arranges the category cards and so has nothing to act on until there
+    /// are some — it used to be visible (and at the top of the page) before the
+    /// first scan had produced anything.
+    /// </summary>
+    public bool HasCategories => Categories.Count > 0;
 
     public bool IsLoading
     {
@@ -446,6 +476,7 @@ public class OrphanedDirectoriesViewModel : ViewModelBase
     }
 
     public ICommand PurgeSelectedCommand { get; }
+    public ICommand CancelPurgeCommand { get; }
     public ICommand ScanCatalogCommand { get; }
     public ICommand ScanExcludedCommand { get; }
     public ICommand ScanDestinationCommand { get; }
@@ -1793,6 +1824,16 @@ public class OrphanedDirectoriesViewModel : ViewModelBase
     private const int DirectoryProbeParallelism = 16;
 
     /// <summary>
+    /// How many source paths the purge marks deleted per catalog call. This is a
+    /// PROGRESS-GRANULARITY knob, not a performance one: the work is identical
+    /// either way, but a single directory can carry hundreds of thousands of
+    /// paths, and reporting only between directories is what made the purge sit
+    /// on one unchanging count for days. 512 keeps the reporting gap far below
+    /// the 500 ms throttle while adding one statement prepare per chunk.
+    /// </summary>
+    private const int PurgePathChunkSize = 512;
+
+    /// <summary>
     /// One directory's probe result.
     /// <list type="bullet">
     /// <item><c>Skip</c> - the directory could not be read, so nothing about it
@@ -2143,6 +2184,37 @@ public class OrphanedDirectoriesViewModel : ViewModelBase
     // Purge
     // ------------------------------------------------------------------
 
+    /// <summary>
+    /// Ask the running purge to stop.  What that costs depends on which half it
+    /// is in, and the two are deliberately different:
+    ///
+    /// <para><b>Catalog phase</b> — everything happens inside one transaction,
+    /// so cancelling throws out of the loop, <c>tx.Complete()</c> is never
+    /// reached and the whole thing rolls back. Nothing changed, and nothing on
+    /// the destination was touched: physical deletion has not started yet.</para>
+    ///
+    /// <para><b>Deletion phase</b> — the catalog has already committed, so this
+    /// cannot undo anything. It stops where it stands; files not yet deleted
+    /// keep their tombstoned rows and reappear under "catalog-deleted files" on
+    /// the next destination scan. The summary says so rather than reporting a
+    /// clean result.</para>
+    ///
+    /// <para>Before this existed the only way out of a long purge was to close
+    /// the application — which did roll the transaction back, but discarded the
+    /// work with no way to say "stop" and keep what had been done. A real
+    /// cleanup ran for two days that way.</para>
+    /// </summary>
+    private void CancelPurge()
+    {
+        if (_purgeCts is not { IsCancellationRequested: false }) return;
+        _purgeCts.Cancel();
+        // Say it immediately: cancellation lands on the next per-path check, and
+        // on a slow catalog that can still be a moment away. A button that grays
+        // out with no other change reads as "did that do anything?".
+        PurgeStatusText = "Cancelling...";
+        SummaryText = "Cancelling...";
+    }
+
     private async void PurgeSelected()
     {
         // Selected items live on the tree leaves; each leaf node keeps the
@@ -2179,6 +2251,10 @@ public class OrphanedDirectoriesViewModel : ViewModelBase
             LastCleanupResultText = $"Last cleanup at {DateTime.Now:HH:mm:ss}: {msg}";
             return;
         }
+
+        _purgeCts?.Dispose();
+        _purgeCts = new CancellationTokenSource();
+        var ct = _purgeCts.Token;
 
         IsPurging = true;
         SummaryText = "Purging...";
@@ -2241,28 +2317,65 @@ public class OrphanedDirectoriesViewModel : ViewModelBase
                 var progressSw = System.Diagnostics.Stopwatch.StartNew();
                 long lastProgressMs = -ProgressUpdateIntervalMs;
 
+                // Count the thing the user is waiting on (design.md, "Long phases
+                // must name what they are doing").  A work item is a DIRECTORY,
+                // but the cost is per CATALOG ROW, and one directory can carry
+                // hundreds of thousands of them.  Counting directories made the
+                // purge sit on a single unchanging "97,059/97,187" for days while
+                // it ground through one item's path list — indistinguishable from
+                // a freeze, and the second time this exact illusion has been
+                // reported.  So the denominator is rows, and the counter advances
+                // inside the per-path work, not just between items.
+                long totalUnits = 0;
+                foreach (var w in workItems)
+                {
+                    if (w.Reason is OrphanedReason.UntrackedFile
+                                  or OrphanedReason.CatalogDeleted)
+                        continue;
+                    if ((w.Reason == OrphanedReason.ExcessVersion
+                         || w.Reason == OrphanedReason.CatalogDuplicate)
+                        && w.ExcessVersionRecords is not null)
+                        totalUnits += w.ExcessVersionRecords.Count;
+                    else if (w.MatchingSourcePaths is not null)
+                        totalUnits += w.MatchingSourcePaths.Count;
+                    else
+                        totalUnits += 1;   // recursive-prefix fallback: one statement
+                }
+                long doneUnits = 0;
+
+                // Emit a throttled progress line.  `force` is for the final
+                // report, which must always land so the user sees a true N/N.
+                // An empty dirName drops the trailing ": " rather than printing
+                // a dangling separator, and a zero total reports 100% instead of
+                // dividing by it — a purge of nothing is complete, not 1/1.
+                void ReportUnits(string dirName, bool force = false)
+                {
+                    long nowMs = progressSw.ElapsedMilliseconds;
+                    if (!force && nowMs - lastProgressMs < ProgressUpdateIntervalMs)
+                        return;
+                    lastProgressMs = nowMs;
+                    int pct = totalUnits <= 0 ? 100 : (int)(doneUnits * 100L / totalUnits);
+                    string suffix = string.IsNullOrEmpty(dirName) ? "" : $": {dirName}";
+                    ((IProgress<Services.ProgressReport>)progress).Report(
+                        $"Updating catalog {doneUnits:N0}/{totalUnits:N0} ({pct}%){suffix}");
+                }
+
                 // -- 1. Catalog updates inside a single transaction. --
-                var tx = _catalog.BeginTransactionAsync(backupSetId).GetAwaiter().GetResult();
+                var tx = _catalog.BeginTransactionAsync(backupSetId, ct).GetAwaiter().GetResult();
                 try
                 {
                     for (int i = 0; i < workItems.Count; i++)
                     {
-                        var wi = workItems[i];
+                        // Throwing here is the point: tx.Complete() is never
+                        // reached, so the transaction rolls back and the purge
+                        // leaves the catalog exactly as it found it.  Nothing on
+                        // the destination has been touched yet either — physical
+                        // deletion is phase 2, strictly after this commits.
+                        ct.ThrowIfCancellationRequested();
 
-                        long nowMs = progressSw.ElapsedMilliseconds;
-                        // Always report the very last item so the user sees
-                        // a final "N/N" before the disk-delete phase takes
-                        // over; throttle every intermediate update.
-                        if (nowMs - lastProgressMs >= ProgressUpdateIntervalMs
-                            || i == workItems.Count - 1)
-                        {
-                            lastProgressMs = nowMs;
-                            var dirName = Path.GetFileName(wi.DirectoryPath.TrimEnd('\\'));
-                            int pct = workItems.Count == 0
-                                ? 100 : (int)((i + 1) * 100L / workItems.Count);
-                            ((IProgress<Services.ProgressReport>)progress).Report(
-                                $"Updating catalog {i + 1:N0}/{workItems.Count:N0} ({pct}%): {dirName}");
-                        }
+                        var wi = workItems[i];
+                        var dirName = Path.GetFileName(wi.DirectoryPath.TrimEnd('\\'));
+                        ReportUnits(dirName);
 
                         if (wi.Reason is OrphanedReason.UntrackedFile)
                         {
@@ -2283,11 +2396,31 @@ public class OrphanedDirectoriesViewModel : ViewModelBase
                              || wi.Reason == OrphanedReason.CatalogDuplicate)
                             && wi.ExcessVersionRecords is not null)
                         {
-                            foreach (var record in wi.ExcessVersionRecords)
+                            // Tombstone by row id, NOT via UpdateFileRecordAsync.
+                            // These records come from the classifier, which loads
+                            // five columns per row; the whole-row update would
+                            // write back defaults for everything else — zeroing
+                            // Hash, Version and the storage flags that tell restore
+                            // how to read each file. It failed loudly instead
+                            // ("disc 0 has no owning set") only because DiscId = 0
+                            // cannot be routed to a set, which is the single reason
+                            // this was a broken cleanup and not a corrupted catalog.
+                            var records = wi.ExcessVersionRecords;
+                            for (int off = 0; off < records.Count; off += PurgePathChunkSize)
                             {
-                                record.IsDeleted = true;
-                                _catalog.UpdateFileRecordAsync(record).GetAwaiter().GetResult();
-                                catPurged++;
+                                int len = Math.Min(PurgePathChunkSize, records.Count - off);
+                                var ids = new List<long>(len);
+                                for (int k = off; k < off + len; k++)
+                                {
+                                    ids.Add(records[k].Id);
+                                    // Keep the in-memory copy consistent with the row.
+                                    records[k].IsDeleted = true;
+                                }
+
+                                catPurged += _catalog.MarkFileRecordsDeletedByIdsAsync(
+                                    backupSetId, ids, ct).GetAwaiter().GetResult();
+                                doneUnits += len;
+                                ReportUnits(dirName);
                             }
                         }
                         else if (wi.MatchingSourcePaths is not null)
@@ -2297,8 +2430,24 @@ public class OrphanedDirectoriesViewModel : ViewModelBase
                             // path list, which is the only way the catalog write
                             // can be guaranteed to match what the user saw and
                             // ticked.
-                            catPurged += _catalog.MarkFilesDeletedBySourcePathsAsync(
-                                backupSetId, wi.MatchingSourcePaths).GetAwaiter().GetResult();
+                            //
+                            // Chunked purely so progress can move WITHIN one
+                            // directory: a single item can hold hundreds of
+                            // thousands of paths, and reporting only between
+                            // items is what made this look hung.  The call is
+                            // already re-entrant inside the open transaction
+                            // (it is invoked once per work item today), so the
+                            // extra calls cost one statement prepare per chunk.
+                            var paths = wi.MatchingSourcePaths;
+                            for (int off = 0; off < paths.Count; off += PurgePathChunkSize)
+                            {
+                                int len = Math.Min(PurgePathChunkSize, paths.Count - off);
+                                catPurged += _catalog.MarkFilesDeletedBySourcePathsAsync(
+                                    backupSetId, paths.GetRange(off, len), ct)
+                                    .GetAwaiter().GetResult();
+                                doneUnits += len;
+                                ReportUnits(dirName);
+                            }
                         }
                         else
                         {
@@ -2313,9 +2462,17 @@ public class OrphanedDirectoriesViewModel : ViewModelBase
                             // than silently doing nothing. If you add a category,
                             // give it MatchingSourcePaths.
                             catPurged += _catalog.MarkFilesDeletedByDirectoryAsync(
-                                backupSetId, wi.DirectoryPath).GetAwaiter().GetResult();
+                                backupSetId, wi.DirectoryPath, ct).GetAwaiter().GetResult();
+                            doneUnits++;
+                            ReportUnits(dirName);
                         }
                     }
+
+                    // Force a final true N/N before the disk-delete phase takes
+                    // over, so the catalog phase never ends mid-throttle on a
+                    // stale number.
+                    doneUnits = totalUnits;
+                    ReportUnits(string.Empty, force: true);
 
                     tx.Complete();
                 }
@@ -2338,9 +2495,13 @@ public class OrphanedDirectoriesViewModel : ViewModelBase
                                  .SelectMany(w => w.DiscFilePaths!),
                         StringComparer.OrdinalIgnoreCase);
 
+                    // Cooperative, not throwing: the catalog transaction above
+                    // has already committed, so a cancel here must still report
+                    // what it managed to delete rather than unwinding into the
+                    // catch and losing the counts.
                     var (deleted, delFailed, delBytes, delAbsent) =
                         Services.DestinationFilePurger.DeleteFilesAndSweep(
-                            targetDir, allDiscPaths, progress);
+                            targetDir, allDiscPaths, progress, ct);
                     fDeleted += deleted;
                     fFailed += delFailed;
                     bytes += delBytes;
@@ -2402,6 +2563,18 @@ public class OrphanedDirectoriesViewModel : ViewModelBase
                 + (summary.Count > 1 ? ", " + string.Join(", ", summary.Skip(1)) : "")
                 + $". {Items.Count} item{(Items.Count == 1 ? "" : "s")} remaining.";
 
+            // Reaching here with the token tripped means the cancel landed in
+            // the DELETION phase — the catalog had already committed, so this
+            // is a partial result, not a clean one, and saying "cleaned N files"
+            // without qualification would misrepresent it. The files that were
+            // not reached still carry tombstoned catalog rows and come back as
+            // "catalog-deleted files" on the next destination scan.
+            if (ct.IsCancellationRequested)
+                composed = "Cancelled part-way. " + composed
+                    + " Backed-up files not yet deleted are still on the"
+                    + " destination and will appear under \"catalog-deleted"
+                    + " files\" the next time you scan it.";
+
             SummaryText = composed;
 
             // Stamp the persistent result line with a timestamp so users
@@ -2409,6 +2582,20 @@ public class OrphanedDirectoriesViewModel : ViewModelBase
             // later and run other actions in the meantime.
             LastCleanupResultText =
                 $"Last cleanup at {DateTime.Now:HH:mm:ss}: {composed}";
+        }
+        catch (OperationCanceledException)
+        {
+            // Cancelled during the CATALOG phase. tx.Complete() was never
+            // reached, so the transaction rolled back: no catalog row changed
+            // and no destination file was touched (deletion is phase 2). Say
+            // that plainly — "cancelled" on its own invites the user to wonder
+            // whether they have been left half-cleaned.
+            const string msg =
+                "Cleanup cancelled — nothing was changed. The catalog update runs "
+                + "in a single transaction, so it rolled back in full, and no "
+                + "backed-up files were deleted.";
+            SummaryText = msg;
+            LastCleanupResultText = $"Last cleanup at {DateTime.Now:HH:mm:ss}: {msg}";
         }
         catch (Exception ex)
         {
@@ -2420,6 +2607,8 @@ public class OrphanedDirectoriesViewModel : ViewModelBase
         {
             PurgeStatusText = "";
             IsPurging = false;
+            _purgeCts?.Dispose();
+            _purgeCts = null;
         }
     }
 

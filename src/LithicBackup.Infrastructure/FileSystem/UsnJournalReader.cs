@@ -25,6 +25,22 @@ public readonly record struct UsnChange(string FullPath, uint Reason, bool IsDir
 /// <param name="IsDirectory">Whether the moved item is a directory.</param>
 public readonly record struct UsnMove(string OldPath, string NewPath, bool IsDirectory);
 
+/// <summary>Outcome of <see cref="UsnJournalReader.TryEnsureMinimumSize"/>.</summary>
+public enum JournalResizeResult
+{
+    /// <summary>Already at or above the requested size; nothing was changed.</summary>
+    AlreadyLargeEnough,
+
+    /// <summary>The journal was grown to the requested size.</summary>
+    Enlarged,
+
+    /// <summary>The caller lacks volume write access (not admin / LocalSystem).</summary>
+    NotPermitted,
+
+    /// <summary>The volume refused the change for some other reason.</summary>
+    Failed,
+}
+
 /// <summary>
 /// Reads change records from a single NTFS volume's USN change journal.
 /// </summary>
@@ -106,18 +122,26 @@ public sealed class UsnJournalReader : IDisposable
 
         try
         {
-            if (!TryQueryJournal(handle, out long journalId, out long nextUsn))
+            // The 4-arg overload, so MaximumSize is populated from the moment the
+            // reader exists. With the 2-arg one it stayed 0 until something called
+            // TryEnsureMinimumSize, which made the "enlarged from N MB" log line
+            // report a 32 MB journal as "from 0 MB" — the one number that line
+            // exists to show.
+            if (!TryQueryJournal(handle, out long journalId, out long nextUsn, out long maxSize))
             {
                 // Journal may simply not be active yet — try to create it.
                 if (!TryCreateJournal(handle) ||
-                    !TryQueryJournal(handle, out journalId, out nextUsn))
+                    !TryQueryJournal(handle, out journalId, out nextUsn, out maxSize))
                 {
                     handle.Dispose();
                     return null;
                 }
             }
 
-            return new UsnJournalReader(handle, volumeId, journalId, nextUsn);
+            return new UsnJournalReader(handle, volumeId, journalId, nextUsn)
+            {
+                MaximumSize = maxSize,
+            };
         }
         catch
         {
@@ -363,11 +387,19 @@ public sealed class UsnJournalReader : IDisposable
         => TryQueryJournal(_volume, out journalId, out nextUsn);
 
     private static bool TryQueryJournal(SafeFileHandle handle, out long journalId, out long nextUsn)
+        => TryQueryJournal(handle, out journalId, out nextUsn, out _);
+
+    private static bool TryQueryJournal(
+        SafeFileHandle handle, out long journalId, out long nextUsn, out long maximumSize)
     {
         journalId = 0;
         nextUsn = 0;
+        maximumSize = 0;
 
-        var outBuffer = new byte[64]; // USN_JOURNAL_DATA_V0 is 56 bytes
+        // USN_JOURNAL_DATA_V0 (56 bytes):
+        //   0 UsnJournalID | 8 FirstUsn | 16 NextUsn | 24 LowestValidUsn
+        //  32 MaxUsn       | 40 MaximumSize          | 48 AllocationDelta
+        var outBuffer = new byte[64];
         if (!DeviceIoControl(handle, FSCTL_QUERY_USN_JOURNAL,
                 null, 0, outBuffer, outBuffer.Length, out int bytesReturned, IntPtr.Zero)
             || bytesReturned < 24)
@@ -375,16 +407,106 @@ public sealed class UsnJournalReader : IDisposable
             return false;
         }
 
-        journalId = BitConverter.ToInt64(outBuffer, 0);  // UsnJournalID
-        nextUsn = BitConverter.ToInt64(outBuffer, 16);   // NextUsn
+        return TryParseJournalData(
+            outBuffer, bytesReturned, out journalId, out nextUsn, out maximumSize);
+    }
+
+    /// <summary>
+    /// Decode a <c>USN_JOURNAL_DATA_V0</c> buffer.
+    ///
+    /// <para>Public so it can be tested directly: reading the raw volume needs
+    /// administrator rights, so the field offsets — the part with a real failure
+    /// mode — would otherwise only ever be exercised inside the service, where a
+    /// wrong one shows up not as an error but as a plausible wrong number.</para>
+    ///
+    /// <para>Layout (56 bytes):
+    /// <c>0</c> UsnJournalID, <c>8</c> FirstUsn, <c>16</c> NextUsn,
+    /// <c>24</c> LowestValidUsn, <c>32</c> MaxUsn, <c>40</c> MaximumSize,
+    /// <c>48</c> AllocationDelta.</para>
+    /// </summary>
+    public static bool TryParseJournalData(
+        ReadOnlySpan<byte> buffer, int bytesReturned,
+        out long journalId, out long nextUsn, out long maximumSize)
+    {
+        journalId = 0;
+        nextUsn = 0;
+        maximumSize = 0;
+
+        if (bytesReturned < 24 || buffer.Length < 24)
+            return false;
+
+        journalId = BitConverter.ToInt64(buffer[..8]);
+        nextUsn = BitConverter.ToInt64(buffer.Slice(16, 8));
+
+        // MaximumSize needs the full V0 record; older/short replies just leave it 0.
+        if (bytesReturned >= 48 && buffer.Length >= 48)
+            maximumSize = BitConverter.ToInt64(buffer.Slice(40, 8));
+
         return true;
     }
 
+    /// <summary>The journal's configured maximum size in bytes, 0 if unknown.</summary>
+    public long MaximumSize { get; private set; }
+
+    /// <summary>
+    /// Grow this volume's USN journal to at least <paramref name="minimumBytes"/>.
+    ///
+    /// <para><b>Why this exists.</b> Windows' default journal is 32 MB, which on a
+    /// busy volume retains only a few hundred thousand records — hours, not days.
+    /// Whenever the worker cannot read the journal for longer than that (a long
+    /// full scan, a service outage, a backup blocked on a lock) the journal wraps,
+    /// the records are destroyed, and the only recovery is a whole-tree rescan.
+    /// The author's machine logged 214 of those in two months on three volumes
+    /// that were all still at the 32 MB default.</para>
+    ///
+    /// <para><b>It only ever grows.</b> The journal is shared with other consumers
+    /// (Windows Search, replication, other backup tools) and shrinking it would
+    /// destroy history they rely on. Enlarging is safe for everyone.</para>
+    ///
+    /// <para>Applied through <c>FSCTL_CREATE_USN_JOURNAL</c>, which on an existing
+    /// journal <i>modifies</i> MaximumSize/AllocationDelta and leaves the journal
+    /// and its <c>UsnJournalID</c> intact — so this does not itself cause the
+    /// continuity loss it exists to prevent. Callers should log the id either side
+    /// to keep that honest.</para>
+    ///
+    /// <para>Needs write access to the volume, i.e. administrator or LocalSystem.
+    /// Unprivileged callers simply get <see cref="JournalResizeResult.NotPermitted"/>;
+    /// it is never fatal, the journal just stays small.</para>
+    /// </summary>
+    public JournalResizeResult TryEnsureMinimumSize(long minimumBytes, long allocationDelta)
+    {
+        if (!TryQueryJournal(_volume, out _, out _, out long current))
+            return JournalResizeResult.Failed;
+
+        MaximumSize = current;
+
+        if (current >= minimumBytes)
+            return JournalResizeResult.AlreadyLargeEnough;
+
+        if (!TryCreateJournal(_volume, minimumBytes, allocationDelta))
+        {
+            return Marshal.GetLastWin32Error() == ERROR_ACCESS_DENIED
+                ? JournalResizeResult.NotPermitted
+                : JournalResizeResult.Failed;
+        }
+
+        if (TryQueryJournal(_volume, out _, out _, out long updated))
+            MaximumSize = updated;
+
+        return JournalResizeResult.Enlarged;
+    }
+
     private static bool TryCreateJournal(SafeFileHandle handle)
+        => TryCreateJournal(handle, 0, 0);
+
+    private static bool TryCreateJournal(
+        SafeFileHandle handle, long maximumSize, long allocationDelta)
     {
         // CREATE_USN_JOURNAL_DATA { DWORDLONG MaximumSize; DWORDLONG AllocationDelta; }
         // Zeros request system defaults.
         var input = new byte[16];
+        BitConverter.GetBytes(maximumSize).CopyTo(input, 0);
+        BitConverter.GetBytes(allocationDelta).CopyTo(input, 8);
         return DeviceIoControl(handle, FSCTL_CREATE_USN_JOURNAL,
             input, input.Length, null, 0, out _, IntPtr.Zero);
     }
@@ -414,6 +536,7 @@ public sealed class UsnJournalReader : IDisposable
 
     /// <summary>The requested start USN has been purged from the journal (it wrapped).</summary>
     private const int ERROR_JOURNAL_ENTRY_DELETED = 1181;
+    private const int ERROR_ACCESS_DENIED = 5;
 
     /// <summary>
     /// USN reason flag meaning the file or directory was newly created. Exposed

@@ -74,6 +74,15 @@ CREATE TABLE IF NOT EXISTS DeduplicationBlocks (
     DiscId              INTEGER NOT NULL DEFAULT 0
 );
 
+-- Discs lookups by owning set.  The master schema (001_InitialSchema) has always
+-- indexed this column; the index was simply never carried across when the catalog
+-- was split into master + per-set databases, so every `WHERE BackupSetId = ?`
+-- against a set database fell back to a full table scan.  On a real 66,470-disc
+-- set that is ~10 MB re-read per query, and the purge issued one such query PER
+-- SOURCE PATH — see the "Cleanup purge scanned the Discs table once per path"
+-- entry in known-issues.md.
+CREATE INDEX IF NOT EXISTS IX_Discs_BackupSetId ON Discs(BackupSetId);
+
 CREATE INDEX IF NOT EXISTS IX_Files_DiscId ON Files(DiscId);
 CREATE INDEX IF NOT EXISTS IX_Files_SourcePath ON Files(SourcePath);
 CREATE INDEX IF NOT EXISTS IX_FileChunks_FileRecordId ON FileChunks(FileRecordId);

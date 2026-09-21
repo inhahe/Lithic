@@ -69,6 +69,29 @@ the backup engine skip that whole directory unconditionally — the databases ar
 open for writing by the running process, so backing them up both wastes space and
 fails on file locks.
 
+### A trimmed projection must not reach a whole-row writer
+
+`GetActiveFilesForClassificationAsync` loads five columns per row so Cleanup's
+scan can hold millions of them in memory. `UpdateFileRecordAsync` writes
+thirteen. Feed the first into the second and every column the reader skipped is
+silently overwritten with a default: `Hash` blanked, the
+IsZipped/IsSplit/IsDeduped/IsFileRef flags cleared — those are how restore knows
+a file's storage form — and `Version` set to 1, because `FileRecord.Version`
+defaults to 1 rather than 0 and so reads as plausible instead of empty.
+
+Cleanup's purge did exactly this. It never corrupted anything only because
+`DiscId` defaults to 0 and file writes route to a set database via the disc's
+owner, so disc 0 threw before any SQL ran. That is luck, not design — the visible
+symptom was a cleanup that always failed, and the invisible one would have been a
+catalog quietly rewritten.
+
+**Either return a type the whole-row writer cannot accept, or give the caller a
+column-specific write.** The purge only ever meant "tombstone these rows", so it
+now calls `MarkFileRecordsDeletedByIdsAsync`, which sets `IsDeleted` by id and
+touches nothing else. Trimming a read is a local optimisation with a non-local
+blast radius: the question is never "does this caller read the column", it is
+"does anything downstream write it back".
+
 ### The catalog is a master plus one database per set
 
 `catalog.db` is a small **master**: `BackupSets`, `DiscOwners` (which set owns
@@ -100,6 +123,27 @@ And a UI rule, because this stayed invisible for several attempts: **a delete
 that fails must say so in a dialog.** The user confirmed a permanent, destructive
 action in a modal dialog; answering Yes and watching the set reappear, with the
 only explanation on a status line, reads as "delete is broken".
+
+**Inside a set database, express "rows owned by this set" as a correlated
+`EXISTS`, never as `DiscId IN (SELECT Id FROM Discs WHERE BackupSetId = ?)`.**
+The IN-form reads like a cheap filter and is not one: SQLite materialises it into
+a LIST SUBQUERY plus a bloom filter, which is a full `SCAN Discs` on *every
+execution of the statement*. A cleanup running one such statement per source path
+spent two days at 58 MB/s of reads against 0.2 MB/s of writes without finishing.
+`Discs.Id` is `INTEGER PRIMARY KEY`, so `EXISTS (SELECT 1 FROM Discs d WHERE
+d.Id = Files.DiscId AND d.BackupSetId = $setId)` is one rowid seek per candidate
+row — measured **772x** faster — and it leaves the planner free to drive off
+`SourcePath` rather than `DiscId`. Ordinary joins (`INNER JOIN Discs d ON
+f.DiscId = d.Id`) were always fine; they resolve through the same rowid. Only the
+IN-form is the trap.
+
+Every disc in `set-<id>.db` does belong to that set, so the predicate is in
+practice a tautology — **keep it anyway.** The invariant is relied on for *speed*,
+never for *correctness*: enforced per row, a stray foreign disc row cannot widen
+an `UPDATE`. And note that `IX_Discs_BackupSetId` — which the per-set schema was
+missing although the master always had it — buys only **1.25x** on its own,
+because the IN-form still materialises every id. It is worth having for genuine
+`WHERE BackupSetId = ?` lookups; it is not a substitute for the rewrite.
 
 The two caches are **derived state and must always be treated as such**: any
 entry may be missing, stale, or wrong-but-validatable, and the code must recompute
@@ -146,6 +190,22 @@ alphabetical prefix forever. Targeted cleanup is the user-driven compaction.
 **Size gates must measure used bytes, not file bytes.** SQLite never shrinks a
 file on delete (freed pages go to the freelist), so `page_count` alone as a loop
 condition never terminates. Use `page_count - freelist_count`.
+
+### A control belongs beside what it changes, and absent when there is nothing to change
+
+Cleanup's "Categories per row" sat at the top of the page, above the scan
+buttons. It was therefore the first thing visible on opening Cleanup — offering
+to arrange results that did not exist yet — and once results did arrive it was
+separated from them by the entire action grid. It now docks immediately above the
+category cards and is hidden until there is at least one.
+
+The trap in implementing that: `Categories` is populated by **two independent
+paths** — the catalog scan builds its categories off-thread and assigns them
+straight onto the collection, while the purge and edit paths go through
+`RebuildCategories`. A `HasCategories` notification raised at one mutation site
+would have left the control hidden after the *scan*, which is the case that
+matters. Drive that kind of flag off `ObservableCollection.CollectionChanged`
+rather than from each call site: a third path is easy to add and easy to forget.
 
 ### Never widen a selection to "repair" a tristate
 
@@ -216,6 +276,15 @@ Three rules came out of it, and they generalise to any phase here:
   worker without a lock (a reference store is atomic; which thread wins does not
   matter) and shown by the UI timer. A phase that genuinely does stall then names
   the path it stalled on, instead of leaving a number to be interpreted.
+
+**The same illusion came back in the purge**, which is why this is stated as an
+invariant and not a one-off fix. `PurgeSelected` counted *work items*
+(directories) while the cost is per *catalog row*; one directory carrying
+hundreds of thousands of paths pinned the display at `97,059/97,187` for two days
+with no way to show movement inside it. The denominator is now rows and the
+counter advances inside the per-path work (chunked at `PurgePathChunkSize`), not
+only between items. When adding a phase, ask what the **unit of cost** is and
+count that — the unit of iteration usually is not it.
 
 ### Probe and classify in one pass, one directory per work item
 
@@ -293,6 +362,36 @@ every directory beneath it. Two separate payoffs, worth keeping straight:
 **Known limitation:** a cached recursive total is validated only against the
 directory's *own* mtime, which does not change when a file deep inside a
 descendant grows. Totals can therefore lag until the scheduler recomputes.
+
+**A row has two halves, written by different passes, and they need separate
+validity stamps.** `DirLastWriteUtc` validates the direct-file figures;
+`FilteredDirLastWriteUtc` validates the filtered recursive totals. Conflating
+them is not a tidiness question — it produced a cache that could never hit. The
+filtered walk does not measure the direct-file figures, so when it created a row
+it stamped `DirLastWriteUtc` with `DateTime.MinValue`, which no
+`stamp >= currentLastWrite` test can ever satisfy, and every later write
+preserved that MinValue. On the real cache **814,458 of 2,515,306 rows (32.4%)**
+were inert, re-enumerated in full on every pass forever. Stamping the *real*
+mtime there would have been just as wrong the other way: it would validate direct
+sizes that pass never measured. If you add a third kind of total, give it its own
+stamp.
+
+Stamp from the mtime read **before** the walk, never after. An mtime read
+afterwards is newer than the data it describes, so a directory modified during
+the walk produces a row that validates and serves a stale total indefinitely.
+Reading first is self-correcting: the stamp is merely too old, so the next pass
+recomputes.
+
+**A background job needs an owner and a way to stop.** `SizeComputeScheduler` is
+per-editor and is disposed from `dialog.Closed`. It had no token, no stop
+condition and no `IDisposable`, so closing the editor left a full-volume
+enumeration running against a window that no longer existed — its worker's
+closures rooting the entire node tree — and each reopen added another scheduler
+over the same cache file. One was found still walking after two days. The token
+is checked **inside the recursive walk**, not merely between queue items: one
+walk of a large volume is hours on its own. And a cancelled scheduler must clear
+its queues and refuse to restart, because `EnsureWorkerRunning` deliberately
+restarts on the empty-queue race and will otherwise resurrect the worker forever.
 
 ## Cleanup's results are resizable in three ways, and the reason matters
 
@@ -640,6 +739,56 @@ destination scan's catalog-deleted category.
 not, for months. **When adding an operation that pairs a catalog write with a
 destination write, the guard goes at the top of the operation, not inside the
 destination half.**
+
+## Continuous backup and full scans interleave; they do not run concurrently
+
+The Worker is **one sequential poll loop** — `CheckSchedules` → `CheckContinuous`
+→ sleep — so `await RunFullBackupAsync(...)` parks every other kind of backup for
+the scan's whole duration. Measured on the author's machine: full scans average
+62–110 minutes and have reached **17.8 hours**, and across the twelve longest of
+them exactly **zero** continuous backups fired.
+
+Keep it sequential. Two runs on one set race on version numbering, disc
+allocation and dedup refcounts, and the per-set `.writelock` prevents SQLite
+corruption without preventing any of those. What a long run must not do is *stop
+the world*, and the fix for that is a yield point, not a thread:
+
+* **`ExecuteAsync` exposes a commit-boundary hook.** Its periodic commit is the
+  one moment in a long run when the catalog is committed and no transaction,
+  per-set gate or cross-process lock is held, so a caller can safely do its own
+  catalog work there. The scan is *paused* at a safe point, never raced.
+* **The hook must be told what the run owns.** `versionInfo` is resolved once,
+  before the copy loop, so anything that writes one of the run's paths from
+  inside the hook leaves it assigning a version computed from a stale snapshot.
+  The handler receives `pathsThisRunWillWrite` and stays off them. A *different*
+  set is fine — its own database, its own snapshot.
+* **Hook the time-bounded commit only**, not the pre-large-file flush: a run that
+  hits many large files in a row would otherwise call the handler in a tight loop.
+* **Some work does not belong at a commit boundary at all.** Scheduling another
+  scan, or rewriting the set's selection, is recorded and handed to the next poll.
+
+**A long scan used to invalidate the journal it was running to repair.** Nothing
+read the USN journal while a scan held the loop, and a 32 MB journal on a busy
+volume does not survive hours — so the scan ended, the wrap was detected, and
+another full scan was scheduled. The commit-boundary drain breaks that loop, and
+the Worker now grows undersized journals to 512 MB (only ever growing: the journal
+is shared with Windows Search and others, and shrinking destroys their history).
+
+**"Did not run" and "ran but some files failed" are different answers.** Collapsing
+them into a bool is what silently discarded the failed files' queued deltas, whose
+journal records had already been consumed and whose cursor had already advanced.
+Only a clean scan supersedes the queue. But the reconcile flag is cleared whenever
+the scan *ran*, failures included — leaving it set starts another whole-tree scan
+on the next poll, and one permanently unreadable file then loops forever. Failed
+files are recovered by keeping their queued deltas, which costs one targeted retry.
+
+**Continuous sets still need a periodic whole-tree scan.** They were given none,
+on the reasoning that the journal reports everything. It does not: a plain
+single-file delete is skipped by `ExecuteTargetedAsync`, a file that failed is
+dropped after its retry, and a journal that silently stops advancing looks exactly
+like "nothing changed". Time it from the last **full scan**, never from the last
+run — every targeted continuous backup bumps the latter, so the busiest sets would
+be the ones that never qualified.
 
 ## Threading rules that bite
 

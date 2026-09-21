@@ -556,6 +556,15 @@ internal sealed class SqliteSetDatabase : IDisposable
         // did .Where(!IsDeleted) on the result, so both the tombstones and every
         // 64-character Hash were materialised and held for the whole scan.
         //
+        // WARNING: the FileRecords returned here are PARTIAL. DiscId, Hash,
+        // Version, SourceLastWriteUtc and the IsZipped/IsSplit/IsDeduped/IsFileRef
+        // flags are all left at their defaults. Never hand one to
+        // UpdateFileRecordAsync — that rewrites every column, so it would zero the
+        // storage flags that tell restore how to read the file's bytes. Cleanup's
+        // purge did exactly that; it was caught only because DiscId = 0 fails the
+        // disc-to-set routing before any write happens. Use
+        // MarkFileRecordsDeletedByIdsAsync, or re-read the row in full first.
+        //
         // ORDER BY is load-bearing, not cosmetic: callers depend on rows for one
         // directory being contiguous and versions of one path being adjacent.
         cmd.CommandText = """
@@ -1356,12 +1365,34 @@ internal sealed class SqliteSetDatabase : IDisposable
 
         var prefix = directoryPrefix.TrimEnd('\\') + "\\";
 
+        // "Rows owned by this set" is spelled as a CORRELATED EXISTS, never as
+        // `DiscId IN (SELECT Id FROM Discs WHERE BackupSetId = $setId)`.  The
+        // IN-form reads as a cheap filter and is not one: SQLite materialises the
+        // subquery into a LIST SUBQUERY + bloom filter, which costs a full SCAN of
+        // Discs on EVERY execution of the statement.  On a real 66,470-disc set
+        // that is ~10 MB of 4 KB page reads per execution, and the two callers
+        // below run one execution PER SOURCE PATH inside a single transaction —
+        // a cleanup was measured sustaining 58 MB/s of reads against 0.2 MB/s of
+        // writes for two days without finishing.
+        //
+        // Worse, the IN-form gave the planner a DiscId equality to drive off, so
+        // this statement chose IX_Files_Active_Disc_Path (DiscId=?) and walked
+        // every disc's files applying the LIKE as a filter, instead of doing a
+        // SourcePath range scan.
+        //
+        // Discs.Id is INTEGER PRIMARY KEY (= the rowid), so the correlated form is
+        // one integer-key seek per candidate row and leaves the planner free to
+        // drive off SourcePath.  It is NOT equivalent to deleting the predicate:
+        // the ownership check is still enforced per row, so a stray foreign disc
+        // row could never widen the UPDATE.  See the "Cleanup purge scanned the
+        // Discs table once per path" entry in known-issues.md.
         using var cmd = _connection.CreateCommand();
         cmd.CommandText = """
             UPDATE Files SET IsDeleted = 1
             WHERE IsDeleted = 0
-              AND DiscId IN (SELECT Id FROM Discs WHERE BackupSetId = $setId)
               AND (SourcePath LIKE $prefix ESCAPE '\' OR SourcePath = $exact COLLATE NOCASE)
+              AND EXISTS (SELECT 1 FROM Discs d
+                          WHERE d.Id = Files.DiscId AND d.BackupSetId = $setId)
             """;
         cmd.Parameters.AddWithValue("$setId", backupSetId);
         // Escape the escape character (backslash) FIRST — Windows source paths
@@ -1390,8 +1421,9 @@ internal sealed class SqliteSetDatabase : IDisposable
         cmd.CommandText = """
             UPDATE Files SET IsDeleted = 1
             WHERE IsDeleted = 0
-              AND DiscId IN (SELECT Id FROM Discs WHERE BackupSetId = $setId)
               AND SourcePath = $path COLLATE NOCASE
+              AND EXISTS (SELECT 1 FROM Discs d
+                          WHERE d.Id = Files.DiscId AND d.BackupSetId = $setId)
             """;
         cmd.Parameters.AddWithValue("$setId", backupSetId);
         var pathParam = cmd.Parameters.AddWithValue("$path", "");
@@ -1405,6 +1437,54 @@ internal sealed class SqliteSetDatabase : IDisposable
         return totalRows;
     }
 
+    /// <summary>
+    /// Tombstone rows by id, touching only <c>IsDeleted</c>.
+    ///
+    /// <para>No Discs ownership predicate here, and deliberately: <c>Files.Id</c> is
+    /// this database's own primary key, so "belongs to this set" is established by
+    /// which database the call was routed to, not by anything the statement could
+    /// check. (Ids are per-database AUTOINCREMENT, so an id from another set is not
+    /// a foreign row here — it is a different, valid row. The guard against that is
+    /// the caller passing its own set's ids, which is why this takes the set id at
+    /// all.)</para>
+    /// </summary>
+    public async Task<int> MarkFileRecordsDeletedByIdsAsync(
+        int backupSetId, IReadOnlyList<long> fileIds, CancellationToken ct = default)
+    {
+        ct.ThrowIfCancellationRequested();
+        if (fileIds.Count == 0)
+            return 0;
+
+        using var _ = await WriteLockAsync(ct).ConfigureAwait(false);
+
+        // Chunked to stay clear of SQLite's bound-variable ceiling.
+        const int ChunkSize = 500;
+        int total = 0;
+
+        for (int offset = 0; offset < fileIds.Count; offset += ChunkSize)
+        {
+            ct.ThrowIfCancellationRequested();
+
+            int len = Math.Min(ChunkSize, fileIds.Count - offset);
+            using var cmd = _connection.CreateCommand();
+
+            var names = new string[len];
+            for (int i = 0; i < len; i++)
+            {
+                names[i] = "$id" + i;
+                cmd.Parameters.AddWithValue(names[i], fileIds[offset + i]);
+            }
+
+            cmd.CommandText =
+                "UPDATE Files SET IsDeleted = 1 WHERE IsDeleted = 0 AND Id IN ("
+                + string.Join(",", names) + ")";
+
+            total += cmd.ExecuteNonQuery();
+        }
+
+        return total;
+    }
+
     public async Task<int> CountFilesUnderSourcePrefixAsync(
         int backupSetId, string sourcePrefix, CancellationToken ct = default)
     {
@@ -1416,8 +1496,9 @@ internal sealed class SqliteSetDatabase : IDisposable
         using var cmd = _connection.CreateCommand();
         cmd.CommandText = """
             SELECT COUNT(*) FROM Files
-            WHERE DiscId IN (SELECT Id FROM Discs WHERE BackupSetId = $setId)
-              AND SourcePath LIKE $prefix ESCAPE '\'
+            WHERE SourcePath LIKE $prefix ESCAPE '\'
+              AND EXISTS (SELECT 1 FROM Discs d
+                          WHERE d.Id = Files.DiscId AND d.BackupSetId = $setId)
             """;
         cmd.Parameters.AddWithValue("$setId", backupSetId);
         cmd.Parameters.AddWithValue("$prefix", EscapeLikePrefix(prefix) + "%");
@@ -1441,8 +1522,9 @@ internal sealed class SqliteSetDatabase : IDisposable
         cmd.CommandText = """
             UPDATE Files
             SET SourcePath = $new || SUBSTR(SourcePath, $prefixLen + 1)
-            WHERE DiscId IN (SELECT Id FROM Discs WHERE BackupSetId = $setId)
-              AND SourcePath LIKE $prefix ESCAPE '\'
+            WHERE SourcePath LIKE $prefix ESCAPE '\'
+              AND EXISTS (SELECT 1 FROM Discs d
+                          WHERE d.Id = Files.DiscId AND d.BackupSetId = $setId)
             """;
         cmd.Parameters.AddWithValue("$setId", backupSetId);
         cmd.Parameters.AddWithValue("$new", newP);

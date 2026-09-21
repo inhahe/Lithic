@@ -14,13 +14,25 @@ namespace LithicBackup.ViewModels;
 /// user-triggered expansions cut ahead of the background scan with at most
 /// one directory of latency.
 /// </remarks>
-public sealed class SizeComputeScheduler
+public sealed class SizeComputeScheduler : IDisposable
 {
     private readonly object _lock = new();
     private readonly LinkedList<WorkItem> _priorityQueue = new();
     private readonly LinkedList<WorkItem> _backgroundQueue = new();
     private bool _workerRunning;
     private readonly DirectorySizeCache _cache = new();
+
+    /// <summary>
+    /// Stops the worker, and every recursive walk inside it, when the owning
+    /// editor closes.  Nothing used to: the scheduler had no token, no stop
+    /// condition and no <see cref="IDisposable"/>, and the worker task plus its
+    /// closures rooted the whole node tree, so closing the backup-set editor
+    /// left a full-volume enumeration running against a window nobody could see
+    /// — and reopening the editor started a SECOND scheduler over the same cache
+    /// file. One was measured still walking after two days.
+    /// </summary>
+    private readonly CancellationTokenSource _cts = new();
+    private bool _disposed;
 
     /// <summary>
     /// When set, the scheduler computes both unfiltered and filtered sizes
@@ -146,6 +158,9 @@ public sealed class SizeComputeScheduler
 
     private void EnsureWorkerRunning()
     {
+        if (_cts.IsCancellationRequested)
+            return;
+
         bool shouldStart;
         lock (_lock)
         {
@@ -179,6 +194,9 @@ public sealed class SizeComputeScheduler
 
             while (true)
             {
+                if (_cts.IsCancellationRequested)
+                    break;
+
                 WorkItem item;
                 lock (_lock)
                 {
@@ -235,7 +253,7 @@ public sealed class SizeComputeScheduler
                     {
                         // Full recursive computation (uses persistent cache).
                         (size, fileCount) = SourceSelectionNodeViewModel.ComputeDirectorySize(
-                            dirInfo, _cache, item.ExcludeFilter);
+                            dirInfo, _cache, item.ExcludeFilter, _cts.Token);
                     }
 
                     // When an exclusion filter is active, compute the
@@ -247,7 +265,7 @@ public sealed class SizeComputeScheduler
                         {
                             (filteredSize, filteredFileCount) =
                                 SourceSelectionNodeViewModel.ComputeDirectorySizeFilteredCached(
-                                    dirInfo, gf!, _cache, sig);
+                                    dirInfo, gf!, _cache, sig, _cts.Token);
                         }
                         else
                         {
@@ -297,11 +315,28 @@ public sealed class SizeComputeScheduler
             // Clear the flag and restart if items arrived between the
             // empty-queue check and here (race with EnqueueAsync).
             bool restartNeeded;
+            bool releaseCache;
             lock (_lock)
             {
                 _workerRunning = false;
-                restartNeeded = _priorityQueue.Count > 0 || _backgroundQueue.Count > 0;
+                // Cancelled: drop whatever is still queued and do NOT restart.
+                // EnsureWorkerRunning restarts on a race with EnqueueAsync, so
+                // without this the worker resurrects itself indefinitely.
+                if (_cts.IsCancellationRequested)
+                {
+                    _priorityQueue.Clear();
+                    _backgroundQueue.Clear();
+                }
+                restartNeeded = !_cts.IsCancellationRequested
+                    && (_priorityQueue.Count > 0 || _backgroundQueue.Count > 0);
+
+                // Dispose() ran while this worker was mid-walk, so it left the
+                // cache to us rather than closing it underneath the walk.
+                releaseCache = _disposed;
             }
+
+            if (releaseCache)
+                ReleaseCache();
 
             if (restartNeeded)
                 EnsureWorkerRunning();
@@ -353,4 +388,45 @@ public sealed class SizeComputeScheduler
         Action OnComplete,
         Func<string, bool>? ExcludeFilter,
         IProgress<string>? Progress);
+
+    /// <summary>
+    /// Stop the worker and release the cache.  Called when the owning editor
+    /// closes.  The in-flight walk unwinds on the next cancellation check —
+    /// every recursion level tests the token — and the worker's finally block
+    /// flushes whatever sizes it had already computed, so a cancelled pass still
+    /// keeps its work rather than discarding it.
+    /// </summary>
+    public void Dispose()
+    {
+        bool workerActive;
+        lock (_lock)
+        {
+            if (_disposed) return;
+            _disposed = true;
+            _priorityQueue.Clear();
+            _backgroundQueue.Clear();
+            workerActive = _workerRunning;
+        }
+
+        try { _cts.Cancel(); } catch { }
+
+        // Whoever finishes last releases the cache. A running worker is still
+        // inside a walk that reads and writes it, so closing the SQLite
+        // connection here would race that walk and throw away the final flush —
+        // sizes that cost a full re-enumeration to recreate. When a worker is
+        // running it releases the cache in its own finally instead.
+        if (!workerActive)
+            ReleaseCache();
+    }
+
+    /// <summary>
+    /// Flush and close the size cache. Called exactly once, by whichever of
+    /// <see cref="Dispose"/> or the worker's finally block is last to finish.
+    /// </summary>
+    private void ReleaseCache()
+    {
+        try { _cache.Flush(); } catch { }
+        try { _cache.Dispose(); } catch { }
+        try { _cts.Dispose(); } catch { }
+    }
 }

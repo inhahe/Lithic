@@ -716,6 +716,13 @@ public class MainViewModel : ViewModelBase
             // Stop any background PlanAsync scan.
             autoCheckCts?.Cancel();
 
+            // Stop this editor's directory-size scheduler. Nothing did, so its
+            // worker carried on enumerating whole volumes against a closed
+            // window — one was found still going after two days — while its
+            // closures kept the entire node tree alive and every reopen added
+            // another scheduler over the same cache file.
+            sourceSelection.Dispose();
+
             if (_unsavedNewSetId is int unsavedId)
             {
                 // User closed without saving a new set — discard the

@@ -74,9 +74,18 @@ internal static class DestinationFilePurger
     /// verified the destination is present can still treat a nonzero count as
     /// benign (the file was cleaned by an earlier pass).</para>
     /// </returns>
+    /// <param name="ct">
+    /// Cancellation for the deletion pass.  Honoured COOPERATIVELY — the loop
+    /// breaks and the method returns the counts collected so far rather than
+    /// throwing.  That is deliberate: by the time this runs the catalog
+    /// transaction has already committed, so the caller must still be able to
+    /// report what was actually deleted.  Files not yet reached keep their
+    /// (deleted) catalog rows and resurface as "catalog-deleted files" on the
+    /// next destination scan, which is an already-supported state.
+    /// </param>
     public static (int FilesDeleted, int Failures, long BytesFreed, int AlreadyAbsent) DeleteFilesAndSweep(
         string targetDir, IReadOnlyCollection<string> discRelPaths,
-        IProgress<ProgressReport>? progress)
+        IProgress<ProgressReport>? progress, CancellationToken ct = default)
     {
         int filesDeleted = 0;
         int failures = 0;
@@ -91,6 +100,8 @@ internal static class DestinationFilePurger
         int total = discRelPaths.Count;
         foreach (var discRel in discRelPaths)
         {
+            if (ct.IsCancellationRequested) break;
+
             idx++;
             long nowMs = sw.ElapsedMilliseconds;
             if (progress is not null
@@ -141,16 +152,25 @@ internal static class DestinationFilePurger
         // throttled live counter rather than a single static message — without
         // it the UI sits on "Cleaning up empty directories..." looking frozen
         // for the entire sweep.
-        progress?.Report("Cleaning up empty directories...");
-        try
+        // Skipped entirely when cancelled: the sweep is a tidy-up, and walking
+        // the whole destination tree is exactly the kind of long unresponsive
+        // tail a user who just pressed Cancel is trying to get away from.
+        if (!ct.IsCancellationRequested)
         {
-            var sweep = new SweepProgress(progress, sw);
-            foreach (var subDir in new DirectoryInfo(targetDir).EnumerateDirectories())
-                CleanEmptyDirectories(subDir, sweep);
-        }
-        catch
-        {
-            // Best-effort — don't fail the whole purge over this.
+            progress?.Report("Cleaning up empty directories...");
+            try
+            {
+                var sweep = new SweepProgress(progress, sw);
+                foreach (var subDir in new DirectoryInfo(targetDir).EnumerateDirectories())
+                {
+                    if (ct.IsCancellationRequested) break;
+                    CleanEmptyDirectories(subDir, sweep, ct);
+                }
+            }
+            catch
+            {
+                // Best-effort — don't fail the whole purge over this.
+            }
         }
 
         return (filesDeleted, failures, bytesFreed, alreadyAbsent);
@@ -162,17 +182,22 @@ internal static class DestinationFilePurger
     /// removed even when they momentarily appear empty.
     /// </summary>
     public static void CleanEmptyDirectories(DirectoryInfo dir)
-        => CleanEmptyDirectories(dir, null);
+        => CleanEmptyDirectories(dir, null, default);
 
     /// <summary>
     /// Recursive worker for <see cref="CleanEmptyDirectories(DirectoryInfo)"/>,
     /// threading an optional <see cref="SweepProgress"/> so large sweeps can
-    /// report how many directories they've scanned so far.
+    /// report how many directories they've scanned so far.  Cancellation stops
+    /// the walk where it stands; a half-finished sweep is harmless, since the
+    /// only thing it does is remove directories that are already empty.
     /// </summary>
-    private static void CleanEmptyDirectories(DirectoryInfo dir, SweepProgress? sweep)
+    private static void CleanEmptyDirectories(
+        DirectoryInfo dir, SweepProgress? sweep, CancellationToken ct)
     {
         try
         {
+            if (ct.IsCancellationRequested) return;
+
             if (dir.Name.Equals("_blocks", StringComparison.OrdinalIgnoreCase) ||
                 dir.Name.Equals("_filestore", StringComparison.OrdinalIgnoreCase))
                 return;
@@ -180,7 +205,12 @@ internal static class DestinationFilePurger
             sweep?.Tick();
 
             foreach (var subDir in dir.EnumerateDirectories())
-                CleanEmptyDirectories(subDir, sweep);
+            {
+                if (ct.IsCancellationRequested) return;
+                CleanEmptyDirectories(subDir, sweep, ct);
+            }
+
+            if (ct.IsCancellationRequested) return;
 
             if (!dir.EnumerateFileSystemInfos().Any())
                 dir.Delete();

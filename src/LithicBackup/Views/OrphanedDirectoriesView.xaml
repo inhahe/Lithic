@@ -328,29 +328,6 @@
                            TextWrapping="Wrap" FontSize="12" />
             </Border>
 
-            <!-- Category layout: fewer columns = wider cards = readable paths in
-                 deep trees. Persisted via UserSettings.CleanupCategoryColumns. -->
-            <StackPanel Orientation="Horizontal" Margin="0,10,0,0"
-                        HorizontalAlignment="Right"
-                        VerticalAlignment="Center">
-                <TextBlock Text="Categories per row:"
-                           Foreground="{StaticResource TextSecondaryBrush}"
-                           FontSize="11"
-                           VerticalAlignment="Center"
-                           Margin="0,0,6,0" />
-                <RadioButton Content="1" GroupName="CleanupCols"
-                             IsChecked="{Binding IsOneColumn, Mode=TwoWay}"
-                             VerticalAlignment="Center" Margin="0,0,6,0"
-                             ToolTip="One category per row — widest tree, best for deep paths." />
-                <RadioButton Content="2" GroupName="CleanupCols"
-                             IsChecked="{Binding IsTwoColumn, Mode=TwoWay}"
-                             VerticalAlignment="Center" Margin="0,0,6,0" />
-                <RadioButton Content="3" GroupName="CleanupCols"
-                             IsChecked="{Binding IsThreeColumn, Mode=TwoWay}"
-                             VerticalAlignment="Center"
-                             ToolTip="Three per row — most categories visible at once." />
-            </StackPanel>
-
             <!-- Scan / maintenance actions laid out as a uniform 2×2 grid so
                  every card is the same width and height regardless of content.
                  The two destination-dependent cards (Reconcile, Scan
@@ -503,6 +480,14 @@
                 <StackPanel Orientation="Horizontal" HorizontalAlignment="Right">
                     <Button Content="Close" Command="{Binding CloseCommand}"
                             Padding="16,8" Margin="0,0,8,0" Cursor="Hand" />
+                    <!-- Only present while a purge is running. A large cleanup
+                         can take a long time, and before this existed the only
+                         way to stop one was to close the application. -->
+                    <Button Content="Cancel"
+                            Command="{Binding CancelPurgeCommand}"
+                            Visibility="{Binding IsPurging, Converter={StaticResource BoolToVis}}"
+                            Padding="16,8" Margin="0,0,8,0" Cursor="Hand"
+                            ToolTip="Stop the cleanup. During the catalog update nothing is changed at all — it runs in one transaction and rolls back. Once it has moved on to deleting files, the files already deleted stay deleted and the rest are left for a later cleanup." />
                     <Button Style="{StaticResource PrimaryButton}"
                             Content="Clean Selected"
                             Command="{Binding PurgeSelectedCommand}"
@@ -510,6 +495,39 @@
                 </StackPanel>
             </DockPanel>
         </DockPanel>
+
+        <!-- Category layout: fewer columns = wider cards = readable paths in
+             deep trees. Persisted via UserSettings.CleanupCategoryColumns.
+
+             Docked immediately above the cards it lays out, and hidden until
+             there are some. It used to sit at the top of the page, above the
+             scan buttons: it was the first thing visible on opening Cleanup,
+             offering to arrange results that did not exist yet, and once they
+             did it was separated from them by the whole action grid. A control
+             should be adjacent to what it changes, and absent when there is
+             nothing to change. -->
+        <StackPanel DockPanel.Dock="Top"
+                    Orientation="Horizontal" Margin="0,0,0,6"
+                    HorizontalAlignment="Right"
+                    VerticalAlignment="Center"
+                    Visibility="{Binding HasCategories, Converter={StaticResource BoolToVis}}">
+            <TextBlock Text="Categories per row:"
+                       Foreground="{StaticResource TextSecondaryBrush}"
+                       FontSize="11"
+                       VerticalAlignment="Center"
+                       Margin="0,0,6,0" />
+            <RadioButton Content="1" GroupName="CleanupCols"
+                         IsChecked="{Binding IsOneColumn, Mode=TwoWay}"
+                         VerticalAlignment="Center" Margin="0,0,6,0"
+                         ToolTip="One category per row — widest tree, best for deep paths." />
+            <RadioButton Content="2" GroupName="CleanupCols"
+                         IsChecked="{Binding IsTwoColumn, Mode=TwoWay}"
+                         VerticalAlignment="Center" Margin="0,0,6,0" />
+            <RadioButton Content="3" GroupName="CleanupCols"
+                         IsChecked="{Binding IsThreeColumn, Mode=TwoWay}"
+                         VerticalAlignment="Center"
+                         ToolTip="Three per row — most categories visible at once." />
+        </StackPanel>
 
         <!-- Category cards laid out as a 3-column wrapping grid -->
         <ScrollViewer VerticalScrollBarVisibility="Auto"

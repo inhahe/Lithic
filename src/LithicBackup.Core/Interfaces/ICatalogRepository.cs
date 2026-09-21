@@ -330,6 +330,27 @@ public interface ICatalogRepository : IDisposable
     /// </summary>
     Task<int> MarkFilesDeletedBySourcePathsAsync(int backupSetId, IEnumerable<string> sourcePaths, CancellationToken ct = default);
 
+    /// <summary>
+    /// Mark specific file rows deleted <b>by row id</b>, without touching any
+    /// other column.
+    ///
+    /// <para>Exists because <see cref="UpdateFileRecordAsync"/> rewrites the whole
+    /// row — DiscId, Hash, Version and the IsZipped/IsSplit/IsDeduped/IsFileRef
+    /// storage flags included — so passing it a record that was not read in full
+    /// silently overwrites everything the reader did not load. Cleanup's
+    /// classifier deliberately loads five columns per row for memory reasons, and
+    /// routing its records through the whole-row update is a corruption waiting to
+    /// happen. Callers that only mean "tombstone these rows" must say exactly
+    /// that.</para>
+    ///
+    /// <para>Ids are the primary key of the set's own database, so
+    /// <paramref name="backupSetId"/> selects the database rather than filtering
+    /// within it.</para>
+    /// </summary>
+    /// <returns>How many rows changed (rows already deleted are not counted).</returns>
+    Task<int> MarkFileRecordsDeletedByIdsAsync(
+        int backupSetId, IReadOnlyList<long> fileIds, CancellationToken ct = default);
+
     // --- Source drive remap ---
 
     /// <summary>

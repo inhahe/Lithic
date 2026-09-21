@@ -6,6 +6,26 @@ namespace LithicBackup.Core.Interfaces;
 public delegate Task<FailureDecision> FailureCallback(
     string filePath, string error, BackupErrorCategory category);
 
+/// <summary>
+/// Invoked at a backup's periodic commit boundary — the only moment during a
+/// long run when the catalog is fully committed and no transaction, per-set gate
+/// or cross-process write lock is held. Lets a caller interleave its own catalog
+/// work into a scan that would otherwise monopolise the set for hours.
+/// </summary>
+/// <param name="pathsThisRunWillWrite">
+/// Every source path the running backup intends to write. The handler <b>must
+/// not</b> back up any of these: the run resolved their version numbers from a
+/// single snapshot taken before its copy loop began, so writing one here would
+/// leave it assigning a version computed from stale information.
+/// </param>
+/// <remarks>
+/// Runs inline, so the backup is paused for its duration — keep the work short
+/// and self-throttled. Exceptions other than cancellation are swallowed by the
+/// caller: this is opportunistic side work and must never fail a backup.
+/// </remarks>
+public delegate Task CommitBoundaryHandler(
+    IReadOnlySet<string> pathsThisRunWillWrite, CancellationToken ct);
+
 /// <summary>The user's decision for a file failure.</summary>
 public class FailureDecision
 {

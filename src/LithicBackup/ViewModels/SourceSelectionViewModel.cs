@@ -21,7 +21,7 @@ public enum SortColumn { Name, Size }
 /// backup-set-level settings (name, destination, exclusions, dedup,
 /// retention tiers).
 /// </summary>
-public class SourceSelectionViewModel : ViewModelBase
+public class SourceSelectionViewModel : ViewModelBase, IDisposable
 {
     private bool _hasSelection;
     private bool _updatingAllAutoInclude;
@@ -56,6 +56,15 @@ public class SourceSelectionViewModel : ViewModelBase
     private string _scheduleMaxWaitSeconds = "300";
     private string _schedulePollSeconds = "30";
     private readonly SizeComputeScheduler _scheduler = new();
+
+    /// <summary>
+    /// Stop this editor's background size computation.  Must be called when the
+    /// editor window closes: the scheduler owns a worker task whose closures
+    /// root this whole view-model and its node tree, so without this it keeps
+    /// walking the filesystem — and holding the tree alive — for a window that
+    /// no longer exists, and the next editor opens a second scheduler beside it.
+    /// </summary>
+    public void Dispose() => _scheduler.Dispose();
     private Dictionary<string, FileVersionInfo>? _catalogInfo;
     private readonly List<DriveData>? _preloadedDrives;
     private bool _showLargestFiles;

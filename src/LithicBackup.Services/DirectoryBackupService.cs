@@ -121,7 +121,8 @@ public class DirectoryBackupService
         ManualResetEventSlim? pauseEvent = null,
         FailureCallback? onFailure = null,
         BackupDiff? precomputedDiff = null,
-        bool scopeRetentionToBackedUpFiles = false)
+        bool scopeRetentionToBackedUpFiles = false,
+        CommitBoundaryHandler? onCommitBoundary = null)
     {
         BackupDiff diff;
         if (precomputedDiff is not null)
@@ -195,6 +196,12 @@ public class DirectoryBackupService
         // actually being written. See the "Worker pegged a CPU core" entry in
         // known-issues.md.
         var lookupPaths = filesToBackup.Select(f => f.FullPath).ToList();
+
+        // Handed to onCommitBoundary so it can stay off the paths this run owns.
+        // Built from the same list the version lookup below uses, so the two can
+        // never disagree about what this run is going to write.
+        IReadOnlySet<string> pathsThisRunWillWrite =
+            lookupPaths.ToHashSet(StringComparer.OrdinalIgnoreCase);
         var versionInfo = job.BackupSetId.HasValue
             ? await _catalog.GetLatestVersionInfoForPathsAsync(backupSetId, lookupPaths, ct)
             : new Dictionary<string, FileVersionInfo>(StringComparer.OrdinalIgnoreCase);
@@ -1324,6 +1331,43 @@ public class DirectoryBackupService
                 await _catalog.UpdateDiscAsync(discRecord, ct);
                 tx.Complete();
                 tx.Dispose();
+
+                // --- the one point in a long run where NO transaction is open ---
+                //
+                // Everything so far is committed and both the per-set gate and the
+                // cross-process write lock are released, so the caller can safely do
+                // its own catalog work here. The Worker uses it to drain the USN
+                // journal, which otherwise goes unread for the scan's whole
+                // duration: a 32 MB journal on a busy volume does not survive a
+                // multi-hour backup, and once it wraps those changes are gone and
+                // the next poll reports "continuity lost" — the very failure the
+                // scan was running to repair.
+                //
+                // The handler is given the paths THIS run will write and must not
+                // touch them. `versionInfo` is resolved once, before the copy loop,
+                // so a write to one of those paths from in here would leave this run
+                // assigning a version number computed from a now-stale snapshot.
+                //
+                // Deliberately hooked on the batch/interval commit only, not on the
+                // pre-large-file flush above: this one is time-bounded
+                // (CommitIntervalSeconds), so the handler cannot be called in a tight
+                // loop by a run that happens to hit many large files in a row.
+                if (onCommitBoundary is not null)
+                {
+                    try
+                    {
+                        await onCommitBoundary(pathsThisRunWillWrite, ct);
+                    }
+                    catch (OperationCanceledException) when (ct.IsCancellationRequested)
+                    {
+                        throw;
+                    }
+                    catch
+                    {
+                        // Opportunistic side work — never fail the backup over it.
+                    }
+                }
+
                 tx = await _catalog.BeginTransactionAsync(backupSetId, ct);
                 batchCount = 0;
                 commitTimer.Restart();

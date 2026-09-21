@@ -333,6 +333,11 @@ public sealed class BackupWorker : BackgroundService
                 {
                     BackupSet = set,
                     LastRunUtc = set.LastBackupUtc ?? DateTime.MinValue,
+                    // Persisted across restarts. Falling back to LastBackupUtc
+                    // (rather than MinValue) keeps a fresh install from running a
+                    // whole-tree scan the moment the service first starts.
+                    LastFullScanUtc = FullScanStamp.Read(set.Id)
+                                      ?? set.LastBackupUtc ?? DateTime.MinValue,
                 };
                 _sets[set.Id] = state;
             }
@@ -391,11 +396,62 @@ public sealed class BackupWorker : BackgroundService
             {
                 ScheduleMode.Interval => ShouldRunInterval(state, schedule, now),
                 ScheduleMode.Daily => ShouldRunDaily(state, schedule, now),
-                _ => false, // Continuous handled separately.
+                // Continuous sets get their per-file work from the journal in
+                // CheckContinuousAsync; this is only the safety net below.
+                ScheduleMode.Continuous => ShouldRunContinuousSafetyNet(state, now),
+                _ => false,
             };
 
             if (shouldRun)
                 await RunFullBackupAsync(state, ct);
+        }
+    }
+
+    /// <summary>
+    /// How long a continuous set may go without a whole-tree scan before one is
+    /// run as a safety net.
+    /// </summary>
+    private const double ContinuousSafetyNetHours = 24;
+
+    /// <summary>
+    /// Continuous sets were given no periodic full scan at all, on the reasoning
+    /// that the USN journal reports everything. It does not, and three gaps had
+    /// no other closer:
+    ///
+    /// <list type="bullet">
+    /// <item>A plain single-file delete is skipped by <c>ExecuteTargetedAsync</c>
+    /// (it <c>continue</c>s on a missing path) and Cleanup only surfaces a record
+    /// when the whole parent directory is gone — so a deleted file whose parent
+    /// survives stayed an active catalog row indefinitely.</item>
+    /// <item>A file that failed to copy is dropped from the pending queue after
+    /// one retry; nothing revisits it.</item>
+    /// <item>A journal that silently stops advancing (a stale reader handle, say)
+    /// looks exactly like "nothing changed", forever.</item>
+    /// </list>
+    ///
+    /// <para>Timed from <see cref="SetState.LastFullScanUtc"/>, not
+    /// <c>LastRunUtc</c>: every targeted continuous backup bumps the latter, so a
+    /// busy set would never qualify.</para>
+    /// </summary>
+    private static bool ShouldRunContinuousSafetyNet(SetState state, DateTime now)
+        => (now - state.LastFullScanUtc).TotalHours >= ContinuousSafetyNetHours;
+
+    /// <summary>
+    /// Record that a whole-tree scan just finished, in memory and on disk.
+    /// Persistence failure is logged and ignored: the only cost is that a service
+    /// restart forgets the timer and schedules the next safety-net scan early.
+    /// </summary>
+    private void MarkFullScanCompleted(SetState state)
+    {
+        var now = DateTime.UtcNow;
+        state.LastFullScanUtc = now;
+
+        if (!FullScanStamp.Write(state.BackupSet.Id, now))
+        {
+            _logger.LogDebug(
+                "Could not persist the full-scan stamp for set {Id}; the safety-net "
+                + "scan will be scheduled from this process's start instead.",
+                state.BackupSet.Id);
         }
     }
 
@@ -600,13 +656,18 @@ public sealed class BackupWorker : BackgroundService
             .Distinct()
             .ToList();
 
-        var truncatedDrives = new HashSet<char>();
+        // Anything a commit-boundary drain noticed while a full scan was running.
+        // It could not act on these itself (scheduling a scan or rewriting the
+        // selection from inside a backup), so it parked them here.
+        var truncatedDrives = new HashSet<char>(_drainTruncatedDrives);
+        _drainTruncatedDrives.Clear();
 
         // Newly-created directories that are included via a parent's auto-include
         // rule but aren't yet explicit selections. Collected during change routing
         // and pinned into their sets afterwards (see MaterializeDiscoveredDirectoriesAsync)
         // so their membership persists past the user turning auto-include off.
-        var discoveredDirs = new List<(SetState State, string Dir)>();
+        var discoveredDirs = new List<(SetState State, string Dir)>(_drainDiscoveredDirs);
+        _drainDiscoveredDirs.Clear();
 
         // [rename-trace] Running totals for the once-per-poll summary below.
         int traceTotalChanges = 0, traceTotalMoves = 0;
@@ -748,13 +809,39 @@ public sealed class BackupWorker : BackgroundService
             if (!state.NeedsReconcile)
                 continue;
 
-            if (await RunFullBackupAsync(state, ct))
+            var outcome = await RunFullBackupAsync(state, ct);
+            if (outcome == ReconcileOutcome.DidNotRun)
+                continue;   // lock busy / destination offline — retry next poll
+
+            // Cleared as soon as the scan RAN, even if files failed. Leaving it
+            // set would start another whole-tree scan on the very next poll, and
+            // for a set with a permanently unreadable file (a locked venv binary,
+            // say — this machine has ~78 of them) that is an endless full-scan
+            // loop. The failed files are covered by keeping their queued deltas
+            // below, which costs one cheap targeted retry instead.
+            state.NeedsReconcile = false;
+
+            if (outcome == ReconcileOutcome.RanClean)
             {
-                state.NeedsReconcile = false;
+                // Only a CLEAN scan supersedes the queued per-file deltas. It
+                // walked the whole tree and compared every file, so those paths
+                // are accounted for.
                 state.Pending.Clear();
                 // A full scan reconciles the destination against the live source
                 // tree, so any queued relocations are already accounted for.
                 state.PendingMoves.Clear();
+            }
+            else
+            {
+                // Partial scan: the failed files' catalog rows still hold their
+                // OLD size/mtime, so the next debounce pass re-stats them, sees
+                // the difference and retries just those. Clearing here dropped
+                // them for good — the journal records that produced them were
+                // consumed and the cursor advanced past them before the scan ran,
+                // so nothing else would ever have reported them again.
+                _logger.LogInformation(
+                    "Keeping {Count} queued change(s) for \"{Name}\": the reconciling scan "
+                    + "did not complete cleanly.", state.Pending.Count, state.BackupSet.Name);
             }
         }
 
@@ -778,36 +865,211 @@ public sealed class BackupWorker : BackgroundService
             if (state.NeedsReconcile || state.Pending.Count == 0)
                 continue;
 
-            var ready = new List<string>();
-
-            foreach (var (path, t) in state.Pending.ToList())
-            {
-                // Size-tiered debounce: a file is ready once it has been quiet for
-                // its size's window (bigger files demand more quiet, since a false
-                // trigger mid-write costs a larger wasted copy). Mask-tiered
-                // max-wait: an ever-changing file whose name/path opts in (logs,
-                // append-only session files) is versioned anyway after its cap;
-                // a file matching no max-wait tier has an infinite cap and is only
-                // copied once it settles via debounce.
-                long size = GetFileSizeSafe(path);
-                var debounceSeconds = _rules.ResolveDebounceSeconds(size);
-                int? maxWaitSeconds = _rules.ResolveMaxWaitSeconds(path);
-
-                var quiet = now - t.Last;
-                var waited = now - t.First;
-
-                bool isReady = quiet.TotalSeconds >= debounceSeconds
-                               || (maxWaitSeconds is int mw && waited.TotalSeconds >= mw);
-
-                if (isReady)
-                {
-                    ready.Add(path);
-                    state.Pending.Remove(path);
-                }
-            }
+            var ready = SelectReadyPaths(state, now);
 
             if (ready.Count > 0)
                 await RunTargetedBackupAsync(state, ready, ct);
+        }
+    }
+
+    /// <summary>
+    /// Take the pending paths whose debounce window has elapsed (or whose
+    /// max-wait cap has expired), removing them from the queue.
+    /// </summary>
+    /// <param name="excluded">
+    /// Paths to leave queued regardless of readiness. Used while a full scan is
+    /// running: that scan resolved its version numbers from a snapshot taken
+    /// before its copy loop, so writing one of its paths from anywhere else
+    /// would make it assign a stale version.
+    /// </param>
+    private List<string> SelectReadyPaths(
+        SetState state, DateTime now, IReadOnlySet<string>? excluded = null)
+    {
+        var ready = new List<string>();
+
+        foreach (var (path, t) in state.Pending.ToList())
+        {
+            if (excluded is not null && excluded.Contains(path))
+                continue;
+
+            // Size-tiered debounce: a file is ready once it has been quiet for
+            // its size's window (bigger files demand more quiet, since a false
+            // trigger mid-write costs a larger wasted copy). Mask-tiered
+            // max-wait: an ever-changing file whose name/path opts in (logs,
+            // append-only session files) is versioned anyway after its cap;
+            // a file matching no max-wait tier has an infinite cap and is only
+            // copied once it settles via debounce.
+            long size = GetFileSizeSafe(path);
+            var debounceSeconds = _rules.ResolveDebounceSeconds(size);
+            int? maxWaitSeconds = _rules.ResolveMaxWaitSeconds(path);
+
+            var quiet = now - t.Last;
+            var waited = now - t.First;
+
+            bool isReady = quiet.TotalSeconds >= debounceSeconds
+                           || (maxWaitSeconds is int mw && waited.TotalSeconds >= mw);
+
+            if (isReady)
+            {
+                ready.Add(path);
+                state.Pending.Remove(path);
+            }
+        }
+
+        return ready;
+    }
+
+    /// <summary>How often the journal may be drained from inside a full scan.</summary>
+    private const double FullScanDrainIntervalSeconds = 60;
+
+    /// <summary>
+    /// Upper bound on files backed up per drain, so one boundary cannot stall the
+    /// scan for long. Anything over the cap stays queued for the next boundary.
+    /// </summary>
+    private const int MaxDrainFilesPerBoundary = 200;
+
+    private DateTime _lastFullScanDrainUtc = DateTime.MinValue;
+
+    /// <summary>
+    /// Truncation and directory discoveries noticed by a drain, handed to the next
+    /// <see cref="CheckContinuousAsync"/>. A drain runs from inside a backup and
+    /// must not start another one or rewrite the selection, so it records these
+    /// and lets the normal poll act on them.
+    /// </summary>
+    private readonly HashSet<char> _drainTruncatedDrives = [];
+    private readonly List<(SetState State, string Dir)> _drainDiscoveredDirs = [];
+
+    /// <summary>
+    /// Called at the running backup's commit boundaries. Two jobs:
+    ///
+    /// <list type="number">
+    /// <item><b>Drain the journal.</b> A full scan parks the poll loop for its
+    /// whole duration - measured up to 17.8 hours on the author's machine - during
+    /// which nothing reads the USN journal. These volumes have the Windows-default
+    /// 32 MB journal, which a busy disk wraps in well under that, and a wrap
+    /// destroys the records: the next poll reports "continuity lost" and schedules
+    /// ANOTHER full scan. Reading here keeps the cursor moving so a long scan
+    /// cannot invalidate the very stream it exists to repair.</item>
+    /// <item><b>Back up what is ready</b>, so changes made during a multi-hour scan
+    /// are protected while it runs instead of waiting for it to finish.</item>
+    /// </list>
+    ///
+    /// <para>Safety rests on two things. It runs at a commit boundary, where the
+    /// catalog is committed and no transaction, gate or cross-process lock is held,
+    /// so it is sequential with the scan rather than concurrent. And it never
+    /// touches a path the scan intends to write, so it cannot race the version
+    /// numbers that scan resolved up front.</para>
+    /// </summary>
+    private async Task DrainJournalDuringFullScanAsync(
+        SetState scanningSet, IReadOnlySet<string> pathsTheScanWillWrite, CancellationToken ct)
+    {
+        var now = DateTime.UtcNow;
+        if ((now - _lastFullScanDrainUtc).TotalSeconds < FullScanDrainIntervalSeconds)
+            return;
+        _lastFullScanDrainUtc = now;
+
+        var continuousSets = _sets.Values
+            .Where(s => s.IsActive
+                        && s.BackupSet.JobOptions?.Schedule is { Mode: ScheduleMode.Continuous })
+            .ToList();
+
+        if (continuousSets.Count == 0)
+            return;
+
+        // (a) Read and route. Same routing as the poll loop, minus the actions a
+        //     drain must not take: directory materialisation rewrites the set's
+        //     selection, and a truncation must schedule a scan - neither belongs
+        //     inside a running backup, so both are deferred to the next poll.
+        var drives = continuousSets
+            .SelectMany(s => s.WatchRoots)
+            .Select(GetDriveLetter)
+            .Where(c => c != NoDrive)
+            .Distinct()
+            .ToList();
+
+        int routed = 0;
+
+        foreach (var drive in drives)
+        {
+            ct.ThrowIfCancellationRequested();
+
+            var (changes, moves, truncated) = await ReadVolumeChangesAsync(drive, ct);
+            if (truncated)
+                _drainTruncatedDrives.Add(drive);
+
+            foreach (var change in changes)
+            {
+                if (change.IsDirectory)
+                {
+                    bool created = (change.Reason & UsnJournalReader.UsnReasonFileCreate) != 0;
+                    if (created && Directory.Exists(change.FullPath))
+                    {
+                        foreach (var state in continuousSets)
+                        {
+                            if (PathBelongsToSet(state.BackupSet, change.FullPath))
+                                _drainDiscoveredDirs.Add((state, change.FullPath));
+                        }
+                    }
+                    continue;
+                }
+
+                foreach (var state in continuousSets)
+                {
+                    if (PathBelongsToSet(state.BackupSet, change.FullPath))
+                    {
+                        state.Pending[change.FullPath] =
+                            state.Pending.TryGetValue(change.FullPath, out var t)
+                                ? (t.First, now)
+                                : (now, now);
+                        routed++;
+                    }
+                }
+            }
+
+            foreach (var move in moves)
+            {
+                foreach (var state in continuousSets)
+                {
+                    bool oldIn = PathBelongsToSet(state.BackupSet, move.OldPath);
+                    bool newIn = PathBelongsToSet(state.BackupSet, move.NewPath);
+                    if (oldIn || newIn)
+                        state.PendingMoves.Add(move);
+                }
+            }
+        }
+
+        // (b) Back up what has settled. Moves are left for the poll loop:
+        //     relocating a destination copy while a scan is writing into the same
+        //     tree is the one thing here that could collide with it.
+        foreach (var state in continuousSets)
+        {
+            ct.ThrowIfCancellationRequested();
+
+            if (state.Pending.Count == 0)
+                continue;
+
+            // Only the set being scanned has paths that are off limits; a different
+            // set has its own catalog database and its own version snapshot.
+            var excluded = ReferenceEquals(state, scanningSet) ? pathsTheScanWillWrite : null;
+            var ready = SelectReadyPaths(state, now, excluded);
+            if (ready.Count == 0)
+                continue;
+
+            if (ready.Count > MaxDrainFilesPerBoundary)
+            {
+                foreach (var extra in ready.Skip(MaxDrainFilesPerBoundary))
+                    state.Pending.TryAdd(extra, (now, now));
+                ready = ready.Take(MaxDrainFilesPerBoundary).ToList();
+            }
+
+            _logger.LogInformation(
+                "Interleaved continuous backup for \"{Name}\" during a full scan: "
+                + "{Count} file(s); {Routed} new journal record(s) this drain.",
+                state.BackupSet.Name, ready.Count, routed);
+
+            // Calls the backup service directly: _backupLock is already held by the
+            // full scan we are running inside, and it is not reentrant.
+            await ExecuteTargetedPathsAsync(state, ready, ct);
         }
     }
 
@@ -817,6 +1079,65 @@ public sealed class BackupWorker : BackgroundService
     /// non-NTFS or inaccessible — and must use the FileSystemWatcher fallback).
     /// Callable only from the poll thread.
     /// </summary>
+    /// <summary>
+    /// Minimum USN journal size the worker wants on a watched volume, and the
+    /// allocation delta to grow it by.
+    ///
+    /// <para>Windows' default is 32 MB, which on a busy volume holds only a few
+    /// hundred thousand records. Any stretch where the journal goes unread for
+    /// longer than that destroys the records in the gap and forces a whole-tree
+    /// rescan: this machine logged 214 "continuity lost" events in two months,
+    /// all three volumes still at the default. 512 MB is ~16x the history for an
+    /// amount of disk no backup target would notice.</para>
+    /// </summary>
+    private const long DesiredJournalBytes = 512L * 1024 * 1024;
+    private const long DesiredJournalDeltaBytes = 64L * 1024 * 1024;
+
+    /// <summary>
+    /// Grow a volume's journal to <see cref="DesiredJournalBytes"/> if it is
+    /// smaller. Only ever enlarges, and logs the journal id either side: enlarging
+    /// is documented to preserve the existing journal, and the id is how we would
+    /// notice if it ever did not.
+    /// </summary>
+    private void EnsureJournalLargeEnough(char drive, UsnJournalReader reader)
+    {
+        long before = reader.MaximumSize;
+        long idBefore = reader.JournalId;
+
+        var outcome = reader.TryEnsureMinimumSize(
+            DesiredJournalBytes, DesiredJournalDeltaBytes);
+
+        switch (outcome)
+        {
+            case JournalResizeResult.Enlarged:
+                reader.TryRefreshPosition(out long idAfter, out _);
+                _logger.LogInformation(
+                    "Enlarged the USN journal on {Drive}: from {Before} MB to {After} MB so a long "
+                    + "backup or outage can no longer wrap it (journal id {IdBefore} -> {IdAfter}"
+                    + "{Note}).",
+                    drive,
+                    before / (1024 * 1024),
+                    reader.MaximumSize / (1024 * 1024),
+                    idBefore, idAfter,
+                    idBefore == idAfter ? ", unchanged as expected" : ", CHANGED — expect one reconciling scan");
+                break;
+
+            case JournalResizeResult.NotPermitted:
+                _logger.LogInformation(
+                    "USN journal on {Drive}: is {Before} MB and could not be enlarged (needs "
+                    + "administrator or LocalSystem). Continuous backup still works; a long "
+                    + "outage is just more likely to wrap it and force a full rescan.",
+                    drive, before / (1024 * 1024));
+                break;
+
+            case JournalResizeResult.Failed:
+                _logger.LogDebug(
+                    "Could not enlarge the USN journal on {Drive}: (currently {Before} MB).",
+                    drive, before / (1024 * 1024));
+                break;
+        }
+    }
+
     private UsnJournalReader? GetJournalReader(char drive)
     {
         if (!_journalReaders.TryGetValue(drive, out var reader))
@@ -829,6 +1150,10 @@ public sealed class BackupWorker : BackgroundService
                     "USN journal unavailable on {Drive}: — using file-system watcher fallback " +
                     "for this volume (live changes only; reconciled by full scan on restart).",
                     drive);
+            }
+            else
+            {
+                EnsureJournalLargeEnough(drive, reader);
             }
         }
 
@@ -1152,11 +1477,14 @@ public sealed class BackupWorker : BackgroundService
         catch { return 0; }
     }
 
+    /// <summary>"no drive letter" sentinel returned by <see cref="GetDriveLetter"/>.</summary>
+    private const char NoDrive = '\0';
+
     private static char GetDriveLetter(string path)
     {
         if (path.Length >= 2 && path[1] == ':' && char.IsLetter(path[0]))
             return char.ToUpperInvariant(path[0]);
-        return '\0';
+        return NoDrive;
     }
 
     /// <summary>
@@ -1189,6 +1517,29 @@ public sealed class BackupWorker : BackgroundService
             return;
         }
 
+        try
+        {
+            await ExecuteTargetedPathsAsync(state, paths, ct);
+        }
+        finally
+        {
+            _backupLock.Release();
+        }
+    }
+
+    /// <summary>
+    /// Back up exactly <paramref name="paths"/> for a set, <b>without</b> taking
+    /// <see cref="_backupLock"/>.
+    ///
+    /// <para>Split out from <see cref="RunTargetedBackupAsync"/> so the
+    /// commit-boundary drain can reuse it: that runs from inside a full scan which
+    /// already holds the lock, and <see cref="SemaphoreSlim"/> is not reentrant, so
+    /// going through the locking wrapper would silently requeue everything and do
+    /// nothing at all. Every other caller must use the wrapper.</para>
+    /// </summary>
+    private async Task ExecuteTargetedPathsAsync(
+        SetState state, IReadOnlyList<string> paths, CancellationToken ct)
+    {
         try
         {
             var set = state.BackupSet;
@@ -1243,10 +1594,6 @@ public sealed class BackupWorker : BackgroundService
         catch (Exception ex)
         {
             _logger.LogError(ex, "Continuous backup failed for \"{Name}\".", state.BackupSet.Name);
-        }
-        finally
-        {
-            _backupLock.Release();
         }
     }
 
@@ -1525,17 +1872,20 @@ public sealed class BackupWorker : BackgroundService
     /// <summary>
     /// Run a full scan-and-backup (scheduled interval/daily runs, and continuous
     /// reconciliation after a journal gap). Returns <c>true</c> when the scan
-    /// actually ran to completion, or <c>false</c> when it was skipped because a
-    /// backup was already in progress or the destination was not connected (so a
-    /// caller that needs the run to happen can retry later).
+    /// actually ran, and whether it reconciled cleanly.
+    ///
+    /// <para>The three-way result matters: "did not run" and "ran but some files
+    /// failed" used to be collapsed into the same <c>true</c>, which silently
+    /// discarded the failed files' queued deltas. See
+    /// <see cref="ReconcileOutcome"/>.</para>
     /// </summary>
-    private async Task<bool> RunFullBackupAsync(SetState state, CancellationToken ct)
+    private async Task<ReconcileOutcome> RunFullBackupAsync(SetState state, CancellationToken ct)
     {
         if (!await _backupLock.WaitAsync(0, ct))
         {
             _logger.LogInformation(
                 "Skipping backup for \"{Name}\" — another backup is in progress.", state.BackupSet.Name);
-            return false;
+            return ReconcileOutcome.DidNotRun;
         }
 
         try
@@ -1544,10 +1894,10 @@ public sealed class BackupWorker : BackgroundService
             var opts = set.JobOptions!;
             var targetDir = await ResolveDestinationAsync(set, opts, ct);
             if (targetDir is null)
-                return false; // Destination not connected; retry on a later run.
+                return ReconcileOutcome.DidNotRun; // Destination not connected; retry later.
 
             if (!await ResolveSourcesAsync(set, ct))
-                return false; // No source available; retry on a later run.
+                return ReconcileOutcome.DidNotRun; // No source available; retry later.
 
             _logger.LogInformation("Starting backup for \"{Name}\" → {Target}", set.Name, targetDir);
 
@@ -1559,7 +1909,8 @@ public sealed class BackupWorker : BackgroundService
             {
                 _logger.LogInformation("Nothing to back up for \"{Name}\".", set.Name);
                 state.LastRunUtc = DateTime.UtcNow;
-                return true;
+                MarkFullScanCompleted(state);
+                return ReconcileOutcome.RanClean;
             }
 
             _logger.LogInformation(
@@ -1572,7 +1923,9 @@ public sealed class BackupWorker : BackgroundService
                 : VersionRetentionService.DefaultTiers;
 
             var result = await _directoryBackup.ExecuteAsync(
-                job, targetDir, retentionTiers, progress: null, ct);
+                job, targetDir, retentionTiers, progress: null, ct,
+                onCommitBoundary: (excluded, innerCt) =>
+                    DrainJournalDuringFullScanAsync(state, excluded, innerCt));
 
             state.LastRunUtc = DateTime.UtcNow;
 
@@ -1595,17 +1948,20 @@ public sealed class BackupWorker : BackgroundService
                         "  … and {More} more failed file(s).", result.FailedFiles.Count - 10);
             }
 
-            return true;
+            MarkFullScanCompleted(state);
+            return result.Success
+                ? ReconcileOutcome.RanClean
+                : ReconcileOutcome.RanWithFailures;
         }
         catch (OperationCanceledException) when (ct.IsCancellationRequested)
         {
             _logger.LogInformation("Backup for \"{Name}\" cancelled.", state.BackupSet.Name);
-            return false;
+            return ReconcileOutcome.DidNotRun;
         }
         catch (Exception ex)
         {
             _logger.LogError(ex, "Backup failed for \"{Name}\".", state.BackupSet.Name);
-            return false;
+            return ReconcileOutcome.DidNotRun;
         }
         finally
         {
@@ -1689,5 +2045,34 @@ public sealed class BackupWorker : BackgroundService
         /// missed. Cleared once that scan runs.
         /// </summary>
         public bool NeedsReconcile { get; set; }
+
+        /// <summary>
+        /// When this set last completed a WHOLE-TREE scan. Distinct from
+        /// <see cref="LastRunUtc"/>, which every targeted continuous backup
+        /// bumps too — using that to time the safety-net scan below would mean a
+        /// set that is busy continuously never gets one, which is exactly
+        /// backwards. Persisted (see <c>FullScanStampPath</c>) so restarting the
+        /// service does not reset the clock.
+        /// </summary>
+        public DateTime LastFullScanUtc { get; set; }
+    }
+
+    /// <summary>
+    /// What a reconciling full scan actually did. "Did not run" and "ran but
+    /// some files failed" must not be the same answer: the first means retry,
+    /// the second means stop retrying the whole tree but keep the failed files'
+    /// queued deltas. Collapsing them into a bool is what silently dropped the
+    /// failures — see the continuous-backup entry in known-issues.md.
+    /// </summary>
+    private enum ReconcileOutcome
+    {
+        /// <summary>Skipped — lock busy, destination offline, or it threw.</summary>
+        DidNotRun,
+
+        /// <summary>Walked the whole tree; every file it tried succeeded.</summary>
+        RanClean,
+
+        /// <summary>Walked the whole tree; at least one file failed to copy.</summary>
+        RanWithFailures,
     }
 }

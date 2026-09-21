@@ -1586,10 +1586,11 @@ public class SourceSelectionNodeViewModel : ViewModelBase
     /// the filtered or cached path depending on whether a filter is present.
     /// </summary>
     internal static (long Size, int FileCount) ComputeDirectorySize(
-        DirectoryInfo dir, DirectorySizeCache cache, Func<string, bool>? excludeFilter)
+        DirectoryInfo dir, DirectorySizeCache cache, Func<string, bool>? excludeFilter,
+        CancellationToken ct = default)
     {
         return excludeFilter is null
-            ? ComputeDirectorySizeCached(dir, cache)
+            ? ComputeDirectorySizeCached(dir, cache, ct)
             : ComputeDirectorySizeFiltered(dir, excludeFilter);
     }
 
@@ -1655,23 +1656,40 @@ public class SourceSelectionNodeViewModel : ViewModelBase
     /// Otherwise the subtree is walked and the result is stored back into the
     /// cache for the next session.
     /// </summary>
+    /// <param name="ct">
+    /// Checked at every recursion level.  Without it, cancelling the scheduler
+    /// only took effect between queue items, so a single walk of a large volume
+    /// carried on for hours after the window that wanted it had closed.
+    /// </param>
     internal static (long Size, int FileCount) ComputeDirectorySizeFilteredCached(
         DirectoryInfo dir, Func<string, bool> isExcluded,
-        DirectorySizeCache cache, string filterSignature)
+        DirectorySizeCache cache, string filterSignature,
+        CancellationToken ct = default)
     {
-        // Fast path: cached filtered total whose directory timestamp is
-        // still current and whose filter signature matches.
-        var cachedRec = cache.TryGetFilteredRecursive(dir.FullName, filterSignature);
-        if (cachedRec is not null)
-        {
-            DateTime currentLastWrite;
-            try { currentLastWrite = dir.LastWriteTimeUtc; }
-            catch { currentLastWrite = DateTime.MinValue; }
+        ct.ThrowIfCancellationRequested();
 
-            var entry = cache.TryGet(dir.FullName);
-            if (entry is not null && entry.Value.DirLastWriteUtc >= currentLastWrite)
-                return cachedRec.Value;
-        }
+        // Read the directory's mtime ONCE, up front, and use it both to validate
+        // any cached value and — if we recompute — to stamp the new one.
+        //
+        // Reading it BEFORE the walk is the conservative order. If the directory
+        // changes while we are walking it, the stamp we store is the older value,
+        // so the next pass recomputes. Reading it afterwards would stamp an mtime
+        // newer than the data the totals describe, and that row would then
+        // validate and serve a stale total until something else touched the
+        // directory.
+        DateTime dirLastWrite;
+        try { dirLastWrite = dir.LastWriteTimeUtc; }
+        catch { dirLastWrite = DateTime.MinValue; }
+
+        // Fast path: cached filtered total whose FILTERED stamp is still current
+        // and whose filter signature matches. The staleness check now lives in
+        // TryGetFilteredRecursive, against the column the filtered pass actually
+        // writes — it used to be done here against DirLastWriteUtc, which this
+        // pass never sets, so it could never succeed.
+        var cachedRec = cache.TryGetFilteredRecursive(
+            dir.FullName, filterSignature, dirLastWrite);
+        if (cachedRec is not null)
+            return cachedRec.Value;
 
         long totalSize = 0;
         int totalCount = 0;
@@ -1703,7 +1721,7 @@ public class SourceSelectionNodeViewModel : ViewModelBase
                     continue;
 
                 var (subSize, subCount) = ComputeDirectorySizeFilteredCached(
-                    subDir, isExcluded, cache, filterSignature);
+                    subDir, isExcluded, cache, filterSignature, ct);
                 totalSize += subSize;
                 totalCount += subCount;
             }
@@ -1712,7 +1730,8 @@ public class SourceSelectionNodeViewModel : ViewModelBase
 
         // Store the computed filtered total so future sessions / re-loads
         // can return it instantly via TryGetCachedFilteredRecursiveSize.
-        cache.SetFilteredRecursive(dir.FullName, totalSize, totalCount, filterSignature);
+        cache.SetFilteredRecursive(
+            dir.FullName, totalSize, totalCount, filterSignature, dirLastWrite);
         return (totalSize, totalCount);
     }
 
@@ -1726,20 +1745,15 @@ public class SourceSelectionNodeViewModel : ViewModelBase
     internal static (long Size, int FileCount)? TryGetCachedFilteredRecursiveSize(
         string path, DirectorySizeCache cache, string filterSignature)
     {
-        var rec = cache.TryGetFilteredRecursive(path, filterSignature);
-        if (rec is null) return null;
-
-        var entry = cache.TryGet(path);
-        if (entry is null) return null;
-
         DateTime currentLastWrite;
         try { currentLastWrite = new DirectoryInfo(path).LastWriteTimeUtc; }
         catch { return null; }
 
-        if (entry.Value.DirLastWriteUtc < currentLastWrite)
-            return null;
-
-        return rec;
+        // Signature match AND filtered-stamp freshness are both checked inside
+        // TryGetFilteredRecursive, against FilteredDirLastWriteUtc rather than
+        // DirLastWriteUtc — see the remarks on SetFilteredRecursive for why the
+        // two must not be conflated.
+        return cache.TryGetFilteredRecursive(path, filterSignature, currentLastWrite);
     }
 
     /// <summary>
@@ -1787,8 +1801,11 @@ public class SourceSelectionNodeViewModel : ViewModelBase
     /// in the cache so future calls to <see cref="TryGetCachedRecursiveSize"/>
     /// can return it instantly.
     /// </summary>
-    internal static (long Size, int FileCount) ComputeDirectorySizeCached(DirectoryInfo dir, DirectorySizeCache cache)
+    internal static (long Size, int FileCount) ComputeDirectorySizeCached(
+        DirectoryInfo dir, DirectorySizeCache cache, CancellationToken ct = default)
     {
+        ct.ThrowIfCancellationRequested();
+
         long directFileSize;
         int directFileCount;
 
@@ -1830,7 +1847,7 @@ public class SourceSelectionNodeViewModel : ViewModelBase
             {
                 // Hidden/System directories are included in size totals so the
                 // displayed size matches what the backup engine actually copies.
-                var (subSize, subCount) = ComputeDirectorySizeCached(subDir, cache);
+                var (subSize, subCount) = ComputeDirectorySizeCached(subDir, cache, ct);
                 subdirSizeTotal += subSize;
                 subdirFileTotal += subCount;
             }
