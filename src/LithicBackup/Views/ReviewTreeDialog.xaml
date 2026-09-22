@@ -4,6 +4,7 @@
         xmlns:vm="clr-namespace:LithicBackup.ViewModels"
         xmlns:b="clr-namespace:LithicBackup.Behaviors"
         Title="{Binding WindowTitle}"
+        Icon="/Assets/LithicBackup.ico"
         Width="640" Height="500"
         MinWidth="480" MinHeight="340"
         WindowStartupLocation="CenterOwner"

@@ -7,6 +7,7 @@
         mc:Ignorable="d"
         d:DataContext="{d:DesignInstance Type=vm:ProgressDialogViewModel, IsDesignTimeCreatable=False}"
         Title="{Binding Title}"
+        Icon="/Assets/LithicBackup.ico"
         Width="440" SizeToContent="Height"
         MinWidth="360"
         WindowStartupLocation="CenterOwner"

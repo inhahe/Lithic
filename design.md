@@ -207,6 +207,30 @@ would have left the control hidden after the *scan*, which is the case that
 matters. Drive that kind of flag off `ObservableCollection.CollectionChanged`
 rather than from each call site: a third path is easy to add and easy to forget.
 
+### Text the app adds to a filename must not look like part of it
+
+Cleanup disambiguates rows that share a filename by appending the backup time —
+`config.yaml (backed up 2026-08-31 20:42)`. Concatenated into one string in one
+colour, that reads as though the file were really called that. The annotation is
+now a separate `OrphanedFileInfo.Annotation` / `OrphanedNodeViewModel.Annotation`
+and is rendered in its own `Run` in `TextSecondaryBrush`.
+
+**Keep it as data, not as a string the view pulls apart.** Sorting, searching and
+copying a name should never need to know how to strip a suffix back off — and the
+old form had already leaked into the sort: the tree ordered by `DisplayName` and
+therefore by the appended timestamp, so the key is now `(DisplayName, Annotation)`
+to reproduce it. `tools\cleanup_display_test` pins both halves: that name +
+annotation still composes to the exact previous string, and that 500 shuffled row
+sets order identically under the old and new keys.
+
+The leading space belongs in `AnnotationDisplay`, not in whitespace between the
+two `Run` elements. XAML collapses inter-element whitespace into a single space,
+which works right up until someone reformats the file.
+
+Volume displays (`E: (no label)`, `E: — MyDisc` in the Test Disc picker) are
+deliberately *not* covered: a volume label is not a filename, and nothing there
+risks being read as one.
+
 ### Never widen a selection to "repair" a tristate
 
 1.3.1 added a model-level pass that promoted a partial directory to
@@ -256,6 +280,71 @@ guessing is worse than no response.
 
 A class handler, not a per-control attached property, because there are nineteen
 views and the twentieth would have been forgotten.
+
+### Rewriting a destructive path needs a frozen oracle, not a careful reading
+
+`DestinationWalker` decides which files Cleanup offers to **delete**, so the three
+optimisations applied to it — one directory sweep instead of two, parallel across
+directories, no per-file string — are held to producing byte-identical verdicts.
+`tools\dest_walk_test\OriginalWalk.cs` keeps the pre-optimisation algorithm
+verbatim from git and both are run over the same generated trees, comparing the
+result *sets* entry by entry rather than their counts. The trees deliberately
+include the case that would destroy data if misjudged: a `.fileref`/`.dedup`
+manifest materialised back into a plain file, whose bytes are real backup content
+that no longer matches its catalog path exactly.
+
+Keep that oracle frozen. Its only value is disagreeing when the real walker
+changes meaning; "tidying" it to match the new code destroys the test.
+
+**Enumerate a directory once.** `GetFiles()` followed by `GetDirectories()` is two
+full FindFirstFile/FindNextFile sweeps of the same directory;
+`GetFileSystemInfos()` returns both in one, partitioned on
+`FileAttributes.Directory`.
+
+**Compose hash keys from spans, not concatenations.** `DiscPathKey` was already
+allocation-free inside while its caller built `dir + "\" + name` for every file
+just to hash it — and two more strings for the `.fileref`/`.dedup` probes. A
+tracked file needs no string at all; materialise the path only for entries that
+land in a result list.
+
+**And benchmark on the medium that matters.** The 13.77x measured here is on a
+warm temp directory, which is precisely where halving the enumeration sweeps helps
+least. A cold USB spinning destination should do better — so that figure is a
+floor, and quoting it as a ceiling would be the wrong lesson.
+
+### Never test one path against a list of roots
+
+`orphanedDirPaths.Any(p => IsPathUnderRoot(path, p))` reads as a filter and is an
+O(files x directories) nested loop. Four classification phases used it, and
+`IsPathUnderRoot` allocates a string per comparison to append a separator.
+Measured live: "Detecting excess versions" advanced at **21 files/sec** against
+2,854,931 rows — about 36 hours for one phase, single-threaded, with the whole
+thread pool parked and the catalog already in memory.
+
+Use `DirectoryPrefixSet`: hash the roots and walk the *path's own ancestors*, so
+cost tracks path depth rather than root count. Measured **3,718x** at 40,000
+directories, widening as that count grows. It memoises the last directory it
+answered for, which collapses per-file cost to per-directory because rows arrive
+ordered by SourcePath — so it is deliberately **not thread-safe**; give each
+consumer its own.
+
+**Rewriting a hot predicate demands an equivalence test, not a reading of the
+code.** A randomised pass over 60,000 cases caught a divergence every hand-picked
+case had missed: for a root stored with a trailing separator, the original rule
+reports the bare path as *outside* it. That is probably a bug in the original —
+and a performance change is still the wrong place to fix it. The quirk is
+preserved, documented, and asserted, and the one-root rule now lives in exactly
+one place so the scalar and set forms cannot drift.
+
+**Also: find out whether a slow phase is doing I/O before restructuring its
+I/O.** The obvious theory here was to bulk-read the catalog and the directory
+listings into memory and compare there. Both were already done exactly once; the
+entire cost was in-memory string work. A ten-sample stack dump of the live
+process named the method immediately — cheaper than any amount of reasoning about
+the architecture.
+
+**Report a rate, not just a percentage.** "2% complete" invites waiting. "21
+files/sec against 2.8M rows" is 36 hours, and ends the discussion.
 
 ### Long phases must name what they are doing
 

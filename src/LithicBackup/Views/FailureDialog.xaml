@@ -7,6 +7,7 @@
         mc:Ignorable="d"
         d:DataContext="{d:DesignInstance Type=vm:FailureDialogViewModel, IsDesignTimeCreatable=False}"
         Title="File Backup Failed"
+        Icon="/Assets/LithicBackup.ico"
         Width="520" Height="300"
         MinWidth="400" MinHeight="250"
         WindowStartupLocation="CenterOwner"

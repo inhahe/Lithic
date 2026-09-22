@@ -50,6 +50,26 @@ public class OrphanedNodeViewModel : ViewModelBase
     public ICommand ToggleExpandCommand { get; }
 
     public string Name { get; }
+
+    /// <summary>
+    /// Text Lithic appends to the name for disambiguation, e.g.
+    /// "(backed up 2026-08-31 20:42)". Null for the vast majority of rows, whose
+    /// name is just the file's name.
+    /// </summary>
+    public string? Annotation { get; init; }
+
+    /// <summary>
+    /// <see cref="Annotation"/> ready to sit directly after the name, with its
+    /// own leading space.
+    ///
+    /// <para>The space lives here rather than between two <c>Run</c> elements in
+    /// XAML: whitespace between inline elements is collapsed by the parser, which
+    /// works until someone reformats the file and silently changes the rendering.
+    /// An empty string when there is no annotation, so the binding never shows
+    /// a stray gap.</para>
+    /// </summary>
+    public string AnnotationDisplay
+        => string.IsNullOrEmpty(Annotation) ? string.Empty : " " + Annotation;
     public string FullPath { get; }
     public bool IsDirectory { get; }
     public OrphanedNodeViewModel? Parent { get; internal set; }

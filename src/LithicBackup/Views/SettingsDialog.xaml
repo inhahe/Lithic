@@ -2,6 +2,7 @@
         xmlns="http://schemas.microsoft.com/winfx/2006/xaml/presentation"
         xmlns:x="http://schemas.microsoft.com/winfx/2006/xaml"
         Title="Settings"
+        Icon="/Assets/LithicBackup.ico"
         Width="580" SizeToContent="Height"
         MaxHeight="1100"
         WindowStartupLocation="CenterOwner"

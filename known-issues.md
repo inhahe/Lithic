@@ -1,5 +1,200 @@
 # LithicBackup — Known Issues & Tech Debt
 
+## FIXED: the destination walk enumerated every directory twice, on one thread, allocating three strings per file (2026-09-21)
+
+**Context.** The destination scan's *catalog* half was already tuned — streaming
+aggregation instead of materialising (1,751 MB → 754 MB on a 2.8M-row set),
+`UInt128` keys instead of path strings, an unsorted read so progress moves from
+the first batch. The **walk** had not been touched.
+
+Three things were wrong with it, and one of them is embarrassing:
+
+**1. Each directory was enumerated twice.**
+
+```csharp
+files   = dir.GetFiles();        // one FindFirstFile/FindNextFile sweep
+subdirs = dir.GetDirectories();  // a second sweep of the same directory
+```
+
+`GetFileSystemInfos()` returns both in one sweep; entries partition on
+`FileAttributes.Directory`. Across hundreds of thousands of directories on a
+spinning USB disk that is one seek pass instead of two.
+
+**2. It was single-threaded** — while design.md already recorded the measurement
+for the same kind of metadata-bound work in the deleted-file check: 16 threads
+gave 235 probes/s against 21 single-threaded, because ~96% of these calls never
+reach the platter and NCQ reorders a deep queue into a shorter sweep. The walk is
+now level-order parallel: every directory at one depth is processed together and
+their children form the next level.
+
+**3. Three strings per file, thrown away.** It built `dir + "\" + name` for every
+file purely to hash it, then on a miss built two more for the `.fileref` and
+`.dedup` probes. `DiscPathKey.From` already took a `ReadOnlySpan<char>` and was
+allocation-free inside — the waste was entirely in the caller. A new
+`From(dir, name, suffix)` overload composes the key from parts into the existing
+pooled buffer, and the path string is materialised only for the few files that
+actually land in a result list. A tracked file — nearly all of them — now
+allocates nothing.
+
+**Measured** (`tools\dest_walk_test`, 15,132 files across 1,261 directories):
+
+| | time | |
+|---|---|---|
+| original: 2 sweeps/dir, 1 thread | 3.461s | |
+| 1 sweep/dir, 1 thread | 2.578s | **1.34x** |
+| 1 sweep/dir, 16 threads | 0.251s | **13.77x** |
+
+**That benchmark understates the real gain.** It runs on a warm temp directory on
+a fast disk, where the second enumeration sweep is served from cache — which is
+exactly the case where halving the sweeps matters least. On a cold USB3 spinning
+destination (the I: set) both the sweep halving and the parallelism should do
+better; the 13.77x is the conservative end.
+
+### Correctness is the point here, not the speed
+
+**This walk decides which files Cleanup offers to DELETE.** A faster walk that
+misclassifies one file is worse than a slow correct one, so it is tested
+differentially rather than by inspection: `tools\dest_walk_test\OriginalWalk.cs`
+holds the pre-optimisation algorithm **verbatim from git**, changed only enough to
+compile outside the view model (renamed, and `TryReconstructSourcePath` taken as a
+delegate). Six generated trees are walked by both and the result *sets* are
+compared exactly — not counts, the entries themselves, including sizes and
+reconstructed source paths.
+
+The trees mix every case the walker distinguishes: tracked-and-live,
+tracked-but-all-records-deleted, untracked, `.fileref`/`.dedup` manifests
+materialised back to plain files (the case where getting it wrong deletes real
+backup data), `.lbtmp` leftovers, and the `_blocks`/`_filestore` stores that must
+be skipped whole. The composing `DiscPathKey` overload is separately proved equal
+to hashing the concatenation, including paths past the 320-char stack budget where
+it switches to a pooled buffer.
+
+Do not "improve" `OriginalWalk.cs`. Its only job is to disagree when the real
+walker changes meaning.
+
+### One intentional behaviour change
+
+A directory that cannot be read now counts **once** toward `DirectoriesSkipped`.
+The original enumerated twice and so counted an entirely unreadable directory
+twice. It is a diagnostic shown in the summary, and counting a skipped directory
+once is what the label claims. The generated trees contain no unreadable
+directories, so the differential test confirms both report 0 rather than proving
+the new behaviour — worth knowing when reading that check.
+
+### A note on the traversal change
+
+Level-order holds one whole directory level in memory where the original's DFS
+stack was bounded by branching x depth. A destination mirrors the source tree, so
+the widest level is realistically tens of thousands of entries — a few MB. If a
+destination ever appears with a single enormous level, this is the thing to
+revisit.
+
+## FIXED: catalog scan's classification phases were O(files x directories) (2026-09-21)
+
+**Symptom.** "Detecting excess versions" appeared to hang. It was not hung — it
+was advancing, at a rate that made the phase effectively infinite.
+
+**Measured live, on both real sets, mid-scan:**
+
+| Set | active rows | rate | remaining in that phase |
+|---|---|---|---|
+| I: | 2,854,931 | **21 files/sec** | ~36 hours |
+| J: | 2,726,507 | **50 files/sec** | ~11 hours |
+
+A 10-sample profile of the running process found exactly one busy frame; every
+other thread was parked:
+
+```
+11  OrphanedDirectoriesViewModel.IsPathUnderRoot   <- the only real work
+37  LowLevelLifoSemaphore.WaitForSignal              (idle)
+10  IOCompletionPoller.Poll                          (idle)
+```
+
+**Cause.** Four phases filtered every catalog row against every orphaned
+directory:
+
+```csharp
+_activeFiles.Where(f => {
+    if (orphanedDirPaths.Any(p => IsPathUnderRoot(f.SourcePath, p))) return false;
+    ...
+})
+```
+
+O(files x directories), single-threaded, and `IsPathUnderRoot` allocates on
+**every comparison**:
+
+```csharp
+string rootWithSep = root.EndsWith('\\') ? root : root + "\\";
+```
+
+With ~2.8M rows and a removed-directory list in the hundreds of thousands, that
+is 10^11-10^12 allocating string comparisons. The work was never I/O — the
+catalog was already in memory, which is why "read everything into RAM first"
+would not have helped: it already does.
+
+**Fix.** `DirectoryPrefixSet`: hash the roots, then walk the *path's own
+ancestors*. Cost tracks path depth (typically under 20) instead of directory
+count, and a one-entry memo on the containing directory collapses per-file cost
+to per-directory — rows arrive ordered by SourcePath, so a directory's files are
+consecutive.
+
+**Measured** (tools\prefix_set_test, 200,000 paths vs 40,000 directories):
+
+| | files/sec |
+|---|---|
+| `Any(IsPathUnderRoot)` | 386 |
+| `DirectoryPrefixSet` | **1,435,758** |
+
+**3,718x**, and the gap widens with directory count. The benchmark's 386/sec at
+40,000 directories against the live 21/sec implies the real removed-directory
+count is roughly 700,000.
+
+**The fuzz test earned its keep immediately.** A randomised equivalence pass
+(60,000 cases) caught a divergence the hand-written cases missed: for a root
+stored *with* a trailing separator (`D:\X\`), the original rule reports the path
+`D:\x` as **not** inside it — string equality fails on length, and `D:\x` does
+not start with `D:\X\`. Normalising the separator away had silently started
+answering `true`.
+
+That is arguably a bug in the original rule — a directory written with a trailing
+separator is the same directory — but **a performance rewrite is the wrong place
+to change behaviour**. The quirk is preserved bit-for-bit, documented on the
+field that preserves it, and pinned by an asserted test case. Roots come from
+`Path.GetDirectoryName`, which only emits a trailing separator for a drive root,
+so the divergence was unreachable in practice; that is luck, not a reason to
+accept it.
+
+`IsPathUnderRoot` now delegates to `DirectoryPrefixSet.IsPathUnderRoot`, so the
+one-root rule and the many-root set cannot drift apart.
+
+### Two further wastes in the excess-version phase
+
+**It built a group for every distinct source path.** Only a `_prev` record can
+ever be excess, and they are a small minority of rows, but the code grouped all
+~1M distinct paths and *then* did `group.Where(IsPreviousVersionPath)
+.OrderByDescending(...).ToList()` per group — allocating a list and sorting it
+before bailing on `versions.Count == 0` for nearly all of them. Filtering to
+prev-version records *before* the `GroupBy` is identical in result (nothing below
+reads a non-prev member; only `group.Key` is used) and skips the lot.
+
+**It re-sorted the retention tiers once per group.** `sortedTiers = tiers
+.OrderBy(...).ToList()` sat inside the loop, repeating the same small sort up to
+a million times. Now memoised by tier-list identity — `tierSelector` returns the
+same instance for every path a tier set matches.
+
+### The rule
+
+**Before optimising a scan's I/O, find out whether it is doing any.** The
+instinct here was to restructure around bulk reads and in-memory comparison. The
+catalog was already read once into memory and directories were already enumerated
+once each; the whole cost was an O(N x M) in-memory scan with a per-comparison
+allocation. Profile first — a 10-sample stack dump of the live process named the
+method in one shot.
+
+**And a rate is more useful than a percentage.** "2% complete" invites waiting;
+"21 files/sec against 2.8M rows" is 36 hours and settles the question
+immediately.
+
 ## FIXED: cleanup failed with "disc 0 has no owning set" — and that error was the only thing preventing catalog corruption (2026-09-21)
 
 **Symptom.** After a catalog scan, Clean Selected always failed:
@@ -87,6 +282,21 @@ Cleanup's purge was the only one.
    `Version`, `SourcePath`, `DiscPath`, `SizeBytes`, the four storage flags and
    `SourceLastWriteUtc` byte-identical — plus re-marking reports 0 changed, and the
    live head stays live.
+
+**Postscript — the conversion itself had a bug, found by asking "which methods
+did this actually change?"** One of the six call sites declared its list as
+`List<string>` rather than the new set. With the method named `Contains`, that
+line bound happily to `List<string>.Contains` and silently became an *exact
+string equality* test — a file path against a directory path, so essentially
+never true, so that site stopped skipping anything. It compiled, and the check I
+had run ("no `Any(p => IsPathUnderRoot` remain") confirmed the old form was gone
+without confirming the new form was right.
+
+Two fixes: the site now builds a `DirectoryPrefixSet`, and the method is called
+`ContainsPathUnder` — a name no collection already has, so repeating the mistake
+is a compile error rather than a silent change of meaning. **When replacing a
+predicate, verify what the replacement BOUND TO, not merely that the old text is
+gone.**
 
 **The general rule this earns:** *a projection that drops columns is safe only
 until one of its records reaches a writer that rewrites them.* Trimming a read is

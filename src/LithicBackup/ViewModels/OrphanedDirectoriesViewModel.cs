@@ -692,8 +692,8 @@ public class OrphanedDirectoriesViewModel : ViewModelBase
             StringComparer.OrdinalIgnoreCase);
 
         // Fast lookup of removed-dir prefixes for the skip check.
-        var collapsedRemovedPaths = collapsedRemoved
-            .Select(r => r.DirectoryPath).ToList();
+        var collapsedRemovedPaths = new DirectoryPrefixSet(
+            collapsedRemoved.Select(r => r.DirectoryPath));
 
         progress.SetPhase("Checking deleted files and directories", totalFiles);
         var deletedDirs = new List<OrphanedDirectoryItem>();
@@ -707,7 +707,7 @@ public class OrphanedDirectoriesViewModel : ViewModelBase
         {
             string dir = group.Key;
             int groupCount = group.Count();
-            if (collapsedRemovedPaths.Any(p => IsPathUnderRoot(dir, p))
+            if (collapsedRemovedPaths.ContainsPathUnder(dir)
                 || !IsDirectoryInSources(dir)
                 // UNREACHABLE IS NOT DELETED. A drive that is merely unplugged
                 // answers "missing" for every path on it, so without this an
@@ -1017,13 +1017,20 @@ public class OrphanedDirectoriesViewModel : ViewModelBase
                     // OrphanedDirectoryItem, not synthetic per-file items.
                     if (item.Files is not null)
                     {
+                        // Annotation is a secondary key because it used to be
+                        // part of DisplayName: several versions of one file share
+                        // a name and were ordered by the timestamp appended to
+                        // it. The dates are written yyyy-MM-dd HH:mm, so ordering
+                        // them as text is still chronological.
                         foreach (var file in item.Files
-                            .OrderBy(f => f.DisplayName, StringComparer.OrdinalIgnoreCase))
+                            .OrderBy(f => f.DisplayName, StringComparer.OrdinalIgnoreCase)
+                            .ThenBy(f => f.Annotation, StringComparer.OrdinalIgnoreCase))
                         {
                             var fileNode = new OrphanedNodeViewModel(
                                 file.DisplayName, file.Path,
                                 isDirectory: false, parent: existing)
                             {
+                                Annotation = file.Annotation,
                                 Depth = existing.Depth + 1,
                                 FileCount = 1,
                                 SizeBytes = file.Size,
@@ -1091,14 +1098,14 @@ public class OrphanedDirectoriesViewModel : ViewModelBase
         // Build list of orphaned directory paths to skip (files there are
         // already covered by orphaned directory items). IsPathUnderRoot
         // handles separator boundaries correctly.
-        var orphanedDirPaths = orphanedDirs.Select(i => i.DirectoryPath).ToList();
+        var orphanedDirPaths = new DirectoryPrefixSet(
+            orphanedDirs.Select(i => i.DirectoryPath));
 
         var excluded = _activeFiles
             .Where(f =>
             {
                 progress?.Bump();
-                if (orphanedDirPaths.Any(p =>
-                    IsPathUnderRoot(f.SourcePath, p)))
+                if (orphanedDirPaths.ContainsPathUnder(f.SourcePath))
                     return false;
 
                 return exclusionFilter(f.SourcePath);
@@ -1178,7 +1185,8 @@ public class OrphanedDirectoriesViewModel : ViewModelBase
 
         // Build skip-sets: files in orphaned dirs or matched by exclusion filter.
         // IsPathUnderRoot handles path-separator boundaries correctly.
-        var orphanedDirPaths = orphanedDirs.Select(i => i.DirectoryPath).ToList();
+        var orphanedDirPaths = new DirectoryPrefixSet(
+            orphanedDirs.Select(i => i.DirectoryPath));
         var excludedPaths = new HashSet<string>(
             excludedItems
                 .Where(i => i.MatchingSourcePaths is not null)
@@ -1190,8 +1198,7 @@ public class OrphanedDirectoriesViewModel : ViewModelBase
             .Where(f =>
             {
                 progress?.Bump();
-                if (orphanedDirPaths.Any(p =>
-                    IsPathUnderRoot(f.SourcePath, p)))
+                if (orphanedDirPaths.ContainsPathUnder(f.SourcePath))
                     return false;
                 if (excludedPaths.Contains(f.SourcePath))
                     return false;
@@ -1203,8 +1210,24 @@ public class OrphanedDirectoriesViewModel : ViewModelBase
         var excessRecords = new List<FileRecord>();
 
         // Group by source path — same approach as VersionRetentionService.
+        //
+        // Filtered to PREV-version records BEFORE the grouping, which is not a
+        // micro-optimisation: only a "_prev" record can ever be excess, and on a
+        // real set they are a small minority of rows. Grouping first built a
+        // group for every distinct source path — roughly a million — and each one
+        // then allocated a list, sorted it, and bailed immediately on
+        // versions.Count == 0. The result is identical because nothing below
+        // reads a non-prev member of the group; only group.Key is used.
         var groupedByPath = eligibleFiles
+            .Where(f => IsPreviousVersionPath(f.DiscPath))
             .GroupBy(f => f.SourcePath, StringComparer.OrdinalIgnoreCase);
+
+        // A tier list is shared by every path its tier set matches, so sorting it
+        // inside the loop repeated the same sort once per group. Keyed by the
+        // list instance itself: tierSelector hands back the same object each
+        // time, and the default comparer on a type that does not override Equals
+        // is reference equality — which is exactly the identity we want here.
+        var sortedTierCache = new Dictionary<object, List<VersionRetentionTier>>();
 
         foreach (var group in groupedByPath)
         {
@@ -1219,13 +1242,15 @@ public class OrphanedDirectoriesViewModel : ViewModelBase
             // here.  Restricting the tier walk to "_prev" records keeps the
             // Excess-Versions category meaningful for users who haven't
             // backed up yet.
+            // Every member is already a prev-version record (filtered above), and
+            // GroupBy never yields an empty group, so this is non-empty by
+            // construction. The guard stays as a cheap invariant check.
             var versions = group
-                .Where(f => IsPreviousVersionPath(f.DiscPath))
                 .OrderByDescending(f => f.BackedUpUtc)
                 .ToList();
 
             if (versions.Count == 0)
-                continue; // No real prev-version records for this file.
+                continue;
 
             var tiers = tierSelector(group.Key);
             if (tiers.Count == 0)
@@ -1238,9 +1263,13 @@ public class OrphanedDirectoriesViewModel : ViewModelBase
             long newestId = versions[0].Id;
 
             // Walk tiers from youngest to oldest.
-            var sortedTiers = tiers
-                .OrderBy(t => t.MaxAge ?? TimeSpan.MaxValue)
-                .ToList();
+            if (!sortedTierCache.TryGetValue(tiers, out var sortedTiers))
+            {
+                sortedTiers = tiers
+                    .OrderBy(t => t.MaxAge ?? TimeSpan.MaxValue)
+                    .ToList();
+                sortedTierCache[tiers] = sortedTiers;
+            }
 
             var processed = new HashSet<long>();
             TimeSpan previousBoundary = TimeSpan.Zero;
@@ -1310,9 +1339,10 @@ public class OrphanedDirectoriesViewModel : ViewModelBase
                     .OrderBy(r => r.SourcePath, StringComparer.OrdinalIgnoreCase)
                     .ThenByDescending(r => r.BackedUpUtc)
                     .Select(r => new OrphanedFileInfo(
-                        $"{Path.GetFileName(r.SourcePath)} (backed up {r.BackedUpUtc.ToLocalTime():yyyy-MM-dd HH:mm})",
+                        Path.GetFileName(r.SourcePath),
                         r.SourcePath,
-                        r.SizeBytes))
+                        r.SizeBytes,
+                        $"(backed up {r.BackedUpUtc.ToLocalTime():yyyy-MM-dd HH:mm})"))
                     .ToList(),
                 DiscFilePaths = _targetDir is null ? null
                     : records.Select(r => r.DiscPath.Replace('/', '\\')).ToList(),
@@ -1368,7 +1398,8 @@ public class OrphanedDirectoriesViewModel : ViewModelBase
     {
         if (_activeFiles is null) return [];
 
-        var orphanedDirPaths = orphanedDirs.Select(i => i.DirectoryPath).ToList();
+        var orphanedDirPaths = new DirectoryPrefixSet(
+            orphanedDirs.Select(i => i.DirectoryPath));
         var excludedPaths = new HashSet<string>(
             excludedItems
                 .Where(i => i.MatchingSourcePaths is not null)
@@ -1382,7 +1413,7 @@ public class OrphanedDirectoriesViewModel : ViewModelBase
             {
                 progress?.Bump();
                 if (IsPreviousVersionPath(f.DiscPath)) return false;
-                if (orphanedDirPaths.Any(p => IsPathUnderRoot(f.SourcePath, p)))
+                if (orphanedDirPaths.ContainsPathUnder(f.SourcePath))
                     return false;
                 if (excludedPaths.Contains(f.SourcePath)) return false;
                 return true;
@@ -1425,9 +1456,10 @@ public class OrphanedDirectoriesViewModel : ViewModelBase
                     .OrderBy(r => r.SourcePath, StringComparer.OrdinalIgnoreCase)
                     .ThenByDescending(r => r.BackedUpUtc)
                     .Select(r => new OrphanedFileInfo(
-                        $"{Path.GetFileName(r.SourcePath)} (seeded {r.BackedUpUtc.ToLocalTime():yyyy-MM-dd HH:mm})",
+                        Path.GetFileName(r.SourcePath),
                         r.SourcePath,
-                        r.SizeBytes))
+                        r.SizeBytes,
+                        $"(seeded {r.BackedUpUtc.ToLocalTime():yyyy-MM-dd HH:mm})"))
                     .ToList(),
                 // Intentionally NULL: every duplicate points at the same
                 // physical file as the surviving record.  Deleting the file
@@ -1491,11 +1523,12 @@ public class OrphanedDirectoriesViewModel : ViewModelBase
         try
         {
             // Build set of directories already shown as orphaned so we don't
-            // double-count files. IsPathUnderRoot handles separator boundaries.
-            var orphanedDirPaths = Items
+            // double-count files. DirectoryPrefixSet answers "is this file inside
+            // any of them" — a List here would bind .Contains to exact string
+            // equality, which compiles and silently means something else.
+            var orphanedDirPaths = new DirectoryPrefixSet(Items
                 .Where(i => i.Reason is OrphanedReason.RemovedFromSources or OrphanedReason.DeletedFromDisk)
-                .Select(i => i.DirectoryPath)
-                .ToList();
+                .Select(i => i.DirectoryPath));
 
             // Also skip files already flagged by auto-detected exclusions.
             var alreadyFlaggedPaths = new HashSet<string>(
@@ -1511,8 +1544,7 @@ public class OrphanedDirectoriesViewModel : ViewModelBase
                     .Where(f =>
                     {
                         // Skip files already covered by an orphaned directory.
-                        if (orphanedDirPaths.Any(p =>
-                            IsPathUnderRoot(f.SourcePath, p)))
+                        if (orphanedDirPaths.ContainsPathUnder(f.SourcePath))
                             return false;
 
                         // Skip files already covered by auto-detected exclusions.
@@ -1672,7 +1704,7 @@ public class OrphanedDirectoriesViewModel : ViewModelBase
                 // Services.DiscPathKey documents why hashing cannot cause a
                 // wrongful deletion here (a collision can only make a file look
                 // MORE tracked, never less).
-                var discPathLookup = new Dictionary<UInt128, DestPathState>();
+                var discPathLookup = new Dictionary<UInt128, Services.DestPathState>();
 
                 await _catalog.ForEachDiscPathEntryAsync(
                     setId,
@@ -1690,21 +1722,27 @@ public class OrphanedDirectoriesViewModel : ViewModelBase
                             // only ever shown when nothing active remains. This
                             // is where most of the memory goes - the vast
                             // majority of paths are active.
-                            discPathLookup[normalised] = new DestPathState(true, null);
+                            discPathLookup[normalised] = new Services.DestPathState(true, null);
                         }
                         else if (!current.HasActive && current.SourcePathWhenAllDeleted is null)
                         {
                             // First deleted record for a path not yet claimed by
                             // an active one: keep its source path in case none
                             // ever arrives.
-                            discPathLookup[normalised] = new DestPathState(false, sourcePath);
+                            discPathLookup[normalised] = new Services.DestPathState(false, sourcePath);
                         }
                         // Otherwise the path is already answered; store nothing.
                     },
                     CancellationToken.None,
                     loadProgress).ConfigureAwait(false);
 
-                return WalkDestination(targetDir, discPathLookup, progress);
+                // The walk is parallel, enumerates each directory once, and
+                // builds no string for a file that is already tracked. See
+                // Services\DestinationWalker.cs — and tools\dest_walk_test,
+                // which pins its verdicts against the original sequential walk,
+                // because this is what Cleanup offers to delete.
+                return Services.DestinationWalker.Walk(
+                    targetDir, discPathLookup, TryReconstructSourcePath, progress);
             });
 
             // ---- UI thread from here on ----
@@ -1941,179 +1979,6 @@ public class OrphanedDirectoriesViewModel : ViewModelBase
     /// Source path to show for a file whose records are ALL deleted; null when
     /// <paramref name="HasActive"/> is true.
     /// </param>
-    private readonly record struct DestPathState(bool HasActive, string? SourcePathWhenAllDeleted);
-
-    /// <summary>
-    /// Background-thread destination walk.  For every file under
-    /// <paramref name="targetDir"/>, either skips it (when the catalog
-    /// records the path as active), routes it to <c>catalogDeleted</c>
-    /// (when only deleted records remain), or routes it to <c>untracked</c>
-    /// (when no record matches at all).  Skips the shared <c>_blocks</c> and
-    /// <c>_filestore</c> stores.
-    /// </summary>
-    private static (List<(string DiscRel, long Size, string? SourcePath)> Untracked,
-                    List<(string DiscRel, long Size, string? SourcePath)> CatalogDeleted,
-                    int DirectoriesSkipped,
-                    int FilesScanned)
-        WalkDestination(
-            string targetDir,
-            Dictionary<UInt128, DestPathState> discPathLookup,
-            IProgress<string> progress)
-    {
-        var untracked = new List<(string, long, string?)>();
-        var catalogDeleted = new List<(string, long, string?)>();
-
-        var targetInfo = new DirectoryInfo(targetDir);
-        if (!targetInfo.Exists)
-            throw new DirectoryNotFoundException($"Destination directory not found: {targetDir}");
-
-        var sw = System.Diagnostics.Stopwatch.StartNew();
-        long lastProgressMs = 0;
-        int filesScanned = 0;
-        int directoriesSkipped = 0;
-
-        // Iterative DFS using an explicit stack to avoid any concern about
-        // deep recursion blowing the thread stack on extremely-nested
-        // destinations.  Each directory's file + subdirectory enumerations
-        // are wrapped in their own try/catch so a single unreadable folder
-        // (UnauthorizedAccessException, PathTooLongException, ArgumentException
-        // from weird path chars, COMException from network shares dropping,
-        // etc.) is recorded as a skip and the walk continues.
-        //
-        // We deliberately catch the broad Exception base type at the
-        // directory-enumeration boundary — the .NET docs only list a few
-        // exception types for these calls, but in practice security
-        // providers, antivirus drivers, and reparse points can throw
-        // arbitrary derived exceptions, and we never want one of those to
-        // silently terminate the entire scan.
-        var stack = new Stack<(DirectoryInfo Dir, string RelativeDir)>();
-        stack.Push((targetInfo, ""));
-
-        while (stack.Count > 0)
-        {
-            var (dir, relativeDir) = stack.Pop();
-
-            // Skip shared content-addressed stores at the top level — these
-            // aren't user-visible backup files and are managed internally.
-            if (relativeDir.Length > 0 && (
-                    relativeDir.Equals("_blocks", StringComparison.OrdinalIgnoreCase) ||
-                    relativeDir.Equals("_filestore", StringComparison.OrdinalIgnoreCase) ||
-                    relativeDir.StartsWith("_blocks\\", StringComparison.OrdinalIgnoreCase) ||
-                    relativeDir.StartsWith("_filestore\\", StringComparison.OrdinalIgnoreCase)))
-                continue;
-
-            // --- Enumerate files in this directory ---
-            FileInfo[]? files = null;
-            try
-            {
-                // Materialise to an array immediately — this makes a single
-                // failure point we can guard, rather than the deferred
-                // enumeration throwing midway through the foreach.
-                files = dir.GetFiles();
-            }
-            catch (Exception ex)
-            {
-                directoriesSkipped++;
-                System.Diagnostics.Debug.WriteLine(
-                    $"WalkDestination: skip files in '{dir.FullName}': {ex.GetType().Name}: {ex.Message}");
-            }
-
-            if (files is not null)
-            {
-                for (int i = 0; i < files.Length; i++)
-                {
-                    var file = files[i];
-                    filesScanned++;
-                    if (sw.ElapsedMilliseconds - lastProgressMs >= ProgressUpdateIntervalMs)
-                    {
-                        lastProgressMs = sw.ElapsedMilliseconds;
-                        progress.Report($"Scanning: {filesScanned:N0} files examined — {dir.Name}");
-                    }
-
-                    long size;
-                    string fileName;
-                    try
-                    {
-                        size = file.Length;
-                        fileName = file.Name;
-                    }
-                    catch (Exception)
-                    {
-                        // File vanished or became inaccessible between enumeration and stat — skip just this file.
-                        continue;
-                    }
-
-                    // Skip partial-copy temp files left by an interrupted backup
-                    // (DirectoryBackupService.CopyFileAsync writes to "*.lbtmp"
-                    // before the atomic rename).  They aren't real backup
-                    // content and shouldn't surface as untracked files.
-                    if (fileName.EndsWith(".lbtmp", StringComparison.OrdinalIgnoreCase))
-                        continue;
-
-                    string relativePath = relativeDir.Length == 0
-                        ? fileName
-                        : relativeDir + "\\" + fileName;
-
-                    // A catalog record's DiscPath for a deduplicated file carries
-                    // a ".fileref" / ".dedup" manifest suffix (e.g.
-                    // "D\AI\foo.zip.fileref"), while the manifest can later be
-                    // MATERIALISED back into a plain, suffix-less file on disk
-                    // ("D\AI\foo.zip") whose bytes ARE the referenced content
-                    // (DirectoryBackupService.MaterialiseFileRef removes the
-                    // manifest and writes the plain file).  So a plain on-disk
-                    // file must match not only an exact-path catalog record but
-                    // also a "<path>.fileref"/"<path>.dedup" record — otherwise
-                    // legitimate, catalog-referenced backup content is wrongly
-                    // reported as untracked, and "cleaning" it would delete real
-                    // backup data (and it reappears once the worker
-                    // re-materialises the reference).  Exact match wins; the
-                    // manifest-suffix fallbacks only fire for suffix-less files.
-                    if (discPathLookup.TryGetValue(Services.DiscPathKey.From(relativePath), out var state)
-                        || discPathLookup.TryGetValue(Services.DiscPathKey.From(relativePath + ".fileref"), out state)
-                        || discPathLookup.TryGetValue(Services.DiscPathKey.From(relativePath + ".dedup"), out state))
-                    {
-                        if (state.HasActive)
-                            continue; // Active record exists — file is properly tracked.
-
-                        catalogDeleted.Add((relativePath, size, state.SourcePathWhenAllDeleted));
-                    }
-                    else
-                    {
-                        string? reconstructed = TryReconstructSourcePath(relativePath);
-                        untracked.Add((relativePath, size, reconstructed));
-                    }
-                }
-            }
-
-            // --- Enumerate subdirectories and push for later traversal ---
-            DirectoryInfo[]? subdirs = null;
-            try
-            {
-                subdirs = dir.GetDirectories();
-            }
-            catch (Exception ex)
-            {
-                directoriesSkipped++;
-                System.Diagnostics.Debug.WriteLine(
-                    $"WalkDestination: skip subdirs of '{dir.FullName}': {ex.GetType().Name}: {ex.Message}");
-                continue;
-            }
-
-            // Push in reverse so traversal order matches alphabetical-ish
-            // (purely cosmetic — affects only the progress messages).
-            for (int i = subdirs.Length - 1; i >= 0; i--)
-            {
-                var sub = subdirs[i];
-                string subRel = relativeDir.Length == 0
-                    ? sub.Name
-                    : relativeDir + "\\" + sub.Name;
-                stack.Push((sub, subRel));
-            }
-        }
-
-        return (untracked, catalogDeleted, directoriesSkipped, filesScanned);
-    }
-
     /// <summary>
     /// Best-effort source-path reconstruction from a disc-relative path.
     /// Examples:
@@ -2517,10 +2382,9 @@ public class OrphanedDirectoriesViewModel : ViewModelBase
                         workItems.Where(w => w.MatchingSourcePaths is not null)
                                  .SelectMany(w => w.MatchingSourcePaths!),
                         StringComparer.OrdinalIgnoreCase);
-                    var purgedDirs = workItems
+                    var purgedDirs = new DirectoryPrefixSet(workItems
                         .Where(w => w.Reason is OrphanedReason.RemovedFromSources or OrphanedReason.DeletedFromDisk)
-                        .Select(w => w.DirectoryPath)
-                        .ToList();
+                        .Select(w => w.DirectoryPath));
                     var purgedRecordIds = new HashSet<long>(
                         workItems.Where(w => w.ExcessVersionRecords is not null)
                                  .SelectMany(w => w.ExcessVersionRecords!)
@@ -2528,7 +2392,7 @@ public class OrphanedDirectoriesViewModel : ViewModelBase
 
                     _activeFiles.RemoveAll(f =>
                         purgedPaths.Contains(f.SourcePath)
-                        || purgedDirs.Any(d => IsPathUnderRoot(f.SourcePath, d))
+                        || purgedDirs.ContainsPathUnder(f.SourcePath)
                         || purgedRecordIds.Contains(f.Id));
                 }
 
@@ -2882,13 +2746,15 @@ public class OrphanedDirectoriesViewModel : ViewModelBase
     /// <c>D:\caitlin's files Backup</c> is NOT treated as being under
     /// <c>D:\caitlin's files</c>.
     /// </summary>
+    /// <summary>
+    /// Whether <paramref name="path"/> is <paramref name="root"/> or sits inside
+    /// it, respecting separator boundaries. Delegates to
+    /// <see cref="DirectoryPrefixSet.IsPathUnderRoot"/> so the rule has exactly
+    /// one definition: <see cref="DirectoryPrefixSet"/> must agree with this for
+    /// many roots, and two copies would be free to drift apart.
+    /// </summary>
     private static bool IsPathUnderRoot(string path, string root)
-    {
-        if (path.Equals(root, StringComparison.OrdinalIgnoreCase))
-            return true;
-        string rootWithSep = root.EndsWith('\\') ? root : root + "\\";
-        return path.StartsWith(rootWithSep, StringComparison.OrdinalIgnoreCase);
-    }
+        => DirectoryPrefixSet.IsPathUnderRoot(path, root);
 
     // ------------------------------------------------------------------
     // Classification progress reporter
@@ -3011,7 +2877,21 @@ public class OrphanedDirectoriesViewModel : ViewModelBase
 /// filename, or the filename plus a version stamp for excess versions);
 /// <see cref="Path"/> is the actual full source path used for tooltips.
 /// </summary>
-public sealed record OrphanedFileInfo(string DisplayName, string Path, long Size);
+/// <summary>
+/// One file row under a cleanup category.
+/// </summary>
+/// <param name="DisplayName">The file's own name, exactly as on disk.</param>
+/// <param name="Annotation">
+/// Text Lithic adds for disambiguation — "(backed up 2026-08-31 20:42)" and the
+/// like — kept SEPARATE from the name rather than concatenated into it.
+///
+/// <para>Two reasons. It is rendered in a dimmer colour so a reader can tell at a
+/// glance which part is the real filename and which part the app invented; and
+/// sorting, searching or copying a name should never have to know how to strip a
+/// suffix back off.</para>
+/// </param>
+public sealed record OrphanedFileInfo(
+    string DisplayName, string Path, long Size, string? Annotation = null);
 
 public enum OrphanedReason
 {

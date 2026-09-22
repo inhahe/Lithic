@@ -47,12 +47,89 @@ namespace LithicBackup.Services;
 /// accelerated on any current CPU, and removes every question about distribution.
 /// The cost is invisible next to a walk that stats a million files.</para>
 /// </summary>
-internal static class DiscPathKey
+public static class DiscPathKey
 {
     /// <summary>Longest path handled without renting; covers essentially every real path.</summary>
     private const int StackBudget = 320;
 
     public static UInt128 From(string path) => From(path.AsSpan());
+
+    /// <summary>
+    /// Key for a path assembled from parts, without building the string.
+    ///
+    /// <para>The destination walk holds a directory's relative path and each
+    /// entry's file name separately, and needs the key for
+    /// <c>dir + "\\" + name</c> — plus, on a miss, for that path with
+    /// <c>.fileref</c> and <c>.dedup</c> appended. Composing through
+    /// <see cref="From(string)"/> allocated up to three strings per file and
+    /// discarded them immediately, since the overwhelming majority of files match
+    /// on the first probe and never need their path materialised at all.</para>
+    ///
+    /// <para>Identical by construction to hashing the concatenation: the
+    /// normalisation is per character, so where the characters come from cannot
+    /// change the result. The equivalence is asserted in
+    /// <c>tools\dest_walk_test</c>.</para>
+    /// </summary>
+    /// <param name="dir">Relative directory, may be empty for the root.</param>
+    /// <param name="name">File or directory name.</param>
+    /// <param name="suffix">Optional suffix, e.g. <c>.fileref</c>.</param>
+    public static UInt128 From(
+        ReadOnlySpan<char> dir, ReadOnlySpan<char> name, ReadOnlySpan<char> suffix = default)
+    {
+        int total = name.Length + suffix.Length + (dir.Length == 0 ? 0 : dir.Length + 1);
+
+        char[]? rented = null;
+        Span<char> buffer = total <= StackBudget
+            ? stackalloc char[StackBudget]
+            : (rented = ArrayPool<char>.Shared.Rent(total));
+
+        try
+        {
+            int at = 0;
+            if (dir.Length != 0)
+            {
+                at += Normalise(dir, buffer);
+                buffer[at++] = '\\';
+            }
+            at += Normalise(name, buffer[at..]);
+            if (suffix.Length != 0)
+                at += Normalise(suffix, buffer[at..]);
+
+            return Digest(buffer[..at]);
+        }
+        finally
+        {
+            if (rented is not null)
+                ArrayPool<char>.Shared.Return(rented);
+        }
+    }
+
+    /// <summary>
+    /// Copy <paramref name="src"/> into <paramref name="dest"/> with <c>/</c>
+    /// folded to <c>\</c> and invariant upper-casing, per character. Shared by
+    /// both overloads so the two can never normalise differently.
+    /// </summary>
+    private static int Normalise(ReadOnlySpan<char> src, Span<char> dest)
+    {
+        for (int i = 0; i < src.Length; i++)
+        {
+            char c = src[i];
+            dest[i] = char.ToUpperInvariant(c == '/' ? '\\' : c);
+        }
+        return src.Length;
+    }
+
+    private static UInt128 Digest(ReadOnlySpan<char> normalised)
+    {
+        Span<byte> digest = stackalloc byte[32];
+        SHA256.HashData(MemoryMarshal.AsBytes(normalised), digest);
+
+        // First 16 bytes. Truncating a cryptographic digest keeps the uniformity
+        // of the full one, which is what the birthday bound above assumes.
+        return new UInt128(
+            BinaryPrimitives.ReadUInt64LittleEndian(digest),
+            BinaryPrimitives.ReadUInt64LittleEndian(digest[8..]));
+    }
 
     /// <summary>
     /// Key for a destination-relative path. Normalises <c>/</c> to <c>\</c> and
@@ -67,21 +144,8 @@ internal static class DiscPathKey
 
         try
         {
-            for (int i = 0; i < path.Length; i++)
-            {
-                char c = path[i];
-                buffer[i] = char.ToUpperInvariant(c == '/' ? '\\' : c);
-            }
-
-            Span<byte> digest = stackalloc byte[32];
-            SHA256.HashData(MemoryMarshal.AsBytes(buffer[..path.Length]), digest);
-
-            // First 16 bytes. Truncating a cryptographic digest keeps the
-            // uniformity of the full one, which is what the birthday bound above
-            // assumes.
-            return new UInt128(
-                BinaryPrimitives.ReadUInt64LittleEndian(digest),
-                BinaryPrimitives.ReadUInt64LittleEndian(digest[8..]));
+            Normalise(path, buffer);
+            return Digest(buffer[..path.Length]);
         }
         finally
         {
