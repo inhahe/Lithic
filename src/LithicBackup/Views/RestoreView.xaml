@@ -82,8 +82,10 @@
                          Height="20" Margin="0,0,0,4"
                          Foreground="{StaticResource PrimaryBrush}" />
             <TextBlock Style="{StaticResource SubText}" Text="{Binding ProgressText}" />
+            <!-- The full path, wrapped, never cut off at the file name. -->
             <TextBlock Foreground="{StaticResource TextSecondaryBrush}"
-                       TextTrimming="CharacterEllipsis"
+                       TextWrapping="Wrap"
+                       MinHeight="32"
                        Text="{Binding CurrentFile}" />
         </StackPanel>
 

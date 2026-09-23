@@ -1802,7 +1802,7 @@ public class MainViewModel : ViewModelBase
                                     ? 100 : (int)((i + 1) * 100L / sourcePaths.Count);
                                 progress.Report(new ProgressReport(
                                     $"Updating catalog {i + 1:N0}/{sourcePaths.Count:N0} ({pct}%): "
-                                    + Path.GetFileName(path.TrimEnd('\\')),
+                                    + path,
                                     pct));
                             }
 
@@ -4520,7 +4520,7 @@ public class MainViewModel : ViewModelBase
             await LoadBackupSetsAsync();
 
             SelectedBackupSet = BackupSets.FirstOrDefault(s => s.Id == newSet.Id)?.Model;
-            StatusText = $"Imported \"{newSet.Name}\" from {Path.GetFileName(dialog.FileName)}.";
+            StatusText = $"Imported \"{newSet.Name}\" from {dialog.FileName}.";
         }
         catch (JsonException)
         {

@@ -112,7 +112,8 @@
                     <!-- Size report (auto-populated when background sizes are ready) -->
                     <TextBlock Text="{Binding SizeCalculationResult}"
                                Foreground="{StaticResource TextSecondaryBrush}"
-                               FontSize="11" Margin="0,4,0,0">
+                               FontSize="11" Margin="0,4,0,0"
+                               TextWrapping="Wrap">
                         <TextBlock.Style>
                             <Style TargetType="TextBlock">
                                 <Setter Property="Visibility" Value="Visible" />

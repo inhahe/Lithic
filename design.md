@@ -573,6 +573,16 @@ Three rules came out of it, and they generalise to any phase here:
   worker without a lock (a reference store is atomic; which thread wins does not
   matter) and shown by the UI timer. A phase that genuinely does stall then names
   the path it stalled on, instead of leaving a number to be interpreted.
+* **The full path, and all of it visible.** Progress names a file or folder by
+  its full path, never `Path.GetFileName`, `DirectoryInfo.Name` or a
+  destination-relative path. `index.html` says nothing about which one, or where.
+  The displays that show it wrap (`TextWrapping="Wrap"`) instead of
+  `TextTrimming="CharacterEllipsis"`, which cuts off the end of a path, and the end
+  is the file name. The lines that change on every file (the progress panel, the
+  main window's per-set line, both restore windows) keep a two-line `MinHeight`
+  so the layout doesn't jump as paths change length. Tree rows, whose position
+  already implies the path, still show just the name. Test:
+  `tools\targeted_progress_test` §8.
 
 **The same illusion came back in the purge**, which is why this is stated as an
 invariant and not a one-off fix. `PurgeSelected` counted *work items*

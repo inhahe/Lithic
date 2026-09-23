@@ -61,17 +61,17 @@ public class CatalogFreeRestoreService : ICatalogFreeRestoreService
         {
             ct.ThrowIfCancellationRequested();
 
+            string destPath = Path.Combine(outputDirectory, item.OutputRelPath);
+
             progress?.Report(new RestoreProgress
             {
-                CurrentFile = item.OutputRelPath,
+                CurrentFile = destPath,
                 FilesCompleted = filesCompleted,
                 TotalFiles = totalFiles,
                 BytesCompleted = bytesCompleted,
                 TotalBytes = totalBytes,
                 Percentage = totalBytes > 0 ? (double)bytesCompleted / totalBytes * 100 : 0,
             });
-
-            string destPath = Path.Combine(outputDirectory, item.OutputRelPath);
             string? destDir = Path.GetDirectoryName(destPath);
             if (destDir is not null)
                 Directory.CreateDirectory(destDir);

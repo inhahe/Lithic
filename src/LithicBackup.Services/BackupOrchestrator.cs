@@ -1569,7 +1569,7 @@ public class BackupOrchestrator : IBackupOrchestrator
                 {
                     CurrentDisc = 1,
                     TotalDiscs = 1,
-                    CurrentFile = $"Staging: {Path.GetFileName(fileRecord.SourcePath)}",
+                    CurrentFile = $"Staging: {fileRecord.SourcePath}",
                     StatusMessage = "Staging files for re-burn...",
                     OverallPercentage = files.Count > 0 ? (double)idx / files.Count * 50 : 0,
                 });

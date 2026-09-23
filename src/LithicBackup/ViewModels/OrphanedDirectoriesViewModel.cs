@@ -2210,17 +2210,17 @@ public class OrphanedDirectoriesViewModel : ViewModelBase
 
                 // Emit a throttled progress line.  `force` is for the final
                 // report, which must always land so the user sees a true N/N.
-                // An empty dirName drops the trailing ": " rather than printing
+                // An empty dirPath drops the trailing ": " rather than printing
                 // a dangling separator, and a zero total reports 100% instead of
                 // dividing by it — a purge of nothing is complete, not 1/1.
-                void ReportUnits(string dirName, bool force = false)
+                void ReportUnits(string dirPath, bool force = false)
                 {
                     long nowMs = progressSw.ElapsedMilliseconds;
                     if (!force && nowMs - lastProgressMs < ProgressUpdateIntervalMs)
                         return;
                     lastProgressMs = nowMs;
                     int pct = totalUnits <= 0 ? 100 : (int)(doneUnits * 100L / totalUnits);
-                    string suffix = string.IsNullOrEmpty(dirName) ? "" : $": {dirName}";
+                    string suffix = string.IsNullOrEmpty(dirPath) ? "" : $": {dirPath}";
                     ((IProgress<Services.ProgressReport>)progress).Report(
                         $"Updating catalog {doneUnits:N0}/{totalUnits:N0} ({pct}%){suffix}");
                 }
@@ -2239,8 +2239,8 @@ public class OrphanedDirectoriesViewModel : ViewModelBase
                         ct.ThrowIfCancellationRequested();
 
                         var wi = workItems[i];
-                        var dirName = Path.GetFileName(wi.DirectoryPath.TrimEnd('\\'));
-                        ReportUnits(dirName);
+                        var dirPath = wi.DirectoryPath;
+                        ReportUnits(dirPath);
 
                         if (wi.Reason is OrphanedReason.UntrackedFile)
                         {
@@ -2285,7 +2285,7 @@ public class OrphanedDirectoriesViewModel : ViewModelBase
                                 catPurged += _catalog.MarkFileRecordsDeletedByIdsAsync(
                                     backupSetId, ids, ct).GetAwaiter().GetResult();
                                 doneUnits += len;
-                                ReportUnits(dirName);
+                                ReportUnits(dirPath);
                             }
                         }
                         else if (wi.MatchingSourcePaths is not null)
@@ -2311,7 +2311,7 @@ public class OrphanedDirectoriesViewModel : ViewModelBase
                                     backupSetId, paths.GetRange(off, len), ct)
                                     .GetAwaiter().GetResult();
                                 doneUnits += len;
-                                ReportUnits(dirName);
+                                ReportUnits(dirPath);
                             }
                         }
                         else
@@ -2329,7 +2329,7 @@ public class OrphanedDirectoriesViewModel : ViewModelBase
                             catPurged += _catalog.MarkFilesDeletedByDirectoryAsync(
                                 backupSetId, wi.DirectoryPath, ct).GetAwaiter().GetResult();
                             doneUnits++;
-                            ReportUnits(dirName);
+                            ReportUnits(dirPath);
                         }
                     }
 

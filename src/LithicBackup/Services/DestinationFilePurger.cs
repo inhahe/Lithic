@@ -103,6 +103,7 @@ internal static class DestinationFilePurger
             if (ct.IsCancellationRequested) break;
 
             idx++;
+            string fullPath = Path.Combine(targetDir, discRel);
             long nowMs = sw.ElapsedMilliseconds;
             if (progress is not null
                 && (nowMs - lastProgressMs >= ProgressIntervalMs || idx == total))
@@ -110,11 +111,10 @@ internal static class DestinationFilePurger
                 lastProgressMs = nowMs;
                 int pct = total == 0 ? 100 : (int)(idx * 100L / total);
                 progress.Report(new ProgressReport(
-                    $"Deleting backed-up files {idx:N0}/{total:N0} ({pct}%): {Path.GetFileName(discRel)}",
+                    $"Deleting backed-up files {idx:N0}/{total:N0} ({pct}%): {fullPath}",
                     pct));
             }
 
-            string fullPath = Path.Combine(targetDir, discRel);
             try
             {
                 if (File.Exists(fullPath))

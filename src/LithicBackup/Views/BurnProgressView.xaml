@@ -74,9 +74,12 @@
 
         <!-- Current file -->
         <TextBlock Style="{StaticResource SubText}" Text="Current:" Margin="0,0,0,2" />
+        <!-- The full path, wrapped: trimming cut off the end, which is the file
+             name. Two lines kept so the panel doesn't jump as paths change length. -->
         <TextBlock Text="{Binding CurrentFile}"
                    Foreground="{StaticResource TextPrimaryBrush}"
-                   TextTrimming="CharacterEllipsis"
+                   TextWrapping="Wrap"
+                   MinHeight="32"
                    Margin="0,0,0,4" />
 
         <!-- Per-file progress (visible when a file is actively being copied) -->

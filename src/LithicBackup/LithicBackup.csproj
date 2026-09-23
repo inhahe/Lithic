@@ -31,6 +31,7 @@
     <InternalsVisibleTo Include="selection_widening_test" />
     <InternalsVisibleTo Include="editor_save_test" />
     <InternalsVisibleTo Include="missing_source_test" />
+    <InternalsVisibleTo Include="targeted_progress_test" />
   </ItemGroup>
 
   <ItemGroup>

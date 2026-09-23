@@ -209,7 +209,7 @@ public class SimulatedDiscBurner : IDiscBurner
             if (FileFailureProbability > 0 && _rng.NextDouble() < FileFailureProbability)
             {
                 throw new IOException(
-                    $"Simulated write error on file: {Path.GetFileName(fullPath)}");
+                    $"Simulated write error on file: {fullPath}");
             }
 
             // Over-reported capacity: the disc claimed more room than it actually
@@ -279,7 +279,7 @@ public class SimulatedDiscBurner : IDiscBurner
                     bytesWritten += chunkSize;
                     progress?.Report(new BurnProgress
                     {
-                        CurrentFile = Path.GetFileName(fullPath),
+                        CurrentFile = fullPath,
                         BytesWritten = bytesWritten,
                         TotalBytes = totalBytes,
                         Percentage = (double)bytesWritten / totalBytes * 100,
@@ -300,7 +300,7 @@ public class SimulatedDiscBurner : IDiscBurner
 
             progress?.Report(new BurnProgress
             {
-                CurrentFile = Path.GetFileName(fullPath),
+                CurrentFile = fullPath,
                 BytesWritten = Math.Min(bytesWritten, totalBytes),
                 TotalBytes = totalBytes,
                 Percentage = Math.Min((double)bytesWritten / totalBytes * 100, 100),

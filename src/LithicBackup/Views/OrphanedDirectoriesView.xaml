@@ -483,10 +483,11 @@
 
             <!-- Action row: transient purge progress (left) + buttons (right) -->
             <DockPanel>
+                <!-- Wrapped: it shows the full path of the file being deleted. -->
                 <TextBlock Text="{Binding PurgeStatusText}"
                            Foreground="{StaticResource TextSecondaryBrush}"
                            FontSize="11" VerticalAlignment="Center"
-                           TextTrimming="CharacterEllipsis"
+                           TextWrapping="Wrap"
                            Margin="0,0,12,0" />
 
                 <StackPanel Orientation="Horizontal" HorizontalAlignment="Right">

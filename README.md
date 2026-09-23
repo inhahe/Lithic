@@ -97,6 +97,8 @@ couldn't read.
 
 Only directory-mode backup sets can be scheduled (disc burns require physical media interaction).
 
+**Progress shows full paths.** Wherever the app reports the file or folder it is working on — backing up, burning and verifying discs, restoring, Cleanup deleting backed-up copies or scanning the destination, removing dropped folders, calculating sizes — it shows the whole path, e.g. `D:\projects\site\index.html`, not just `index.html`. A long path wraps onto a second line instead of being cut off.
+
 **A backup you start in the app goes first.** If the background Worker is backing up the same set, it pauses at its next commit (within a batch of files, or after the large file it is copying) and carries on once your backup is done. Until then the progress window says "Waiting for the background backup of this set to pause...".
 
 ### Source Selection

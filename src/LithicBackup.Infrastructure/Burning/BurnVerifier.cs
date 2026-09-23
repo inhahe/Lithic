@@ -57,7 +57,7 @@ internal static class BurnVerifier
 
             progress?.Report(new BurnProgress
             {
-                CurrentFile = $"Verifying: {Path.GetFileName(sourcePath)}",
+                CurrentFile = $"Verifying: {sourcePath}",
                 BytesWritten = Math.Min(bytesVerified, totalBytes),
                 TotalBytes = totalBytes,
                 Percentage = Math.Min((double)bytesVerified / denom * 100, 100),

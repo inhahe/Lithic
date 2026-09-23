@@ -319,10 +319,12 @@
                                                                                                         </TextBlock.Text>
                                                                                                     </TextBlock>
                                                                                                 </Grid>
-                                                                                                <!-- Current file (collapsed when idle, e.g. during the scan) -->
+                                                                                                <!-- Current file (collapsed when idle, e.g. during the scan).
+                                                                                                     The full path, wrapped, never cut off at the file name. -->
                                                                                                 <TextBlock Foreground="{StaticResource TextDimBrush}"
                                                                                                            FontSize="10" Margin="0,3,0,0"
-                                                                                                           TextTrimming="CharacterEllipsis"
+                                                                                                           TextWrapping="Wrap"
+                                                                                                           MinHeight="27"
                                                                                                            Text="{Binding CurrentFile, Mode=OneWay}"
                                                                                                            Visibility="{Binding CurrentFile, Converter={StaticResource NonEmptyVis}}" />
                                                                                                 <!-- Byte/time stats (collapsed until real copy figures arrive) -->

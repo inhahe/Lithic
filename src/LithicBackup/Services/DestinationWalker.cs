@@ -134,7 +134,7 @@ public static class DestinationWalker
                             && Interlocked.CompareExchange(ref lastProgressMs, now, last) == last)
                         {
                             progress.Report(
-                                $"Scanning: {scanned:N0} files examined — {item.Dir.Name}");
+                                $"Scanning: {scanned:N0} files examined — {item.Dir.FullName}");
                         }
                     }
 

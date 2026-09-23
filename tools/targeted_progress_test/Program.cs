@@ -10,6 +10,11 @@
 // This drives the real backup engine against a throwaway catalog and temp
 // folders, and checks what that panel depends on: per-file reports naming the
 // file, byte totals, a 100% at the end, and working Pause and Cancel.
+//
+// Section 8: progress names every file by its FULL path. Several displays showed
+// only the file name - Cleanup's "Deleting backed-up files ... : one.txt", the
+// catalog-free restore's destination-relative path - which says nothing about
+// where the file is.
 
 using System.Collections.Concurrent;
 using System.IO;
@@ -40,6 +45,7 @@ internal static class Program
         try
         {
             await RunAsync(root);
+            await FullPathTestsAsync(root);
         }
         catch (Exception ex)
         {
@@ -63,6 +69,57 @@ internal static class Program
         public List<BackupProgress> Data => Reports.Where(r => string.IsNullOrEmpty(r.StatusMessage)).ToList();
         public List<string> Statuses => Reports.Where(r => !string.IsNullOrEmpty(r.StatusMessage))
                                                .Select(r => r.StatusMessage!).ToList();
+    }
+
+    /// <summary>Collects reports synchronously, as they are made.</summary>
+    sealed class Collect<T>(Action<T> add) : IProgress<T>
+    {
+        public void Report(T value) => add(value);
+    }
+
+    static async Task FullPathTestsAsync(string root)
+    {
+        Console.WriteLine();
+        Console.WriteLine("=== 8. progress names each file by its full path, not just its name ===");
+
+        // Cleanup deleting the backed-up copies of files (DestinationFilePurger).
+        string target = Path.Combine(root, "purge-dest");
+        string[] rels = [Path.Combine("D", "projects", "one.txt"), Path.Combine("D", "two.txt")];
+        foreach (var rel in rels)
+        {
+            string p = Path.Combine(target, rel);
+            Directory.CreateDirectory(Path.GetDirectoryName(p)!);
+            File.WriteAllText(p, "x");
+        }
+        var purge = new List<string>();
+        DestinationFilePurger.DeleteFilesAndSweep(
+            target, rels, new Collect<ProgressReport>(r => purge.Add(r.Text)));
+        var deleting = purge.Where(m => m.StartsWith("Deleting backed-up files")).ToList();
+        Check(deleting.Count > 0
+              && deleting.All(m => rels.Any(r => m.EndsWith(": " + Path.Combine(target, r)))),
+            $"deleting backed-up copies names each by its full path: \"{deleting.LastOrDefault()}\"");
+
+        // A catalog-free restore (CatalogFreeRestoreService).
+        string backup = Path.Combine(root, "cf-backup");
+        string output = Path.Combine(root, "cf-output");
+        foreach (var rel in new[] { Path.Combine("C", "docs", "a.txt"), Path.Combine("C", "b.txt") })
+        {
+            string p = Path.Combine(backup, rel);
+            Directory.CreateDirectory(Path.GetDirectoryName(p)!);
+            File.WriteAllText(p, "restore me");
+        }
+        var restoring = new List<string>();
+        await new CatalogFreeRestoreService().RestoreAsync(backup, output,
+            new Collect<RestoreProgress>(p =>
+            {
+                if (!string.IsNullOrEmpty(p.CurrentFile))
+                    restoring.Add(p.CurrentFile);
+            }));
+        Check(restoring.Count == 2
+              && restoring.All(f => Path.IsPathRooted(f)
+                                    && f.StartsWith(output, StringComparison.OrdinalIgnoreCase)
+                                    && File.Exists(f)),
+            $"a catalog-free restore names each file by the full path it is restored to: \"{restoring.FirstOrDefault()}\"");
     }
 
     /// <summary>Create <paramref name="count"/> files in a new folder; returns their paths.</summary>
