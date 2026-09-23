@@ -1,5 +1,6 @@
 using System.IO;
 using System.Windows.Input;
+using LithicBackup.Core;
 using LithicBackup.Core.Models;
 
 namespace LithicBackup.ViewModels;
@@ -42,6 +43,26 @@ public class SourceSelectionNodeViewModel : ViewModelBase
     /// at which point the node serialises normally.
     /// </summary>
     private bool _isAutoIncludeDerived;
+    /// <summary>
+    /// Set when this directory was restored from a saved entry that is ticked,
+    /// lists children, and has auto-include-new off (<see cref="CoversListedChildrenOnly"/>).
+    /// Such an entry backs up exactly the children it lists, so a child that is on
+    /// disk but not listed is NOT covered, and <see cref="CreateChildNode"/> must
+    /// create it unticked instead of letting it inherit the folder's tick.
+    ///
+    /// <para><b>Without this the editor widens the selection by itself.</b> An
+    /// unlisted child used to inherit the tick; nothing marked it as merely drawn
+    /// that way, so <see cref="ToModel"/> wrote it out as a real selection when the
+    /// editor saved. Saved "D:\ ticked, auto-include off, these 95 folders" came
+    /// back as all 309 top-level entries - the recycle bin included - and the next
+    /// backup went for 836,146 files nobody had picked. E:\ went the same way a day
+    /// earlier, down to <c>pagefile.sys</c>.</para>
+    ///
+    /// <para>Cleared the moment the user ticks or unticks this folder (or the
+    /// push-down from an ancestor's click reaches it): that is a choice about the
+    /// whole folder, and children seen after it follow it as usual.</para>
+    /// </summary>
+    private bool _unlistedChildrenExcluded;
     private bool _autoIncludeNew = true;
     private bool _isExpanded;
     private bool _isLoaded;
@@ -619,13 +640,23 @@ public class SourceSelectionNodeViewModel : ViewModelBase
             // auto-include junk) never stuck, while a childless one (C:\Users) did.
             if (value == false && IsDirectory && !_suppressPropagation)
                 DiscardSavedSubtreeSelections();
+            // A tick races the same way: a lazy expand before the settle pass would
+            // re-apply the saved sub-selection - its exclusions included - and
+            // UpdateFromChildren would turn this folder back to partial, losing the
+            // tick. The tick means all of the folder, so release the saved
+            // sub-selection now (see ReleaseSavedSubtreeForInclusion).
+            else if (value == true && IsDirectory && !_suppressPropagation)
+                ReleaseSavedSubtreeForInclusion();
 
             if (_suppressPropagation)
                 return;
 
             // Only a user's click gets here (propagation and recomputes run
-            // suppressed), so this node now carries a choice of its own.
+            // suppressed), so this node now carries a choice of its own - and it is
+            // a choice about the whole folder, so its saved "only these children"
+            // no longer applies (see _unlistedChildrenExcluded).
             _hasExplicitState = true;
+            _unlistedChildrenExcluded = false;
 
             // The clicked checkbox's own visual state is already updated
             // (OnPropertyChanged above).  Defer the rest — pushing the state
@@ -643,8 +674,9 @@ public class SourceSelectionNodeViewModel : ViewModelBase
     }
 
     /// <summary>
-    /// Push this node's current selection state down to loaded children and
-    /// recompute ancestor tristates.  Split out of the <see cref="IsSelected"/>
+    /// Push this node's current selection state down through every loaded
+    /// descendant (a tick or an untick is about the whole folder) and recompute
+    /// ancestor tristates.  Split out of the <see cref="IsSelected"/>
     /// setter so the owning viewmodel can run it off the click's synchronous
     /// path (letting the clicked checkbox repaint first).  Does NOT raise the
     /// selection-changed aggregate — the caller does that once per coalesced
@@ -667,19 +699,76 @@ public class SourceSelectionNodeViewModel : ViewModelBase
                 foreach (var child in Children)
                     child.ExcludeSubtree();
         }
-        else if (value.HasValue && IsDirectory && _isLoaded)
+        else if (value == true && IsDirectory)
         {
-            // Inclusion: push the definite state down to loaded children.
-            foreach (var child in Children)
-            {
-                child._suppressPropagation = true;
-                child.IsSelected = value;
-                child._suppressPropagation = false;
-            }
+            // Inclusion: all of the folder, however deep it has been opened. The
+            // push used to stop at the direct children, so an opened sub-folder's
+            // own exclusions survived under a ticked folder, and a collapsed one
+            // was saved as its old entry verbatim (ToModel's _restoredModel
+            // fallback) - a tick that looked complete and backed up only part.
+            // The mirror of the exclusion branch above.
+            ReleaseSavedSubtreeForInclusion();
+            if (_isLoaded)
+                foreach (var child in Children)
+                    child.IncludeSubtree();
         }
 
         // Propagate up: recalculate parent's tristate.
         Parent?.UpdateFromChildren();
+    }
+
+    /// <summary>
+    /// Recursively tick this node and every loaded descendant, releasing each
+    /// one's saved or deferred sub-selection (<see cref="ReleaseSavedSubtreeForInclusion"/>).
+    /// Used when an ancestor is ticked: the user chose the whole folder, so nothing
+    /// beneath it may keep an older, narrower choice - not an opened grandchild
+    /// left unticked, and not a collapsed folder's saved sub-selection, which
+    /// <see cref="ToModel"/> would write back verbatim and a later expand
+    /// re-apply. The mirror of <see cref="ExcludeSubtree"/>. Does not propagate up
+    /// (the caller owns the ticked ancestor).
+    /// </summary>
+    private void IncludeSubtree()
+    {
+        ReleaseSavedSubtreeForInclusion();
+
+        // Through the setter, suppressed: it raises the notifications, clears the
+        // auto-include-derived flag on a real change, and pushes nothing further.
+        // A derived child is already ticked and keeps its flag, which is right:
+        // its folder now covers it, as the auto-include it was derived from.
+        _suppressPropagation = true;
+        IsSelected = true;
+        _suppressPropagation = false;
+
+        if (IsDirectory && _isLoaded)
+            foreach (var child in Children)
+                child.IncludeSubtree();
+    }
+
+    /// <summary>
+    /// Let go of the narrower choices this directory holds, for a tick of the whole
+    /// folder: the deferred child restore and the restored-model fallback (a
+    /// collapsed folder then saves as ticked with nothing listed - all of it - and
+    /// its children load ticked), and "only these children"
+    /// (<see cref="_unlistedChildrenExcluded"/>). Preserved orphan entries (on disk,
+    /// not enumerated) become whole-folder ticks rather than being dropped: under a
+    /// folder with auto-include off an entry has to stay listed to stay covered.
+    /// </summary>
+    private void ReleaseSavedSubtreeForInclusion()
+    {
+        _pendingDeferredRestore = false;
+        _restoredModel = null;
+        _unlistedChildrenExcluded = false;
+        if (_orphanedChildModels is not null)
+            _orphanedChildModels = _orphanedChildModels
+                .Select(o => new Core.Models.SourceSelection
+                {
+                    Path = o.Path,
+                    IsDirectory = o.IsDirectory,
+                    IsSelected = true,
+                    IsExpanded = o.IsExpanded,
+                    AutoIncludeNewSubdirectories = o.AutoIncludeNewSubdirectories,
+                })
+                .ToList();
     }
 
     /// <summary>
@@ -726,6 +815,7 @@ public class SourceSelectionNodeViewModel : ViewModelBase
         _pendingDeferredRestore = false;
         _restoredModel = null;
         _orphanedChildModels = null;
+        _unlistedChildrenExcluded = false;
     }
 
     /// <summary>
@@ -943,6 +1033,13 @@ public class SourceSelectionNodeViewModel : ViewModelBase
         _restoredModel = model;
         _hasExplicitState = true;
 
+        // "Ticked, auto-include off, these children" backs up only the children
+        // it lists: anything else on disk must come up unticked, not inherit the
+        // tick (see _unlistedChildrenExcluded). The virtual "All Drives" root is
+        // never saved or scanned, so the rule is not applied to it.
+        bool listedOnly = Parent is not null && CoversListedChildrenOnly(model);
+        _unlistedChildrenExcluded = listedOnly;
+
         // Apply state without triggering propagation.
         _suppressPropagation = true;
         _isSelected = model.IsSelected;
@@ -959,7 +1056,10 @@ public class SourceSelectionNodeViewModel : ViewModelBase
         // This node's own state is now settled — reveal its checkbox immediately,
         // without waiting for its (possibly deep, slow-to-enumerate) descendants
         // to finish restoring.  This is what makes checkboxes appear top-down.
-        IsSelectionRestored = true;
+        // Except an "only these children" folder: its saved tick is only right if
+        // nothing unlisted is on disk, which its children decide just below.
+        if (!listedOnly)
+            IsSelectionRestored = true;
 
         // Decide whether to restore this subtree's children eagerly now, or
         // defer it until the user expands the node.  To keep the initial dialog
@@ -968,8 +1068,12 @@ public class SourceSelectionNodeViewModel : ViewModelBase
         // saved model had expanded.  Collapsed subtrees are deferred — their
         // saved child selections are re-applied on first expand (see
         // LoadChildrenAsync), and until then ToModel's _restoredModel fallback
-        // keeps the save lossless.
-        bool restoreChildrenNow = model.IsExpanded || Parent is null;
+        // keeps the save lossless.  An "only these children" folder is loaded
+        // now even when collapsed, so its checkbox is right before it is shown
+        // (partial if anything on disk is unlisted) instead of changing the
+        // first time it is expanded. The shape is rare - one level is read per
+        // such folder.
+        bool restoreChildrenNow = model.IsExpanded || Parent is null || listedOnly;
 
         // If this directory has child selections to restore, load children
         // and apply.  Suppress size computation during this phase — we're
@@ -991,6 +1095,28 @@ public class SourceSelectionNodeViewModel : ViewModelBase
                 // saved subtree; LoadChildrenAsync re-applies it on first expand.
                 _pendingDeferredRestore = true;
             }
+        }
+
+        if (listedOnly)
+        {
+            if (_isLoaded)
+            {
+                // Settle this folder's own box from its children: ticked only if
+                // every entry on disk is listed and ticked, partial otherwise.
+                // Its subtree has finished restoring (ApplyChildModelsAsync awaited
+                // it), and the recompute never reaches above this node.
+                RecomputeLoadedTristate();
+            }
+            else
+            {
+                // Its folder could not be read. Show it partial rather than claim
+                // all of it; saving still writes the saved entry back unchanged
+                // (ToModel's _restoredModel fallback), so nothing is lost.
+                _suppressPropagation = true;
+                IsSelected = null;
+                _suppressPropagation = false;
+            }
+            IsSelectionRestored = true;
         }
 
         // Restore expansion state from the saved model.  Children are
@@ -1047,6 +1173,16 @@ public class SourceSelectionNodeViewModel : ViewModelBase
                 string.Equals(c.Path, childModel.Path, StringComparison.OrdinalIgnoreCase));
             if (childNode is not null)
                 tasks.Add(childNode.ApplySelectionAsync(childModel));
+            else if (VolumeMetadataPaths.IsVolumeMetadata(childModel.Path))
+            {
+                // The recycle bin, System Volume Information and the like: not in
+                // the tree, never backed up whatever the entry says. An old saved
+                // entry for one (a fully-selected drive lists its children) is kept
+                // as it was, invisibly - never shown as "not found" when it comes and
+                // goes, never counted or forgotten.
+                if (childModel.IsSelected != false)
+                    (_orphanedChildModels ??= []).Add(childModel);
+            }
             else
                 (unmatched ??= []).Add(childModel);
         }
@@ -1088,6 +1224,22 @@ public class SourceSelectionNodeViewModel : ViewModelBase
 
         await Task.WhenAll(tasks);
     }
+
+    /// <summary>
+    /// Whether a saved entry is a ticked folder that backs up only the children it
+    /// lists: ticked, at least one child listed, auto-include-new off. The backup
+    /// treats it exactly like a partial folder with the same children
+    /// (<see cref="Core.Models.SourceSelection.IncludesUnlistedDescendants"/> is
+    /// false for both), so the editor must too. This is what turning auto-include
+    /// off on a ticked folder produces (the current children are pinned so new
+    /// ones stay out), and what the 1.3.1 tristate "repair" left behind when it
+    /// promoted partial folders to ticked.
+    /// </summary>
+    internal static bool CoversListedChildrenOnly(Core.Models.SourceSelection model)
+        => model.IsDirectory
+           && model.IsSelected == true
+           && model.Children.Count > 0
+           && !Core.Models.SourceSelection.IncludesUnlistedDescendants(model);
 
     /// <summary>Whether a saved entry's path exists, as a folder or a file to match.</summary>
     internal static bool ExistsOnDisk(Core.Models.SourceSelection model)
@@ -1408,6 +1560,12 @@ public class SourceSelectionNodeViewModel : ViewModelBase
             {
                 foreach (var subDir in dirInfo.EnumerateDirectories())
                 {
+                    // Never user data, never backed up (the recycle bin, System
+                    // Volume Information): not offered either, so the tree shows
+                    // only what a backup can actually include.
+                    if (VolumeMetadataPaths.IsVolumeMetadata(subDir.FullName))
+                        continue;
+
                     try
                     {
                         // Hidden/System directories are shown (so they can be
@@ -1461,6 +1619,10 @@ public class SourceSelectionNodeViewModel : ViewModelBase
             {
                 foreach (var file in dirInfo.EnumerateFiles())
                 {
+                    // The paging, hibernation and swap files - see above.
+                    if (VolumeMetadataPaths.IsVolumeMetadata(file.FullName))
+                        continue;
+
                     try
                     {
                         long size = 0;
@@ -1507,10 +1669,16 @@ public class SourceSelectionNodeViewModel : ViewModelBase
             // render CHECKED, so the checkbox no longer contradicts what will be
             // backed up.  If the child also appears in the saved model,
             // ApplyChildModelsAsync overrides this below.
+            //
+            // Under a fully-selected parent "included" holds only while that
+            // parent really covers unlisted children. One restored as "ticked,
+            // auto-include off, these children" does not (_unlistedChildrenExcluded),
+            // and inheriting the tick there drew every other child checked and
+            // then SAVED it - see that field.
             _isSelected = _isSelected switch
             {
                 false => false,
-                true => true,
+                true => !_unlistedChildrenExcluded || _autoIncludeNew,
                 null => _autoIncludeNew,
             },
             // When the parent is partially selected and auto-include is on, the

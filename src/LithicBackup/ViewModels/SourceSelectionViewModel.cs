@@ -1088,6 +1088,10 @@ public class SourceSelectionViewModel : ViewModelBase, IDisposable
         {
             foreach (var node in nodes)
             {
+                // Never backed up, never shown: whether it exists is irrelevant.
+                if (LithicBackup.Core.VolumeMetadataPaths.IsVolumeMetadata(node.Path))
+                    continue;
+
                 if (!SourceSelectionNodeViewModel.ExistsOnDisk(node))
                 {
                     if (node.IsDirectory) folders++; else files++;
@@ -1194,6 +1198,13 @@ public class SourceSelectionViewModel : ViewModelBase, IDisposable
         var kept = new List<SourceSelection>(model.Children.Count);
         foreach (var child in model.Children)
         {
+            // Left exactly as saved - see CountMissing.
+            if (LithicBackup.Core.VolumeMetadataPaths.IsVolumeMetadata(child.Path))
+            {
+                kept.Add(child);
+                continue;
+            }
+
             if (!SourceSelectionNodeViewModel.ExistsOnDisk(child))
             {
                 changed = true;

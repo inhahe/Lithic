@@ -1,5 +1,236 @@
 # LithicBackup — Known Issues & Tech Debt
 
+## FIXED: ticking a folder could leave parts of it out of the backup (2026-09-23)
+
+**Symptom.** A folder ticked in the editor showed ticked but did not back up all of
+itself. This is the opposite of a widening: whatever the folder had excluded before
+the tick could stay excluded, silently. It was found while investigating the J:
+widening, not reported.
+
+**Cause.** A tick reached only part of the folder, three ways:
+
+1. **Opened sub-folders.** `PropagateSelection` pushed the tick to the **direct**
+   children only. Each child was set with propagation suppressed, so the push
+   stopped there. For `drive` (partial) > `a` (partial, opened) > `y` unticked,
+   ticking `drive` showed `a` ticked while `a\y` stayed unticked. `ToModel` then
+   wrote `y` as an explicit exclusion under a ticked parent. Unticking already
+   recursed (`ExcludeSubtree`).
+2. **Collapsed sub-folders.** A collapsed folder restored with a saved partial
+   choice is written back by `ToModel` from `_restoredModel` **verbatim**. That
+   includes its saved tick state, not the one on screen. Ticking its parent changed
+   the checkbox and nothing else. Expanding it afterwards re-applied any exclusions
+   it had saved, turning it partial again. This is the common case, because the
+   editor opens with most folders collapsed.
+3. **The clicked folder itself, if collapsed.** Ticking a collapsed, partly ticked
+   folder was lost the same way on save. In the real editor the push-down runs in a
+   deferred settle pass. So expanding the folder before that pass re-applied its
+   saved exclusions, turned it partial, and the pass then had nothing to push.
+
+**Fix.** A tick now means the whole folder, as an untick always did:
+- `PropagateSelection` calls `IncludeSubtree`, the mirror of `ExcludeSubtree`. It
+  ticks every loaded descendant, "not found" rows included, however deep.
+- Each of those, and the clicked folder, releases its narrower saved state
+  (`ReleaseSavedSubtreeForInclusion`):
+  - the deferred restore and `_restoredModel`, so a collapsed folder saves as
+    ticked with nothing listed, which is all of it, and loads its children ticked
+  - "only these children" (`_unlistedChildrenExcluded`)
+- Orphan entries become whole-folder ticks rather than being dropped. These are
+  entries on disk that the tree could not list. They must stay listed, because
+  under a folder with auto-include off an unlisted entry is not covered.
+- The click releases the folder's own saved state synchronously in the setter,
+  before the settle pass, as an untick already did.
+
+A derived child, one drawn ticked by auto-include, keeps its flag. The now-ticked
+folder covers it through the same auto-include.
+
+**Tested.** `tools\selection_widening_test` §E (17 checks) runs against a real
+tree and the node view-model:
+- an opened sub-folder two levels down
+- collapsed sub-folders holding a partial choice and an exclusion under
+  auto-include
+- a collapsed folder ticked directly
+- the same with a queued settle pass and an expand before it runs
+- a "not found" row two levels down
+- an orphan entry
+- controls for unticking and for ticking one sibling
+
+Each piece of the fix was reverted in turn and every revert was caught. Putting
+the original one-level push back fails 11 checks, each naming what it would have
+left out, e.g. `left out: a\y\2.txt, c\q\5.txt`.
+
+## FIXED: a ticked folder with auto-include off came back with every child ticked — J:'s D:\ and E:\ widened to the whole drive (2026-09-23)
+
+**Symptom.** "All my folders under D: and E: are ticked. I didn't have it that
+way." In J:'s saved selection, D:\ had gone from 95 listed folders (catalog
+snapshot of 20:38 on 09-22) to **all 309 top-level items**. The new ones included
+`$RECYCLE.BIN`, `Config.Msi` and 193 folders J: had never backed up. The 00:20 J:
+backup then planned **836,487 files, 836,146 of them new** (cancelled at 01:13).
+E:\ had gone the same way a day earlier: from 4 entries to all 57. The 09-22 13:20
+backup swept through them alphabetically. J:'s first-ever copies of
+`E:\$RECYCLE.BIN` (14:53), `E:\System Volume Information` (21:17) and
+`E:\pagefile.sys` / `swapfile.sys` (22:18) are all from that day.
+
+**Cause.** Both drives were stored **ticked, with auto-include off and children
+listed**. For a folder that lists children, the scanner looks only at the
+auto-include flag (`IncludesUnlistedDescendants`) and treats ticked exactly like
+partial. So that shape backs up the listed children and nothing else. The editor
+disagreed. `CreateChildNode` gave every unlisted child of a ticked folder the tick,
+without the `_isAutoIncludeDerived` flag that would have kept it out of the save,
+so `ToModel` wrote each one out as a real selection. 1.6.0 still saved on every
+close, so opening the editor with the folder expanded was enough.
+
+How the shape got there: 1.3.1's tristate "repair" (09-18..09-20, see the I: entry
+below) promoted both from *partial* to *ticked*, because every child they listed
+was ticked. 352ba73 withdrew the code, but saved sets kept the promotion, and only
+I:'s C:\ was repaired. The same shape is also what turning auto-include off on a
+ticked folder deliberately produces, so it is not only a leftover.
+
+E:\ was saved expanded, so its children loaded on every open and the first close
+after the promotion widened it. That was on 09-22 before 13:20; the backup history
+has no trace of the new items before then. D:\ was saved collapsed, and a collapsed
+folder is written back from its saved entry verbatim. So D:\ survived until it was
+expanded in the editor, in the 1.6.0 session that started at 22:37. Its saved
+entry flipped to expanded in the same change.
+
+The coverage functions shared the mistake. `CollectCoveredEntries` and
+`CollectSelectedRoots` treated any ticked folder as its whole subtree. So the
+widened D:\ entries looked "already covered", and no "back up what you added"
+prompt warned of them. The Worker also watched all of D:.
+
+**Fix.**
+- A folder restored in that shape (`CoversListedChildrenOnly`) is flagged
+  `_unlistedChildrenExcluded`. `CreateChildNode` creates its unlisted children
+  unticked.
+- Its children are read at open even when it is collapsed. Its checkbox is shown
+  only after being recomputed from them: *partial* if anything unlisted is on disk,
+  *ticked* if not, with no flip when expanded.
+- A folder created while the editor is open comes up unticked too, as auto-include
+  is off.
+- Ticking or unticking the folder, or an ancestor whose push reaches it, is a
+  whole-folder choice and clears the flag.
+- `Collect*` descends into that shape the way it does a partial folder.
+
+**Data repair (set 4, J:).** The catalog was backed up first to
+`catalog_backup_20260923_014303_pre-J-selection-revert.db`, and the new selection
+was written compare-and-swap against the text it was built from.
+- D:\ has the 95 entries from the 20:38 snapshot.
+- E:\ has the four entries J: had backed up before 09-22: `new_save`, `AI`,
+  `warez` (both gone from disk, kept as the user's choices) and
+  `visual studio projects`, with its sub-entries including the Worker's three
+  `os-lane` pins.
+- Both are stored **partial**. That is identical coverage, and the 1.6.0 editor
+  draws partial correctly, so it cannot widen them again before 1.7.0 is installed.
+- 1.6.0 already re-reads a set before editing or backing it up, so no restart was
+  needed.
+- `E:\new_save` is the one uncertain entry. J: backed it up in May and June, but
+  it wasn't in the 07-12 selection. It is 8 files and was kept.
+- The dropped E:\ items were all first backed up on 09-22 or never. The ones never
+  backed up are empty or unreadable.
+- Copies already on J: from the widened folders stay there. The next full scan
+  marks them deleted, which is non-destructive; only Cleanup removes them.
+
+**Tested.** `tools\selection_widening_test` §D runs against a real directory tree
+through the node view-model:
+- the incident, restored collapsed
+- restored inside a collapsed parent
+- every entry listed
+- a folder created after opening
+- the user's click
+- two controls
+- the coverage diff and the Worker's watch list
+
+Every piece of the fix was reverted in turn and the suite re-run. Reverting the
+inheritance reproduces the incident exactly: `save 1 writes only what it had:
+FULL, 5 listed [keep, other1, other2, other3, loose.txt]`.
+
+## FIXED: the recycle bin was backed up whenever a whole drive was selected (2026-09-23)
+
+**Symptom.** A J: backup showed it was copying a `.py` file from `D:\$Recycle.Bin`.
+The run itself was 836,487 files, 370 GB. Nearly all of that was the widening in
+the entry above: J:'s D:\ had just been saved with every top-level item ticked.
+`D:\$Recycle.Bin` alone held 216,208 files (21 GB) in 76 deleted folders, and
+every one of them was in the plan. Only 3 of the 76 showed in the Recycle Bin
+window, because the rest had lost their `$I` index files. They were invisible to
+the user, but on disk and enumerable.
+
+**Cause.** J:'s D:\ had been widened to every top-level item (see above), and
+nothing marked the recycle bin as not-user-data. A drive selected in full, on
+purpose, would have had the same problem. The same had already happened elsewhere:
+J: held 1,028 files from `E:\$Recycle.Bin` (the earlier E:\ widening), and I:
+14,756 from `C:\$Recycle.Bin` (copied during the runaway whole-of-C: run).
+
+**Fix.** `VolumeMetadataPaths`, which already kept NTFS's `$Extend\$Deleted`
+(files mid-deletion) out of every backup, now also lists Windows' own per-volume
+items: `$Recycle.Bin`, `System Volume Information`, `pagefile.sys`, `hiberfil.sys`,
+`swapfile.sys`. They are hard-excluded by `BuildExclusionFilter`, never walked by
+a scan (`BuildDirectoryPruneFilter`), and no longer shown in the editor's tree.
+Only the first component after a volume root matches, so `D:\projects\$Recycle.Bin`
+or `D:\pagefile.sys.bak` is still backed up. Saved selections can name some of
+these items. J: listed `D:\$RECYCLE.BIN` and `E:\hiberfil.sys` as ticked; the
+widening put both there, and its repair removed them. I: has them unticked on E:.
+Such entries are left as they were, invisibly. They
+never become "not found" rows, never count on the missing-folders bar, and Forget
+never touches them. The skip list wins either way.
+
+**What is already backed up** stays until Cleanup, like everything else: its
+excluded-files category now lists those copies and can release them.
+
+**Tested.** `tools\targeted_progress_test` §5: seven system paths excluded (UNC
+included), six look-alikes still backed up, and scan pruning. Against the old code
+the eight exclusion checks fail and the six look-alikes pass.
+
+## FIXED: the progress panel could sit on a file it had finished with, for minutes (2026-09-23)
+
+**Symptom.** The same run kept showing the `.py` file "for a while" — longer than
+any `.py` file could take.
+
+**Cause, two parts.**
+1. The panel shows at most one progress report per half second and **dropped** the
+   rest. The dropped report could be the one naming the next file. A big file
+   starting within half a second of a small one left the small file's name up.
+2. Nothing corrected it for a long time. Both sets use whole-file duplicate
+   detection, so a file whose size matches stored content is read and hashed in
+   full before anything is copied. That read reported nothing. Here that meant
+   nearly every file moved from E: to D:, whose content J: already held.
+
+**Fix.** The panel holds the newest report back instead of dropping it, and shows
+it when the interval is up. A report still waiting when the run completes is
+discarded, so it cannot overwrite the result. The engine reports the pre-copy read,
+labelled with the new `BackupProgress.CurrentFileActivity` ("Checking for
+duplicates"). The panel shows that label, with the file's own progress bar, in
+place of "Copying files...".
+
+**Tested.** `tools\targeted_progress_test` §6 (the read is reported, on the right
+file, to its full size, then the copy reports as a copy) and §7 (a held-back file
+name appears within the interval; the activity label; completion not overwritten).
+Against the old code all four of those checks fail.
+
+## FIXED: backing up the folders you just added showed no progress at all (2026-09-23)
+
+**Symptom.** After an edit that added folders, answering Yes to "back up the added
+files" showed "Backing up 71 added file(s)…" on the row and a small window saying
+"Copying 71 file(s) to i:\lithicbackup…". Neither moved until the run finished: no
+percentage, no current file, no time remaining.
+
+**Cause.** The run goes through `DirectoryBackupService.ExecuteTargetedAsync`, which
+called `ExecuteAsync(..., progress: null, ...)`. The `ProgressDialog` it ran in did
+supply a reporter, but the lambda ignored it, and `ExecuteTargetedAsync` had no
+parameter to take it anyway. `ExecuteAsync` itself reports every file.
+
+**Fix.** `ExecuteTargetedAsync` takes an optional progress reporter and pause event
+and passes both through; the continuous-backup Worker's call is unchanged. The GUI
+now runs a targeted backup in the row's inline progress panel, the same one a normal
+backup uses: percentage, bytes copied of total, elapsed and remaining time, the file
+being copied with its own progress, Pause and Cancel, and the failed-files list at
+the end. The small dialog is gone from this path.
+
+**Tested.** `tools\targeted_progress_test` runs the real engine on a throwaway
+catalog: every file named as it is copied, the byte total on every report, a
+percentage that only rises and ends at 100, Pause holding the run with nothing
+copied, Cancel ending it, and the Worker's reporter-less call still working (14
+checks). Against the old code the test does not compile: there was no way to pass a
+reporter at all.
+
 ## FIXED: saved choices for folders that no longer exist were invisible — and a source drive that wasn't plugged in was dropped from the set on save (2026-09-22)
 
 **Behaviour, by design.** A selection is stored by path. When a selected folder
@@ -105,6 +336,14 @@ already open: the test's copy then woke that window, bringing it to the front, a
 shut the test down. `App.SkipStartupForTests` now makes `OnStartup` return at once;
 the harness sets it before constructing `App`, stands in its own invisible main
 window, and fails if the app shuts down mid-run.
+
+Those runs also logged through the app's own `CrashLogger` into the user's
+`C:\ProgramData\LithicBackup\logs`. That left 11 crash reports and 25 entries in
+`lithic-gui-20260922.log`, 11 of them FATAL, between 22:15 and 23:52, all with
+`Process : editor_save_test`. They were removed so they cannot be mistaken for
+crashes of the real app. Selection was by that `Process` line only, and nothing the
+app itself wrote was touched. A full run of all 14 harnesses since then leaves those
+logs unchanged.
 
 ## FIXED: the backup-set editor saved changes nobody asked it to save, and its Cancel could not undo them (2026-09-22)
 

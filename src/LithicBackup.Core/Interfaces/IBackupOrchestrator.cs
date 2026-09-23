@@ -159,4 +159,12 @@ public class BackupProgress
     /// When null or empty, the UI shows default copy-progress text.
     /// </summary>
     public string? StatusMessage { get; init; }
+
+    /// <summary>
+    /// What is being done to <see cref="CurrentFile"/> when it is not the copy
+    /// itself - e.g. "Checking for duplicates" while a file is read to hash it
+    /// before deciding whether to copy it at all. Null means copying. Lets a long
+    /// read show as progress on the right file instead of as a frozen display.
+    /// </summary>
+    public string? CurrentFileActivity { get; init; }
 }

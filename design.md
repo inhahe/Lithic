@@ -36,6 +36,13 @@ monitors, an update check. `tools\editor_save_test` ran a second, full Lithic Ba
 that way for a whole session before it came to light. With the real app already
 open, the harness's copy woke that window and shut the harness down.
 
+**A harness that runs a backup must give it a real set.** Since the catalog split
+into per-set databases, the file-dedup index lives in the set's own database. A
+`BackupJob` with `BackupSetId = null` backs up without deduplicating anything, and
+reports no error. `dir_dedup_test` and `dedup_estimate_test` failed on every
+dedup check for that reason alone while dedup itself worked. The app never runs a
+backup without a set.
+
 ## Two processes, one dataset
 
 The GUI and the Worker service are separate processes that share the catalog and
@@ -257,6 +264,42 @@ user who does click Save must not save a promotion they never made.)
 a child counts toward promotion only if it is selected *and not derived*. This is
 the view-model form of the model-level rule below; the 352ba73 revert removed the
 model pass and left this one.
+
+**A child's default follows coverage, not its parent's checkbox.** A folder saved
+as *ticked, auto-include off, these children listed* backs up exactly the listed
+children: for any folder with children, `IncludesUnlistedDescendants` looks only at
+the auto-include flag, and the scanner treats ticked and partial alike. Turning
+auto-include off on a ticked folder is the designed way to get this shape (its
+current children are pinned so later ones stay out), and 1.3.1's promotion left
+it behind on sets that never asked for it. `CreateChildNode` used to give every
+unlisted child of a ticked folder the tick, unflagged, so `ToModel` wrote it out:
+one open and close of the editor turned J:'s D:\ from 95 folders into all 309,
+recycle bin included, and E:\ into every item on the drive down to `pagefile.sys`.
+The restore now flags such a folder (`_unlistedChildrenExcluded`, from
+`CoversListedChildrenOnly`), creates its unlisted children unticked, reads its
+children at open even when it is collapsed, and reveals its checkbox only after
+recomputing it from them. So it shows *partial* when anything unlisted is on disk,
+and *ticked* with no flip on expand when nothing is. A click on the folder, or
+on an ancestor whose push reaches it, is a whole-folder choice and clears the
+flag. `CollectCoveredEntries` and `CollectSelectedRoots` descend into the same
+shape instead of claiming the whole folder. Before this, adding a folder under
+it never counted as "added", and the Worker watched the whole drive.
+
+**A tick or an untick is about the whole folder, however deep it has been
+opened.** `PropagateSelection` pushes either through every loaded descendant
+(`IncludeSubtree` / `ExcludeSubtree`). Both release the narrower saved state
+beneath. A collapsed folder restored from a saved entry is written back from that
+entry verbatim (`ToModel`'s `_restoredModel` fallback, which keeps a never-opened
+subtree lossless). Its deferred restore also re-applies that entry on first
+expand. So a click that only changes the checkbox is lost. It shows, but the save
+writes the old entry, and the next expand re-applies its exclusions. The tick used
+to reach one level down and release
+nothing, so a ticked folder could back up only part of itself. Orphan entries are
+the exception to "release": they are turned into whole-folder ticks, not dropped,
+because under auto-include off an unlisted entry is not covered. The clicked
+folder's own release happens synchronously in the setter, because the push-down
+runs later in a settle pass and an expand in between would re-apply the old
+choices.
 
 **Edit and back up from the catalog, not from memory.** A window that read a set
 hours ago holds an old copy of it. `RefreshFromCatalogAsync` re-reads the set into
@@ -711,6 +754,29 @@ it says which less.
 The ordinary **Backup** button still means everything: it passes no path list and
 takes the full scan.
 
+**A targeted run shows the same progress as any other backup.** It fills the row's
+inline progress panel (`BurnProgressViewModel`) exactly as a full directory backup
+does. It hands a progress reporter and the panel's pause event through
+`ExecuteTargetedAsync` to `ExecuteAsync`, which reports each file as it starts, the
+byte totals, and 100% at the end. It used to run behind a `ProgressDialog` whose
+reporter was never passed down: `ExecuteTargetedAsync` gave `ExecuteAsync`
+`progress: null`, so the run said "Copying N file(s)…" and nothing more until it
+finished. `tools\targeted_progress_test` pins the reports, Pause and Cancel against
+the real engine. Anything new that copies files must take both, or the user is left
+guessing whether it is working.
+
+**Progress is throttled by holding back, never by dropping.** The row panel
+(`BurnProgressViewModel.OnBackupProgress`) shows at most one data report per half
+second. It used to throw the rest away, and the report thrown away could be the one
+naming a new file: a big file that started just after a small one left the small
+file's name on screen for as long as the big one took. It now keeps the newest
+held-back report and shows it when the interval is up. Equally, **a long phase of
+work on one file must report**, not just the copy. Reading a file to hash it
+before deciding whether to copy it (whole-file duplicate detection) is as slow as
+the copy for a big file and used to say nothing. It now reports with
+`BackupProgress.CurrentFileActivity` = "Checking for duplicates", which the panel
+shows in place of "Copying files...".
+
 ## "What does this selection cover" has two answers, and only one is precise
 
 `SourceSelection` offers two collectors, and picking the wrong one is silent:
@@ -885,9 +951,24 @@ offer only Save / Don't Save. Largest Files is the only such flow today.
 
 A file is excluded from a set by any of: a user glob in `ExcludedExtensions`, a
 tier set with **zero** tiers, or a hard exclusion (the app's own data directory,
-NTFS volume metadata). All three live in one place —
+and `VolumeMetadataPaths`). All three live in one place —
 `DirectoryBackupService.BuildExclusionFilter` — because a second copy of the
 logic in the Cleanup view had already drifted from it once.
+
+**`VolumeMetadataPaths` is everything in a volume root that is never user
+data:** NTFS's metadata (`$Extend` and friends, which enumeration never shows),
+and Windows' own per-volume items: `$Recycle.Bin`, `System Volume Information`,
+and the paging, hibernation and swap files. The recycle bin is the same garbage as
+`$Extend\$Deleted` by another route, namely what the user threw away. Before it was
+listed, any set with a whole drive selected backed it up. One run was set to copy
+216,208 files (21 GB) out of `D:\$Recycle.Bin`, most of them invisible even in the
+Recycle Bin window because their `$I` index files were gone. It matches the first
+component after the root only, so a user folder that merely shares a name deeper
+down is ordinary data. Hard exclusions are also pruned from scans
+(`BuildDirectoryPruneFilter`) and left out of the editor's tree, so the tree never
+offers a checkbox for something no backup would include. Copies made before an
+item joined the list are released the way everything is: through Cleanup's
+excluded-files category.
 
 **The invariant: no path may enter or stay in the catalog without passing that
 filter.** Every route by which a path can become tracked must apply it:

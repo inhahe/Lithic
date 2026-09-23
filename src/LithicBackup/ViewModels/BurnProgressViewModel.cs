@@ -4,6 +4,7 @@ using System.Text;
 using System.Threading;
 using System.Windows;
 using System.Windows.Input;
+using System.Windows.Threading;
 using LithicBackup.Core.Interfaces;
 
 namespace LithicBackup.ViewModels;
@@ -34,6 +35,16 @@ public class BurnProgressViewModel : ViewModelBase
     private bool _isPaused;
     private string _statusBeforePause = "";
     private long _lastUiUpdateMs;
+
+    /// <summary>
+    /// The newest data report the throttle held back, applied when the interval
+    /// is up (<see cref="_flushTimer"/>). The throttle used to DROP such a report,
+    /// and the one dropped could be the report that names a new file: a big file
+    /// starting within the interval after a small one left the panel on the small
+    /// file's name for as long as the big one took - minutes on a .py, once.
+    /// </summary>
+    private BackupProgress? _heldBack;
+    private DispatcherTimer? _flushTimer;
 
     /// <summary>
     /// Signaling primitive shared with the backup service. When reset (paused),
@@ -248,6 +259,8 @@ public class BurnProgressViewModel : ViewModelBase
         // progress bars reflect the actual state (e.g. 100% after copying).
         if (!string.IsNullOrEmpty(progress.StatusMessage))
         {
+            // A status report supersedes any data report still waiting its turn.
+            _heldBack = null;
             StatusText = progress.StatusMessage;
             CurrentFile = progress.CurrentFile;
 
@@ -262,10 +275,46 @@ public class BurnProgressViewModel : ViewModelBase
             return;
         }
 
-        // Throttle data-progress updates.
+        // Throttle data-progress updates - but hold the newest one back rather
+        // than dropping it, and show it when the interval is up (see _heldBack).
         long nowMs = _stopwatch.ElapsedMilliseconds;
-        if (nowMs - _lastUiUpdateMs < ProgressUpdateIntervalMs)
+        long sinceLast = nowMs - _lastUiUpdateMs;
+        if (sinceLast < ProgressUpdateIntervalMs)
+        {
+            _heldBack = progress;
+            ScheduleFlush(ProgressUpdateIntervalMs - sinceLast);
             return;
+        }
+
+        _heldBack = null;
+        ApplyDataProgress(progress, nowMs);
+    }
+
+    /// <summary>Show a held-back report once the throttle interval is up.</summary>
+    private void ScheduleFlush(long dueInMs)
+    {
+        if (_flushTimer is null)
+        {
+            _flushTimer = new DispatcherTimer(DispatcherPriority.Background);
+            _flushTimer.Tick += (_, _) =>
+            {
+                _flushTimer!.Stop();
+                if (_heldBack is { } held && IsBurning)
+                {
+                    _heldBack = null;
+                    ApplyDataProgress(held, _stopwatch.ElapsedMilliseconds);
+                }
+            };
+        }
+
+        if (_flushTimer.IsEnabled)
+            return;   // already due; it will show whatever is newest by then
+        _flushTimer.Interval = TimeSpan.FromMilliseconds(Math.Max(1, dueInMs));
+        _flushTimer.Start();
+    }
+
+    private void ApplyDataProgress(BackupProgress progress, long nowMs)
+    {
         _lastUiUpdateMs = nowMs;
 
         CurrentDisc = progress.CurrentDisc;
@@ -317,7 +366,11 @@ public class BurnProgressViewModel : ViewModelBase
             DiscPercentage = progress.DiscBurnProgress.Percentage;
         }
 
-        StatusText = "Copying files...";
+        // What is being done to the current file: copying, unless the engine
+        // says otherwise (e.g. reading it to check for duplicates first).
+        StatusText = string.IsNullOrEmpty(progress.CurrentFileActivity)
+            ? "Copying files..."
+            : progress.CurrentFileActivity + "...";
     }
 
     /// <summary>Creates and returns a CancellationTokenSource for this operation.</summary>
@@ -339,6 +392,10 @@ public class BurnProgressViewModel : ViewModelBase
         IReadOnlyList<FailedFile>? failedFiles = null,
         bool cancelled = false)
     {
+        // Nothing still waiting for the throttle may overwrite the result.
+        _heldBack = null;
+        _flushTimer?.Stop();
+
         PauseEvent.Set();
         IsPaused = false;
         _stopwatch.Stop();

@@ -4,7 +4,8 @@
 // back as "fully selected: every top-level entry on the drive", and the second
 // time the Worker copied 1.2 TB of C: overnight. Then, minutes after the
 // selection was corrected by hand, a GUI session holding the old widened copy
-// wrote it straight back. Three bugs:
+// wrote it straight back. Then the same happened to another set's D:\ and E:\
+// by a different route. Four bugs:
 //
 //   A. The editor's tristate recompute promoted a partial folder to FULLY
 //      selected from children that were only drawn checked by auto-include
@@ -13,10 +14,24 @@
 //      catalog, so a stale copy was displayed and then saved back over.
 //   C. Writers that only meant to record a timestamp or a destination rewrote
 //      the whole row - selection included - from whatever copy they held.
+//   D. A folder saved as "ticked, auto-include off, these children" backs up
+//      only those children, but the editor drew every other child ticked and
+//      wrote them all out on save: J:'s D:\ went from 95 entries to 309 (the
+//      recycle bin among them) and E:\ to every item on the drive, pagefile
+//      included. Coverage diffs read the same shape as the whole folder.
+//
+// And the opposite fault, which narrowed instead:
+//
+//   E. Ticking a folder pushed the tick one level down only, and a collapsed
+//      sub-folder was saved as its old entry. A folder shown ticked could back up
+//      only part of itself.
 //
 // Each is tested at the level it lives: A against a real directory tree and the
 // real node view-model; B by checking the refresh copies every persisted field;
-// C against a real SQLite catalog.
+// C against a real SQLite catalog; D against a real tree, the node view-model
+// and the coverage functions the scanner and the Worker share; E against a real
+// tree and the node view-model, with the editor's deferred push-down as well as
+// the inline one.
 
 using System.IO;
 using System.Reflection;
@@ -52,6 +67,8 @@ internal static class Program
                 try
                 {
                     await TristateTests(root);
+                    await ListedOnlyTests(root);
+                    await TickTests(root);
                     CopyPersistedFieldsTest();
                     await MetadataWriteTests(root);
                 }
@@ -161,6 +178,295 @@ internal static class Program
         Check(node4.Children.Count(c => c.IsSelected == true) == 1,
             "control: with auto-include off only the picked folder is checked");
         Check(node4.IsSelected is null, "control: with auto-include off the folder stays partial");
+    }
+
+    // ------------------------------------------------------------------
+    // D. a ticked folder listing its children, auto-include off
+    // ------------------------------------------------------------------
+
+    static SourceSelection FileSel(string path)
+        => new() { Path = path, IsDirectory = false, IsSelected = true };
+
+    /// <summary>
+    /// Restore under a real parent, as every drive and folder has in the editor
+    /// (the rule under test is deliberately not applied to the parentless
+    /// "All Drives" root).
+    /// </summary>
+    static async Task<SourceSelectionNodeViewModel> OpenUnder(string path, SourceSelection model,
+        Action<SourceSelectionNodeViewModel>? settle = null)
+    {
+        // With a settle delegate a click queues its push-down, as in the real
+        // editor, instead of running it inline.
+        var parent = new SourceSelectionNodeViewModel("", isDirectory: true, parent: null,
+            requestSelectionSettle: settle);
+        var node = new SourceSelectionNodeViewModel(path, isDirectory: true, parent: parent);
+        await node.ApplySelectionAsync(model);
+        return node;
+    }
+
+    static async Task Reexpand(SourceSelectionNodeViewModel node)
+    {
+        node.IsExpanded = false;
+        node.IsExpanded = true;             // re-expanding re-reads the folder
+        await node.EnsureChildrenLoadedAsync();
+    }
+
+    /// <summary>Whether two selections back up exactly the same files under
+    /// <paramref name="dir"/> - every file on disk, plus one in a folder that
+    /// does not exist yet (the auto-include question).</summary>
+    static bool SameCoverage(SourceSelection a, SourceSelection b, string dir)
+        => Directory.EnumerateFiles(dir, "*", SearchOption.AllDirectories)
+            .Append(Path.Combine(dir, "not-yet-created", "x.txt"))
+            .All(f => SourceSelection.IsPathIncluded([a], f) == SourceSelection.IsPathIncluded([b], f));
+
+    static string St(bool? v) => v is null ? "partial" : v == true ? "ticked" : "unticked";
+
+    static string Ticked(SourceSelectionNodeViewModel node)
+        => string.Join(", ", node.Children.Where(c => c.IsSelected == true).Select(c => Path.GetFileName(c.Path)));
+
+    static async Task ListedOnlyTests(string tmp)
+    {
+        Console.WriteLine();
+        Console.WriteLine("=== D. \"ticked, auto-include off, these children\" covers only those children ===");
+
+        string drive = Path.Combine(tmp, "listed");
+        foreach (var name in new[] { "keep", "other1", "other2", "other3" })
+            Directory.CreateDirectory(Path.Combine(drive, name));
+        string keep = Path.Combine(drive, "keep");
+        string other1 = Path.Combine(drive, "other1");
+        File.WriteAllText(Path.Combine(drive, "loose.txt"), "x");
+        File.WriteAllText(Path.Combine(keep, "a.txt"), "x");
+        File.WriteAllText(Path.Combine(other1, "b.txt"), "x");
+
+        // --- the incident: J:'s D:\, saved collapsed ---
+        var saved = Dir(drive, true, auto: false, Dir(keep, true, auto: false));
+        Check(SourceSelection.IsPathIncluded([saved], Path.Combine(keep, "a.txt"))
+              && !SourceSelection.IsPathIncluded([saved], Path.Combine(other1, "b.txt")),
+            "precondition: the backup takes keep\\a.txt and NOT other1\\b.txt");
+
+        var node = await OpenUnder(drive, saved);
+        Check(node.Children.Count == 5,
+            $"its children are read at open although it is collapsed: 4 folders + 1 file ({node.Children.Count})");
+        Check(Ticked(node) == "keep", $"only the listed child is drawn ticked (drawn ticked: {Ticked(node)})");
+        Check(node.IsSelected is null, $"the folder shows PARTIAL - the backup takes part of it (got {St(node.IsSelected)})");
+        Check(node.IsSelectionRestored, "and its checkbox is shown");
+
+        var save1 = node.ToModel();
+        Check(save1 is not null && save1.Children.Count == 1, $"save 1 writes only what it had: {Describe(save1)}");
+        Check(save1 is not null && SameCoverage(saved, save1, drive), "save 1 backs up exactly the same files");
+        var save2 = (await OpenUnder(drive, save1!)).ToModel();
+        Check(save2 is not null && save2.Children.Count == 1, $"save 2 still has 1 entry: {Describe(save2)}");
+        Console.WriteLine("     (before the fix: save 1 listed all 5 - on the real D:\\ that was 309, recycle bin included)");
+
+        // --- a folder that restores collapsed INSIDE a collapsed parent ---
+        string outer = Path.Combine(tmp, "outer");
+        string inner = Path.Combine(outer, "inner");
+        foreach (var name in new[] { "x", "y", "z" })
+            Directory.CreateDirectory(Path.Combine(inner, name));
+        var nested = Dir(outer, null, auto: false, Dir(inner, true, auto: false, Dir(Path.Combine(inner, "x"), true, false)));
+        var outerNode = await OpenUnder(outer, nested);
+        outerNode.IsExpanded = true;       // first expand: the deferred restore runs now
+        await outerNode.EnsureChildrenLoadedAsync();
+        var innerNode = outerNode.Children.Single(c => Path.GetFileName(c.Path) == "inner");
+        Check(innerNode.IsSelected is null && Ticked(innerNode) == "x",
+            $"restored later, on its parent's first expand: partial, only x ticked ({St(innerNode.IsSelected)}; {Ticked(innerNode)})");
+        var outerSaved = outerNode.ToModel();
+        Check(outerSaved is not null && SameCoverage(nested, outerSaved, outer), $"and saving it changes nothing backed up");
+
+        // --- every entry listed and ticked: stays ticked, no change on expand ---
+        var all = Dir(drive, true, auto: false,
+            Dir(keep, true, false), Dir(other1, true, false),
+            Dir(Path.Combine(drive, "other2"), true, false), Dir(Path.Combine(drive, "other3"), true, false),
+            FileSel(Path.Combine(drive, "loose.txt")));
+        var full = await OpenUnder(drive, all);
+        Check(full.IsSelected == true, "every entry listed and ticked: it shows TICKED from the start");
+        full.IsExpanded = true;
+        await full.EnsureChildrenLoadedAsync();
+        Check(full.IsSelected == true, "and expanding it changes nothing");
+
+        // --- a folder created later is not covered by it: drawn unticked, not saved ---
+        Directory.CreateDirectory(Path.Combine(drive, "late"));
+        await Reexpand(full);
+        var late = full.Children.FirstOrDefault(c => Path.GetFileName(c.Path) == "late");
+        Check(late is not null && late.IsSelected == false,
+            $"a folder created since the save is drawn unticked (auto-include is off) ({St(late?.IsSelected)})");
+        Check(full.IsSelected is null, "and the folder turns partial, as it is");
+        var fullSaved = full.ToModel();
+        Check(fullSaved is not null && SameCoverage(all, fullSaved, drive),
+            $"saving adds nothing to the backup: {Describe(fullSaved)}");
+
+        // --- the user ticks the folder: now it IS the whole folder ---
+        var clicked = await OpenUnder(drive, saved);
+        clicked.IsSelected = true;          // a click (tests have no settle delegate: runs inline)
+        Check(clicked.Children.All(c => c.IsSelected == true), "clicking the folder ticks every child");
+        Directory.CreateDirectory(Path.Combine(drive, "late2"));
+        await Reexpand(clicked);
+        var late2 = clicked.Children.FirstOrDefault(c => Path.GetFileName(c.Path) == "late2");
+        Check(late2?.IsSelected == true, "and a folder appearing after that click follows it, ticked");
+        var clickedSaved = clicked.ToModel();
+        Check(clickedSaved is not null && SourceSelection.IsPathIncluded([clickedSaved], Path.Combine(other1, "b.txt")),
+            "saving that click backs up the rest of the folder");
+
+        // --- controls: the shapes that DO cover unlisted children ---
+        var whole = Dir(drive, true, auto: false);
+        var wholeNode = await OpenUnder(drive, whole);
+        await wholeNode.EnsureChildrenLoadedAsync();
+        Check(wholeNode.Children.Count > 0 && wholeNode.Children.All(c => c.IsSelected == true),
+            "control: ticked with nothing listed is the whole folder - every child drawn ticked");
+        var autoOn = Dir(drive, true, auto: true, Dir(keep, true, false));
+        var autoOnNode = await OpenUnder(drive, autoOn);
+        await autoOnNode.EnsureChildrenLoadedAsync();
+        Check(autoOnNode.Children.Count > 1 && autoOnNode.Children.All(c => c.IsSelected == true),
+            "control: with auto-include ON unlisted children are covered - drawn ticked");
+
+        // --- the coverage diff behind "back up what you just added" agrees ---
+        var before = SourceSelection.CollectCoveredEntries([saved]);
+        Check(before.SequenceEqual([keep]), $"CollectCoveredEntries: just the listed child ({string.Join(", ", before)})");
+        var after = SourceSelection.CollectCoveredEntries([Dir(drive, null, false, Dir(keep, true, false), Dir(other1, true, false))]);
+        var added = after.Where(r => !before.Any(o => r.Equals(o, StringComparison.OrdinalIgnoreCase)
+                                                    || r.StartsWith(o.TrimEnd('\\') + "\\", StringComparison.OrdinalIgnoreCase)))
+                         .ToList();
+        Check(added.SequenceEqual([other1]),
+            $"ticking other1 under it counts as ADDED, so the offer to back it up appears ({string.Join(", ", added)})");
+        Check(SourceSelection.CollectSelectedRoots([saved]).SequenceEqual([keep]),
+            "CollectSelectedRoots (the Worker's watch list): just the listed child");
+        Check(SourceSelection.CollectCoveredEntries([whole]).SequenceEqual([drive])
+              && SourceSelection.CollectCoveredEntries([autoOn]).SequenceEqual([drive]),
+            "control: whole-folder and auto-include-on shapes are still collected whole");
+    }
+
+    // ------------------------------------------------------------------
+    // E. ticking a folder covers all of it, however deep it was opened
+    // ------------------------------------------------------------------
+
+    static SourceSelection Exp(SourceSelection s)
+    {
+        s.IsExpanded = true;
+        return s;
+    }
+
+    /// <summary>The files under <paramref name="dir"/> a saved selection leaves out.</summary>
+    static List<string> LeftOut(SourceSelection? m, string dir)
+        => Directory.EnumerateFiles(dir, "*", SearchOption.AllDirectories)
+            .Where(f => m is null || !SourceSelection.IsPathIncluded([m], f))
+            .Select(f => Path.GetRelativePath(dir, f))
+            .ToList();
+
+    static async Task TickTests(string tmp)
+    {
+        Console.WriteLine();
+        Console.WriteLine("=== E. ticking a folder backs up ALL of it, however deep it was opened ===");
+
+        string top = Path.Combine(tmp, "tick");
+        string a = Path.Combine(top, "a"), b = Path.Combine(top, "b"), c = Path.Combine(top, "c");
+        string ax = Path.Combine(a, "x"), ay = Path.Combine(a, "y");
+        string cp = Path.Combine(c, "p"), cq = Path.Combine(c, "q");
+        foreach (var (dir, file) in new[] { (ax, "1.txt"), (ay, "2.txt"), (b, "3.txt"), (cp, "4.txt"), (cq, "5.txt") })
+        {
+            Directory.CreateDirectory(dir);
+            File.WriteAllText(Path.Combine(dir, file), "x");
+        }
+        File.WriteAllText(Path.Combine(top, "loose.txt"), "x");
+
+        // --- 1. an OPENED sub-folder's own choices, two levels down ---
+        var opened = Exp(Dir(top, null, auto: false, Exp(Dir(a, null, auto: false, Dir(ax, true, false)))));
+        var n1 = await OpenUnder(top, opened);
+        var y1 = n1.Children.Single(ch => ch.Path == a).Children.Single(ch => ch.Path == ay);
+        Check(y1.IsSelected == false, "precondition: a\\y is unticked inside the opened, partly ticked a");
+        n1.IsSelected = true;               // the user ticks the folder
+        Check(y1.IsSelected == true, $"ticking the folder ticks a\\y, two levels down (got {St(y1.IsSelected)})");
+        var left1 = LeftOut(n1.ToModel(), top);
+        Check(left1.Count == 0, $"and saving backs up every file in it (left out: {string.Join(", ", left1)})");
+        Console.WriteLine("     (before the fix: a\\y stayed unticked under a ticked a, and a\\y\\2.txt was left out)");
+
+        // --- 2. COLLAPSED sub-folders holding saved partial choices ---
+        var collapsed = Exp(Dir(top, null, auto: false,
+            Dir(a, null, auto: false, Dir(ax, true, false)),        // a: only x
+            Dir(c, null, auto: true, Dir(cq, false, false))));      // c: all but q
+        Check(LeftOut(collapsed, top).Contains(Path.Combine("a", "y", "2.txt"))
+              && LeftOut(collapsed, top).Contains(Path.Combine("c", "q", "5.txt")),
+            "precondition: a\\y and c\\q are not backed up");
+        var n2 = await OpenUnder(top, collapsed);
+        n2.IsSelected = true;
+        var left2 = LeftOut(n2.ToModel(), top);
+        Check(left2.Count == 0,
+            $"ticking the folder covers its collapsed sub-folders' contents too (left out: {string.Join(", ", left2)})");
+        var a2 = n2.Children.Single(ch => ch.Path == a);
+        var c2 = n2.Children.Single(ch => ch.Path == c);
+        a2.IsExpanded = true;
+        await a2.EnsureChildrenLoadedAsync();
+        c2.IsExpanded = true;
+        await c2.EnsureChildrenLoadedAsync();
+        Check(a2.Children.All(ch => ch.IsSelected == true) && c2.Children.All(ch => ch.IsSelected == true),
+            $"expanding them afterwards shows all of it ticked (a: {Ticked(a2)}; c: {Ticked(c2)})");
+        Check(a2.IsSelected == true && c2.IsSelected == true,
+            "and no old exclusion comes back to turn them partial");
+        Console.WriteLine("     (before the fix: both were saved as their old entries, leaving out a\\y and c\\q)");
+
+        // --- 3. ticking a COLLAPSED folder itself ---
+        var n3 = await OpenUnder(a, Dir(a, null, auto: false, Dir(ax, true, false)));
+        n3.IsSelected = true;
+        var left3 = LeftOut(n3.ToModel(), a);
+        Check(left3.Count == 0,
+            $"ticking a collapsed, partly ticked folder saves all of it (left out: {string.Join(", ", left3)})");
+
+        // --- 4. ... expanded before the queued push has run, as the editor does it ---
+        var queued = new List<SourceSelectionNodeViewModel>();
+        var n4 = await OpenUnder(c, Dir(c, null, auto: true, Dir(cq, false, false)), settle: queued.Add);
+        n4.IsSelected = true;               // the click; its push-down is queued
+        n4.IsExpanded = true;               // the user expands before the settle pass
+        await n4.EnsureChildrenLoadedAsync();
+        foreach (var node in queued)
+            node.PropagateSelection();       // the settle pass
+        var q4 = n4.Children.Single(ch => ch.Path == cq);
+        Check(n4.IsSelected == true && q4.IsSelected == true,
+            $"the old exclusion of q is not re-applied by the expand (c {St(n4.IsSelected)}, q {St(q4.IsSelected)})");
+        var left4 = LeftOut(n4.ToModel(), c);
+        Check(left4.Count == 0, $"and saving backs up all of c (left out: {string.Join(", ", left4)})");
+
+        // --- 5. a "not found" entry two levels down ---
+        string gone = Path.Combine(a, "gone");
+        var withMissing = Exp(Dir(top, null, auto: false, Exp(Dir(a, null, auto: true, Dir(gone, false, false)))));
+        var n5 = await OpenUnder(top, withMissing);
+        var g5 = n5.Children.Single(ch => ch.Path == a).Children.SingleOrDefault(ch => ch.Path == gone);
+        Check(g5 is not null && g5.IsMissing && g5.IsSelected == false,
+            "precondition: a\\gone is a 'not found' row, excluded");
+        n5.IsSelected = true;
+        Check(g5?.IsSelected == true, "ticking the folder ticks that row as well");
+        Check(n5.ToModel() is { } m5 && SourceSelection.IsPathIncluded([m5], Path.Combine(gone, "back.txt")),
+            "so if it comes back it is backed up with the rest of the folder");
+
+        // --- 6. an entry saved under it that the tree could not list ---
+        // On disk but not enumerated (a transient access error, say), and kept
+        // invisibly so a save cannot drop it. Planted directly: there is no
+        // portable way to make the enumeration skip a real entry.
+        string unlisted = Path.Combine(top, "unlisted");
+        var n6 = await OpenUnder(top, Exp(Dir(top, null, auto: false, Dir(b, true, false))));
+        typeof(SourceSelectionNodeViewModel)
+            .GetField("_orphanedChildModels", BindingFlags.NonPublic | BindingFlags.Instance)!
+            .SetValue(n6, new List<SourceSelection>
+            {
+                Dir(unlisted, null, false, Dir(Path.Combine(unlisted, "k"), true, false)),
+            });
+        Check(n6.ToModel() is { } before6
+              && !SourceSelection.IsPathIncluded([before6], Path.Combine(unlisted, "z.txt")),
+            "precondition: that entry's saved partial choice leaves unlisted\\z.txt out");
+        n6.IsSelected = true;
+        var m6 = n6.ToModel();
+        Check(m6 is not null && SourceSelection.IsPathIncluded([m6], Path.Combine(unlisted, "z.txt"))
+              && m6.Children.Any(ch => ch.Path == unlisted),
+            "ticking the folder makes it all of that entry, still listed so auto-include-off keeps it");
+
+        // --- controls ---
+        var n7 = await OpenUnder(top, opened);
+        n7.IsSelected = false;
+        Check(LeftOut(n7.ToModel(), top).Count == Directory.EnumerateFiles(top, "*", SearchOption.AllDirectories).Count(),
+            "control: unticking the folder still takes out everything in it");
+        var n8 = await OpenUnder(top, opened);
+        var a8 = n8.Children.Single(ch => ch.Path == a);
+        n8.Children.Single(ch => ch.Path == b).IsSelected = true;
+        Check(a8.IsSelected is null && a8.Children.Single(ch => ch.Path == ay).IsSelected == false,
+            "control: ticking one sub-folder leaves its siblings' choices alone");
     }
 
     // ------------------------------------------------------------------

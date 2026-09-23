@@ -1,10 +1,12 @@
 namespace LithicBackup.Core;
 
 /// <summary>
-/// Paths that live on a volume but are NOT user data and can never be shown in
-/// a directory listing — NTFS's own metadata files and directories.
+/// Paths in a volume root that are never user data, and so are never backed up
+/// whatever the selection says: NTFS's own metadata, and Windows' own per-volume
+/// system items (the recycle bin, System Volume Information, the paging,
+/// hibernation and swap files).
 ///
-/// <para><b>Why this exists.</b> Two different mechanisms discover files for a
+/// <para><b>NTFS metadata.</b> Two different mechanisms discover files for a
 /// backup, and they do not see the same filesystem:</para>
 /// <list type="bullet">
 ///   <item><description>Directory enumeration (the source-selection treeview and
@@ -30,26 +32,40 @@ namespace LithicBackup.Core;
 /// eight times. Two real backup sets held ~4.2 GB of this. See the
 /// "$Extend" entry in known-issues.md.</para>
 ///
-/// <para><b>The invariant.</b> Anything the selection treeview cannot display
-/// must not be backed up, so that what the user sees is what the backup does.
-/// This class is the single definition of that set, applied both to the backup
-/// hot paths and to the worker's set-membership / auto-include-new test, so the
-/// two can never drift apart.</para>
+/// <para><b>Windows' system items.</b> These DO show up in a listing, so a set with
+/// a whole drive selected used to back them up. <c>$Recycle.Bin</c> is the same
+/// garbage as <c>$Extend\$Deleted</c> by another route: what the user deleted.
+/// One set was found copying 216,208 files (21 GB) out of <c>D:\$Recycle.Bin</c>,
+/// most of them invisible even in the Recycle Bin window because their
+/// <c>$I</c> index files were gone. <c>System Volume Information</c> holds restore
+/// points, shadow-copy storage and the search index, and is unreadable anyway; the
+/// paging, hibernation and swap files are locked by the OS. The editor's tree does
+/// not show them either, so nothing it offers to back up is silently skipped. See
+/// the recycle-bin entry in known-issues.md.</para>
+///
+/// <para><b>The invariant.</b> Anything that is never user data must not be backed
+/// up, and must not be offered as though it could be. This class is the single
+/// definition of that set, applied to the backup hot paths, the scan's directory
+/// pruning, the editor's tree, and the worker's set-membership / auto-include-new
+/// test, so none of them can drift apart.</para>
 /// </summary>
 public static class VolumeMetadataPaths
 {
     /// <summary>
-    /// The NTFS metadata entries that sit directly in a volume root. All of them
-    /// begin with '$', and none are returned by directory enumeration.
+    /// The entries that sit directly in a volume root and are never user data.
     ///
-    /// <para><c>$Extend</c> is the one that actually shows up in USN records in
-    /// practice (via <c>$Deleted</c>, <c>$RmMetadata</c>, <c>$Quota</c>,
-    /// <c>$ObjId</c>, <c>$Reparse</c>). The rest are listed so a future Windows
-    /// build that starts journaling them is covered too, rather than silently
-    /// reintroducing this bug.</para>
+    /// <para>The NTFS metadata entries all begin with '$' and are never returned by
+    /// directory enumeration. <c>$Extend</c> is the one that actually shows up in
+    /// USN records in practice (via <c>$Deleted</c>, <c>$RmMetadata</c>,
+    /// <c>$Quota</c>, <c>$ObjId</c>, <c>$Reparse</c>). The rest are listed so a
+    /// future Windows build that starts journaling them is covered too, rather than
+    /// silently reintroducing this bug.</para>
+    ///
+    /// <para>The Windows system items are enumerable; see the class summary.</para>
     /// </summary>
-    private static readonly HashSet<string> RootMetadataNames = new(StringComparer.OrdinalIgnoreCase)
+    private static readonly HashSet<string> RootNames = new(StringComparer.OrdinalIgnoreCase)
     {
+        // NTFS metadata.
         "$Extend",
         "$MFT",
         "$MFTMirr",
@@ -61,18 +77,25 @@ public static class VolumeMetadataPaths
         "$BadClus",
         "$Secure",
         "$UpCase",
+
+        // Windows' own per-volume items.
+        "$Recycle.Bin",
+        "System Volume Information",
+        "pagefile.sys",
+        "hiberfil.sys",
+        "swapfile.sys",
     };
 
     /// <summary>
-    /// True when <paramref name="path"/> is an NTFS metadata entry in a volume
-    /// root, or lives underneath one. Such a path is never user data and is never
-    /// enumerable, so it must never be backed up.
+    /// True when <paramref name="path"/> is one of <see cref="RootNames"/> in a
+    /// volume root, or lives underneath one. Such a path is never user data, so it
+    /// must never be backed up.
     /// </summary>
     /// <remarks>
     /// Deliberately matches on the FIRST path component after the volume root
-    /// only. A user directory genuinely named "$Extend" nested somewhere else
-    /// (e.g. <c>D:\projects\$Extend</c>) is ordinary data, is enumerable, is
-    /// visible in the treeview, and must keep being backed up.
+    /// only. A user directory genuinely named "$Extend" or "$Recycle.Bin" nested
+    /// somewhere else (e.g. <c>D:\projects\$Extend</c>) is ordinary data, is
+    /// enumerable, is visible in the treeview, and must keep being backed up.
     /// </remarks>
     public static bool IsVolumeMetadata(string? path)
     {
@@ -80,12 +103,13 @@ public static class VolumeMetadataPaths
             return false;
 
         string name = FirstComponentAfterRoot(path);
-        return name.Length > 0 && RootMetadataNames.Contains(name);
+        return name.Length > 0 && RootNames.Contains(name);
     }
 
     /// <summary>
     /// The first path component below the volume root, or "" when the path has
-    /// none (it IS a root) or isn't a rooted local path.
+    /// none (it IS a root), isn't a rooted local path, or cannot be one of
+    /// <see cref="RootNames"/>.
     /// </summary>
     /// <remarks>
     /// Written against the raw string rather than <see cref="Path.GetPathRoot"/>
@@ -145,9 +169,10 @@ public static class VolumeMetadataPaths
         if (start >= path.Length)
             return string.Empty;
 
-        // Fast reject: every NTFS metadata name starts with '$', so a normal
-        // path costs one character comparison and no allocation.
-        if (path[start] != '$')
+        // Fast reject: every name in RootNames starts with '$', 's', 'p' or 'h',
+        // so an ordinary path usually costs one character comparison and no
+        // allocation.
+        if (path[start] is not ('$' or 's' or 'S' or 'p' or 'P' or 'h' or 'H'))
             return string.Empty;
 
         int end = start;

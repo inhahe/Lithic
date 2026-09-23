@@ -718,6 +718,39 @@ public class DirectoryBackupService
                     && !mightBeUnchanged
                     && !StubPlainContentForTesting;
 
+                // Reading a whole file to hash it before deciding whether to copy
+                // it (the duplicate and unchanged-content checks) is as slow as the
+                // copy itself for a big file, and it used to report nothing: the
+                // progress panel went on showing the previous file for the whole
+                // read - one sat on a small .py for minutes while a large file
+                // behind it was being hashed. Report the read as its own activity.
+                Action<long>? hashProgress = null;
+                if (!deferHashToCopy && file.SizeBytes >= PerFileProgressThreshold && progress is not null)
+                {
+                    long capturedBytesProcessed = bytesProcessed;
+                    long lastReportedAt = -PerFileReportInterval;
+                    hashProgress = bytesRead =>
+                    {
+                        if (bytesRead - lastReportedAt < PerFileReportInterval && bytesRead < file.SizeBytes)
+                            return;
+                        lastReportedAt = bytesRead;
+                        progress.Report(new BackupProgress
+                        {
+                            CurrentDisc = 1,
+                            TotalDiscs = 1,
+                            CurrentFile = file.FullPath,
+                            BytesWrittenTotal = capturedBytesProcessed,
+                            BytesTotalAll = totalBytes,
+                            OverallPercentage = totalBytes > 0
+                                ? (double)capturedBytesProcessed / totalBytes * 100
+                                : 0,
+                            CurrentFileBytesWritten = bytesRead,
+                            CurrentFileTotalBytes = file.SizeBytes,
+                            CurrentFileActivity = "Checking for duplicates",
+                        });
+                    };
+                }
+
                 if (!deferHashToCopy)
                 {
                     // Compute the hash now — needed for the content-identity
@@ -752,14 +785,14 @@ public class DirectoryBackupService
                             // buffer is dropped when this iteration ends.
                             try
                             {
-                                contentBuffer = await ReadAllBytesSharedAsync(file.FullPath, ct);
+                                contentBuffer = await ReadAllBytesSharedAsync(file.FullPath, ct, hashProgress);
                                 contentSize = contentBuffer.Length;
                                 hash = ComputeHashOfBuffer(contentBuffer);
                             }
                             catch
                             {
                                 contentBuffer = null;
-                                (hash, contentSize) = await ComputeFileHashAndSizeAsync(file.FullPath, ct);
+                                (hash, contentSize) = await ComputeFileHashAndSizeAsync(file.FullPath, ct, hashProgress);
                             }
                         }
                         else if (!blockDedupEnabled
@@ -783,7 +816,7 @@ public class DirectoryBackupService
                         }
                         else
                         {
-                            (hash, contentSize) = await ComputeFileHashAndSizeAsync(file.FullPath, ct);
+                            (hash, contentSize) = await ComputeFileHashAndSizeAsync(file.FullPath, ct, hashProgress);
                         }
                     }
                 }
@@ -1747,15 +1780,28 @@ public class DirectoryBackupService
     /// <see cref="ExecuteAsync"/>, reusing all per-file versioning, dedup,
     /// retention, and catalog machinery.
     /// </remarks>
+    /// <param name="progress">
+    /// Per-file progress, as <see cref="ExecuteAsync"/> reports it. The GUI's "back
+    /// up the folders you just added" run shows it; it used to pass nothing here,
+    /// so that run said only "Copying N file(s)…" until it finished.
+    /// </param>
+    /// <param name="pauseEvent">Pause support, as for <see cref="ExecuteAsync"/>.</param>
     public async Task<BackupResult> ExecuteTargetedAsync(
         BackupJob job,
         string targetDirectory,
         IReadOnlyList<string> candidatePaths,
         IReadOnlyList<VersionRetentionTier>? retentionTiers,
-        CancellationToken ct)
+        CancellationToken ct,
+        IProgress<BackupProgress>? progress = null,
+        ManualResetEventSlim? pauseEvent = null)
     {
         if (!job.BackupSetId.HasValue)
             throw new ArgumentException("Targeted backup requires an existing backup set.", nameof(job));
+
+        progress?.Report(new BackupProgress
+        {
+            StatusMessage = $"Checking {candidatePaths.Count:N0} file(s) against the catalog...",
+        });
 
         var isExcluded = BuildExclusionFilter(job);
 
@@ -1845,7 +1891,7 @@ public class DirectoryBackupService
 
         return await ExecuteAsync(
             job, targetDirectory, retentionTiers,
-            progress: null, ct, precomputedDiff: diff,
+            progress, ct, pauseEvent, precomputedDiff: diff,
             scopeRetentionToBackedUpFiles: true);
     }
 
@@ -2266,7 +2312,9 @@ public class DirectoryBackupService
     /// <see cref="VersionTierSet.FileExemptPatterns"/> — an exempt pattern can
     /// re-include a file deep inside, so the subtree is not uniformly
     /// excluded;</item>
-    /// <item>the app's own data directory, which is excluded wholesale.</item>
+    /// <item>the app's own data directory, which is excluded wholesale;</item>
+    /// <item>Windows' per-volume system folders (<see cref="VolumeMetadataPaths"/>),
+    /// likewise.</item>
     /// </list>
     /// Anything it cannot prove, it declines to prune: the cost is a slower scan,
     /// never a missing file.
@@ -2302,6 +2350,11 @@ public class DirectoryBackupService
         return directoryPath =>
         {
             if (CatalogLocation.IsInsideAppDataDirectory(directoryPath))
+                return true;
+            // Never walk the recycle bin or System Volume Information: every file
+            // beneath is excluded anyway (BuildExclusionFilter), and one recycle bin
+            // alone held 216,208 files.
+            if (VolumeMetadataPaths.IsVolumeMetadata(directoryPath))
                 return true;
             if (globPrune?.Invoke(directoryPath) ?? false)
                 return true;
@@ -2923,16 +2976,66 @@ public class DirectoryBackupService
     /// on a file another app holds open for writing), this can back up a file
     /// that is still open in its editor — e.g. a note open in KeyNote NF.
     /// </summary>
-    private static async Task<byte[]> ReadAllBytesSharedAsync(string filePath, CancellationToken ct)
+    private static async Task<byte[]> ReadAllBytesSharedAsync(
+        string filePath, CancellationToken ct, Action<long>? onProgress = null)
     {
-        await using var stream = new FileStream(
+        await using var file = new FileStream(
             filePath, FileMode.Open, FileAccess.Read, FileShare.ReadWrite,
             bufferSize: 81920, useAsync: true);
+        Stream stream = onProgress is null ? file : new ProgressReadStream(file, onProgress);
 
         using var ms = new MemoryStream(
-            stream.Length > 0 && stream.Length <= int.MaxValue ? (int)stream.Length : 0);
+            file.Length > 0 && file.Length <= int.MaxValue ? (int)file.Length : 0);
         await stream.CopyToAsync(ms, ct);
         return ms.ToArray();
+    }
+
+    /// <summary>
+    /// A read-only pass-through that reports the bytes read so far after each
+    /// read, so a whole-file read (to hash it) can drive a progress bar.
+    /// </summary>
+    private sealed class ProgressReadStream(Stream inner, Action<long> onProgress) : Stream
+    {
+        private long _read;
+
+        public override bool CanRead => true;
+        public override bool CanSeek => false;
+        public override bool CanWrite => false;
+        public override long Length => inner.Length;
+        public override long Position
+        {
+            get => inner.Position;
+            set => throw new NotSupportedException();
+        }
+
+        public override int Read(byte[] buffer, int offset, int count)
+            => Advance(inner.Read(buffer, offset, count));
+
+        public override int Read(Span<byte> buffer) => Advance(inner.Read(buffer));
+
+        public override async Task<int> ReadAsync(
+            byte[] buffer, int offset, int count, CancellationToken cancellationToken)
+            => Advance(await inner.ReadAsync(buffer.AsMemory(offset, count), cancellationToken)
+                                  .ConfigureAwait(false));
+
+        public override async ValueTask<int> ReadAsync(
+            Memory<byte> buffer, CancellationToken cancellationToken = default)
+            => Advance(await inner.ReadAsync(buffer, cancellationToken).ConfigureAwait(false));
+
+        public override void Flush() { }
+        public override long Seek(long offset, SeekOrigin origin) => throw new NotSupportedException();
+        public override void SetLength(long value) => throw new NotSupportedException();
+        public override void Write(byte[] buffer, int offset, int count) => throw new NotSupportedException();
+
+        private int Advance(int n)
+        {
+            if (n > 0)
+            {
+                _read += n;
+                onProgress(_read);
+            }
+            return n;
+        }
     }
 
     /// <summary>
@@ -2943,18 +3046,19 @@ public class DirectoryBackupService
     /// between the directory scan and this read.
     /// </summary>
     private static async Task<(string Hash, long Size)> ComputeFileHashAndSizeAsync(
-        string filePath, CancellationToken ct)
+        string filePath, CancellationToken ct, Action<long>? onProgress = null)
     {
-        await using var stream = new FileStream(
+        await using var file = new FileStream(
             // ReadWrite share so a file another app holds open for writing
             // (e.g. a note still open in KeyNote NF) can still be hashed.
             // Safe for destination callers too: they never write concurrently.
             filePath, FileMode.Open, FileAccess.Read, FileShare.ReadWrite,
             bufferSize: 81920, useAsync: true);
+        Stream stream = onProgress is null ? file : new ProgressReadStream(file, onProgress);
 
         var hash = await SHA256.HashDataAsync(stream, ct);
         // Position after HashDataAsync == total bytes consumed == content length.
-        return (Convert.ToHexString(hash).ToLowerInvariant(), stream.Position);
+        return (Convert.ToHexString(hash).ToLowerInvariant(), file.Position);
     }
 
     /// <summary>

@@ -337,6 +337,34 @@ internal static class Program
         await srcNode.EnsureChildrenLoadedAsync(); await Task.Delay(100);
         Check(Node(vm3, v) is null, "a folder that came and went without ever being chosen leaves no row behind");
 
+#if !OLD_CODE
+        // ---------------------------------------------------------------- never-user-data entries
+        Console.WriteLine();
+        Console.WriteLine("=== 6. old saved entries for the recycle bin are left alone ===");
+        // A fully-selected drive that was expanded lists every child, the recycle
+        // bin included, so real selections carry entries like these. The recycle bin
+        // is never backed up or shown now; its entry must not turn into a "not found"
+        // row, a count on the bar, or something Forget prunes. Read-only: this only
+        // asks whether C:'s recycle bin folder exists.
+        string bin = @"C:\$Recycle.Bin";
+        string fakeR = bin + @"\S-1-5-21-0-0-0-0\$RNOTREAL";
+        // The shape the J: set really has: the whole drive ticked and expanded, so
+        // its saved entry lists children - the recycle bin among them.
+        var saved4 = new List<SourceSelection>
+        {
+            Dir(@"C:\", true, auto: true, expanded: true,
+                Dir(bin, true, true, false, Dir(fakeR, true, false))),
+        };
+        Check(SourceSelectionViewModel.CountMissing(saved4) == (0, 0),
+            "a gone entry inside the recycle bin is not counted");
+        Check(SourceSelectionViewModel.PruneMissing(saved4[0]) is null, "nor pruned by Forget");
+        var vm4 = await OpenAsync(saved4);
+        Check(Node(vm4, bin) is null, "the recycle bin has no row in the tree");
+        Check(Find(vm4.GetSelections(), fakeR) is not null, "and the old entry is written back as it was");
+        Check(vm4.MissingFolderCount == 0, "the bar stays away");
+        vm4.Dispose();
+#endif
+
         vm.Dispose(); vm3.Dispose();
     }
 }

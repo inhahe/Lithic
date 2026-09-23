@@ -69,9 +69,23 @@ static async Task<(List<string> Plain, List<(string Path, FileRefManifest M)> Re
     // No dedup engine => block-level dedup OFF => NEW format (plain + .fileref).
     var svc = new DirectoryBackupService(repo, scanner, retention);
 
+    // A real backup always belongs to a set, and the file-dedup index lives in
+    // that set's own database (since the per-set split). Run with no set, the
+    // backup silently cannot dedup - which is how this test came to fail on
+    // every check without anything in the product being wrong.
+    var set = await repo.CreateBackupSetAsync(new BackupSet
+    {
+        Name = "dir-dedup",
+        SourceRoots = [source],
+        CreatedUtc = DateTime.UtcNow,
+        DefaultMediaType = MediaType.Directory,
+        SourceSelections = [new SourceSelection { Path = source, IsDirectory = true, IsSelected = true }],
+        JobOptions = new JobOptions(),
+    });
+
     var job = new BackupJob
     {
-        BackupSetId = null,
+        BackupSetId = set.Id,
         Sources = { new SourceSelection { Path = source, IsDirectory = true, IsSelected = true } },
         EnableFileDeduplication = true,
         EnableDeduplication = false,

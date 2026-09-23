@@ -66,7 +66,10 @@ public class SourceSelection
     /// <list type="bullet">
     ///   <item><c>IsSelected == false</c> — skip the subtree entirely.</item>
     ///   <item><c>IsSelected == true</c> on a directory — add its path and stop
-    ///         descending (the whole subtree is included).</item>
+    ///         descending (the whole subtree is included). Unless it lists children
+    ///         and auto-include-new is off: then it covers only those children
+    ///         (<see cref="IncludesUnlistedDescendants"/>), and is descended like a
+    ///         partial directory.</item>
     ///   <item><c>IsSelected == true</c> on a file — add its containing directory.</item>
     ///   <item><c>IsSelected == null</c> (partial) — descend into children.</item>
     /// </list>
@@ -135,6 +138,18 @@ public class SourceSelection
         {
             if (node.IsSelected == false)
                 continue;
+
+            // Ticked, but backing up only the children it lists (auto-include off):
+            // the scanner treats it exactly like a partial folder, so collect it the
+            // same way. Claiming the whole folder here made every folder ticked
+            // beneath it look already covered - the "back up what you just added"
+            // offer never came - and made the Worker watch all of it.
+            if (node.IsSelected == true && node.IsDirectory && node.Children.Count > 0
+                && !IncludesUnlistedDescendants(node))
+            {
+                CollectSelectedRootsRecursive(node.Children, result, coarsenFilesToDirectories);
+                continue;
+            }
 
             if (node.IsSelected == true)
             {

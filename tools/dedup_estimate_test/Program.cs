@@ -78,9 +78,23 @@ static async Task<(DedupSizeEstimate Est, long Actual, long Raw)> RunAsync(
     };
     var scanned = await scanner.ScanAsync(sources, null, CancellationToken.None, null);
 
+    // A real backup always belongs to a set, and since the catalog split into
+    // per-set databases the file-dedup index lives in that set's database: with
+    // no set the backup cannot dedup at all, while the estimator still assumes
+    // it will. A run with no set to reuse therefore gets one of its own.
+    int setId = reuseSetId ?? (await repo.CreateBackupSetAsync(new BackupSet
+    {
+        Name = "estimate",
+        SourceRoots = [source],
+        CreatedUtc = DateTime.UtcNow,
+        DefaultMediaType = MediaType.Directory,
+        SourceSelections = sources,
+        JobOptions = new JobOptions(),
+    })).Id;
+
     var job = new BackupJob
     {
-        BackupSetId = reuseSetId,
+        BackupSetId = setId,
         Sources = sources,
         EnableFileDeduplication = fileDedup,
         EnableDeduplication = blockDedup,

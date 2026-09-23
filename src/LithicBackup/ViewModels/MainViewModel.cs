@@ -3091,68 +3091,87 @@ public class MainViewModel : ViewModelBase
             return;
         }
 
-        row.Progress = null;
-        row.LastResultText = "";
-        row.IsRunning = true;
-        row.RunningStatusText = $"Backing up {paths.Count:N0} added file(s)\u2026";
+        var targetDir = job.TargetDirectory;
+        var tiers = job.RetentionTiers;
 
         CrashLogger.Log(null,
-            $"GUI: targeted backup for \"{row.Name}\" \u2192 {job.TargetDirectory}: "
+            $"GUI: targeted backup for \"{row.Name}\" → {targetDir}: "
             + $"{paths.Count:N0} file(s) from a source-selection edit.");
+
+        // The same inline progress panel a normal backup gets: percent, bytes
+        // done of total, time remaining, the file being copied and its own
+        // progress, Pause and Cancel, and the failed-files list at the end. This
+        // run used to sit behind a small dialog that only ever said "Copying N
+        // file(s) to …", because no progress reporter was passed down at all.
+        var progressVm = new BurnProgressViewModel { IsDirectoryMode = true };
+        string? resultText = null;   // the row's result line, once there is one
+
+        row.LastResultText = "";
+        row.RunningStatusText = "";
+        row.Progress = progressVm;
+        row.IsRunning = true;
+
+        progressVm.DoneRequested += () =>
+        {
+            row.LastResultIsError = progressVm.HasFailedFiles
+                || progressVm.StatusText.Contains("failed", StringComparison.OrdinalIgnoreCase);
+            row.LastResultText = resultText ?? progressVm.StatusText;
+            CrashLogger.Log(null,
+                $"GUI: targeted backup for \"{row.Name}\" finished"
+                + (row.LastResultIsError ? " WITH ERRORS" : "") + $": {row.LastResultText}");
+            row.Progress = null;
+            row.IsRunning = false;
+            _ = LoadBackupSetsAsync();
+        };
+
+        var cts = progressVm.StartBurn();
+        progressVm.OnBackupProgress(new BackupProgress
+        {
+            StatusMessage = $"Backing up {paths.Count:N0} added file(s)…",
+        });
+
+        // Let the panel render before the work starts.
+        await Task.Yield();
 
         try
         {
-            var targetDir = job.TargetDirectory;
-            var tiers = job.RetentionTiers;
-
-            var (completed, result) = await Views.ProgressDialog.RunAsync(
-                Application.Current.MainWindow,
-                "Backing up added files",
-                $"Copying {paths.Count:N0} file(s) to {targetDir}\u2026",
-                cancellable: true,
-                (progress, ct) =>
-                {
-                    // ExecuteTargetedAsync is async; this lambda already runs on a
-                    // background thread, so blocking on it here is safe.
-                    return _directoryBackupService
-                        .ExecuteTargetedAsync(job, targetDir, paths, tiers, ct)
-                        .GetAwaiter().GetResult();
-                },
-                // Read/write of ONE set, and the user may well want to look at
-                // something else while 12 GB copies.
-                modal: false);
-
-            if (!completed)
+            var progress = new Progress<BackupProgress>(p =>
             {
-                row.LastResultText = "Cancelled — some added files may not be backed up yet.";
-                StatusText = row.LastResultText;
-                CrashLogger.Log(null, $"GUI: targeted backup for \"{row.Name}\" cancelled.");
-                return;
-            }
+                progressVm.OnBackupProgress(p);
+                if (string.IsNullOrEmpty(p.StatusMessage))
+                    StatusText = $"Backing up added files for \"{row.Name}\": {p.OverallPercentage:F0}%";
+            });
 
-            int failed = result?.FailedFiles.Count ?? 0;
-            long bytes = result?.BytesWritten ?? 0;
-            row.LastResultIsError = failed > 0;
-            row.LastResultText = failed > 0
-                ? $"Backed up {FormatBytes(bytes)} of added files, {failed:N0} failed."
-                : $"Backed up {paths.Count:N0} added file(s) ({FormatBytes(bytes)}).";
-            StatusText = row.LastResultText;
-            CrashLogger.Log(null,
-                $"GUI: targeted backup for \"{row.Name}\" finished"
-                + (failed > 0 ? " WITH ERRORS" : "") + $": {row.LastResultText}");
+            var result = await Task.Run(() => _directoryBackupService.ExecuteTargetedAsync(
+                job, targetDir, paths, tiers, cts.Token, progress, progressVm.PauseEvent));
+
+            int failed = result.FailedFiles.Count;
+            resultText = failed > 0
+                ? $"Backed up {FormatBytes(result.BytesWritten)} of added files, {failed:N0} failed."
+                : $"Backed up {paths.Count:N0} added file(s) ({FormatBytes(result.BytesWritten)}).";
+            progressVm.CompleteBurn(result.Success, "",
+                $"Data written: {FormatBytes(result.BytesWritten)}", result.FailedFiles);
+            StatusText = resultText;
+
+            // A clean run goes straight to the row's result line; with failures
+            // the panel stays up so the list of failed files can be reviewed.
+            if (result.Success && failed == 0)
+                progressVm.RequestDone();
+        }
+        catch (OperationCanceledException)
+        {
+            resultText = "Cancelled — some added files may not be backed up yet.";
+            progressVm.CompleteBurn(false, "Cancelled by user.", cancelled: true);
+            StatusText = resultText;
+            if (!progressVm.HasFailedFiles)
+                progressVm.RequestDone();
         }
         catch (Exception ex)
         {
-            row.LastResultIsError = true;
-            row.LastResultText = $"Backing up the added files failed: {ex.Message}";
-            StatusText = row.LastResultText;
+            resultText = $"Backing up the added files failed: {ex.Message}";
+            progressVm.CompleteBurn(false, ex.Message);
+            StatusText = resultText;
             CrashLogger.Log(ex, $"GUI: targeted backup for \"{row.Name}\" threw.");
-        }
-        finally
-        {
-            row.IsRunning = false;
-            row.RunningStatusText = "";
-            _ = LoadBackupSetsAsync();
         }
     }
 
