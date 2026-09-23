@@ -543,7 +543,17 @@ public class DirectoryBackupService
         const double CommitIntervalSeconds = 30;
         int batchCount = 0;
         var commitTimer = System.Diagnostics.Stopwatch.StartNew();
-        var tx = await _catalog.BeginTransactionAsync(backupSetId, ct);
+
+        // Taking the set's write lock can mean waiting for the Worker's continuous
+        // backup of the same set to reach its next commit. Say so: the status on
+        // screen until the first file is otherwise whatever came before - for a
+        // targeted run, "Checking N file(s) against the catalog...", which read
+        // as hung for as long as the Worker kept the lock.
+        void ReportWaitingForLock() => progress?.Report(new BackupProgress
+        {
+            StatusMessage = "Waiting for the background backup of this set to pause...",
+        });
+        var tx = await _catalog.BeginTransactionAsync(backupSetId, ct, ReportWaitingForLock);
 
         try
         {
@@ -635,7 +645,7 @@ public class DirectoryBackupService
                 await _catalog.UpdateDiscAsync(discRecord, ct);
                 tx.Complete();
                 tx.Dispose();
-                tx = await _catalog.BeginTransactionAsync(backupSetId, ct);
+                tx = await _catalog.BeginTransactionAsync(backupSetId, ct, ReportWaitingForLock);
                 batchCount = 0;
                 commitTimer.Restart();
             }
@@ -1401,7 +1411,7 @@ public class DirectoryBackupService
                     }
                 }
 
-                tx = await _catalog.BeginTransactionAsync(backupSetId, ct);
+                tx = await _catalog.BeginTransactionAsync(backupSetId, ct, ReportWaitingForLock);
                 batchCount = 0;
                 commitTimer.Restart();
             }

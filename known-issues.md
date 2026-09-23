@@ -1,5 +1,59 @@
 # LithicBackup — Known Issues & Tech Debt
 
+## FIXED: a backup started in the app waited for the Worker's whole continuous run — "Checking 23,780 file(s) against the catalog..." for hours (2026-09-23)
+
+**Symptom.** The user changed both sets' sources and said yes to backing up the
+additions for each. J:'s ran at once. I:'s sat on "Checking 23,780 file(s) against
+the catalog..." with no disk reads and no progress.
+
+**Cause.** The catalog check had finished. The backup was waiting for I:'s
+cross-process write lock (`set-11.db.writelock`), and it had no way to say so. The
+Worker held that lock: at 02:34 it had started a continuous backup of I: with
+90,415 changed files, moving about 40 files and 1.2 GB a minute, mostly large
+files. It commits every 50 files, after a large file, or every 30 s. Each time it
+releases the lock and takes it back within microseconds, while a waiter polls
+every 25 ms, so the GUI essentially never got in before the Worker's run ended.
+Restart Manager showed the Worker holding the lock file. The GUI showed 0 MB/s of
+reads. The lookup the status refers to times at about 9 ms per path on I:'s
+3.3M-row catalog, a few minutes at most.
+
+**Fix.**
+- A waiter leaves a marker, `set-<id>.db.writelock.wait-<pid>`, refreshed each
+  second.
+- The Worker (`YieldWritesToWaitingProcesses`) steps aside at its next
+  acquisition while a fresh marker from another process is there. Markers older
+  than 5 s are ignored, and it gives way for at most 2 minutes at a time.
+- The GUI never gives way, so the backup the user is watching goes first and the
+  Worker carries on after it.
+- While waiting, the backup now says "Waiting for the background backup of this
+  set to pause..." (`BeginTransactionAsync(..., onWaitingForOtherProcess)`).
+
+**Found on the way: opening a set could wait on the Worker too.** `SetSchema.sql`
+runs every time a process opens a set. It contained `INSERT INTO SchemaVersion ...
+WHERE NOT EXISTS`, which takes SQLite's write lock even when it inserts nothing. A
+probe holding a write transaction confirmed it was the only statement in the script
+that needed the lock. So the first open of a set during a Worker run waited for the
+run to end, or failed with "database is locked" after the 30 s busy timeout. The
+row is now inserted by the constructor only when missing.
+
+**Tested.** `tools\write_lock_fairness_test` runs a second copy of itself as the
+"Worker", holding the set's lock in 150 ms batches and re-taking it at once:
+- With the fix, the waiter gets in within about one batch (174–215 ms of a 12 s
+  run). It is told once that it is waiting, its marker comes and goes, and the
+  Worker carries on afterwards.
+- A set opens mid-run in about 13 ms.
+- Stale, orphaned and own-process markers are handled.
+- The control, without stepping aside, is shut out for most of the run (median
+  3.3–5.1 s of 5 s).
+
+Each piece was reverted in turn and caught: without the step-aside the waiter
+waited 12,076 ms; with the old schema script the open waited 8,020 ms.
+
+The first control used `Task.Delay` batches and passed only intermittently. Both
+processes' timers fire on the same Windows tick, which lined the waiter's polls up
+with the releases. The stand-in's batches are now spun, ending off-tick as the real
+Worker's I/O-bound batches do.
+
 ## FIXED: ticking a folder could leave parts of it out of the backup (2026-09-23)
 
 **Symptom.** A folder ticked in the editor showed ticked but did not back up all of

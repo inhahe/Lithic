@@ -17,10 +17,16 @@
 -- on-disk _blocks/ directory, and restore reads blocks from there, never from
 -- this table.
 
+-- Everything in this script must be a no-op on an existing database that does
+-- not need SQLite's write lock: it runs every time a process opens the set, and
+-- the other process may be holding that lock for a long run of commits. Every
+-- CREATE ... IF NOT EXISTS qualifies. The SchemaVersion row is inserted by the
+-- SqliteSetDatabase constructor, and only when it is missing - an INSERT needs
+-- the write lock even when it inserts nothing, and used to make opening a set
+-- wait on the Worker (and fail after the 30 s busy timeout).
 CREATE TABLE IF NOT EXISTS SchemaVersion (
     Version INTEGER NOT NULL PRIMARY KEY
 );
-INSERT INTO SchemaVersion (Version) SELECT 1 WHERE NOT EXISTS (SELECT 1 FROM SchemaVersion);
 
 CREATE TABLE IF NOT EXISTS Discs (
     Id                  INTEGER PRIMARY KEY,

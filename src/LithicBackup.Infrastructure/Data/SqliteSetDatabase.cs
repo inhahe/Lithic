@@ -87,6 +87,18 @@ internal sealed class SqliteSetDatabase : IDisposable
             using var reader = new StreamReader(stream);
             Execute(reader.ReadToEnd());
         }
+
+        // Stamp a new database's schema version. Checked with a read first: an
+        // INSERT takes SQLite's write lock even when it inserts nothing, so doing it
+        // unconditionally made every open of an existing set wait for the other
+        // process's write transaction - with continuous backup committing back to
+        // back, until its run ended or the 30 s busy timeout threw.
+        using (var check = _connection.CreateCommand())
+        {
+            check.CommandText = "SELECT EXISTS (SELECT 1 FROM SchemaVersion)";
+            if (Convert.ToInt64(check.ExecuteScalar()) == 0)
+                Execute("INSERT INTO SchemaVersion (Version) SELECT 1 WHERE NOT EXISTS (SELECT 1 FROM SchemaVersion)");
+        }
     }
 
     // ---------------------------------------------------------------
@@ -139,42 +151,163 @@ internal sealed class SqliteSetDatabase : IDisposable
     /// dead-wait on a dead process.  Returns the owning stream; disposing it frees
     /// the lock for the next writer.
     /// </summary>
-    private async Task<FileStream> AcquireCrossProcessWriteAsync(CancellationToken ct)
+    /// <param name="onWaiting">
+    /// Called once, the first time the lock turns out to be held elsewhere, so a
+    /// caller with a progress display can say it is waiting.
+    /// </param>
+    private async Task<FileStream> AcquireCrossProcessWriteAsync(
+        CancellationToken ct, Action? onWaiting = null)
     {
-        while (true)
+        // A background writer lets a writer that is already waiting in another
+        // process go first (see YieldToWaitingWriters).
+        await WaitWhileAnotherProcessWaitsAsync(ct).ConfigureAwait(false);
+
+        string? marker = null;
+        var markerTouched = DateTime.MinValue;
+        try
         {
-            ct.ThrowIfCancellationRequested();
-            try
+            while (true)
             {
-                return new FileStream(
-                    _writeLockPath,
-                    FileMode.OpenOrCreate,
-                    FileAccess.ReadWrite,
-                    FileShare.None);
-            }
-            catch (IOException)
-            {
-                // Another process (or another writer in this one) holds the lock.
-                // Poll until it is released; the wait is unbounded by design so
-                // legitimate contention never degrades into a "database is locked".
+                ct.ThrowIfCancellationRequested();
+                try
+                {
+                    return new FileStream(
+                        _writeLockPath,
+                        FileMode.OpenOrCreate,
+                        FileAccess.ReadWrite,
+                        FileShare.None);
+                }
+                catch (Exception ex) when (ex is IOException or UnauthorizedAccessException)
+                {
+                    // Another process (or another writer in this one) holds the
+                    // lock, or a transient sharing/ACL race during creation. Poll
+                    // until it is released; the wait is unbounded by design so
+                    // legitimate contention never degrades into a "database is
+                    // locked".
+                }
+
+                if (marker is null)
+                {
+                    onWaiting?.Invoke();
+                    marker = WaitMarkerPath(Environment.ProcessId);
+                }
+
+                // Say that we are waiting, and keep saying it, so a background
+                // holder steps aside at its next commit instead of re-taking the
+                // lock the instant it lets go - which, polled every 25 ms against a
+                // re-take measured in microseconds, it effectively always won.
+                // Only the process that steps aside reads these, so a background
+                // writer does not bother to leave one.
+                if (!YieldToWaitingWriters && DateTime.UtcNow - markerTouched > MarkerRefresh)
+                {
+                    try
+                    {
+                        File.WriteAllText(marker, "");
+                        markerTouched = DateTime.UtcNow;
+                    }
+                    catch (Exception ex) when (ex is IOException or UnauthorizedAccessException)
+                    {
+                        // Best effort: without the marker we just wait as before.
+                    }
+                }
+
                 await Task.Delay(25, ct).ConfigureAwait(false);
             }
-            catch (UnauthorizedAccessException)
+        }
+        finally
+        {
+            if (marker is not null && !YieldToWaitingWriters)
             {
-                // Transient sharing/ACL race during creation — retry.
-                await Task.Delay(25, ct).ConfigureAwait(false);
+                try { File.Delete(marker); }
+                catch (Exception ex) when (ex is IOException or UnauthorizedAccessException) { }
             }
         }
     }
 
-    public async Task<ICatalogTransaction> BeginTransactionAsync(CancellationToken ct)
+    // ---------------------------------------------------------------
+    // Cross-process fairness
+    // ---------------------------------------------------------------
+
+    /// <summary>
+    /// When true, this process steps aside for a writer in another process that is
+    /// waiting for the same set: before taking the set's write lock it waits until
+    /// that writer has had its turn. The Worker service sets it. Its continuous
+    /// backup commits every 50 files or 30 s and takes the lock back within
+    /// microseconds of letting it go, while a waiter polls every 25 ms, so without
+    /// this a backup the user started could not get in until the Worker's whole
+    /// run was over - which on a large run is hours ("Checking 23,780 file(s)
+    /// against the catalog..." until then). The GUI does not step aside: the work
+    /// the user is watching goes first, and the Worker carries on after it.
+    /// </summary>
+    internal static bool YieldToWaitingWriters { get; set; }
+
+    /// <summary>How often a waiter refreshes its marker.</summary>
+    private static readonly TimeSpan MarkerRefresh = TimeSpan.FromSeconds(1);
+
+    /// <summary>
+    /// A marker older than this is ignored: its process gave up or died without
+    /// removing it. Several refresh periods, so a busy waiter never looks stale.
+    /// </summary>
+    private static readonly TimeSpan MarkerStale = TimeSpan.FromSeconds(5);
+
+    /// <summary>
+    /// The longest a background writer steps aside at one acquisition, a safety
+    /// valve against a marker that stays fresh while its owner never takes the lock.
+    /// A real waiter gets in within a poll or two.
+    /// </summary>
+    private static readonly TimeSpan MaxYield = TimeSpan.FromMinutes(2);
+
+    private string WaitMarkerPath(int processId) => $"{_writeLockPath}.wait-{processId}";
+
+    /// <summary>
+    /// For a background writer (<see cref="YieldToWaitingWriters"/>): wait while a
+    /// writer in another process is waiting for this set's lock. Its marker goes
+    /// when it gets the lock, so this returns as soon as it is in.
+    /// </summary>
+    private async Task WaitWhileAnotherProcessWaitsAsync(CancellationToken ct)
+    {
+        if (!YieldToWaitingWriters)
+            return;
+
+        var giveUp = DateTime.UtcNow + MaxYield;
+        while (AnotherProcessIsWaiting() && DateTime.UtcNow < giveUp)
+            await Task.Delay(25, ct).ConfigureAwait(false);
+    }
+
+    private bool AnotherProcessIsWaiting()
+    {
+        try
+        {
+            string? dir = Path.GetDirectoryName(_writeLockPath);
+            if (dir is null)
+                return false;
+            string prefix = Path.GetFileName(_writeLockPath) + ".wait-";
+            foreach (var file in Directory.EnumerateFiles(dir, prefix + "*"))
+            {
+                if (!int.TryParse(Path.GetFileName(file).AsSpan(prefix.Length), out int pid)
+                    || pid == Environment.ProcessId)
+                    continue;
+                if (DateTime.UtcNow - File.GetLastWriteTimeUtc(file) < MarkerStale)
+                    return true;
+            }
+        }
+        catch (Exception ex) when (ex is IOException or UnauthorizedAccessException)
+        {
+            // Can't tell: don't hold anything up over it.
+        }
+        return false;
+    }
+
+    public async Task<ICatalogTransaction> BeginTransactionAsync(
+        CancellationToken ct, Action? onWaitingForOtherProcess = null)
     {
         ct.ThrowIfCancellationRequested();
 
         // A transaction is a write: take the cross-process lock before the gate so
         // no other process can be mid-write on this set while we hold SQLite's
         // write lock for the whole transaction.
-        var fileLock = await AcquireCrossProcessWriteAsync(ct).ConfigureAwait(false);
+        var fileLock = await AcquireCrossProcessWriteAsync(ct, onWaitingForOtherProcess)
+            .ConfigureAwait(false);
         try
         {
             await _gate.WaitAsync(ct).ConfigureAwait(false);

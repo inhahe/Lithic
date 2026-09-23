@@ -97,6 +97,8 @@ couldn't read.
 
 Only directory-mode backup sets can be scheduled (disc burns require physical media interaction).
 
+**A backup you start in the app goes first.** If the background Worker is backing up the same set, it pauses at its next commit (within a batch of files, or after the large file it is copying) and carries on once your backup is done. Until then the progress window says "Waiting for the background backup of this set to pause...".
+
 ### Source Selection
 
 - Treeview file browser with tristate checkboxes — select entire drives, individual directories, or specific files

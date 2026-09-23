@@ -814,8 +814,21 @@ public class SqliteCatalogRepository : ICatalogRepository
     // Transactions (routed)
     // ---------------------------------------------------------------
 
-    public Task<ICatalogTransaction> BeginTransactionAsync(int backupSetId, CancellationToken ct = default)
-        => GetSet(backupSetId).BeginTransactionAsync(ct);
+    public Task<ICatalogTransaction> BeginTransactionAsync(
+        int backupSetId, CancellationToken ct = default, Action? onWaitingForOtherProcess = null)
+        => GetSet(backupSetId).BeginTransactionAsync(ct, onWaitingForOtherProcess);
+
+    /// <summary>
+    /// Make this process's writes step aside for a writer in another process that
+    /// is waiting for the same set (see <c>SqliteSetDatabase.YieldToWaitingWriters</c>).
+    /// Set once at startup by the Worker service, so a backup the user starts in the
+    /// GUI gets in at the Worker's next commit instead of after its whole run.
+    /// </summary>
+    public static bool YieldWritesToWaitingProcesses
+    {
+        get => SqliteSetDatabase.YieldToWaitingWriters;
+        set => SqliteSetDatabase.YieldToWaitingWriters = value;
+    }
 
     // ---------------------------------------------------------------
     // USN change-journal cursors (master)

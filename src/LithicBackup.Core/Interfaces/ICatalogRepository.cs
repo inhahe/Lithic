@@ -427,5 +427,14 @@ public interface ICatalogRepository : IDisposable
 
     // --- Transactions ---
     // A transaction is scoped to one set's database.
-    Task<ICatalogTransaction> BeginTransactionAsync(int backupSetId, CancellationToken ct = default);
+    /// <summary>
+    /// Begin a write transaction on one set's database. Waits, without a timeout,
+    /// while another process is writing the same set.
+    /// </summary>
+    /// <param name="onWaitingForOtherProcess">
+    /// Called once if that wait happens, so a caller showing progress can say so
+    /// rather than leave its previous status on screen.
+    /// </param>
+    Task<ICatalogTransaction> BeginTransactionAsync(
+        int backupSetId, CancellationToken ct = default, Action? onWaitingForOtherProcess = null);
 }

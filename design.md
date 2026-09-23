@@ -63,6 +63,27 @@ when the other process is running.
   in `CLAUDE.md`.
 * **Settings** are machine-global and read by both, so a new setting has to be
   meaningful (or harmless) in a service with no UI.
+* **Writes to a set take turns, and the Worker gives way.** Every write to a set's
+  database first takes a cross-process lock file (`set-<id>.db.writelock`,
+  `SqliteSetDatabase.AcquireCrossProcessWriteAsync`). A waiter polls every 25 ms.
+  A backup holds the lock for a whole commit batch (50 files, a large file, or
+  30 s) and takes it back within microseconds of releasing it. So the Worker's
+  continuous run used to shut the GUI out for as long as it lasted: hours on a
+  large one, with the GUI's backup showing its previous status throughout. A
+  waiter now leaves `set-<id>.db.writelock.wait-<pid>`, refreshed each second. The
+  Worker (`SqliteCatalogRepository.YieldWritesToWaitingProcesses`, set in its
+  `Program.cs`) steps aside at its next acquisition while a fresh marker from
+  another process exists. It ignores markers more than 5 s old and gives way for
+  at most 2 minutes at a time. The GUI never gives way, so the backup the user is
+  watching goes first. `BeginTransactionAsync`'s `onWaitingForOtherProcess`
+  lets a backup say that it is waiting.
+* **Opening a set must not need the write lock.** Every process runs
+  `SetSchema.sql` when it first opens a set, while the other may be mid-run. So
+  the script is `CREATE ... IF NOT EXISTS` only, which is a no-op on an existing
+  database and needs no write lock. The `SchemaVersion` row is inserted by the
+  constructor only when missing. An `INSERT` takes the write lock even when it
+  inserts nothing, and it made an open wait on the Worker, failing after the
+  30 s busy timeout.
 
 ## Persistent stores
 
