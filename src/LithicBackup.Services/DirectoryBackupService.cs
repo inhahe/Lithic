@@ -1414,7 +1414,9 @@ public class DirectoryBackupService
         if (backupSet is not null)
         {
             backupSet.LastBackupUtc = DateTime.UtcNow;
-            await _catalog.UpdateBackupSetAsync(backupSet, ct);
+            // Timestamp only. The re-read above keeps this fresh, but between that
+            // read and this write the selection can still change underneath.
+            await _catalog.UpdateBackupSetMetadataAsync(backupSet, ct);
         }
 
         // 7. Verify backed-up files by reading them back and comparing hashes.

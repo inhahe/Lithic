@@ -49,7 +49,6 @@ public class MainViewModel : ViewModelBase
     /// </summary>
     private readonly Services.TaskWindowManager _taskWindows;
     private Window? _largestFilesWindow;
-    private Func<Task>? _pendingSettingsSave;
     private int? _unsavedNewSetId;
 
     // --- In-app update check (GitHub Releases) ---
@@ -483,11 +482,103 @@ public class MainViewModel : ViewModelBase
     // Flow 1b: Edit Backup Set (modify-only — no wizard, no Plan/Start)
     // -------------------------------------------------------------------
 
+    /// <summary>
+    /// Overwrite <paramref name="target"/>'s persisted fields with
+    /// <paramref name="source"/>'s, keeping the <paramref name="target"/> instance.
+    /// Every field the catalog stores is copied, so a value changed underneath
+    /// this window cannot survive in memory to be saved back later.
+    /// </summary>
+    private static void CopyPersistedFields(BackupSet source, BackupSet target)
+    {
+        target.Name = source.Name;
+        target.SourceRoots = source.SourceRoots;
+        target.MaxIncrementalDiscs = source.MaxIncrementalDiscs;
+        target.DefaultMediaType = source.DefaultMediaType;
+        target.DefaultFilesystemType = source.DefaultFilesystemType;
+        target.CapacityOverrideBytes = source.CapacityOverrideBytes;
+        target.SourceSelections = source.SourceSelections;
+        target.JobOptions = source.JobOptions;
+        target.CreatedUtc = source.CreatedUtc;
+        target.LastBackupUtc = source.LastBackupUtc;
+    }
+
+    /// <summary>
+    /// A deep, independent copy of <paramref name="set"/>: no list or object is
+    /// shared with the original, so editing the copy cannot change the original.
+    /// Round-trips through System.Text.Json with default options - exactly how the
+    /// catalog stores the nested fields - so the copy is as faithful as a save and
+    /// a reload.
+    /// </summary>
+    internal static BackupSet CloneBackupSet(BackupSet set)
+        => JsonSerializer.Deserialize<BackupSet>(JsonSerializer.SerializeToUtf8Bytes(set))
+           ?? throw new InvalidOperationException("A backup set could not be copied.");
+
+    /// <summary>
+    /// Re-read <paramref name="set"/> from the catalog into the SAME instance, so
+    /// every holder of that reference sees current values. Anything that writes a
+    /// set from memory must do this first: a copy read an hour ago otherwise puts
+    /// back whatever has changed since (see the selection-widening entry in
+    /// known-issues.md). A failed read is reported, not thrown, and the caller
+    /// carries on with the copy it has.
+    /// </summary>
+    private async Task RefreshFromCatalogAsync(BackupSet set, string beforeWhat)
+    {
+        try
+        {
+            var fresh = await _catalog.GetBackupSetAsync(set.Id);
+            if (fresh is not null)
+                CopyPersistedFields(fresh, set);
+        }
+        catch (Exception ex)
+        {
+            StatusText = $"Could not refresh \"{set.Name}\" from the catalog "
+                         + $"before {beforeWhat}: {ex.Message}";
+        }
+    }
+
+    /// <summary>
+    /// Apply one Largest Files include/exclude toggle to the editor's exclusion
+    /// list (one pattern per line, as the editor shows it). Returns the text
+    /// unchanged when the toggle changes nothing, so it raises no edit.
+    /// </summary>
+    internal static string ApplyExclusionToggle(string patternsText, string pattern, bool excluded)
+    {
+        var list = BackupJobViewModel.ParseExclusionPatterns(patternsText);
+        bool present = list.Contains(pattern, StringComparer.OrdinalIgnoreCase);
+
+        if (excluded == present)
+            return patternsText;
+
+        if (excluded)
+            list.Add(pattern);
+        else
+            list.RemoveAll(p => string.Equals(p, pattern, StringComparison.OrdinalIgnoreCase));
+
+        return BackupJobViewModel.FormatExclusionPatterns(list);
+    }
+
     private async void StartEditFlow()
     {
         if (SelectedBackupSet is null) return;
 
-        var backupSet = SelectedBackupSet;
+        // The set as the rest of the app holds it: the row, SelectedBackupSet, any
+        // window opened on it. The editor never edits this instance.
+        var shared = SelectedBackupSet;
+
+        // Edit what the catalog says NOW, not what this window last read. The
+        // editor used to edit the in-memory copy as-is, so anything that changed
+        // the catalog underneath - the Worker pinning a new folder, a repair done
+        // by hand - was displayed stale and then written straight back over. That
+        // is how a corrected source selection reverted within minutes.
+        await RefreshFromCatalogAsync(shared, "editing");
+
+        // ...and edit a PRIVATE copy of it. Nothing done in the editor is saved
+        // until the user clicks Save, or answers Yes when closing, and Cancel has
+        // to be able to throw all of it away. Edits made on the shared instance
+        // would outlive a Cancel in memory - the row, and every later write made
+        // from SelectedBackupSet, would still carry them. SaveAllAsync copies what
+        // it saved back into `shared`.
+        var backupSet = CloneBackupSet(shared);
 
         // Snapshot the source selection as it stands before any edit.  After the
         // editor closes we diff this against the saved selection to offer to (a)
@@ -500,6 +591,11 @@ public class MainViewModel : ViewModelBase
             ? os
             : new List<Core.Models.SourceSelection>();
         bool savedThisSession = false;
+
+        // Exactly what the last save wrote, frozen. The post-close reconcile
+        // compares against this rather than backupSet, which the live size check
+        // keeps syncing with whatever is on screen - saved or not.
+        BackupSet? savedState = null;
 
         // Baseline for the close prompt's real-change detection, so a no-touch
         // open/close can't pop a bogus "unsaved changes" prompt off the racy
@@ -517,13 +613,18 @@ public class MainViewModel : ViewModelBase
         string? settingsBaseline = null;
         int cleanSelectionMark = 0;
 
+        // Same idea for edits to entries whose folder no longer exists ("not found"
+        // rows, Forget), which are counted apart from ChangedSelectionPaths so the
+        // reconcile never offers to purge a deleted folder's backups.
+        int cleanMissingEditMark = 0;
+
         // Completes once the deferred selection restore (Phase 3, below) has
         // finished.  The restore runs asynchronously AFTER the dialog is shown,
         // during which GetSelections() would return a partial/empty tree.  Every
-        // path that persists the selection (SaveAllAsync — used by both the Save
-        // button and the auto-save-on-close — plus the Seed and Largest-Files
-        // handlers) awaits this first, so a fast close or click can never write a
-        // half-restored tree over the real saved sources.  It is completed
+        // path that reads the selection to save it (SaveAllAsync — used by the
+        // Save button, Yes at the close prompt and saving before a seed) or to
+        // hand it on (Largest Files) awaits this first, so a fast click can never
+        // write a half-restored tree over the real saved sources.  It is completed
         // unconditionally in Phase 3's finally, so new sets (which have nothing
         // to restore) and error paths still release any waiter.
         var selectionRestored = new TaskCompletionSource(
@@ -584,6 +685,7 @@ public class MainViewModel : ViewModelBase
         {
             settingsBaseline = SnapshotEditorSettings(backupSet, sourceSelection);
             cleanSelectionMark = sourceSelection.ChangedSelectionPaths.Count;
+            cleanMissingEditMark = sourceSelection.MissingFolderEditCount;
         }
 
         // Selection restore and size computation are deferred to after the
@@ -599,7 +701,8 @@ public class MainViewModel : ViewModelBase
             sourceSelection.HasSelection = true;
         sourceSelection.ShowLargestFiles = true;
 
-        // Helper: sync all VM settings into the BackupSet and write to DB.
+        // The one way the editor writes the set. Called by the Save button, by Yes
+        // at the close prompt, and by "save first" before a seed - never on its own.
         async Task SaveAllAsync()
         {
             // Never read GetSelections() from a still-restoring tree — wait for
@@ -607,10 +710,50 @@ public class MainViewModel : ViewModelBase
             // not a partial/empty snapshot.  Completes instantly once restore is
             // done (or immediately for new sets).
             await selectionRestored.Task;
+
+            // Nor from a half-propagated one: drain any deferred checkbox
+            // propagation and in-flight node work first. The Save button already
+            // does this before it gets here; the other two callers do not.
+            await sourceSelection.FlushPendingEditsAsync();
+
             SyncSettingsToJobOptions(backupSet, sourceSelection);
             backupSet.SourceSelections = sourceSelection.GetSelections();
             await Task.Run(() => _catalog.UpdateBackupSetAsync(backupSet));
+            AfterSave();
+        }
+
+        // Yes at the close prompt during File > Exit. The process will not wait for
+        // an async save to finish, and with nothing auto-saved any more, that
+        // would lose the whole edit. So write before returning - the UI-thread part
+        // first, then the row update, waited for off the UI thread's context.
+        void SaveBeforeExit()
+        {
+            // Nothing restored yet means nothing the user could have changed.
+            if (!selectionRestored.Task.IsCompleted)
+                return;
+
+            // Drains the checkbox settle synchronously; an in-flight folder load
+            // cannot be waited for here, and is the one thing this may miss.
+            _ = sourceSelection.FlushPendingEditsAsync();
+
+            SyncSettingsToJobOptions(backupSet, sourceSelection);
+            backupSet.SourceSelections = sourceSelection.GetSelections();
+            Task.Run(() => _catalog.UpdateBackupSetAsync(backupSet)).GetAwaiter().GetResult();
+            AfterSave();
+        }
+
+        void AfterSave()
+        {
             savedThisSession = true;
+            savedState = CloneBackupSet(backupSet);
+
+            // Let the rest of the app see what is now saved; the editor's own copy
+            // stays private. Both the instance the editor was opened from and, if
+            // the main window has since swapped in another copy of this set, that.
+            CopyPersistedFields(CloneBackupSet(backupSet), shared);
+            if (SelectedBackupSet is { } selected && selected.Id == backupSet.Id
+                && !ReferenceEquals(selected, shared))
+                CopyPersistedFields(CloneBackupSet(backupSet), selected);
 
             // The persisted state is now the new "clean" baseline, so a later
             // stray dirty event (or the still-populated ChangedSelectionPaths from
@@ -618,10 +761,9 @@ public class MainViewModel : ViewModelBase
             // save changes that are already on disk.
             settingsBaseline = SnapshotEditorSettings(backupSet, sourceSelection);
             cleanSelectionMark = sourceSelection.ChangedSelectionPaths.Count;
+            cleanMissingEditMark = sourceSelection.MissingFolderEditCount;
+            sourceSelection.MarkClean();
         }
-
-        // Register a pending save so settings are persisted on dialog close.
-        _pendingSettingsSave = SaveAllAsync;
 
         // ---------------------------------------------------------------
         // Phase 2: create dialog, set content, then show (invisible → reveal)
@@ -634,54 +776,64 @@ public class MainViewModel : ViewModelBase
         };
         _editorWindow = dialog;
 
-        // Prompt before closing if there are unsaved changes.  A "save before
-        // closing?" prompt (Yes / No / Cancel) is used for both new and existing
-        // sets — it's more intuitive and safer than a "discard it?" prompt,
-        // because the safe action (keep the work by saving) lines up with the
-        // default Yes rather than being buried behind a "No".
-        //   Yes    → save and close
-        //   No     → close without saving (existing: skip auto-save; new: discard
-        //            the temporary catalog record)
-        //   Cancel → stay open
+        // Closing the editor never saves by itself. How it closes decides:
+        //   Save button   → SaveRequested has saved everything; closes silently.
+        //   Cancel button → discards (after a confirm, if anything changed).
+        //   ✕ / Alt+F4    → nothing changed: closes and writes nothing.
+        //                   changed: "Save before closing?"
+        //                     Yes    → save, then close
+        //                     No     → close without saving (a new set's
+        //                              temporary record is deleted)
+        //                     Cancel → stay open
+        // It used to save on EVERY close, prompt or no prompt, and to auto-save
+        // each checkbox change 300 ms after it was made - so No and Cancel threw
+        // away nothing but settings, and a stray click reached the Worker.
+
+        // Set by the Cancel button: close and throw the edits away, no prompt.
+        bool discardRequested = false;
+
+        // Set by Yes at the close prompt: the Closed handler saves.
+        bool saveOnClose = false;
+
+        // Whether anything genuinely changed since the last save. The event-based
+        // flag never misses a real change but fires on programmatic churn, so it is
+        // confirmed with the two precise, cheap signals: a genuine selection toggle
+        // (ChangedSelectionPaths grew past the last clean mark) or a genuine setting
+        // edit (the settings snapshot differs from the baseline). Neither walks the
+        // whole selection tree, so this stays fast on huge sets. New sets have no
+        // baseline and always count as changed: there is an unsaved record either way.
+        bool HasRealUnsavedChanges()
+        {
+            if (!sourceSelection.HasUnsavedChanges)
+                return false;
+            if (_unsavedNewSetId is not null || settingsBaseline is null)
+                return true;
+            bool selectionChanged = sourceSelection.ChangedSelectionPaths.Count > cleanSelectionMark
+                                    || sourceSelection.MissingFolderEditCount > cleanMissingEditMark;
+            bool settingsChanged = SnapshotEditorSettings(backupSet, sourceSelection) != settingsBaseline;
+            return selectionChanged || settingsChanged;
+        }
+
         dialog.Closing += (_, e) =>
         {
-            // A forced shutdown (upgrade installer's Restart-Manager signal or a
-            // Windows session end) must not be blocked by a modal prompt: the
-            // installer waits only ~15s for LithicBackup.exe to exit, so stalling
-            // Application.Shutdown() on this dialog keeps the .exe locked and makes
-            // the upgrade fail with "unable to close all requested applications."
-            // Let the window close; the Closed handler still runs the pending
-            // best-effort save for existing sets (new sets discard their temp
-            // record, which is the right call for an unsaved set during shutdown).
+            // A forced shutdown (the upgrade installer's signal, or Windows ending
+            // the session) must not be held up by a modal prompt - the installer
+            // waits only a bounded time for LithicBackup.exe to exit. Nor may it
+            // save edits nobody confirmed, so they are dropped, exactly as for No.
+            // (A new set's temporary record is deleted by the Closed handler.)
             if (Application.Current is App { IsForcedShutdown: true })
                 return;
 
-            bool isNewSet = _unsavedNewSetId is not null;
-
-            // Cheap first gate: the event-based dirty flag never *misses* a real
-            // change (it errs the other way — firing on programmatic noise), so if
-            // it says clean, we truly are and can skip the prompt without any
-            // further work.
-            if (!sourceSelection.HasUnsavedChanges)
+            // Cancel button: it has already confirmed, if there was anything to lose.
+            if (discardRequested)
                 return;
 
-            // The flag says dirty, but it's prone to false positives.  For an
-            // existing set, confirm with the two precise, cheap signals: a genuine
-            // selection toggle (ChangedSelectionPaths grew past the last clean mark)
-            // or a genuine setting edit (settings snapshot differs from baseline).
-            // Neither walks the whole selection tree, so this stays fast even on
-            // huge sets.  If neither fired, only programmatic churn dirtied the flag
-            // and we must NOT prompt.  (New sets have no baseline and always prompt —
-            // there's an unsaved record to persist.)
-            if (!isNewSet && settingsBaseline is not null)
-            {
-                bool selectionChanged = sourceSelection.ChangedSelectionPaths.Count > cleanSelectionMark;
-                bool settingsChanged = SnapshotEditorSettings(backupSet, sourceSelection) != settingsBaseline;
+            // Nothing to save - including right after the Save button, which saved
+            // and refreshed the baseline before calling Close().
+            if (!HasRealUnsavedChanges())
+                return;
 
-                if (!selectionChanged && !settingsChanged)
-                    return;
-            }
-
+            bool isNewSet = _unsavedNewSetId is not null;
             var result = MessageBox.Show(
                 isNewSet
                     ? "This backup set hasn't been saved yet.\n\nSave it before closing?"
@@ -696,19 +848,13 @@ public class MainViewModel : ViewModelBase
             }
             else if (result == MessageBoxResult.Yes)
             {
-                // Save on close.  For a new set, clear the "unsaved new" marker so
-                // the Closed handler persists it (via _pendingSettingsSave) instead
-                // of deleting the temporary catalog record.
+                // Save in the Closed handler. For a new set, clear the "unsaved new"
+                // marker so it is kept rather than deleted.
+                saveOnClose = true;
                 _unsavedNewSetId = null;
             }
-            else // No — close without saving.
-            {
-                // Existing set: skip the auto-save.  New set: leave
-                // _unsavedNewSetId set so the Closed handler discards the
-                // temporary record.
-                if (!isNewSet)
-                    _pendingSettingsSave = null;
-            }
+            // No: close without saving. A new set keeps _unsavedNewSetId, so the
+            // Closed handler deletes its temporary record.
         };
 
         dialog.Closed += async (_, _) =>
@@ -716,51 +862,55 @@ public class MainViewModel : ViewModelBase
             // Stop any background PlanAsync scan.
             autoCheckCts?.Cancel();
 
-            // Stop this editor's directory-size scheduler. Nothing did, so its
-            // worker carried on enumerating whole volumes against a closed
-            // window — one was found still going after two days — while its
-            // closures kept the entire node tree alive and every reopen added
-            // another scheduler over the same cache file.
-            sourceSelection.Dispose();
-
             if (_unsavedNewSetId is int unsavedId)
             {
-                // User closed without saving a new set — discard the
-                // temporary DB record so no orphan appears in the catalog.
+                // A new set that was never saved - Cancel, No at the prompt, or a
+                // forced shutdown. Delete the temporary record so no orphan
+                // appears in the catalog.
                 _unsavedNewSetId = null;
-                _pendingSettingsSave = null;
                 try { await _catalog.DeleteBackupSetAsync(unsavedId); }
                 catch { /* best effort */ }
             }
-            else if (_pendingSettingsSave is not null)
+            else if (saveOnClose)
             {
-                // Save all settings on close — the user chose "Save" at the
-                // close prompt (existing set, or a new set they kept).  Guard the
-                // save: this is an async-void event handler, so an unhandled
-                // exception here would tear down the app.  On failure savedThisSession
-                // stays false, so the reconcile below is correctly skipped.
+                // Yes at the close prompt. Guard the save: this is an async-void
+                // event handler, so an unhandled exception here would tear down
+                // the app. On failure savedThisSession stays false, so the
+                // reconcile below is correctly skipped.
                 try
                 {
-                    await _pendingSettingsSave();
+                    if (Application.Current is App { IsExiting: true })
+                        SaveBeforeExit();
+                    else
+                        await SaveAllAsync();
                 }
                 catch (Exception ex)
                 {
                     StatusText = $"Failed to save on close: {ex.Message}";
                 }
-                _pendingSettingsSave = null;
             }
+
+            // Stop this editor's directory-size scheduler - after the save above,
+            // which still reads the tree. Nothing used to stop it, so its worker
+            // carried on enumerating whole volumes against a closed window - one
+            // was found still going after two days - while its closures kept the
+            // entire node tree alive and every reopen added another scheduler
+            // over the same cache file.
+            sourceSelection.Dispose();
+
             _editorWindow = null;
             await LoadBackupSetsAsync();
 
             // If the edit actually saved, reconcile the destination with the new
             // source selection: offer to purge copies of removed folders and to
-            // back up newly added ones.  Skipped entirely when nothing was saved
-            // (e.g. the user discarded changes on close).  Whether the reconcile
+            // back up newly added ones.  Skipped entirely when nothing was saved.
+            // Uses savedState - what was written - not backupSet, which can also
+            // hold later edits that were then discarded.  Whether the reconcile
             // runs at all — and whether it prompts first — is governed inside
             // ReconcileDestinationAfterEditAsync by the ReconcileMode setting.
-            if (savedThisSession)
+            if (savedThisSession && savedState is not null)
                 await ReconcileDestinationAfterEditAsync(
-                    backupSet, originalSelections, sourceSelection.ChangedSelectionPaths);
+                    savedState, originalSelections, sourceSelection.ChangedSelectionPaths);
         };
 
         // Save button: persist everything, then close the editor — matching the
@@ -775,11 +925,6 @@ public class MainViewModel : ViewModelBase
                 await LoadBackupSetsAsync();
                 SelectedBackupSet = BackupSets.FirstOrDefault(s => s.Id == backupSet.Id)?.Model;
 
-                // We just persisted everything, so clear the on-close pending save;
-                // otherwise the Closed handler would run SaveAllAsync a second time.
-                // (savedThisSession stays true, so the post-close reconcile still runs.)
-                _pendingSettingsSave = null;
-
                 // Close on save. SaveAllAsync just refreshed the dirty baseline, so
                 // the Closing handler sees a clean state and won't re-prompt to save.
                 dialog.Close();
@@ -791,19 +936,72 @@ public class MainViewModel : ViewModelBase
             }
         };
 
-        sourceSelection.CancelRequested += () => dialog.Close();
+        // Cancel discards. It used to just call Close(), which asked "Save before
+        // closing?" - an odd question for a button labelled Cancel, and moot for
+        // the selection, which had already been auto-saved.
+        sourceSelection.CancelRequested += () =>
+        {
+            if (HasRealUnsavedChanges())
+            {
+                var confirm = MessageBox.Show(
+                    _unsavedNewSetId is not null
+                        ? "Discard this new backup set?"
+                        : "Discard your changes to this backup set?\n\n"
+                          + "Nothing you changed since opening it (or since your "
+                          + "last save) will be kept.",
+                    "Discard Changes",
+                    MessageBoxButton.YesNo,
+                    MessageBoxImage.Question);
+
+                if (confirm != MessageBoxResult.Yes)
+                    return;
+            }
+
+            discardRequested = true;
+            dialog.Close();
+        };
 
         // "Seed from Existing Backup" button: imports files from an existing
         // mirror-format backup directory (e.g. backup4all mirror) into the
         // catalog so future incremental backups only copy new/changed files.
         sourceSelection.SeedFromExistingRequested += async () =>
         {
-            // Sync and save current settings first (after the deferred restore
-            // has finished, so GetSelections() reflects the real selection).
+            // After the deferred restore, so the editor's state is the real one.
             await selectionRestored.Task;
-            SyncSettingsToJobOptions(backupSet, sourceSelection);
-            backupSet.SourceSelections = sourceSelection.GetSelections();
-            await Task.Run(() => _catalog.UpdateBackupSetAsync(backupSet));
+
+            // Seeding records every file it finds as ALREADY BACKED UP, to the
+            // destination shown in this editor, and writes those records to the
+            // catalog at once - Cancel cannot take them back. Discarding an
+            // unsaved destination afterwards would leave the catalog saying files
+            // are backed up somewhere the saved set does not point, and the next
+            // backup would skip them. So with unsaved changes, seeding asks to
+            // save first. It used to save them without asking.
+            if (HasRealUnsavedChanges())
+            {
+                var answer = MessageBox.Show(
+                    (_unsavedNewSetId is not null
+                        ? "This backup set hasn't been saved yet."
+                        : "You have unsaved changes to this backup set.")
+                    + "\n\nSeeding records the files it finds as already backed up "
+                    + "to the destination shown here, and Cancel can't undo that, so "
+                    + "the set has to be saved first.\n\nSave now and seed?",
+                    "Save Before Seeding",
+                    MessageBoxButton.OKCancel,
+                    MessageBoxImage.Question);
+                if (answer != MessageBoxResult.OK)
+                    return;
+
+                try
+                {
+                    await SaveAllAsync();
+                    _unsavedNewSetId = null; // committed - Cancel must not delete it now
+                }
+                catch (Exception ex)
+                {
+                    sourceSelection.SeedResult = $"Save failed, so nothing was imported: {ex.Message}";
+                    return;
+                }
+            }
 
             string? dir = sourceSelection.TargetDirectory;
             if (sourceSelection.CreateSubdirectory
@@ -931,35 +1129,17 @@ public class MainViewModel : ViewModelBase
             catch (OperationCanceledException) { }
         }
 
-        // Auto-save source selections to the database whenever the user
-        // toggles a checkbox.  Debounced because cascading parent→child
-        // changes fire the callback many times for a single click.
-        CancellationTokenSource? saveDebounce = null;
+        // NOTHING is written to the catalog while the editor is open - see the
+        // close rules above the Closing handler. This used to auto-save every
+        // checkbox change 300 ms after it was made, which made Cancel and "No"
+        // meaningless for the selection and let one stray click reach the Worker:
+        // a click on the tick-box column's header while it is mixed selects every
+        // drive in full. The live size estimate needs no write; it reads the
+        // editor's in-memory copy.
         sourceSelection.SelectionChanged += () =>
         {
-            // Don't auto-save while restoring saved selections — the tree
-            // is in a partially-restored state and GetSelections() would
-            // produce incomplete data, overwriting the real saved state.
+            // The tree is still being restored - nothing the user did.
             if (sourceSelection.IsApplyingSelections) return;
-
-            saveDebounce?.Cancel();
-            saveDebounce = new CancellationTokenSource();
-            var ct = saveDebounce.Token;
-            _ = DebouncedSaveAsync(ct);
-
-            async Task DebouncedSaveAsync(CancellationToken token)
-            {
-                try
-                {
-                    await Task.Delay(300, token);
-                    // Sync ALL settings (including JobOptions) so the
-                    // full BackupSet write never overwrites with stale data.
-                    SyncSettingsToJobOptions(backupSet, sourceSelection);
-                    backupSet.SourceSelections = sourceSelection.GetSelections();
-                    await Task.Run(() => _catalog.UpdateBackupSetAsync(backupSet));
-                }
-                catch (OperationCanceledException) { }
-            }
 
             // Re-run PlanAsync so the size report reflects the new selection.
             TriggerPlanReCheck();
@@ -979,19 +1159,34 @@ public class MainViewModel : ViewModelBase
                 return;
             }
 
-            // Flush any pending debounced save so the scan sees current state.
-            // Wait for the deferred restore first so we don't flush a partial tree.
+            // Hand Largest Files the editor's CURRENT state, in memory only: it
+            // scans backupSet's selection and exclusions directly and never
+            // re-reads the catalog. This used to save the whole set first, which
+            // wrote the user's in-progress edits just for opening a window. Wait
+            // for the deferred restore so it isn't handed a half-restored tree.
             await selectionRestored.Task;
-            saveDebounce?.Cancel();
+            await sourceSelection.FlushPendingEditsAsync();
             SyncSettingsToJobOptions(backupSet, sourceSelection);
             backupSet.SourceSelections = sourceSelection.GetSelections();
-            await Task.Run(() => _catalog.UpdateBackupSetAsync(backupSet));
 
             int estimatedCount = 0;
             try { estimatedCount = await _catalog.GetFileCountForBackupSetAsync(backupSet.Id); }
             catch { }
 
-            var vm = new LargestFilesViewModel(_scanner, _catalog, backupSet, estimatedCount);
+            // Opened from the editor, Largest Files is part of this editing session.
+            // Each include/exclude toggle becomes an edit of the editor's own
+            // exclusion list: shown there, counted as an unsaved change, saved by
+            // Save and dropped by Cancel. Toggles used to be written to the catalog
+            // on every click without ever reaching that list, so the editor's next
+            // save put the old list back and the exclusions silently vanished.
+            var vm = new LargestFilesViewModel(
+                _scanner, _catalog, backupSet, estimatedCount, deferPersistence: true);
+            vm.ExclusionToggled += (pattern, excluded) =>
+            {
+                sourceSelection.ExcludedExtensions = ApplyExclusionToggle(
+                    sourceSelection.ExcludedExtensions, pattern, excluded);
+                TriggerPlanReCheck();
+            };
 
             var lfWindow = new BackupSetEditorWindow
             {
@@ -1005,30 +1200,10 @@ public class MainViewModel : ViewModelBase
 
             vm.DoneRequested += () => lfWindow.Close();
 
-            vm.SaveRequested += async () =>
-            {
-                try
-                {
-                    await selectionRestored.Task;
-                    SyncSettingsToJobOptions(backupSet, sourceSelection);
-                    backupSet.SourceSelections = sourceSelection.GetSelections();
-                    await Task.Run(() => _catalog.UpdateBackupSetAsync(backupSet));
-                    vm.SaveStatusText = "Saved";
-                }
-                catch (Exception ex)
-                {
-                    vm.SaveStatusText = $"Save failed: {ex.Message}";
-                }
-            };
-
             lfWindow.Closed += (_, _) =>
             {
                 vm.CancelScan();
                 _largestFilesWindow = null;
-
-                // LargestFiles may have modified ExcludedExtensions on the
-                // backup set; those changes are persisted directly on the
-                // BackupSet.JobOptions and don't need syncing back here.
             };
 
             lfWindow.SetEditorContent(vm);
@@ -1080,7 +1255,7 @@ public class MainViewModel : ViewModelBase
         {
             sourceSelection.IsApplyingSelections = false;
             // Release any save/seed/largest-files path that was waiting for the
-            // restore to finish (including an auto-save queued by a fast close).
+            // restore to finish.
             selectionRestored.TrySetResult();
         }
 
@@ -1129,7 +1304,8 @@ public class MainViewModel : ViewModelBase
                     // _needsSave and the baseline intact so the edit sticks.
                     string refreshed = SnapshotEditorSettings(backupSet, sourceSelection);
                     bool selectionChanged =
-                        sourceSelection.ChangedSelectionPaths.Count > cleanSelectionMark;
+                        sourceSelection.ChangedSelectionPaths.Count > cleanSelectionMark
+                        || sourceSelection.MissingFolderEditCount > cleanMissingEditMark;
                     bool settingsChanged = refreshed != settingsBaseline;
                     if (!selectionChanged && !settingsChanged)
                     {
@@ -1138,6 +1314,7 @@ public class MainViewModel : ViewModelBase
                         sourceSelection.MarkClean();
                         settingsBaseline = refreshed;
                         cleanSelectionMark = sourceSelection.ChangedSelectionPaths.Count;
+                        cleanMissingEditMark = sourceSelection.MissingFolderEditCount;
                     }
                     // Otherwise the user made a genuine edit during the load window —
                     // leave _needsSave and the baseline intact so the edit sticks.
@@ -1224,8 +1401,8 @@ public class MainViewModel : ViewModelBase
 
         // Fast path: if the source selection is unchanged from when the dialog
         // opened, there is nothing to reconcile — no folders were dropped or
-        // added. Skip all catalog work that would otherwise run on EVERY dialog
-        // close, since close auto-saves and thus always sets savedThisSession.
+        // added - a save that changed only settings. Skip all the catalog work
+        // below in that case.
         // The comparison uses the same JSON serialization the catalog persists
         // with, so it is conservative: any real change produces different JSON
         // and still runs the reconcile below.
@@ -1901,6 +2078,13 @@ public class MainViewModel : ViewModelBase
         if (SelectedBackupSet?.JobOptions is null) return;
 
         var backupSet = SelectedBackupSet;
+
+        // It writes the set's settings back below, so start from the catalog's
+        // copy: the editor no longer edits this instance, so after a save made
+        // there it can be behind.
+        await RefreshFromCatalogAsync(backupSet, "changing its destination");
+        if (backupSet.JobOptions is null) return;
+
         string oldPath = backupSet.JobOptions.TargetDirectory ?? "";
 
         var dialog = new System.Windows.Forms.FolderBrowserDialog
@@ -1945,7 +2129,8 @@ public class MainViewModel : ViewModelBase
             backupSet.JobOptions.DestinationVolumeId = null;
             backupSet.JobOptions.DestinationSubpath = null;
             _destinationResolver?.Resolve(backupSet.JobOptions);
-            await _catalog.UpdateBackupSetAsync(backupSet);
+            // Destination only - never the selection.
+            await _catalog.UpdateBackupSetMetadataAsync(backupSet);
 
             // Update disc record labels so they reflect the new path.
             var discs = await _catalog.GetDiscsForBackupSetAsync(backupSet.Id);
@@ -1983,6 +2168,10 @@ public class MainViewModel : ViewModelBase
     {
         if (SelectedBackupSet is null) return;
         var backupSet = SelectedBackupSet;
+
+        // It rewrites the whole set below, selection included, so start from the
+        // catalog's copy - see ChangeDestinationAsync.
+        await RefreshFromCatalogAsync(backupSet, "remapping its source drive");
 
         // Collect the distinct source drive letters currently in the set.
         var sourceDrives = new SortedSet<char>();
@@ -2984,6 +3173,14 @@ public class MainViewModel : ViewModelBase
             return;
 
         var backupSet = row.Model;
+
+        // Back up what the catalog says NOW - same reasoning as StartEditFlow.
+        // This window's copy can predate a change made elsewhere (the Worker
+        // pinning a folder, a selection corrected by hand), and everything below
+        // works from it: the plan, the source-drive remap, and that remap's full
+        // write, which would otherwise put the stale selection back.
+        await RefreshFromCatalogAsync(backupSet, "backing up");
+
         backupSet.JobOptions ??= new JobOptions();
         var opts = backupSet.JobOptions;
 
@@ -3056,8 +3253,11 @@ public class MainViewModel : ViewModelBase
         {
             var resolution = _destinationResolver.Resolve(opts);
 
+            // Volume identity lives in JobOptions. Metadata write: this runs at
+            // the start of every GUI backup, from whatever copy of the set this
+            // window holds, which may predate a selection change made elsewhere.
             if (resolution.MetadataChanged)
-                await _catalog.UpdateBackupSetAsync(backupSet);
+                await _catalog.UpdateBackupSetMetadataAsync(backupSet);
 
             if (!resolution.IsConnected)
             {
@@ -3680,7 +3880,8 @@ public class MainViewModel : ViewModelBase
             if (!excl.Contains(p, StringComparer.OrdinalIgnoreCase))
                 excl.Add(p);
         }
-        try { await Task.Run(() => _catalog.UpdateBackupSetAsync(set)); }
+        // Exclusion patterns live in JobOptions - never rewrite the selection here.
+        try { await Task.Run(() => _catalog.UpdateBackupSetMetadataAsync(set)); }
         catch { /* best effort — the run still honours the filtered diff */ }
     }
 

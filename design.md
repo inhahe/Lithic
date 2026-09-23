@@ -28,6 +28,14 @@ project — measurement and verification live there). Each sets
 `ImportDirectoryBuildProps=false` so it never stamps the shipping version onto
 itself.
 
+**A harness that constructs `App` must set `App.SkipStartupForTests` first.**
+WPF's `Application` constructor queues `OnStartup` for the first dispatcher pump,
+`Run()` or not, and `App.OnStartup` starts the entire application: the
+single-instance lock, the real catalog, a main window, a tray icon, background
+monitors, an update check. `tools\editor_save_test` ran a second, full Lithic Backup
+that way for a whole session before it came to light. With the real app already
+open, the harness's copy woke that window and shut the harness down.
+
 ## Two processes, one dataset
 
 The GUI and the Worker service are separate processes that share the catalog and
@@ -230,6 +238,142 @@ which works right up until someone reformats the file.
 Volume displays (`E: (no label)`, `E: — MyDisc` in the Test Disc picker) are
 deliberately *not* covered: a volume label is not a filename, and nothing there
 risks being read as one.
+
+### An inferred check must never promote a folder, and a stale copy must never be saved
+
+Both halves were learned from the same set, twice, the second time costing a
+1.2 TB copy of C:.
+
+**Tristate promotion counts genuine selections only.** Under a partial folder with
+auto-include-new on, the editor draws every unlisted child checked and flags it
+`_isAutoIncludeDerived` — the scanner does cover them, so that display is right.
+But a recompute that treats those inferred checks as selections promotes the
+parent to *full*, and a full parent re-lists every child as an explicit selection
+on the next open. Closing the editor used to save every time, so that was a
+selection that widened itself with no clicks at all. (It no longer saves unasked
+— see *The editor saves only when told to* — but the rule stands on its own: a
+user who does click Save must not save a promotion they never made.)
+`AllChildrenGenuinelySelected` is the rule:
+a child counts toward promotion only if it is selected *and not derived*. This is
+the view-model form of the model-level rule below; the 352ba73 revert removed the
+model pass and left this one.
+
+**Edit and back up from the catalog, not from memory.** A window that read a set
+hours ago holds an old copy of it. `RefreshFromCatalogAsync` re-reads the set into
+the *same* instance, because the row and every other holder share that
+reference, and every GUI path that writes a set from memory calls it first: the
+editor, a GUI backup (`RunIncrementalFlowAsync`), Change Destination and Remap
+Source Drive. Without this, a selection corrected elsewhere is displayed stale and
+then saved straight back — which happened within twelve minutes of a manual fix.
+Standalone Largest Files goes one better and never writes its own copy at all: it
+applies its change to a fresh read and writes that.
+
+**Write only what you meant to change.** `UpdateBackupSetAsync` rewrites every
+column from the object it is handed, selection included.
+`UpdateBackupSetMetadataAsync` writes everything except `SourceSelectionJson`. A
+caller that is recording a timestamp, a destination, a volume identity or an
+exclusion pattern has no business carrying a selection with it — use the metadata
+write. Reserve the full write for code whose purpose is to change the selection.
+The same shape of bug was fixed for file rows earlier (a partial projection
+reaching a whole-row writer); this is the backup-set version of it.
+
+**Test the regression against the old code, not just the new.** The widening test
+passes on the fix; what makes it worth keeping is that, with the fix reverted, it
+reproduces the incident verbatim — `cycle 2 saves: FULL, 5 listed`. A test that
+would also have passed on the bug proves nothing.
+
+### The editor saves only when told to
+
+Nothing done in the backup-set editor reaches the catalog until the user clicks
+**Save**, or answers **Yes** when closing with unsaved changes. **Cancel**
+discards the whole edit, confirming first only if something changed. Closing
+with ✕ and no changes writes nothing; with changes it asks Save / Don't Save /
+Cancel. A forced shutdown (installer, Windows ending the session) neither prompts
+nor saves.
+
+It used to auto-save every checkbox change 300 ms after it was made, and to save
+on every close. No and Cancel therefore discarded nothing but settings, and any
+stray click went straight to the catalog, where the Worker acts on it — one click
+on the tick-box column's header while it is mixed selects every drive in full.
+
+How it holds:
+
+- **A private copy.** `StartEditFlow` edits `CloneBackupSet(shared)`, a deep copy
+  made through the catalog's own JSON serialization, never the instance the
+  row and `SelectedBackupSet` hold. A discarded edit therefore cannot linger in
+  memory for some later metadata write to persist. After a save, `SaveAllAsync`
+  copies what it wrote back into the shared instance.
+- **One writer.** `SaveAllAsync` is the only place the editor writes the set. Its
+  callers are the Save button, Yes at the close prompt, and "save first" before a
+  seed. It drains the tree's deferred checkbox work (`FlushPendingEditsAsync`)
+  before reading the tree, since only the Save button did that before.
+  During File > Exit, `SaveBeforeExit` writes synchronously, because an exiting
+  process does not wait for an async save, and nothing is auto-saved any more to
+  cover for it.
+- **One definition of "changed".** `HasRealUnsavedChanges` decides whether
+  Cancel, ✕ and Seed need to ask. It is the event-based dirty flag, confirmed
+  against the toggled-paths mark and the settings snapshot, so programmatic churn
+  never raises a prompt.
+- **Seeding is the exception, and says so.** It writes file records immediately
+  (Cancel cannot undo that), against the destination shown on screen. With unsaved
+  changes it asks to save first; it used to save silently.
+- **Largest Files belongs to the edit it was opened from.** Opened from the editor
+  (`deferPersistence`), each include/exclude toggle becomes an edit of the
+  editor's exclusion list (`ExclusionToggled` → `ApplyExclusionToggle`): shown
+  there, counted as unsaved, and kept or dropped with everything else. It used to
+  write the catalog on every click without reaching that list, so the editor's
+  next save put the old list back. On its own, its toggles wait for its Save
+  button. Closing with unsaved toggles asks, through `IConfirmClose`, which
+  `TaskWindow` consults on every close.
+- **The reconcile follows what was saved.** The post-close purge/back-up offer
+  compares against `savedState`, the copy frozen at the last save, not against
+  the live copy, which may also hold edits made after that save and then
+  discarded.
+
+The cost: folder expand/collapse state, stored in the selection as `IsExpanded`,
+is remembered only when a save happens. A no-change close used to persist it as
+a side effect of saving everything.
+
+`tools\editor_save_test` drives the real editor, message boxes included, against a
+throwaway catalog, and counts every write (86 checks, the missing-entry cases
+included). Built against the pre-change editor, 37 of the 60 checks that compiled
+there at the time failed.
+
+### A saved choice for something that isn't on disk is kept, shown, and never re-derived
+
+A selection is kept by path, so a folder that is deleted, moved, or on a drive that
+isn't plugged in keeps its entry, and a folder that reappears at that path is backed
+up (or excluded) as before. That is deliberate: a folder that is only temporarily
+gone must not fall out of the backup. What the editor must do about such entries:
+
+- **Show them.** A saved entry whose path is gone is a real row
+  (`CreateMissingNode`), dimmed and labelled "(not found)", or "(not connected)" for
+  a top-level drive or share. That includes a whole source: dropping a top-level
+  entry the editor couldn't find is how an unplugged drive used to be deleted from
+  its set by the next save. Existence is checked off the UI thread, because an
+  offline share can take seconds to answer. The row holds the saved entry exactly,
+  never reads the disk, and never reports a size.
+- **Never re-derive its state.** A missing folder's children are only its saved
+  exceptions, not everything that was in it, so they cannot say what the folder
+  itself should be: "all of it except tmp" has one child, tmp, unticked. The node
+  keeps its saved state. It does count towards its parent's state; leaving it out
+  is what used to untick a folder whose only ticked child had gone, dropping both.
+- **Keep what the user chose when a row vanishes mid-session.** When a re-read
+  (`ReconcileChildrenAsync`) finds a row gone, the row stays as "not found" if it
+  carries a saved or user-made choice (`_hasExplicitState`). A row that only
+  inherited its state from its parent goes. A missing row whose folder returns
+  becomes a live row with its saved choice.
+- **Keep the reconcile away from them.** Edits to missing rows go to
+  `MissingFolderEditCount`, never `ChangedSelectionPaths`. The post-save reconcile
+  offers to purge the backed-up copies of anything dropped from the selection, and
+  for a folder that no longer exists those can be the only copies left. The editor's
+  unsaved-changes check counts both.
+- **Forget in one go, conservatively.** "Forget them" (`ForgetMissingAsync`) removes
+  the missing rows and prunes missing entries from never-expanded folders' saved
+  sub-selections (`PruneMissing`). It re-checks every path first, and leaves alone
+  any source that isn't connected, together with everything under it: an unplugged
+  drive has lost nothing. The count on the bar (`CountMissing`) uses the same rules,
+  computed from what would be saved.
 
 ### Never widen a selection to "repair" a tristate
 
@@ -728,6 +872,14 @@ be open at once, which means two of them can act on one backup set.
 Read-only pairs (Coverage alongside Cleanup) open silently. Adding a flow means
 declaring its access honestly; understating it is how you get two writers on one
 catalog with no warning.
+
+**A task window asks before it loses unsaved edits.** A flow that holds edits
+until its own Save implements `IConfirmClose`, and `TaskWindow.OnClosing` asks
+it on every close — the flow's Close button and the window's ✕ alike, since both
+end up in `Window.Close()`. With nothing unsaved it must return true without
+asking. A forced shutdown never asks (unsaved edits are dropped, as in the set
+editor). During File > Exit the close cannot be refused, so the flow is told to
+offer only Save / Don't Save. Largest Files is the only such flow today.
 
 ## Exclusion rules are an invariant of the catalog, not a step in one code path
 

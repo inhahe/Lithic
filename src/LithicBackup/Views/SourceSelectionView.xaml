@@ -124,6 +124,23 @@
                             </Style>
                         </TextBlock.Style>
                     </TextBlock>
+                    <!-- Saved entries whose folder no longer exists. Their rows can sit
+                         inside collapsed folders, so say how many there are, and offer
+                         to forget them all at once. -->
+                    <Border Margin="0,6,0,0" Padding="8,4"
+                            BorderBrush="{StaticResource BorderBrush}" BorderThickness="1"
+                            Background="{StaticResource SurfaceBrush}"
+                            Visibility="{Binding HasMissingFolders, Converter={StaticResource BoolToVis}}">
+                        <DockPanel>
+                            <Button DockPanel.Dock="Right" Content="Forget them"
+                                    Command="{Binding ForgetMissingCommand}"
+                                    Padding="10,3" Margin="8,0,0,0" Cursor="Hand"
+                                    ToolTip="Remove them from the selection. If something is ever created at one of these paths again, it is treated as new: backed up only if its parent auto-includes new folders. Drives and shares that aren't connected are left alone." />
+                            <TextBlock Text="{Binding MissingFoldersText}"
+                                       VerticalAlignment="Center" TextWrapping="Wrap"
+                                       Foreground="{StaticResource TextSecondaryBrush}" FontSize="11" />
+                        </DockPanel>
+                    </Border>
                 </StackPanel>
 
                 <!-- Tree + exclusion patterns (share the vertical space) -->
@@ -526,11 +543,16 @@
 
             <!-- Data template: just the name (checkboxes are in the ControlTemplate).
                  Hidden/System entries (e.g. C:\ProgramData) are shown but painted a
-                 distinct violet so it's clear they're special. -->
+                 distinct violet so it's clear they're special. A saved entry whose
+                 folder no longer exists is dimmed and labelled "(not found)", or
+                 "(not connected)" for a drive or share. The label is its own Run in
+                 its own colour so it can never be read as part of the name, and its
+                 leading space comes from AnnotationDisplay rather than from
+                 whitespace between the tags, which the parser collapses. -->
             <TreeView.ItemTemplate>
                 <HierarchicalDataTemplate ItemsSource="{Binding Children}">
-                    <TextBlock Text="{Binding Name}" VerticalAlignment="Center">
-                        <TextBlock.Style>
+                    <TextBlock VerticalAlignment="Center"><Run Text="{Binding Name, Mode=OneWay}" /><Run Text="{Binding AnnotationDisplay, Mode=OneWay}"
+             Foreground="{StaticResource WarningBrush}" FontStyle="Normal" /><TextBlock.Style>
                             <Style TargetType="TextBlock">
                                 <Setter Property="Foreground" Value="{StaticResource TextPrimaryBrush}" />
                                 <Style.Triggers>
@@ -538,10 +560,14 @@
                                         <Setter Property="Foreground" Value="{StaticResource HiddenSystemBrush}" />
                                         <Setter Property="ToolTip" Value="Hidden or system item" />
                                     </DataTrigger>
+                                    <DataTrigger Binding="{Binding IsMissing}" Value="True">
+                                        <Setter Property="Foreground" Value="{StaticResource TextDimBrush}" />
+                                        <Setter Property="FontStyle" Value="Italic" />
+                                        <Setter Property="ToolTip" Value="{Binding MissingToolTip}" />
+                                    </DataTrigger>
                                 </Style.Triggers>
                             </Style>
-                        </TextBlock.Style>
-                    </TextBlock>
+                        </TextBlock.Style></TextBlock>
                 </HierarchicalDataTemplate>
             </TreeView.ItemTemplate>
         </TreeView>

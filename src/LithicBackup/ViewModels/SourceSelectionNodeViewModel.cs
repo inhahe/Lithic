@@ -74,16 +74,34 @@ public class SourceSelectionNodeViewModel : ViewModelBase
     /// </summary>
     private Core.Models.SourceSelection? _restoredModel;
     /// <summary>
-    /// Saved child selections whose paths were NOT present on disk when this
-    /// directory's children were enumerated (e.g. a selected subfolder was
-    /// renamed, moved, or temporarily disconnected).  Without preserving them,
-    /// <see cref="ToModel"/> would re-derive the subtree from only the live
-    /// children and silently, permanently drop the missing selection — so a
-    /// folder that is later restored under its original name would no longer be
-    /// backed up.  These are re-emitted verbatim by <see cref="ToModel"/> so the
-    /// selection survives until the user explicitly changes it.
+    /// Saved child selections that matched no enumerated child although their
+    /// path IS on disk - an entry the enumeration skipped (a transient access
+    /// error, say). Re-emitted verbatim by <see cref="ToModel"/> so a save cannot
+    /// drop them. Saved entries whose path is genuinely gone are not kept here any
+    /// more: they become visible "not found" rows (see <see cref="IsMissing"/>).
     /// </summary>
     private List<Core.Models.SourceSelection>? _orphanedChildModels;
+
+    /// <summary>See <see cref="IsMissing"/>.</summary>
+    private bool _isMissing;
+
+    /// <summary>
+    /// True once this node carries a choice worth keeping if its folder
+    /// disappears: it was restored from a saved entry, or the user changed it
+    /// this session. A node that only inherited its state from its parent
+    /// carries nothing, so when its folder vanishes nothing is lost by letting
+    /// the row go (see <see cref="ReconcileChildrenAsync"/>).
+    /// </summary>
+    private bool _hasExplicitState;
+
+    /// <summary>
+    /// Records an edit to a "not found" node. Kept apart from the changed-paths
+    /// set on purpose: that set scopes the post-save reconcile, which offers to
+    /// purge the backed-up copies of anything dropped from the selection - and
+    /// for a folder that no longer exists, those copies can be the only ones
+    /// left. Such an edit still counts as an unsaved change.
+    /// </summary>
+    private readonly Action? _recordMissingEdit;
     /// <summary>
     /// Set when <see cref="ApplySelectionAsync"/> deferred restoring this
     /// collapsed directory's child selections to keep the initial dialog open
@@ -157,7 +175,8 @@ public class SourceSelectionNodeViewModel : ViewModelBase
         Func<Func<string, bool>?>? getExcludeFilter = null,
         Action<SourceSelectionNodeViewModel>? requestSelectionSettle = null,
         Action<Task>? registerPendingWork = null,
-        Action<string>? recordChangedPath = null)
+        Action<string>? recordChangedPath = null,
+        Action? recordMissingEdit = null)
     {
         Path = path;
         Name = System.IO.Path.GetFileName(path);
@@ -174,6 +193,7 @@ public class SourceSelectionNodeViewModel : ViewModelBase
         _requestSelectionSettle = requestSelectionSettle ?? parent?._requestSelectionSettle;
         _registerPendingWork = registerPendingWork ?? parent?._registerPendingWork;
         _recordChangedPath = recordChangedPath ?? parent?._recordChangedPath;
+        _recordMissingEdit = recordMissingEdit ?? parent?._recordMissingEdit;
         _getCatalogInfo = getCatalogInfo ?? parent?._getCatalogInfo;
         Depth = parent is null ? 0 : parent.Depth + 1;
         Children = [];
@@ -209,6 +229,61 @@ public class SourceSelectionNodeViewModel : ViewModelBase
     /// file-system attributes.
     /// </summary>
     public bool IsHiddenOrSystem { get; internal set; }
+
+    /// <summary>
+    /// True for a saved entry whose folder (or file) is not on disk: deleted,
+    /// moved, or on a drive or share that is not connected. The entry is kept
+    /// exactly as saved - so if a folder appears at that path again it is backed
+    /// up (or excluded) as before - and shown dimmed with a label, so it can be
+    /// seen and unticked. It used to be kept but invisible (and a whole missing
+    /// drive was not kept at all). A missing node never reads the disk: its
+    /// children are its saved sub-entries, all missing too.
+    /// </summary>
+    public bool IsMissing => _isMissing;
+
+    /// <summary>
+    /// Text the app shows after the name, in its own colour (never part of the
+    /// name - design.md, "Text the app adds to a filename must not look like
+    /// part of it"). Empty unless <see cref="IsMissing"/>.
+    /// </summary>
+    public string Annotation
+        => !_isMissing ? string.Empty
+         : IsTopLevelRoot ? "(not connected)"
+         : "(not found)";
+
+    /// <summary><see cref="Annotation"/> with its own leading space, so the view
+    /// never depends on whitespace between two <c>Run</c> elements.</summary>
+    public string AnnotationDisplay
+        => string.IsNullOrEmpty(Annotation) ? string.Empty : " " + Annotation;
+
+    /// <summary>
+    /// A drive or share listed directly as a source - "not connected" rather
+    /// than "not found" when missing, because that is almost always the reason.
+    /// </summary>
+    private bool IsTopLevelRoot
+        => Parent is { Path: "" }
+           && string.Equals(System.IO.Path.GetPathRoot(Path)?.TrimEnd('\\'), Path.TrimEnd('\\'),
+                            StringComparison.OrdinalIgnoreCase);
+
+    /// <summary>Explains a "not found" row; null (no tooltip) for ordinary rows.</summary>
+    public string? MissingToolTip
+    {
+        get
+        {
+            if (!_isMissing)
+                return null;
+            string what = IsDirectory ? "folder" : "file";
+            if (IsTopLevelRoot)
+                return "This source isn't connected. Its selections are kept, and apply "
+                       + "again when it is.";
+            return _isSelected == false
+                ? $"This {what} no longer exists. It is still excluded, so if a {what} is "
+                  + "created here again it won't be backed up, even where new folders are "
+                  + "auto-included."
+                : $"This {what} no longer exists. It is still selected, so if a {what} is "
+                  + "created here again it will be backed up. Untick it if it shouldn't be.";
+        }
+    }
 
     /// <summary>Whether this directory's children have been loaded from the filesystem.</summary>
     public bool IsLoaded
@@ -296,6 +371,7 @@ public class SourceSelectionNodeViewModel : ViewModelBase
     {
         get
         {
+            if (_isMissing) return "";
             bool selectedOnly = _getShowSelectedOnly?.Invoke() ?? false;
             if (selectedOnly)
             {
@@ -338,7 +414,7 @@ public class SourceSelectionNodeViewModel : ViewModelBase
     {
         get
         {
-            if (!IsDirectory) return "";
+            if (!IsDirectory || _isMissing) return "";
             bool selectedOnly = _getShowSelectedOnly?.Invoke() ?? false;
             if (selectedOnly)
             {
@@ -521,6 +597,8 @@ public class SourceSelectionNodeViewModel : ViewModelBase
             _isAutoIncludeDerived = false;
             OnPropertyChanged();
             OnPropertyChanged(nameof(IsNodeEnabled));
+            if (_isMissing)
+                OnPropertyChanged(nameof(MissingToolTip));
 
             // Clear backup status for deselected files — they're not part
             // of the backup, so showing a status dot would be misleading.
@@ -544,6 +622,10 @@ public class SourceSelectionNodeViewModel : ViewModelBase
 
             if (_suppressPropagation)
                 return;
+
+            // Only a user's click gets here (propagation and recomputes run
+            // suppressed), so this node now carries a choice of its own.
+            _hasExplicitState = true;
 
             // The clicked checkbox's own visual state is already updated
             // (OnPropertyChanged above).  Defer the rest — pushing the state
@@ -740,6 +822,7 @@ public class SourceSelectionNodeViewModel : ViewModelBase
         // recursively-propagated child, which would fire the aggregate many times.
         if (userInitiated)
         {
+            _hasExplicitState = true;
             _onSelectionChanged?.Invoke();
 
             // Record this directory as a changed subtree so the post-edit
@@ -752,7 +835,12 @@ public class SourceSelectionNodeViewModel : ViewModelBase
             // destination.  Recording on turn-ON too is harmless: the reconcile's
             // "included before AND excluded now" filter yields no removals when
             // coverage only grew.
-            if (IsDirectory && !string.IsNullOrEmpty(Path))
+            // (Not for a "not found" folder: nothing of it is on disk to rescan,
+            // and the reconcile must never be pointed at one - see
+            // _recordMissingEdit.)
+            if (_isMissing)
+                _recordMissingEdit?.Invoke();
+            else if (IsDirectory && !string.IsNullOrEmpty(Path))
                 _recordChangedPath?.Invoke(Path);
         }
     }
@@ -805,6 +893,11 @@ public class SourceSelectionNodeViewModel : ViewModelBase
             if (!SetProperty(ref _isExpanded, value) || !value || !IsDirectory)
                 return;
 
+            // A "not found" node's children are its saved sub-entries, already
+            // in place; there is nothing on disk to load or re-read.
+            if (_isMissing)
+                return;
+
             if (!_isLoaded)
             {
                 // First expansion — enumerate this directory's children.
@@ -848,6 +941,7 @@ public class SourceSelectionNodeViewModel : ViewModelBase
         // Remember the saved subtree so ToModel can fall back to it if this
         // directory's children can't be enumerated later (see _restoredModel).
         _restoredModel = model;
+        _hasExplicitState = true;
 
         // Apply state without triggering propagation.
         _suppressPropagation = true;
@@ -925,11 +1019,12 @@ public class SourceSelectionNodeViewModel : ViewModelBase
     /// <summary>
     /// Apply a set of saved child <see cref="Core.Models.SourceSelection"/>
     /// models to this node's already-loaded children, recursing into each.
-    /// Saved children whose paths are no longer present on disk are preserved as
-    /// orphans (see <see cref="_orphanedChildModels"/>) so a later save doesn't
-    /// silently drop them.  Sibling subtrees are applied concurrently — each
-    /// child's filesystem enumeration runs on the thread pool, so siblings
-    /// overlap instead of serialising.
+    /// A saved child whose path is gone from disk becomes a "not found" row
+    /// (<see cref="CreateMissingNode"/>), so it is both kept and visible; one
+    /// that is on disk but was not enumerated is kept invisibly
+    /// (<see cref="_orphanedChildModels"/>).  Sibling subtrees are applied
+    /// concurrently — each child's filesystem enumeration runs on the thread
+    /// pool, so siblings overlap instead of serialising.
     /// </summary>
     private async Task ApplyChildModelsAsync(
         IReadOnlyList<Core.Models.SourceSelection> childModels)
@@ -945,26 +1040,140 @@ public class SourceSelectionNodeViewModel : ViewModelBase
             child.IsSelectionRestored = true;
 
         var tasks = new List<Task>(childModels.Count);
+        List<Core.Models.SourceSelection>? unmatched = null;
         foreach (var childModel in childModels)
         {
             var childNode = Children.FirstOrDefault(c =>
                 string.Equals(c.Path, childModel.Path, StringComparison.OrdinalIgnoreCase));
             if (childNode is not null)
-            {
                 tasks.Add(childNode.ApplySelectionAsync(childModel));
-            }
-            else if (childModel.IsSelected != false)
+            else
+                (unmatched ??= []).Add(childModel);
+        }
+
+        if (unmatched is not null)
+        {
+            // Which of these are really gone? Asked off the UI thread: at the
+            // "All Drives" root they can be network paths, and a share that is
+            // offline can take many seconds to answer.
+            var gone = await Task.Run(() => unmatched.Where(m => !ExistsOnDisk(m)).ToHashSet());
+
+            var missingNodes = new List<SourceSelectionNodeViewModel>();
+            foreach (var childModel in unmatched)
             {
-                // The saved selection referenced a child that is no longer
-                // on disk (renamed/moved/disconnected).  Preserve it so a
-                // later save (ToModel) doesn't silently drop the selection;
-                // if the path comes back under its original name it will be
-                // backed up again.
-                (_orphanedChildModels ??= []).Add(childModel);
+                if (gone.Contains(childModel))
+                {
+                    // Deleted, moved, or not connected. Keep the saved choice -
+                    // a folder that comes back under this name is backed up (or
+                    // excluded) exactly as before - but as a row the user can see
+                    // and untick, not an invisible leftover. Exclusions are kept
+                    // too: dropping one would quietly let a re-created folder back
+                    // in under an auto-include parent.
+                    missingNodes.Add(CreateMissingNode(childModel, this));
+                }
+                else if (childModel.IsSelected != false)
+                {
+                    // On disk but not enumerated. Keep it invisibly, as before,
+                    // so a save cannot drop it.
+                    (_orphanedChildModels ??= []).Add(childModel);
+                }
+            }
+
+            if (missingNodes.Count > 0)
+            {
+                Children.ReplaceAll(Children.Concat(missingNodes).ToList());
+                SortChildren();
             }
         }
+
         await Task.WhenAll(tasks);
     }
+
+    /// <summary>Whether a saved entry's path exists, as a folder or a file to match.</summary>
+    internal static bool ExistsOnDisk(Core.Models.SourceSelection model)
+        => model.IsDirectory ? Directory.Exists(model.Path) : File.Exists(model.Path);
+
+    /// <summary>
+    /// A row for a saved entry that is not on disk, with its saved sub-entries
+    /// beneath it (every descendant of a missing folder is missing too). It holds
+    /// the saved state exactly, so saving writes the entry back unchanged; it
+    /// never reads the disk; and it contributes nothing to sizes.
+    /// </summary>
+    internal static SourceSelectionNodeViewModel CreateMissingNode(
+        Core.Models.SourceSelection model, SourceSelectionNodeViewModel parent)
+    {
+        var node = new SourceSelectionNodeViewModel(model.Path, model.IsDirectory, parent)
+        {
+            _isMissing = true,
+            _hasExplicitState = true,
+            _restoredModel = model,
+            _isSelected = model.IsSelected,
+            _autoIncludeNew = model.AutoIncludeNewSubdirectories,
+            _isExpanded = model.IsExpanded,
+            _isLoaded = true,
+            _size = 0,
+            _fileCount = 0,
+            _filteredSize = 0,
+            _filteredFileCount = 0,
+            _isSelectionRestored = true,
+        };
+
+        // Drop the "Loading..." placeholder the constructor gave the directory.
+        node.Children.Clear();
+        foreach (var childModel in model.Children)
+            node.Children.Add(CreateMissingNode(childModel, node));
+        return node;
+    }
+
+    /// <summary>
+    /// Whether this node, or anything loaded beneath it, carries a choice that
+    /// should outlive its folder disappearing (see <see cref="_hasExplicitState"/>).
+    /// </summary>
+    private bool CarriesExplicitState()
+        => _hasExplicitState || (_isLoaded && Children.Any(c => c.CarriesExplicitState()));
+
+    /// <summary>
+    /// The saved sub-selection a collapsed, never-expanded directory is holding
+    /// for its first expansion, or null. <see cref="ToModel"/> writes it back
+    /// verbatim, so any missing entries inside it are saved too.
+    /// </summary>
+    internal Core.Models.SourceSelection? DeferredModel
+        => IsDirectory && !_isLoaded && _pendingDeferredRestore ? _restoredModel : null;
+
+    /// <summary>Swap in a pruned copy of <see cref="DeferredModel"/> (Forget).</summary>
+    internal void ReplaceDeferredModel(Core.Models.SourceSelection model)
+    {
+        if (DeferredModel is not null)
+            _restoredModel = model;
+    }
+
+    /// <summary>
+    /// Collect, beneath this node (which must itself be on disk), every top-most
+    /// "not found" row and every collapsed directory still holding an unloaded
+    /// saved sub-selection - the two places a missing entry can be.
+    /// </summary>
+    internal void CollectMissingWork(
+        List<SourceSelectionNodeViewModel> missing, List<SourceSelectionNodeViewModel> deferred)
+    {
+        if (!IsDirectory || _isMissing)
+            return;
+        if (!_isLoaded)
+        {
+            if (DeferredModel is not null)
+                deferred.Add(this);
+            return;
+        }
+        foreach (var child in Children)
+        {
+            if (child._isMissing)
+                missing.Add(child);
+            else
+                child.CollectMissingWork(missing, deferred);
+        }
+    }
+
+    /// <summary>Take a child row out of the tree (Forget).</summary>
+    internal bool RemoveChild(SourceSelectionNodeViewModel child) => Children.Remove(child);
 
     /// <summary>
     /// Reveal this node's Include checkbox and those of all currently-loaded
@@ -1400,30 +1609,53 @@ public class SourceSelectionNodeViewModel : ViewModelBase
                 existing[child.Path] = child;
 
             bool anyAdded = entries.Any(e => !existing.ContainsKey(e.FullName));
-            bool anyRemoved = Children.Any(c => !onDisk.Contains(c.Path));
-            if (!anyAdded && !anyRemoved)
+            bool anyGone = Children.Any(c => !c._isMissing && !onDisk.Contains(c.Path));
+            bool anyBack = Children.Any(c => c._isMissing && onDisk.Contains(c.Path));
+            if (!anyAdded && !anyGone && !anyBack)
                 return;
 
             // Build the merged list, reusing existing nodes (to preserve their
             // selection/expansion/sizes) and creating nodes for new entries.
             var merged = new List<SourceSelectionNodeViewModel>(entries.Count);
             var newDirNodes = new List<SourceSelectionNodeViewModel>();
+            var revived = new List<(SourceSelectionNodeViewModel Node, Core.Models.SourceSelection Saved)>();
             foreach (var entry in entries)
             {
-                if (existing.TryGetValue(entry.FullName, out var node))
+                if (existing.TryGetValue(entry.FullName, out var node) && !node._isMissing)
                 {
                     merged.Add(node);
+                    continue;
                 }
-                else
-                {
-                    var child = CreateChildNode(entry);
+
+                var child = CreateChildNode(entry);
+                merged.Add(child);
+                if (child.IsDirectory)
+                    newDirNodes.Add(child);
+
+                // A "not found" folder is back: the live row takes over its saved
+                // choice (and its saved sub-entries) instead of starting blank.
+                if (node is not null && node.ToModel() is { } saved)
+                    revived.Add((child, saved));
+            }
+
+            // Rows whose folder has gone since the last read. One that carries a
+            // saved or user-made choice stays, as "not found": removing it would
+            // drop that choice on the next save, which is how a selected folder
+            // deleted while the editor was open used to fall out of the set.
+            // Rows that only inherited their state from this folder go.
+            foreach (var child in Children)
+            {
+                if (onDisk.Contains(child.Path))
+                    continue;
+                if (child._isMissing)
                     merged.Add(child);
-                    if (child.IsDirectory)
-                        newDirNodes.Add(child);
-                }
+                else if (child.CarriesExplicitState() && child.ToModel() is { } model)
+                    merged.Add(CreateMissingNode(model, this));
             }
 
             Children.ReplaceAll(merged);
+            foreach (var (node, saved) in revived)
+                await node.ApplySelectionAsync(saved);
             SortChildren();
 
             if (_getCatalogInfo?.Invoke() is not null)
@@ -1973,6 +2205,10 @@ public class SourceSelectionNodeViewModel : ViewModelBase
 
         foreach (var child in Children)
         {
+            // Nothing on disk to compare with the catalog.
+            if (child._isMissing)
+                continue;
+
             if (child.IsDirectory)
             {
                 if (child._isLoaded)
@@ -2029,12 +2265,51 @@ public class SourceSelectionNodeViewModel : ViewModelBase
     /// <summary>
     /// Recalculate this node's tristate based on its children's states.
     /// </summary>
+    /// <summary>
+    /// Whether every child is selected <b>by the user or a saved selection</b>,
+    /// as opposed to merely drawn checked.
+    ///
+    /// <para><b>This is the rule that stops the editor widening a selection by
+    /// itself.</b> Under a partially-selected folder with auto-include-new on,
+    /// <see cref="CreateChildNode"/> draws every unlisted child checked and flags
+    /// it <see cref="_isAutoIncludeDerived"/> — correctly, since the scanner does
+    /// cover those folders. Both tristate recomputes used to ask only
+    /// <c>c.IsSelected == true</c>, so those inferred checks promoted the parent
+    /// to <i>fully</i> selected. On the next open a fully-selected parent creates
+    /// its children as real selections, and <see cref="ToModel"/> writes every one
+    /// of them out. Two open/close cycles with no clicks at all turned a C:\ saved
+    /// as "these five folders" into every top-level entry on the drive — and
+    /// because closing the editor always saves, it persisted. It happened to a
+    /// real backup set twice, the second time copying 1.2 TB of C: overnight.</para>
+    ///
+    /// <para>A tristate correction may only ever narrow a selection, never widen
+    /// it (design.md). Promoting partial to full is a widening, so it must be
+    /// justified by genuine selections alone. When the user really does tick
+    /// every child, each one's derived flag is cleared by that click and the
+    /// parent still becomes fully selected, so ordinary checkbox behaviour is
+    /// unchanged.</para>
+    ///
+    /// <para>A derived child keeps its flag through these recomputes: the
+    /// <see cref="IsSelected"/> setter only clears it on an actual change, and a
+    /// derived child is already <c>true</c>.</para>
+    /// </summary>
+    private bool AllChildrenGenuinelySelected()
+        => Children.All(c => c.IsSelected == true && !c._isAutoIncludeDerived);
+
     internal void UpdateFromChildren()
     {
         if (Children.Count == 0)
             return;
 
-        bool allSelected = Children.All(c => c.IsSelected == true);
+        // A "not found" folder's children are only its saved exceptions, not
+        // everything that was in it, so they cannot tell what the folder itself
+        // should be: "all of it except tmp" has one child, tmp, unticked, and
+        // re-deriving from that would turn it into "none of it". Its own saved
+        // state stands. (It still counts towards its parent's state.)
+        if (_isMissing)
+            return;
+
+        bool allSelected = AllChildrenGenuinelySelected();
         bool allDeselected = Children.All(c => c.IsSelected == false);
 
         _suppressPropagation = true;
@@ -2066,13 +2341,14 @@ public class SourceSelectionNodeViewModel : ViewModelBase
     /// </summary>
     internal void RecomputeLoadedTristate()
     {
-        if (!IsDirectory || !_isLoaded || Children.Count == 0)
+        // A "not found" folder keeps its saved state - see UpdateFromChildren.
+        if (!IsDirectory || !_isLoaded || Children.Count == 0 || _isMissing)
             return;
 
         foreach (var child in Children)
             child.RecomputeLoadedTristate();
 
-        bool allSelected = Children.All(c => c.IsSelected == true);
+        bool allSelected = AllChildrenGenuinelySelected();
         bool allDeselected = Children.All(c => c.IsSelected == false);
 
         _suppressPropagation = true;
@@ -2194,8 +2470,10 @@ public class SourceSelectionNodeViewModel : ViewModelBase
                     model.Children.Add(childModel);
             }
 
-            // Re-emit saved selections whose paths weren't on disk this session
+            // Re-emit saved selections that are on disk but were not enumerated
             // (see _orphanedChildModels) so they survive a re-save untouched.
+            // (Saved entries that are genuinely gone are "not found" children
+            // above, and serialise themselves.)
             if (_orphanedChildModels is not null)
             {
                 foreach (var orphan in _orphanedChildModels)

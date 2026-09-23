@@ -18,7 +18,13 @@ namespace LithicBackup.ViewModels;
 /// showing directories sorted by total size with nested subdirectories.
 /// Supports toggling file/directory inclusion (adds/removes exclusion patterns).
 /// </summary>
-public class LargestFilesViewModel : ViewModelBase
+/// <remarks>
+/// Toggles are never written as they happen. Opened on its own, this window
+/// collects them until Save, and asks before closing with any unsaved. Opened
+/// from the backup-set editor (<c>deferPersistence</c>), it hands each toggle to
+/// the editor, which saves or discards it along with the rest of the edit.
+/// </remarks>
+public class LargestFilesViewModel : ViewModelBase, IConfirmClose
 {
     private readonly IFileScanner _scanner;
     private readonly ICatalogRepository _catalog;
@@ -46,38 +52,64 @@ public class LargestFilesViewModel : ViewModelBase
     /// </summary>
     private bool _suppressInclusionCallback;
 
+    /// <summary>See <see cref="DeferPersistence"/>.</summary>
+    private readonly bool _deferPersistence;
+
+    /// <summary>
+    /// Standalone only: toggles not yet saved, as pattern → excluded. The last
+    /// toggle of a pattern wins, so toggling one off and on again leaves an entry
+    /// that <see cref="HasUnsavedChanges"/> recognises as no change.
+    /// </summary>
+    private readonly Dictionary<string, bool> _pendingExclusions =
+        new(StringComparer.OrdinalIgnoreCase);
+
+    /// <summary>The exclusion list as last saved (or as loaded).</summary>
+    private HashSet<string> _savedExclusions;
+
     /// <summary>Fired when the user clicks "Close".</summary>
     public event Action? DoneRequested;
 
-    /// <summary>Fired when the user clicks "Save".</summary>
-    public event Func<Task>? SaveRequested;
+    /// <summary>
+    /// Opened from the editor only: raised for every include/exclude toggle with
+    /// the exclusion pattern and whether it is now excluded. The editor applies it
+    /// to its own exclusion list.
+    /// </summary>
+    public event Action<string, bool>? ExclusionToggled;
 
     private string _saveStatusText = "";
 
     /// <summary>Cancel any running scan (e.g. when the host window closes).</summary>
     public void CancelScan() => _cts?.Cancel();
 
+    /// <param name="deferPersistence">
+    /// True when opened from the backup-set editor - see <see cref="DeferPersistence"/>.
+    /// </param>
     public LargestFilesViewModel(
         IFileScanner scanner,
         ICatalogRepository catalog,
         BackupSet backupSet,
-        int estimatedFileCount = 0)
+        int estimatedFileCount = 0,
+        bool deferPersistence = false)
     {
         _scanner = scanner;
         _catalog = catalog;
         _backupSet = backupSet;
         _backupSet.JobOptions ??= new JobOptions();
+        _deferPersistence = deferPersistence;
+        _savedExclusions = new HashSet<string>(
+            _backupSet.JobOptions.ExcludedExtensions, StringComparer.OrdinalIgnoreCase);
 
         _filesCollection = [];
         _filesView = CollectionViewSource.GetDefaultView(_filesCollection);
 
+        // Closing goes through the host window, which asks ConfirmClose first.
         CloseCommand = new RelayCommand(_ =>
         {
             _cts?.Cancel();
             DoneRequested?.Invoke();
         });
 
-        SaveCommand = new RelayCommand(_ => OnSave(), _ => !IsLoading);
+        SaveCommand = new RelayCommand(_ => OnSave(), _ => !IsLoading && HasUnsavedChanges);
 
         SortByNameCommand = new RelayCommand(_ => ApplySort("Name"));
         SortByDirectoryCommand = new RelayCommand(_ => ApplySort("Directory"));
@@ -102,6 +134,26 @@ public class LargestFilesViewModel : ViewModelBase
     // --- Properties ---
 
     public string BackupSetName => _backupSet.Name;
+
+    /// <summary>
+    /// True when opened from the backup-set editor. Toggles then go to the editor
+    /// (<see cref="ExclusionToggled"/>) and are saved or discarded with the rest of
+    /// that edit, so this window has no Save button and nothing of its own to
+    /// lose. They used to be written to the catalog on every click, behind the
+    /// editor's back - which its next save then undid.
+    /// </summary>
+    public bool DeferPersistence => _deferPersistence;
+
+    /// <summary>Hidden when the editor does the saving.</summary>
+    public bool ShowSaveButton => !_deferPersistence;
+
+    /// <summary>
+    /// Standalone: whether any toggle would change the saved exclusion list.
+    /// Always false when <see cref="DeferPersistence"/> - the editor tracks it.
+    /// </summary>
+    public bool HasUnsavedChanges =>
+        !_deferPersistence
+        && _pendingExclusions.Any(kv => kv.Value != _savedExclusions.Contains(kv.Key));
 
     public string ViewTitle => _isDirectoryMode
         ? "Largest Source Directories"
@@ -219,14 +271,136 @@ public class LargestFilesViewModel : ViewModelBase
 
     private async void OnSave()
     {
-        if (SaveRequested is not null)
-            await SaveRequested.Invoke();
+        await SaveAsync();
 
         if (!string.IsNullOrEmpty(SaveStatusText))
         {
             await Task.Delay(3000);
             SaveStatusText = "";
         }
+    }
+
+    /// <summary>
+    /// Standalone: write the unsaved toggles. Returns false if the write failed
+    /// (the toggles stay pending, and <see cref="SaveStatusText"/> says why).
+    /// </summary>
+    public async Task<bool> SaveAsync()
+    {
+        if (!HasUnsavedChanges)
+            return true;
+
+        var changes = _pendingExclusions.ToList();
+        try
+        {
+            var saved = await Task.Run(() => WriteExclusionsAsync(changes));
+            ApplySaved(saved);
+            SaveStatusText = "Saved";
+            return true;
+        }
+        catch (Exception ex)
+        {
+            SaveStatusText = $"Save failed: {ex.Message}";
+            return false;
+        }
+    }
+
+    /// <summary>
+    /// Apply the toggles to the catalog's CURRENT copy of the set and write only
+    /// that: re-read, change the exclusion list, metadata write. Writing this
+    /// window's own copy instead would put back any setting changed since it
+    /// opened - the set editor saving a new schedule, say - and the selection is
+    /// never written at all.
+    /// </summary>
+    private async Task<List<string>> WriteExclusionsAsync(List<KeyValuePair<string, bool>> changes)
+    {
+        var fresh = await _catalog.GetBackupSetAsync(_backupSet.Id)
+                    ?? throw new InvalidOperationException("the backup set no longer exists");
+        fresh.JobOptions ??= new JobOptions();
+        var list = fresh.JobOptions.ExcludedExtensions;
+
+        foreach (var (pattern, excluded) in changes)
+        {
+            if (excluded)
+            {
+                if (!list.Contains(pattern, StringComparer.OrdinalIgnoreCase))
+                    list.Add(pattern);
+            }
+            else
+            {
+                list.RemoveAll(p => string.Equals(p, pattern, StringComparison.OrdinalIgnoreCase));
+            }
+        }
+
+        await _catalog.UpdateBackupSetMetadataAsync(fresh);
+        return [.. list];
+    }
+
+    private void ApplySaved(List<string> saved)
+    {
+        _savedExclusions = new HashSet<string>(saved, StringComparer.OrdinalIgnoreCase);
+        _pendingExclusions.Clear();
+
+        // Keep this window's copy of the set in step with what is now saved.
+        _backupSet.JobOptions!.ExcludedExtensions = saved;
+
+        OnPropertyChanged(nameof(HasUnsavedChanges));
+        CommandManager.InvalidateRequerySuggested();
+    }
+
+    /// <inheritdoc />
+    public bool ConfirmClose(bool canCancel)
+    {
+        if (!HasUnsavedChanges)
+            return true;
+
+        var answer = MessageBox.Show(
+            "You have unsaved changes to which files are excluded from this backup.\n\n"
+            + "Save them before closing?",
+            "Unsaved Changes",
+            canCancel ? MessageBoxButton.YesNoCancel : MessageBoxButton.YesNo,
+            MessageBoxImage.Question);
+
+        if (answer == MessageBoxResult.Cancel)
+            return false;
+
+        if (answer == MessageBoxResult.Yes)
+        {
+            // Saved before returning, so the window can close in the same
+            // gesture - also during an app exit, which will not wait for an async
+            // save. It is one row update, run off the UI thread's context so the
+            // wait cannot deadlock.
+            var changes = _pendingExclusions.ToList();
+            try
+            {
+                ApplySaved(Task.Run(() => WriteExclusionsAsync(changes)).GetAwaiter().GetResult());
+            }
+            catch (Exception ex)
+            {
+                MessageBox.Show(
+                    $"Your exclusion changes could not be saved:\n\n{ex.Message}",
+                    "Save Failed", MessageBoxButton.OK, MessageBoxImage.Error);
+                return !canCancel;
+            }
+        }
+
+        return true;
+    }
+
+    /// <summary>
+    /// Record one toggle: hand it to the editor, or hold it for Save.
+    /// </summary>
+    private void RecordExclusion(string pattern, bool excluded)
+    {
+        if (_deferPersistence)
+        {
+            ExclusionToggled?.Invoke(pattern, excluded);
+            return;
+        }
+
+        _pendingExclusions[pattern] = excluded;
+        SaveStatusText = "";
+        OnPropertyChanged(nameof(HasUnsavedChanges));
+        CommandManager.InvalidateRequerySuggested();
     }
 
     // --- Sort ---
@@ -314,20 +488,15 @@ public class LargestFilesViewModel : ViewModelBase
 
     // --- Inclusion toggle ---
 
-    private async void OnFileInclusionToggled(LargestFileItem item)
+    private void OnFileInclusionToggled(LargestFileItem item)
     {
         if (_suppressInclusionCallback) return;
 
-        var exclusions = _backupSet.JobOptions!.ExcludedExtensions;
-        if (item.IsIncluded)
-            exclusions.Remove(item.FullPath);
-        else if (!exclusions.Contains(item.FullPath, StringComparer.OrdinalIgnoreCase))
-            exclusions.Add(item.FullPath);
-
-        try { await _catalog.UpdateBackupSetAsync(_backupSet); } catch { }
+        // A full path is honoured as an exact-path exclusion pattern.
+        RecordExclusion(item.FullPath, excluded: !item.IsIncluded);
     }
 
-    private async void OnDirectoryInclusionToggled(DirectoryItem item)
+    private void OnDirectoryInclusionToggled(DirectoryItem item)
     {
         if (_suppressInclusionCallback) return;
 
@@ -335,19 +504,13 @@ public class LargestFilesViewModel : ViewModelBase
         // GlobMatcher translates * to .* which matches path separators,
         // so dir\* covers all descendants recursively.
         var pattern = item.FullPath.TrimEnd('\\') + @"\*";
-        var exclusions = _backupSet.JobOptions!.ExcludedExtensions;
-
-        if (item.IsIncluded)
-            exclusions.Remove(pattern);
-        else if (!exclusions.Contains(pattern, StringComparer.OrdinalIgnoreCase))
-            exclusions.Add(pattern);
 
         // Propagate visual state to descendants without triggering their callbacks.
         _suppressInclusionCallback = true;
         PropagateInclusion(item.Children, item.IsIncluded);
         _suppressInclusionCallback = false;
 
-        try { await _catalog.UpdateBackupSetAsync(_backupSet); } catch { }
+        RecordExclusion(pattern, excluded: !item.IsIncluded);
     }
 
     private static void PropagateInclusion(List<DirectoryItem> children, bool included)

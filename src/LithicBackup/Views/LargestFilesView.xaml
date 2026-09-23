@@ -112,9 +112,16 @@
                            Foreground="{StaticResource AccentBrush}"
                            FontWeight="SemiBold" FontSize="12"
                            VerticalAlignment="Center" Margin="0,0,12,0" />
+                <!-- Opened from the backup-set editor, unticking here is part of
+                     that edit: the editor's Save keeps it, its Cancel drops it. -->
+                <TextBlock Text="Changes are saved with the backup set"
+                           Foreground="{StaticResource TextSecondaryBrush}"
+                           FontSize="12" VerticalAlignment="Center" Margin="0,0,12,0"
+                           Visibility="{Binding DeferPersistence, Converter={StaticResource BoolToVis}}" />
                 <Button Content="Save" Command="{Binding SaveCommand}"
                         Style="{StaticResource PrimaryButton}"
-                        Padding="16,8" Margin="0,0,8,0" Cursor="Hand" />
+                        Padding="16,8" Margin="0,0,8,0" Cursor="Hand"
+                        Visibility="{Binding ShowSaveButton, Converter={StaticResource BoolToVis}}" />
                 <Button Content="Close" Command="{Binding CloseCommand}"
                         Padding="16,8" Cursor="Hand" />
             </StackPanel>

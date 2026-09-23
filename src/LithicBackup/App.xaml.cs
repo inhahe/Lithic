@@ -113,9 +113,23 @@ public partial class App : Application
     /// </summary>
     internal bool IsForcedShutdown { get; private set; }
 
+    /// <summary>
+    /// Set by a test harness before it constructs the App, when all it wants is
+    /// the App's resources and flags. WPF's Application constructor queues
+    /// OnStartup for the first dispatcher pump whether or not Run() is called,
+    /// and this OnStartup starts the whole application: the single-instance lock,
+    /// the real catalog, a main window, a tray icon, background monitors and an
+    /// update check. With Lithic Backup already open, it instead pulls that window
+    /// to the front and shuts the harness down. (tools\editor_save_test hit both.)
+    /// </summary>
+    internal static bool SkipStartupForTests { get; set; }
+
     protected override async void OnStartup(StartupEventArgs e)
     {
         base.OnStartup(e);
+
+        if (SkipStartupForTests)
+            return;
 
         // --- Crash diagnostics ---
         // Install process-global exception capture as the very first thing, so

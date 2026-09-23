@@ -12,6 +12,26 @@ public interface ICatalogRepository : IDisposable
     Task<BackupSet?> GetBackupSetAsync(int id, CancellationToken ct = default);
     Task<IReadOnlyList<BackupSet>> GetAllBackupSetsAsync(CancellationToken ct = default);
     Task UpdateBackupSetAsync(BackupSet set, CancellationToken ct = default);
+
+    /// <summary>
+    /// Update a backup set's settings and bookkeeping <b>without touching its
+    /// source selection</b> — the stored <c>SourceSelectionJson</c> is left
+    /// exactly as it is in the catalog.
+    ///
+    /// <para><see cref="UpdateBackupSetAsync"/> rewrites every column from the
+    /// object it is handed, so any caller holding an older copy of the set writes
+    /// that copy's selection back too. Callers that only mean to record a backup
+    /// time, a destination change or a volume identity have no business
+    /// carrying a selection with them: a GUI session that had read a widened
+    /// selection earlier wrote it back over a corrected one minutes after the
+    /// correction, and the backup that followed would have copied 1.2 TB of C:
+    /// again.</para>
+    ///
+    /// <para>Use this whenever the change is not to the selection. Use
+    /// <see cref="UpdateBackupSetAsync"/> only where the selection itself is the
+    /// thing being changed.</para>
+    /// </summary>
+    Task UpdateBackupSetMetadataAsync(BackupSet set, CancellationToken ct = default);
     Task DeleteBackupSetAsync(int backupSetId, CancellationToken ct = default);
 
     /// <summary>

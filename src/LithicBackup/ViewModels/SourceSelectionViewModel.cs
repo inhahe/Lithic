@@ -64,7 +64,11 @@ public class SourceSelectionViewModel : ViewModelBase, IDisposable
     /// walking the filesystem — and holding the tree alive — for a window that
     /// no longer exists, and the next editor opens a second scheduler beside it.
     /// </summary>
-    public void Dispose() => _scheduler.Dispose();
+    public void Dispose()
+    {
+        _missingRecountCts?.Cancel();
+        _scheduler.Dispose();
+    }
     private Dictionary<string, FileVersionInfo>? _catalogInfo;
     private readonly List<DriveData>? _preloadedDrives;
     private bool _showLargestFiles;
@@ -124,6 +128,12 @@ public class SourceSelectionViewModel : ViewModelBase, IDisposable
     /// </summary>
     private readonly HashSet<string> _changedSelectionPaths =
         new(StringComparer.OrdinalIgnoreCase);
+
+    // Saved entries whose folder no longer exists - see MissingFolderCount.
+    private int _missingFolderCount;
+    private int _missingFileCount;
+    private CancellationTokenSource? _missingRecountCts;
+    private bool _forgettingMissing;
     /// <summary>True once a settle pass has been scheduled but not yet run.</summary>
     private bool _selectionSettleScheduled;
     /// <summary>
@@ -233,6 +243,9 @@ public class SourceSelectionViewModel : ViewModelBase, IDisposable
             _ => _selectedTierSet is not null && !_selectedTierSet.IsBuiltIn);
         AddPathCommand = new RelayCommand(_ => AddCustomPath());
         AutoIncludeCheckedCommand = new RelayCommand(_ => SetAutoIncludeOnChecked());
+        ForgetMissingCommand = new RelayCommand(
+            _ => _ = ForgetMissingAsync(),
+            _ => HasMissingFolders && !IsApplyingSelections && !_forgettingMissing);
         CalculateSizeCommand = new RelayCommand(
             _ => _ = OnCalculateSize(),
             _ => !IsCalculatingSize);
@@ -268,7 +281,9 @@ public class SourceSelectionViewModel : ViewModelBase, IDisposable
                     or nameof(IsCalculatingSize) or nameof(SizeCalculationResult)
                     or nameof(IsSeeding) or nameof(SeedResult)
                     or nameof(DestinationSpaceText)
-                    or nameof(IsAnalyzingDedup) or nameof(DedupAnalysisResult)))
+                    or nameof(IsAnalyzingDedup) or nameof(DedupAnalysisResult)
+                    or nameof(MissingFolderCount) or nameof(HasMissingFolders)
+                    or nameof(MissingFoldersText)))
             {
                 if (!_dirtyTrackingArmed)
                     return;
@@ -969,6 +984,242 @@ public class SourceSelectionViewModel : ViewModelBase, IDisposable
     public IReadOnlyCollection<string> ChangedSelectionPaths => _changedSelectionPaths.ToList();
 
     /// <summary>
+    /// Edits to entries whose folder no longer exists: ticking or unticking a
+    /// "not found" row, or Forget. Counted apart from
+    /// <see cref="ChangedSelectionPaths"/> on purpose - that set scopes the
+    /// post-save reconcile, which offers to purge the backed-up copies of anything
+    /// dropped from the selection, and for a folder that is gone from disk those
+    /// copies can be the only ones left. The editor still counts these as unsaved
+    /// changes (MainViewModel compares this against its clean mark).
+    /// </summary>
+    public int MissingFolderEditCount { get; private set; }
+
+    private void RecordMissingFolderEdit()
+    {
+        MissingFolderEditCount++;
+        if (!string.IsNullOrEmpty(_saveStatusText))
+            SaveStatusText = "";
+        if (!_needsSave)
+        {
+            _needsSave = true;
+            CommandManager.InvalidateRequerySuggested();
+        }
+    }
+
+    /// <summary>
+    /// How many entries in the current selection point at folders (or files)
+    /// that no longer exist - counting each gone subtree once, and only inside
+    /// sources that are connected (a drive that is merely unplugged has not lost
+    /// anything). Drives the bar above the tree; recounted in the background.
+    /// </summary>
+    public int MissingFolderCount
+    {
+        get => _missingFolderCount + _missingFileCount;
+    }
+
+    public bool HasMissingFolders => MissingFolderCount > 0;
+
+    public string MissingFoldersText
+    {
+        get
+        {
+            int folders = _missingFolderCount, files = _missingFileCount;
+            string what = files == 0 ? (folders == 1 ? "folder" : "folders")
+                        : folders == 0 ? (files == 1 ? "file" : "files")
+                        : "folders and files";
+            int n = folders + files;
+            return $"{n:N0} {what} in this selection no longer {(n == 1 ? "exists" : "exist")}. "
+                   + "They're shown dimmed, marked \u201cnot found\u201d.";
+        }
+    }
+
+    private void SetMissingCounts(int folders, int files)
+    {
+        if (_missingFolderCount == folders && _missingFileCount == files)
+            return;
+        _missingFolderCount = folders;
+        _missingFileCount = files;
+        OnPropertyChanged(nameof(MissingFolderCount));
+        OnPropertyChanged(nameof(HasMissingFolders));
+        OnPropertyChanged(nameof(MissingFoldersText));
+        CommandManager.InvalidateRequerySuggested();
+    }
+
+    /// <summary>
+    /// Recount <see cref="MissingFolderCount"/> shortly, from the selection as it
+    /// would be saved now. Coalesces bursts (a settle pass per click) into one
+    /// count; the existence checks run on the thread pool.
+    /// </summary>
+    internal void ScheduleMissingFolderRecount(int delayMs = 400)
+    {
+        _missingRecountCts?.Cancel();
+        var cts = _missingRecountCts = new CancellationTokenSource();
+        _ = RecountMissingAsync(delayMs, cts.Token);
+    }
+
+    private async Task RecountMissingAsync(int delayMs, CancellationToken ct)
+    {
+        try
+        {
+            if (delayMs > 0)
+                await Task.Delay(delayMs, ct);
+
+            // Mid-restore the tree is half-built; the restore reschedules when done.
+            if (IsApplyingSelections)
+                return;
+
+            var selections = GetSelections();
+            var (folders, files) = await Task.Run(() => CountMissing(selections), ct);
+            if (!ct.IsCancellationRequested)
+                SetMissingCounts(folders, files);
+        }
+        catch (OperationCanceledException) { }
+    }
+
+    /// <summary>
+    /// Count the saved entries whose path is gone: each gone subtree once, and
+    /// only inside top-level sources that are themselves on disk.
+    /// </summary>
+    internal static (int Folders, int Files) CountMissing(IEnumerable<SourceSelection> topLevel)
+    {
+        int folders = 0, files = 0;
+
+        void Walk(IEnumerable<SourceSelection> nodes)
+        {
+            foreach (var node in nodes)
+            {
+                if (!SourceSelectionNodeViewModel.ExistsOnDisk(node))
+                {
+                    if (node.IsDirectory) folders++; else files++;
+                    continue;
+                }
+                Walk(node.Children);
+            }
+        }
+
+        foreach (var source in topLevel)
+        {
+            // A source that isn't connected is not "gone" - leave it and all its
+            // entries out of the count, as Forget leaves them alone.
+            if (SourceSelectionNodeViewModel.ExistsOnDisk(source))
+                Walk(source.Children);
+        }
+        return (folders, files);
+    }
+
+    /// <summary>
+    /// "Forget them": remove every saved entry whose folder no longer exists, so
+    /// that a folder created at one of those paths later is treated as new
+    /// (backed up only if its parent auto-includes new folders). Covers the
+    /// visible "not found" rows and the entries inside collapsed folders that were
+    /// never expanded. Sources that aren't connected, and everything under them,
+    /// are left alone: an unplugged drive has not lost anything. Every path is
+    /// re-checked first, so a folder that has reappeared since is kept.
+    /// </summary>
+    internal async Task ForgetMissingAsync()
+    {
+        if (RootNode is null || _forgettingMissing)
+            return;
+
+        _forgettingMissing = true;
+        CommandManager.InvalidateRequerySuggested();
+        try
+        {
+            var missing = new List<SourceSelectionNodeViewModel>();
+            var deferred = new List<SourceSelectionNodeViewModel>();
+            foreach (var source in RootNode.Children)
+            {
+                if (!source.IsMissing)
+                    source.CollectMissingWork(missing, deferred);
+            }
+
+            var candidates = missing.Select(n => (n, n.Path, n.IsDirectory)).ToList();
+            var deferredModels = deferred.Select(n => (n, n.DeferredModel!)).ToList();
+
+            // Existence checks off the UI thread, fresh (never from a cache): a
+            // folder that has come back since the tree was built must be kept.
+            var (stillGone, pruned) = await Task.Run(() =>
+            {
+                var gone = candidates
+                    .Where(c => !(c.IsDirectory ? Directory.Exists(c.Path) : File.Exists(c.Path))
+                                && Directory.Exists(System.IO.Path.GetDirectoryName(c.Path.TrimEnd('\\')) ?? ""))
+                    .Select(c => c.n)
+                    .ToList();
+                var prunedModels = deferredModels
+                    // A collapsed folder that is itself unreachable now (a share
+                    // that went offline) tells us nothing about its children.
+                    .Where(d => Directory.Exists(d.Item2.Path))
+                    .Select(d => (d.n, Model: PruneMissing(d.Item2)))
+                    .Where(d => d.Model is not null)
+                    .ToList();
+                return (gone, prunedModels);
+            });
+
+            var parents = new HashSet<SourceSelectionNodeViewModel>();
+            foreach (var node in stillGone)
+            {
+                if (node.Parent is { } parent && parent.RemoveChild(node))
+                    parents.Add(parent);
+            }
+            foreach (var (node, model) in pruned)
+                node.ReplaceDeferredModel(model!);
+
+            // A parent that lost rows may now be all-in or all-out; deepest first
+            // so each ripple starts from settled children.
+            foreach (var parent in parents.OrderByDescending(p => p.Depth))
+                parent.UpdateFromChildren();
+
+            if (stillGone.Count > 0 || pruned.Count > 0)
+            {
+                RecordMissingFolderEdit();
+                HandleSelectionChanged();
+            }
+        }
+        finally
+        {
+            _forgettingMissing = false;
+            CommandManager.InvalidateRequerySuggested();
+            ScheduleMissingFolderRecount(0);
+        }
+    }
+
+    /// <summary>
+    /// A copy of <paramref name="model"/> without the descendants that no longer
+    /// exist, or null when nothing beneath it is gone (so an untouched subtree
+    /// keeps its original object).
+    /// </summary>
+    internal static SourceSelection? PruneMissing(SourceSelection model)
+    {
+        bool changed = false;
+        var kept = new List<SourceSelection>(model.Children.Count);
+        foreach (var child in model.Children)
+        {
+            if (!SourceSelectionNodeViewModel.ExistsOnDisk(child))
+            {
+                changed = true;
+                continue;
+            }
+            var prunedChild = PruneMissing(child);
+            if (prunedChild is not null)
+                changed = true;
+            kept.Add(prunedChild ?? child);
+        }
+
+        if (!changed)
+            return null;
+
+        return new SourceSelection
+        {
+            Path = model.Path,
+            IsDirectory = model.IsDirectory,
+            IsSelected = model.IsSelected,
+            AutoIncludeNewSubdirectories = model.AutoIncludeNewSubdirectories,
+            IsExpanded = model.IsExpanded,
+            Children = kept,
+        };
+    }
+
+    /// <summary>
     /// Mark the current state as clean (just saved or freshly loaded).
     /// Disables the Save button until the user makes further changes.
     /// </summary>
@@ -1008,6 +1259,9 @@ public class SourceSelectionViewModel : ViewModelBase, IDisposable
     public ICommand RemoveTierSetCommand { get; }
     public ICommand AddPathCommand { get; }
     public ICommand AutoIncludeCheckedCommand { get; }
+
+    /// <summary>"Forget them" on the missing-folders bar: see <see cref="ForgetMissingAsync"/>.</summary>
+    public ICommand ForgetMissingCommand { get; }
     public ICommand ApplyFiltersCommand { get; }
     public ICommand AnalyzeDedupCommand { get; }
     public ICommand CancelDedupCommand { get; }
@@ -1109,6 +1363,7 @@ public class SourceSelectionViewModel : ViewModelBase, IDisposable
         RefreshSelectedSize();
         SizeCalculationResult = "";
         SelectionChanged?.Invoke();
+        ScheduleMissingFolderRecount();
     }
 
     /// <summary>
@@ -1127,7 +1382,12 @@ public class SourceSelectionViewModel : ViewModelBase, IDisposable
         // catalog reads to just the changed subtrees.  This setter fires only
         // for the node the user actually clicked (propagation to descendants is
         // suppressed before it reaches here), so the set stays minimal.
-        _changedSelectionPaths.Add(node.Path);
+        // A "not found" row is counted separately and never handed to the
+        // reconcile: see MissingFolderEditCount.
+        if (node.IsMissing)
+            MissingFolderEditCount++;
+        else
+            _changedSelectionPaths.Add(node.Path);
 
         // Mark dirty right away.  The heavy aggregation is deferred, but the
         // fact that *something* changed is known now, so the Save button should
@@ -1230,7 +1490,8 @@ public class SourceSelectionViewModel : ViewModelBase, IDisposable
             getExcludeFilter: () => GetExcludeFilter(),
             requestSelectionSettle: RequestSelectionSettle,
             registerPendingWork: RegisterPendingWork,
-            recordChangedPath: p => _changedSelectionPaths.Add(p));
+            recordChangedPath: p => _changedSelectionPaths.Add(p),
+            recordMissingEdit: RecordMissingFolderEdit);
         RootNode = root;
 
         // Mark as loaded BEFORE setting IsExpanded — otherwise the
@@ -1483,12 +1744,28 @@ public class SourceSelectionViewModel : ViewModelBase, IDisposable
             // Create nodes for custom paths (network shares, etc.)
             // that aren't pre-populated as drive roots.  Sequential because
             // AddPathNode modifies the Children collection.
-            foreach (var selection in customSelections)
+            //
+            // A source that is not there right now - a drive that isn't plugged
+            // in, a share that's offline, a custom folder that was deleted - is
+            // kept as a "not connected" / "not found" row with all its saved
+            // choices. It used to be left out of the tree, and GetSelections has
+            // nothing else to write it back from, so the next save dropped the
+            // whole source from the set. (Checked off the UI thread: an offline
+            // share can take many seconds to answer.)
+            var present = await Task.Run(() =>
+                customSelections.Select(s => Directory.Exists(s.Path)).ToList());
+            for (int i = 0; i < customSelections.Count; i++)
             {
-                if (Directory.Exists(selection.Path))
+                var selection = customSelections[i];
+                if (present[i])
                 {
                     var node = AddPathNode(selection.Path, isSelected: false);
                     await node.ApplySelectionAsync(selection);
+                }
+                else
+                {
+                    RootNode.Children.Add(
+                        SourceSelectionNodeViewModel.CreateMissingNode(selection, RootNode));
                 }
             }
 
@@ -1523,6 +1800,9 @@ public class SourceSelectionViewModel : ViewModelBase, IDisposable
         {
             IsApplyingSelections = false;
         }
+
+        // Now that the tree is whole, count what in it no longer exists.
+        ScheduleMissingFolderRecount(0);
     }
 
     private void OnNext()
@@ -1550,6 +1830,31 @@ public class SourceSelectionViewModel : ViewModelBase, IDisposable
         }
     }
 
+    /// <summary>
+    /// Bring the tree fully up to date before it is read for saving. The Save
+    /// button does this itself; every other save path (Yes at the editor's close
+    /// prompt, saving before a seed) must call it too, or it can persist a
+    /// half-propagated tree.
+    /// </summary>
+    public Task FlushPendingEditsAsync()
+    {
+        // A checkbox toggle defers its propagation/aggregation to a
+        // Background-priority settle pass.  That pass can be STARVED for
+        // seconds by the post-show catalog/size work (which pumps a steady
+        // stream of higher-priority dispatcher activity) — which is what made
+        // Save look like it "did nothing" until some unrelated interaction let
+        // the pass finally run.  Drain it synchronously here instead of
+        // awaiting it, so a save acts immediately regardless of dispatcher load.
+        if (_selectionSettleScheduled || _pendingSelectionNodes.Count > 0)
+            SettlePendingSelections();
+
+        // An auto-include-new toggle on an unloaded directory kicks off an
+        // async load-then-pin; that one is genuinely asynchronous, so wait for it
+        // to avoid serialising a not-yet-pinned tree.  It completes on its own —
+        // it doesn't need any user action.
+        return WaitForPendingNodeWorkAsync();
+    }
+
     private async void OnSave()
     {
         // Ignore rapid re-clicks while a save is already running.  Without this,
@@ -1564,21 +1869,8 @@ public class SourceSelectionViewModel : ViewModelBase, IDisposable
         Mouse.OverrideCursor = Cursors.Wait;
         try
         {
-            // A checkbox toggle defers its propagation/aggregation to a
-            // Background-priority settle pass.  That pass can be STARVED for
-            // seconds by the post-show catalog/size work (which pumps a steady
-            // stream of higher-priority dispatcher activity) — which is what made
-            // Save look like it "did nothing" until some unrelated interaction let
-            // the pass finally run.  Drain it synchronously here instead of
-            // awaiting it, so Save acts immediately regardless of dispatcher load.
-            if (_selectionSettleScheduled || _pendingSelectionNodes.Count > 0)
-                SettlePendingSelections();
-
-            // An auto-include-new toggle on an unloaded directory kicks off an
-            // async load-then-pin; that one is genuinely asynchronous, so await it
-            // (still under the busy cursor) to avoid serialising a not-yet-pinned
-            // tree.  It completes on its own — it doesn't need any user action.
-            await WaitForPendingNodeWorkAsync();
+            // Under the busy cursor, so a slow node load reads as "working".
+            await FlushPendingEditsAsync();
 
             if (SaveRequested is not null)
                 await SaveRequested.Invoke();

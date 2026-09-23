@@ -28,6 +28,9 @@
        internal so the shipping app keeps exactly one cache location. -->
   <ItemGroup>
     <InternalsVisibleTo Include="CacheMaintTest" />
+    <InternalsVisibleTo Include="selection_widening_test" />
+    <InternalsVisibleTo Include="editor_save_test" />
+    <InternalsVisibleTo Include="missing_source_test" />
   </ItemGroup>
 
   <ItemGroup>

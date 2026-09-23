@@ -1,5 +1,326 @@
 # LithicBackup — Known Issues & Tech Debt
 
+## FIXED: saved choices for folders that no longer exist were invisible — and a source drive that wasn't plugged in was dropped from the set on save (2026-09-22)
+
+**Behaviour, by design.** A selection is stored by path. When a selected folder
+disappears, its entry stays: the scanner skips it silently, and if a folder is
+created at that path again it is backed up again. The parent's auto-include-new
+setting never comes into it, because that setting only governs folders that have
+no entry of their own. This protects a folder that is only temporarily gone (renamed
+and back, an app reinstalling itself) from silently dropping out of the backup, and
+it stays.
+
+**What was wrong with it.**
+
+* **Invisible.** The editor kept such entries on purpose (`_orphanedChildModels`,
+  and `_restoredModel` for collapsed folders) but gave them no row, so they could
+  not be seen or unticked.
+* **They pile up, mostly from the Worker.** Under a parent with auto-include-new
+  on, the Worker pins every newly created folder as a permanent selection
+  (`MaterializeDiscoveredDirectoriesAsync`), so build tools' throwaway folders are
+  pinned the moment they appear and never leave. A pinned folder also stays selected
+  after auto-include is turned off, so deleting and re-creating it brings it back:
+  "auto-include is off, but this new folder was picked up". Measured on 2026-09-22:
+
+  | Set | selection JSON | entries | selected paths not on disk |
+  |---|---|---|---|
+  | backup to j: | 672 KB | 4,148 | 57 — moved projects (`D:\visual studio projects\os`, `os-lane-*`), deleted folders, UE crash-report and git-ref folders |
+  | backup to i: | 495 KB | 2,873 | 55 — incl. 29 rustc temp folders under `E:\slateos-build\…\deps` |
+
+* **Bug: a missing SOURCE was dropped.** A drive that wasn't plugged in, or a
+  custom-path source that was absent, when the editor opened got no node at all
+  (`ApplySelectionsAsync` skipped a top-level entry whose path did not exist), and
+  `GetSelections` had nothing to write it back from, so the next save removed the
+  whole source from the set. Up to 1.5.x merely opening and closing the editor
+  did it, since every close saved.
+* **Bug: a ticked folder deleted while the editor was open was dropped.**
+  Re-expanding its parent re-reads the folder (`ReconcileChildrenAsync`), which
+  removed rows no longer on disk, and with them the selection, on the next save.
+* **Bug: a folder whose only ticked child had gone was unticked.** The invisible
+  child was not among the folder's rows, so the tristate recompute saw only unticked
+  children, made the folder unticked, and `ToModel` then dropped it and the hidden
+  child together.
+
+### Fix
+
+* **"Not found" rows.** A saved entry whose path is gone becomes a real row
+  (`SourceSelectionNodeViewModel.CreateMissingNode`), dimmed and italic, labelled
+  "(not found)" (or "(not connected)" for a drive or share), with a tooltip saying
+  what it means. The label is a separate `Run`, per design.md. The row holds the
+  saved entry exactly (saving writes it back unchanged), never reads the disk, shows
+  no size, and its saved sub-entries sit beneath it, all missing too. Exclusions
+  are kept the same way. Before, a missing exclusion was dropped on save, which
+  could let a re-created folder back in under an auto-include parent.
+* **Its own state is never re-derived** (`UpdateFromChildren`,
+  `RecomputeLoadedTristate`). Its children are only its saved exceptions, not
+  everything that was in it: "all of it except tmp" has one child, tmp, unticked,
+  and re-deriving would turn it into "none of it". It still counts towards its
+  parent's state, which is what fixes the third bug above.
+* **Unticking one** works like any row: under a parent that doesn't auto-include it
+  leaves the selection, under one that does it becomes an exclusion. Edits to
+  missing rows are counted apart from `ChangedSelectionPaths`
+  (`MissingFolderEditCount`, which the editor's unsaved-changes check includes), so
+  the post-save reconcile is never pointed at them. The reconcile offers to purge
+  the backed-up copies of anything dropped from the selection, and for a folder
+  that no longer exists those can be the only copies.
+* **"Forget them"**: a bar above the tree says how many entries in the selection no
+  longer exist (`MissingFolderCount`, recounted in the background from what would be
+  saved: each gone subtree once, only inside connected sources). The button removes
+  them all: the visible rows and the entries inside collapsed folders that were never
+  expanded (`ForgetMissingAsync`, `PruneMissing`). Every path is re-checked first, so
+  a folder that has come back is kept. Sources that aren't connected, and everything
+  under them, are left alone: an unplugged drive has not lost anything.
+* **Missing sources are kept** as top-level "(not connected)" / "(not found)" rows
+  with their saved choices. Existence is checked off the UI thread, because an
+  offline share can take seconds to answer.
+* **Re-expanding a folder** keeps a row that vanished if it carried a saved or
+  user-made choice (turning it into a "not found" row), and lets a row go if it only
+  inherited its state. A "not found" folder that has come back becomes a live row
+  again, with its saved choice.
+
+### Tested — and against the old code
+
+`tools\missing_source_test` drives the real scanner and the editor's real selection
+tree on temp folders: 35 checks, covering the round trip, the rows and labels,
+unticking, Forget (including a collapsed folder, and a folder that comes back
+mid-session), a folder deleted while the editor is open, and an unplugged drive and
+an absent custom source. Built against the pre-change view models
+(`-p:OldCode=true`), the 11 checks that compile there fail 6: the round trip, the
+unplugged drive dropped, the absent source dropped, the invisible missing folder, the
+folder recomputed to unticked, and the folder deleted while open dropped.
+`tools\editor_save_test` (86 checks) adds an unplugged drive and a deleted folder to
+its set and confirms both survive the editor's Save. It also checks that Forget is
+an unsaved change like any other: Cancel asks and discards it, and Save writes it
+once.
+
+### The test harness itself had a side effect
+
+`editor_save_test` constructs the real `App` for its resources. WPF's `Application`
+constructor queues `OnStartup` for the first dispatcher pump whether or not `Run()`
+is called, and this `OnStartup` starts the whole application. So the earlier runs
+each started a second full Lithic Backup inside the test: the single-instance lock,
+the real catalog (opened; startup only reads), a main window, a tray icon,
+background monitors, an update check. It only came to light when the real app was
+already open: the test's copy then woke that window, bringing it to the front, and
+shut the test down. `App.SkipStartupForTests` now makes `OnStartup` return at once;
+the harness sets it before constructing `App`, stands in its own invisible main
+window, and fails if the app shuts down mid-run.
+
+## FIXED: the backup-set editor saved changes nobody asked it to save, and its Cancel could not undo them (2026-09-22)
+
+**Symptom.** The editor has **Save** and **Cancel** buttons, but neither decided
+anything:
+
+* every checkbox change was **auto-saved 300 ms after it was made**, so Cancel
+  and "No, don't save" discarded nothing but settings;
+* **every close saved**, even with no prompt and no change;
+* opening **Largest Files** from the editor saved the whole set, and each
+  include/exclude click in it wrote the catalog on its own;
+* **Seed from Existing Backup** saved the set first, without asking;
+* a **forced shutdown** (the upgrade installer, Windows ending the session) saved
+  whatever was on screen, "best effort".
+
+A stray click therefore went straight to the catalog, and the Worker acts on what
+the catalog says. One click on the tick-box column's header while it is mixed
+selects every drive in full (see *Open decisions* in the widening entry below).
+
+**Also found: Largest Files exclusions made from the editor were silently lost.**
+Its clicks were written to the catalog, but never to the editor's own exclusion
+list. The editor's next save — which every close was — wrote that list, from
+before the clicks, back over them.
+
+### Fix — the editor saves only when told to
+
+* **Nothing is written while the editor is open.** Changes are saved by **Save**,
+  or by **Yes** at the close prompt, and by nothing else.
+* **Cancel discards.** If anything changed it asks "Discard your changes?" first.
+  A new set that was never saved is deleted, as before.
+* **✕ with no changes writes nothing.** With changes: Save / Don't Save / Cancel.
+* **A forced shutdown** neither prompts nor saves: unconfirmed edits are dropped.
+* **File > Exit, Yes** saves *before* the window finishes closing
+  (`SaveBeforeExit`). The old save ran asynchronously after the window was gone,
+  racing the process exit. The auto-save used to hide that race; without it, the
+  whole edit would have been at stake.
+* **The editor edits a private copy** (`CloneBackupSet`). It used to edit the
+  instance the main window holds, so a discarded edit stayed in memory for the
+  next metadata write (Change Destination, say) to persist. After a save, the
+  saved values are copied back into the shared instance. Change Destination and
+  Remap Source Drive now re-read the set before writing it, as a GUI backup
+  already did.
+* **Seeding asks** "save first?" when there are unsaved changes. It has to: it
+  writes file records at once, against the destination shown on screen, and
+  Cancel cannot take those back.
+* **Largest Files opened from the editor is part of the edit.** Each click becomes
+  a line in the editor's exclusion list: shown there, counted as an unsaved
+  change, kept by Save, dropped by Cancel. Its Save button is hidden, with a note
+  that changes are saved with the backup set.
+* **Largest Files on its own** keeps clicks until its **Save** button, which
+  used to do nothing because every click had already been written. Closing with
+  unsaved clicks asks, from the Close button or the window's ✕
+  (`IConfirmClose`, consulted by `TaskWindow`). Its save re-reads the set and
+  changes only the exclusion list, so it cannot put back settings changed
+  elsewhere since the window opened.
+* The post-close reconcile compares against what was actually saved (`savedState`),
+  not the live copy.
+
+**Cost:** which folders are expanded is remembered only when you save. A
+no-change close used to save it as a side effect.
+
+### Tested — against the real editor, and against the old one
+
+`tools\editor_save_test` opens the real editor through the row's Modify command,
+against a throwaway catalog wrapped in a write-counting proxy. It answers the
+editor's message boxes from a watcher thread, the way a user clicks them, and
+covers Cancel, ✕ (No / Cancel / Yes), Save, Largest Files in the editor and on its
+own, forced shutdown, File > Exit, and new sets (discarded or kept). It also tests
+the private copy, the exclusion-list edit and both Largest Files modes directly:
+**76 checks, all pass.**
+
+Built against the pre-change `MainViewModel` / `LargestFilesViewModel` (`-p:OldCode=true`),
+**37 of the 60 checks that compile there fail**. Some are knock-on effects of an
+earlier failure, but the direct ones each name the old behaviour:
+
+```
+✗ nothing was written 1.5 s after the tick (writes: 1; the old editor auto-saved at 300 ms)
+✗ and wrote nothing (writes: 1; the old editor saved on every close)
+✗ opening it wrote nothing (writes: 1; it used to save the whole set)
+✗ after the editor's Save the exclusion is in the catalog (it used to be lost to the editor's own list)
+✗ and saved nothing nobody confirmed (writes: 2; it used to save "best effort")
+```
+
+## FIXED: the I: set's C:\ kept widening to the whole drive — three bugs, and a correction that got overwritten within minutes (2026-09-22)
+
+**Symptom.** The I: set's C:\ was saved as *partial — five folders picked on
+purpose* (`mIRC`, `pics`, `py`, `VirtualBox VMs`, `vmware vms`). It kept coming back
+as **fully selected with every top-level entry on the drive listed**. The second
+time it was noticed, the new daily safety-net scan (see the continuous-backup
+entry) ran over it: `Plan for "backup to i:": 1,620,293 files, 1,196,950,425,971
+bytes` — 1.2 TB of C:, `Windows`, `Program Files` and the page file included,
+against 1,507 files / 702 MB two days earlier. The Worker was stopped mid-copy via
+its own shutdown event.
+
+**It had been wide since July, not September.** Grouping the I: set's catalog by
+top-level C: folder and first-backed-up date:
+
+| From C: | first backed up |
+|---|---|
+| `mIRC`, `pics`, `py`, `VirtualBox VMs`, `vmware vms` | 2026-06-11 — the intended five |
+| `Program Files`, `Windows`, `ProgramData`, `Users` (493,207 active rows) | **2026-07-12..14** |
+| everything else (`cygwin64`, `emsdk`, `local`, …) | 2026-09-22 — the first full scan to reach them |
+
+Continuous backup had been routing every changed file on C: to I: for two months;
+the September full scan only reached the folders that rarely change. Commit
+352ba73 (09-20) described a *second* occurrence and reverted its code — but did not
+repair the saved JSON.
+
+### Cause 1 — July: e533f05 changed what "auto-include new" means on a partial folder
+
+Before 2026-07-12, `AutoIncludeNewSubdirectories` did nothing on a partial node.
+e533f05 made `IncludesUnlistedDescendants` return it for partial nodes too, so a
+partial folder with the flag on covers **every existing unticked child**, not just
+new ones — and the flag **defaults to true**. A C:\ saved as "these five folders"
+became "all of C:" at the next scan **without the saved JSON changing**. The 07-12
+entry's reasoning assumed "partial" means "select all, then untick a few"; for
+"tick a few", the unticked children are deliberate exclusions.
+
+This is **not changed here** — see *Open decisions* below.
+
+### Cause 2 — the editor widened the saved selection by itself (fixed)
+
+Under a partial folder with auto-include on, `CreateChildNode` draws every
+unlisted child checked and flags it `_isAutoIncludeDerived` — correct, since the
+scanner does cover them. But both tristate recomputes (`RecomputeLoadedTristate`,
+run on every editor open, and `UpdateFromChildren`, run on any click below) asked
+only `Children.All(c => c.IsSelected == true)`, so those **inferred** checks
+promoted the parent to **fully** selected. On the next open a fully-selected
+parent creates its children as real selections, and `ToModel` writes every one of
+them out. Closing the editor **always saved** (it no longer does — see the
+editor-save entry above). Two open/close cycles with no clicks turned "these
+five folders" into every entry on the drive.
+
+**Fix:** promotion to full now requires every child to be *genuinely* selected —
+`c.IsSelected == true && !c._isAutoIncludeDerived`. When the user really ticks
+every child, each tick clears that child's derived flag and the parent still
+becomes full, so ordinary checkbox behaviour is unchanged. A derived child keeps
+its flag through the recomputes because the setter only clears it on an actual
+change, and a derived child is already `true`.
+
+### Cause 3 — stale in-memory copies written back (fixed)
+
+The selection was corrected by hand at 20:07 and verified. At **20:19:52**, with the
+Worker stopped, `catalog.db` was written again and the widened selection was back —
+**byte-for-byte** (JSON length 511,104, identical). The only writer alive was a GUI
+session that had read the set hours earlier, before the fix, and had since run a
+GUI backup of it (19:57, *1,482,987 files, 1.02 TB*, cancelled). Two routes let a
+stale copy write back:
+
+* **The editor edited the in-memory `SelectedBackupSet`** and never re-read the
+  catalog. Now `StartEditFlow` refreshes it from the catalog first — into the *same*
+  instance, because the row and every other holder share that reference. The GUI
+  backup flow (`RunIncrementalFlowAsync`) does the same.
+* **`UpdateBackupSetAsync` rewrites every column**, selection included, from the
+  object it is given — so anything holding an old copy wrote that copy's selection
+  back even when all it meant was a timestamp. New
+  `UpdateBackupSetMetadataAsync` writes everything *except* `SourceSelectionJson`.
+  Nine callers that never mean to change the selection now use it: both Largest
+  Files exclusion toggles, Change Destination, adding exclusion patterns, the GUI
+  and Worker destination resolvers, and all three `LastBackupUtc` stamps —
+  including Consolidate, which read the set at the *start* of a burn and wrote it
+  back at the end. The nine left on the full write are exactly the ones that do
+  change the selection (the editor's five save paths, Seed, Remap Source Drive,
+  both source resolvers, and the Worker's `MaterializeDirectory`).
+
+### Data repair
+
+With both processes stopped, I:'s C:\ was set to the five original folders plus
+J:'s four — `mIRC`, `pics`, `py`, `VirtualBox VMs` (J:'s partial sub-selection),
+`vmware vms`, `youtube` — **partial, with auto-include-new OFF**. The flag matters:
+a partial C:\ with it on is exactly Cause 1's precondition. D:\ and E:\ were
+verified deep-equal before and after. Backups of the catalog were taken before
+each change: `catalog_backup_20260922_200709_pre-I-selection-fix.db` and
+`catalog_backup_20260922_203832_pre-I-selection-refix.db`.
+
+The safety-net scan on next start tombstones every I: row outside that selection
+(C:\Users included). That is non-destructive — files stay on I: and re-selecting a
+folder resurrects its history. **Only Cleanup is irreversible.**
+
+### Tested — and proven to fail on the old code
+
+`tools\selection_widening_test` (15 checks):
+
+* **A** builds a real five-folder directory, restores "partial, auto-include on,
+  one folder picked" through the real node view-model, runs both recomputes and
+  two full open/close cycles.
+* **B** asserts the pre-edit refresh copies *every* persisted `BackupSet` property,
+  by reflection — adding a property and forgetting the copy becomes a failure.
+* **C** runs the exact incident against a real SQLite catalog: a stale reader, a
+  correction, then the stale reader's metadata write.
+
+To prove the suite would have caught the bugs, both fixes were **reverted and the
+suite re-run**. Against the old code it reproduces the incident exactly:
+
+```
+cycle 1 saves: FULL, 1 listed [keep]
+cycle 2 saves: FULL, 5 listed [keep, other1, other2, other3, other4]
+stale metadata write -> corrected selection overwritten (FULL, 0 listed)
+5 CHECK(S) FAILED
+```
+
+### Open decisions (not changed)
+
+* **What auto-include-new means on a partial folder, and its default.** Cause 1 is
+  still live for any partial folder with the flag on and no explicit exclusions.
+  Changing the *semantics* would narrow I:'s E:\ — partial, auto-include on, 51
+  exclusions — which reads as "all of E: except these" and relies on e533f05.
+  Changing only the *default* for newly-created nodes to false would close the trap
+  for future selections without touching existing ones, since saved JSON always
+  carries the flag explicitly.
+* **The column headers.** `IsAllSelected` and `IsAllAutoIncludeNew` ignore the
+  clicked value (`target = !All(...)`), so a click on a mixed header selects every
+  drive in full, or turns auto-include on everywhere. Since the editor-save entry
+  above, such a click stays in the editor until Save and Cancel undoes it; it used
+  to be auto-saved 300 ms later.
+
 ## FIXED: the destination walk enumerated every directory twice, on one thread, allocating three strings per file (2026-09-21)
 
 **Context.** The destination scan's *catalog* half was already tuned — streaming

@@ -1131,7 +1131,7 @@ public class BackupOrchestrator : IBackupOrchestrator
         if (backupSet is not null)
         {
             backupSet.LastBackupUtc = DateTime.UtcNow;
-            await _catalog.UpdateBackupSetAsync(backupSet, ct);
+            await _catalog.UpdateBackupSetMetadataAsync(backupSet, ct);
         }
 
         return new BackupResult
@@ -1334,8 +1334,13 @@ public class BackupOrchestrator : IBackupOrchestrator
         }
 
         // 6. Update backup set timestamp.
+        //
+        // Metadata write, and this one matters more than most: `set` was read at
+        // the START of consolidation, and a burn takes as long as it takes. A full
+        // write here stamped that old copy's selection over anything changed in
+        // the meantime.
         set.LastBackupUtc = DateTime.UtcNow;
-        await _catalog.UpdateBackupSetAsync(set, ct);
+        await _catalog.UpdateBackupSetMetadataAsync(set, ct);
     }
 
     // -------------------------------------------------------------------

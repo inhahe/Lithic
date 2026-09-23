@@ -1,0 +1,24 @@
+<Project Sdk="Microsoft.NET.Sdk">
+
+  <PropertyGroup>
+    <OutputType>Exe</OutputType>
+    <!-- Never stamp the shipping version onto a harness (see design.md). -->
+    <ImportDirectoryBuildProps>false</ImportDirectoryBuildProps>
+    <TargetFramework>net8.0-windows</TargetFramework>
+    <UseWPF>true</UseWPF>
+    <ImplicitUsings>enable</ImplicitUsings>
+    <Nullable>enable</Nullable>
+    <AssemblyName>missing_source_test</AssemblyName>
+    <RootNamespace>MissingSourceTest</RootNamespace>
+    <!-- -p:OldCode=true: compile only the checks that also build against the
+         pre-change editor, to show they fail on it. -->
+    <DefineConstants Condition="'$(OldCode)' == 'true'">$(DefineConstants);OLD_CODE</DefineConstants>
+  </PropertyGroup>
+
+  <ItemGroup>
+    <ProjectReference Include="..\..\src\LithicBackup.Core\LithicBackup.Core.csproj" />
+    <ProjectReference Include="..\..\src\LithicBackup.Infrastructure\LithicBackup.Infrastructure.csproj" />
+    <ProjectReference Include="..\..\src\LithicBackup\LithicBackup.csproj" />
+  </ItemGroup>
+
+</Project>

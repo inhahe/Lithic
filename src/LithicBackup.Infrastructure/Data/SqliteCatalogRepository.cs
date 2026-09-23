@@ -263,6 +263,39 @@ public class SqliteCatalogRepository : ICatalogRepository
         }
     }
 
+    public async Task UpdateBackupSetMetadataAsync(BackupSet set, CancellationToken ct = default)
+    {
+        ct.ThrowIfCancellationRequested();
+        await _masterGate.WaitAsync(ct).ConfigureAwait(false);
+        try
+        {
+            using var cmd = _master.CreateCommand();
+            // Same statement as UpdateBackupSetAsync minus SourceSelectionJson.
+            // SourceRoots is kept: it is derived settings the user edits alongside
+            // the destination, not the selection tree, and nothing that calls
+            // this changes it.
+            cmd.CommandText = """
+                UPDATE BackupSets SET
+                    Name = $name,
+                    SourceRoots = $roots,
+                    MaxIncrementalDiscs = $maxDiscs,
+                    DefaultMediaType = $mediaType,
+                    DefaultFilesystemType = $fsType,
+                    CapacityOverrideBytes = $capOverride,
+                    LastBackupUtc = $lastBackup,
+                    JobOptionsJson = $jobJson
+                WHERE Id = $id
+                """;
+            cmd.Parameters.AddWithValue("$id", set.Id);
+            BindBackupSetWriteParameters(cmd, set);
+            cmd.ExecuteNonQuery();
+        }
+        finally
+        {
+            _masterGate.Release();
+        }
+    }
+
     private static void BindBackupSetWriteParameters(SqliteCommand cmd, BackupSet set)
     {
         cmd.Parameters.AddWithValue("$name", set.Name);

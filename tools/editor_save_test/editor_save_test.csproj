@@ -1,0 +1,25 @@
+<Project Sdk="Microsoft.NET.Sdk">
+
+  <PropertyGroup>
+    <OutputType>Exe</OutputType>
+    <!-- Never stamp the shipping version onto a harness (see design.md). -->
+    <ImportDirectoryBuildProps>false</ImportDirectoryBuildProps>
+    <TargetFramework>net8.0-windows</TargetFramework>
+    <UseWPF>true</UseWPF>
+    <ImplicitUsings>enable</ImplicitUsings>
+    <Nullable>enable</Nullable>
+    <AssemblyName>editor_save_test</AssemblyName>
+    <RootNamespace>EditorSaveTest</RootNamespace>
+    <!-- Build with -p:OldCode=true for the mutation run: compiles only what also
+         builds against the pre-change editor, so the end-to-end checks can be
+         shown to fail on it. -->
+    <DefineConstants Condition="'$(OldCode)' == 'true'">$(DefineConstants);OLD_CODE</DefineConstants>
+  </PropertyGroup>
+
+  <ItemGroup>
+    <ProjectReference Include="..\..\src\LithicBackup.Core\LithicBackup.Core.csproj" />
+    <ProjectReference Include="..\..\src\LithicBackup.Infrastructure\LithicBackup.Infrastructure.csproj" />
+    <ProjectReference Include="..\..\src\LithicBackup\LithicBackup.csproj" />
+  </ItemGroup>
+
+</Project>

@@ -162,8 +162,9 @@ public sealed class BackupWorker : BackgroundService
     {
         var resolution = _destinationResolver.Resolve(opts);
 
+        // Volume identity only - never the selection.
         if (resolution.MetadataChanged)
-            await _catalog.UpdateBackupSetAsync(set, ct);
+            await _catalog.UpdateBackupSetMetadataAsync(set, ct);
 
         if (!resolution.IsConnected)
         {
