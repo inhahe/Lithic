@@ -1924,8 +1924,11 @@ public sealed class BackupWorker : BackgroundService
                 ? opts.RetentionTiers
                 : VersionRetentionService.DefaultTiers;
 
+            // Hand over the plan's diff: without it ExecuteAsync scans the whole
+            // tree and diffs it against the catalog all over again.
             var result = await _directoryBackup.ExecuteAsync(
                 job, targetDir, retentionTiers, progress: null, ct,
+                precomputedDiff: diff,
                 onCommitBoundary: (excluded, innerCt) =>
                     DrainJournalDuringFullScanAsync(state, excluded, innerCt));
 
