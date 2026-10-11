@@ -234,21 +234,6 @@ public class BurnProgressViewModel : ViewModelBase
     }
 
     /// <summary>
-    /// Update the view from a <see cref="BurnProgress"/> event.
-    /// Called on the UI thread via IProgress marshaling.
-    /// </summary>
-    public void OnBurnProgress(BurnProgress progress)
-    {
-        DiscPercentage = progress.Percentage;
-        BytesWrittenText = $"{FormatBytes(progress.BytesWritten)} / {FormatBytes(progress.TotalBytes)}";
-        ElapsedText = FormatTimeSpan(progress.Elapsed);
-        RemainingText = progress.EstimatedRemaining.HasValue
-            ? FormatTimeSpan(progress.EstimatedRemaining.Value)
-            : "--:--";
-        CurrentFile = progress.CurrentFile;
-    }
-
-    /// <summary>
     /// Update the view from a <see cref="BackupProgress"/> event.
     /// Throttled to avoid excessive UI redraw (see <see cref="ProgressCadence.IntervalMs"/>).
     /// Status-message-only reports (planning phases) are never throttled.
