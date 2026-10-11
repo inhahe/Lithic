@@ -878,18 +878,24 @@ internal sealed class SqliteSetDatabase : IDisposable
         return dict;
     }
 
-    public async Task<(FileVersionInfo Version, bool IsDeleted)?> GetLastVersionAsync(
+    public async Task<(FileVersionInfo Version, bool IsDeleted, int HighestVersion)?> GetLastVersionAsync(
         int backupSetId, string path, CancellationToken ct = default)
     {
         ct.ThrowIfCancellationRequested();
         using var _ = await LockAsync(ct).ConfigureAwait(false);
 
         // Live records sort first (IsDeleted = 0), so this is the newest live
-        // record when the path has one and otherwise its newest deleted one.
+        // record when the path has one and otherwise its newest deleted one. The
+        // highest number is taken over every record, deleted ones included: a
+        // tombstoned newer record still owns its number.
         using var cmd = _connection.CreateCommand();
         cmd.CommandText = """
             SELECT f.SourcePath, f.Version, f.SizeBytes, f.SourceLastWriteUtc,
-                   f.IsDeduped, f.IsFileRef, f.Hash, f.IsDeleted
+                   f.IsDeduped, f.IsFileRef, f.Hash, f.IsDeleted,
+                   (SELECT MAX(f2.Version) FROM Files f2
+                    INNER JOIN Discs d2 ON f2.DiscId = d2.Id
+                    WHERE d2.BackupSetId = $setId
+                      AND f2.SourcePath = $path COLLATE NOCASE)
             FROM Files f
             INNER JOIN Discs d ON f.DiscId = d.Id
             WHERE d.BackupSetId = $setId
@@ -901,7 +907,7 @@ internal sealed class SqliteSetDatabase : IDisposable
         cmd.Parameters.AddWithValue("$path", path);
 
         using var r = cmd.ExecuteReader();
-        return r.Read() ? (ReadVersionInfo(r), r.GetInt32(7) != 0) : null;
+        return r.Read() ? (ReadVersionInfo(r), r.GetInt32(7) != 0, r.GetInt32(8)) : null;
     }
 
     private static FileVersionInfo ReadVersionInfo(SqliteDataReader r) => new(

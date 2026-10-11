@@ -670,6 +670,68 @@ internal static class Program
         Check(rewritten && result16c.Success && result16c.FailedFiles.Count == 0,
             $"a file another writer backed up again during verification is not reported as failing ({result16c.FailedFiles.Count} failed)");
 
+        // ------------------------------------------------------------ version numbers
+        Console.WriteLine();
+        Console.WriteLine("=== 17. a version number is never given twice ===");
+        // A pause mid-file lets the write lock go after the file's number was
+        // read. Another writer may take that number meanwhile: the file restarts.
+        string seventeen = Path.Combine(src, "seventeen");
+        Directory.CreateDirectory(seventeen);
+        string bigFile = Path.Combine(seventeen, "seventeen_big.bin");
+        File.WriteAllBytes(bigFile, Enumerable.Repeat((byte)1, 1_000_000).ToArray());
+        await svc.ExecuteTargetedAsync(job, dest, [bigFile], tiers, CancellationToken.None);
+        File.WriteAllBytes(bigFile, Enumerable.Repeat((byte)2, 1_200_000).ToArray());
+        using var pause17 = new ManualResetEventSlim(true);
+        bool paused17 = false;
+        var pauseAtBig = new SyncProgress<BackupProgress>(p =>
+        {
+            if (!paused17 && string.IsNullOrEmpty(p.StatusMessage) && p.CurrentFile == bigFile)
+            {
+                paused17 = true;
+                pause17.Reset();
+            }
+        });
+        var run17 = Task.Run(() => svc.ExecuteTargetedAsync(
+            job, dest, [bigFile], tiers, CancellationToken.None, pauseAtBig, pause17));
+        await WaitForAsync(() => paused17, 30_000);
+        await Task.Delay(300);
+        // Another writer records version 2 meanwhile. (A real one could not write
+        // this file now - the paused copy holds its temp file exclusively - but it
+        // can commit a version of it, which is what the run must notice.)
+        var v1Big = (await repo.GetFileRecordsByPathAsync(set.Id, bigFile)).Single(r => r.Version == 1);
+        byte[] takenBytes = Enumerable.Repeat((byte)2, 1_200_000).ToArray();
+        string takenDiscPath = v1Big.DiscPath[..^".v1".Length] + ".v2";
+        File.WriteAllBytes(Path.Combine(dest, takenDiscPath), takenBytes);
+        await repo.CreateFileRecordAsync(new FileRecord
+        {
+            DiscId = v1Big.DiscId, SourcePath = bigFile, DiscPath = takenDiscPath,
+            SizeBytes = takenBytes.Length, Version = 2,
+            Hash = Convert.ToHexString(System.Security.Cryptography.SHA256.HashData(takenBytes)).ToLowerInvariant(),
+            SourceLastWriteUtc = DateTime.UtcNow, BackedUpUtc = DateTime.UtcNow,
+        });
+        File.WriteAllBytes(bigFile, Enumerable.Repeat((byte)3, 1_400_000).ToArray());
+        pause17.Set();
+        var result17 = await run17;
+        var (intact17, detail17) = await VersionsIntactAsync(repo, set.Id, dest, bigFile, 3);
+        Check(paused17 && result17.Success && intact17,
+            $"paused mid-file while another writer took its number, the file starts again: versions 1-3 ({detail17}; paused {paused17}, failed: {string.Join(" | ", result17.FailedFiles.Select(f => f.Error))})");
+
+        // A newer record that was tombstoned (its copy found missing) keeps its
+        // number; the next version goes after it, not after the newest live one.
+        string tomb = Path.Combine(seventeen, "seventeen_tomb.txt");
+        File.WriteAllText(tomb, "one");
+        await svc.ExecuteTargetedAsync(job, dest, [tomb], tiers, CancellationToken.None);
+        File.WriteAllText(tomb, "two, edited");
+        await svc.ExecuteTargetedAsync(job, dest, [tomb], tiers, CancellationToken.None);
+        var v2 = (await repo.GetFileRecordsByPathAsync(set.Id, tomb)).Single(r => r.Version == 2);
+        File.Delete(Path.Combine(dest, v2.DiscPath));
+        v2.IsDeleted = true;
+        await repo.UpdateFileRecordAsync(v2);
+        File.WriteAllText(tomb, "three, edited again");
+        await svc.ExecuteTargetedAsync(job, dest, [tomb], tiers, CancellationToken.None);
+        var (intactTomb, detailTomb) = await VersionsIntactAsync(repo, set.Id, dest, tomb, 3);
+        Check(intactTomb, $"after a tombstoned version 2 comes version 3, not a second 2 ({detailTomb})");
+
         await Task.Run(PanelTests);
     }
 
@@ -685,7 +747,8 @@ internal static class Program
         var versions = records.Select(r => r.Version).OrderBy(v => v).ToList();
         string numbers = "versions " + string.Join(", ", versions);
         if (!versions.SequenceEqual(Enumerable.Range(1, expected)))
-            return (false, numbers);
+            return (false, numbers + ": " + string.Join("; ", records.OrderBy(r => r.Version).Select(r =>
+                $"v{r.Version}{(r.IsDeleted ? " deleted" : "")} {r.SizeBytes:N0} B at {r.DiscPath}")));
         foreach (var r in records.Where(r => !r.IsDeleted))
         {
             string copy = Path.Combine(dest, r.DiscPath);

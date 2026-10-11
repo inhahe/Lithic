@@ -137,9 +137,15 @@ public class DirectoryBackupService
         }
         catch (OperationCanceledException ex) when (ex is not BackupCanceledException)
         {
-            throw new BackupCanceledException(run.FailedFiles, run.CopyFinished, ex.CancellationToken);
+            throw new BackupCanceledException(run.FailedFiles, run.CopyFinished, ex);
         }
     }
+
+    /// <summary>
+    /// A file's version number was taken by another writer while the copy waited
+    /// out a pause without the lock; the file is started again.
+    /// </summary>
+    private sealed class VersionTakenException : Exception;
 
     /// <summary>What a run has done so far, for reporting it if it is cancelled.</summary>
     private sealed class RunState
@@ -721,9 +727,27 @@ public class DirectoryBackupService
 
             if (hasExistingInfo)
             {
-                version = existingInfo.MaxVersion + 1;
+                // After every number taken, tombstoned records included; the live
+                // record (existingInfo) is still the copy that moves to _prev.
+                version = last!.Value.HighestVersion + 1;
                 pathsWithHistory?.Add(file.FullPath);
             }
+
+            // Between chunks of this file. A pause lets the write lock go
+            // (WaitOutPauseAsync), and the number this version took was read under
+            // that lock: if another writer added a version of the file meanwhile,
+            // the number is taken, so abandon this copy and start the file again.
+            async Task WaitMidFileAsync()
+            {
+                if (pauseEvent is null || pauseEvent.IsSet)
+                    return;
+                await WaitOutPauseAsync();
+                var now = await _catalog.GetLastVersionAsync(backupSetId, file.FullPath, ct);
+                if ((now?.HighestVersion ?? 0) != version - 1)
+                    throw new VersionTakenException();
+            }
+            Func<Task>? waitMidFile = pauseEvent is null ? null : WaitMidFileAsync;
+            bool restartFile = false;
 
             bool fileRetrying = true;
             while (fileRetrying)
@@ -905,10 +929,10 @@ public class DirectoryBackupService
                         string revivePath = GetCurrentPath(
                             targetDirectory, file.FullPath,
                             existingInfo.IsDeduped, existingInfo.IsFileRef);
-                        if (File.Exists(revivePath) && job.BackupSetId.HasValue)
+                        if (File.Exists(revivePath))
                         {
                             var revived = await _catalog.GetFileRecordByPathAndVersionAsync(
-                                job.BackupSetId.Value, file.FullPath, existingInfo.MaxVersion, ct);
+                                backupSetId, file.FullPath, existingInfo.MaxVersion, ct);
                             if (revived is not null)
                             {
                                 revived.IsDeleted = false;
@@ -928,12 +952,11 @@ public class DirectoryBackupService
                         // stops re-detecting this file. A stale stored size (from a
                         // prior scan that raced an edit) would otherwise keep the
                         // file flagged as changed and re-hashed on every run.
-                        if (job.BackupSetId.HasValue
-                            && (existingInfo.SourceLastWriteUtc != file.LastWriteUtc
+                        if ((existingInfo.SourceLastWriteUtc != file.LastWriteUtc
                                 || existingInfo.SizeBytes != contentSize))
                         {
                             var latest = await _catalog.GetFileRecordByPathAndVersionAsync(
-                                job.BackupSetId.Value, file.FullPath, existingInfo.MaxVersion, ct);
+                                backupSetId, file.FullPath, existingInfo.MaxVersion, ct);
                             if (latest is not null)
                             {
                                 latest.SourceLastWriteUtc = file.LastWriteUtc;
@@ -1079,7 +1102,7 @@ public class DirectoryBackupService
 
                     if (File.Exists(oldCurrentPath))
                     {
-                        int oldVersion = version - 1;
+                        int oldVersion = existingInfo.MaxVersion;
                         string prevPath = GetPrevPath(
                             targetDirectory, file.FullPath, oldVersion,
                             oldDeduped, oldFileRef);
@@ -1095,22 +1118,19 @@ public class DirectoryBackupService
 
                         // Load the specific old record on-demand (not pre-loaded)
                         // to update its DiscPath to the new _prev location.
-                        if (job.BackupSetId.HasValue)
+                        var oldRecord = await _catalog.GetFileRecordByPathAndVersionAsync(
+                            backupSetId, file.FullPath, oldVersion, ct);
+                        if (oldRecord is not null)
                         {
-                            var oldRecord = await _catalog.GetFileRecordByPathAndVersionAsync(
-                                job.BackupSetId.Value, file.FullPath, oldVersion, ct);
-                            if (oldRecord is not null)
-                            {
-                                oldRecord.DiscPath = prevDiscPath;
-                                // Resurrection: the old version is a tombstone (its
-                                // file was deleted-and-recreated). Now that it holds
-                                // the real _prev bytes of a live chain again, un-delete
-                                // it so it's a retained version rather than a ghost
-                                // hidden from restore/version listings.
-                                if (resurrecting)
-                                    oldRecord.IsDeleted = false;
-                                await _catalog.UpdateFileRecordAsync(oldRecord, ct);
-                            }
+                            oldRecord.DiscPath = prevDiscPath;
+                            // Resurrection: the old version is a tombstone (its
+                            // file was deleted-and-recreated). Now that it holds
+                            // the real _prev bytes of a live chain again, un-delete
+                            // it so it's a retained version rather than a ghost
+                            // hidden from restore/version listings.
+                            if (resurrecting)
+                                oldRecord.IsDeleted = false;
+                            await _catalog.UpdateFileRecordAsync(oldRecord, ct);
                         }
 
                         // The moved plain copy held the real bytes for its content
@@ -1118,8 +1138,7 @@ public class DirectoryBackupService
                         // ContentPath hint repointed to the new _prev location.
                         // (Hash-anchored, so this is best-effort upkeep only.)
                         if (!oldDeduped && !oldFileRef
-                            && !string.IsNullOrEmpty(existingInfo.Hash)
-                            && job.BackupSetId.HasValue)
+                            && !string.IsNullOrEmpty(existingInfo.Hash))
                         {
                             await UpdateFileRefContentPathsAsync(
                                 backupSetId, existingInfo.Hash, prevDiscPath,
@@ -1197,7 +1216,7 @@ public class DirectoryBackupService
                     // already read (by the block-dedup pre-pass or the file-dedup
                     // hash read above), so it is not read from disk a second time.
                     await WritePlainFromBufferAsync(
-                        contentBuffer, currentPath, ct, fileProgress, WaitOutPauseAsync);
+                        contentBuffer, currentPath, ct, fileProgress, waitMidFile);
                 }
                 else if (deferHashToCopy)
                 {
@@ -1208,12 +1227,12 @@ public class DirectoryBackupService
                     // is plain without reading it), so capture them here for the
                     // content-path seeding and catalog record below.
                     (hash, contentSize) = await CopyFileWithHashAsync(
-                        file.FullPath, currentPath, ct, fileProgress, WaitOutPauseAsync);
+                        file.FullPath, currentPath, ct, fileProgress, waitMidFile);
                 }
                 else
                 {
                     // Plain copy (hash already computed above; file not buffered).
-                    await CopyFileAsync(file.FullPath, currentPath, ct, fileProgress, WaitOutPauseAsync);
+                    await CopyFileAsync(file.FullPath, currentPath, ct, fileProgress, waitMidFile);
                 }
 
                 // If this file was stored as a plain named copy, its content now
@@ -1272,6 +1291,10 @@ public class DirectoryBackupService
                 batchCount++;
             }
             catch (OperationCanceledException) { throw; }
+            catch (VersionTakenException)
+            {
+                restartFile = true;
+            }
             catch (Exception ex)
             {
                 string errorDetail = DescribeFileError(ex, file.FullPath);
@@ -1375,6 +1398,17 @@ public class DirectoryBackupService
 
             }
             } // while (fileRetrying)
+
+            if (restartFile)
+            {
+                // The same file again, numbered afresh, and read afresh: what was
+                // read of it before the pause (its buffer, its block-dedup recipe)
+                // may no longer be its content. Without a recipe it is copied plain.
+                bufferedContent.Remove(file.FullPath);
+                preRecipes.Remove(file.FullPath);
+                i--;
+                continue;
+            }
 
             // Destination filled up — stop processing further files. Whatever was
             // committed is preserved; the next run picks up the rest.
@@ -1496,22 +1530,37 @@ public class DirectoryBackupService
         {
             var verifying = PhaseProgress.Begin(progress, "Verifying backup", backedUp.Count);
             var verifiedBlocks = new HashSet<string>(StringComparer.OrdinalIgnoreCase);
-            int verifiedCount = 0;
+            var verifyPaths = backedUp.Keys.ToList();
 
-            foreach (var (sourcePath, info) in backedUp)
+            // The newest live version of each path, a batch ahead of the files
+            // being verified (see the check below).
+            var liveNow = new Dictionary<string, FileVersionInfo>(StringComparer.OrdinalIgnoreCase);
+            var liveBatch = new LookupBatch();
+            int liveUpTo = 0;
+
+            for (int v = 0; v < verifyPaths.Count; v++)
             {
+                string sourcePath = verifyPaths[v];
+                var info = backedUp[sourcePath];
                 ct.ThrowIfCancellationRequested();
                 pauseEvent?.Wait(ct);
 
-                verifying.Advance(verifiedCount++, sourcePath);
+                verifying.Advance(v, sourcePath);
 
                 // The write lock is no longer held, so another writer (the Worker)
                 // may have written a newer version since, moving this run's copy
                 // into _prev. The current path then holds that version, which is
                 // no failure of this one: leave it to that writer.
-                var lastNow = await _catalog.GetLastVersionAsync(backupSetId, sourcePath, ct);
-                if (lastNow is not { IsDeleted: false } current
-                    || !string.Equals(current.Version.Hash, info.Hash, StringComparison.OrdinalIgnoreCase))
+                if (v >= liveUpTo)
+                {
+                    var batch = verifyPaths.GetRange(liveUpTo, Math.Min(liveBatch.Size, verifyPaths.Count - liveUpTo));
+                    liveBatch.Starting();
+                    liveNow = await _catalog.GetLatestVersionInfoForPathsAsync(backupSetId, batch, ct);
+                    liveBatch.Finished(batch.Count);
+                    liveUpTo += batch.Count;
+                }
+                if (!liveNow.TryGetValue(sourcePath, out var current)
+                    || !string.Equals(current.Hash, info.Hash, StringComparison.OrdinalIgnoreCase))
                     continue;
 
                 try

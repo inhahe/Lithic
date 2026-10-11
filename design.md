@@ -885,6 +885,14 @@ the lock is taken back (`ReacquireLockAsync`), because the copy it names may hav
 been pruned. Pause commits and lets the lock go before waiting
 (`WaitOutPauseAsync`, also called by the copy helpers between chunks): held, it
 stalls every other writer of the set, the Worker's whole poll loop included.
+Mid-file that hands the lock back after the file's number was read, so on
+resuming the number is checked again: if another writer has recorded a version of
+the file meanwhile, the partial copy is abandoned and the file starts over with a
+fresh number and a fresh read (`VersionTakenException`). A new number follows the
+highest any record of the path has, tombstoned ones included
+(`GetLastVersionAsync`'s `HighestVersion`). A live chain can sit below a newer
+tombstoned record, and that record still owns its number. The live record is still
+the copy that moves to `_prev`.
 Verification, which runs after the last commit, skips a file whose last version is
 no longer the one this run wrote. A cancel throws `BackupCanceledException`,
 carrying the files that had failed and whether the copy had finished.

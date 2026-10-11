@@ -28,6 +28,32 @@ with the old code.
   The Worker counts a full scan stopped during verification or retention as done,
   instead of repeating hours of scanning after a restart.
 
+## FIXED: a version number could be given twice: after a mid-file pause, and after a tombstoned record (2026-10-11)
+
+Found by the Fable review of the work above:
+- **A pause mid-file let the lock go after the file's number was read.**
+  Another writer could record that number meanwhile. In practice it could not
+  *write* the file, since the paused copy holds `<file>.lbtmp` exclusively and
+  the Worker's attempt fails with a sharing violation and is retried later. But
+  any version committed in the gap would be duplicated. On resuming, the number
+  is now checked again, and if it was taken the file starts over with a fresh one.
+- **Numbers followed the newest live record**, so a path whose newest record had
+  been tombstoned (its copy found missing by the reconcile) reused that record's
+  number. They now follow the highest number any record of the path has.
+
+Also from that review:
+- Verification checks for superseded copies in batches, not one seek per file.
+- The Worker's copy helpers are back on the plain `CopyToAsync` path when there
+  is no Pause to honour.
+- `BackupCanceledException` keeps the original cancellation as its inner exception.
+- The GUI's message for a cancel after the copy names what was actually cut short.
+
+**Open, by choice:** a Worker full scan stopped during whole-set retention is
+still counted as done, so it is not repeated; the next full scan does the
+retention. Repeating hours of scanning to finish a prune is worse. If every full
+scan were stopped there, versions of untouched files would never age out. The
+Worker logs "retention did not complete" when it happens.
+
 ## Tech debt: the duplicate scan's hashing loop exists twice
 
 `MainViewModel` (the set's duplicate scan) and `SourceSelectionViewModel` (the

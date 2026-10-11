@@ -168,8 +168,13 @@ public interface ICatalogRepository : IDisposable
     /// .knt files) need this: each save briefly removes the original, which
     /// tombstones its record.
     /// </summary>
-    /// <returns>That version, and whether its record is deleted.</returns>
-    Task<(FileVersionInfo Version, bool IsDeleted)?> GetLastVersionAsync(
+    /// <returns>
+    /// That version; whether its record is deleted; and the highest version
+    /// number any record of the path has, deleted or not. A new version takes the
+    /// number after <c>HighestVersion</c>: a live chain can sit below a newer
+    /// tombstoned record, which still owns its number.
+    /// </returns>
+    Task<(FileVersionInfo Version, bool IsDeleted, int HighestVersion)?> GetLastVersionAsync(
         int backupSetId, string path, CancellationToken ct = default);
 
     /// <summary>

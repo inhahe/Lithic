@@ -3163,7 +3163,7 @@ public class MainViewModel : ViewModelBase
         {
             var cancelled = ex as BackupCanceledException;
             resultText = cancelled is { CopyFinished: true }
-                ? "Cancelled after the copy — the added files are backed up; checking them was cut short."
+                ? "Cancelled after the copy — the added files are backed up; what follows it (verifying, pruning old versions) was cut short."
                 : "Cancelled — some added files may not be backed up yet.";
             progressVm.CompleteBurn(false, "Cancelled by user.",
                 failedFiles: cancelled?.FailedFiles, cancelled: true);

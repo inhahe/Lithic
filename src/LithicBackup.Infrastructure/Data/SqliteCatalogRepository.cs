@@ -463,7 +463,7 @@ public class SqliteCatalogRepository : ICatalogRepository
         int backupSetId, IReadOnlyCollection<string> paths, CancellationToken ct = default)
         => GetSet(backupSetId).GetLatestVersionInfoForPathsAsync(backupSetId, paths, ct);
 
-    public Task<(FileVersionInfo Version, bool IsDeleted)?> GetLastVersionAsync(
+    public Task<(FileVersionInfo Version, bool IsDeleted, int HighestVersion)?> GetLastVersionAsync(
         int backupSetId, string path, CancellationToken ct = default)
         => GetSet(backupSetId).GetLastVersionAsync(backupSetId, path, ct);
 

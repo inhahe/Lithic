@@ -1963,8 +1963,11 @@ public sealed class BackupWorker : BackgroundService
             // Stopped during verification or retention: every file was copied and
             // committed, so the scan did its job, and repeating hours of it after
             // the restart would gain nothing.
+            // Its whole-set retention - the only pruning of versions the targeted
+            // runs never touch - did not finish; the next full scan does it.
             _logger.LogInformation(
-                "Backup for \"{Name}\" stopped after its copy finished.", state.BackupSet.Name);
+                "Backup for \"{Name}\" stopped after its copy finished; retention did not complete.",
+                state.BackupSet.Name);
             state.LastRunUtc = DateTime.UtcNow;
             MarkFullScanCompleted(state);
             return ex.FailedFiles.Count == 0

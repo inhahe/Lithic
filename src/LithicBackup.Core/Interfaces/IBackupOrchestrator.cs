@@ -137,9 +137,10 @@ public class BackupResult
 /// Every file had been copied and committed: only verification or retention was
 /// cut short, so the backup itself is complete.
 /// </param>
+/// <param name="cancellation">Where the run stopped: kept as the inner exception.</param>
 public sealed class BackupCanceledException(
-    IReadOnlyList<FailedFile> failedFiles, bool copyFinished, CancellationToken ct)
-    : OperationCanceledException("The backup was cancelled.", ct)
+    IReadOnlyList<FailedFile> failedFiles, bool copyFinished, OperationCanceledException cancellation)
+    : OperationCanceledException("The backup was cancelled.", cancellation, cancellation.CancellationToken)
 {
     public IReadOnlyList<FailedFile> FailedFiles { get; } = failedFiles;
     public bool CopyFinished { get; } = copyFinished;
