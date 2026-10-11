@@ -820,63 +820,11 @@ internal sealed class SqliteSetDatabase : IDisposable
         return dict;
     }
 
-    public async Task<Dictionary<string, FileVersionInfo>> GetOrphanedVersionInfoAsync(int backupSetId, CancellationToken ct = default)
-    {
-        ct.ThrowIfCancellationRequested();
-        using var _ = await LockAsync(ct).ConfigureAwait(false);
-
-        using var cmd = _connection.CreateCommand();
-        // Latest record per SourcePath across ALL rows (deleted included),
-        // keeping only paths whose newest row is soft-deleted. A path with a
-        // live (IsDeleted = 0) latest row is already covered by
-        // GetLatestVersionInfoAsync and is intentionally excluded here so the
-        // two dictionaries never overlap. COLLATE NOCASE mirrors that method:
-        // the Windows filesystem is case-insensitive, so all casings of a path
-        // share one version chain.
-        cmd.CommandText = """
-            SELECT SourcePath, Version, SizeBytes, SourceLastWriteUtc, IsDeduped, IsFileRef, Hash
-            FROM (
-                SELECT f.SourcePath,
-                       f.Version,
-                       f.SizeBytes,
-                       f.SourceLastWriteUtc,
-                       f.IsDeduped,
-                       f.IsFileRef,
-                       f.Hash,
-                       f.IsDeleted,
-                       ROW_NUMBER() OVER (
-                           PARTITION BY f.SourcePath COLLATE NOCASE
-                           ORDER BY f.Version DESC, f.Id DESC
-                       ) AS rn
-                FROM Files f
-                INNER JOIN Discs d ON f.DiscId = d.Id
-                WHERE d.BackupSetId = $setId
-            )
-            WHERE rn = 1 AND IsDeleted = 1
-            """;
-        cmd.Parameters.AddWithValue("$setId", backupSetId);
-
-        var dict = new Dictionary<string, FileVersionInfo>(StringComparer.OrdinalIgnoreCase);
-        using var r = cmd.ExecuteReader();
-        while (r.Read())
-        {
-            string path = r.GetString(0);
-            dict[path] = new FileVersionInfo(
-                MaxVersion: r.GetInt32(1),
-                SizeBytes: r.GetInt64(2),
-                SourceLastWriteUtc: DateTime.Parse(r.GetString(3), null, DateTimeStyles.RoundtripKind),
-                IsDeduped: r.GetInt32(4) != 0,
-                IsFileRef: r.GetInt32(5) != 0,
-                Hash: r.IsDBNull(6) ? "" : r.GetString(6));
-        }
-        return dict;
-    }
-
     // ---------------------------------------------------------------------
-    // Path-scoped variants of the two "latest version per path" queries.
+    // Path-scoped forms of the "latest version per path" query.
     //
-    // GetLatestVersionInfoAsync / GetOrphanedVersionInfoAsync build a map for
-    // the WHOLE set. That means a full table scan plus a window-function sort
+    // GetLatestVersionInfoAsync builds a map for the WHOLE set. That means a
+    // full table scan plus a window-function sort
     // over every row — measured at ~12.5 s / 2.2M rows on a real 1.9 GB set
     // database. Continuous backup only ever needs the entries for the handful
     // of paths the USN journal just reported (typically 1-30), so paying the
@@ -930,20 +878,14 @@ internal sealed class SqliteSetDatabase : IDisposable
         return dict;
     }
 
-    public async Task<Dictionary<string, FileVersionInfo>> GetOrphanedVersionInfoForPathsAsync(
-        int backupSetId, IReadOnlyCollection<string> paths, CancellationToken ct = default)
+    public async Task<(FileVersionInfo Version, bool IsDeleted)?> GetLastVersionAsync(
+        int backupSetId, string path, CancellationToken ct = default)
     {
         ct.ThrowIfCancellationRequested();
-        var dict = new Dictionary<string, FileVersionInfo>(StringComparer.OrdinalIgnoreCase);
-        if (paths.Count == 0)
-            return dict;
-
         using var _ = await LockAsync(ct).ConfigureAwait(false);
 
-        // Newest row for the path across ALL rows (tombstones included); the
-        // path is "orphaned history" only when that newest row is itself
-        // soft-deleted, exactly as the whole-set query's `rn = 1 AND
-        // IsDeleted = 1` filter decides.
+        // Live records sort first (IsDeleted = 0), so this is the newest live
+        // record when the path has one and otherwise its newest deleted one.
         using var cmd = _connection.CreateCommand();
         cmd.CommandText = """
             SELECT f.SourcePath, f.Version, f.SizeBytes, f.SourceLastWriteUtc,
@@ -952,23 +894,14 @@ internal sealed class SqliteSetDatabase : IDisposable
             INNER JOIN Discs d ON f.DiscId = d.Id
             WHERE d.BackupSetId = $setId
               AND f.SourcePath = $path COLLATE NOCASE
-            ORDER BY f.Version DESC, f.Id DESC
+            ORDER BY f.IsDeleted, f.Version DESC, f.Id DESC
             LIMIT 1
             """;
         cmd.Parameters.AddWithValue("$setId", backupSetId);
-        var pathParam = cmd.Parameters.Add("$path", SqliteType.Text);
+        cmd.Parameters.AddWithValue("$path", path);
 
-        foreach (var path in paths)
-        {
-            ct.ThrowIfCancellationRequested();
-            if (dict.ContainsKey(path))
-                continue;
-            pathParam.Value = path;
-            using var r = cmd.ExecuteReader();
-            if (r.Read() && r.GetInt32(7) != 0)
-                dict[r.GetString(0)] = ReadVersionInfo(r);
-        }
-        return dict;
+        using var r = cmd.ExecuteReader();
+        return r.Read() ? (ReadVersionInfo(r), r.GetInt32(7) != 0) : null;
     }
 
     private static FileVersionInfo ReadVersionInfo(SqliteDataReader r) => new(

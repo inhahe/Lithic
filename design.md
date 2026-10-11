@@ -821,7 +821,6 @@ Pause ignored throughout. Each of these is now a **phase** that counts files:
 | phase | where | when |
 |---|---|---|
 | Checking files against the catalog | `ExecuteTargetedAsync` | always |
-| Looking up earlier versions | `ExecuteAsync` | handed a diff without versions (a full backup) |
 | Analyzing files for deduplication | `ExecuteAsync` | block dedup on |
 | Checking which files might be duplicates | `ExecuteAsync` | file dedup on, block dedup off |
 | Verifying backup | `ExecuteAsync`, after the copy | verify after backup on |
@@ -833,7 +832,7 @@ of files, millions of posts to the UI thread. A full backup's retention reads th
 whole set in one query and still shows only "Applying retention rules...".
 
 **A targeted run's retention reads only the files it gave a second or later
-version** (`pathsWithHistory`: a live or orphaned version before the copy). A
+version** (`pathsWithHistory`: those the copy found an earlier version of). A
 first version leaves no previous one to prune, so reading the other files' records
 could never remove anything. It used to read every file the run wrote, a path at a
 time: for 2.67M new files, 2.67M queries and as many `FileRecord` objects, silent,
@@ -849,18 +848,29 @@ elapsed and the time left.
 Catalog lookups go in batches (`LookupBatch`) sized from the rate of the calls so
 far to take about 100 ms each. A call holds the set's connection, and the count and
 Pause are serviced only between calls, so one must stay well inside a progress
-interval; yet its fixed cost should vanish into its seeks. The seeks take 15-20 µs
-warm on the 5.7M-row set but have been timed at 9 ms with the Worker writing to the
-same set, which is why the size is measured, not fixed.
+interval; yet its fixed cost should vanish into its seeks. On the 5.7M-row set a
+seek takes 15-60 µs when its pages are cached and 1.5-3.6 ms when they are not, a
+hundredfold apart, and 9 ms has been seen with the Worker writing to the same set.
+That is why the size is measured, not fixed: a fixed 1,000 would hold the count
+and Pause for seconds on a cold cache.
 
-**The check's answers are handed on.** The check needs each candidate's newest
-live version to classify it; `ExecuteAsync` needs the same to number the new
-versions, and the orphaned history for the ones without. The check now looks up
-both, the orphaned query only for paths with no live version (the only case in
-which its answer is used), and passes them as `ExecuteAsync(knownVersions:)`
-(`CatalogVersions`). It used to look all of them up again: about a minute per
-pass at this size. `targeted_progress_test` §9 counts the lookups through a proxy
-catalog.
+**Each version is numbered as it is written, from the catalog under the write
+lock.** The copy loop reads every file's last version (`GetLastVersionAsync`: the
+newest live record, or failing that the newest deleted one, which a reappearing
+file continues from) inside the transaction it writes in. That transaction holds
+the set's cross-process write lock, so no other process can add a version of the
+path between the read and the write. The run used to number every file from one
+lookup made before its copy loop. The Worker's continuous backup commits between
+a long run's transactions, and when it backed up a file the run was still to
+reach, the run gave that file the same version number again, and moving the
+current copy into `_prev` overwrote the older version's copy there
+(`File.Move(..., overwrite: true)`). The check before copying still looks each
+candidate up, but only to decide whether it is new or changed. One indexed seek
+a file (19-36 µs warm on the 5.7M-row set) is noise beside the copy it numbers,
+and it made a whole pre-copy pass ("Looking up earlier versions") unnecessary.
+`targeted_progress_test` §14 has another writer add a version between the check
+and the copy, and at a commit boundary, and checks every version's number and
+content.
 
 **Progress is throttled by holding back, never by dropping.** The row panel
 (`BurnProgressViewModel.OnBackupProgress`) shows at most one data report per half

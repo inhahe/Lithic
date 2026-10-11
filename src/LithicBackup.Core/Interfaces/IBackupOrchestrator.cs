@@ -13,10 +13,10 @@ public delegate Task<FailureDecision> FailureCallback(
 /// work into a scan that would otherwise monopolise the set for hours.
 /// </summary>
 /// <param name="pathsThisRunWillWrite">
-/// Every source path the running backup intends to write. The handler <b>must
-/// not</b> back up any of these: the run resolved their version numbers from a
-/// single snapshot taken before its copy loop began, so writing one here would
-/// leave it assigning a version computed from stale information.
+/// Every source path the running backup intends to write. The handler should
+/// leave these to it: backing one up here copies the same file twice in one run.
+/// (The run numbers each file's version as it writes it, from the catalog under
+/// its write lock, so a version written here is followed, not duplicated.)
 /// </param>
 /// <remarks>
 /// Runs inline, so the backup is paused for its duration — keep the work short

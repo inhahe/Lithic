@@ -46,25 +46,6 @@ public enum TargetedMoveOutcome
 }
 
 /// <summary>
-/// What the catalog holds for the paths a directory backup is about to write,
-/// looked up before its copy loop; the run numbers each new version from it.
-/// Keyed case-insensitively, as the Windows filesystem is.
-/// </summary>
-public sealed class CatalogVersions
-{
-    /// <summary>The newest live (not deleted) version of each path that has one.</summary>
-    public Dictionary<string, FileVersionInfo> Live { get; } = new(StringComparer.OrdinalIgnoreCase);
-
-    /// <summary>
-    /// For paths with no live version: the newest version, when that is a
-    /// deleted record (see <see cref="ICatalogRepository.GetOrphanedVersionInfoAsync"/>).
-    /// A file that reappears there resumes its numbering from it instead of
-    /// starting again at version 1.
-    /// </summary>
-    public Dictionary<string, FileVersionInfo> Orphaned { get; } = new(StringComparer.OrdinalIgnoreCase);
-}
-
-/// <summary>
 /// Backs up files to a directory target with versioned file history.
 ///
 /// Layout on disk:
@@ -131,13 +112,6 @@ public class DirectoryBackupService
     /// for why that is safe and what it defers to the next full backup. A full
     /// backup must leave this false.
     /// </param>
-    /// <param name="knownVersions">
-    /// What the catalog holds for every new and changed path in
-    /// <paramref name="precomputedDiff"/>, from a caller that has just looked it up
-    /// (<see cref="ExecuteTargetedAsync"/>, whose check needs the same answers), so
-    /// it is not looked up a second time - over two million paths, that is minutes.
-    /// The run takes ownership: it adds the versions it writes. Null to look up here.
-    /// </param>
     public async Task<BackupResult> ExecuteAsync(
         BackupJob job,
         string targetDirectory,
@@ -148,8 +122,7 @@ public class DirectoryBackupService
         FailureCallback? onFailure = null,
         BackupDiff? precomputedDiff = null,
         bool scopeRetentionToBackedUpFiles = false,
-        CommitBoundaryHandler? onCommitBoundary = null,
-        CatalogVersions? knownVersions = null)
+        CommitBoundaryHandler? onCommitBoundary = null)
     {
         BackupDiff diff;
         if (precomputedDiff is not null)
@@ -210,61 +183,19 @@ public class DirectoryBackupService
             backupSetId = newSet.Id;
         }
 
-        // 4. Build version lookup and storage format from existing catalog.
-        //
-        // Scoped to exactly the paths this run will touch. Both maps below are
-        // only ever consulted (and extended) for files in filesToBackup, so a
-        // path-scoped lookup is equivalent to the whole-set form — but it costs
-        // one indexed seek per file instead of a full table scan plus a
-        // window-function sort over every row in the set. On a real 2.2M-row
-        // set the whole-set queries measured ~12.5 s EACH, and continuous
-        // backup runs them on every wake-up: that is what pegged a CPU core and
-        // drove ~110 MB/s of pure reads in the Worker service with nothing
-        // actually being written. See the "Worker pegged a CPU core" entry in
-        // known-issues.md.
-        var lookupPaths = filesToBackup.Select(f => f.FullPath).ToList();
+        // 4. Each file's version is numbered in the copy loop, from the catalog
+        // as it stands when that file is written (see there).
 
-        // Handed to onCommitBoundary so it can stay off the paths this run owns.
-        // Built from the same list the version lookup below uses, so the two can
-        // never disagree about what this run is going to write.
+        // Handed to onCommitBoundary so it can stay off the paths this run will
+        // write itself.
         IReadOnlySet<string> pathsThisRunWillWrite =
-            lookupPaths.ToHashSet(StringComparer.OrdinalIgnoreCase);
+            filesToBackup.Select(f => f.FullPath).ToHashSet(StringComparer.OrdinalIgnoreCase);
 
-        var versions = knownVersions ?? new CatalogVersions();
-        if (knownVersions is null && job.BackupSetId.HasValue)
-        {
-            var lookingUp = PhaseProgress.Begin(progress, "Looking up earlier versions", lookupPaths.Count);
-            var lookupBatch = new LookupBatch();
-            for (int start = 0; start < lookupPaths.Count;)
-            {
-                pauseEvent?.Wait(ct);
-                ct.ThrowIfCancellationRequested();
-                var chunk = lookupPaths.GetRange(start, Math.Min(lookupBatch.Size, lookupPaths.Count - start));
-                lookupBatch.Starting();
-                await LookUpVersionsAsync(backupSetId, chunk, versions, ct);
-                lookupBatch.Finished(chunk.Count);
-                start += chunk.Count;
-                lookingUp.Advance(start, chunk[^1]);
-            }
-        }
-        var versionInfo = versions.Live;
-
-        // Orphaned history: paths whose every catalog record is soft-deleted, so
-        // they're absent from versionInfo above. When such a path reappears we
-        // RESURRECT its version chain (continue numbering, move the old copy into
-        // _prev) instead of restarting at version 1 and discarding history. This
-        // is what lets atomically-saved files (e.g. KeyNote .knt, which briefly
-        // delete-and-recreate the original on every save, tombstoning the record)
-        // keep accumulating versions. Consulted per file below.
-        var orphanedVersionInfo = versions.Orphaned;
-
-        // The paths this run gives a second or later version: those with a live
-        // or orphaned version now, before the copy loop adds the ones it writes.
-        // Only they can have a previous version for a scoped retention pass to
-        // prune; a first version has none.
-        List<string>? pathsWithHistory = scopeRetentionToBackedUpFiles
-            ? lookupPaths.Where(p => versionInfo.ContainsKey(p) || orphanedVersionInfo.ContainsKey(p)).ToList()
-            : null;
+        // The paths this run gives a second or later version, gathered as the
+        // copy loop finds each one's earlier version. Only they can have a
+        // previous version for a scoped retention pass to prune; a first version
+        // has none. Null when retention covers the whole set.
+        List<string>? pathsWithHistory = scopeRetentionToBackedUpFiles ? [] : null;
 
         // Map of content hash -> destination-relative path of an active PLAIN
         // copy of that content somewhere in the backup tree (a real-bytes file
@@ -706,11 +637,19 @@ public class DirectoryBackupService
                 commitTimer.Restart();
             }
 
-            // Determine version number from the lightweight lookup
-            // BEFORE entering the retry loop so retries don't increment
-            // the version number.
+            // Number this version from the catalog as it stands now, read inside
+            // the open transaction, which holds the set's write lock: no other
+            // process - the Worker's continuous backup, between two of this run's
+            // commits - can add a version of the path before this one is
+            // written. A lookup made before the copy loop could be hours old by
+            // the time a file's turn came, and numbering from it duplicated the
+            // version another writer had added and overwrote its _prev copy.
+            // Read BEFORE entering the retry loop so retries don't increment the
+            // version number.
             int version = 1;
-            bool hasExistingInfo = versionInfo.TryGetValue(file.FullPath, out var existingInfo);
+            var last = await _catalog.GetLastVersionAsync(backupSetId, file.FullPath, ct);
+            bool hasExistingInfo = last is not null;
+            var existingInfo = last?.Version ?? default;
 
             // Resurrection: if there's no LIVE prior version but this path has a
             // fully-tombstoned history (its file was deleted then reappeared —
@@ -718,23 +657,20 @@ public class DirectoryBackupService
             // Treat it exactly like a normal existing version from here on: the
             // _prev move below picks up the old copy (still at its live on-disk
             // path) and un-deletes it as a retained version.
-            bool resurrecting = false;
-            if (!hasExistingInfo
-                && orphanedVersionInfo.TryGetValue(file.FullPath, out var orphanInfo))
-            {
-                existingInfo = orphanInfo;
-                hasExistingInfo = true;
-                resurrecting = true;
-                // The diff classifies a reappeared (tombstoned) path as a NEW
-                // file, so isChanged is false — but relative to its retained
-                // history it IS a change. Promote it so the downstream _prev
-                // move, content-identity short-circuit, and dedup hint all treat
-                // it as a changed existing file rather than a fresh version-1.
-                isChanged = true;
-            }
+            bool resurrecting = last is { IsDeleted: true };
 
             if (hasExistingInfo)
+            {
                 version = existingInfo.MaxVersion + 1;
+                // Relative to an earlier version this write is a change, whatever
+                // the diff said: it classifies a reappeared (tombstoned) path as
+                // new, and it can predate a version committed since. Promote it so
+                // the _prev move, content-identity short-circuit and dedup hint
+                // all treat it as a changed existing file rather than a fresh
+                // version 1 written over a copy another record still points at.
+                isChanged = true;
+                pathsWithHistory?.Add(file.FullPath);
+            }
 
             bool fileRetrying = true;
             while (fileRetrying)
@@ -927,11 +863,6 @@ public class DirectoryBackupService
                                 revived.SizeBytes = contentSize;
                                 await _catalog.UpdateFileRecordAsync(revived, ct);
 
-                                versionInfo[file.FullPath] = existingInfo with
-                                {
-                                    SourceLastWriteUtc = file.LastWriteUtc,
-                                    SizeBytes = contentSize,
-                                };
                                 bytesProcessed += file.SizeBytes;
                                 break; // revived in place — move on to the next file
                             }
@@ -958,12 +889,6 @@ public class DirectoryBackupService
                             }
                         }
 
-                        // Keep the in-memory view current for the rest of this run.
-                        versionInfo[file.FullPath] = existingInfo with
-                        {
-                            SourceLastWriteUtc = file.LastWriteUtc,
-                            SizeBytes = contentSize,
-                        };
                         // Unchanged content writes nothing, but it's a planned file
                         // now dealt with — advance the progress numerator so a run
                         // over a large unchanged tree doesn't look frozen.
@@ -1225,7 +1150,7 @@ public class DirectoryBackupService
                     // destination and through the hash at the same time. The hash
                     // and true byte count weren't known above (we proved the file
                     // is plain without reading it), so capture them here for the
-                    // version info, content-path seeding, and catalog record below.
+                    // content-path seeding and catalog record below.
                     (hash, contentSize) = await CopyFileWithHashAsync(
                         file.FullPath, currentPath, ct, fileProgress, pauseEvent);
                 }
@@ -1234,11 +1159,6 @@ public class DirectoryBackupService
                     // Plain copy (hash already computed above; file not buffered).
                     await CopyFileAsync(file.FullPath, currentPath, ct, fileProgress, pauseEvent);
                 }
-
-                // Update version info so a later file in this same run
-                // picks up the correct format for prev-moves.
-                versionInfo[file.FullPath] = new FileVersionInfo(
-                    version, contentSize, file.LastWriteUtc, isDeduped, isFileRef, hash);
 
                 // If this file was stored as a plain named copy, its content now
                 // has a real-bytes home in the tree: remember the hash -> its
@@ -1442,10 +1362,10 @@ public class DirectoryBackupService
                 // the next poll reports "continuity lost" — the very failure the
                 // scan was running to repair.
                 //
-                // The handler is given the paths THIS run will write and must not
-                // touch them. `versionInfo` is resolved once, before the copy loop,
-                // so a write to one of those paths from in here would leave this run
-                // assigning a version number computed from a now-stale snapshot.
+                // The handler is given the paths THIS run will write, to leave them
+                // to it: backing one up from in here would copy the same file twice
+                // in one run. (It would not corrupt the numbering, which this run
+                // reads per file as it writes.)
                 //
                 // Deliberately hooked on the batch/interval commit only, not on the
                 // pre-large-file flush above: this one is time-bounded
@@ -1874,10 +1794,6 @@ public class DirectoryBackupService
         // sort (~12.5 s, ~110 MB/s of reads) per wake-up, per set, forever. That is
         // what pegged a CPU core in the Worker service; see the "Worker pegged a
         // CPU core" entry in known-issues.md.
-        //
-        // The versions found are handed on to ExecuteAsync, which needs the same
-        // answers to number the new versions, so it does not look them up again.
-        var versions = new CatalogVersions();
         var newFiles = new List<ScannedFile>();
         var changedFiles = new List<ScannedFile>();
         var seen = new HashSet<string>(StringComparer.OrdinalIgnoreCase);
@@ -1925,7 +1841,7 @@ public class DirectoryBackupService
         return await ExecuteAsync(
             job, targetDirectory, retentionTiers,
             progress, ct, pauseEvent, precomputedDiff: diff,
-            scopeRetentionToBackedUpFiles: true, knownVersions: versions);
+            scopeRetentionToBackedUpFiles: true);
 
         // Sort the stat'ed candidates in `chunk` into new and changed by what the
         // catalog holds for them.
@@ -1934,11 +1850,12 @@ public class DirectoryBackupService
             if (chunk.Count == 0)
                 return;
             batch.Starting();
-            await LookUpVersionsAsync(backupSetId, chunk.Select(f => f.FullPath).ToList(), versions, ct);
+            var versions = await _catalog.GetLatestVersionInfoForPathsAsync(
+                backupSetId, chunk.Select(f => f.FullPath).ToList(), ct);
             batch.Finished(chunk.Count);
             foreach (var file in chunk)
             {
-                if (!versions.Live.TryGetValue(file.FullPath, out var last))
+                if (!versions.TryGetValue(file.FullPath, out var last))
                 {
                     newFiles.Add(file);
                 }
@@ -1959,9 +1876,10 @@ public class DirectoryBackupService
     /// call holds the set's connection, and Pause and the progress count are
     /// serviced only between calls, so one must stay well inside a progress
     /// interval; yet its fixed cost (the gate, preparing the statement) should
-    /// vanish into its seeks. A seek takes 15-20 µs warm (measured on a 5.7M-row
-    /// set) but has been timed at 9 ms with the Worker writing to the same set, so
-    /// the size follows the rate measured on the calls so far.
+    /// vanish into its seeks. On a 5.7M-row set a seek takes 15-60 µs when its
+    /// pages are cached and 1.5-3.6 ms when they are not, and 9 ms has been seen
+    /// with the Worker writing to the same set, so the size follows the rate
+    /// measured on the calls so far.
     /// </summary>
     private sealed class LookupBatch
     {
@@ -2004,26 +1922,6 @@ public class DirectoryBackupService
         {
             return null;
         }
-    }
-
-    /// <summary>
-    /// Add to <paramref name="versions"/> what the catalog holds for each of
-    /// <paramref name="paths"/>: its newest live version, or for a path without
-    /// one, its orphaned history. The orphaned query is put only to the paths with
-    /// no live version, as that is the only case in which its answer is used.
-    /// </summary>
-    private async Task LookUpVersionsAsync(
-        int backupSetId, IReadOnlyList<string> paths, CatalogVersions versions, CancellationToken ct)
-    {
-        foreach (var (path, info) in await _catalog.GetLatestVersionInfoForPathsAsync(backupSetId, paths, ct))
-            versions.Live[path] = info;
-
-        var withoutLive = paths.Where(p => !versions.Live.ContainsKey(p)).ToList();
-        if (withoutLive.Count == 0)
-            return;
-        var orphaned = await _catalog.GetOrphanedVersionInfoForPathsAsync(backupSetId, withoutLive, ct);
-        foreach (var (path, info) in orphaned)
-            versions.Orphaned[path] = info;
     }
 
     /// <summary>

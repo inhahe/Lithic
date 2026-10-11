@@ -141,40 +141,36 @@ public interface ICatalogRepository : IDisposable
     Task<Dictionary<string, FileVersionInfo>> GetLatestVersionInfoAsync(int backupSetId, CancellationToken ct = default);
 
     /// <summary>
-    /// Get lightweight version info for paths whose ENTIRE history is soft-deleted
-    /// — i.e. every catalog record for that SourcePath has <c>IsDeleted = 1</c>, so
-    /// the path is absent from <see cref="GetLatestVersionInfoAsync"/>. Returns one
-    /// entry per such path, carrying the max version and its metadata.
+    /// Path-scoped form of <see cref="GetLatestVersionInfoAsync"/>: same
+    /// semantics, but the result is restricted to <paramref name="paths"/>
+    /// (matched case-insensitively, as the Windows filesystem does) and each path
+    /// is resolved with an indexed seek instead of a whole-set scan-and-sort.
     ///
-    /// This is the "orphaned history" set. It exists so a backup can *resurrect* a
-    /// version chain when a previously-deleted path reappears: without it, the
-    /// reappearing file looks brand-new (version resets to 1, the old copy is never
-    /// moved into _prev). This matters for editors that save atomically (write a
-    /// temp file then replace the original, e.g. KeyNote's .knt files): each save
-    /// briefly removes the original, tombstoning its record, so the next backup
-    /// must continue the chain rather than start over.
-    /// </summary>
-    Task<Dictionary<string, FileVersionInfo>> GetOrphanedVersionInfoAsync(int backupSetId, CancellationToken ct = default);
-
-    /// <summary>
-    /// Path-scoped variants of <see cref="GetLatestVersionInfoAsync"/> and
-    /// <see cref="GetOrphanedVersionInfoAsync"/>: same semantics, but the result
-    /// is restricted to <paramref name="paths"/> (matched case-insensitively,
-    /// as the Windows filesystem does) and each path is resolved with an indexed
-    /// seek instead of a whole-set scan-and-sort.
-    ///
-    /// Prefer these whenever the set of interesting paths is known up front — a
-    /// continuous-backup wake-up, or any run working from a precomputed diff.
-    /// The whole-set forms cost a full table scan plus a window-function sort
+    /// Prefer it whenever the set of interesting paths is known up front — a
+    /// continuous-backup wake-up, or any run working from a candidate list.
+    /// The whole-set form costs a full table scan plus a window-function sort
     /// over every row (~12.5 s on a 2.2M-row set), which is what pegged a CPU
     /// core in the Worker service. See known-issues.md.
     /// </summary>
     Task<Dictionary<string, FileVersionInfo>> GetLatestVersionInfoForPathsAsync(
         int backupSetId, IReadOnlyCollection<string> paths, CancellationToken ct = default);
 
-    /// <inheritdoc cref="GetLatestVersionInfoForPathsAsync"/>
-    Task<Dictionary<string, FileVersionInfo>> GetOrphanedVersionInfoForPathsAsync(
-        int backupSetId, IReadOnlyCollection<string> paths, CancellationToken ct = default);
+    /// <summary>
+    /// The version a new backup of <paramref name="path"/> follows on from: its
+    /// newest live record, or, when every record of the path is soft-deleted, its
+    /// newest deleted one. Null when the set has no record of the path. Matched
+    /// case-insensitively, as the Windows filesystem is; one indexed seek.
+    ///
+    /// The deleted case is "orphaned history". A path that was deleted and has
+    /// reappeared continues its version chain from it instead of looking brand-new
+    /// (version 1, its old copy never moved into _prev). Editors that save
+    /// atomically (write a temp file, then replace the original, e.g. KeyNote's
+    /// .knt files) need this: each save briefly removes the original, which
+    /// tombstones its record.
+    /// </summary>
+    /// <returns>That version, and whether its record is deleted.</returns>
+    Task<(FileVersionInfo Version, bool IsDeleted)?> GetLastVersionAsync(
+        int backupSetId, string path, CancellationToken ct = default);
 
     /// <summary>
     /// Fast scalar count of distinct source paths in a backup set (non-deleted).

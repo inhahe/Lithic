@@ -459,16 +459,13 @@ public class SqliteCatalogRepository : ICatalogRepository
     public Task<Dictionary<string, FileVersionInfo>> GetLatestVersionInfoAsync(int backupSetId, CancellationToken ct = default)
         => GetSet(backupSetId).GetLatestVersionInfoAsync(backupSetId, ct);
 
-    public Task<Dictionary<string, FileVersionInfo>> GetOrphanedVersionInfoAsync(int backupSetId, CancellationToken ct = default)
-        => GetSet(backupSetId).GetOrphanedVersionInfoAsync(backupSetId, ct);
-
     public Task<Dictionary<string, FileVersionInfo>> GetLatestVersionInfoForPathsAsync(
         int backupSetId, IReadOnlyCollection<string> paths, CancellationToken ct = default)
         => GetSet(backupSetId).GetLatestVersionInfoForPathsAsync(backupSetId, paths, ct);
 
-    public Task<Dictionary<string, FileVersionInfo>> GetOrphanedVersionInfoForPathsAsync(
-        int backupSetId, IReadOnlyCollection<string> paths, CancellationToken ct = default)
-        => GetSet(backupSetId).GetOrphanedVersionInfoForPathsAsync(backupSetId, paths, ct);
+    public Task<(FileVersionInfo Version, bool IsDeleted)?> GetLastVersionAsync(
+        int backupSetId, string path, CancellationToken ct = default)
+        => GetSet(backupSetId).GetLastVersionAsync(backupSetId, path, ct);
 
     public Task<int> GetFileCountForBackupSetAsync(int backupSetId, CancellationToken ct = default)
         => GetSet(backupSetId).GetFileCountForBackupSetAsync(backupSetId, ct);

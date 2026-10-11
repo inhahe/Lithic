@@ -374,11 +374,9 @@ internal static class Program
               && end9 - check9.LastOrDefault().Ms <= 3 * ProgressCadence.IntervalMs,
             $"and the count never stands still for long (longest gap {gaps9.DefaultIfEmpty().Max()} ms)");
         Check(counts.LivePaths == 5,
-            $"each candidate that exists is looked up in the catalog once, not again before copying ({counts.LivePaths} lookups for 5)");
-        Check(counts.OrphanedPaths == 5,
-            $"and its deleted history once ({counts.OrphanedPaths} for 5 new files)");
-        Check(rec9.Phase("Looking up earlier versions").Count == 0,
-            "the copy reuses what the check found instead of looking it up again");
+            $"each candidate that exists is looked up in the catalog once, with no second pass before copying ({counts.LivePaths} lookups for 5)");
+        Check(counts.LastVersionReads == 5,
+            $"and its last version read once more as it is written, under the write lock ({counts.LastVersionReads} for 5)");
 
         Console.WriteLine();
         Console.WriteLine("=== 9b. Pause holds the check ===");
@@ -404,24 +402,6 @@ internal static class Program
         // ------------------------------------------------------------ the other checks
         Console.WriteLine();
         Console.WriteLine("=== 10. the other checks before copying report their progress too ===");
-        // A full backup hands ExecuteAsync a diff without versions: it looks them up itself.
-        var batch10 = MakeBatch(src, "ten", 4, 4 * 1024);
-        var diff10 = new BackupDiff
-        {
-            NewFiles = batch10.Select(p => new ScannedFile
-            {
-                FullPath = p, SizeBytes = new FileInfo(p).Length, LastWriteUtc = File.GetLastWriteTimeUtc(p),
-            }).ToList(),
-            ChangedFiles = [],
-            DeletedFiles = [],
-        };
-        var rec10 = new TimedRecorder();
-        var result10 = await svc.ExecuteAsync(job, dest, tiers, rec10, CancellationToken.None, precomputedDiff: diff10);
-        var lookup10 = rec10.Phase("Looking up earlier versions");
-        Check(result10.Success && CountInDest(dest, "ten") == 4, "a backup handed a diff but no versions backs it up");
-        Check(lookup10.Count > 0 && lookup10.All(r => r.Report.PhaseFilesTotal == 4),
-            $"reporting as it looks up their earlier versions ({lookup10.Count} report(s))");
-
         var batch10b = MakeBatch(src, "tenbee", 3, 4 * 1024);
         var rec10b = new TimedRecorder();
         var result10b = await svc.ExecuteTargetedAsync(dedupJob, dest, batch10b, tiers, CancellationToken.None, rec10b);
@@ -499,7 +479,91 @@ internal static class Program
               && removing13.Count > 0 && removing13.All(r => r.Report.PhaseFilesTotal == 1),
             $"both retention steps report their progress ({applying13.Count}, {removing13.Count} report(s))");
 
+        // ------------------------------------------------------------ another writer
+        Console.WriteLine();
+        Console.WriteLine("=== 14. a version another writer adds meanwhile is followed, not duplicated ===");
+        // The Worker's continuous backup can commit a version of a file between two
+        // of a run's transactions. A run that numbered its versions from a lookup
+        // made earlier gave the file that same number again and moved its copy
+        // over the older version's in _prev.
+        string raceDir = Path.Combine(src, "fourteen");
+        Directory.CreateDirectory(raceDir);
+
+        // Between the check and the copy.
+        string raced = Path.Combine(raceDir, "fourteen_check.txt");
+        File.WriteAllText(raced, "one");
+        await svc.ExecuteTargetedAsync(job, dest, [raced], tiers, CancellationToken.None);
+        File.WriteAllText(raced, "two, edited");
+        var (raceRepo, raceCounts) = CountingCatalog.Wrap(repo);
+        raceCounts.AfterLiveLookup = async () =>
+        {
+            await svc.ExecuteTargetedAsync(job, dest, [raced], tiers, CancellationToken.None);
+            File.WriteAllText(raced, "three, edited again");
+        };
+        var raceSvc = new DirectoryBackupService(
+            raceRepo, new FileScanner(raceRepo), new VersionRetentionService(raceRepo));
+        var result14 = await raceSvc.ExecuteTargetedAsync(job, dest, [raced], tiers, CancellationToken.None);
+        var (intact14, detail14) = await VersionsIntactAsync(repo, set.Id, dest, raced, 3);
+        Check(result14.Success && intact14,
+            $"written after the check: versions 1-3, each copy holding its own content ({detail14})");
+
+        // At a commit boundary, between two of the copy's own transactions.
+        string boundary = Path.Combine(raceDir, "fourteen_boundary.txt");
+        File.WriteAllText(boundary, "one");
+        await svc.ExecuteTargetedAsync(job, dest, [boundary], tiers, CancellationToken.None);
+        var fillers = MakeBatch(src, "fourteen_fill", 50, 512);   // one commit batch ahead of it
+        File.WriteAllText(boundary, "two, edited");
+        static ScannedFile Scan(string p) => new()
+        {
+            FullPath = p, SizeBytes = new FileInfo(p).Length, LastWriteUtc = File.GetLastWriteTimeUtc(p),
+        };
+        var diff14 = new BackupDiff
+        {
+            NewFiles = fillers.Select(Scan).ToList(),
+            ChangedFiles = [Scan(boundary)],
+            DeletedFiles = [],
+        };
+        bool boundaryHit = false;
+        var result14b = await svc.ExecuteAsync(job, dest, tiers, null, CancellationToken.None,
+            precomputedDiff: diff14,
+            onCommitBoundary: async (_, _) =>
+            {
+                if (boundaryHit)
+                    return;
+                boundaryHit = true;
+                await svc.ExecuteTargetedAsync(job, dest, [boundary], tiers, CancellationToken.None);
+                File.WriteAllText(boundary, "three, edited again");
+            });
+        var (intact14b, detail14b) = await VersionsIntactAsync(repo, set.Id, dest, boundary, 3);
+        Check(result14b.Success && boundaryHit && intact14b,
+            $"written at a commit boundary: versions 1-3, each copy holding its own content ({detail14b})");
+
         await Task.Run(PanelTests);
+    }
+
+    /// <summary>
+    /// Whether <paramref name="path"/> has exactly versions 1 to
+    /// <paramref name="expected"/>, each once, and every live one's copy at the
+    /// destination holds the content its record says (by SHA-256).
+    /// </summary>
+    static async Task<(bool Ok, string Detail)> VersionsIntactAsync(
+        ICatalogRepository repo, int setId, string dest, string path, int expected)
+    {
+        var records = await repo.GetFileRecordsByPathAsync(setId, path);
+        var versions = records.Select(r => r.Version).OrderBy(v => v).ToList();
+        string numbers = "versions " + string.Join(", ", versions);
+        if (!versions.SequenceEqual(Enumerable.Range(1, expected)))
+            return (false, numbers);
+        foreach (var r in records.Where(r => !r.IsDeleted))
+        {
+            string copy = Path.Combine(dest, r.DiscPath);
+            if (!File.Exists(copy))
+                return (false, $"{numbers}; version {r.Version}'s copy is missing");
+            string hash = Convert.ToHexString(System.Security.Cryptography.SHA256.HashData(File.ReadAllBytes(copy)));
+            if (!hash.Equals(r.Hash, StringComparison.OrdinalIgnoreCase))
+                return (false, $"{numbers}; version {r.Version}'s copy holds other content");
+        }
+        return (true, numbers);
     }
 
     // ------------------------------------------------------------ the panel
@@ -614,7 +678,13 @@ internal static class Program
 public class CountingCatalog : DispatchProxy
 {
     public ICatalogRepository Inner = null!;
-    public long LivePaths, OrphanedPaths, RecordReads;
+    public long LivePaths, LastVersionReads, RecordReads;
+
+    /// <summary>
+    /// Run once, after the next live-version lookup returns and before its caller
+    /// sees the answer: what another writer might do in the meantime.
+    /// </summary>
+    public Func<Task>? AfterLiveLookup;
 
     public static (ICatalogRepository Catalog, CountingCatalog Counts) Wrap(ICatalogRepository inner)
     {
@@ -628,11 +698,25 @@ public class CountingCatalog : DispatchProxy
     {
         if (method!.Name == nameof(ICatalogRepository.GetLatestVersionInfoForPathsAsync))
             Interlocked.Add(ref LivePaths, ((IReadOnlyCollection<string>)args![1]!).Count);
-        else if (method.Name == nameof(ICatalogRepository.GetOrphanedVersionInfoForPathsAsync))
-            Interlocked.Add(ref OrphanedPaths, ((IReadOnlyCollection<string>)args![1]!).Count);
+        else if (method.Name == nameof(ICatalogRepository.GetLastVersionAsync))
+            Interlocked.Increment(ref LastVersionReads);
         else if (method.Name == nameof(ICatalogRepository.GetFileRecordsByPathAsync))
             Interlocked.Increment(ref RecordReads);
-        try { return method.Invoke(Inner, args); }
+
+        object? result;
+        try { result = method.Invoke(Inner, args); }
         catch (TargetInvocationException ex) when (ex.InnerException is not null) { throw ex.InnerException; }
+
+        if (method.Name == nameof(ICatalogRepository.GetLatestVersionInfoForPathsAsync)
+            && Interlocked.Exchange(ref AfterLiveLookup, null) is { } then)
+            return ThenAsync((Task<Dictionary<string, LithicBackup.Core.Models.FileVersionInfo>>)result!, then);
+        return result;
+
+        static async Task<T> ThenAsync<T>(Task<T> task, Func<Task> then)
+        {
+            var answer = await task;
+            await then();
+            return answer;
+        }
     }
 }

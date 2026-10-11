@@ -1,5 +1,43 @@
 # LithicBackup — Known Issues & Tech Debt
 
+## FIXED: a version the Worker committed during a run could be numbered twice, losing the older one's `_prev` copy (2026-10-10)
+
+**Found by** the code review of the progress work below; no incident was seen.
+
+**Cause.** A directory backup numbered each new version from catalog lookups made
+before its copy loop. A long run commits every 50 files or 30 s, and the Worker's
+continuous backup of the same set can take the write lock between two of those
+commits. Suppose it backs up a file the run has not reached yet, as version N+1.
+When the run reaches the file it still has version N in hand, so:
+- it writes another version N+1;
+- moving the current copy, now the Worker's N+1, into `_prev` as `.vN` overwrites
+  the real version N's copy there (`File.Move(..., overwrite: true)`). Version N's
+  record then names bytes that are not version N.
+
+The window was the whole copy loop, hours on a large run. The progress work
+widened it a little further: it had the copy reuse the check's lookups instead of
+re-reading them just before the loop.
+
+The same snapshot could also disagree with the diff in a way that lost data. A
+file classified as new whose first version another writer had committed in the
+meantime got a version number but no `_prev` move, because the move ran only for
+files the diff called changed. Its new copy then overwrote the one the earlier
+record pointed at.
+
+**Fix.** The copy loop reads each file's last version
+(`ICatalogRepository.GetLastVersionAsync`: the newest live record, or the newest
+deleted one when it has none) inside the transaction it writes in. That
+transaction holds the set's cross-process write lock, so nothing can add a version
+between the read and the write. Any earlier version makes the write a change,
+whatever the diff said. The pre-loop lookups are gone, and with them
+`GetOrphanedVersionInfoAsync` / `GetOrphanedVersionInfoForPathsAsync`, which
+nothing else used.
+
+**Tested.** `tools\targeted_progress_test` §14 has another writer add a version of
+a file twice: between the run's check and its copy, through a proxy catalog, and
+at a commit boundary, through `onCommitBoundary`. Each time the file must end with
+versions 1-3, each once, every copy holding the content its record names.
+
 ## FIXED: backing up 2,671,103 added files sat on "Checking 2,671,103 file(s) against the catalog..." at 0.0% for 16 minutes (2026-10-10)
 
 **Symptom.** The user added a folder whose subfolder holds millions of files and
@@ -20,9 +58,13 @@ In that time:
   has whole-file dedup on).
 - Pause did nothing until the copy started.
 
-A lookup costs 15-20 µs on set-11's 5.7M rows (timed read-only against the live
-database), so each pass over 2.67M paths took about a minute. By that arithmetic
-the stats took most of the rest; that is inferred, not measured.
+Timed read-only against set-11's live 5.7M-row database, 3,000 lookups at a time,
+a lookup costs 15-60 µs when its part of the index is cached and 1.5-3.6 ms when
+it is not. A run's candidates sit side by side in the index, so after the first
+few they find their pages cached. Had they not, three passes would have taken
+hours, not sixteen minutes. So the lookups were probably 2-8 minutes, and the
+stats most of the rest. That split is inferred, not measured; the phases now
+show it.
 
 **Fix.**
 - Each of those steps is now a phase that counts files
@@ -32,9 +74,9 @@ the stats took most of the rest; that is inferred, not measured.
   own bar, the file it has reached, files per second, time elapsed and time left.
 - The check stats candidates and looks them up in batches sized to take about
   100 ms per catalog call. Pause is checked before every candidate and every batch.
-- The check hands what it found to `ExecuteAsync` (`knownVersions`), which no
-  longer looks it up again. The orphaned-history query now goes only to paths with
-  no live version, the only case in which its answer is used.
+- `ExecuteAsync` no longer looks every path up again before copying. It reads
+  each file's last version as it writes the file, under the write lock: one
+  indexed seek, and the fix for a race (next entry).
 - A report that arrives after Pause no longer replaces "Paused" on the panel.
 - The size probe no longer swallows a cancellation.
 
@@ -66,7 +108,7 @@ checks failed.
 - **The check still stats every candidate, one at a time.** The GUI's walk of the
   added folders already had each file's size, and could have had its time too.
   Passing those on would skip 2.67M stats, which by the arithmetic above were
-  most of the sixteen minutes. The price: a file deleted between the walk and the
+  probably half or more of the sixteen minutes. The price: a file deleted between the walk and the
   backup would surface as a failed copy instead of being skipped quietly. Measure
   the stats before deciding. Parallel stats are the other option.
 - Block dedup's pre-pass reads each file whole, and its count moves per file. One
