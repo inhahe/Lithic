@@ -877,6 +877,18 @@ and it made a whole pre-copy pass ("Looking up earlier versions") unnecessary.
 and the copy, and at a commit boundary, and checks every version's number and
 content.
 
+**Anything learned under the write lock is good only until the run lets it go.**
+A run lets go at every commit (every 50 files or 30 s), and the Worker can write
+between two of them. So: version numbers are read per file under the lock (above).
+The file-level dedup memo of "hash -> a plain copy holding it" is emptied whenever
+the lock is taken back (`ReacquireLockAsync`), because the copy it names may have
+been pruned. Pause commits and lets the lock go before waiting
+(`WaitOutPauseAsync`, also called by the copy helpers between chunks): held, it
+stalls every other writer of the set, the Worker's whole poll loop included.
+Verification, which runs after the last commit, skips a file whose last version is
+no longer the one this run wrote. A cancel throws `BackupCanceledException`,
+carrying the files that had failed and whether the copy had finished.
+
 **Progress is throttled by holding back, never by dropping.** The row panel
 (`BurnProgressViewModel.OnBackupProgress`) shows at most one data report per half
 second. It used to throw the rest away, and the report thrown away could be the one

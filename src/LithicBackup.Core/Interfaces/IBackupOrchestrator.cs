@@ -128,6 +128,23 @@ public class BackupResult
     public IReadOnlyList<FailedFile> FailedFiles { get; init; } = [];
 }
 
+/// <summary>
+/// A directory backup was cancelled. Still an <see cref="OperationCanceledException"/>,
+/// but carrying what a caller needs to report the cancelled run honestly.
+/// </summary>
+/// <param name="failedFiles">Files that had failed before the cancellation, to list as for a finished run.</param>
+/// <param name="copyFinished">
+/// Every file had been copied and committed: only verification or retention was
+/// cut short, so the backup itself is complete.
+/// </param>
+public sealed class BackupCanceledException(
+    IReadOnlyList<FailedFile> failedFiles, bool copyFinished, CancellationToken ct)
+    : OperationCanceledException("The backup was cancelled.", ct)
+{
+    public IReadOnlyList<FailedFile> FailedFiles { get; } = failedFiles;
+    public bool CopyFinished { get; } = copyFinished;
+}
+
 /// <summary>A file that failed to back up.</summary>
 public class FailedFile
 {

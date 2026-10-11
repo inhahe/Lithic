@@ -3137,7 +3137,9 @@ public class MainViewModel : ViewModelBase
             var progress = new Progress<BackupProgress>(p =>
             {
                 progressVm.OnBackupProgress(p);
-                if (string.IsNullOrEmpty(p.StatusMessage))
+                // Reports with byte totals carry the backup's percentage; a
+                // phase's report carries only its own count, shown on the panel.
+                if (p.BytesTotalAll > 0)
                     StatusText = $"Backing up added files for \"{row.Name}\": {p.OverallPercentage:F0}%";
             });
 
@@ -3157,10 +3159,14 @@ public class MainViewModel : ViewModelBase
             if (result.Success && failed == 0)
                 progressVm.RequestDone();
         }
-        catch (OperationCanceledException)
+        catch (OperationCanceledException ex)
         {
-            resultText = "Cancelled — some added files may not be backed up yet.";
-            progressVm.CompleteBurn(false, "Cancelled by user.", cancelled: true);
+            var cancelled = ex as BackupCanceledException;
+            resultText = cancelled is { CopyFinished: true }
+                ? "Cancelled after the copy — the added files are backed up; checking them was cut short."
+                : "Cancelled — some added files may not be backed up yet.";
+            progressVm.CompleteBurn(false, "Cancelled by user.",
+                failedFiles: cancelled?.FailedFiles, cancelled: true);
             StatusText = resultText;
             if (!progressVm.HasFailedFiles)
                 progressVm.RequestDone();
@@ -4160,10 +4166,10 @@ public class MainViewModel : ViewModelBase
             var progress = new Progress<BackupProgress>(p =>
             {
                 progressVm.OnBackupProgress(p);
-                // The copy's percentage only. A status report - a phase before or
-                // after the copy, with its own count on the panel - carries none,
-                // and would put "0% complete" up while a backup verifies.
-                if (string.IsNullOrEmpty(p.StatusMessage))
+                // Reports with byte totals carry the backup's percentage. A phase
+                // before or after the copy reports only its own count, shown on
+                // the panel, and would put "0% complete" up while a backup verifies.
+                if (p.BytesTotalAll > 0)
                     StatusText = $"{p.OverallPercentage:F0}% complete";
             });
 
@@ -4194,9 +4200,11 @@ public class MainViewModel : ViewModelBase
             if (result.Success && result.FailedFiles.Count == 0)
                 progressVm.RequestDone();
         }
-        catch (OperationCanceledException)
+        catch (OperationCanceledException ex)
         {
-            progressVm.CompleteBurn(false, "Cancelled by user.", cancelled: true);
+            // Files that failed before the cancel are listed as after any run.
+            progressVm.CompleteBurn(false, "Cancelled by user.",
+                failedFiles: (ex as BackupCanceledException)?.FailedFiles, cancelled: true);
             StatusText = "Directory backup cancelled.";
             // A user abort with no failed files leaves nothing to review, so
             // finalize straight to the row's persistent result line instead of

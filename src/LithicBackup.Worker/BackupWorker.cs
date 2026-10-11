@@ -957,9 +957,10 @@ public sealed class BackupWorker : BackgroundService
     ///
     /// <para>Safety rests on two things. It runs at a commit boundary, where the
     /// catalog is committed and no transaction, gate or cross-process lock is held,
-    /// so it is sequential with the scan rather than concurrent. And it never
-    /// touches a path the scan intends to write, so it cannot race the version
-    /// numbers that scan resolved up front.</para>
+    /// so it is sequential with the scan rather than concurrent. And it leaves the
+    /// paths the scan intends to write to the scan, which would otherwise copy
+    /// them a second time. (The scan numbers each version under the write lock as
+    /// it writes, so a version written here would be followed, not duplicated.)</para>
     /// </summary>
     private async Task DrainJournalDuringFullScanAsync(
         SetState scanningSet, IReadOnlySet<string> pathsTheScanWillWrite, CancellationToken ct)
@@ -1049,8 +1050,8 @@ public sealed class BackupWorker : BackgroundService
             if (state.Pending.Count == 0)
                 continue;
 
-            // Only the set being scanned has paths that are off limits; a different
-            // set has its own catalog database and its own version snapshot.
+            // Only the set being scanned has paths to leave alone; a different set
+            // is not being written by the scan.
             var excluded = ReferenceEquals(state, scanningSet) ? pathsTheScanWillWrite : null;
             var ready = SelectReadyPaths(state, now, excluded);
             if (ready.Count == 0)
@@ -1951,6 +1952,19 @@ public sealed class BackupWorker : BackgroundService
 
             MarkFullScanCompleted(state);
             return result.Success
+                ? ReconcileOutcome.RanClean
+                : ReconcileOutcome.RanWithFailures;
+        }
+        catch (BackupCanceledException ex) when (ct.IsCancellationRequested && ex.CopyFinished)
+        {
+            // Stopped during verification or retention: every file was copied and
+            // committed, so the scan did its job, and repeating hours of it after
+            // the restart would gain nothing.
+            _logger.LogInformation(
+                "Backup for \"{Name}\" stopped after its copy finished.", state.BackupSet.Name);
+            state.LastRunUtc = DateTime.UtcNow;
+            MarkFullScanCompleted(state);
+            return ex.FailedFiles.Count == 0
                 ? ReconcileOutcome.RanClean
                 : ReconcileOutcome.RanWithFailures;
         }

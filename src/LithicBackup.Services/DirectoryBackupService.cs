@@ -112,6 +112,10 @@ public class DirectoryBackupService
     /// for why that is safe and what it defers to the next full backup. A full
     /// backup must leave this false.
     /// </param>
+    /// <exception cref="BackupCanceledException">
+    /// Cancelled: with the files that had failed by then, and whether the copy
+    /// itself had finished.
+    /// </exception>
     public async Task<BackupResult> ExecuteAsync(
         BackupJob job,
         string targetDirectory,
@@ -123,6 +127,41 @@ public class DirectoryBackupService
         BackupDiff? precomputedDiff = null,
         bool scopeRetentionToBackedUpFiles = false,
         CommitBoundaryHandler? onCommitBoundary = null)
+    {
+        var run = new RunState();
+        try
+        {
+            return await ExecuteCoreAsync(
+                job, targetDirectory, retentionTiers, progress, ct, pauseEvent, onFailure,
+                precomputedDiff, scopeRetentionToBackedUpFiles, onCommitBoundary, run);
+        }
+        catch (OperationCanceledException ex) when (ex is not BackupCanceledException)
+        {
+            throw new BackupCanceledException(run.FailedFiles, run.CopyFinished, ex.CancellationToken);
+        }
+    }
+
+    /// <summary>What a run has done so far, for reporting it if it is cancelled.</summary>
+    private sealed class RunState
+    {
+        public List<FailedFile> FailedFiles { get; } = [];
+        public bool CopyFinished { get; set; }
+    }
+
+    /// <inheritdoc cref="ExecuteAsync"/>
+    /// <param name="run">Filled in as the run goes.</param>
+    private async Task<BackupResult> ExecuteCoreAsync(
+        BackupJob job,
+        string targetDirectory,
+        IReadOnlyList<VersionRetentionTier>? retentionTiers,
+        IProgress<BackupProgress>? progress,
+        CancellationToken ct,
+        ManualResetEventSlim? pauseEvent,
+        FailureCallback? onFailure,
+        BackupDiff? precomputedDiff,
+        bool scopeRetentionToBackedUpFiles,
+        CommitBoundaryHandler? onCommitBoundary,
+        RunState run)
     {
         BackupDiff diff;
         if (precomputedDiff is not null)
@@ -216,13 +255,18 @@ public class DirectoryBackupService
         // stored during the run are stamped straight into the cache
         // (SetContentPath) exactly as they were stamped into the preloaded map,
         // so intra-run dedup is unchanged.
+        //
+        // An entry holds only while this run holds the set's write lock. Each
+        // time the run lets it go, another writer (the Worker) may prune the
+        // plain copy an entry names, and a .fileref pointed at it would never
+        // resolve, so ReacquireLockAsync empties the memo.
         var contentPathCache = new Dictionary<string, string?>(StringComparer.OrdinalIgnoreCase);
 
         // Destination-relative path of an active plain copy of this content, or
         // null when the set has none (so the content still needs real bytes).
         async Task<string?> ContentPathForHashAsync(string? hash)
         {
-            if (string.IsNullOrEmpty(hash) || !job.BackupSetId.HasValue)
+            if (string.IsNullOrEmpty(hash))
                 return null;
             if (contentPathCache.TryGetValue(hash, out string? cached))
                 return cached;
@@ -232,11 +276,6 @@ public class DirectoryBackupService
         }
 
         void SetContentPath(string hash, string discPath) => contentPathCache[hash] = discPath;
-
-        // Build a set of changed paths for quick lookup.
-        var changedPaths = new HashSet<string>(
-            diff.ChangedFiles.Select(f => f.FullPath),
-            StringComparer.OrdinalIgnoreCase);
 
         // Pattern-based tier resolver: matches file paths against tier set
         // FilePatterns to determine each file's retention policy.
@@ -497,7 +536,7 @@ public class DirectoryBackupService
             && !existingPlainSizes.Contains(size);
 
         // 6. Copy files.
-        var failedFiles = new List<FailedFile>();
+        var failedFiles = run.FailedFiles;
         long totalBytes = filesToBackup.Sum(f => f.SizeBytes);
         // Physical bytes actually stored — drives the disc record's BytesUsed.
         long bytesWritten = 0;
@@ -559,6 +598,38 @@ public class DirectoryBackupService
             LastWrittenUtc = DateTime.UtcNow,
         }, ct);
 
+        // Commit what this run has written and let the set's write lock go.
+        async Task CommitAndReleaseAsync()
+        {
+            discRecord.BytesUsed = bytesWritten;
+            discRecord.LastWrittenUtc = DateTime.UtcNow;
+            await _catalog.UpdateDiscAsync(discRecord, ct);
+            tx.Complete();
+            tx.Dispose();
+        }
+
+        // Take the lock back. What was learned under the last one may be stale.
+        async Task ReacquireLockAsync()
+        {
+            tx = await _catalog.BeginTransactionAsync(backupSetId, ct, ReportWaitingForLock);
+            batchCount = 0;
+            commitTimer.Restart();
+            contentPathCache.Clear();
+        }
+
+        // Wait out a Pause without holding the write lock: held, it would stall
+        // every other writer of the set - the Worker's whole poll loop - for as
+        // long as the backup stayed paused. Called between files and, by the
+        // copy helpers, between chunks of a file.
+        async Task WaitOutPauseAsync()
+        {
+            if (pauseEvent is null || pauseEvent.IsSet)
+                return;
+            await CommitAndReleaseAsync();
+            pauseEvent.Wait(ct);
+            await ReacquireLockAsync();
+        }
+
         // Per-file progress: only report intermediate progress for files >= 1 MB,
         // and throttle reports to every ~1 MB to avoid flooding the UI thread.
         const long PerFileProgressThreshold = 1024 * 1024;      // 1 MB
@@ -572,11 +643,10 @@ public class DirectoryBackupService
 
         for (int i = 0; i < filesToBackup.Count; i++)
         {
-            pauseEvent?.Wait(ct);
+            await WaitOutPauseAsync();
             ct.ThrowIfCancellationRequested();
 
             var file = filesToBackup[i];
-            bool isChanged = changedPaths.Contains(file.FullPath);
 
             // Periodic free-space check.
             if (!lowSpaceWarned && targetRoot is not null
@@ -626,24 +696,15 @@ public class DirectoryBackupService
             // files already copied are safe if the large copy is cancelled.
             if (file.SizeBytes >= CommitLargeFileThreshold && batchCount > 0)
             {
-                discRecord.BytesUsed = bytesWritten;
-                discRecord.LastWrittenUtc = DateTime.UtcNow;
-                await _catalog.UpdateDiscAsync(discRecord, ct);
-                tx.Complete();
-                tx.Dispose();
-                tx = await _catalog.BeginTransactionAsync(backupSetId, ct, ReportWaitingForLock);
-                batchCount = 0;
-                commitTimer.Restart();
+                await CommitAndReleaseAsync();
+                await ReacquireLockAsync();
             }
 
             // Number this version from the catalog as it stands now, read inside
             // the open transaction, which holds the set's write lock: no other
             // process - the Worker's continuous backup, between two of this run's
             // commits - can add a version of the path before this one is
-            // written. A lookup made before the copy loop could be hours old by
-            // the time a file's turn came, and numbering from it duplicated the
-            // version another writer had added and overwrote its _prev copy.
-            // Read BEFORE entering the retry loop so retries don't increment the
+            // written. Read BEFORE entering the retry loop so retries don't increment the
             // version number.
             int version = 1;
             var last = await _catalog.GetLastVersionAsync(backupSetId, file.FullPath, ct);
@@ -661,13 +722,6 @@ public class DirectoryBackupService
             if (hasExistingInfo)
             {
                 version = existingInfo.MaxVersion + 1;
-                // Relative to an earlier version this write is a change, whatever
-                // the diff said: it classifies a reappeared (tombstoned) path as
-                // new, and it can predate a version committed since. Promote it so
-                // the _prev move, content-identity short-circuit and dedup hint
-                // all treat it as a changed existing file rather than a fresh
-                // version 1 written over a copy another record still points at.
-                isChanged = true;
                 pathsWithHistory?.Add(file.FullPath);
             }
 
@@ -711,7 +765,7 @@ public class DirectoryBackupService
                 //     now (it might be unchanged content with a new timestamp).
                 //   - the test stub path writes a placeholder instead of copying,
                 //     so it can't produce a hash as a side effect.
-                bool mightBeUnchanged = isChanged && hasExistingInfo
+                bool mightBeUnchanged = hasExistingInfo
                     && !string.IsNullOrEmpty(existingInfo.Hash);
                 bool definitelyPlain = !blockDedupEnabled
                     && (!job.EnableFileDeduplication || !CouldBeWholeFileDuplicate(file));
@@ -835,7 +889,7 @@ public class DirectoryBackupService
                 // version.  On a match the file is functionally unchanged:
                 // skip versioning entirely and just refresh the recorded
                 // source timestamp so the next run doesn't re-detect it.
-                if (isChanged && hasExistingInfo
+                if (hasExistingInfo
                     && !string.IsNullOrEmpty(existingInfo.Hash)
                     && string.Equals(hash, existingInfo.Hash, StringComparison.OrdinalIgnoreCase))
                 {
@@ -1010,9 +1064,12 @@ public class DirectoryBackupService
                     keepVersions = true;
                 }
 
-                // Move existing current file to _prev if this is a changed file
-                // and version history is enabled.
-                if (isChanged && keepVersions && hasExistingInfo)
+                // Move the existing current file to _prev when there is an earlier
+                // version and version history is enabled. The earlier version, not
+                // the diff, decides: the diff calls a reappeared path new, and can
+                // predate a version committed since, which this write would
+                // otherwise overwrite in place.
+                if (keepVersions && hasExistingInfo)
                 {
                     bool oldDeduped = existingInfo.IsDeduped;
                     bool oldFileRef = existingInfo.IsFileRef;
@@ -1140,7 +1197,7 @@ public class DirectoryBackupService
                     // already read (by the block-dedup pre-pass or the file-dedup
                     // hash read above), so it is not read from disk a second time.
                     await WritePlainFromBufferAsync(
-                        contentBuffer, currentPath, ct, fileProgress, pauseEvent);
+                        contentBuffer, currentPath, ct, fileProgress, WaitOutPauseAsync);
                 }
                 else if (deferHashToCopy)
                 {
@@ -1151,12 +1208,12 @@ public class DirectoryBackupService
                     // is plain without reading it), so capture them here for the
                     // content-path seeding and catalog record below.
                     (hash, contentSize) = await CopyFileWithHashAsync(
-                        file.FullPath, currentPath, ct, fileProgress, pauseEvent);
+                        file.FullPath, currentPath, ct, fileProgress, WaitOutPauseAsync);
                 }
                 else
                 {
                     // Plain copy (hash already computed above; file not buffered).
-                    await CopyFileAsync(file.FullPath, currentPath, ct, fileProgress, pauseEvent);
+                    await CopyFileAsync(file.FullPath, currentPath, ct, fileProgress, WaitOutPauseAsync);
                 }
 
                 // If this file was stored as a plain named copy, its content now
@@ -1344,11 +1401,7 @@ public class DirectoryBackupService
                 || file.SizeBytes >= CommitLargeFileThreshold
                 || commitTimer.Elapsed.TotalSeconds >= CommitIntervalSeconds)
             {
-                discRecord.BytesUsed = bytesWritten;
-                discRecord.LastWrittenUtc = DateTime.UtcNow;
-                await _catalog.UpdateDiscAsync(discRecord, ct);
-                tx.Complete();
-                tx.Dispose();
+                await CommitAndReleaseAsync();
 
                 // --- the one point in a long run where NO transaction is open ---
                 //
@@ -1386,9 +1439,7 @@ public class DirectoryBackupService
                     }
                 }
 
-                tx = await _catalog.BeginTransactionAsync(backupSetId, ct, ReportWaitingForLock);
-                batchCount = 0;
-                commitTimer.Restart();
+                await ReacquireLockAsync();
             }
         }
 
@@ -1427,6 +1478,9 @@ public class DirectoryBackupService
             tx.Dispose();
         }
 
+        // Every planned file copied and committed - unless the disk filled first.
+        run.CopyFinished = !diskFullAbort;
+
         // Update the backup set's last backup timestamp.
         var backupSet = await _catalog.GetBackupSetAsync(backupSetId, ct);
         if (backupSet is not null)
@@ -1450,6 +1504,15 @@ public class DirectoryBackupService
                 pauseEvent?.Wait(ct);
 
                 verifying.Advance(verifiedCount++, sourcePath);
+
+                // The write lock is no longer held, so another writer (the Worker)
+                // may have written a newer version since, moving this run's copy
+                // into _prev. The current path then holds that version, which is
+                // no failure of this one: leave it to that writer.
+                var lastNow = await _catalog.GetLastVersionAsync(backupSetId, sourcePath, ct);
+                if (lastNow is not { IsDeleted: false } current
+                    || !string.Equals(current.Version.Hash, info.Hash, StringComparison.OrdinalIgnoreCase))
+                    continue;
 
                 try
                 {
@@ -2515,10 +2578,14 @@ public class DirectoryBackupService
     /// Called with bytes copied so far. Caller is responsible for throttling
     /// how often this translates to UI updates.
     /// </param>
+    /// <param name="waitIfPaused">
+    /// Awaited between chunks; returns once the backup is not paused. The same
+    /// for the other copy helpers.
+    /// </param>
     private static async Task CopyFileAsync(
         string sourcePath, string destPath, CancellationToken ct,
         Action<long>? onProgress = null,
-        ManualResetEventSlim? pauseEvent = null)
+        Func<Task>? waitIfPaused = null)
     {
         string? destDir = Path.GetDirectoryName(destPath);
         if (destDir is not null)
@@ -2544,7 +2611,7 @@ public class DirectoryBackupService
                 tempPath, FileMode.Create, FileAccess.Write,
                 FileShare.None, bufferSize: 81920, useAsync: true))
             {
-                if (onProgress is null && pauseEvent is null)
+                if (onProgress is null && waitIfPaused is null)
                 {
                     await srcStream.CopyToAsync(dstStream, ct);
                 }
@@ -2556,7 +2623,8 @@ public class DirectoryBackupService
                     int read;
                     while ((read = await srcStream.ReadAsync(buffer, ct)) > 0)
                     {
-                        pauseEvent?.Wait(ct);
+                        if (waitIfPaused is not null)
+                            await waitIfPaused();
                         await dstStream.WriteAsync(buffer.AsMemory(0, read), ct);
                         totalCopied += read;
                         onProgress?.Invoke(totalCopied);
@@ -2588,7 +2656,7 @@ public class DirectoryBackupService
     private static async Task<(string Hash, long Size)> CopyFileWithHashAsync(
         string sourcePath, string destPath, CancellationToken ct,
         Action<long>? onProgress = null,
-        ManualResetEventSlim? pauseEvent = null)
+        Func<Task>? waitIfPaused = null)
     {
         string? destDir = Path.GetDirectoryName(destPath);
         if (destDir is not null)
@@ -2615,7 +2683,8 @@ public class DirectoryBackupService
                 int read;
                 while ((read = await srcStream.ReadAsync(buffer, ct)) > 0)
                 {
-                    pauseEvent?.Wait(ct);
+                    if (waitIfPaused is not null)
+                        await waitIfPaused();
                     await dstStream.WriteAsync(buffer.AsMemory(0, read), ct);
                     hasher.AppendData(buffer, 0, read);
                     totalCopied += read;
@@ -2647,7 +2716,7 @@ public class DirectoryBackupService
     private static async Task WritePlainFromBufferAsync(
         byte[] content, string destPath, CancellationToken ct,
         Action<long>? onProgress = null,
-        ManualResetEventSlim? pauseEvent = null)
+        Func<Task>? waitIfPaused = null)
     {
         string? destDir = Path.GetDirectoryName(destPath);
         if (destDir is not null)
@@ -2665,7 +2734,8 @@ public class DirectoryBackupService
                 int offset = 0;
                 while (offset < content.Length)
                 {
-                    pauseEvent?.Wait(ct);
+                    if (waitIfPaused is not null)
+                        await waitIfPaused();
                     int len = Math.Min(chunk, content.Length - offset);
                     await dstStream.WriteAsync(content.AsMemory(offset, len), ct);
                     offset += len;

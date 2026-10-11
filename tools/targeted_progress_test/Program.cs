@@ -584,6 +584,92 @@ internal static class Program
         heldV1 = (await repo.GetFileRecordsByPathAsync(set.Id, held)).FirstOrDefault(r => r.Version == 1);
         Check(heldV1 is { IsDeleted: true }, "resumed, it prunes the expired version");
 
+        // Cancelled during retention, after the copy: cancelled, and says the copy finished.
+        string held2 = Path.Combine(histDir, "thirteen_held2.txt");
+        File.WriteAllText(held2, "1");
+        await svc.ExecuteTargetedAsync(job, dest, [held2], keepOne, CancellationToken.None);
+        File.WriteAllText(held2, "2, edited");
+        await svc.ExecuteTargetedAsync(job, dest, [held2], keepOne, CancellationToken.None);
+        File.WriteAllText(held2, "3, edited again");
+        using var cts15b = new CancellationTokenSource();
+        var cancelAtRetention = new SyncProgress<BackupProgress>(p =>
+        {
+            if (p.StatusMessage == "Applying retention rules")
+                cts15b.Cancel();
+        });
+        BackupCanceledException? atRetention = null;
+        try { await svc.ExecuteTargetedAsync(job, dest, [held2], keepOne, cts15b.Token, cancelAtRetention); }
+        catch (BackupCanceledException ex) { atRetention = ex; }
+        Check(atRetention is { CopyFinished: true },
+            "cancelled during retention, the run ends cancelled, and says its copy had finished");
+
+        // ------------------------------------------------------------ the lock, and the failed list
+        Console.WriteLine();
+        Console.WriteLine("=== 16. a paused or cancelled copy ===");
+        // Paused mid-copy, the run must not keep the set's write lock: held, it
+        // stalled every other writer of the set - the Worker's whole poll loop.
+        var batch16 = MakeBatch(src, "sixteen", 4, 64 * 1024);
+        using var pause16 = new ManualResetEventSlim(true);
+        bool paused16 = false;
+        var pauseAtCopy = new SyncProgress<BackupProgress>(p =>
+        {
+            if (!paused16 && string.IsNullOrEmpty(p.StatusMessage) && !string.IsNullOrEmpty(p.CurrentFile))
+            {
+                paused16 = true;
+                pause16.Reset();
+            }
+        });
+        var run16 = Task.Run(() => svc.ExecuteTargetedAsync(
+            job, dest, batch16, tiers, CancellationToken.None, pauseAtCopy, pause16));
+        await WaitForAsync(() => paused16, 30_000);
+        await Task.Delay(300);
+        string otherDir = Path.Combine(src, "sixteen_other");
+        Directory.CreateDirectory(otherDir);
+        string other = Path.Combine(otherDir, "other.txt");
+        File.WriteAllText(other, "written while the other run is paused");
+        var otherRun = svc.ExecuteTargetedAsync(job, dest, [other], tiers, CancellationToken.None);
+        bool otherGotIn = await Task.WhenAny(otherRun, Task.Delay(10_000)) == otherRun;
+        Check(paused16 && otherGotIn && !run16.IsCompleted,
+            "paused mid-copy, the run lets the set's write lock go: another backup of the set gets in");
+        pause16.Set();
+        var result16 = await run16;
+        await otherRun;
+        Check(result16.Success && CountInDest(dest, "sixteen") == 4, "resumed, the paused run finishes");
+
+        // Cancelled mid-copy: the files that had failed are still reported.
+        var batch16b = MakeBatch(src, "sixteenbee", 4, 4 * 1024);
+        using var cts16 = new CancellationTokenSource();
+        var cancelAtThird = new SyncProgress<BackupProgress>(p =>
+        {
+            if (p.CurrentFile == batch16b[2])
+                cts16.Cancel();
+        });
+        BackupCanceledException? midCopy = null;
+        using (new FileStream(batch16b[0], FileMode.Open, FileAccess.Read, FileShare.None))   // cannot be read
+        {
+            try { await svc.ExecuteTargetedAsync(job, dest, batch16b, tiers, cts16.Token, cancelAtThird); }
+            catch (BackupCanceledException ex) { midCopy = ex; }
+        }
+        Check(midCopy is { CopyFinished: false } && midCopy.FailedFiles.Any(f => f.Path == batch16b[0]),
+            $"cancelled mid-copy, it still reports the file that failed ({midCopy?.FailedFiles.Count} failed)");
+
+        // Verifying after another writer has backed a file up again is no failure.
+        var batch16c = MakeBatch(src, "sixteencee", 3, 4 * 1024);
+        bool rewritten = false;
+        var rewriteAtVerify = new SyncProgress<BackupProgress>(p =>
+        {
+            if (rewritten || p.StatusMessage != "Verifying backup")
+                return;
+            rewritten = true;
+            File.WriteAllText(batch16c[0], "edited, and backed up by the Worker meanwhile");
+            svc.ExecuteTargetedAsync(job, dest, [batch16c[0]], tiers, CancellationToken.None)
+               .GetAwaiter().GetResult();
+        });
+        var result16c = await svc.ExecuteTargetedAsync(
+            verifyJob, dest, batch16c, tiers, CancellationToken.None, rewriteAtVerify);
+        Check(rewritten && result16c.Success && result16c.FailedFiles.Count == 0,
+            $"a file another writer backed up again during verification is not reported as failing ({result16c.FailedFiles.Count} failed)");
+
         await Task.Run(PanelTests);
     }
 

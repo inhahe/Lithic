@@ -1,5 +1,40 @@
 # LithicBackup — Known Issues & Tech Debt
 
+## FIXED: a paused backup held the set's write lock, stalling the Worker; other run-boundary hazards (2026-10-11)
+
+Found by the second code review (Opus, max) of the progress work. None was seen in
+use; each is now pinned by `tools\targeted_progress_test` §15-16 and fails there
+with the old code.
+
+- **Pause held the write lock.** The copy loop waited on Pause inside its batch
+  transaction, between files and mid-file in the copy helpers. A GUI backup left
+  paused kept the set's cross-process write lock. The Worker's next write to that
+  set then waited inside its global backup lock, which stopped its whole poll
+  loop: no journal was read on any volume, and a busy journal could wrap. A pause
+  now commits what is written, lets the lock go, waits, and takes the lock back
+  (`WaitOutPauseAsync`; the copy helpers call it between chunks).
+- **The content-hash memo outlived the lock.** File-level dedup memoised "hash ->
+  a plain copy holding it" for the whole run. Between two of the run's commits
+  another writer could prune that copy, and a later duplicate would become a
+  `.fileref` that resolves to nothing. The memo is now emptied whenever the run
+  takes the lock back.
+- **Verification failed copies another writer had superseded.** Verify runs after
+  the lock is released. If the Worker wrote a newer version meanwhile, the current
+  path held that version's bytes, and the run reported "hash mismatch". A file
+  whose last version is no longer the one this run wrote is now skipped.
+- **A cancel lost the list of failed files**, mid-copy or after.
+  `ExecuteAsync` now throws `BackupCanceledException` carrying the failed files,
+  and whether the copy itself had finished. The GUI lists them as after any run.
+  The Worker counts a full scan stopped during verification or retention as done,
+  instead of repeating hours of scanning after a restart.
+
+## Tech debt: the duplicate scan's hashing loop exists twice
+
+`MainViewModel` (the set's duplicate scan) and `SourceSelectionViewModel` (the
+editor's dedup analysis) carry near-identical candidate-hashing loops. Every change
+to one, cadence included, has to be made to both. A shared helper taking a status
+callback would hold it once.
+
 ## FIXED: a version the Worker committed during a run could be numbered twice, losing the older one's `_prev` copy (2026-10-10)
 
 **Found by** the code review of the progress work below; no incident was seen.
