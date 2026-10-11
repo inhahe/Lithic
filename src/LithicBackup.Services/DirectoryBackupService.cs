@@ -123,11 +123,11 @@ public class DirectoryBackupService
     /// steps are skipped (they were already done during planning).
     /// </summary>
     /// <param name="scopeRetentionToBackedUpFiles">
-    /// Restrict the retention pass to the paths this run actually wrote, instead
-    /// of re-evaluating every path in the set. Set by targeted/continuous backups,
-    /// where the whole-set pass costs orders of magnitude more than the backup it
-    /// follows; see
-    /// <see cref="VersionRetentionService.ComputeRetentionAsync(int, Func{string, IReadOnlyList{VersionRetentionTier}}, IReadOnlyCollection{string}, CancellationToken)"/>
+    /// Restrict the retention pass to the paths this run gave a second or later
+    /// version, instead of re-evaluating every path in the set. Set by
+    /// targeted/continuous backups, where the whole-set pass costs orders of
+    /// magnitude more than the backup it follows; see
+    /// <see cref="VersionRetentionService.ComputeRetentionAsync(int, Func{string, IReadOnlyList{VersionRetentionTier}}, IReadOnlyCollection{string}, CancellationToken, IProgress{int})"/>
     /// for why that is safe and what it defers to the next full backup. A full
     /// backup must leave this false.
     /// </param>
@@ -257,6 +257,14 @@ public class DirectoryBackupService
         // delete-and-recreate the original on every save, tombstoning the record)
         // keep accumulating versions. Consulted per file below.
         var orphanedVersionInfo = versions.Orphaned;
+
+        // The paths this run gives a second or later version: those with a live
+        // or orphaned version now, before the copy loop adds the ones it writes.
+        // Only they can have a previous version for a scoped retention pass to
+        // prune; a first version has none.
+        List<string>? pathsWithHistory = scopeRetentionToBackedUpFiles
+            ? lookupPaths.Where(p => versionInfo.ContainsKey(p) || orphanedVersionInfo.ContainsKey(p)).ToList()
+            : null;
 
         // Map of content hash -> destination-relative path of an active PLAIN
         // copy of that content somewhere in the backup tree (a real-bytes file
@@ -1513,14 +1521,7 @@ public class DirectoryBackupService
         // 7. Verify backed-up files by reading them back and comparing hashes.
         if (backedUp is not null && backedUp.Count > 0)
         {
-            progress?.Report(new BackupProgress
-            {
-                StatusMessage = "Verifying backup...",
-                BytesWrittenTotal = bytesProcessed,
-                BytesTotalAll = totalBytes,
-                OverallPercentage = 100,
-            });
-
+            var verifying = PhaseProgress.Begin(progress, "Verifying backup", backedUp.Count);
             var verifiedBlocks = new HashSet<string>(StringComparer.OrdinalIgnoreCase);
             int verifiedCount = 0;
 
@@ -1529,15 +1530,7 @@ public class DirectoryBackupService
                 if (ct.IsCancellationRequested) break;
                 pauseEvent?.Wait(ct);
 
-                verifiedCount++;
-                progress?.Report(new BackupProgress
-                {
-                    StatusMessage = $"Verifying backup ({verifiedCount:N0} / {backedUp.Count:N0})...",
-                    CurrentFile = sourcePath,
-                    BytesWrittenTotal = bytesProcessed,
-                    BytesTotalAll = totalBytes,
-                    OverallPercentage = 100,
-                });
+                verifying.Advance(verifiedCount++, sourcePath);
 
                 try
                 {
@@ -1648,42 +1641,50 @@ public class DirectoryBackupService
         bool hasRetention = tierResolver is not null || (retentionTiers is not null && retentionTiers.Count > 0);
         if (hasRetention)
         {
-            progress?.Report(new BackupProgress
-            {
-                StatusMessage = "Applying retention rules...",
-                BytesWrittenTotal = bytesProcessed,
-                BytesTotalAll = totalBytes,
-                OverallPercentage = 100,
-            });
-        }
-        if (hasRetention)
-        {
             try
             {
                 // A targeted run only added versions to the files it just wrote,
-                // so only those paths can have newly exceeded their quota. The
-                // whole-set alternative materialises every record in the set
-                // (2.35M rows / ~10.4 s of SQL on a real set database, plus the
-                // objects) after backing up, typically, one file — the largest
-                // single term in the Worker pegging a CPU core. Age-driven
-                // pruning of untouched paths still happens on the next full
-                // backup, which passes a null scope.
-                IReadOnlyCollection<string>? pathScope = scopeRetentionToBackedUpFiles
-                    ? filesToBackup.Select(f => f.FullPath).ToList()
-                    : null;
-
+                // so only those paths can have newly exceeded their quota - and
+                // of those, only the ones it gave a second or later version
+                // (pathsWithHistory), since a first version leaves no previous
+                // one to prune. The whole-set alternative materialises every
+                // record in the set (2.35M rows / ~10.4 s of SQL on a real set
+                // database, plus the objects) after backing up, typically, one
+                // file — the largest single term in the Worker pegging a CPU
+                // core. Age-driven pruning of untouched paths still happens on
+                // the next full backup, which passes a null scope.
                 Func<string, IReadOnlyList<VersionRetentionTier>> tierSelector =
                     tierResolver is not null
                         ? path => tierResolver(path).Tiers
                         : _ => retentionTiers!;
 
-                IReadOnlyList<FileRecord> toDelete =
-                    await _retention.ComputeRetentionAsync(backupSetId, tierSelector, pathScope, ct);
+                IReadOnlyList<FileRecord> toDelete;
+                if (pathsWithHistory is null)
+                {
+                    // The whole set, in one query: nothing to count through.
+                    progress?.Report(new BackupProgress
+                    {
+                        StatusMessage = "Applying retention rules...",
+                        BytesWrittenTotal = bytesProcessed,
+                        BytesTotalAll = totalBytes,
+                        OverallPercentage = 100,
+                    });
+                    toDelete = await _retention.ComputeRetentionAsync(backupSetId, tierSelector, null, ct);
+                }
+                else
+                {
+                    var reading = PhaseProgress.Begin(progress, "Applying retention rules", pathsWithHistory.Count);
+                    toDelete = await _retention.ComputeRetentionAsync(
+                        backupSetId, tierSelector, pathsWithHistory, ct,
+                        new SyncProgress<int>(read => reading.Advance(read, "")));
+                }
 
                 var toDeleteIds = toDelete.Select(f => f.Id).ToHashSet();
+                var removing = PhaseProgress.Begin(progress, "Removing expired versions", toDelete.Count);
 
-                foreach (var fileRecord in toDelete)
+                for (int i = 0; i < toDelete.Count; i++)
                 {
+                    var fileRecord = toDelete[i];
                     ct.ThrowIfCancellationRequested();
 
                     // Physically delete the .v{N} file (with .dedup/.fileref/no
@@ -1696,6 +1697,7 @@ public class DirectoryBackupService
                     // we still flip IsDeleted below, producing the
                     // "catalog-deleted (still on disk)" inconsistency.
                     string prevPath = Path.Combine(targetDirectory, fileRecord.DiscPath);
+                    removing.Advance(i, prevPath);
 
                     // Last-plain-copy guard. A plain _prev file holds the real
                     // bytes for its content hash, and file-level dedup .fileref

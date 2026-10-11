@@ -445,6 +445,60 @@ internal static class Program
         Check(result10c.Success && analyze10.Count > 0 && analyze10.All(r => r.Report.PhaseFilesTotal == 3),
             $"so does block deduplication's read of every file ({analyze10.Count} report(s))");
 
+        // ------------------------------------------------------------ after the copy
+        Console.WriteLine();
+        Console.WriteLine("=== 12. verifying reports at the cadence, not once per file ===");
+        var verifyJob = new BackupJob
+        {
+            BackupSetId = job.BackupSetId,
+            Sources = job.Sources,
+            TargetDirectory = dest,
+            VerifyAfterBackup = true,
+        };
+        var batch12 = MakeBatch(src, "twelve", 300, 1024);
+        var rec12 = new TimedRecorder();
+        var result12 = await svc.ExecuteTargetedAsync(verifyJob, dest, batch12, tiers, CancellationToken.None, rec12);
+        var verify12 = rec12.Phase("Verifying backup");
+        var verifyAll12 = rec12.Reports.Where(r => r.Report.StatusMessage?.StartsWith("Verifying") == true).ToList();
+        long verifyMs = verifyAll12.Count > 0 ? verifyAll12[^1].Ms - verifyAll12[0].Ms : 0;
+        Check(result12.Success && CountInDest(dest, "twelve") == 300, "300 files are backed up and verified");
+        Check(verify12.Count > 0 && verify12.All(r => r.Report.PhaseFilesTotal == 300),
+            $"verifying counts through them ({verify12.Count} report(s))");
+        Check(verifyAll12.Count <= 1 + verifyMs / (ProgressCadence.IntervalMs - 50),
+            $"at the progress cadence, not once per file ({verifyAll12.Count} report(s) in {verifyMs} ms)");
+
+        Console.WriteLine();
+        Console.WriteLine("=== 13. retention reads only the files given a second version, and reports ===");
+        // Keep one previous version: a file's third backup prunes its first.
+        var keepOne = new List<VersionRetentionTier> { new() { MaxAge = null, MaxVersions = 1 } };
+        string histDir = Path.Combine(src, "thirteen");
+        Directory.CreateDirectory(histDir);
+        string hist = Path.Combine(histDir, "thirteen_history.txt");
+        File.WriteAllText(hist, "version one");
+        await svc.ExecuteTargetedAsync(job, dest, [hist], keepOne, CancellationToken.None);
+        File.WriteAllText(hist, "version two, longer");
+        await svc.ExecuteTargetedAsync(job, dest, [hist], keepOne, CancellationToken.None);
+        File.WriteAllText(hist, "version three, longer still");
+        var batch13 = MakeBatch(src, "thirteen_new", 20, 1024);
+        var (retentionRepo, retentionCounts) = CountingCatalog.Wrap(repo);
+        var retentionSvc = new DirectoryBackupService(
+            retentionRepo, new FileScanner(retentionRepo), new VersionRetentionService(retentionRepo));
+        var rec13 = new TimedRecorder();
+        var result13 = await retentionSvc.ExecuteTargetedAsync(
+            job, dest, [hist, .. batch13], keepOne, CancellationToken.None, rec13);
+        var records13 = await repo.GetFileRecordsByPathAsync(set.Id, hist);
+        var v1 = records13.FirstOrDefault(r => r.Version == 1);
+        Check(result13.Success && records13.Count == 3, $"the file has three versions ({records13.Count})");
+        Check(v1 is { IsDeleted: true } && !File.Exists(Path.Combine(dest, v1.DiscPath)),
+            "and its first, one past the one previous version kept, is pruned from catalog and disk");
+        Check(retentionCounts.RecordReads == 1,
+            $"retention read the records of that file alone, not of the 20 backed up for the first time ({retentionCounts.RecordReads} read(s))");
+        var applying13 = rec13.Phase("Applying retention rules");
+        var removing13 = rec13.Phase("Removing expired versions");
+        Check(applying13.Count > 0 && applying13.All(r => r.Report.PhaseFilesTotal == 1)
+              && removing13.Count > 0 && removing13.All(r => r.Report.PhaseFilesTotal == 1),
+            $"both retention steps report their progress ({applying13.Count}, {removing13.Count} report(s))");
+
         await Task.Run(PanelTests);
     }
 
@@ -560,7 +614,7 @@ internal static class Program
 public class CountingCatalog : DispatchProxy
 {
     public ICatalogRepository Inner = null!;
-    public long LivePaths, OrphanedPaths;
+    public long LivePaths, OrphanedPaths, RecordReads;
 
     public static (ICatalogRepository Catalog, CountingCatalog Counts) Wrap(ICatalogRepository inner)
     {
@@ -576,6 +630,8 @@ public class CountingCatalog : DispatchProxy
             Interlocked.Add(ref LivePaths, ((IReadOnlyCollection<string>)args![1]!).Count);
         else if (method.Name == nameof(ICatalogRepository.GetOrphanedVersionInfoForPathsAsync))
             Interlocked.Add(ref OrphanedPaths, ((IReadOnlyCollection<string>)args![1]!).Count);
+        else if (method.Name == nameof(ICatalogRepository.GetFileRecordsByPathAsync))
+            Interlocked.Increment(ref RecordReads);
         try { return method.Invoke(Inner, args); }
         catch (TargetInvocationException ex) when (ex.InnerException is not null) { throw ex.InnerException; }
     }

@@ -2843,19 +2843,6 @@ public class OrphanedDirectoriesViewModel : ViewModelBase
         return "..." + path[^(max - 3)..];
     }
 
-    /// <summary>
-    /// Minimal synchronous <see cref="IProgress{T}"/> that invokes its callback
-    /// on the reporting thread, unlike <see cref="Progress{T}"/> which marshals
-    /// through a captured <see cref="SynchronizationContext"/> (and, with none,
-    /// hops through the thread pool — reordering monotonic counts). The catalog
-    /// read already runs on a background thread and only bumps a thread-safe
-    /// counter, so a direct, in-order call is both cheaper and correct.
-    /// </summary>
-    private sealed class SyncProgress<T>(Action<T> handler) : IProgress<T>
-    {
-        public void Report(T value) => handler(value);
-    }
-
     private static List<string> ParsePatterns(string input)
     {
         if (string.IsNullOrWhiteSpace(input))

@@ -38,6 +38,18 @@ the stats took most of the rest; that is inferred, not measured.
 - A report that arrives after Pause no longer replaces "Paused" on the panel.
 - The size probe no longer swallows a cancellation.
 
+**The same run would have gone quiet again after the copy.** Two more problems,
+fixed in the follow-up commit:
+- Verification sent one unthrottled status report per file, which over millions
+  of files means millions of posts to the UI thread. It is now a phase,
+  "Verifying backup (X of N)...".
+- A targeted run's retention read the catalog records of every file it wrote, a
+  path at a time, under a static "Applying retention rules...". For 2.67M new
+  files that is 2.67M queries and as many `FileRecord` objects, and none of them
+  could have anything to prune: a first version leaves no previous one. It now
+  reads only the files the run gave a second or later version, and both it and
+  the deletions report as phases.
+
 **Tested.** `tools\targeted_progress_test` §9-11:
 - 400,005 candidates check in about 11 s, reporting 0, 5,745, 26,995, … every
   472-501 ms, each report naming the candidate reached.
@@ -59,6 +71,12 @@ checks failed.
   the stats before deciding. Parallel stats are the other option.
 - Block dedup's pre-pass reads each file whole, and its count moves per file. One
   huge file shows no movement inside it, though the panel names the file.
+- Two steps of a **full** backup still show one static line over a whole-set
+  query, with no count. The diff after the scan (`FileScanner.ComputeDiffAsync` ->
+  `GetLatestVersionInfoAsync`, ~12.5 s on a 2.2M-row set) leaves the scan's last
+  "N files scanned" on the row. Retention's whole-set read sits under
+  "Applying retention rules...". Counting either needs the read itself to report
+  rows against a known total.
 - Observed on the same run, not investigated: the copy itself ran at about 25
   files/s (12,370 files, 730 MB in 8 min 16 s, mostly small files to a USB hard
   disk). At that rate this run needs about 30 hours.

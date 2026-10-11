@@ -824,6 +824,20 @@ Pause ignored throughout. Each of these is now a **phase** that counts files:
 | Looking up earlier versions | `ExecuteAsync` | handed a diff without versions (a full backup) |
 | Analyzing files for deduplication | `ExecuteAsync` | block dedup on |
 | Checking which files might be duplicates | `ExecuteAsync` | file dedup on, block dedup off |
+| Verifying backup | `ExecuteAsync`, after the copy | verify after backup on |
+| Applying retention rules | `ExecuteAsync`, after the copy | retention scoped to the run (targeted runs) |
+| Removing expired versions | `ExecuteAsync`, after the copy | retention found versions to remove |
+
+Verification used to send a status report per file, unthrottled: over millions
+of files, millions of posts to the UI thread. A full backup's retention reads the
+whole set in one query and still shows only "Applying retention rules...".
+
+**A targeted run's retention reads only the files it gave a second or later
+version** (`pathsWithHistory`: a live or orphaned version before the copy). A
+first version leaves no previous one to prune, so reading the other files' records
+could never remove anything. It used to read every file the run wrote, a path at a
+time: for 2.67M new files, 2.67M queries and as many `FileRecord` objects, silent,
+for nothing.
 
 `PhaseProgress` reports a phase as `BackupProgress.PhaseFilesDone` of
 `PhaseFilesTotal`, with `StatusMessage` naming it and `CurrentFile` the file it is
