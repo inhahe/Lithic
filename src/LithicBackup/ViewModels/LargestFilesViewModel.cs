@@ -1,6 +1,5 @@
 using System.Collections.ObjectModel;
 using System.ComponentModel;
-using System.Diagnostics;
 using System.IO;
 using System.Windows;
 using System.Windows.Data;
@@ -557,7 +556,8 @@ public class LargestFilesViewModel : ViewModelBase, IConfirmClose
                 IsProgressIndeterminate = false;
 
             // Scan source files on background thread.
-            // Scanner writes to a lightweight holder; UI polls every second.
+            // Scanner writes to a lightweight holder; the UI polls it at the
+            // progress cadence.
             var scanProgress = new LatestProgress<ScanProgress>();
 
             ScanProgressText = "Scanning source directories...";
@@ -573,7 +573,7 @@ public class LargestFilesViewModel : ViewModelBase, IConfirmClose
                     if (_estimatedTotal > 0)
                         ScanPercent = Math.Min(99, (double)p.FilesFound / _estimatedTotal * 100);
                 }
-                await Task.WhenAny(scanTask, Task.Delay(1000));
+                await Task.WhenAny(scanTask, Task.Delay(ProgressCadence.IntervalMs));
             }
 
             var scannedFiles = await scanTask;
@@ -906,28 +906,6 @@ public class LargestFileItem : ViewModelBase
         {
             if (SetProperty(ref _isIncluded, value))
                 InclusionToggled?.Invoke(this);
-        }
-    }
-}
-
-/// <summary>
-/// An <see cref="IProgress{T}"/> wrapper that drops reports arriving faster
-/// than the specified interval. Prevents <see cref="Progress{T}"/> from
-/// flooding the UI thread dispatcher when the producer reports per-file or
-/// per-directory at thousands of calls per second.
-/// </summary>
-internal sealed class ThrottledProgress<T>(IProgress<T> inner, TimeSpan interval) : IProgress<T>
-{
-    private readonly long _intervalTicks = (long)(interval.TotalSeconds * Stopwatch.Frequency);
-    private long _nextReportTimestamp;
-
-    public void Report(T value)
-    {
-        long now = Stopwatch.GetTimestamp();
-        if (now >= Volatile.Read(ref _nextReportTimestamp))
-        {
-            Volatile.Write(ref _nextReportTimestamp, now + _intervalTicks);
-            inner.Report(value);
         }
     }
 }

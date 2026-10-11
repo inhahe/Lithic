@@ -1,5 +1,6 @@
 using System.Collections.ObjectModel;
 using System.Windows.Input;
+using LithicBackup.Core;
 using LithicBackup.Core.Interfaces;
 using LithicBackup.Core.Models;
 using LithicBackup.Infrastructure.Burning;
@@ -457,7 +458,7 @@ public class BackupJobViewModel : ViewModelBase
             var scanProgress = new Progress<ScanProgress>(sp =>
             {
                 long now = scanSw.ElapsedMilliseconds;
-                if (now - lastScanUpdate >= ProgressUpdateIntervalMs)
+                if (now - lastScanUpdate >= ProgressCadence.IntervalMs)
                 {
                     lastScanUpdate = now;
                     PlanSummary = $"Scanning... {sp.FilesFound:N0} files found, {sp.DirectoriesScanned:N0} folders";

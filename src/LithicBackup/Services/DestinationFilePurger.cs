@@ -1,5 +1,6 @@
 using System.Diagnostics;
 using System.IO;
+using LithicBackup.Core;
 
 namespace LithicBackup.Services;
 
@@ -18,9 +19,6 @@ namespace LithicBackup.Services;
 /// </remarks>
 internal static class DestinationFilePurger
 {
-    /// <summary>Throttle cadence for progress reports (matches the rest of the app).</summary>
-    private const int ProgressIntervalMs = 500;
-
     /// <summary>
     /// Whether a configured destination directory is actually reachable right
     /// now. A backup set's target is a saved PATH STRING, so having one
@@ -94,7 +92,7 @@ internal static class DestinationFilePurger
 
         var sw = Stopwatch.StartNew();
         // Negative initial value guarantees the first Report fires immediately.
-        long lastProgressMs = -ProgressIntervalMs;
+        long lastProgressMs = -ProgressCadence.IntervalMs;
 
         int idx = 0;
         int total = discRelPaths.Count;
@@ -106,7 +104,7 @@ internal static class DestinationFilePurger
             string fullPath = Path.Combine(targetDir, discRel);
             long nowMs = sw.ElapsedMilliseconds;
             if (progress is not null
-                && (nowMs - lastProgressMs >= ProgressIntervalMs || idx == total))
+                && (nowMs - lastProgressMs >= ProgressCadence.IntervalMs || idx == total))
             {
                 lastProgressMs = nowMs;
                 int pct = total == 0 ? 100 : (int)(idx * 100L / total);
@@ -224,7 +222,7 @@ internal static class DestinationFilePurger
     /// <summary>
     /// Throttled directory-scan counter for the empty-directory sweep.  Shares
     /// the caller's stopwatch so the whole purge uses one monotonic clock, and
-    /// reports at the same <see cref="ProgressIntervalMs"/> cadence as the rest
+    /// reports at the same <see cref="ProgressCadence.IntervalMs"/> cadence as the rest
     /// of the operation.
     /// </summary>
     private sealed class SweepProgress(IProgress<ProgressReport>? progress, Stopwatch sw)
@@ -237,7 +235,7 @@ internal static class DestinationFilePurger
             _scanned++;
             if (progress is null) return;
             long nowMs = sw.ElapsedMilliseconds;
-            if (nowMs - _lastMs < ProgressIntervalMs) return;
+            if (nowMs - _lastMs < ProgressCadence.IntervalMs) return;
             _lastMs = nowMs;
             progress.Report($"Cleaning empty directories: {_scanned:N0} scanned");
         }

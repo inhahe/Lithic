@@ -5,6 +5,7 @@ using System.Threading;
 using System.Windows;
 using System.Windows.Input;
 using System.Windows.Threading;
+using LithicBackup.Core;
 using LithicBackup.Core.Interfaces;
 
 namespace LithicBackup.ViewModels;
@@ -249,7 +250,7 @@ public class BurnProgressViewModel : ViewModelBase
 
     /// <summary>
     /// Update the view from a <see cref="BackupProgress"/> event.
-    /// Throttled to avoid excessive UI redraw (see <see cref="ProgressUpdateIntervalMs"/>).
+    /// Throttled to avoid excessive UI redraw (see <see cref="ProgressCadence.IntervalMs"/>).
     /// Status-message-only reports (planning phases) are never throttled.
     /// </summary>
     public void OnBackupProgress(BackupProgress progress)
@@ -279,10 +280,10 @@ public class BurnProgressViewModel : ViewModelBase
         // than dropping it, and show it when the interval is up (see _heldBack).
         long nowMs = _stopwatch.ElapsedMilliseconds;
         long sinceLast = nowMs - _lastUiUpdateMs;
-        if (sinceLast < ProgressUpdateIntervalMs)
+        if (sinceLast < ProgressCadence.IntervalMs)
         {
             _heldBack = progress;
-            ScheduleFlush(ProgressUpdateIntervalMs - sinceLast);
+            ScheduleFlush(ProgressCadence.IntervalMs - sinceLast);
             return;
         }
 
@@ -382,7 +383,7 @@ public class BurnProgressViewModel : ViewModelBase
         IsBurning = true;
         IsComplete = false;
         StatusText = IsDirectoryMode ? "Copying files..." : "Burning...";
-        _lastUiUpdateMs = -ProgressUpdateIntervalMs; // ensure first report gets through
+        _lastUiUpdateMs = -ProgressCadence.IntervalMs; // ensure first report gets through
         _stopwatch.Restart();
         return _cts;
     }

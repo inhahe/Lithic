@@ -1,5 +1,6 @@
 using System.IO;
 using System.Threading;
+using LithicBackup.Core;
 
 namespace LithicBackup.ViewModels;
 
@@ -176,9 +177,6 @@ public sealed class SizeComputeScheduler : IDisposable
     /// <summary>Maximum results to accumulate before flushing to the UI.</summary>
     private const int FlushBatchSize = 50;
 
-    /// <summary>Minimum interval between progress reports (ms).</summary>
-    private const long ProgressIntervalMs = 150;
-
     /// <summary>Minimum interval between SQLite cache flushes (ms).</summary>
     private const long CacheFlushIntervalMs = 1000;
 
@@ -234,7 +232,7 @@ public sealed class SizeComputeScheduler : IDisposable
                 if (item.Progress is not null)
                 {
                     long now = Environment.TickCount64;
-                    if (now - lastProgressTick >= ProgressIntervalMs)
+                    if (now - lastProgressTick >= ProgressCadence.IntervalMs)
                     {
                         item.Progress.Report(item.Node.Path);
                         lastProgressTick = now;

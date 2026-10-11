@@ -1,4 +1,5 @@
 using System.Security.Cryptography;
+using LithicBackup.Core;
 using LithicBackup.Core.Interfaces;
 using LithicBackup.Core.Models;
 
@@ -30,9 +31,6 @@ namespace LithicBackup.Services;
 /// </summary>
 public sealed class CatalogReconcileService
 {
-    /// <summary>Throttle cadence for progress reports (matches the rest of the app).</summary>
-    private const int ProgressIntervalMs = 500;
-
     private readonly ICatalogRepository _catalog;
 
     public CatalogReconcileService(ICatalogRepository catalog) => _catalog = catalog;
@@ -70,7 +68,7 @@ public sealed class CatalogReconcileService
 
         // --- Pass 1: flip stale filerefs. ---
         int processed = 0;
-        long lastReportMs = -ProgressIntervalMs; // fire the first report immediately
+        long lastReportMs = -ProgressCadence.IntervalMs; // fire the first report immediately
         foreach (var r in active)
         {
             ct.ThrowIfCancellationRequested();
@@ -110,7 +108,7 @@ public sealed class CatalogReconcileService
         if (report.TargetPresent)
         {
             processed = 0;
-            lastReportMs = -ProgressIntervalMs;
+            lastReportMs = -ProgressCadence.IntervalMs;
             foreach (var r in active)
             {
                 ct.ThrowIfCancellationRequested();
@@ -298,7 +296,7 @@ public sealed class CatalogReconcileService
         // smoothly and lands on N/N (100%) — matching the app's other progress
         // stages ("Updating catalog x/y (n%)", "Deleting backed-up files x/y (n%)").
         long nowMs = sw.ElapsedMilliseconds;
-        if (nowMs - lastReportMs < ProgressIntervalMs && processed != total)
+        if (nowMs - lastReportMs < ProgressCadence.IntervalMs && processed != total)
             return;
         lastReportMs = nowMs;
         int pct = total == 0 ? 100 : (int)(processed * 100L / total);

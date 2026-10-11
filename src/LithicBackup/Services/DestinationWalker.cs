@@ -1,5 +1,6 @@
 using System.Collections.Concurrent;
 using System.IO;
+using LithicBackup.Core;
 
 namespace LithicBackup.Services;
 
@@ -63,8 +64,6 @@ public static class DestinationWalker
     /// value; 32 bought only ~20% more there while making the drive unresponsive.
     /// </summary>
     public const int DefaultParallelism = 16;
-
-    private const int ProgressIntervalMs = 500;
 
     /// <summary>Per-worker accumulator, merged once at the end.</summary>
     private sealed class Bucket
@@ -130,7 +129,7 @@ public static class DestinationWalker
 
                         long now = sw.ElapsedMilliseconds;
                         long last = Interlocked.Read(ref lastProgressMs);
-                        if (now - last >= ProgressIntervalMs
+                        if (now - last >= ProgressCadence.IntervalMs
                             && Interlocked.CompareExchange(ref lastProgressMs, now, last) == last)
                         {
                             progress.Report(

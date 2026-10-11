@@ -495,13 +495,13 @@ public class OrphanedDirectoriesViewModel : ViewModelBase
         SummaryText = "Loading catalogue...";
 
         // A DispatcherTimer polls a thread-safe progress counter at the shared
-        // ProgressUpdateIntervalMs cadence so the user gets live feedback without
+        // ProgressCadence.IntervalMs cadence so the user gets live feedback without
         // cross-thread marshaling per file/row. Started BEFORE the catalog read
         // so the (multi-second, synchronous) load also shows a running count.
         var progress = new ClassifyProgress();
         var timer = new DispatcherTimer
         {
-            Interval = TimeSpan.FromMilliseconds(ProgressUpdateIntervalMs),
+            Interval = TimeSpan.FromMilliseconds(ProgressCadence.IntervalMs),
         };
         timer.Tick += (_, _) => SummaryText = FormatProgress(progress.Snapshot());
         timer.Start();
@@ -2180,7 +2180,7 @@ public class OrphanedDirectoriesViewModel : ViewModelBase
                 // this.  Negative initial value guarantees the first
                 // Report fires immediately.
                 var progressSw = System.Diagnostics.Stopwatch.StartNew();
-                long lastProgressMs = -ProgressUpdateIntervalMs;
+                long lastProgressMs = -ProgressCadence.IntervalMs;
 
                 // Count the thing the user is waiting on (design.md, "Long phases
                 // must name what they are doing").  A work item is a DIRECTORY,
@@ -2216,7 +2216,7 @@ public class OrphanedDirectoriesViewModel : ViewModelBase
                 void ReportUnits(string dirPath, bool force = false)
                 {
                     long nowMs = progressSw.ElapsedMilliseconds;
-                    if (!force && nowMs - lastProgressMs < ProgressUpdateIntervalMs)
+                    if (!force && nowMs - lastProgressMs < ProgressCadence.IntervalMs)
                         return;
                     lastProgressMs = nowMs;
                     int pct = totalUnits <= 0 ? 100 : (int)(doneUnits * 100L / totalUnits);

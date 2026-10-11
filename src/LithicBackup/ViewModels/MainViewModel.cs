@@ -3,6 +3,7 @@ using System.IO;
 using System.Text.Json;
 using System.Windows;
 using System.Windows.Input;
+using LithicBackup.Core;
 using LithicBackup.Core.Interfaces;
 using LithicBackup.Core.Models;
 using LithicBackup.Infrastructure.Burning;
@@ -1025,7 +1026,7 @@ public class MainViewModel : ViewModelBase
                 lastSkippedExisting = sp.FilesSkipped;
 
                 long now = seedSw.ElapsedMilliseconds;
-                if (now - lastSeedUpdate < ProgressUpdateIntervalMs)
+                if (now - lastSeedUpdate < ProgressCadence.IntervalMs)
                     return;
                 lastSeedUpdate = now;
 
@@ -1590,7 +1591,7 @@ public class MainViewModel : ViewModelBase
         var removed = new List<FileRecord>();
         long checkedCount = 0;
         var sw = System.Diagnostics.Stopwatch.StartNew();
-        long lastReportMs = -ProgressUpdateIntervalMs;   // fire the first report immediately
+        long lastReportMs = -ProgressCadence.IntervalMs;   // fire the first report immediately
         foreach (var path in roots)
         {
             ct.ThrowIfCancellationRequested();
@@ -1607,7 +1608,7 @@ public class MainViewModel : ViewModelBase
                 checkedCount++;
 
                 long nowMs = sw.ElapsedMilliseconds;
-                if (progress is not null && nowMs - lastReportMs >= ProgressUpdateIntervalMs)
+                if (progress is not null && nowMs - lastReportMs >= ProgressCadence.IntervalMs)
                 {
                     lastReportMs = nowMs;
                     progress.Report($"Checked {checkedCount:N0} files, {removed.Count:N0} to remove\u2026");
@@ -1645,14 +1646,14 @@ public class MainViewModel : ViewModelBase
         long checkedCount = 0;
         int total = all.Count;
         var sw = System.Diagnostics.Stopwatch.StartNew();
-        long lastReportMs = -ProgressUpdateIntervalMs;   // fire the first report immediately
+        long lastReportMs = -ProgressCadence.IntervalMs;   // fire the first report immediately
         foreach (var f in all)
         {
             ct.ThrowIfCancellationRequested();
             checkedCount++;
 
             long nowMs = sw.ElapsedMilliseconds;
-            if (progress is not null && nowMs - lastReportMs >= ProgressUpdateIntervalMs)
+            if (progress is not null && nowMs - lastReportMs >= ProgressCadence.IntervalMs)
             {
                 lastReportMs = nowMs;
                 int pct = total == 0 ? 100 : (int)(checkedCount * 100L / total);
@@ -1779,11 +1780,11 @@ public class MainViewModel : ViewModelBase
                 {
                     // Catalog marks inside a single transaction (mirrors Cleanup).
                     // Loop per source path so the marking shows live "x of y"
-                    // progress (throttled to ProgressUpdateIntervalMs) instead of a
+                    // progress (throttled to ProgressCadence.IntervalMs) instead of a
                     // single static "Updating catalog…" that looks frozen while
                     // thousands of rows are updated — the user observed exactly this.
                     var progressSw = System.Diagnostics.Stopwatch.StartNew();
-                    long lastReportMs = -ProgressUpdateIntervalMs; // fire first report immediately
+                    long lastReportMs = -ProgressCadence.IntervalMs; // fire first report immediately
                     var tx = _catalog.BeginTransactionAsync(backupSet.Id).GetAwaiter().GetResult();
                     int purged = 0;
                     try
@@ -1794,7 +1795,7 @@ public class MainViewModel : ViewModelBase
                             long nowMs = progressSw.ElapsedMilliseconds;
                             // Always report the final item so a "N/N" lands before
                             // the disk-delete phase takes over; throttle the rest.
-                            if (nowMs - lastReportMs >= ProgressUpdateIntervalMs
+                            if (nowMs - lastReportMs >= ProgressCadence.IntervalMs
                                 || i == sourcePaths.Count - 1)
                             {
                                 lastReportMs = nowMs;
@@ -1895,14 +1896,14 @@ public class MainViewModel : ViewModelBase
                 long alreadyCovered = 0;
                 long coveredBytes = 0;
                 var sw = System.Diagnostics.Stopwatch.StartNew();
-                long lastReportMs = -ProgressUpdateIntervalMs;
+                long lastReportMs = -ProgressCadence.IntervalMs;
                 foreach (var (path, size) in EnumerateFilesUnderRoots(addedRoots))
                 {
                     ct.ThrowIfCancellationRequested();
                     scanned++;
 
                     long nowMs = sw.ElapsedMilliseconds;
-                    if (nowMs - lastReportMs >= ProgressUpdateIntervalMs)
+                    if (nowMs - lastReportMs >= ProgressCadence.IntervalMs)
                     {
                         lastReportMs = nowMs;
                         progress.Report($"Scanned {scanned:N0} files, {result.Count:N0} new\u2026");
@@ -2587,7 +2588,7 @@ public class MainViewModel : ViewModelBase
             var scanProgress = new Progress<ScanProgress>(sp =>
             {
                 long now = scanSw.ElapsedMilliseconds;
-                if (now - lastScanUpdate >= ProgressUpdateIntervalMs)
+                if (now - lastScanUpdate >= ProgressCadence.IntervalMs)
                 {
                     lastScanUpdate = now;
                     StatusText = $"Checking \"{backupSet.Name}\"... {sp.FilesFound:N0} files scanned, "
@@ -2885,7 +2886,7 @@ public class MainViewModel : ViewModelBase
             var scanProgress = new Progress<ScanProgress>(sp =>
             {
                 long now = scanSw.ElapsedMilliseconds;
-                if (now - lastUpdate >= ProgressUpdateIntervalMs)
+                if (now - lastUpdate >= ProgressCadence.IntervalMs)
                 {
                     lastUpdate = now;
                     // Directories as well as files: FilesFound counts only files
@@ -3360,7 +3361,7 @@ public class MainViewModel : ViewModelBase
             {
                 if (!scanning) return;
                 long now = scanSw.ElapsedMilliseconds;
-                if (now - lastScanUpdate >= ProgressUpdateIntervalMs)
+                if (now - lastScanUpdate >= ProgressCadence.IntervalMs)
                 {
                     lastScanUpdate = now;
                     var text = $"Scanning \"{backupSet.Name}\"... {sp.FilesFound:N0} files scanned ({FormatBytes(sp.TotalBytes)})";

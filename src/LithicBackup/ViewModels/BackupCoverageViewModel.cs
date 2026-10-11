@@ -225,7 +225,7 @@ public class BackupCoverageViewModel : ViewModelBase
                     if (estimatedTotal > 0)
                         ScanPercent = Math.Min(99, (double)p.FilesFound / estimatedTotal * 100);
                 }
-                await Task.WhenAny(scanTask, Task.Delay(1000));
+                await Task.WhenAny(scanTask, Task.Delay(ProgressCadence.IntervalMs));
             }
 
             var scannedFiles = await scanTask;

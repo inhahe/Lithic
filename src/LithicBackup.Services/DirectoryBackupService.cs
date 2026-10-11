@@ -3256,7 +3256,6 @@ public class DirectoryBackupService
         long totalBytes = 0;
         var progressSw = System.Diagnostics.Stopwatch.StartNew();
         long lastProgressMs = 0;
-        const int ProgressIntervalMs = 500;
 
         // Idempotency guard: load the set of SourcePaths already present in
         // the catalog so re-running the seed on the same destination doesn't
@@ -3396,7 +3395,7 @@ public class DirectoryBackupService
                     // Report before hashing so the UI shows which file is
                     // being processed — large files take a long time to hash.
                     long nowPre = progressSw.ElapsedMilliseconds;
-                    if (nowPre - lastProgressMs >= ProgressIntervalMs)
+                    if (nowPre - lastProgressMs >= ProgressCadence.IntervalMs)
                     {
                         lastProgressMs = nowPre;
                         progress?.Report(new ScanProgress
@@ -3440,7 +3439,7 @@ public class DirectoryBackupService
 
                 // Throttle progress reports to avoid flooding the UI thread.
                 long nowPost = progressSw.ElapsedMilliseconds;
-                if (nowPost - lastProgressMs >= ProgressIntervalMs)
+                if (nowPost - lastProgressMs >= ProgressCadence.IntervalMs)
                 {
                     lastProgressMs = nowPost;
                     progress?.Report(new ScanProgress
