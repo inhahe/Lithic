@@ -20,8 +20,7 @@ NativeCrashDumps.TryEnableLocalDumps();
 // This process's writes step aside for a writer in the GUI that is waiting for
 // the same set. Continuous backup re-takes a set's write lock at every commit,
 // within microseconds of releasing it, so without this a backup the user starts
-// in the GUI waits for the Worker's whole run - hours on a large one - showing
-// only "Checking N file(s) against the catalog...".
+// in the GUI waits for the Worker's whole run - hours on a large one.
 SqliteCatalogRepository.YieldWritesToWaitingProcesses = true;
 
 var builder = Host.CreateDefaultBuilder(args)

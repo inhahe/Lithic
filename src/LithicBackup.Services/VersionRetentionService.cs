@@ -60,11 +60,6 @@ public class VersionRetentionService : IVersionRetentionService
     /// source paths are — used by continuous/targeted backups, which write a new
     /// version for a handful of paths and would otherwise pay for the whole set.
     /// </param>
-    /// <param name="scopedPathsRead">
-    /// With a <paramref name="pathScope"/>, the number of its paths whose records
-    /// have been read, after each one: they are read a path at a time, and a scope
-    /// can run to millions. Never reported for the whole set.
-    /// </param>
     /// <remarks>
     /// <para>
     /// Retention is computed per source path from that path's own version rows
@@ -96,8 +91,7 @@ public class VersionRetentionService : IVersionRetentionService
         int backupSetId,
         Func<string, IReadOnlyList<VersionRetentionTier>> tierSelector,
         IReadOnlyCollection<string>? pathScope,
-        CancellationToken ct = default,
-        IProgress<int>? scopedPathsRead = null)
+        CancellationToken ct = default)
     {
         IReadOnlyList<FileRecord> allFiles;
         if (pathScope is null)
@@ -107,12 +101,10 @@ public class VersionRetentionService : IVersionRetentionService
         else
         {
             var scoped = new List<FileRecord>();
-            int read = 0;
             foreach (var path in pathScope.Distinct(StringComparer.OrdinalIgnoreCase))
             {
                 ct.ThrowIfCancellationRequested();
                 scoped.AddRange(await _catalog.GetFileRecordsByPathAsync(backupSetId, path, ct));
-                scopedPathsRead?.Report(++read);
             }
             allFiles = scoped;
         }

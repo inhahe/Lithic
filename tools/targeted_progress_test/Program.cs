@@ -21,6 +21,12 @@
 // "Checking 2,671,103 file(s) against the catalog..." at 0.0% for sixteen minutes:
 // the stat of every candidate, a catalog lookup of every one - made twice - and a
 // lookup of deleted history all ran behind that one line, and Pause did nothing.
+//
+// Sections 12-13: verifying and retention after the copy report the same way,
+// and a targeted run's retention reads only the files it gave a further version.
+//
+// Section 14: a version another writer (the Worker's continuous backup) adds while
+// a run is under way is followed, not given the same number again.
 
 using System.Collections.Concurrent;
 using System.Diagnostics;
@@ -76,14 +82,6 @@ internal static class Program
         public readonly ConcurrentQueue<BackupProgress> Reports = new();
         public void Report(BackupProgress value) => Reports.Enqueue(value);
         public List<BackupProgress> Data => Reports.Where(r => string.IsNullOrEmpty(r.StatusMessage)).ToList();
-        public List<string> Statuses => Reports.Where(r => !string.IsNullOrEmpty(r.StatusMessage))
-                                               .Select(r => r.StatusMessage!).ToList();
-    }
-
-    /// <summary>Collects reports synchronously, as they are made.</summary>
-    sealed class Collect<T>(Action<T> add) : IProgress<T>
-    {
-        public void Report(T value) => add(value);
     }
 
     /// <summary>Records each report with the time it was made.</summary>
@@ -125,7 +123,7 @@ internal static class Program
         }
         var purge = new List<string>();
         DestinationFilePurger.DeleteFilesAndSweep(
-            target, rels, new Collect<ProgressReport>(r => purge.Add(r.Text)));
+            target, rels, new SyncProgress<ProgressReport>(r => purge.Add(r.Text)));
         var deleting = purge.Where(m => m.StartsWith("Deleting backed-up files")).ToList();
         Check(deleting.Count > 0
               && deleting.All(m => rels.Any(r => m.EndsWith(": " + Path.Combine(target, r)))),
@@ -142,7 +140,7 @@ internal static class Program
         }
         var restoring = new List<string>();
         await new CatalogFreeRestoreService().RestoreAsync(backup, output,
-            new Collect<RestoreProgress>(p =>
+            new SyncProgress<RestoreProgress>(p =>
             {
                 if (!string.IsNullOrEmpty(p.CurrentFile))
                     restoring.Add(p.CurrentFile);
@@ -367,7 +365,10 @@ internal static class Program
                                 .Select(r => r.Ms).DefaultIfEmpty(check9.LastOrDefault().Ms).Min();
         Check(end9 - start9 >= 3 * ProgressCadence.IntervalMs,
             $"(the check ran {end9 - start9:N0} ms - long enough to judge its cadence)");
-        var gaps9 = check9.Zip(check9.Skip(1)).Select(p => p.Second.Ms - p.First.Ms).ToList();
+        Check(check9.Count > 1 && check9[1].Report.PhaseFilesDone == 1 && check9[1].Report.CurrentFile == candidates9[0],
+            "then names the first file at once, the start report not having used up the cadence");
+        // After those two, the cadence.
+        var gaps9 = check9.Skip(1).Zip(check9.Skip(2)).Select(p => p.Second.Ms - p.First.Ms).ToList();
         Check(gaps9.Count > 0 && gaps9.Min() >= ProgressCadence.IntervalMs - 50,
             $"reports come no faster than the progress cadence (closest {gaps9.DefaultIfEmpty().Min()} ms apart)");
         Check(gaps9.Count > 0 && gaps9.Max() <= 3 * ProgressCadence.IntervalMs
@@ -444,7 +445,8 @@ internal static class Program
         Check(result12.Success && CountInDest(dest, "twelve") == 300, "300 files are backed up and verified");
         Check(verify12.Count > 0 && verify12.All(r => r.Report.PhaseFilesTotal == 300),
             $"verifying counts through them ({verify12.Count} report(s))");
-        Check(verifyAll12.Count <= 1 + verifyMs / (ProgressCadence.IntervalMs - 50),
+        // The start, the first file, then one a cadence.
+        Check(verifyAll12.Count <= 2 + verifyMs / (ProgressCadence.IntervalMs - 50),
             $"at the progress cadence, not once per file ({verifyAll12.Count} report(s) in {verifyMs} ms)");
 
         Console.WriteLine();
@@ -537,6 +539,50 @@ internal static class Program
         var (intact14b, detail14b) = await VersionsIntactAsync(repo, set.Id, dest, boundary, 3);
         Check(result14b.Success && boundaryHit && intact14b,
             $"written at a commit boundary: versions 1-3, each copy holding its own content ({detail14b})");
+
+        // ------------------------------------------------------------ cancel and pause after the copy
+        Console.WriteLine();
+        Console.WriteLine("=== 15. Cancel and Pause hold after the copy too ===");
+        var batch15 = MakeBatch(src, "fifteen", 40, 1024);
+        using var cts15 = new CancellationTokenSource();
+        var cancelAtVerify = new SyncProgress<BackupProgress>(p =>
+        {
+            if (p.StatusMessage == "Verifying backup")
+                cts15.Cancel();
+        });
+        bool cancelled15 = false;
+        try { await svc.ExecuteTargetedAsync(verifyJob, dest, batch15, tiers, cts15.Token, cancelAtVerify); }
+        catch (OperationCanceledException) { cancelled15 = true; }
+        Check(cancelled15 && CountInDest(dest, "fifteen") == 40,
+            "cancelled while verifying, the run ends cancelled, not completed (its files are copied)");
+
+        // Pause as retention starts: nothing may be pruned until Resume.
+        string held = Path.Combine(histDir, "thirteen_held.txt");
+        File.WriteAllText(held, "1");
+        await svc.ExecuteTargetedAsync(job, dest, [held], keepOne, CancellationToken.None);
+        File.WriteAllText(held, "2, edited");
+        await svc.ExecuteTargetedAsync(job, dest, [held], keepOne, CancellationToken.None);
+        File.WriteAllText(held, "3, edited again");
+        using var pause15 = new ManualResetEventSlim(true);
+        bool pausedOnce = false;   // the user clicks Pause once; later reports must not re-pause
+        var pauseAtRetention = new SyncProgress<BackupProgress>(p =>
+        {
+            if (p.StatusMessage == "Applying retention rules" && !pausedOnce)
+            {
+                pausedOnce = true;
+                pause15.Reset();
+            }
+        });
+        var run15 = Task.Run(() => svc.ExecuteTargetedAsync(
+            job, dest, [held], keepOne, CancellationToken.None, pauseAtRetention, pause15));
+        await Task.Delay(1500);
+        var heldV1 = (await repo.GetFileRecordsByPathAsync(set.Id, held)).FirstOrDefault(r => r.Version == 1);
+        Check(!run15.IsCompleted && heldV1 is { IsDeleted: false } && File.Exists(Path.Combine(dest, heldV1.DiscPath)),
+            "paused as retention starts, it prunes nothing and waits");
+        pause15.Set();
+        await run15;
+        heldV1 = (await repo.GetFileRecordsByPathAsync(set.Id, held)).FirstOrDefault(r => r.Version == 1);
+        Check(heldV1 is { IsDeleted: true }, "resumed, it prunes the expired version");
 
         await Task.Run(PanelTests);
     }
@@ -668,6 +714,33 @@ internal static class Program
         Check(pvm.StatusText == "Copying files..." && pvm.StatsText.StartsWith("10 / 100  ·  "),
             $"and the copy then shows its bytes (\"{pvm.StatsText}\")");
         pvm.CompleteBurn(true, "");
+
+        var svm = new LithicBackup.ViewModels.BurnProgressViewModel { IsDirectoryMode = true };
+        svm.StartBurn();
+        static BackupProgress Slow(long done) => new()
+        {
+            StatusMessage = "Verifying backup", PhaseFilesDone = done, PhaseFilesTotal = 100,
+        };
+        svm.OnBackupProgress(Slow(0));
+        await Task.Delay(2200);
+        svm.OnBackupProgress(Slow(1));
+        Check(svm.StatsText.Contains(" s per file"),
+            $"a phase slower than a file a second says how long one takes (\"{svm.StatsText}\")");
+
+        await Task.Delay(400);                          // the phases took 2.6 s
+        svm.OnBackupProgress(Data(@"D:\x\a.bin", 0));   // then the copy starts
+        await Task.Delay(600);
+        svm.OnBackupProgress(Data(@"D:\x\a.bin", 50));  // and is half done 0.6 s later
+        Check(svm.StatsText.EndsWith("~00:00 remaining") || svm.StatsText.EndsWith("~00:01 remaining"),
+            $"the copy's time left follows its own rate, not the phases' time before it (\"{svm.StatsText}\")");
+
+        svm.CancelCommand.Execute(null);
+        await Task.Delay(600);
+        svm.OnBackupProgress(Data(@"D:\x\b.bin", 60));
+        svm.OnBackupProgress(Slow(3));
+        Check(svm.StatusText == "Cancelling...",
+            $"reports still on their way after Cancel leave \"Cancelling...\" up (\"{svm.StatusText}\")");
+        svm.CompleteBurn(false, "Cancelled by user.", cancelled: true);
     }
 }
 

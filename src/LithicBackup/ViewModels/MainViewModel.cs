@@ -2730,7 +2730,7 @@ public class MainViewModel : ViewModelBase
         // Hash candidates on a background thread.
         int filesHashed = 0;
         int filesProcessed = 0;
-        long lastProgressTick = 0;
+        var progressCadence = new ProgressCadence();
         var hashMap = new Dictionary<string, List<ScannedFile>>();
         string setName = backupSet.Name;
 
@@ -2742,11 +2742,9 @@ public class MainViewModel : ViewModelBase
                 {
                     ct.ThrowIfCancellationRequested();
 
-                    // Rate-limited progress (~4 updates/sec).
-                    long now = Environment.TickCount64;
-                    if (now - lastProgressTick >= 250)
+                    // Rate-limited progress, at the shared cadence.
+                    if (progressCadence.IsDue())
                     {
-                        lastProgressTick = now;
                         int n = filesProcessed;
                         int h = filesHashed;
                         _ = Application.Current.Dispatcher.InvokeAsync(() =>
@@ -4162,7 +4160,11 @@ public class MainViewModel : ViewModelBase
             var progress = new Progress<BackupProgress>(p =>
             {
                 progressVm.OnBackupProgress(p);
-                StatusText = $"{p.OverallPercentage:F0}% complete";
+                // The copy's percentage only. A status report - a phase before or
+                // after the copy, with its own count on the panel - carries none,
+                // and would put "0% complete" up while a backup verifies.
+                if (string.IsNullOrEmpty(p.StatusMessage))
+                    StatusText = $"{p.OverallPercentage:F0}% complete";
             });
 
             // Directory (non-optical) backups do not prompt on per-file

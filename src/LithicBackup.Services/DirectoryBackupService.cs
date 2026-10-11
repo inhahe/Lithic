@@ -108,7 +108,7 @@ public class DirectoryBackupService
     /// version, instead of re-evaluating every path in the set. Set by
     /// targeted/continuous backups, where the whole-set pass costs orders of
     /// magnitude more than the backup it follows; see
-    /// <see cref="VersionRetentionService.ComputeRetentionAsync(int, Func{string, IReadOnlyList{VersionRetentionTier}}, IReadOnlyCollection{string}, CancellationToken, IProgress{int})"/>
+    /// <see cref="VersionRetentionService.ComputeRetentionAsync(int, Func{string, IReadOnlyList{VersionRetentionTier}}, IReadOnlyCollection{string}, CancellationToken)"/>
     /// for why that is safe and what it defers to the next full backup. A full
     /// backup must leave this false.
     /// </param>
@@ -532,10 +532,9 @@ public class DirectoryBackupService
         var commitTimer = System.Diagnostics.Stopwatch.StartNew();
 
         // Taking the set's write lock can mean waiting for the Worker's continuous
-        // backup of the same set to reach its next commit. Say so: the status on
-        // screen until the first file is otherwise whatever came before - for a
-        // targeted run, "Checking N file(s) against the catalog...", which read
-        // as hung for as long as the Worker kept the lock.
+        // backup of the same set to reach its next commit. Say so, or the panel
+        // keeps showing whatever came before for as long as the Worker holds the
+        // lock, which reads as hung.
         void ReportWaitingForLock() => progress?.Report(new BackupProgress
         {
             StatusMessage = "Waiting for the background backup of this set to pause...",
@@ -1447,7 +1446,7 @@ public class DirectoryBackupService
 
             foreach (var (sourcePath, info) in backedUp)
             {
-                if (ct.IsCancellationRequested) break;
+                ct.ThrowIfCancellationRequested();
                 pauseEvent?.Wait(ct);
 
                 verifying.Advance(verifiedCount++, sourcePath);
@@ -1593,10 +1592,16 @@ public class DirectoryBackupService
                 }
                 else
                 {
+                    // A batch of paths at a time, so the count moves and Pause
+                    // holds. Retention keeps no state across paths, so the
+                    // batches' verdicts are the scope's.
                     var reading = PhaseProgress.Begin(progress, "Applying retention rules", pathsWithHistory.Count);
-                    toDelete = await _retention.ComputeRetentionAsync(
-                        backupSetId, tierSelector, pathsWithHistory, ct,
-                        new SyncProgress<int>(read => reading.Advance(read, "")));
+                    var expired = new List<FileRecord>();
+                    await InBatchesAsync(pathsWithHistory,
+                        async batch => expired.AddRange(
+                            await _retention.ComputeRetentionAsync(backupSetId, tierSelector, batch, ct)),
+                        done => reading.Advance(done, ""), pauseEvent, ct);
+                    toDelete = expired;
                 }
 
                 var toDeleteIds = toDelete.Select(f => f.Id).ToHashSet();
@@ -1605,6 +1610,7 @@ public class DirectoryBackupService
                 for (int i = 0; i < toDelete.Count; i++)
                 {
                     var fileRecord = toDelete[i];
+                    pauseEvent?.Wait(ct);
                     ct.ThrowIfCancellationRequested();
 
                     // Physically delete the .v{N} file (with .dedup/.fileref/no
@@ -1699,9 +1705,11 @@ public class DirectoryBackupService
                     }
                 }
             }
-            catch
+            catch (Exception ex) when (ex is not OperationCanceledException)
             {
                 // Retention failure is non-fatal; the backup itself succeeded.
+                // A cancellation is not a failure to swallow: the user asked to
+                // stop, and the run must end as cancelled, not as completed.
             }
         }
 
@@ -1871,12 +1879,12 @@ public class DirectoryBackupService
     }
 
     /// <summary>
-    /// How many paths (or sizes) to put to the catalog in one call when a run looks
-    /// up thousands or millions of them: about <see cref="TargetMs"/> of work. A
-    /// call holds the set's connection, and Pause and the progress count are
-    /// serviced only between calls, so one must stay well inside a progress
-    /// interval; yet its fixed cost (the gate, preparing the statement) should
-    /// vanish into its seeks. On a 5.7M-row set a seek takes 15-60 µs when its
+    /// How many items (paths, sizes) to put to the catalog in one batch when a run
+    /// works through thousands or millions of them: about <see cref="TargetMs"/>
+    /// of work. A lookup call holds the set's connection, and Pause and the
+    /// progress count are serviced only between batches, so one must stay well
+    /// inside a progress interval; yet a call's fixed cost (the gate, preparing
+    /// the statement) should vanish into its seeks. On a 5.7M-row set a seek takes 15-60 µs when its
     /// pages are cached and 1.5-3.6 ms when they are not, and 9 ms has been seen
     /// with the Worker writing to the same set, so the size follows the rate
     /// measured on the calls so far.
@@ -1935,25 +1943,40 @@ public class DirectoryBackupService
         int backupSetId, Dictionary<long, int> filesPerSize, int fileCount,
         IProgress<BackupProgress>? progress, ManualResetEventSlim? pauseEvent, CancellationToken ct)
     {
-        var sizes = filesPerSize.Keys.ToList();
         var stored = new HashSet<long>();
         var probing = PhaseProgress.Begin(progress, "Checking which files might be duplicates", fileCount);
-        var batch = new LookupBatch();
         long filesCovered = 0;
-        for (int start = 0; start < sizes.Count;)
+        await InBatchesAsync(filesPerSize.Keys.ToList(), async sizes =>
+        {
+            stored.UnionWith(await _catalog.GetActivePlainSizesPresentAsync(backupSetId, sizes, ct));
+            foreach (long size in sizes)
+                filesCovered += filesPerSize[size];
+        }, _ => probing.Advance(filesCovered, ""), pauseEvent, ct);
+        return stored;
+    }
+
+    /// <summary>
+    /// Do <paramref name="work"/> on <paramref name="items"/> a batch at a time,
+    /// each batch sized by <see cref="LookupBatch"/>, waiting out a Pause and
+    /// stopping for Cancel between batches.
+    /// </summary>
+    /// <param name="afterBatch">Given how many items are done, after each batch.</param>
+    private static async Task InBatchesAsync<T>(
+        List<T> items, Func<List<T>, Task> work, Action<int> afterBatch,
+        ManualResetEventSlim? pauseEvent, CancellationToken ct)
+    {
+        var sizing = new LookupBatch();
+        for (int start = 0; start < items.Count;)
         {
             pauseEvent?.Wait(ct);
             ct.ThrowIfCancellationRequested();
-            var chunk = sizes.GetRange(start, Math.Min(batch.Size, sizes.Count - start));
-            batch.Starting();
-            stored.UnionWith(await _catalog.GetActivePlainSizesPresentAsync(backupSetId, chunk, ct));
-            batch.Finished(chunk.Count);
-            start += chunk.Count;
-            foreach (long size in chunk)
-                filesCovered += filesPerSize[size];
-            probing.Advance(filesCovered, "");
+            var batch = items.GetRange(start, Math.Min(sizing.Size, items.Count - start));
+            sizing.Starting();
+            await work(batch);
+            sizing.Finished(batch.Count);
+            start += batch.Count;
+            afterBatch(start);
         }
-        return stored;
     }
 
     /// <summary>
@@ -1986,7 +2009,9 @@ public class DirectoryBackupService
         public static PhaseProgress Begin(IProgress<BackupProgress>? progress, string phase, long total)
         {
             var started = new PhaseProgress(progress, phase, total);
-            started.Advance(0, "");
+            // Outside the cadence, so the first Advance reports too and names the
+            // phase's first file: that file can take minutes on its own.
+            started.Report(0, "");
             return started;
         }
 
@@ -1994,7 +2019,13 @@ public class DirectoryBackupService
         /// <param name="currentPath">The file just finished or now under way, named on the panel; empty for none.</param>
         public void Advance(long done, string currentPath)
         {
-            if (_progress is null || _total <= 0 || !_cadence.IsDue())
+            if (_progress is not null && _cadence.IsDue())
+                Report(done, currentPath);
+        }
+
+        private void Report(long done, string currentPath)
+        {
+            if (_progress is null || _total <= 0)
                 return;
             _progress.Report(new BackupProgress
             {

@@ -606,7 +606,12 @@ of the Coverage and Largest Files scans. It lived in `ViewModelBase`, out of the
 services' reach, so they kept private copies, and two displays drifted (150 ms,
 1 s). A loop that could report after every item asks `ProgressCadence.IsDue()`
 after each one and reports when it says so: that holds the pace whether items
-take microseconds or seconds, which a report every N items does not.
+take microseconds or seconds, which a report every N items does not. The backup
+engine's phases use it, as do the duplicate scans. About fifteen older loops
+still keep their own stopwatch against `IntervalMs`: the catalog reconcile, the
+purge, the main window's scans and deletes, Cleanup, the seed import and the size
+scan. That is the same check by hand, worth converting when next touched.
+`DestinationWalker`'s is shared between threads, which `ProgressCadence` is not.
 
 ### Probe and classify in one pass, one directory per work item
 

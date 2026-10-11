@@ -1988,7 +1988,7 @@ public class SourceSelectionViewModel : ViewModelBase, IDisposable
             // 3. Hash candidates on a background thread.
             int filesHashed = 0;
             int filesProcessed = 0;
-            long lastProgressTick = 0;
+            var progressCadence = new ProgressCadence();
             long totalRawSize = scanned.Sum(f => f.SizeBytes);
             var hashMap = new Dictionary<string, List<ScannedFile>>();
 
@@ -2000,11 +2000,9 @@ public class SourceSelectionViewModel : ViewModelBase, IDisposable
                     {
                         ct.ThrowIfCancellationRequested();
 
-                        // Rate-limited progress (~4 updates/sec).
-                        long now = Environment.TickCount64;
-                        if (now - lastProgressTick >= 250)
+                        // Rate-limited progress, at the shared cadence.
+                        if (progressCadence.IsDue())
                         {
-                            lastProgressTick = now;
                             int n = filesProcessed;
                             int h = filesHashed;
                             _ = Application.Current.Dispatcher.InvokeAsync(() =>

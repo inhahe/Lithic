@@ -47,18 +47,35 @@ public class BurnProgressViewModel : ViewModelBase
 
     /// <summary>
     /// The copy's time-left estimate, kept between reports that cannot refine it
-    /// (too early in the run, or a status report). Null until there is one.
+    /// (too early in the copy, or a status report). Null until there is one.
     /// </summary>
     private TimeSpan? _copyRemaining;
 
     /// <summary>
-    /// The phase on screen (<see cref="BackupProgress.PhaseFilesTotal"/>), by name,
-    /// with the stopwatch time and file count it started at, so its rate covers
-    /// that phase alone. Null when the panel is not showing a phase.
+    /// Stopwatch time and bytes at the copy's first report, so its rate covers the
+    /// copy alone and not the phases before it, which on a large run take minutes.
+    /// Null until the copy reports.
+    /// </summary>
+    private long? _copyStartMs;
+    private long _copyStartBytes;
+
+    /// <summary>
+    /// The phase on screen (<see cref="BackupProgress.PhaseFilesTotal"/>), by name
+    /// and total, with the stopwatch time and file count it started at, so its rate
+    /// covers that phase alone, and the count it last showed. Null when the panel
+    /// is not showing a phase.
     /// </summary>
     private string? _phase;
+    private long _phaseTotal;
     private long _phaseStartMs;
     private long _phaseStartDone;
+    private long _phaseLastDone;
+
+    /// <summary>
+    /// Cancel was clicked: "Cancelling..." stays up until the run ends, whatever
+    /// reports are still on their way.
+    /// </summary>
+    private bool _cancelling;
 
     /// <summary>
     /// Signaling primitive shared with the backup service. When reset (paused),
@@ -219,6 +236,7 @@ public class BurnProgressViewModel : ViewModelBase
     private void Cancel()
     {
         _cts?.Cancel();
+        _cancelling = true;
         StatusText = "Cancelling...";
     }
 
@@ -226,7 +244,8 @@ public class BurnProgressViewModel : ViewModelBase
     {
         PauseEvent.Reset();
         _statusBeforePause = StatusText;
-        StatusText = "Paused";
+        if (!_cancelling)
+            StatusText = "Paused";
         _stopwatch.Stop();
         IsPaused = true;
     }
@@ -234,7 +253,8 @@ public class BurnProgressViewModel : ViewModelBase
     private void Resume()
     {
         PauseEvent.Set();
-        StatusText = _statusBeforePause;
+        if (!_cancelling)
+            StatusText = _statusBeforePause;
         _stopwatch.Start();
         IsPaused = false;
     }
@@ -330,13 +350,18 @@ public class BurnProgressViewModel : ViewModelBase
         OverallPercentage = progress.OverallPercentage;
         CurrentFile = progress.CurrentFile;
 
-        // Estimate remaining time from byte throughput.
+        // Estimate remaining time from the copy's own byte throughput.
+        if (_copyStartMs is null)
+        {
+            _copyStartMs = nowMs;
+            _copyStartBytes = progress.BytesWrittenTotal;
+        }
         if (progress.BytesWrittenTotal > 0 && progress.BytesTotalAll > 0)
         {
-            double elapsedSec = _stopwatch.Elapsed.TotalSeconds;
+            double elapsedSec = (nowMs - _copyStartMs.Value) / 1000.0;
             if (elapsedSec > 0.5) // need at least half a second of data
             {
-                double bytesPerSec = progress.BytesWrittenTotal / elapsedSec;
+                double bytesPerSec = (progress.BytesWrittenTotal - _copyStartBytes) / elapsedSec;
                 long bytesRemaining = progress.BytesTotalAll - progress.BytesWrittenTotal;
                 _copyRemaining = bytesRemaining > 0 && bytesPerSec > 0
                     ? Eta(bytesRemaining / bytesPerSec)
@@ -380,14 +405,19 @@ public class BurnProgressViewModel : ViewModelBase
     private void ApplyPhaseProgress(BackupProgress progress)
     {
         long nowMs = _stopwatch.ElapsedMilliseconds;
-        if (progress.StatusMessage != _phase)
+        long done = progress.PhaseFilesDone, total = progress.PhaseFilesTotal;
+
+        // A new phase - or the same one begun again, which counts from the start
+        // or over another total - gets a rate window of its own.
+        if (progress.StatusMessage != _phase || total != _phaseTotal || done < _phaseLastDone)
         {
             _phase = progress.StatusMessage;
+            _phaseTotal = total;
             _phaseStartMs = nowMs;
-            _phaseStartDone = progress.PhaseFilesDone;
+            _phaseStartDone = done;
         }
+        _phaseLastDone = done;
 
-        long done = progress.PhaseFilesDone, total = progress.PhaseFilesTotal;
         ShowStatus($"{progress.StatusMessage} ({done:N0} of {total:N0})...");
         CurrentFile = progress.CurrentFile;
         OverallPercentage = (double)done / total * 100;
@@ -402,7 +432,12 @@ public class BurnProgressViewModel : ViewModelBase
         if (seconds >= 1 && doneThisPhase > 0)
         {
             double perSecond = doneThisPhase / seconds;
-            StatsText = Stats($"{perSecond:N0} files/s", Eta((total - done) / perSecond));
+            // Below one a second, say how long one takes: "0 files/s" next to a
+            // moving count reads as stalled.
+            string rate = perSecond >= 1
+                ? $"{perSecond:N0} files/s"
+                : $"{1 / perSecond:N0} s per file";
+            StatsText = Stats(rate, Eta((total - done) / perSecond));
         }
         else
         {
@@ -412,11 +447,14 @@ public class BurnProgressViewModel : ViewModelBase
 
     /// <summary>
     /// Put a report's status on screen - except while paused, when "Paused" stays
-    /// and the status is kept for <see cref="Resume"/> instead. A report already
-    /// on its way when Pause was clicked must not make a paused run read as running.
+    /// and the status is kept for <see cref="Resume"/> instead, and while
+    /// cancelling, when "Cancelling..." stays. A report already on its way when the
+    /// button was clicked must not make the run read as carrying on.
     /// </summary>
     private void ShowStatus(string status)
     {
+        if (_cancelling)
+            return;
         if (IsPaused)
             _statusBeforePause = status;
         else
@@ -457,7 +495,9 @@ public class BurnProgressViewModel : ViewModelBase
         StatusText = IsDirectoryMode ? "Copying files..." : "Burning...";
         StatsText = "";
         _copyRemaining = null;
+        _copyStartMs = null;
         _phase = null;
+        _cancelling = false;
         _lastUiUpdateMs = -ProgressCadence.IntervalMs; // ensure first report gets through
         _stopwatch.Restart();
         return _cts;
