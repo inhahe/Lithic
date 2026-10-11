@@ -167,4 +167,20 @@ public class BackupProgress
     /// read show as progress on the right file instead of as a frozen display.
     /// </summary>
     public string? CurrentFileActivity { get; init; }
+
+    /// <summary>
+    /// For a report from a phase that works through files rather than bytes, such
+    /// as the checks before the first file is copied: how many of the phase's
+    /// <see cref="PhaseFilesTotal"/> files it has finished.
+    /// <see cref="StatusMessage"/> names the phase, and <see cref="CurrentFile"/>
+    /// the file it is on (empty when it is not working file by file).
+    /// </summary>
+    public long PhaseFilesDone { get; init; }
+
+    /// <summary>
+    /// Files the phase works through in all, or zero when the report is not from
+    /// such a phase. Above zero, the display shows the phase's own progress
+    /// instead of the byte totals.
+    /// </summary>
+    public long PhaseFilesTotal { get; init; }
 }

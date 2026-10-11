@@ -15,13 +15,22 @@
 // only the file name - Cleanup's "Deleting backed-up files ... : one.txt", the
 // catalog-free restore's destination-relative path - which says nothing about
 // where the file is.
+//
+// Sections 9-11: the checks before the first file is copied count through the
+// files at the progress cadence. A run over 2,671,103 added files sat on
+// "Checking 2,671,103 file(s) against the catalog..." at 0.0% for sixteen minutes:
+// the stat of every candidate, a catalog lookup of every one - made twice - and a
+// lookup of deleted history all ran behind that one line, and Pause did nothing.
 
 using System.Collections.Concurrent;
+using System.Diagnostics;
 using System.IO;
+using System.Reflection;
 using LithicBackup.Core;
 using LithicBackup.Core.Interfaces;
 using LithicBackup.Core.Models;
 using LithicBackup.Infrastructure.Data;
+using LithicBackup.Infrastructure.Deduplication;
 using LithicBackup.Infrastructure.FileSystem;
 using LithicBackup.Services;
 
@@ -75,6 +84,29 @@ internal static class Program
     sealed class Collect<T>(Action<T> add) : IProgress<T>
     {
         public void Report(T value) => add(value);
+    }
+
+    /// <summary>Records each report with the time it was made.</summary>
+    sealed class TimedRecorder : IProgress<BackupProgress>
+    {
+        readonly Stopwatch _clock = Stopwatch.StartNew();
+        public readonly ConcurrentQueue<(long Ms, BackupProgress Report)> Reports = new();
+        public void Report(BackupProgress value) => Reports.Enqueue((_clock.ElapsedMilliseconds, value));
+        public List<(long Ms, BackupProgress Report)> Phase(string name)
+            => Reports.Where(r => r.Report.StatusMessage == name && r.Report.PhaseFilesTotal > 0).ToList();
+    }
+
+    /// <summary>Wait until <paramref name="condition"/> holds, or the timeout passes.</summary>
+    static async Task<bool> WaitForAsync(Func<bool> condition, int timeoutMs)
+    {
+        var clock = Stopwatch.StartNew();
+        while (!condition())
+        {
+            if (clock.ElapsedMilliseconds > timeoutMs)
+                return false;
+            await Task.Delay(20);
+        }
+        return true;
     }
 
     static async Task FullPathTestsAsync(string root)
@@ -183,8 +215,9 @@ internal static class Program
 
         Check(result1.Success && result1.FailedFiles.Count == 0, "the run succeeds");
         Check(CountInDest(dest, "one") == 12, $"all 12 files are at the destination ({CountInDest(dest, "one")})");
-        Check(rec1.Statuses.FirstOrDefault()?.StartsWith("Checking 12 file(s)") == true,
-            $"it starts by saying what it is doing (\"{rec1.Statuses.FirstOrDefault()}\")");
+        var first1 = rec1.Reports.FirstOrDefault();
+        Check(first1 is { StatusMessage: "Checking files against the catalog", PhaseFilesDone: 0, PhaseFilesTotal: 12 },
+            $"it starts by saying what it is doing (\"{first1?.StatusMessage}\", {first1?.PhaseFilesDone} of {first1?.PhaseFilesTotal})");
         var data1 = rec1.Data;
         var namedFiles = data1.Select(r => r.CurrentFile).Where(f => !string.IsNullOrEmpty(f))
                               .ToHashSet(StringComparer.OrdinalIgnoreCase);
@@ -300,6 +333,118 @@ internal static class Program
         Check(rec6.Data.Any(r => r.CurrentFileActivity is null && r.CurrentFile == fileB),
             "then the copy reports as a copy");
 
+        // ------------------------------------------------------------ the check before copying
+        Console.WriteLine();
+        Console.WriteLine("=== 9. the check before copying counts through the files, at the progress cadence ===");
+        // Candidates that no longer exist still cost a stat each and are counted -
+        // the count is of the files the user is waiting on, whatever becomes of
+        // them - so enough of them stretch the check over a few seconds.
+        const int Ghosts = 400_000;
+        string ghostDir = Path.Combine(src, "ghosts");
+        Directory.CreateDirectory(ghostDir);
+        var ghosts = Enumerable.Range(0, Ghosts).Select(i => Path.Combine(ghostDir, $"gone_{i:D7}.bin")).ToList();
+        var batch9 = MakeBatch(src, "nine", 5, 4 * 1024);
+        var candidates9 = batch9.Concat(ghosts).ToList();
+        var (countingRepo, counts) = CountingCatalog.Wrap(repo);
+        var countingSvc = new DirectoryBackupService(
+            countingRepo, new FileScanner(countingRepo), new VersionRetentionService(countingRepo));
+        var rec9 = new TimedRecorder();
+        var result9 = await countingSvc.ExecuteTargetedAsync(job, dest, candidates9, tiers, CancellationToken.None, rec9);
+        var check9 = rec9.Phase("Checking files against the catalog");
+        Check(result9.Success && CountInDest(dest, "nine") == 5, "the 5 candidates that exist are backed up");
+        Check(check9.Count > 0 && check9.All(r => r.Report.PhaseFilesTotal == candidates9.Count),
+            $"the check reports its progress against all {candidates9.Count:N0} candidates ({check9.Count} report(s))");
+        Check(check9.Count > 0 && check9[0].Report.PhaseFilesDone == 0, "starting at 0, before the first file");
+        var done9 = check9.Select(r => r.Report.PhaseFilesDone).ToList();
+        Check(done9.Count > 1 && done9.Zip(done9.Skip(1)).All(p => p.Second > p.First) && done9[^1] <= candidates9.Count,
+            $"then counting up ({string.Join(", ", done9.Select(d => d.ToString("N0")))})");
+        var candidateSet = candidates9.ToHashSet(StringComparer.OrdinalIgnoreCase);
+        Check(check9.Count > 1 && check9.Skip(1).All(r => candidateSet.Contains(r.Report.CurrentFile)),
+            "each report names the candidate it has reached");
+        // How long the check ran: until the first report after it.
+        long start9 = check9.FirstOrDefault().Ms;
+        long end9 = rec9.Reports.Where(r => r.Ms >= check9.LastOrDefault().Ms && !check9.Contains(r))
+                                .Select(r => r.Ms).DefaultIfEmpty(check9.LastOrDefault().Ms).Min();
+        Check(end9 - start9 >= 3 * ProgressCadence.IntervalMs,
+            $"(the check ran {end9 - start9:N0} ms - long enough to judge its cadence)");
+        var gaps9 = check9.Zip(check9.Skip(1)).Select(p => p.Second.Ms - p.First.Ms).ToList();
+        Check(gaps9.Count > 0 && gaps9.Min() >= ProgressCadence.IntervalMs - 50,
+            $"reports come no faster than the progress cadence (closest {gaps9.DefaultIfEmpty().Min()} ms apart)");
+        Check(gaps9.Count > 0 && gaps9.Max() <= 3 * ProgressCadence.IntervalMs
+              && end9 - check9.LastOrDefault().Ms <= 3 * ProgressCadence.IntervalMs,
+            $"and the count never stands still for long (longest gap {gaps9.DefaultIfEmpty().Max()} ms)");
+        Check(counts.LivePaths == 5,
+            $"each candidate that exists is looked up in the catalog once, not again before copying ({counts.LivePaths} lookups for 5)");
+        Check(counts.OrphanedPaths == 5,
+            $"and its deleted history once ({counts.OrphanedPaths} for 5 new files)");
+        Check(rec9.Phase("Looking up earlier versions").Count == 0,
+            "the copy reuses what the check found instead of looking it up again");
+
+        Console.WriteLine();
+        Console.WriteLine("=== 9b. Pause holds the check ===");
+        var batch9b = MakeBatch(src, "ninebee", 3, 4 * 1024);
+        var candidates9b = batch9b.Concat(ghosts).ToList();
+        var rec9b = new TimedRecorder();
+        using var pause9 = new ManualResetEventSlim(true);
+        var run9b = Task.Run(() => svc.ExecuteTargetedAsync(
+            job, dest, candidates9b, tiers, CancellationToken.None, rec9b, pause9));
+        long Reached9b() => rec9b.Phase("Checking files against the catalog")
+                                 .Select(r => r.Report.PhaseFilesDone).DefaultIfEmpty(-1).Max();
+        bool underway = await WaitForAsync(() => Reached9b() > 0, 30_000);
+        pause9.Reset();
+        await Task.Delay(ProgressCadence.IntervalMs);   // a report already on its way lands
+        long heldAt = Reached9b();
+        await Task.Delay(4 * ProgressCadence.IntervalMs);
+        Check(underway && Reached9b() == heldAt && !run9b.IsCompleted,
+            $"paused part-way, the count stops ({heldAt:N0} of {candidates9b.Count:N0}) and the run waits");
+        pause9.Set();
+        var result9b = await run9b;
+        Check(result9b.Success && CountInDest(dest, "ninebee") == 3, "resumed, it finishes and backs up the 3 files");
+
+        // ------------------------------------------------------------ the other checks
+        Console.WriteLine();
+        Console.WriteLine("=== 10. the other checks before copying report their progress too ===");
+        // A full backup hands ExecuteAsync a diff without versions: it looks them up itself.
+        var batch10 = MakeBatch(src, "ten", 4, 4 * 1024);
+        var diff10 = new BackupDiff
+        {
+            NewFiles = batch10.Select(p => new ScannedFile
+            {
+                FullPath = p, SizeBytes = new FileInfo(p).Length, LastWriteUtc = File.GetLastWriteTimeUtc(p),
+            }).ToList(),
+            ChangedFiles = [],
+            DeletedFiles = [],
+        };
+        var rec10 = new TimedRecorder();
+        var result10 = await svc.ExecuteAsync(job, dest, tiers, rec10, CancellationToken.None, precomputedDiff: diff10);
+        var lookup10 = rec10.Phase("Looking up earlier versions");
+        Check(result10.Success && CountInDest(dest, "ten") == 4, "a backup handed a diff but no versions backs it up");
+        Check(lookup10.Count > 0 && lookup10.All(r => r.Report.PhaseFilesTotal == 4),
+            $"reporting as it looks up their earlier versions ({lookup10.Count} report(s))");
+
+        var batch10b = MakeBatch(src, "tenbee", 3, 4 * 1024);
+        var rec10b = new TimedRecorder();
+        var result10b = await svc.ExecuteTargetedAsync(dedupJob, dest, batch10b, tiers, CancellationToken.None, rec10b);
+        var probe10 = rec10b.Phase("Checking which files might be duplicates");
+        Check(result10b.Success && probe10.Count > 0 && probe10.All(r => r.Report.PhaseFilesTotal == 3),
+            $"with duplicate detection on, comparing sizes with what is stored reports too ({probe10.Count} report(s))");
+
+        var blockSvc = new DirectoryBackupService(
+            repo, new FileScanner(repo), new VersionRetentionService(repo), new BlockDeduplicationEngine());
+        var blockJob = new BackupJob
+        {
+            BackupSetId = job.BackupSetId,
+            Sources = job.Sources,
+            TargetDirectory = dest,
+            EnableDeduplication = true,
+        };
+        var batch10c = MakeBatch(src, "tencee", 3, 64 * 1024);
+        var rec10c = new TimedRecorder();
+        var result10c = await blockSvc.ExecuteTargetedAsync(blockJob, dest, batch10c, tiers, CancellationToken.None, rec10c);
+        var analyze10 = rec10c.Phase("Analyzing files for deduplication");
+        Check(result10c.Success && analyze10.Count > 0 && analyze10.All(r => r.Report.PhaseFilesTotal == 3),
+            $"so does block deduplication's read of every file ({analyze10.Count} report(s))");
+
         await Task.Run(PanelTests);
     }
 
@@ -361,5 +506,77 @@ internal static class Program
         await Task.Delay(900);
         Check(vm.StatusText == "Backup completed." && vm.CurrentFile != @"D:\x\late.txt",
             "a report still waiting when the run finishes cannot overwrite the result");
+
+        Console.WriteLine();
+        Console.WriteLine("=== 11. the panel shows a phase's count, bar, file, rate and time left ===");
+        var pvm = new LithicBackup.ViewModels.BurnProgressViewModel { IsDirectoryMode = true };
+        pvm.StartBurn();
+        static BackupProgress Phase(long done, string file = "") => new()
+        {
+            StatusMessage = "Checking files against the catalog", CurrentFile = file,
+            PhaseFilesDone = done, PhaseFilesTotal = 2_671_103,
+        };
+
+        pvm.OnBackupProgress(Phase(0));
+        Check(pvm.StatusText == "Checking files against the catalog (0 of 2,671,103)...",
+            $"it says how far through how many files it is (\"{pvm.StatusText}\")");
+        Check(pvm.StatsText.Contains("elapsed") && !pvm.StatsText.Contains("files/s"),
+            $"with no rate before there is a second of it to measure (\"{pvm.StatsText}\")");
+        await Task.Delay(1100);
+        pvm.OnBackupProgress(Phase(1_000_000, @"C:\music\a.mod"));
+        Check(pvm.StatusText == "Checking files against the catalog (1,000,000 of 2,671,103)...",
+            $"the count moves (\"{pvm.StatusText}\")");
+        Check(Math.Abs(pvm.OverallPercentage - 1_000_000 / 2_671_103.0 * 100) < 0.001,
+            $"the bar shows the phase's own progress ({pvm.OverallPercentage:F1}%)");
+        Check(pvm.CurrentFile == @"C:\music\a.mod", "and names the file it is on");
+        Check(pvm.StatsText.Contains(" files/s") && pvm.StatsText.Contains(" remaining") && !pvm.StatsText.Contains("--:--"),
+            $"and how fast it goes and how long it has left (\"{pvm.StatsText}\")");
+
+        pvm.PauseResumeCommand.Execute(null);
+        pvm.OnBackupProgress(Phase(1_000_500));
+        Check(pvm.StatusText == "Paused", $"a report arriving after Pause leaves \"Paused\" up (\"{pvm.StatusText}\")");
+        pvm.PauseResumeCommand.Execute(null);
+        Check(pvm.StatusText == "Checking files against the catalog (1,000,500 of 2,671,103)...",
+            $"and Resume shows where the phase had got to (\"{pvm.StatusText}\")");
+
+        pvm.OnBackupProgress(new BackupProgress
+        {
+            StatusMessage = "Waiting for the background backup of this set to pause...",
+        });
+        Check(pvm.OverallPercentage == 0 && pvm.StatsText == "",
+            $"a message that is not about the phase takes its bar and rate down ({pvm.OverallPercentage}%, \"{pvm.StatsText}\")");
+
+        pvm.OnBackupProgress(Data(@"D:\x\c.txt", 10));
+        Check(pvm.StatusText == "Copying files..." && pvm.StatsText.StartsWith("10 / 100  ·  "),
+            $"and the copy then shows its bytes (\"{pvm.StatsText}\")");
+        pvm.CompleteBurn(true, "");
+    }
+}
+
+/// <summary>
+/// A catalog that counts the paths each version lookup is asked about, and
+/// otherwise passes every call through to the real one.
+/// </summary>
+public class CountingCatalog : DispatchProxy
+{
+    public ICatalogRepository Inner = null!;
+    public long LivePaths, OrphanedPaths;
+
+    public static (ICatalogRepository Catalog, CountingCatalog Counts) Wrap(ICatalogRepository inner)
+    {
+        var proxy = Create<ICatalogRepository, CountingCatalog>();
+        var counts = (CountingCatalog)(object)proxy;
+        counts.Inner = inner;
+        return (proxy, counts);
+    }
+
+    protected override object? Invoke(MethodInfo? method, object?[]? args)
+    {
+        if (method!.Name == nameof(ICatalogRepository.GetLatestVersionInfoForPathsAsync))
+            Interlocked.Add(ref LivePaths, ((IReadOnlyCollection<string>)args![1]!).Count);
+        else if (method.Name == nameof(ICatalogRepository.GetOrphanedVersionInfoForPathsAsync))
+            Interlocked.Add(ref OrphanedPaths, ((IReadOnlyCollection<string>)args![1]!).Count);
+        try { return method.Invoke(Inner, args); }
+        catch (TargetInvocationException ex) when (ex.InnerException is not null) { throw ex.InnerException; }
     }
 }

@@ -327,18 +327,12 @@
                                                                                                            MinHeight="27"
                                                                                                            Text="{Binding CurrentFile, Mode=OneWay}"
                                                                                                            Visibility="{Binding CurrentFile, Converter={StaticResource NonEmptyVis}}" />
-                                                                                                <!-- Byte/time stats (collapsed until real copy figures arrive) -->
+                                                                                                <!-- Bytes copied (or a phase's files per second), time elapsed and time left
+                                                                                                     (collapsed until a report brings figures) -->
                                                                                                 <TextBlock Foreground="{StaticResource TextDimBrush}"
                                                                                                            FontSize="10" Margin="0,3,0,0"
-                                                                                                           Visibility="{Binding BytesWrittenText, Converter={StaticResource NonEmptyVis}}">
-                                                                                                    <Run Text="{Binding BytesWrittenText, Mode=OneWay}" />
-                                                                                                    <Run Text="  ·  " />
-                                                                                                    <Run Text="{Binding ElapsedText, Mode=OneWay}" />
-                                                                                                    <Run Text=" elapsed" />
-                                                                                                    <Run Text="  ·  ~" />
-                                                                                                    <Run Text="{Binding RemainingText, Mode=OneWay}" />
-                                                                                                    <Run Text=" remaining" />
-                                                                                                </TextBlock>
+                                                                                                           Text="{Binding StatsText, Mode=OneWay}"
+                                                                                                           Visibility="{Binding StatsText, Converter={StaticResource NonEmptyVis}}" />
 
                                                                                                 <!-- Simulated burner failure injection (test mode only) -->
                                                                                                 <Border Visibility="{Binding DataContext.IsTestMode,

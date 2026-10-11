@@ -46,6 +46,25 @@ public enum TargetedMoveOutcome
 }
 
 /// <summary>
+/// What the catalog holds for the paths a directory backup is about to write,
+/// looked up before its copy loop; the run numbers each new version from it.
+/// Keyed case-insensitively, as the Windows filesystem is.
+/// </summary>
+public sealed class CatalogVersions
+{
+    /// <summary>The newest live (not deleted) version of each path that has one.</summary>
+    public Dictionary<string, FileVersionInfo> Live { get; } = new(StringComparer.OrdinalIgnoreCase);
+
+    /// <summary>
+    /// For paths with no live version: the newest version, when that is a
+    /// deleted record (see <see cref="ICatalogRepository.GetOrphanedVersionInfoAsync"/>).
+    /// A file that reappears there resumes its numbering from it instead of
+    /// starting again at version 1.
+    /// </summary>
+    public Dictionary<string, FileVersionInfo> Orphaned { get; } = new(StringComparer.OrdinalIgnoreCase);
+}
+
+/// <summary>
 /// Backs up files to a directory target with versioned file history.
 ///
 /// Layout on disk:
@@ -112,6 +131,13 @@ public class DirectoryBackupService
     /// for why that is safe and what it defers to the next full backup. A full
     /// backup must leave this false.
     /// </param>
+    /// <param name="knownVersions">
+    /// What the catalog holds for every new and changed path in
+    /// <paramref name="precomputedDiff"/>, from a caller that has just looked it up
+    /// (<see cref="ExecuteTargetedAsync"/>, whose check needs the same answers), so
+    /// it is not looked up a second time - over two million paths, that is minutes.
+    /// The run takes ownership: it adds the versions it writes. Null to look up here.
+    /// </param>
     public async Task<BackupResult> ExecuteAsync(
         BackupJob job,
         string targetDirectory,
@@ -122,7 +148,8 @@ public class DirectoryBackupService
         FailureCallback? onFailure = null,
         BackupDiff? precomputedDiff = null,
         bool scopeRetentionToBackedUpFiles = false,
-        CommitBoundaryHandler? onCommitBoundary = null)
+        CommitBoundaryHandler? onCommitBoundary = null,
+        CatalogVersions? knownVersions = null)
     {
         BackupDiff diff;
         if (precomputedDiff is not null)
@@ -202,9 +229,25 @@ public class DirectoryBackupService
         // never disagree about what this run is going to write.
         IReadOnlySet<string> pathsThisRunWillWrite =
             lookupPaths.ToHashSet(StringComparer.OrdinalIgnoreCase);
-        var versionInfo = job.BackupSetId.HasValue
-            ? await _catalog.GetLatestVersionInfoForPathsAsync(backupSetId, lookupPaths, ct)
-            : new Dictionary<string, FileVersionInfo>(StringComparer.OrdinalIgnoreCase);
+
+        var versions = knownVersions ?? new CatalogVersions();
+        if (knownVersions is null && job.BackupSetId.HasValue)
+        {
+            var lookingUp = PhaseProgress.Begin(progress, "Looking up earlier versions", lookupPaths.Count);
+            var lookupBatch = new LookupBatch();
+            for (int start = 0; start < lookupPaths.Count;)
+            {
+                pauseEvent?.Wait(ct);
+                ct.ThrowIfCancellationRequested();
+                var chunk = lookupPaths.GetRange(start, Math.Min(lookupBatch.Size, lookupPaths.Count - start));
+                lookupBatch.Starting();
+                await LookUpVersionsAsync(backupSetId, chunk, versions, ct);
+                lookupBatch.Finished(chunk.Count);
+                start += chunk.Count;
+                lookingUp.Advance(start, chunk[^1]);
+            }
+        }
+        var versionInfo = versions.Live;
 
         // Orphaned history: paths whose every catalog record is soft-deleted, so
         // they're absent from versionInfo above. When such a path reappears we
@@ -212,10 +255,8 @@ public class DirectoryBackupService
         // _prev) instead of restarting at version 1 and discarding history. This
         // is what lets atomically-saved files (e.g. KeyNote .knt, which briefly
         // delete-and-recreate the original on every save, tombstoning the record)
-        // keep accumulating versions. Looked up lazily per file below.
-        var orphanedVersionInfo = job.BackupSetId.HasValue
-            ? await _catalog.GetOrphanedVersionInfoForPathsAsync(backupSetId, lookupPaths, ct)
-            : new Dictionary<string, FileVersionInfo>(StringComparer.OrdinalIgnoreCase);
+        // keep accumulating versions. Consulted per file below.
+        var orphanedVersionInfo = versions.Orphaned;
 
         // Map of content hash -> destination-relative path of an active PLAIN
         // copy of that content somewhere in the backup tree (a real-bytes file
@@ -370,14 +411,16 @@ public class DirectoryBackupService
         var blockOccur = new Dictionary<string, int>(StringComparer.OrdinalIgnoreCase);
         if (blockDedupEnabled)
         {
-            progress?.Report(new BackupProgress
+            var analyzing = PhaseProgress.Begin(
+                progress, "Analyzing files for deduplication", filesToBackup.Count);
+            for (int i = 0; i < filesToBackup.Count; i++)
             {
-                StatusMessage = "Analyzing files for deduplication...",
-            });
-            foreach (var file in filesToBackup)
-            {
+                var file = filesToBackup[i];
                 ct.ThrowIfCancellationRequested();
                 pauseEvent?.Wait(ct);
+                // Named before it is read: the whole file is read, so a big one
+                // takes a while, and the panel should say which file it is.
+                analyzing.Advance(i, file.FullPath);
                 try
                 {
                     DeduplicationRecipe r;
@@ -476,10 +519,15 @@ public class DirectoryBackupService
                 // "Worker pegged a CPU core" entry in known-issues.md.
                 try
                 {
-                    existingPlainSizes = await _catalog.GetActivePlainSizesPresentAsync(
-                        backupSetId, candidateSizeCounts.Keys, ct);
+                    existingPlainSizes = await FindStoredSizesAsync(
+                        backupSetId, candidateSizeCounts, filesToBackup.Count, progress, pauseEvent, ct);
                 }
-                catch { /* fall back to "could be a duplicate" for safety */ existingPlainSizes = new HashSet<long>(); }
+                catch (Exception ex) when (ex is not OperationCanceledException)
+                {
+                    // Treat no size as stored: those files are then copied plain,
+                    // which is always correct; only the dedup saving is lost.
+                    existingPlainSizes = new HashSet<long>();
+                }
             }
         }
 
@@ -1791,11 +1839,10 @@ public class DirectoryBackupService
     /// retention, and catalog machinery.
     /// </remarks>
     /// <param name="progress">
-    /// Per-file progress, as <see cref="ExecuteAsync"/> reports it. The GUI's "back
-    /// up the folders you just added" run shows it; it used to pass nothing here,
-    /// so that run said only "Copying N file(s)…" until it finished.
+    /// Progress through the check, then per-file progress as <see cref="ExecuteAsync"/>
+    /// reports it. The GUI's "back up the folders you just added" run shows both.
     /// </param>
-    /// <param name="pauseEvent">Pause support, as for <see cref="ExecuteAsync"/>.</param>
+    /// <param name="pauseEvent">Pause support, as for <see cref="ExecuteAsync"/>; it holds the check too.</param>
     public async Task<BackupResult> ExecuteTargetedAsync(
         BackupJob job,
         string targetDirectory,
@@ -1807,79 +1854,53 @@ public class DirectoryBackupService
     {
         if (!job.BackupSetId.HasValue)
             throw new ArgumentException("Targeted backup requires an existing backup set.", nameof(job));
-
-        progress?.Report(new BackupProgress
-        {
-            StatusMessage = $"Checking {candidatePaths.Count:N0} file(s) against the catalog...",
-        });
+        int backupSetId = job.BackupSetId.Value;
 
         var isExcluded = BuildExclusionFilter(job);
 
-        // Stat the candidates first, so the catalog is asked about the SAME
-        // canonical paths the comparison below uses (FileInfo.FullName, not the
-        // raw USN-supplied string).
-        var scannedFiles = new List<ScannedFile>();
-        foreach (var path in candidatePaths.Distinct(StringComparer.OrdinalIgnoreCase))
-        {
-            ct.ThrowIfCancellationRequested();
-
-            if (isExcluded is not null && isExcluded(path))
-                continue;
-
-            FileInfo info;
-            try
-            {
-                info = new FileInfo(path);
-                if (!info.Exists)
-                    continue; // deleted — handled by the periodic full scan
-            }
-            catch (Exception ex) when (ex is IOException or UnauthorizedAccessException)
-            {
-                continue;
-            }
-
-            scannedFiles.Add(new ScannedFile
-            {
-                FullPath = info.FullName,
-                SizeBytes = info.Length,
-                LastWriteUtc = info.LastWriteTimeUtc,
-            });
-        }
-
+        // Stat each candidate, then ask the catalog about it under the SAME
+        // canonical path the comparison below uses (FileInfo.FullName, not the raw
+        // USN-supplied string) - a batch at a time (LookupBatch), so the count on
+        // screen moves through both halves of the work and Pause holds it.
+        //
+        // Only the candidate paths matter here, so they are looked up one indexed
+        // seek each rather than by materialising the set's entire manifest. This
+        // method runs on EVERY continuous-backup wake-up — including the
+        // overwhelmingly common case where the USN journal reported a
+        // metadata-only touch and nothing ends up being backed up at all — so a
+        // whole-set query here cost a full 2.2M-row scan plus a window-function
+        // sort (~12.5 s, ~110 MB/s of reads) per wake-up, per set, forever. That is
+        // what pegged a CPU core in the Worker service; see the "Worker pegged a
+        // CPU core" entry in known-issues.md.
+        //
+        // The versions found are handed on to ExecuteAsync, which needs the same
+        // answers to number the new versions, so it does not look them up again.
+        var versions = new CatalogVersions();
         var newFiles = new List<ScannedFile>();
         var changedFiles = new List<ScannedFile>();
+        var seen = new HashSet<string>(StringComparer.OrdinalIgnoreCase);
+        var batch = new LookupBatch();
+        var chunk = new List<ScannedFile>();
+        var checking = PhaseProgress.Begin(
+            progress, "Checking files against the catalog", candidatePaths.Count);
 
-        if (scannedFiles.Count > 0)
+        for (int i = 0; i < candidatePaths.Count; i++)
         {
-            // Only the candidate paths matter here, so look up exactly those
-            // rather than materialising the set's entire manifest. This method
-            // runs on EVERY continuous-backup wake-up — including the
-            // overwhelmingly common case where the USN journal reported a
-            // metadata-only touch and nothing ends up being backed up at all —
-            // so a whole-set query here cost a full 2.2M-row scan plus a
-            // window-function sort (~12.5 s, ~110 MB/s of reads) per wake-up,
-            // per set, forever. That is what pegged a CPU core in the Worker
-            // service; see the "Worker pegged a CPU core" entry in
-            // known-issues.md.
-            var versionInfo = await _catalog.GetLatestVersionInfoForPathsAsync(
-                job.BackupSetId.Value,
-                scannedFiles.Select(f => f.FullPath).ToList(),
-                ct);
+            pauseEvent?.Wait(ct);
+            ct.ThrowIfCancellationRequested();
 
-            foreach (var scanned in scannedFiles)
+            string path = candidatePaths[i];
+            if ((isExcluded is null || !isExcluded(path))
+                && StatCandidate(path) is { } scanned   // null: deleted — handled by the periodic full scan
+                && seen.Add(scanned.FullPath))
             {
-                if (!versionInfo.TryGetValue(scanned.FullPath, out var last))
-                {
-                    newFiles.Add(scanned);
-                }
-                else if (scanned.SizeBytes != last.SizeBytes
-                         || scanned.LastWriteUtc > last.SourceLastWriteUtc)
-                {
-                    changedFiles.Add(scanned);
-                }
-                // else: catalog already has this exact version — nothing to do.
+                chunk.Add(scanned);
+                if (chunk.Count >= batch.Size)
+                    await ClassifyChunkAsync();
             }
+            checking.Advance(i + 1, path);
         }
+        await ClassifyChunkAsync();
 
         if (newFiles.Count == 0 && changedFiles.Count == 0)
         {
@@ -1902,7 +1923,187 @@ public class DirectoryBackupService
         return await ExecuteAsync(
             job, targetDirectory, retentionTiers,
             progress, ct, pauseEvent, precomputedDiff: diff,
-            scopeRetentionToBackedUpFiles: true);
+            scopeRetentionToBackedUpFiles: true, knownVersions: versions);
+
+        // Sort the stat'ed candidates in `chunk` into new and changed by what the
+        // catalog holds for them.
+        async Task ClassifyChunkAsync()
+        {
+            if (chunk.Count == 0)
+                return;
+            batch.Starting();
+            await LookUpVersionsAsync(backupSetId, chunk.Select(f => f.FullPath).ToList(), versions, ct);
+            batch.Finished(chunk.Count);
+            foreach (var file in chunk)
+            {
+                if (!versions.Live.TryGetValue(file.FullPath, out var last))
+                {
+                    newFiles.Add(file);
+                }
+                else if (file.SizeBytes != last.SizeBytes
+                         || file.LastWriteUtc > last.SourceLastWriteUtc)
+                {
+                    changedFiles.Add(file);
+                }
+                // else: catalog already has this exact version — nothing to do.
+            }
+            chunk.Clear();
+        }
+    }
+
+    /// <summary>
+    /// How many paths (or sizes) to put to the catalog in one call when a run looks
+    /// up thousands or millions of them: about <see cref="TargetMs"/> of work. A
+    /// call holds the set's connection, and Pause and the progress count are
+    /// serviced only between calls, so one must stay well inside a progress
+    /// interval; yet its fixed cost (the gate, preparing the statement) should
+    /// vanish into its seeks. A seek takes 15-20 µs warm (measured on a 5.7M-row
+    /// set) but has been timed at 9 ms with the Worker writing to the same set, so
+    /// the size follows the rate measured on the calls so far.
+    /// </summary>
+    private sealed class LookupBatch
+    {
+        private const int TargetMs = 100, Smallest = 16, Largest = 4096;
+        private readonly System.Diagnostics.Stopwatch _clock = new();
+
+        /// <summary>Items to put in the next call.</summary>
+        public int Size { get; private set; } = 256;
+
+        /// <summary>Call as a lookup starts.</summary>
+        public void Starting() => _clock.Restart();
+
+        /// <summary>Call when a lookup of <paramref name="items"/> items is done, to size the next.</summary>
+        public void Finished(int items)
+        {
+            double ms = Math.Max(_clock.Elapsed.TotalMilliseconds, 0.1);
+            Size = (int)Math.Clamp(items * TargetMs / ms, Smallest, Largest);
+        }
+    }
+
+    /// <summary>
+    /// The candidate as it is on disk now, under its canonical full path; null
+    /// when it no longer exists or cannot be read.
+    /// </summary>
+    private static ScannedFile? StatCandidate(string path)
+    {
+        try
+        {
+            var info = new FileInfo(path);
+            if (!info.Exists)
+                return null;
+            return new ScannedFile
+            {
+                FullPath = info.FullName,
+                SizeBytes = info.Length,
+                LastWriteUtc = info.LastWriteTimeUtc,
+            };
+        }
+        catch (Exception ex) when (ex is IOException or UnauthorizedAccessException)
+        {
+            return null;
+        }
+    }
+
+    /// <summary>
+    /// Add to <paramref name="versions"/> what the catalog holds for each of
+    /// <paramref name="paths"/>: its newest live version, or for a path without
+    /// one, its orphaned history. The orphaned query is put only to the paths with
+    /// no live version, as that is the only case in which its answer is used.
+    /// </summary>
+    private async Task LookUpVersionsAsync(
+        int backupSetId, IReadOnlyList<string> paths, CatalogVersions versions, CancellationToken ct)
+    {
+        foreach (var (path, info) in await _catalog.GetLatestVersionInfoForPathsAsync(backupSetId, paths, ct))
+            versions.Live[path] = info;
+
+        var withoutLive = paths.Where(p => !versions.Live.ContainsKey(p)).ToList();
+        if (withoutLive.Count == 0)
+            return;
+        var orphaned = await _catalog.GetOrphanedVersionInfoForPathsAsync(backupSetId, withoutLive, ct);
+        foreach (var (path, info) in orphaned)
+            versions.Orphaned[path] = info;
+    }
+
+    /// <summary>
+    /// The sizes, among the keys of <paramref name="filesPerSize"/>, that some
+    /// active plain copy in the set already has. Probed a chunk of sizes at a
+    /// time, reported as the files those sizes cover.
+    /// </summary>
+    /// <param name="filesPerSize">This run's files, counted by size.</param>
+    /// <param name="fileCount">Files in the run; the phase's total.</param>
+    private async Task<HashSet<long>> FindStoredSizesAsync(
+        int backupSetId, Dictionary<long, int> filesPerSize, int fileCount,
+        IProgress<BackupProgress>? progress, ManualResetEventSlim? pauseEvent, CancellationToken ct)
+    {
+        var sizes = filesPerSize.Keys.ToList();
+        var stored = new HashSet<long>();
+        var probing = PhaseProgress.Begin(progress, "Checking which files might be duplicates", fileCount);
+        var batch = new LookupBatch();
+        long filesCovered = 0;
+        for (int start = 0; start < sizes.Count;)
+        {
+            pauseEvent?.Wait(ct);
+            ct.ThrowIfCancellationRequested();
+            var chunk = sizes.GetRange(start, Math.Min(batch.Size, sizes.Count - start));
+            batch.Starting();
+            stored.UnionWith(await _catalog.GetActivePlainSizesPresentAsync(backupSetId, chunk, ct));
+            batch.Finished(chunk.Count);
+            start += chunk.Count;
+            foreach (long size in chunk)
+                filesCovered += filesPerSize[size];
+            probing.Advance(filesCovered, "");
+        }
+        return stored;
+    }
+
+    /// <summary>
+    /// Reports a phase that works through files, such as the checks before the
+    /// first file is copied, as <see cref="BackupProgress.PhaseFilesDone"/> of
+    /// <see cref="BackupProgress.PhaseFilesTotal"/> at the <see cref="ProgressCadence"/>.
+    /// Over millions of files such a phase runs for minutes; one unchanging line
+    /// for all of them reads as a hang.
+    /// </summary>
+    private sealed class PhaseProgress
+    {
+        private readonly IProgress<BackupProgress>? _progress;
+        private readonly string _phase;
+        private readonly long _total;
+        private readonly ProgressCadence _cadence = new();
+
+        private PhaseProgress(IProgress<BackupProgress>? progress, string phase, long total)
+        {
+            _progress = progress;
+            _phase = phase;
+            _total = total;
+        }
+
+        /// <summary>
+        /// Start a phase, and say so at once: the previous phase's last report must
+        /// not stay on screen while this one does its first stretch of work.
+        /// </summary>
+        /// <param name="phase">What it does, as the panel's headline: "Checking files against the catalog".</param>
+        /// <param name="total">Files it will work through.</param>
+        public static PhaseProgress Begin(IProgress<BackupProgress>? progress, string phase, long total)
+        {
+            var started = new PhaseProgress(progress, phase, total);
+            started.Advance(0, "");
+            return started;
+        }
+
+        /// <summary>Report <paramref name="done"/> files finished, if one is due.</summary>
+        /// <param name="currentPath">The file just finished or now under way, named on the panel; empty for none.</param>
+        public void Advance(long done, string currentPath)
+        {
+            if (_progress is null || _total <= 0 || !_cadence.IsDue())
+                return;
+            _progress.Report(new BackupProgress
+            {
+                StatusMessage = _phase,
+                CurrentFile = currentPath,
+                PhaseFilesDone = done,
+                PhaseFilesTotal = _total,
+            });
+        }
     }
 
     /// <summary>

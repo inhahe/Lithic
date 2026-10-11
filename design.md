@@ -593,6 +593,21 @@ counter advances inside the per-path work (chunked at `PurgePathChunkSize`), not
 only between items. When adding a phase, ask what the **unit of cost** is and
 count that — the unit of iteration usually is not it.
 
+**And it came back a third time, in the backup itself** — the checks a directory
+backup makes before copying its first file. See "A targeted run shows the same
+progress as any other backup" below.
+
+### One cadence for every progress display
+
+`ProgressCadence` (Core) holds the one interval at which progress reaches the
+screen, `IntervalMs` = 500 ms, two updates a second, and every display and every
+throttled reporter uses it — the GUI's view models, the service layer, the polls
+of the Coverage and Largest Files scans. It lived in `ViewModelBase`, out of the
+services' reach, so they kept private copies, and two displays drifted (150 ms,
+1 s). A loop that could report after every item asks `ProgressCadence.IsDue()`
+after each one and reports when it says so: that holds the pace whether items
+take microseconds or seconds, which a report every N items does not.
+
 ### Probe and classify in one pass, one directory per work item
 
 The deleted-file check probes a directory and classifies it in the same work
@@ -795,6 +810,43 @@ reporter was never passed down: `ExecuteTargetedAsync` gave `ExecuteAsync`
 finished. `tools\targeted_progress_test` pins the reports, Pause and Cancel against
 the real engine. Anything new that copies files must take both, or the user is left
 guessing whether it is working.
+
+**So does everything it does before the first file is copied.** Adding a folder
+of 2,671,103 files sat on "Checking 2,671,103 file(s) against the catalog..." at
+0.0% for **15 min 55 s** (measured from the log and the run's disc record): a stat
+of every candidate, a catalog lookup of every one, then — inside `ExecuteAsync`,
+under the same line — the same lookup again and a lookup of deleted history, with
+Pause ignored throughout. Each of these is now a **phase** that counts files:
+
+| phase | where | when |
+|---|---|---|
+| Checking files against the catalog | `ExecuteTargetedAsync` | always |
+| Looking up earlier versions | `ExecuteAsync` | handed a diff without versions (a full backup) |
+| Analyzing files for deduplication | `ExecuteAsync` | block dedup on |
+| Checking which files might be duplicates | `ExecuteAsync` | file dedup on, block dedup off |
+
+`PhaseProgress` reports a phase as `BackupProgress.PhaseFilesDone` of
+`PhaseFilesTotal`, with `StatusMessage` naming it and `CurrentFile` the file it is
+on, at the `ProgressCadence`, starting with "0 of N" the moment the phase begins.
+The panel shows "*phase* (*done* of *total*)...", the bar at the phase's own
+percentage, the file, and under the bar the phase's files per second, the time
+elapsed and the time left.
+
+Catalog lookups go in batches (`LookupBatch`) sized from the rate of the calls so
+far to take about 100 ms each. A call holds the set's connection, and the count and
+Pause are serviced only between calls, so one must stay well inside a progress
+interval; yet its fixed cost should vanish into its seeks. The seeks take 15-20 µs
+warm on the 5.7M-row set but have been timed at 9 ms with the Worker writing to the
+same set, which is why the size is measured, not fixed.
+
+**The check's answers are handed on.** The check needs each candidate's newest
+live version to classify it; `ExecuteAsync` needs the same to number the new
+versions, and the orphaned history for the ones without. The check now looks up
+both, the orphaned query only for paths with no live version (the only case in
+which its answer is used), and passes them as `ExecuteAsync(knownVersions:)`
+(`CatalogVersions`). It used to look all of them up again: about a minute per
+pass at this size. `targeted_progress_test` §9 counts the lookups through a proxy
+catalog.
 
 **Progress is throttled by holding back, never by dropping.** The row panel
 (`BurnProgressViewModel.OnBackupProgress`) shows at most one data report per half

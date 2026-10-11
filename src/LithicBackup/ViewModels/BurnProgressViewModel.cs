@@ -21,9 +21,7 @@ public class BurnProgressViewModel : ViewModelBase
     private string _currentFile = "";
     private double _discPercentage;
     private double _overallPercentage;
-    private string _bytesWrittenText = "";
-    private string _elapsedText = "00:00";
-    private string _remainingText = "--:--";
+    private string _statsText = "";
     private string _statusText = "Preparing...";
     private bool _isBurning;
     private bool _isComplete;
@@ -46,6 +44,21 @@ public class BurnProgressViewModel : ViewModelBase
     /// </summary>
     private BackupProgress? _heldBack;
     private DispatcherTimer? _flushTimer;
+
+    /// <summary>
+    /// The copy's time-left estimate, kept between reports that cannot refine it
+    /// (too early in the run, or a status report). Null until there is one.
+    /// </summary>
+    private TimeSpan? _copyRemaining;
+
+    /// <summary>
+    /// The phase on screen (<see cref="BackupProgress.PhaseFilesTotal"/>), by name,
+    /// with the stopwatch time and file count it started at, so its rate covers
+    /// that phase alone. Null when the panel is not showing a phase.
+    /// </summary>
+    private string? _phase;
+    private long _phaseStartMs;
+    private long _phaseStartDone;
 
     /// <summary>
     /// Signaling primitive shared with the backup service. When reset (paused),
@@ -107,22 +120,15 @@ public class BurnProgressViewModel : ViewModelBase
         set => SetProperty(ref _overallPercentage, value);
     }
 
-    public string BytesWrittenText
+    /// <summary>
+    /// The line under the bar: bytes copied of the total, or for a phase that works
+    /// through files, how many it gets through a second; then the time so far and
+    /// the time left. Empty until a report brings figures.
+    /// </summary>
+    public string StatsText
     {
-        get => _bytesWrittenText;
-        set => SetProperty(ref _bytesWrittenText, value);
-    }
-
-    public string ElapsedText
-    {
-        get => _elapsedText;
-        set => SetProperty(ref _elapsedText, value);
-    }
-
-    public string RemainingText
-    {
-        get => _remainingText;
-        set => SetProperty(ref _remainingText, value);
+        get => _statsText;
+        set => SetProperty(ref _statsText, value);
     }
 
     public string StatusText
@@ -236,7 +242,8 @@ public class BurnProgressViewModel : ViewModelBase
     /// <summary>
     /// Update the view from a <see cref="BackupProgress"/> event.
     /// Throttled to avoid excessive UI redraw (see <see cref="ProgressCadence.IntervalMs"/>).
-    /// Status-message-only reports (planning phases) are never throttled.
+    /// Status-message reports are never throttled here: the phases that send
+    /// them many times over keep to the cadence themselves.
     /// </summary>
     public void OnBackupProgress(BackupProgress progress)
     {
@@ -247,15 +254,29 @@ public class BurnProgressViewModel : ViewModelBase
         {
             // A status report supersedes any data report still waiting its turn.
             _heldBack = null;
-            StatusText = progress.StatusMessage;
+
+            if (progress.PhaseFilesTotal > 0)
+            {
+                ApplyPhaseProgress(progress);
+                return;
+            }
+
+            ShowStatus(progress.StatusMessage);
             CurrentFile = progress.CurrentFile;
 
             if (progress.BytesTotalAll > 0)
             {
                 OverallPercentage = progress.OverallPercentage;
-                BytesWrittenText = $"{FormatBytes(progress.BytesWrittenTotal)} / {FormatBytes(progress.BytesTotalAll)}";
-                ElapsedText = FormatTimeSpan(_stopwatch.Elapsed);
+                StatsText = Stats(BytesText(progress), _copyRemaining);
             }
+            else if (_phase is not null)
+            {
+                // A phase's bar and rate would otherwise stay up, stale, under a
+                // message that is not about them (waiting for the set's lock, say).
+                OverallPercentage = 0;
+                StatsText = "";
+            }
+            _phase = null;
             CurrentFilePercentage = 0;
             CurrentFileSizeText = "";
             return;
@@ -302,16 +323,12 @@ public class BurnProgressViewModel : ViewModelBase
     private void ApplyDataProgress(BackupProgress progress, long nowMs)
     {
         _lastUiUpdateMs = nowMs;
+        _phase = null;
 
         CurrentDisc = progress.CurrentDisc;
         TotalDiscs = progress.TotalDiscs;
         OverallPercentage = progress.OverallPercentage;
         CurrentFile = progress.CurrentFile;
-        BytesWrittenText = $"{FormatBytes(progress.BytesWrittenTotal)} / {FormatBytes(progress.BytesTotalAll)}";
-
-        // Always update elapsed from our own stopwatch so it works for
-        // both disc burns and directory backups.
-        ElapsedText = FormatTimeSpan(_stopwatch.Elapsed);
 
         // Estimate remaining time from byte throughput.
         if (progress.BytesWrittenTotal > 0 && progress.BytesTotalAll > 0)
@@ -321,17 +338,12 @@ public class BurnProgressViewModel : ViewModelBase
             {
                 double bytesPerSec = progress.BytesWrittenTotal / elapsedSec;
                 long bytesRemaining = progress.BytesTotalAll - progress.BytesWrittenTotal;
-                if (bytesRemaining > 0 && bytesPerSec > 0)
-                {
-                    RemainingText = FormatTimeSpan(
-                        TimeSpan.FromSeconds(bytesRemaining / bytesPerSec));
-                }
-                else
-                {
-                    RemainingText = "00:00";
-                }
+                _copyRemaining = bytesRemaining > 0 && bytesPerSec > 0
+                    ? Eta(bytesRemaining / bytesPerSec)
+                    : TimeSpan.Zero;
             }
         }
+        StatsText = Stats(BytesText(progress), _copyRemaining);
 
         // Per-file progress (updated during large file copies).
         if (progress.CurrentFileTotalBytes > 0)
@@ -354,10 +366,85 @@ public class BurnProgressViewModel : ViewModelBase
 
         // What is being done to the current file: copying, unless the engine
         // says otherwise (e.g. reading it to check for duplicates first).
-        StatusText = string.IsNullOrEmpty(progress.CurrentFileActivity)
+        ShowStatus(string.IsNullOrEmpty(progress.CurrentFileActivity)
             ? "Copying files..."
-            : progress.CurrentFileActivity + "...";
+            : progress.CurrentFileActivity + "...");
     }
+
+    /// <summary>
+    /// Show a report from a phase that works through files, such as a check before
+    /// the copy, as "&lt;phase&gt; (done of total)...", with the bar at the phase's
+    /// own percentage, the file it is on, and under the bar how many files it gets
+    /// through a second and how long it has left.
+    /// </summary>
+    private void ApplyPhaseProgress(BackupProgress progress)
+    {
+        long nowMs = _stopwatch.ElapsedMilliseconds;
+        if (progress.StatusMessage != _phase)
+        {
+            _phase = progress.StatusMessage;
+            _phaseStartMs = nowMs;
+            _phaseStartDone = progress.PhaseFilesDone;
+        }
+
+        long done = progress.PhaseFilesDone, total = progress.PhaseFilesTotal;
+        ShowStatus($"{progress.StatusMessage} ({done:N0} of {total:N0})...");
+        CurrentFile = progress.CurrentFile;
+        OverallPercentage = (double)done / total * 100;
+        CurrentFilePercentage = 0;
+        CurrentFileSizeText = "";
+
+        // A rate says what a percentage cannot: 3,000 files/s against millions
+        // is minutes, 20 is days. Measured over this phase alone, and not before
+        // a second of it has passed, when the figure would be noise.
+        double seconds = (nowMs - _phaseStartMs) / 1000.0;
+        long doneThisPhase = done - _phaseStartDone;
+        if (seconds >= 1 && doneThisPhase > 0)
+        {
+            double perSecond = doneThisPhase / seconds;
+            StatsText = Stats($"{perSecond:N0} files/s", Eta((total - done) / perSecond));
+        }
+        else
+        {
+            StatsText = Stats(null, null);
+        }
+    }
+
+    /// <summary>
+    /// Put a report's status on screen - except while paused, when "Paused" stays
+    /// and the status is kept for <see cref="Resume"/> instead. A report already
+    /// on its way when Pause was clicked must not make a paused run read as running.
+    /// </summary>
+    private void ShowStatus(string status)
+    {
+        if (IsPaused)
+            _statusBeforePause = status;
+        else
+            StatusText = status;
+    }
+
+    /// <summary>
+    /// The line under the bar (<see cref="StatsText"/>).
+    /// </summary>
+    /// <param name="figures">What has been done, or how fast; null to leave it out.</param>
+    /// <param name="remaining">Time left, or null while there is no estimate yet.</param>
+    private string Stats(string? figures, TimeSpan? remaining)
+    {
+        string times = $"{FormatTimeSpan(_stopwatch.Elapsed)} elapsed  ·  ~"
+            + (remaining is { } left ? FormatTimeSpan(left) : "--:--") + " remaining";
+        return figures is null ? times : $"{figures}  ·  {times}";
+    }
+
+    private static string BytesText(BackupProgress progress)
+        => $"{FormatBytes(progress.BytesWrittenTotal)} / {FormatBytes(progress.BytesTotalAll)}";
+
+    /// <summary>
+    /// <paramref name="seconds"/> as a time-left estimate; null when it is too
+    /// large to be one (a rate near zero), which <see cref="TimeSpan"/> would
+    /// otherwise reject by throwing.
+    /// </summary>
+    private static TimeSpan? Eta(double seconds)
+        => seconds < TimeSpan.FromDays(999).TotalSeconds ? TimeSpan.FromSeconds(seconds) : null;
 
     /// <summary>Creates and returns a CancellationTokenSource for this operation.</summary>
     public CancellationTokenSource StartBurn()
@@ -368,6 +455,9 @@ public class BurnProgressViewModel : ViewModelBase
         IsBurning = true;
         IsComplete = false;
         StatusText = IsDirectoryMode ? "Copying files..." : "Burning...";
+        StatsText = "";
+        _copyRemaining = null;
+        _phase = null;
         _lastUiUpdateMs = -ProgressCadence.IntervalMs; // ensure first report gets through
         _stopwatch.Restart();
         return _cts;
@@ -387,8 +477,6 @@ public class BurnProgressViewModel : ViewModelBase
         _stopwatch.Stop();
         IsBurning = false;
         IsComplete = true;
-        ElapsedText = FormatTimeSpan(_stopwatch.Elapsed);
-        RemainingText = "00:00";
         string verb = IsDirectoryMode ? "Backup" : "Burn";
         if (cancelled)
             // A user-initiated abort is not a failure — say so plainly rather

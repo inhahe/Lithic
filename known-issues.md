@@ -1,5 +1,68 @@
 # LithicBackup — Known Issues & Tech Debt
 
+## FIXED: backing up 2,671,103 added files sat on "Checking 2,671,103 file(s) against the catalog..." at 0.0% for 16 minutes (2026-10-10)
+
+**Symptom.** The user added a folder whose subfolder holds millions of files and
+said yes to backing up the additions. The row said "Checking 2,671,103 file(s)
+against the catalog..." with the bar at 0.0%, and nothing on it moved. Every other
+long step in the app shows its progress, at the app's update rate; this one showed
+none.
+
+**What it was doing.** Measured on the live run: the GUI logged the targeted
+backup at 22:12:59, and the run's disc record, created just before the first file
+is copied, is stamped 22:28:54. So **15 min 55 s** passed behind that one line.
+In that time:
+- `ExecuteTargetedAsync` stat'ed each of the 2,671,103 candidates and looked each
+  one up in the catalog.
+- `ExecuteAsync` reported nothing new before its copy loop, so the same line stayed
+  up while it looked every new or changed path up **again** for its newest
+  version, once more for orphaned history, and probed every distinct size (the set
+  has whole-file dedup on).
+- Pause did nothing until the copy started.
+
+A lookup costs 15-20 µs on set-11's 5.7M rows (timed read-only against the live
+database), so each pass over 2.67M paths took about a minute. By that arithmetic
+the stats took most of the rest; that is inferred, not measured.
+
+**Fix.**
+- Each of those steps is now a phase that counts files
+  (`BackupProgress.PhaseFilesDone`/`PhaseFilesTotal`, reported by `PhaseProgress`
+  at the `ProgressCadence`, two updates a second). The panel shows
+  "Checking files against the catalog (1,234,567 of 2,671,103)...", the phase's
+  own bar, the file it has reached, files per second, time elapsed and time left.
+- The check stats candidates and looks them up in batches sized to take about
+  100 ms per catalog call. Pause is checked before every candidate and every batch.
+- The check hands what it found to `ExecuteAsync` (`knownVersions`), which no
+  longer looks it up again. The orphaned-history query now goes only to paths with
+  no live version, the only case in which its answer is used.
+- A report that arrives after Pause no longer replaces "Paused" on the panel.
+- The size probe no longer swallows a cancellation.
+
+**Tested.** `tools\targeted_progress_test` §9-11:
+- 400,005 candidates check in about 11 s, reporting 0, 5,745, 26,995, … every
+  472-501 ms, each report naming the candidate reached.
+- A pause part-way stops the count, and resuming finishes the run.
+- A proxy catalog counts 5 live lookups for 5 files, where the old code made 10.
+- Every other pre-copy phase reports.
+- The panel shows a phase's count, bar, file, rate and time left, and keeps
+  "Paused".
+
+Each fix was put back to the old behaviour in a scratch tree, and the matching
+checks failed.
+
+**Not done.**
+- **The check still stats every candidate, one at a time.** The GUI's walk of the
+  added folders already had each file's size, and could have had its time too.
+  Passing those on would skip 2.67M stats, which by the arithmetic above were
+  most of the sixteen minutes. The price: a file deleted between the walk and the
+  backup would surface as a failed copy instead of being skipped quietly. Measure
+  the stats before deciding. Parallel stats are the other option.
+- Block dedup's pre-pass reads each file whole, and its count moves per file. One
+  huge file shows no movement inside it, though the panel names the file.
+- Observed on the same run, not investigated: the copy itself ran at about 25
+  files/s (12,370 files, 730 MB in 8 min 16 s, mostly small files to a USB hard
+  disk). At that rate this run needs about 30 hours.
+
 ## FIXED: a backup started in the app waited for the Worker's whole continuous run — "Checking 23,780 file(s) against the catalog..." for hours (2026-09-23)
 
 **Symptom.** The user changed both sets' sources and said yes to backing up the
