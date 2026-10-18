@@ -1194,6 +1194,115 @@ not, for months. **When adding an operation that pairs a catalog write with a
 destination write, the guard goes at the top of the operation, not inside the
 destination half.**
 
+## An empty catalog is not an empty destination
+
+The engine numbers a file's versions from the catalog (`GetLastVersionAsync`,
+`HighestVersion + 1`) and files the superseded copy at `{drive}_prev\rel.v{N}`.
+Every path to a catalog that knows less than the destination - a set imported
+without its history, re-created by hand, cleared with Clear Backup History, or
+seeded by a seed that skipped `_prev` - restarts that numbering at 1 over a
+destination whose `.v1`, `.v2`, … already exist. The `_prev` move used
+`File.Move(..., overwrite: true)`, so each later change silently destroyed one old
+version. That is how the first two sets ever moved to a new computer behaved:
+"Never backed up", then the Worker began a 1.6 TB re-copy a minute after the
+import (see known-issues.md). Four defences, each sufficient for part of it:
+
+* **The engine never overwrites a version file it does not own.** At the `_prev`
+  move, a version file already at the record's number belongs to no record (the
+  catalog's only record of that number says its copy is at the current path), so
+  the catalog and the drive disagree, and **which file holds the record's
+  content decides what happened**. If the current copy matches the record (hash,
+  or size for a record seeded without one), the `.vN` is history the catalog
+  never had: the copy is filed under the first number above both
+  `HighestVersion` and every `.vN` on disk and the record renumbered to match.
+  If instead the existing `.vN` matches, the catalog is *behind* the drive - the
+  old computer backed up again after its history was exported, or a batch was
+  uncommitted when the snapshot was taken - so the record is pointed at its `.vN`
+  unchanged and the newer, unrecorded current copy becomes a version record of
+  its own under the fresh number. (Renumbering in that case labelled the newer
+  bytes with the old hash; the review of this change caught it.) Either way the
+  new copy is numbered after the fresh number and the move is `overwrite:
+  false`. Cost: three `File.Exists` probes per versioned write, plus one read of
+  the current copy only when they find a collision.
+* **History travels with an export.** `BackupSetTransfer` writes a zip of
+  `backupset.json` plus `history.db`, a `VACUUM INTO` snapshot taken through its
+  own read-only connection (the set's connection would hold its gate for the whole
+  copy, and cannot `VACUUM` at all while a backup's transaction is open on it).
+  Import `ATTACH`es the snapshot to the new set's connection and copies all four
+  tables in one transaction. **Only disc ids are remapped**: they are global
+  (allocated from the master's `DiscOwners`, in one transaction - a directory set
+  gets a disc per run, continuous runs included, so tens of thousands is normal),
+  while file, chunk and block ids are local and are kept, which only an empty
+  target can guarantee - hence the emptiness check. A failed history import
+  deletes the set it created: a set claiming a last-backup time with no records is
+  the trap this exists to close. Settings-only exports stay the old plain JSON, so
+  older versions can still read them; the two are told apart by the zip magic.
+* **The catalog-empty check** (`DirectoryBackupService.FindUntrackedBackupAsync`):
+  no file records at all (one `EXISTS` probe) **and** a file under the destination
+  path of one of the set's own selected roots, current or `_prev`. Scoped to the
+  set's roots on purpose: sets sharing a destination folder with different
+  sources, or pointed at a folder of unrelated files, never trigger it. The GUI
+  asks (seed / back up anyway / cancel) before its scan; the Worker refuses and
+  logs once per destination, because "copy it all again" is not a choice to make
+  on the user's behalf. Once the catalog has a single record the check is free and
+  never fires, which is also why no "user confirmed" flag is needed.
+* **The automated-backup hold** (`JobOptions.HoldAutomatedBackups`). Set by
+  import, Clear Backup History and seeding, honoured by the Worker's
+  `ReloadBackupSetsAsync` (`active` excludes held sets), cleared by the first full
+  backup the GUI completes (including one that found nothing to copy) or the
+  row's Resume link. Seeding needs it for a reason of its own: the seed commits
+  in batches, so a Worker full scan that started mid-seed would treat every path
+  not yet reached as new. It is written straight to the catalog from a fresh read;
+  the editor's Save writes back whatever the catalog holds at that moment
+  (`CarryStoredHoldAsync`) rather than its own copy's value, which re-paused a set
+  released while the editor was open, and `SnapshotEditorSettings` blanks it so it
+  cannot pose as an unsaved edit. On
+  release the Worker moves its in-memory clocks up to `LastBackupUtc` (only on
+  release: `LastBackupUtc` is bumped by targeted runs too, and timing the safety
+  net from it is exactly what `LastFullScanUtc` exists to avoid).
+
+**The seed** now walks each drive folder and its `{drive}_prev` twin together,
+folder by folder, so all stored forms and versions of one source path are in hand
+at once; it records each version under its own number (backup time = the version
+file's write time, which is when it was copied - copies do not carry the source
+timestamp - and what retention ages it by), numbers the current copy after them,
+keeps one stored form per file and version (plain, then `.dedup`, then
+`.fileref`), and commits whole paths in batches so a cancel can never leave a path
+with history but no current copy (a re-run skips paths already present and would
+never fill the gap). A file's source path comes from where it sits, never from a
+`.fileref`'s own `SourcePath`: relocation moves manifests without rewriting it, so
+after a rename it named the old file. After a seed it ticks the folders it found
+only for a set with no sources yet; in an existing set that widened the selection.
+
+**Catalog-writing work holds the set's row, wherever it was started.** Seeding
+and Clear Backup History call `BeginRowWork`/`EndRowWork`: the row goes into
+`IsRunning` with `BusyActivity` set ("seeding"), its scan-phase status line shows
+the progress, and `ScanCts` is a token linked to the editor's own, so the row's
+Abort stops it. Reusing `IsRunning` rather than adding a flag is the point: every
+per-set command, `RunIncrementalFlowAsync`, the task-window conflict check and
+`LoadBackupSetsAsync` already treat a running row as untouchable, so a backup
+cannot start mid-seed from any path (the editor is modeless, and the post-edit
+"back up added folders" offer reaches the backup flow without the row's button).
+The reverse holds too: seeding or clearing is refused while the row is running a
+backup. The work outlives the editor - Save and ✕ close it, the work carries on on
+the row - so the seed must not touch the editor's tree once it has closed
+(`editorClosed`), and the row is released before anything that could still throw.
+The post-save reconcile prompts are skipped while the row is busy. A duplicate
+analysis is read-only and blocks nothing; if the editor closes mid-run it moves to
+the row's `BackgroundWorkText` line with Stop (`CarryDedupAnalysisToRow`).
+Pinned by `tools\editor_save_test` §15, which freezes a seed by holding the set's
+cross-process write lock.
+
+**Restore follows the destination, not the disc label.** A directory backup's
+disc record is labelled with the destination folder as it was when that run
+happened, and restore found files only through that label. Nothing relabels
+discs when the drive is followed to a new letter or the set is imported where the
+drive has another letter (Change Destination relabels only discs matching the
+path it changes from), so every version backed up before such a change failed to
+restore with "Backup folder not found". `RestoreService.FindDiscRootAsync` keeps
+the label when its folder exists and otherwise falls back to the set's current
+destination, where the files sit at the same relative paths.
+
 ## Continuous backup and full scans interleave; they do not run concurrently
 
 The Worker is **one sequential poll loop** — `CheckSchedules` → `CheckContinuous`

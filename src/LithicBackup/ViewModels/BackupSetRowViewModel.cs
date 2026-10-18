@@ -29,6 +29,15 @@ public class BackupSetRowViewModel : ViewModelBase
     public DateTime? LastBackupUtc => Model.LastBackupUtc;
 
     /// <summary>
+    /// The set has automated backups switched on but held until a backup is run
+    /// from the app (<see cref="JobOptions.HoldAutomatedBackups"/>), so the row
+    /// says so and offers to resume them. Not shown for a manual-only set, where
+    /// there is nothing to hold.
+    /// </summary>
+    public bool IsAutomationHeld =>
+        Model.JobOptions is { HoldAutomatedBackups: true, Schedule.Enabled: true };
+
+    /// <summary>
     /// Swap in a freshly-loaded model (after a catalog reload) and refresh the
     /// display bindings, without discarding any live run state on this row.
     /// </summary>
@@ -38,6 +47,7 @@ public class BackupSetRowViewModel : ViewModelBase
         OnPropertyChanged(nameof(Name));
         OnPropertyChanged(nameof(SourceRoots));
         OnPropertyChanged(nameof(LastBackupUtc));
+        OnPropertyChanged(nameof(IsAutomationHeld));
     }
 
     private bool _isRunning;
@@ -51,6 +61,44 @@ public class BackupSetRowViewModel : ViewModelBase
         get => _isRunning;
         set { if (SetProperty(ref _isRunning, value)) CommandManager.InvalidateRequerySuggested(); }
     }
+
+    private string? _busyActivity;
+    /// <summary>
+    /// What is holding this row in <see cref="IsRunning"/> when it is not a backup:
+    /// "seeding", "clearing its history". Null during a backup and when idle.
+    /// Work that writes the set's catalog takes the row exactly as a backup does,
+    /// so the set's Backup, Modify, Restore and Delete actions are unavailable
+    /// until it finishes - a backup started mid-seed copied every file the seed
+    /// had not reached yet - and it carries on, visible here, after the editor
+    /// that started it is closed.
+    /// </summary>
+    public string? BusyActivity
+    {
+        get => _busyActivity;
+        set => SetProperty(ref _busyActivity, value);
+    }
+
+    private string _backgroundWorkText = "";
+    /// <summary>
+    /// Progress of read-only work an editor started and was closed during (a
+    /// duplicate analysis), shown on its own line with a Stop link. It blocks
+    /// nothing. Empty when there is none.
+    /// </summary>
+    public string BackgroundWorkText
+    {
+        get => _backgroundWorkText;
+        set
+        {
+            if (SetProperty(ref _backgroundWorkText, value))
+                OnPropertyChanged(nameof(HasBackgroundWork));
+        }
+    }
+
+    /// <summary>True while <see cref="BackgroundWorkText"/> has something to show.</summary>
+    public bool HasBackgroundWork => !string.IsNullOrEmpty(_backgroundWorkText);
+
+    /// <summary>Stops the work shown in <see cref="BackgroundWorkText"/>.</summary>
+    internal Action? StopBackgroundWork;
 
     private bool _isChecking;
     /// <summary>True while a pre-backup size check is running for this set.</summary>

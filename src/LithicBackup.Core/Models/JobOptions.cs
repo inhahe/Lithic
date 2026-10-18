@@ -72,4 +72,24 @@ public class JobOptions
     /// that lack this field.
     /// </summary>
     public BackupSchedule? Schedule { get; set; }
+
+    /// <summary>
+    /// Automated backups (the Worker's schedule and continuous runs) are paused
+    /// until a backup is run from the app. Cleared by the first full backup the
+    /// GUI completes for the set, or by the row's Resume link.
+    ///
+    /// <para>Set whenever the catalog stops being a trustworthy record of the
+    /// destination: when the set is imported (on a new machine its destination
+    /// and sources may be at other paths, and without history it would copy
+    /// everything again), when its history is cleared, and when it is seeded
+    /// (a full backup that started mid-seed would treat every file the seed had
+    /// not reached yet as new). An imported set with an overdue schedule used to
+    /// start a full 1.6 TB backup about a minute after the import, before anyone
+    /// had looked at it.</para>
+    ///
+    /// <para>Kept out of the editor's unsaved-changes comparison
+    /// (<c>MainViewModel.SnapshotEditorSettings</c>): it is written straight to
+    /// the catalog, never by the editor's Save.</para>
+    /// </summary>
+    public bool HoldAutomatedBackups { get; set; }
 }

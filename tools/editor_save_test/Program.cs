@@ -258,6 +258,7 @@ internal static class Program
 #endif
 #if !OLD_CODE
         await UnitTestsAsync();
+        await SeedHoldsTheRowAsync(dbPath);
 #endif
         Check(_dialogs.Unexpected.Count == 0,
             "no unexpected message box appeared"
@@ -545,6 +546,114 @@ internal static class Program
             "and the deleted-but-ticked folder is still selected");
         await EnsureClosedAsync(ed.Window);
     }
+
+#if !OLD_CODE
+    /// <summary>
+    /// A seed holds the set's row like a backup: progress on the row, Backup /
+    /// Modify / Delete unavailable, and it carries on, visibly, after Save closes
+    /// the editor; the row's Abort stops it. Saving mid-seed used to leave it
+    /// running with nothing on screen, and a backup started then copied every file
+    /// the seed had not reached yet.
+    ///
+    /// The seed is frozen deterministically by holding the set's cross-process
+    /// write lock (the seed's first write - its disc record - waits for it), so
+    /// nothing here depends on how fast the disk is.
+    /// </summary>
+    static async Task SeedHoldsTheRowAsync(string dbPath)
+    {
+        Console.WriteLine();
+        Console.WriteLine("=== 15. a seed holds the set's row, survives Save, and Abort stops it ===");
+
+        // A Lithic-style destination: the current copy of small.txt and one
+        // earlier version of it.
+        string rel = _smallFile[Path.GetPathRoot(_smallFile)!.Length..];
+        string current = Path.Combine(_dst, _smallFile[..1], rel);
+        string prev = Path.Combine(_dst, _smallFile[..1] + "_prev", rel + ".v1");
+        Directory.CreateDirectory(Path.GetDirectoryName(current)!);
+        Directory.CreateDirectory(Path.GetDirectoryName(prev)!);
+        File.WriteAllText(current, "current copy");
+        File.WriteAllText(prev, "an earlier version");
+
+        // This scenario needs a real backup service (the others run without one).
+        _vm = new MainViewModel(
+            _catalog,
+            burner: null!,
+            scanner: new LithicBackup.Infrastructure.FileSystem.FileScanner(_catalog),
+            orchestrator: null!,
+            restoreService: null!,
+            catalogFreeRestoreService: null!,
+            directoryBackupService: new DirectoryBackupService(
+                _catalog,
+                new LithicBackup.Infrastructure.FileSystem.FileScanner(_catalog),
+                new VersionRetentionService(_catalog)),
+            settings: new UserSettings { ReconcileMode = ReconcileAfterEditMode.Never });
+        if (!await WaitFor(() => _vm.BackupSets.Any(r => r.Id == _setId), 10000))
+        {
+            Check(false, "the second main window loaded the test set");
+            return;
+        }
+        var row = _vm.BackupSets.First(r => r.Id == _setId);
+        string lockPath = Path.Combine(Path.GetDirectoryName(dbPath)!, "sets", $"set-{_setId}.db.writelock");
+
+        // --- Save mid-seed ---
+        var ed = await OpenEditorAsync("seed");
+        if (ed is null) return;
+        var held = new FileStream(lockPath, FileMode.OpenOrCreate, FileAccess.ReadWrite, FileShare.None);
+        try
+        {
+            ed.Vm.SeedFromExistingCommand.Execute(null);
+            Check(await WaitFor(() => row.IsRunning && row.BusyActivity == "seeding", 10000),
+                "the seed holds the set's row as soon as it starts");
+            Check(!_vm.SetBackupCommand.CanExecute(row), "Backup is unavailable while it seeds");
+            Check(!_vm.SetModifyCommand.CanExecute(row), "so is Modify");
+            Check(!_vm.SetDeleteCommand.CanExecute(row), "and Delete");
+            Check(row.RunningStatusText.Contains("Seeding", StringComparison.Ordinal),
+                $"the row says it is seeding (\"{row.RunningStatusText}\")");
+
+            await ToggleAsync(ed, _b, true);
+            ed.Vm.SaveCommand.Execute(null);
+            Check(await WaitClosedAsync(ed.Window), "Save closes the editor mid-seed");
+            Check(row.IsRunning && row.BusyActivity == "seeding", "and the seed carries on, on the row");
+            Check(_vm.StatusText.Contains("still seeding", StringComparison.Ordinal),
+                $"the status bar says where it went (\"{_vm.StatusText}\")");
+        }
+        finally
+        {
+            held.Dispose();
+        }
+
+        Check(await WaitFor(() => !row.IsRunning, 20000), "once it can write, the seed finishes and releases the row");
+        Check(row.LastResultText.StartsWith("Seeded:", StringComparison.Ordinal),
+            $"its result is left on the row (\"{row.LastResultText}\")");
+        var heads = await _observer.GetLatestVersionInfoAsync(_setId);
+        Check(heads.TryGetValue(_smallFile, out var head) && head.MaxVersion == 2,
+            "it recorded small.txt after its earlier version (v2)");
+        Check(_vm.SetBackupCommand.CanExecute(row), "and Backup is available again");
+
+        // --- Abort mid-seed ---
+        await _observer.ClearBackupSetCatalogAsync(_setId);
+        var ed2 = await OpenEditorAsync("seed abort");
+        if (ed2 is null) return;
+        held = new FileStream(lockPath, FileMode.OpenOrCreate, FileAccess.ReadWrite, FileShare.None);
+        try
+        {
+            ed2.Vm.SeedFromExistingCommand.Execute(null);
+            Check(await WaitFor(() => row.IsRunning && row.BusyActivity == "seeding", 10000),
+                "a second seed holds the row");
+            Check(_vm.AbortBackupCommand.CanExecute(row), "the row's Abort is available during a seed");
+            _vm.AbortBackupCommand.Execute(row);
+            Check(await WaitFor(() => !row.IsRunning, 10000), "Abort stops the seed and releases the row");
+            Check(row.LastResultText.StartsWith("Seed stopped", StringComparison.Ordinal),
+                $"and says so (\"{row.LastResultText}\")");
+            Check(await WaitFor(() => !ed2.Vm.IsSeeding, 5000), "the open editor sees it stop too");
+        }
+        finally
+        {
+            held.Dispose();
+        }
+        await EnsureClosedAsync(ed2.Window);
+    }
+#endif
 
     static LargestFilesViewModel? FindLargestFilesVm(out Window? host)
     {

@@ -1750,6 +1750,153 @@ internal sealed class SqliteSetDatabase : IDisposable
         cmd.ExecuteNonQuery();
     }
 
+    /// <summary>Whether this set holds any file record, deleted ones included.</summary>
+    public async Task<bool> HasFileRecordsAsync(CancellationToken ct = default)
+    {
+        ct.ThrowIfCancellationRequested();
+        using var _ = await LockAsync(ct).ConfigureAwait(false);
+
+        using var cmd = _connection.CreateCommand();
+        cmd.CommandText = "SELECT EXISTS (SELECT 1 FROM Files)";
+        return Convert.ToInt64(cmd.ExecuteScalar()) != 0;
+    }
+
+    /// <summary>
+    /// Copy every disc, file, chunk and dedup-block row out of an exported history
+    /// database into this one, in one transaction. This database must be empty:
+    /// file, chunk and block ids are kept as they are (so FileChunks.FileRecordId
+    /// stays valid without remapping), which only an empty table can guarantee.
+    /// Disc ids are global and come from <paramref name="discIdMap"/> (old → new),
+    /// allocated by the caller from the master catalog.
+    /// </summary>
+    /// <returns>The number of file records copied.</returns>
+    public async Task<int> ImportHistoryFromAsync(
+        string sourceDatabasePath, IReadOnlyDictionary<long, int> discIdMap, CancellationToken ct = default)
+    {
+        ct.ThrowIfCancellationRequested();
+
+        // A write like any other: cross-process lock, then the gate. Not through
+        // BeginTransactionAsync, because ATTACH and DETACH must run outside a
+        // transaction on this same connection.
+        var fileLock = await AcquireCrossProcessWriteAsync(ct).ConfigureAwait(false);
+        try
+        {
+            await _gate.WaitAsync(ct).ConfigureAwait(false);
+        }
+        catch
+        {
+            fileLock.Dispose();
+            throw;
+        }
+
+        try
+        {
+            using (var check = _connection.CreateCommand())
+            {
+                check.CommandText = "SELECT EXISTS (SELECT 1 FROM Files) OR EXISTS (SELECT 1 FROM Discs)";
+                if (Convert.ToInt64(check.ExecuteScalar()) != 0)
+                    throw new InvalidOperationException(
+                        "This backup set already has backup history; history can only be imported into an empty set.");
+            }
+
+            using (var attach = _connection.CreateCommand())
+            {
+                attach.CommandText = "ATTACH DATABASE $path AS src";
+                attach.Parameters.AddWithValue("$path", sourceDatabasePath);
+                attach.ExecuteNonQuery();
+            }
+
+            try
+            {
+                using var tx = _connection.BeginTransaction();
+
+                Execute("CREATE TEMP TABLE DiscIdMap (OldId INTEGER PRIMARY KEY, NewId INTEGER NOT NULL)");
+                using (var ins = _connection.CreateCommand())
+                {
+                    ins.CommandText = "INSERT INTO temp.DiscIdMap (OldId, NewId) VALUES ($old, $new)";
+                    var pOld = ins.Parameters.Add("$old", SqliteType.Integer);
+                    var pNew = ins.Parameters.Add("$new", SqliteType.Integer);
+                    foreach (var (oldId, newId) in discIdMap)
+                    {
+                        pOld.Value = oldId;
+                        pNew.Value = newId;
+                        ins.ExecuteNonQuery();
+                    }
+                }
+
+                // Explicit column lists on both sides, so an export from a build
+                // whose tables carry extra columns still imports.
+                using (var cmd = _connection.CreateCommand())
+                {
+                    cmd.CommandText = """
+                        INSERT INTO main.Discs
+                            (Id, BackupSetId, Label, SequenceNumber, MediaType, FilesystemType,
+                             Capacity, BytesUsed, RewriteCount, IsMultisession, IsBad, Status,
+                             CreatedUtc, LastWrittenUtc)
+                        SELECT m.NewId, $setId, d.Label, d.SequenceNumber, d.MediaType, d.FilesystemType,
+                               d.Capacity, d.BytesUsed, d.RewriteCount, d.IsMultisession, d.IsBad, d.Status,
+                               d.CreatedUtc, d.LastWrittenUtc
+                        FROM src.Discs d
+                        INNER JOIN temp.DiscIdMap m ON m.OldId = d.Id
+                        """;
+                    cmd.Parameters.AddWithValue("$setId", SetId);
+                    cmd.ExecuteNonQuery();
+                }
+
+                int files;
+                using (var cmd = _connection.CreateCommand())
+                {
+                    cmd.CommandText = """
+                        INSERT INTO main.Files
+                            (Id, DiscId, SourcePath, DiscPath, SizeBytes, Hash,
+                             IsZipped, IsSplit, IsDeduped, IsFileRef, Version, IsDeleted,
+                             SourceLastWriteUtc, BackedUpUtc)
+                        SELECT f.Id, m.NewId, f.SourcePath, f.DiscPath, f.SizeBytes, f.Hash,
+                               f.IsZipped, f.IsSplit, f.IsDeduped, f.IsFileRef, f.Version, f.IsDeleted,
+                               f.SourceLastWriteUtc, f.BackedUpUtc
+                        FROM src.Files f
+                        INNER JOIN temp.DiscIdMap m ON m.OldId = f.DiscId
+                        """;
+                    files = cmd.ExecuteNonQuery();
+                }
+
+                Execute("""
+                    INSERT INTO main.FileChunks
+                        (Id, FileRecordId, DiscId, Sequence, Offset, Length, DiscFilename)
+                    SELECT c.Id, c.FileRecordId, m.NewId, c.Sequence, c.Offset, c.Length, c.DiscFilename
+                    FROM src.FileChunks c
+                    INNER JOIN temp.DiscIdMap m ON m.OldId = c.DiscId
+                    WHERE c.FileRecordId IN (SELECT Id FROM main.Files)
+                    """);
+
+                // Directory backups register blocks with DiscId 0 (no disc), which
+                // has no mapping and stays 0.
+                Execute("""
+                    INSERT INTO main.DeduplicationBlocks (Id, Hash, SizeBytes, ReferenceCount, DiscId)
+                    SELECT b.Id, b.Hash, b.SizeBytes, b.ReferenceCount, COALESCE(m.NewId, b.DiscId)
+                    FROM src.DeduplicationBlocks b
+                    LEFT JOIN temp.DiscIdMap m ON m.OldId = b.DiscId
+                    """);
+
+                Execute("DROP TABLE temp.DiscIdMap");
+                tx.Commit();
+                return files;
+            }
+            finally
+            {
+                // A failed transaction has rolled back by now (the using above),
+                // so DETACH is allowed.
+                try { Execute("DETACH DATABASE src"); }
+                catch { /* the connection is still usable; the file is a temp copy */ }
+            }
+        }
+        finally
+        {
+            _gate.Release();
+            fileLock.Dispose();
+        }
+    }
+
     /// <summary>
     /// Delete every disc/file/chunk record in this set's database, leaving the
     /// (empty) database file in place.  Dedup blocks are also cleared since they

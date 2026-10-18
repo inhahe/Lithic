@@ -413,6 +413,37 @@ public interface ICatalogRepository : IDisposable
     /// </summary>
     Task ExportDatabaseAsync(int backupSetId, string destinationPath, CancellationToken ct = default);
 
+    // --- Backup history transfer (set export/import) ---
+
+    /// <summary>
+    /// Whether the set's catalog holds any file record at all, deleted or not.
+    /// A single indexed probe, cheap enough to ask before every automated run.
+    /// </summary>
+    Task<bool> HasFileRecordsAsync(int backupSetId, CancellationToken ct = default);
+
+    /// <summary>
+    /// Approximate on-disk size of the set's history database in bytes (the
+    /// database file plus its write-ahead log), or 0 when it has none yet.
+    /// </summary>
+    long GetSetHistorySizeBytes(int backupSetId);
+
+    /// <summary>
+    /// Write a consistent snapshot of the set's history database (discs, files,
+    /// chunks, dedup blocks) to <paramref name="destinationPath"/>, for carrying
+    /// the set to another machine. Reads through its own connection, so it never
+    /// waits on, or interleaves with, a backup running on the set.
+    /// </summary>
+    Task ExportSetHistoryAsync(int backupSetId, string destinationPath, CancellationToken ct = default);
+
+    /// <summary>
+    /// Load a history snapshot written by <see cref="ExportSetHistoryAsync"/> into
+    /// <paramref name="backupSetId"/>, which must have no history yet. Disc ids
+    /// are re-allocated (they are unique across the whole catalog, and the
+    /// snapshot's may already belong to another set here); everything else keeps
+    /// its numbers. All or nothing. Returns the number of file records imported.
+    /// </summary>
+    Task<int> ImportSetHistoryAsync(int backupSetId, string sourceDatabasePath, CancellationToken ct = default);
+
     // --- USN change-journal cursors ---
 
     /// <summary>

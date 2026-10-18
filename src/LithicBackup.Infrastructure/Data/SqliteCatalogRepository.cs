@@ -138,6 +138,35 @@ public class SqliteCatalogRepository : ICatalogRepository
         }
     }
 
+    /// <summary>Allocate <paramref name="count"/> disc ids for one set in a single master transaction.</summary>
+    private async Task<IReadOnlyList<int>> AllocateDiscIdsAsync(int setId, int count, CancellationToken ct)
+    {
+        var ids = new List<int>(count);
+        await _masterGate.WaitAsync(ct).ConfigureAwait(false);
+        try
+        {
+            using var tx = _master.BeginTransaction();
+            using var cmd = _master.CreateCommand();
+            cmd.Transaction = tx;
+            cmd.CommandText = """
+                INSERT INTO DiscOwners (SetId) VALUES ($setId);
+                SELECT last_insert_rowid();
+                """;
+            cmd.Parameters.AddWithValue("$setId", setId);
+            for (int i = 0; i < count; i++)
+                ids.Add(Convert.ToInt32(cmd.ExecuteScalar()));
+            tx.Commit();
+        }
+        finally
+        {
+            _masterGate.Release();
+        }
+
+        foreach (int id in ids)
+            _discToSet[id] = setId;
+        return ids;
+    }
+
     /// <summary>Resolve which set owns a disc, or null if the disc is unknown.</summary>
     private async Task<int?> ResolveSetForDiscAsync(int discId, CancellationToken ct)
     {
@@ -583,6 +612,143 @@ public class SqliteCatalogRepository : ICatalogRepository
 
     public Task ExportDatabaseAsync(int backupSetId, string destinationPath, CancellationToken ct = default)
         => GetSet(backupSetId).ExportDatabaseAsync(destinationPath, ct);
+
+    // ---------------------------------------------------------------
+    // Backup history transfer (set export/import)
+    // ---------------------------------------------------------------
+
+    public Task<bool> HasFileRecordsAsync(int backupSetId, CancellationToken ct = default)
+        => GetSet(backupSetId).HasFileRecordsAsync(ct);
+
+    public long GetSetHistorySizeBytes(int backupSetId)
+    {
+        long total = 0;
+        foreach (var suffix in new[] { "", "-wal" })
+        {
+            try
+            {
+                var fi = new FileInfo(SetDbPath(backupSetId) + suffix);
+                if (fi.Exists) total += fi.Length;
+            }
+            catch { /* best effort - only shown as an estimate */ }
+        }
+        return total;
+    }
+
+    public async Task ExportSetHistoryAsync(int backupSetId, string destinationPath, CancellationToken ct = default)
+    {
+        ct.ThrowIfCancellationRequested();
+
+        // Make sure the set database exists (an untouched set has no file yet).
+        GetSet(backupSetId);
+
+        if (File.Exists(destinationPath))
+            File.Delete(destinationPath); // VACUUM INTO refuses an existing file
+
+        // A connection of our own rather than the set's: VACUUM INTO reads a
+        // consistent snapshot inside one read transaction, which in WAL mode
+        // neither blocks nor is blocked by a writer in this process or the
+        // Worker. Going through the set's connection would hold its gate for the
+        // whole copy (minutes, for a multi-GB set) and could not run at all while
+        // that connection had a backup's transaction open.
+        await Task.Run(() =>
+        {
+            using (var conn = new SqliteConnection(
+                       $"Data Source={SetDbPath(backupSetId)};Mode=ReadOnly;Pooling=False"))
+            {
+                conn.Open();
+                using var cmd = conn.CreateCommand();
+                cmd.CommandText = "VACUUM INTO $path";
+                cmd.Parameters.AddWithValue("$path", destinationPath);
+                cmd.ExecuteNonQuery();
+            }
+
+            // A self-contained file: no -wal/-shm companions to lose in transit.
+            using (var conn = new SqliteConnection($"Data Source={destinationPath};Pooling=False"))
+            {
+                conn.Open();
+                using var cmd = conn.CreateCommand();
+                cmd.CommandText = "PRAGMA journal_mode=DELETE";
+                cmd.ExecuteNonQuery();
+            }
+        }, ct).ConfigureAwait(false);
+    }
+
+    public async Task<int> ImportSetHistoryAsync(int backupSetId, string sourceDatabasePath, CancellationToken ct = default)
+    {
+        ct.ThrowIfCancellationRequested();
+
+        // The snapshot's disc ids, to re-allocate. Read through a connection of
+        // its own; it is a plain file, not one of ours.
+        var oldDiscIds = new List<long>();
+        await Task.Run(() =>
+        {
+            using var conn = new SqliteConnection($"Data Source={sourceDatabasePath};Mode=ReadOnly;Pooling=False");
+            conn.Open();
+            using var cmd = conn.CreateCommand();
+            cmd.CommandText = "SELECT Id FROM Discs ORDER BY Id";
+            using var r = cmd.ExecuteReader();
+            while (r.Read())
+                oldDiscIds.Add(r.GetInt64(0));
+        }, ct).ConfigureAwait(false);
+
+        if (oldDiscIds.Count == 0)
+            return 0;
+
+        var db = GetSet(backupSetId);
+        if (await db.HasFileRecordsAsync(ct).ConfigureAwait(false))
+            throw new InvalidOperationException(
+                "This backup set already has backup history; history can only be imported into an empty set.");
+
+        var map = new Dictionary<long, int>(oldDiscIds.Count);
+        try
+        {
+            // Directory sets get a disc record per run, continuous runs included,
+            // so a long-lived set can have tens of thousands: allocate them in one
+            // master transaction rather than one commit each.
+            var newIds = await AllocateDiscIdsAsync(backupSetId, oldDiscIds.Count, ct).ConfigureAwait(false);
+            for (int i = 0; i < oldDiscIds.Count; i++)
+                map[oldDiscIds[i]] = newIds[i];
+
+            return await Task.Run(() => db.ImportHistoryFromAsync(sourceDatabasePath, map, ct), ct)
+                .ConfigureAwait(false);
+        }
+        catch
+        {
+            // Nothing was imported (the copy is one transaction), so give back the
+            // disc ids reserved for it rather than leave owners with no discs.
+            await ReleaseDiscIdsAsync(map.Values).ConfigureAwait(false);
+            throw;
+        }
+    }
+
+    private async Task ReleaseDiscIdsAsync(IEnumerable<int> discIds)
+    {
+        var ids = discIds.ToList();
+        if (ids.Count == 0) return;
+
+        await _masterGate.WaitAsync().ConfigureAwait(false);
+        try
+        {
+            using var tx = _master.BeginTransaction();
+            using var cmd = _master.CreateCommand();
+            cmd.Transaction = tx;
+            cmd.CommandText = "DELETE FROM DiscOwners WHERE DiscId = $id";
+            var p = cmd.Parameters.Add("$id", SqliteType.Integer);
+            foreach (int id in ids)
+            {
+                p.Value = id;
+                cmd.ExecuteNonQuery();
+                _discToSet.TryRemove(id, out _);
+            }
+            tx.Commit();
+        }
+        catch { /* best effort - an unused owner row is harmless */ }
+        finally
+        {
+            _masterGate.Release();
+        }
+    }
 
     // ---------------------------------------------------------------
     // Delete / clear / copy backup set

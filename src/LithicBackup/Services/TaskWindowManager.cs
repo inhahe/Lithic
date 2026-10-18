@@ -70,15 +70,19 @@ public static class TaskKinds
 public sealed class TaskWindowManager
 {
     private readonly Dictionary<string, TaskWindow> _open = new(StringComparer.Ordinal);
-    private readonly Func<int, bool> _isBackupRunning;
+    /// <summary>
+    /// Describes work that holds a set without a window of its own (a backup, a
+    /// seed), as a clause for the conflict warning, or null when there is none.
+    /// </summary>
+    private readonly Func<int, string?> _describeRunningWork;
     private readonly Func<Window?> _mainWindow;
 
     /// <summary>Cascade offset so successive windows don't land exactly on top of each other.</summary>
     private int _cascadeStep;
 
-    public TaskWindowManager(Func<int, bool> isBackupRunning, Func<Window?> mainWindow)
+    public TaskWindowManager(Func<int, string?> describeRunningWork, Func<Window?> mainWindow)
     {
-        _isBackupRunning = isBackupRunning;
+        _describeRunningWork = describeRunningWork;
         _mainWindow = mainWindow;
     }
 
@@ -181,13 +185,11 @@ public sealed class TaskWindowManager
     {
         var reasons = new List<string>();
 
-        // A running backup is a writer too, even though it has no window.
+        // A running backup (or seed) is a writer too, even though it has no window.
         if ((kind.WritesCatalog || kind.WritesDestination || kind.ReadsDestination)
-            && _isBackupRunning(setId))
+            && _describeRunningWork(setId) is { } running)
         {
-            reasons.Add(
-                "a backup of this set is running right now, so it is actively "
-                + "writing the catalog and the destination");
+            reasons.Add(running);
         }
 
         foreach (var (openKind, openSetId) in _meta.Values)

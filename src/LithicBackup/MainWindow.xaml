@@ -246,6 +246,38 @@
                                                                                                    Foreground="{StaticResource ErrorBrush}"
                                                                                                    Text="{Binding DestinationFullText}"
                                                                                                    Visibility="{Binding IsDestinationFull, Converter={StaticResource BoolToVis}}" />
+
+                                                                                        <!-- Read-only work an editor was closed during (a duplicate
+                                                                                             analysis): its progress, and a way to stop it. -->
+                                                                                        <TextBlock FontSize="11"
+                                                                                                   Margin="0,2,0,0"
+                                                                                                   TextWrapping="Wrap"
+                                                                                                   Foreground="{StaticResource TextSecondaryBrush}"
+                                                                                                   Visibility="{Binding HasBackgroundWork, Converter={StaticResource BoolToVis}}">
+                                                                                            <Run Text="{Binding BackgroundWorkText, Mode=OneWay}" />
+                                                                                            <Hyperlink Command="{Binding DataContext.SetStopBackgroundWorkCommand,
+                                                                                                                 RelativeSource={RelativeSource AncestorType=Window}}"
+                                                                                                       CommandParameter="{Binding}">
+                                                                                                <Run Text="Stop" />
+                                                                                            </Hyperlink>
+                                                                                        </TextBlock>
+
+                                                                                        <!-- Automated backups held until the user runs one (an imported,
+                                                                                             cleared or seeded set). Released by the next backup run from
+                                                                                             here, or by Resume. -->
+                                                                                        <TextBlock FontSize="11"
+                                                                                                   Margin="0,2,0,0"
+                                                                                                   TextWrapping="Wrap"
+                                                                                                   Foreground="{StaticResource TextSecondaryBrush}"
+                                                                                                   Visibility="{Binding IsAutomationHeld, Converter={StaticResource BoolToVis}}">
+                                                                                            <Run Text="Automated backups are paused until you run a backup." />
+                                                                                            <Hyperlink Command="{Binding DataContext.SetResumeAutomationCommand,
+                                                                                                                 RelativeSource={RelativeSource AncestorType=Window}}"
+                                                                                                       CommandParameter="{Binding}"
+                                                                                                       ToolTip="Let the background service back this set up on its schedule again, without running a backup first.">
+                                                                                                <Run Text="Resume now" />
+                                                                                            </Hyperlink>
+                                                                                        </TextBlock>
                                                                                     </StackPanel>
 
                                                                                     <!-- Running status (visible only while this set is running) -->

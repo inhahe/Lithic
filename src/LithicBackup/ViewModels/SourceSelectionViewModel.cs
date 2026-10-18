@@ -943,9 +943,11 @@ public class SourceSelectionViewModel : ViewModelBase, IDisposable
     }
 
     /// <summary>
-    /// When true, the seed operation skips SHA-256 hashing and records only
-    /// file size + last-write-time.  Much faster — hashing is not needed for
-    /// incremental detection (which uses size + timestamp).
+    /// When true, the seed operation skips SHA-256 hashing of plain copies and
+    /// records only file size + last-write-time.  Much faster — hashing is not
+    /// needed for incremental detection (which uses size + timestamp) — but a
+    /// .fileref resolves to its content by hash, so references to unhashed plain
+    /// copies would not resolve on restore.
     /// </summary>
     public bool SeedSkipHashing
     {

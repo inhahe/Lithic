@@ -90,7 +90,12 @@ public class MainViewModel : ViewModelBase
         // The row VMs are the authority on whether a set is mid-run, and the
         // main window is resolved lazily because it does not exist yet here.
         _taskWindows = new Services.TaskWindowManager(
-            isBackupRunning: setId => RowFor(setId)?.IsRunning == true,
+            describeRunningWork: setId => RowFor(setId) is { IsRunning: true } r
+                ? r.BusyActivity is { } activity
+                    ? $"this set is {activity} right now, so its catalog is actively being written"
+                    : "a backup of this set is running right now, so it is actively "
+                      + "writing the catalog and the destination"
+                : null,
             mainWindow: () => Application.Current?.MainWindow);
 
         BackupSets = [];
@@ -149,9 +154,11 @@ public class MainViewModel : ViewModelBase
         LargestFilesCommand = new RelayCommand(
             _ => StartLargestFilesFlow(),
             _ => SelectedBackupSet is not null);
+        // Not while the set is backing up in this window: the export reads the
+        // set's database, and a read here shares the backup's connection.
         ExportBackupSetCommand = new RelayCommand(
             _ => _ = ExportBackupSetAsync(),
-            _ => SelectedBackupSet is not null);
+            _ => SelectedBackupSet is not null && SelectedRow is not { IsRunning: true });
         ImportBackupSetCommand = new RelayCommand(
             _ => _ = ImportBackupSetAsync());
 
@@ -203,10 +210,16 @@ public class MainViewModel : ViewModelBase
             o => o is BackupSetRowViewModel r && !r.IsRunning);
         SetExportCommand = new RelayCommand(
             o => { if (o is BackupSetRowViewModel r) { SelectedBackupSet = r.Model; _ = ExportBackupSetAsync(); } },
-            o => o is BackupSetRowViewModel);
+            o => o is BackupSetRowViewModel r && !r.IsRunning);
         SetDeleteCommand = new RelayCommand(
             o => { if (o is BackupSetRowViewModel r) _ = DeleteBackupSetAsync(r.Model); },
             o => o is BackupSetRowViewModel r && !r.IsRunning);
+        SetResumeAutomationCommand = new RelayCommand(
+            o => { if (o is BackupSetRowViewModel r) _ = ResumeAutomatedBackupsAsync(r.Model); },
+            o => o is BackupSetRowViewModel { IsAutomationHeld: true });
+        SetStopBackgroundWorkCommand = new RelayCommand(
+            o => (o as BackupSetRowViewModel)?.StopBackgroundWork?.Invoke(),
+            o => o is BackupSetRowViewModel { StopBackgroundWork: not null });
         InstallServiceCommand = new RelayCommand(_ => InstallService());
         UninstallServiceCommand = new RelayCommand(_ => UninstallService());
         StartServiceCommand = new RelayCommand(_ => StartService());
@@ -337,6 +350,12 @@ public class MainViewModel : ViewModelBase
     public ICommand SetRemapSourceDriveCommand { get; }
     public ICommand SetExportCommand { get; }
     public ICommand SetDeleteCommand { get; }
+
+    /// <summary>Release a set's <see cref="JobOptions.HoldAutomatedBackups"/> without running a backup.</summary>
+    public ICommand SetResumeAutomationCommand { get; }
+
+    /// <summary>Stop the read-only work shown on a row's <see cref="BackupSetRowViewModel.BackgroundWorkText"/> line.</summary>
+    public ICommand SetStopBackgroundWorkCommand { get; }
 
     // --- Worker Service management ---
 
@@ -593,6 +612,10 @@ public class MainViewModel : ViewModelBase
             : new List<Core.Models.SourceSelection>();
         bool savedThisSession = false;
 
+        // Set once the editor window has closed. Work it started (a seed) can
+        // still be running, and must not touch the closed editor's tree.
+        bool editorClosed = false;
+
         // Exactly what the last save wrote, frozen. The post-close reconcile
         // compares against this rather than backupSet, which the live size check
         // keeps syncing with whatever is on screen - saved or not.
@@ -719,8 +742,26 @@ public class MainViewModel : ViewModelBase
 
             SyncSettingsToJobOptions(backupSet, sourceSelection);
             backupSet.SourceSelections = sourceSelection.GetSelections();
-            await Task.Run(() => _catalog.UpdateBackupSetAsync(backupSet));
+            await Task.Run(async () =>
+            {
+                await CarryStoredHoldAsync(backupSet);
+                await _catalog.UpdateBackupSetAsync(backupSet);
+            });
             AfterSave();
+        }
+
+        // The automated-backup hold is not an editor setting (seeding, Clear
+        // Backup History, a completed backup and the row's Resume link write it
+        // straight to the catalog), so a save writes back whatever the catalog
+        // holds now. Writing the editor's copy instead re-paused a set whose hold
+        // was released while the editor was open, and could release one that was
+        // set meanwhile.
+        async Task CarryStoredHoldAsync(BackupSet editorCopy)
+        {
+            if (editorCopy.JobOptions is null)
+                return;
+            var stored = await _catalog.GetBackupSetAsync(editorCopy.Id);
+            editorCopy.JobOptions.HoldAutomatedBackups = stored?.JobOptions?.HoldAutomatedBackups ?? false;
         }
 
         // Yes at the close prompt during File > Exit. The process will not wait for
@@ -739,7 +780,11 @@ public class MainViewModel : ViewModelBase
 
             SyncSettingsToJobOptions(backupSet, sourceSelection);
             backupSet.SourceSelections = sourceSelection.GetSelections();
-            Task.Run(() => _catalog.UpdateBackupSetAsync(backupSet)).GetAwaiter().GetResult();
+            Task.Run(async () =>
+            {
+                await CarryStoredHoldAsync(backupSet);
+                await _catalog.UpdateBackupSetAsync(backupSet);
+            }).GetAwaiter().GetResult();
             AfterSave();
         }
 
@@ -860,6 +905,8 @@ public class MainViewModel : ViewModelBase
 
         dialog.Closed += async (_, _) =>
         {
+            editorClosed = true;
+
             // Stop any background PlanAsync scan.
             autoCheckCts?.Cancel();
 
@@ -900,6 +947,17 @@ public class MainViewModel : ViewModelBase
             sourceSelection.Dispose();
 
             _editorWindow = null;
+
+            // Work this editor started outlives it, visibly. A seed or a history
+            // clear already holds the set's row (BeginRowWork). A duplicate
+            // analysis - read-only, so it blocks nothing - moves to a line of its
+            // own on the row. (Calculate size stops with the window: its only
+            // output is this editor's size column, and what it computed is cached.)
+            var editedRow = RowFor(backupSet.Id);
+            CarryDedupAnalysisToRow(sourceSelection, editedRow);
+            if (editedRow?.BusyActivity is { } stillBusy)
+                StatusText = $"\"{editedRow.Name}\" is still {stillBusy}; its progress is on its row in the list.";
+
             await LoadBackupSetsAsync();
 
             // If the edit actually saved, reconcile the destination with the new
@@ -909,9 +967,21 @@ public class MainViewModel : ViewModelBase
             // hold later edits that were then discarded.  Whether the reconcile
             // runs at all — and whether it prompts first — is governed inside
             // ReconcileDestinationAfterEditAsync by the ReconcileMode setting.
+            // Not while a seed or history clear is still writing the catalog: the
+            // purge it can offer marks records deleted under them, and a backup
+            // of added folders cannot run until they finish. Folders added are
+            // then picked up by the next backup, and copies of removed ones are
+            // left for Cleanup.
             if (savedThisSession && savedState is not null)
-                await ReconcileDestinationAfterEditAsync(
-                    savedState, originalSelections, sourceSelection.ChangedSelectionPaths);
+            {
+                if (RowFor(backupSet.Id)?.BusyActivity is { } busy)
+                    StatusText = $"Saved \"{savedState.Name}\". It is still {busy}, so folders you added "
+                                 + "will be backed up by its next backup, and backed-up copies of folders you "
+                                 + "removed are left for Cleanup.";
+                else
+                    await ReconcileDestinationAfterEditAsync(
+                        savedState, originalSelections, sourceSelection.ChangedSelectionPaths);
+            }
         };
 
         // Save button: persist everything, then close the editor — matching the
@@ -1015,16 +1085,57 @@ public class MainViewModel : ViewModelBase
                 return;
             }
 
+            // The editor is not modal: a backup can have been started on this
+            // set's row since it opened, and seeding under a running backup would
+            // record files that backup is in the middle of writing.
+            var row = RowFor(backupSet.Id);
+            if (row is { IsRunning: true })
+            {
+                sourceSelection.SeedResult = row.BusyActivity is { } busy
+                    ? $"This set is {busy} already."
+                    : "This set is backing up. Seed it when the backup has finished.";
+                return;
+            }
+
+            // Hold automated backups until the user runs one. A full backup the
+            // Worker started mid-seed would find every file the seed had not
+            // reached yet missing from the catalog and copy it all again. Written
+            // to the catalog now, and to the editor's copy so its Save keeps it.
+            try
+            {
+                if (await SetAutomationHoldAsync(backupSet.Id, hold: true) is { JobOptions: not null }
+                    && backupSet.JobOptions is not null)
+                    backupSet.JobOptions.HoldAutomatedBackups = true;
+            }
+            catch (Exception ex)
+            {
+                sourceSelection.SeedResult = $"Could not pause automated backups, so nothing was imported: {ex.Message}";
+                return;
+            }
+
+            // Whether the set already chose its sources. After a seed, the folders
+            // found in the backup are ticked so a set being CREATED from a mirror
+            // shows what it covers - but ticking them in a set that already has a
+            // selection widened it (C:\Users\me\Documents became all of C:\Users),
+            // waiting for the next Save. Seeding is how an imported set catches up
+            // with its destination, so that was the common case, not an edge one.
+            bool hadSelection = backupSet.SourceSelections is { Count: > 0 } || backupSet.SourceRoots.Count > 0;
+
+            // From here the seed holds the set's row the way a backup does: its
+            // progress shows there, Abort stops it, and the set cannot be backed
+            // up, modified, restored or deleted until it ends - whether or not this
+            // editor is still open. Saving or closing the editor used to leave it
+            // running with nothing on screen to say so, and a backup started then
+            // copied every file the seed had not reached yet. The editor's own
+            // Cancel stops it too (the tokens are linked).
+            using var rowCts = CancellationTokenSource.CreateLinkedTokenSource(
+                sourceSelection.SeedCancellationToken);
+            BeginRowWork(row, "seeding", $"Seeding from {dir}…", rowCts);
+
             long lastSeedUpdate = 0;
-            int lastSkippedExisting = 0;
             var seedSw = System.Diagnostics.Stopwatch.StartNew();
             var scanProgress = new Progress<ScanProgress>(sp =>
             {
-                // Track the most recent skipped count so the post-completion
-                // message can show "X already in catalog" even after the
-                // throttled progress reports stop firing.
-                lastSkippedExisting = sp.FilesSkipped;
-
                 long now = seedSw.ElapsedMilliseconds;
                 if (now - lastSeedUpdate < ProgressCadence.IntervalMs)
                     return;
@@ -1036,39 +1147,90 @@ public class MainViewModel : ViewModelBase
                     ? $", {sp.FilesSkipped:N0} already in catalog"
                     : "";
                 sourceSelection.SeedResult =
-                    $"Importing... {sp.FilesFound:N0} files ({FormatBytes(sp.TotalBytes)}){skipped}{current}";
+                    $"Importing... {sp.FilesFound:N0} files and earlier versions ({FormatBytes(sp.TotalBytes)} bytes){skipped}{current}";
+                if (row is not null && row.BusyActivity == "seeding")
+                    row.RunningStatusText =
+                        $"Seeding from {dir}: {sp.FilesFound:N0} files and earlier versions recorded{skipped}{current}";
             });
 
             bool skipHash = sourceSelection.SeedSkipHashing;
-            var seedCt = sourceSelection.SeedCancellationToken;
-            int count = await Task.Run(() =>
-                _directoryBackupService.SeedFromExistingDirectoryAsync(
-                    backupSet.Id, dir, scanProgress, seedCt,
-                    skipHashing: skipHash));
-
-            if (count > 0)
+            DirectoryBackupService.SeedOutcome outcome;
+            try
             {
-                string skippedSuffix = lastSkippedExisting > 0
-                    ? $" ({lastSkippedExisting:N0} already in catalog were skipped)"
-                    : "";
-                sourceSelection.SeedResult =
-                    $"Imported {count:N0} files{skippedSuffix}. Future backups will be incremental.";
-
-                // Check source tree nodes matching the seeded directory structure
-                // so the user sees which drives/directories are covered.
-                await ApplySeedSelectionsAsync(sourceSelection, dir!);
-
-                sourceSelection.HasSelection = true;
+                outcome = await Task.Run(() =>
+                    _directoryBackupService.SeedFromExistingDirectoryAsync(
+                        backupSet.Id, dir, scanProgress, rowCts.Token,
+                        skipHashing: skipHash));
             }
-            else if (lastSkippedExisting > 0)
+            catch (OperationCanceledException)
             {
-                sourceSelection.SeedResult =
-                    $"Nothing new to import — all {lastSkippedExisting:N0} files were already in the catalog.";
+                // Whole paths were committed as it went, so nothing is half-done.
+                EndRowWork(row,
+                    "Seed stopped. What it had recorded is kept; seeding again carries on from there.",
+                    isError: false);
+                CrashLogger.Log(null, $"GUI: seeding \"{backupSet.Name}\" from {dir} was stopped.");
+                await LoadBackupSetsAsync();
+                throw; // the editor, if still open, says "Import cancelled."
+            }
+            catch (Exception ex)
+            {
+                EndRowWork(row, $"Seed failed: {ex.Message}", isError: true);
+                CrashLogger.Log(ex, $"GUI: seeding \"{backupSet.Name}\" from {dir}");
+                await LoadBackupSetsAsync();
+                throw;
+            }
+
+            CrashLogger.Log(null,
+                $"GUI: seeded \"{backupSet.Name}\" from {dir}: {outcome.Files:N0} file(s), "
+                + $"{outcome.PreviousVersions:N0} earlier version(s), {outcome.SkippedExisting:N0} already in "
+                + $"the catalog, {outcome.DuplicateCopies:N0} duplicate stored cop(ies) left untracked, "
+                + $"{outcome.Unrecognized:N0} unrecognised file(s) left alone.");
+
+            bool imported = outcome.Files + outcome.PreviousVersions > 0;
+            string result;
+            if (imported)
+            {
+                var parts = new List<string>();
+                if (outcome.PreviousVersions > 0)
+                    parts.Add($"{outcome.PreviousVersions:N0} earlier versions");
+                if (outcome.SkippedExisting > 0)
+                    parts.Add($"{outcome.SkippedExisting:N0} files already in the catalog were skipped");
+                if (outcome.DuplicateCopies > 0)
+                    parts.Add($"{outcome.DuplicateCopies:N0} duplicate stored copies were left alone");
+                string detail = parts.Count > 0 ? $" ({string.Join("; ", parts)})" : "";
+                result = $"Imported {outcome.Files:N0} files{detail}. Run a backup next: it copies only "
+                         + "what changed, and resumes automated backups.";
+            }
+            else if (outcome.SkippedExisting > 0)
+            {
+                result = $"Nothing new to import — all {outcome.SkippedExisting:N0} files were already in the catalog.";
             }
             else
             {
-                sourceSelection.SeedResult = "No files found to import.";
+                result = "No files found to import.";
             }
+
+            // Release the row before anything else can fail.
+            sourceSelection.SeedResult = result;
+            EndRowWork(row, "Seeded: " + result, isError: false);
+
+            // A set created from a mirror: tick the folders found in it so the
+            // user sees what it covers. Never in a set that has its sources, and
+            // not in an editor that has been closed meanwhile.
+            if (imported && !hadSelection && !editorClosed)
+            {
+                try
+                {
+                    await ApplySeedSelectionsAsync(sourceSelection, dir!);
+                    sourceSelection.HasSelection = true;
+                }
+                catch (Exception ex)
+                {
+                    CrashLogger.Log(ex, $"GUI: ticking the seeded folders of \"{backupSet.Name}\"");
+                }
+            }
+
+            await LoadBackupSetsAsync();
         };
 
         // "Clear Backup History" button: wipes the catalog record of what's
@@ -1076,13 +1238,26 @@ public class MainViewModel : ViewModelBase
         // settings.  The next backup then treats every source file as new.
         sourceSelection.ClearHistoryRequested += async () =>
         {
+            // Not under a running backup or seed (the editor is not modal): the
+            // delete would race the records they are writing.
+            var row = RowFor(backupSet.Id);
+            if (row is { IsRunning: true })
+            {
+                sourceSelection.ClearHistoryResult = row.BusyActivity is { } busy
+                    ? $"This set is {busy}. Clear its history when that has finished."
+                    : "This set is backing up. Clear its history when the backup has finished.";
+                return;
+            }
+
             var confirm = MessageBox.Show(
                 $"Clear the backup history for \"{sourceSelection.SetName}\"?\n\n" +
                 "This deletes the catalog records of which files have been backed " +
                 "up (disc entries and file records). Settings, sources, and schedule " +
                 "are kept.\n\n" +
                 "The next backup will treat every source file as new. Files already " +
-                "written to the destination are not deleted.",
+                "written to the destination are not deleted.\n\n" +
+                "Automated backups for this set pause until you run a backup yourself, " +
+                "so you can seed it from the destination first.",
                 "Clear Backup History",
                 MessageBoxButton.YesNo,
                 MessageBoxImage.Warning);
@@ -1090,12 +1265,25 @@ public class MainViewModel : ViewModelBase
             if (confirm != MessageBoxResult.Yes)
                 return;
 
+            // Deleting millions of records takes a while; hold the row meanwhile,
+            // as the seed does, so nothing can back the set up half-cleared.
+            BeginRowWork(row, "clearing its history", "Clearing backup history…", cancel: null);
             try
             {
+                // Hold first: with an empty catalog, the Worker's next run would
+                // be a full re-copy over the destination before the user had a
+                // chance to seed it. (It would also be refused there now, but only
+                // while the destination holds files at this set's paths.)
+                await SetAutomationHoldAsync(backupSet.Id, hold: true);
+                if (backupSet.JobOptions is not null)
+                    backupSet.JobOptions.HoldAutomatedBackups = true;
+
                 await Task.Run(() => _catalog.ClearBackupSetCatalogAsync(backupSet.Id));
                 sourceSelection.ClearHistoryResult =
-                    "Backup history cleared. The next backup will re-copy everything.";
+                    "Backup history cleared. The next backup will re-copy everything, unless you seed first.";
                 StatusText = $"Cleared backup history for \"{sourceSelection.SetName}\".";
+                EndRowWork(row, "Backup history cleared. Seed from the destination, or back up to copy everything again.",
+                    isError: false);
                 await LoadBackupSetsAsync();
                 SelectedBackupSet = BackupSets.FirstOrDefault(s => s.Id == backupSet.Id)?.Model;
             }
@@ -1103,6 +1291,7 @@ public class MainViewModel : ViewModelBase
             {
                 sourceSelection.ClearHistoryResult = $"Failed to clear history: {ex.Message}";
                 StatusText = $"Failed to clear backup history: {ex.Message}";
+                EndRowWork(row, $"Clearing the backup history failed: {ex.Message}", isError: true);
             }
         };
 
@@ -3194,7 +3383,19 @@ public class MainViewModel : ViewModelBase
         IReadOnlyList<string>? onlyThesePaths = null)
     {
         if (row.IsRunning)
+        {
+            // The row's Backup link is hidden while it runs, but other paths (the
+            // offers made after an edit) reach here too, and must not just do
+            // nothing after the user said yes.
+            if (row.BusyActivity is { } activity)
+            {
+                MessageBox.Show(
+                    $"\"{row.Name}\" is {activity} right now, so it can't be backed up "
+                    + "yet. Back it up when that has finished.",
+                    "Backup", MessageBoxButton.OK, MessageBoxImage.Information);
+            }
             return;
+        }
 
         var backupSet = row.Model;
 
@@ -3332,6 +3533,13 @@ public class MainViewModel : ViewModelBase
 
         bool isDir = job.TargetDirectory is not null;
 
+        // No history, but the destination already holds a backup at this set's
+        // paths (an imported or re-created set, a cleared history): ask before
+        // copying everything again over it. Before the scan, which on a large set
+        // takes minutes to say nothing the answer depends on.
+        if (isDir && !await ConfirmBackupOverUntrackedDestinationAsync(backupSet, sources, job.TargetDirectory!))
+            return;
+
         // Targeted run: the caller already knows exactly which files to copy, so
         // skip the scan-and-diff entirely.
         if (onlyThesePaths is not null)
@@ -3390,6 +3598,9 @@ public class MainViewModel : ViewModelBase
                 if (totalFiles == 0)
                 {
                     scanning = false;
+                    // A full check that found everything backed up: the user has
+                    // run a backup, as far as a hold on automated ones goes.
+                    await AfterManualFullBackupAsync(row, nothingToBackUp: true);
                     ShowNoOpCompletion(row,
                         BuildNothingToBackUpMessage(diff.DeletedFiles.Count));
                     return;
@@ -3699,6 +3910,10 @@ public class MainViewModel : ViewModelBase
                 JsonSerializer.Serialize(backupSet.JobOptions, _jsonOptions),
                 _jsonOptions) ?? new JobOptions();
         ApplyVmSettingsToJobOptions(opts, vm);
+        // Not an editor setting: seeding and Clear Backup History write it to the
+        // catalog themselves (and into the editor's copy, so Save keeps it). Left
+        // in, it made those two actions look like unsaved edits.
+        opts.HoldAutomatedBackups = false;
         return JsonSerializer.Serialize(new { Name = vm.SetName, JobOptions = opts }, _jsonOptions);
     }
 
@@ -4189,6 +4404,10 @@ public class MainViewModel : ViewModelBase
                 onFailure: null,
                 plan.Diff));
 
+            // The run finished (individual failed files aside): release any hold
+            // on automated backups before the row reloads.
+            await AfterManualFullBackupAsync(row, nothingToBackUp: false);
+
             string detail = $"Data written: {FormatBytes(result.BytesWritten)}";
 
             progressVm.CompleteBurn(result.Success, "", detail, result.FailedFiles);
@@ -4476,32 +4695,76 @@ public class MainViewModel : ViewModelBase
         PropertyNameCaseInsensitive = true,
     };
 
+    /// <summary>
+    /// Export a set to a <c>.lithic</c> file, with its backup history unless the
+    /// user leaves it out. See <see cref="BackupSetTransfer"/> for the format, and
+    /// for why the history is what makes an exported set useful on another
+    /// computer: without it the set starts out knowing nothing about the backup
+    /// already on its destination.
+    /// </summary>
     private async Task ExportBackupSetAsync()
     {
         if (SelectedBackupSet is null) return;
+        var set = SelectedBackupSet;
 
-        var exported = ExportedBackupSet.FromBackupSet(SelectedBackupSet);
+        if (RowFor(set.Id)?.IsRunning == true)
+        {
+            StatusText = $"\"{set.Name}\" is backing up; export it when the backup has finished.";
+            return;
+        }
+
+        // Export what the catalog holds now, not this window's older copy.
+        await RefreshFromCatalogAsync(set, "exporting");
+
+        bool hasHistory = false;
+        long historyBytes = 0;
+        try
+        {
+            hasHistory = await _catalog.HasFileRecordsAsync(set.Id);
+            if (hasHistory)
+                historyBytes = _catalog.GetSetHistorySizeBytes(set.Id);
+        }
+        catch (Exception ex)
+        {
+            CrashLogger.Log(ex, $"Export of \"{set.Name}\": could not inspect its history.");
+        }
+
+        var options = new ExportBackupSetViewModel(set.Name, hasHistory, historyBytes);
+        var optionsDialog = new ExportBackupSetDialog
+        {
+            Owner = Application.Current.MainWindow,
+            DataContext = options,
+        };
+        if (optionsDialog.ShowDialog() != true)
+            return;
 
         var dialog = new System.Windows.Forms.SaveFileDialog
         {
-            Title = $"Export \"{SelectedBackupSet.Name}\"",
-            Filter = "Backup Set Config (*.lithic)|*.lithic|JSON files (*.json)|*.json|All files (*.*)|*.*",
-            FileName = SanitizeFilename(SelectedBackupSet.Name) + ".lithic",
+            Title = $"Export \"{set.Name}\"",
+            Filter = "Backup Set (*.lithic)|*.lithic|All files (*.*)|*.*",
+            FileName = SanitizeFilename(set.Name) + ".lithic",
             DefaultExt = ".lithic",
         };
 
         if (dialog.ShowDialog() != System.Windows.Forms.DialogResult.OK)
             return;
 
+        bool withHistory = hasHistory && options.IncludeHistory;
+        string file = dialog.FileName;
         try
         {
-            var json = JsonSerializer.Serialize(exported, _jsonOptions);
-            await File.WriteAllTextAsync(dialog.FileName, json);
-            StatusText = $"Exported \"{SelectedBackupSet.Name}\" to {dialog.FileName}";
+            var status = new Progress<string>(s => StatusText = $"Exporting \"{set.Name}\": {s}");
+            await BackupSetTransfer.ExportAsync(_catalog, set, file, withHistory, status);
+            StatusText = withHistory
+                ? $"Exported \"{set.Name}\" with its backup history to {file} ({FormatBytes(new FileInfo(file).Length)} bytes)."
+                : $"Exported \"{set.Name}\" (settings only) to {file}.";
         }
         catch (Exception ex)
         {
             StatusText = $"Export failed: {ex.Message}";
+            CrashLogger.Log(ex, $"Export of \"{set.Name}\" to {file}");
+            MessageBox.Show($"Could not export \"{set.Name}\".\n\n{ex.Message}",
+                "Export Backup Set", MessageBoxButton.OK, MessageBoxImage.Error);
         }
     }
 
@@ -4510,7 +4773,7 @@ public class MainViewModel : ViewModelBase
         var dialog = new System.Windows.Forms.OpenFileDialog
         {
             Title = "Import Backup Set",
-            Filter = "Backup Set Config (*.lithic)|*.lithic|JSON files (*.json)|*.json|All files (*.*)|*.*",
+            Filter = "Backup Set (*.lithic)|*.lithic|JSON files (*.json)|*.json|All files (*.*)|*.*",
         };
 
         if (dialog.ShowDialog() != System.Windows.Forms.DialogResult.OK)
@@ -4518,28 +4781,266 @@ public class MainViewModel : ViewModelBase
 
         try
         {
-            var json = await File.ReadAllTextAsync(dialog.FileName);
-            var exported = JsonSerializer.Deserialize<ExportedBackupSet>(json, _jsonOptions);
-            if (exported is null)
-            {
-                StatusText = "Import failed: file is empty or invalid.";
-                return;
-            }
-
-            var newSet = exported.ToBackupSet();
-            await _catalog.CreateBackupSetAsync(newSet);
+            var status = new Progress<string>(s => StatusText = $"Importing: {s}");
+            var result = await BackupSetTransfer.ImportAsync(_catalog, dialog.FileName, status);
+            var newSet = result.Set;
             await LoadBackupSetsAsync();
-
             SelectedBackupSet = BackupSets.FirstOrDefault(s => s.Id == newSet.Id)?.Model;
-            StatusText = $"Imported \"{newSet.Name}\" from {dialog.FileName}.";
-        }
-        catch (JsonException)
-        {
-            StatusText = "Import failed: the file is not a valid backup set configuration.";
+
+            StatusText = result.IncludedHistory
+                ? $"Imported \"{newSet.Name}\" with its backup history ({result.FileRecords:N0} file records)."
+                : $"Imported \"{newSet.Name}\" (settings only, no backup history).";
+
+            bool scheduled = newSet.JobOptions?.Schedule?.Enabled == true;
+            string held = scheduled
+                ? "\n\nIts automated backups are paused until you run a backup yourself, so nothing "
+                  + "is written to its destination before you have checked it."
+                : "";
+            string message = result.IncludedHistory
+                ? $"Imported \"{newSet.Name}\" with its backup history "
+                  + $"({result.FileRecords:N0} file records).\n\n"
+                  + "Before backing up, open it (Modify) and check that its destination and "
+                  + "sources are where they are on this computer." + held
+                : $"Imported \"{newSet.Name}\". The file holds its settings only, not its backup "
+                  + "history, so the set starts out knowing nothing about what is already backed up.\n\n"
+                  + "If its destination already holds this set's backup, open it (Modify) and use "
+                  + "Seed from Existing Backup on the General tab before backing up. Otherwise the "
+                  + "first backup copies everything again." + held;
+            MessageBox.Show(message, "Import Backup Set", MessageBoxButton.OK, MessageBoxImage.Information);
         }
         catch (Exception ex)
         {
             StatusText = $"Import failed: {ex.Message}";
+            CrashLogger.Log(ex, $"Import of {dialog.FileName}");
+            MessageBox.Show($"Could not import {Path.GetFileName(dialog.FileName)}.\n\n{ex.Message}",
+                "Import Backup Set", MessageBoxButton.OK, MessageBoxImage.Error);
+        }
+    }
+
+    // -------------------------------------------------------------------
+    // Automated-backup hold (JobOptions.HoldAutomatedBackups)
+    // -------------------------------------------------------------------
+
+    /// <summary>
+    /// Set or clear a set's automated-backup hold in the catalog, from a fresh
+    /// read so nothing else in the stored set is rewritten from an older copy.
+    /// Returns the set as stored, or null if it no longer exists. A set with no
+    /// saved options has no schedule to hold and is left alone.
+    /// </summary>
+    /// <param name="markBackedUpIfNever">
+    /// Also stamp <see cref="BackupSet.LastBackupUtc"/> when it is empty: a full
+    /// check that found every file already backed up has, in effect, backed the
+    /// set up, and "Never backed up" would then be wrong (it is what a freshly
+    /// seeded set showed indefinitely, since a backup with nothing to copy never
+    /// set it).
+    /// </param>
+    private async Task<BackupSet?> SetAutomationHoldAsync(int setId, bool hold, bool markBackedUpIfNever = false)
+    {
+        var fresh = await _catalog.GetBackupSetAsync(setId);
+        if (fresh is null)
+            return null;
+
+        bool changed = false;
+        if (fresh.JobOptions is { } opts && opts.HoldAutomatedBackups != hold)
+        {
+            opts.HoldAutomatedBackups = hold;
+            changed = true;
+        }
+        if (markBackedUpIfNever && fresh.LastBackupUtc is null)
+        {
+            fresh.LastBackupUtc = DateTime.UtcNow;
+            changed = true;
+        }
+
+        if (changed)
+            await _catalog.UpdateBackupSetMetadataAsync(fresh);
+        return fresh;
+    }
+
+    /// <summary>
+    /// Hold a set's row for work, other than a backup, that writes its catalog
+    /// (a seed, clearing its history): the row shows <paramref name="status"/> in
+    /// place of its actions, as during a backup's scan, so the set cannot be
+    /// backed up, modified, restored or deleted until <see cref="EndRowWork"/>.
+    /// With <paramref name="cancel"/>, the row's Abort link stops it.
+    /// </summary>
+    private static void BeginRowWork(
+        BackupSetRowViewModel? row, string activity, string status, CancellationTokenSource? cancel)
+    {
+        if (row is null)
+            return;
+        row.LastResultText = "";
+        row.LastResultIsError = false;
+        row.Progress = null;
+        row.BusyActivity = activity;
+        row.RunningStatusText = status;
+        row.ScanCts = cancel;
+        row.IsRunning = true;
+    }
+
+    /// <summary>
+    /// An editor closed while its duplicate analysis was running: show the
+    /// analysis's progress on the set's row, with Stop, and its summary on the
+    /// row's result line when it ends. It used to carry on hashing with nothing
+    /// on screen at all. Read-only, so the set's actions stay available.
+    /// </summary>
+    private static void CarryDedupAnalysisToRow(SourceSelectionViewModel editor, BackupSetRowViewModel? row)
+    {
+        if (row is null || !editor.IsAnalyzingDedup)
+            return;
+
+        static string Summary(string text)
+        {
+            string flat = string.Join(" · ", text.Split('\n',
+                StringSplitOptions.RemoveEmptyEntries | StringSplitOptions.TrimEntries));
+            return flat.StartsWith("Dedup analysis", StringComparison.OrdinalIgnoreCase)
+                ? flat
+                : "Duplicate analysis: " + flat;
+        }
+
+        row.BackgroundWorkText = Summary(editor.DedupAnalysisResult);
+        row.StopBackgroundWork = () =>
+        {
+            if (editor.CancelDedupCommand.CanExecute(null))
+                editor.CancelDedupCommand.Execute(null);
+        };
+
+        System.ComponentModel.PropertyChangedEventHandler? onChanged = null;
+        onChanged = (_, e) =>
+        {
+            if (e.PropertyName == nameof(SourceSelectionViewModel.DedupAnalysisResult) && editor.IsAnalyzingDedup)
+            {
+                row.BackgroundWorkText = Summary(editor.DedupAnalysisResult);
+            }
+            else if (e.PropertyName == nameof(SourceSelectionViewModel.IsAnalyzingDedup) && !editor.IsAnalyzingDedup)
+            {
+                // The final text is set before IsAnalyzingDedup clears.
+                editor.PropertyChanged -= onChanged;
+                row.BackgroundWorkText = "";
+                row.StopBackgroundWork = null;
+                row.LastResultIsError = editor.DedupAnalysisResult.Contains("failed", StringComparison.OrdinalIgnoreCase);
+                row.LastResultText = Summary(editor.DedupAnalysisResult);
+                CommandManager.InvalidateRequerySuggested();
+            }
+        };
+        editor.PropertyChanged += onChanged;
+    }
+
+    /// <summary>Release a row held by <see cref="BeginRowWork"/>, leaving <paramref name="result"/> on it.</summary>
+    private static void EndRowWork(BackupSetRowViewModel? row, string result, bool isError)
+    {
+        if (row is null)
+            return;
+        row.IsRunning = false;
+        row.BusyActivity = null;
+        row.RunningStatusText = "";
+        row.ScanCts = null;
+        row.LastResultIsError = isError;
+        row.LastResultText = result;
+    }
+
+    /// <summary>The row's "Resume now" link.</summary>
+    private async Task ResumeAutomatedBackupsAsync(BackupSet set)
+    {
+        try
+        {
+            await SetAutomationHoldAsync(set.Id, hold: false);
+            await LoadBackupSetsAsync();
+            StatusText = $"Automated backups for \"{set.Name}\" resumed.";
+        }
+        catch (Exception ex)
+        {
+            StatusText = $"Could not resume automated backups for \"{set.Name}\": {ex.Message}";
+        }
+    }
+
+    /// <summary>
+    /// A full directory backup started from the app has finished - it copied
+    /// files, or found nothing to copy. That is the user having run a backup, so
+    /// release any hold on automated backups.
+    /// </summary>
+    private async Task AfterManualFullBackupAsync(BackupSetRowViewModel row, bool nothingToBackUp)
+    {
+        try
+        {
+            var stored = await SetAutomationHoldAsync(row.Id, hold: false, markBackedUpIfNever: nothingToBackUp);
+            if (stored is not null)
+                row.UpdateModel(stored);
+        }
+        catch (Exception ex)
+        {
+            CrashLogger.Log(ex, $"GUI: could not release the automated-backup hold on \"{row.Name}\".");
+        }
+    }
+
+    /// <summary>
+    /// Before backing up a directory set: if its catalog is empty but its
+    /// destination already holds backed-up files where it writes, say so and let
+    /// the user choose. Returns whether to go ahead.
+    /// </summary>
+    /// <remarks>
+    /// A set imported onto a new computer without its history used to back up
+    /// here without a word, copying every file again over the copies already on
+    /// the drive, with the version history beside them invisible to the set.
+    /// Seeding records what is there instead; "back up anyway" remains for when
+    /// copying it all again is really what the user wants.
+    /// </remarks>
+    private async Task<bool> ConfirmBackupOverUntrackedDestinationAsync(
+        BackupSet backupSet, IReadOnlyList<SourceSelection> sources, string targetDirectory)
+    {
+        DirectoryBackupService.UntrackedBackup? found;
+        try
+        {
+            var roots = SourceSelection.CollectSelectedRoots(sources);
+            if (roots.Count == 0)
+                roots = backupSet.SourceRoots.ToList();
+            found = await _directoryBackupService.FindUntrackedBackupAsync(backupSet.Id, roots, targetDirectory);
+        }
+        catch (Exception ex)
+        {
+            // The user asked for this backup; an unanswerable check does not stop it.
+            CrashLogger.Log(ex, $"GUI: could not check whether the destination of \"{backupSet.Name}\" "
+                                + "already holds a backup.");
+            return true;
+        }
+
+        if (found is null)
+            return true;
+
+        const int shown = 4;
+        string examples = string.Join("\n", found.OccupiedPaths.Take(shown).Select(p => "    " + p))
+            + (found.OccupiedPaths.Count > shown ? $"\n    … and {found.OccupiedPaths.Count - shown} more" : "");
+
+        var answer = MessageBox.Show(
+            $"\"{backupSet.Name}\" has no backup history, but its destination already holds "
+            + $"backed-up files where this set would write them:\n\n{examples}\n\n"
+            + "Backing up now would copy every file again on top of them"
+            + (found.HasVersionHistory
+                ? ", and the earlier versions kept there would not be part of this set's history "
+                  + "(Restore couldn't see them)."
+                : ".")
+            + "\n\nTo carry on from that backup instead, record what's already there with "
+            + "Seed from Existing Backup, on the General tab of the set's editor.\n\n"
+            + "Yes: open the editor\nNo: back up anyway\nCancel: do nothing",
+            "Destination Already Holds a Backup",
+            MessageBoxButton.YesNoCancel,
+            MessageBoxImage.Warning,
+            MessageBoxResult.Yes);
+
+        switch (answer)
+        {
+            case MessageBoxResult.Yes:
+                SelectedBackupSet = backupSet;
+                StartEditFlow();
+                return false;
+            case MessageBoxResult.No:
+                CrashLogger.Log(null,
+                    $"GUI: backing up \"{backupSet.Name}\" with no history over the existing backup at "
+                    + $"{targetDirectory}, as the user chose.");
+                return true;
+            default:
+                StatusText = $"Backup of \"{backupSet.Name}\" cancelled.";
+                return false;
         }
     }
 

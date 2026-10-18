@@ -324,9 +324,13 @@ public sealed class BackupWorker : BackgroundService
             seen.Add(set.Id);
             var schedule = set.JobOptions?.Schedule;
 
-            // Only directory-mode sets with an enabled schedule are relevant.
-            bool active = schedule is { Enabled: true }
-                          && set.JobOptions?.TargetDirectory is not null;
+            // Only directory-mode sets with an enabled schedule are relevant -
+            // and not while automated backups are held until the user runs a
+            // backup in the app (an imported, cleared or seeded set).
+            bool scheduled = schedule is { Enabled: true }
+                             && set.JobOptions?.TargetDirectory is not null;
+            bool held = set.JobOptions?.HoldAutomatedBackups == true;
+            bool active = scheduled && !held;
 
             if (!_sets.TryGetValue(set.Id, out var state))
             {
@@ -346,6 +350,33 @@ public sealed class BackupWorker : BackgroundService
             {
                 state.BackupSet = set;
             }
+
+            if (scheduled && held != state.WasHeld)
+            {
+                if (held)
+                    _logger.LogInformation(
+                        "Automated backups for \"{Name}\" are paused until a backup is run from Lithic Backup " +
+                        "(the set was imported, or its history was cleared or seeded).", set.Name);
+                else
+                    _logger.LogInformation("Automated backups for \"{Name}\" resumed.", set.Name);
+            }
+
+            // Released from a hold: its clocks were read when this service first
+            // saw the set, before the full backup the user has just run in the app
+            // to release it. Without this, the release was followed at once by a
+            // redundant whole-tree scan. Only on release, never at first sight:
+            // LastBackupUtc is also bumped by every targeted continuous run, and
+            // timing the safety net from it is exactly what LastFullScanUtc exists
+            // to avoid.
+            bool released = state.WasHeld && !held;
+            if (released && set.LastBackupUtc is { } lastBackup)
+            {
+                if (lastBackup > state.LastRunUtc)
+                    state.LastRunUtc = lastBackup;
+                if (lastBackup > state.LastFullScanUtc)
+                    state.LastFullScanUtc = lastBackup;
+            }
+            state.WasHeld = held;
 
             state.IsActive = active;
 
@@ -1555,6 +1586,12 @@ public sealed class BackupWorker : BackgroundService
                     state.Pending.TryAdd(p, (requeueNow, requeueNow));
                 return;
             }
+
+            // Dropped rather than requeued: nothing can run until the user acts,
+            // and the full backup that follows picks these files up anyway.
+            if (await RefuseUntrackedDestinationAsync(state, targetDir, ct))
+                return;
+
             var job = BuildJob(set, opts, targetDir);
 
             var retentionTiers = opts.RetentionTiers.Count > 0
@@ -1901,6 +1938,9 @@ public sealed class BackupWorker : BackgroundService
             if (!await ResolveSourcesAsync(set, ct))
                 return ReconcileOutcome.DidNotRun; // No source available; retry later.
 
+            if (await RefuseUntrackedDestinationAsync(state, targetDir, ct))
+                return ReconcileOutcome.DidNotRun; // Until the user seeds or backs up in the app.
+
             _logger.LogInformation("Starting backup for \"{Name}\" → {Target}", set.Name, targetDir);
 
             var job = BuildJob(set, opts, targetDir);
@@ -1990,6 +2030,55 @@ public sealed class BackupWorker : BackgroundService
         }
     }
 
+    /// <summary>
+    /// True when the set must not be backed up because its catalog is empty while
+    /// its destination already holds backed-up files where this set writes (see
+    /// <see cref="DirectoryBackupService.FindUntrackedBackupAsync"/>). A run then
+    /// copies every file again over the copies already there, and the version
+    /// history beside them is invisible to the set. That is a decision for the
+    /// user, in the app: seed from the destination, or back up anyway. Logged
+    /// once per destination, not at every poll.
+    /// </summary>
+    private async Task<bool> RefuseUntrackedDestinationAsync(SetState state, string targetDir, CancellationToken ct)
+    {
+        var set = state.BackupSet;
+        DirectoryBackupService.UntrackedBackup? found;
+        try
+        {
+            found = await _directoryBackup.FindUntrackedBackupAsync(
+                set.Id, ResolveWatchRoots(set), targetDir, ct);
+        }
+        catch (OperationCanceledException) { throw; }
+        catch (Exception ex)
+        {
+            // Cannot tell: err on the side of not writing over a backup.
+            _logger.LogWarning(ex,
+                "Could not check whether the destination of \"{Name}\" already holds a backup; skipping this run.",
+                set.Name);
+            return true;
+        }
+
+        if (found is null)
+        {
+            state.RefusedUntrackedAt = null;
+            return false;
+        }
+
+        if (!string.Equals(state.RefusedUntrackedAt, targetDir, StringComparison.OrdinalIgnoreCase))
+        {
+            state.RefusedUntrackedAt = targetDir;
+            _logger.LogWarning(
+                "Not backing up \"{Name}\": it has no backup history, but its destination already holds " +
+                "backed-up files ({Example}{More}). A backup now would copy everything again over them{History}. " +
+                "Open the set in Lithic Backup and use Seed from Existing Backup in its editor, or run a backup " +
+                "there to go ahead anyway.",
+                set.Name, found.OccupiedPaths[0],
+                found.OccupiedPaths.Count > 1 ? $" and {found.OccupiedPaths.Count - 1} more" : "",
+                found.HasVersionHistory ? ", and the version history kept there would not be part of the set" : "");
+        }
+        return true;
+    }
+
     /// <summary>Build a <see cref="BackupJob"/> from a set's saved options.</summary>
     private static BackupJob BuildJob(BackupSet set, JobOptions opts, string targetDir)
     {
@@ -2035,6 +2124,17 @@ public sealed class BackupWorker : BackgroundService
         public required BackupSet BackupSet { get; set; }
         public DateTime LastRunUtc { get; set; }
         public bool IsActive { get; set; }
+
+        /// <summary>Whether the set was held at the last reload (to log the change once).</summary>
+        public bool WasHeld { get; set; }
+
+        /// <summary>
+        /// The destination this set was last refused at because its catalog is
+        /// empty and the destination already holds a backup (see
+        /// <c>RefuseUntrackedDestinationAsync</c>), so the refusal is logged once
+        /// rather than at every poll. Null while not refusing.
+        /// </summary>
+        public string? RefusedUntrackedAt { get; set; }
 
         /// <summary>
         /// Directories actually selected for this set (not the drive roots).

@@ -1103,18 +1103,89 @@ public class DirectoryBackupService
                     if (File.Exists(oldCurrentPath))
                     {
                         int oldVersion = existingInfo.MaxVersion;
+
+                        // The number the copy at the current path is filed under in
+                        // _prev: the old record's own number - unless a version file
+                        // of that number is already there. No record owns that file
+                        // (the catalog's only record of this number is the live one,
+                        // which says its copy is at the current path), so the
+                        // catalog and the drive disagree. Moving over it with
+                        // overwrite, as this did, destroyed a version every time.
+                        // Two ways to get here, told apart by which file actually
+                        // holds the record's content:
+                        //  * History the catalog never had: an earlier catalog of
+                        //    this destination (a cleared history, a set imported or
+                        //    re-created without its history, a seed that skipped
+                        //    _prev) numbered from 1 too. The current copy IS the
+                        //    record's: file it under a fresh number and renumber the
+                        //    record to match.
+                        //  * The catalog is behind the drive: a later writer it
+                        //    never heard of (the old computer backing up after the
+                        //    set's history was exported; a batch still uncommitted
+                        //    when the export was taken) already moved the record's
+                        //    copy to that .vN and wrote a newer one at the current
+                        //    path. The record stays as it is, pointed at its .vN, and
+                        //    the newer copy is recorded as a version of its own
+                        //    under the fresh number. Renumbering here would label the
+                        //    newer bytes with the old hash.
+                        // Either way the new copy is numbered after the fresh number,
+                        // and no file on disk is replaced.
+                        int prevVersion = oldVersion;
+                        StoredFileInfo? unrecordedCopy = null;
+                        if (AnyPrevVersionFileExists(targetDirectory, file.FullPath, oldVersion))
+                        {
+                            prevVersion = Math.Max(version, oldVersion + 1);
+                            while (AnyPrevVersionFileExists(targetDirectory, file.FullPath, prevVersion))
+                                prevVersion++;
+                            version = prevVersion + 1;
+
+                            var atCurrent = await DescribeStoredCopyAsync(
+                                oldCurrentPath, oldDeduped, oldFileRef, existingInfo, ct);
+                            if (!StoredCopyMatches(atCurrent, existingInfo))
+                            {
+                                string recordedPrev = GetPrevPath(
+                                    targetDirectory, file.FullPath, oldVersion, oldDeduped, oldFileRef);
+                                if (File.Exists(recordedPrev)
+                                    && StoredCopyMatches(
+                                        await DescribeStoredCopyAsync(
+                                            recordedPrev, oldDeduped, oldFileRef, existingInfo, ct),
+                                        existingInfo))
+                                {
+                                    // Hash the newer copy for its own record (the
+                                    // match check may have stopped at its size).
+                                    unrecordedCopy = string.IsNullOrEmpty(atCurrent?.Hash)
+                                                     && !oldDeduped && !oldFileRef
+                                        ? new StoredFileInfo(
+                                            new FileInfo(oldCurrentPath).Length,
+                                            await ComputeFileHashAsync(oldCurrentPath, ct),
+                                            null, false, false)
+                                        : atCurrent;
+                                }
+                            }
+                        }
+
                         string prevPath = GetPrevPath(
-                            targetDirectory, file.FullPath, oldVersion,
+                            targetDirectory, file.FullPath, prevVersion,
                             oldDeduped, oldFileRef);
 
                         string? prevDir = Path.GetDirectoryName(prevPath);
                         if (prevDir is not null)
                             Directory.CreateDirectory(prevDir);
 
-                        File.Move(oldCurrentPath, prevPath, overwrite: true);
+                        // Never replaces a file: if one appeared since the check,
+                        // this throws and the file fails (and is retried next run)
+                        // rather than destroy a version.
+                        File.Move(oldCurrentPath, prevPath, overwrite: false);
 
                         string prevDiscPath = GetPrevDiscPath(
-                            file.FullPath, oldVersion, oldDeduped, oldFileRef);
+                            file.FullPath, prevVersion, oldDeduped, oldFileRef);
+
+                        // Where the old record's bytes are now: the copy just moved,
+                        // or - when the catalog was behind the drive - the .vN of
+                        // its own number that was already there.
+                        string oldRecordDiscPath = unrecordedCopy is null
+                            ? prevDiscPath
+                            : GetPrevDiscPath(file.FullPath, oldVersion, oldDeduped, oldFileRef);
 
                         // Load the specific old record on-demand (not pre-loaded)
                         // to update its DiscPath to the new _prev location.
@@ -1122,7 +1193,15 @@ public class DirectoryBackupService
                             backupSetId, file.FullPath, oldVersion, ct);
                         if (oldRecord is not null)
                         {
-                            oldRecord.DiscPath = prevDiscPath;
+                            oldRecord.DiscPath = oldRecordDiscPath;
+                            // Renumbered past untracked history (above). Keeps the
+                            // catalog's numbers matching the .vN names on disk, and
+                            // keeps this the highest number the path has used, so
+                            // the new copy's (version = prevVersion + 1) is next.
+                            // Not when the catalog was behind: the record keeps the
+                            // number its .vN is named with.
+                            if (unrecordedCopy is null)
+                                oldRecord.Version = prevVersion;
                             // Resurrection: the old version is a tombstone (its
                             // file was deleted-and-recreated). Now that it holds
                             // the real _prev bytes of a live chain again, un-delete
@@ -1133,18 +1212,41 @@ public class DirectoryBackupService
                             await _catalog.UpdateFileRecordAsync(oldRecord, ct);
                         }
 
-                        // The moved plain copy held the real bytes for its content
-                        // hash; any .fileref pointing at it must have its
-                        // ContentPath hint repointed to the new _prev location.
+                        // The newer copy the catalog never recorded, now at the
+                        // fresh number: a version of its own. Its write time is when
+                        // it was copied, which is what its backup time means.
+                        if (unrecordedCopy is { } newer)
+                        {
+                            DateTime copiedUtc = File.GetLastWriteTimeUtc(prevPath);
+                            await _catalog.CreateFileRecordAsync(new FileRecord
+                            {
+                                DiscId = discRecord.Id,
+                                SourcePath = file.FullPath,
+                                DiscPath = prevDiscPath,
+                                SizeBytes = newer.Size,
+                                Hash = newer.Hash ?? "",
+                                IsDeduped = oldDeduped,
+                                IsFileRef = oldFileRef,
+                                Version = prevVersion,
+                                SourceLastWriteUtc = copiedUtc,
+                                BackedUpUtc = copiedUtc,
+                            }, ct);
+                            if (!oldDeduped && !oldFileRef && !string.IsNullOrEmpty(newer.Hash))
+                                SetContentPath(newer.Hash, prevDiscPath);
+                        }
+
+                        // The old record's plain copy holds the real bytes for its
+                        // content hash; any .fileref pointing at it must have its
+                        // ContentPath hint repointed to where it now is.
                         // (Hash-anchored, so this is best-effort upkeep only.)
                         if (!oldDeduped && !oldFileRef
                             && !string.IsNullOrEmpty(existingInfo.Hash))
                         {
                             await UpdateFileRefContentPathsAsync(
-                                backupSetId, existingInfo.Hash, prevDiscPath,
+                                backupSetId, existingInfo.Hash, oldRecordDiscPath,
                                 targetDirectory, ct);
                             if (await ContentPathForHashAsync(existingInfo.Hash) is not null)
-                                SetContentPath(existingInfo.Hash, prevDiscPath);
+                                SetContentPath(existingInfo.Hash, oldRecordDiscPath);
                         }
                     }
                 }
@@ -3057,6 +3159,168 @@ public class DirectoryBackupService
     }
 
     /// <summary>
+    /// Whether any stored form (plain, .dedup, .fileref) of version
+    /// <paramref name="version"/> of <paramref name="fullPath"/> exists under
+    /// <c>{drive}_prev</c>.
+    /// </summary>
+    private static bool AnyPrevVersionFileExists(string targetDir, string fullPath, int version)
+        => File.Exists(GetPrevPath(targetDir, fullPath, version, false, false))
+        || File.Exists(GetPrevPath(targetDir, fullPath, version, true, false))
+        || File.Exists(GetPrevPath(targetDir, fullPath, version, false, true));
+
+    /// <summary>
+    /// Size and content hash of a stored copy, for telling which file holds a
+    /// record's content (the _prev move in ExecuteCoreAsync). A manifest's figures
+    /// come from the manifest. A plain copy is hashed only when the record has a
+    /// hash to compare against; otherwise only its size is read. Null when it
+    /// cannot be read.
+    /// </summary>
+    private static async Task<StoredFileInfo?> DescribeStoredCopyAsync(
+        string path, bool isDeduped, bool isFileRef, FileVersionInfo record, CancellationToken ct)
+    {
+        try
+        {
+            if (isFileRef)
+            {
+                var m = JsonSerializer.Deserialize<FileRefManifest>(
+                    await File.ReadAllTextAsync(path, ct), _jsonOptions);
+                return m is null ? null : new StoredFileInfo(m.OriginalSize, m.Hash ?? "", null, false, true);
+            }
+            if (isDeduped)
+            {
+                var d = JsonSerializer.Deserialize<DedupManifest>(
+                    await File.ReadAllTextAsync(path, ct), _jsonOptions);
+                return d is null ? null : new StoredFileInfo(d.OriginalSize, d.OriginalHash ?? "", null, true, false);
+            }
+            long size = new FileInfo(path).Length;
+            string? hash = string.IsNullOrEmpty(record.Hash) ? null : await ComputeFileHashAsync(path, ct);
+            return new StoredFileInfo(size, hash, null, false, false);
+        }
+        catch (OperationCanceledException) { throw; }
+        catch
+        {
+            return null;
+        }
+    }
+
+    /// <summary>
+    /// Whether a stored copy holds what <paramref name="record"/> describes: same
+    /// hash when both have one, else (a record seeded without hashing) same size.
+    /// </summary>
+    private static bool StoredCopyMatches(StoredFileInfo? copy, FileVersionInfo record) =>
+        copy is { } c
+        && (!string.IsNullOrEmpty(c.Hash) && !string.IsNullOrEmpty(record.Hash)
+            ? string.Equals(c.Hash, record.Hash, StringComparison.OrdinalIgnoreCase)
+            : c.Size == record.SizeBytes);
+
+    // ------------------------------------------------------------------
+    // Untracked backup at the destination
+    // ------------------------------------------------------------------
+
+    /// <summary>
+    /// A set with no backup history whose destination already holds backed-up
+    /// files at the places the set writes to - typically a set imported or
+    /// re-created on a new computer without its history, or one whose history
+    /// was cleared. See <see cref="FindUntrackedBackupAsync"/>.
+    /// </summary>
+    /// <param name="OccupiedPaths">The destination folders (or files) found holding files.</param>
+    /// <param name="HasVersionHistory">Whether any of them is a <c>{drive}_prev</c> history folder.</param>
+    public sealed record UntrackedBackup(IReadOnlyList<string> OccupiedPaths, bool HasVersionHistory);
+
+    /// <summary>
+    /// Null unless the set's catalog is empty AND its destination already holds
+    /// files where this set's sources would be written. A backup in that state
+    /// copies every file again over the copies already there, and the version
+    /// history beside them is invisible to the set (Restore cannot see it, and
+    /// Cleanup lists it as untracked). Callers ask first (the GUI) or refuse (the
+    /// Worker); seeding from the destination is what the user usually wants.
+    /// </summary>
+    /// <remarks>
+    /// Only the paths this set writes are looked at, so another set sharing the
+    /// destination folder with different sources never triggers it, and a set
+    /// pointed at a folder of unrelated files does not either. The catalog probe
+    /// comes first and is a single indexed lookup, so a set with history costs
+    /// nothing here.
+    /// </remarks>
+    public async Task<UntrackedBackup?> FindUntrackedBackupAsync(
+        int backupSetId, IEnumerable<string> sourceRoots, string targetDirectory,
+        CancellationToken ct = default)
+    {
+        if (await _catalog.HasFileRecordsAsync(backupSetId, ct))
+            return null;
+        var roots = sourceRoots.ToList();
+        return await Task.Run(() => FindBackupContent(targetDirectory, roots), ct);
+    }
+
+    /// <summary>
+    /// The destination-side half of <see cref="FindUntrackedBackupAsync"/>: which
+    /// of <paramref name="sourceRoots"/>' destination locations (current tree and
+    /// <c>{drive}_prev</c> history) already hold at least one file.
+    /// </summary>
+    public static UntrackedBackup? FindBackupContent(string targetDirectory, IEnumerable<string> sourceRoots)
+    {
+        if (string.IsNullOrWhiteSpace(targetDirectory) || !Directory.Exists(targetDirectory))
+            return null;
+
+        var occupied = new List<string>();
+        var seen = new HashSet<string>(StringComparer.OrdinalIgnoreCase);
+        bool history = false;
+
+        foreach (string root in sourceRoots)
+        {
+            if (string.IsNullOrWhiteSpace(root))
+                continue;
+
+            string prefix = GetDrivePrefix(root);
+            string relative = GetRelativePath(root).TrimEnd('\\', '/');
+            string current = Path.Combine(targetDirectory, prefix, relative);
+            string prev = Path.Combine(targetDirectory, prefix + "_prev", relative);
+
+            if (seen.Add(current) && HoldsStoredContent(current, versioned: false))
+                occupied.Add(current);
+            if (seen.Add(prev) && HoldsStoredContent(prev, versioned: true))
+            {
+                occupied.Add(prev);
+                history = true;
+            }
+        }
+
+        return occupied.Count > 0 ? new UntrackedBackup(occupied, history) : null;
+    }
+
+    /// <summary>
+    /// Whether <paramref name="path"/> is a folder containing at least one file
+    /// (at any depth), or the stored form of a single selected file: the file
+    /// itself, its .fileref/.dedup manifest, or (for history) any version of it.
+    /// </summary>
+    private static bool HoldsStoredContent(string path, bool versioned)
+    {
+        try
+        {
+            if (Directory.Exists(path))
+            {
+                return Directory.EnumerateFiles(path, "*", new EnumerationOptions
+                {
+                    RecurseSubdirectories = true,
+                    IgnoreInaccessible = true,
+                    AttributesToSkip = 0,
+                }).Any();
+            }
+
+            if (!versioned)
+                return File.Exists(path) || File.Exists(path + ".fileref") || File.Exists(path + ".dedup");
+
+            string? parent = Path.GetDirectoryName(path);
+            return parent is not null && Directory.Exists(parent)
+                && Directory.EnumerateFiles(parent, Path.GetFileName(path) + ".v*").Any();
+        }
+        catch (Exception ex) when (ex is IOException or UnauthorizedAccessException)
+        {
+            return false;
+        }
+    }
+
+    /// <summary>
     /// Materialise a <c>.fileref</c> record into a real plain file using bytes
     /// from <paramref name="sourceBytesPath"/> — an existing plain copy of the
     /// same content that is about to be deleted by retention. Replaces the
@@ -3473,21 +3737,71 @@ public class DirectoryBackupService
     // Seed from existing mirror directory
     // ------------------------------------------------------------------
 
+    /// <summary>What a seed recorded; see <see cref="SeedFromExistingDirectoryAsync"/>.</summary>
+    /// <param name="Files">Current copies recorded, one per source path.</param>
+    /// <param name="PreviousVersions">Earlier versions recorded from the <c>{drive}_prev</c> folders.</param>
+    /// <param name="SkippedExisting">Source paths left alone because the catalog already had them.</param>
+    /// <param name="DuplicateCopies">
+    /// Stored files not recorded because another form of the same file and version
+    /// was (a plain copy and a <c>.fileref</c> of one file, say). They stay on disk.
+    /// </param>
+    /// <param name="Unrecognized">
+    /// Files left alone: a manifest that could not be read, or a file in a
+    /// <c>_prev</c> folder not named <c>name.vN</c>.
+    /// </param>
+    public sealed record SeedOutcome(
+        int Files, int PreviousVersions, int SkippedExisting, int DuplicateCopies, int Unrecognized);
+
+    /// <summary>The stored files of one source path found in one folder of the destination.</summary>
+    private sealed class SeedGroup
+    {
+        public List<FileInfo> Current { get; } = [];
+        public List<(int Version, FileInfo File)> Previous { get; } = [];
+    }
+
+    /// <summary>What a stored file says about the source file it holds.</summary>
+    private readonly record struct StoredFileInfo(
+        long Size, string? Hash, string? SourcePath, bool IsDeduped, bool IsFileRef);
+
     /// <summary>
-    /// Import files from an existing mirror-format backup directory (e.g. a
-    /// backup4all mirror or a plain robocopy mirror) into the LithicBackup
-    /// catalog. Each file under the mirror's drive-letter subdirectories
-    /// (e.g. <c>C/Users/foo/file.txt</c>) is recorded as "already backed up"
-    /// so that future incremental backups only copy new or changed files.
+    /// Record what an existing backup at <paramref name="targetDir"/> holds as
+    /// already backed up, so the next backup copies only new and changed files.
+    /// Reads Lithic Backup's own layout as well as plain mirrors (backup4all,
+    /// robocopy): the current copy of each file under its drive folder
+    /// (<c>C\Users\…</c>), and Lithic's version history under
+    /// <c>C_prev\…\name.vN</c>.
     /// </summary>
-    /// <returns>Number of files imported.</returns>
-    public async Task<int> SeedFromExistingDirectoryAsync(
+    /// <remarks>
+    /// <para><b>History is imported, and numbering continues after it.</b> The seed
+    /// used to skip <c>{drive}_prev</c> entirely and record every current copy as
+    /// version 1. The next time a file changed, its current copy was moved to
+    /// <c>name.v1</c> - on top of the real version 1 from the destination's earlier
+    /// life - and so on up the chain, one version lost per change. Now each version
+    /// file becomes a record with its own number, and the current copy is numbered
+    /// after the highest. (The backup engine also refuses to overwrite a version
+    /// file it does not own; see the _prev move in ExecuteCoreAsync.) A version's
+    /// backup time is its file's last-write time - when it was copied, since copies
+    /// do not carry the source's timestamp - which is what retention ages it by.</para>
+    /// <para><b>One record per file and version.</b> A destination written by two
+    /// catalogs can hold both <c>name</c> and <c>name.fileref</c> (or <c>.dedup</c>)
+    /// for one file. Only one is recorded: the plain copy (it holds the bytes), else
+    /// the <c>.dedup</c>, else the <c>.fileref</c>. The others stay on disk.</para>
+    /// <para><b>A source path is all or nothing.</b> Its versions and current copy
+    /// are committed together, in batches of whole paths, so cancelling never
+    /// leaves a path with its history recorded and its current copy not: a re-run
+    /// skips every path the catalog already has, and would never fill that gap.</para>
+    /// </remarks>
+    public async Task<SeedOutcome> SeedFromExistingDirectoryAsync(
         int backupSetId,
         string targetDir,
         IProgress<ScanProgress>? progress = null,
         CancellationToken ct = default,
         bool skipHashing = false)
     {
+        var rootDir = new DirectoryInfo(targetDir);
+        if (!rootDir.Exists)
+            throw new DirectoryNotFoundException($"Target directory not found: {targetDir}");
+
         // Create a disc record for this import.
         var discRecord = await _catalog.CreateDiscAsync(new DiscRecord
         {
@@ -3502,221 +3816,357 @@ public class DirectoryBackupService
             CreatedUtc = DateTime.UtcNow,
         }, ct);
 
-        int importedCount = 0;
-        int skippedExisting = 0;
+        int files = 0, versions = 0, skippedExisting = 0, duplicates = 0, unrecognized = 0;
         long totalBytes = 0;
         var progressSw = System.Diagnostics.Stopwatch.StartNew();
-        long lastProgressMs = 0;
+        long lastProgressMs = -ProgressCadence.IntervalMs;
 
-        // Idempotency guard: load the set of SourcePaths already present in
-        // the catalog so re-running the seed on the same destination doesn't
-        // create duplicate FileRecords.  GetLatestVersionInfoAsync returns
-        // one entry per unique source path (non-deleted), which is exactly
-        // the set we need to skip.
+        // Idempotency guard: re-running the seed on the same destination must not
+        // create duplicate records, so every source path the catalog already has
+        // (one entry per live path) is left alone, history and all.
         var existing = await _catalog.GetLatestVersionInfoAsync(backupSetId, ct);
-        var existingPaths = new HashSet<string>(
-            existing.Keys, StringComparer.OrdinalIgnoreCase);
+        var existingPaths = new HashSet<string>(existing.Keys, StringComparer.OrdinalIgnoreCase);
 
-        // Enumerate all single-letter (or short) subdirectories that look like
-        // drive prefixes: C, D, E, etc.
-        var rootDir = new DirectoryInfo(targetDir);
-        if (!rootDir.Exists)
-            throw new DirectoryNotFoundException($"Target directory not found: {targetDir}");
+        // Records of whole source paths, committed a batch at a time. One commit
+        // per record, as this used to do, is a million commits on a large backup.
+        // Never committed while a file is being hashed, so the set's write lock is
+        // only ever held for the inserts.
+        var pending = new List<FileRecord>();
+        var flushSw = System.Diagnostics.Stopwatch.StartNew();
 
-        foreach (var driveDir in rootDir.EnumerateDirectories())
+        async Task FlushAsync()
         {
-            // Accept single-letter or two-letter names as potential drive prefixes.
-            // Skip _prev, _blocks, _filestore directories.
-            string dirName = driveDir.Name;
-            if (dirName.StartsWith('_') || dirName.Length > 2)
-                continue;
-
-            // Reconstruct the drive root: "C" → "C:\"
-            string driveRoot = dirName + @":\";
-
-            foreach (var file in driveDir.EnumerateFiles("*", SearchOption.AllDirectories))
+            if (pending.Count == 0)
+                return;
+            // Not cancellable: a batch is committed whole or not at all.
+            var tx = await _catalog.BeginTransactionAsync(backupSetId, CancellationToken.None);
+            try
             {
-                ct.ThrowIfCancellationRequested();
+                foreach (var rec in pending)
+                    await _catalog.CreateFileRecordAsync(rec, CancellationToken.None);
+                tx.Complete();
+            }
+            finally
+            {
+                tx.Dispose();
+            }
+            pending.Clear();
+            flushSw.Restart();
+        }
 
-                // Classify the stored file by its LithicBackup suffix:
-                //   .fileref — a file-level duplicate (no bytes of its own; its
-                //              content lives as a plain copy elsewhere). Import
-                //              it as an IsFileRef record so dedup'd source files
-                //              are represented in the catalog.
-                //   .dedup   — a block-deduplicated file (manifest + _blocks).
-                //              Import as an IsDeduped record.
-                //   .lbtmp   — a partial copy left behind by an interrupted
-                //              backup (CopyFileAsync writes there before the
-                //              atomic rename); ignore it entirely.
-                // Anything else is a plain named copy holding its own bytes.
-                bool isFileRefFile = file.Name.EndsWith(".fileref", StringComparison.OrdinalIgnoreCase);
-                bool isDedupFile = file.Name.EndsWith(".dedup", StringComparison.OrdinalIgnoreCase);
-                if (file.Name.EndsWith(".lbtmp", StringComparison.OrdinalIgnoreCase))
-                    continue;
+        void Report(string current, bool force = false)
+        {
+            long now = progressSw.ElapsedMilliseconds;
+            if (!force && now - lastProgressMs < ProgressCadence.IntervalMs)
+                return;
+            lastProgressMs = now;
+            progress?.Report(new ScanProgress
+            {
+                CurrentDirectory = current,
+                FilesFound = files + versions,
+                TotalBytes = totalBytes,
+                FilesSkipped = skippedExisting,
+            });
+        }
 
-                // Skip files under any "_prev" segment — these are
-                // versioned-history copies kept by other backup tools (e.g.
-                // backup4all stores superseded files in per-folder _prev
-                // subdirectories) and importing them would create catalog
-                // rows whose SourcePath isn't a real source location.
-                string relativeToDrive = System.IO.Path.GetRelativePath(driveDir.FullName, file.FullName);
-                if (relativeToDrive.Split(['\\', '/'])
-                        .Any(seg => seg.Equals("_prev", StringComparison.OrdinalIgnoreCase)))
-                    continue;
-
-                // For stored-content manifests (.fileref / .dedup) the real
-                // file metadata — original size, content hash, and (for new-
-                // format filerefs) the original source path — comes from the
-                // manifest, NOT from the tiny JSON file on disk. Using the
-                // manifest's OriginalSize is essential: seeding the manifest
-                // file's own length would make every duplicate look "changed"
-                // to the next incremental backup (size mismatch) and force a
-                // needless re-copy.
-                long recordSize = file.Length;
-                string? manifestHash = null;
-                string? manifestSourcePath = null;
-                if (isFileRefFile || isDedupFile)
+        // Size, hash and (for new-format filerefs) source path of a stored file.
+        // For a manifest (.fileref / .dedup) they come from the manifest, NOT from
+        // the tiny JSON file: seeding the manifest's own length would make every
+        // such file look changed to the next backup and force a needless re-copy.
+        // Null for a manifest that cannot be read.
+        async Task<StoredFileInfo?> ReadStoredAsync(FileInfo f)
+        {
+            bool isFileRef = f.Name.EndsWith(".fileref", StringComparison.OrdinalIgnoreCase);
+            bool isDedup = f.Name.EndsWith(".dedup", StringComparison.OrdinalIgnoreCase);
+            if (!isFileRef && !isDedup)
+                return new StoredFileInfo(f.Length, null, null, false, false);
+            try
+            {
+                string json = await File.ReadAllTextAsync(f.FullName, ct);
+                if (isFileRef)
                 {
-                    try
-                    {
-                        string manifestJson = await File.ReadAllTextAsync(file.FullName, ct);
-                        if (isFileRefFile)
-                        {
-                            var m = JsonSerializer.Deserialize<FileRefManifest>(manifestJson, _jsonOptions);
-                            if (m is null) continue;
-                            recordSize = m.OriginalSize;
-                            manifestHash = m.Hash ?? "";
-                            manifestSourcePath = string.IsNullOrEmpty(m.SourcePath) ? null : m.SourcePath;
-                        }
-                        else
-                        {
-                            var m = JsonSerializer.Deserialize<DedupManifest>(manifestJson, _jsonOptions);
-                            if (m is null) continue;
-                            recordSize = m.OriginalSize;
-                            manifestHash = m.OriginalHash ?? "";
-                        }
-                    }
-                    catch
-                    {
-                        // Unreadable / malformed manifest — skip it.
-                        continue;
-                    }
+                    var m = JsonSerializer.Deserialize<FileRefManifest>(json, _jsonOptions);
+                    return m is null ? null : new StoredFileInfo(
+                        m.OriginalSize, m.Hash ?? "",
+                        string.IsNullOrEmpty(m.SourcePath) ? null : m.SourcePath, false, true);
                 }
-
-                // Reconstruct the original source path. New-format filerefs
-                // carry it explicitly; otherwise rebuild it from the drive
-                // prefix plus the relative path with any storage suffix removed.
-                string logicalRelative = relativeToDrive;
-                if (isFileRefFile)
-                    logicalRelative = relativeToDrive[..^".fileref".Length];
-                else if (isDedupFile)
-                    logicalRelative = relativeToDrive[..^".dedup".Length];
-
-                string fullSourcePath = manifestSourcePath
-                    ?? System.IO.Path.Combine(driveRoot, logicalRelative);
-                // DiscPath is the path of the stored file itself, INCLUDING the
-                // .fileref / .dedup suffix, so restore/verify can locate it.
-                string discPath = System.IO.Path.Combine(dirName, relativeToDrive);
-
-                // Idempotent skip: this source path is already in the catalog
-                // (from a previous seed of the same destination).  Re-importing
-                // would create a duplicate FileRecord that retention logic
-                // would later flag as an excess version.
-                if (existingPaths.Contains(fullSourcePath))
-                {
-                    skippedExisting++;
-                    continue;
-                }
-
-                string hash;
-                if (manifestHash is not null)
-                {
-                    // Stored-content manifest: the content hash is recorded in
-                    // the manifest — no need to (and we must not) hash the JSON.
-                    hash = manifestHash;
-                }
-                else if (skipHashing)
-                {
-                    // Use empty hash — incremental detection relies on
-                    // size + last-write-time, not content hash.
-                    hash = "";
-                }
-                else
-                {
-                    // Report before hashing so the UI shows which file is
-                    // being processed — large files take a long time to hash.
-                    long nowPre = progressSw.ElapsedMilliseconds;
-                    if (nowPre - lastProgressMs >= ProgressCadence.IntervalMs)
-                    {
-                        lastProgressMs = nowPre;
-                        progress?.Report(new ScanProgress
-                        {
-                            CurrentDirectory = fullSourcePath,
-                            FilesFound = importedCount,
-                            TotalBytes = totalBytes,
-                            FilesSkipped = skippedExisting,
-                        });
-                    }
-
-                    try
-                    {
-                        hash = await ComputeFileHashAsync(file.FullName, ct);
-                    }
-                    catch
-                    {
-                        // If we can't read the file (locked, etc.), skip it.
-                        continue;
-                    }
-                }
-
-                await _catalog.CreateFileRecordAsync(new FileRecord
-                {
-                    DiscId = discRecord.Id,
-                    SourcePath = fullSourcePath,
-                    DiscPath = discPath,
-                    SizeBytes = recordSize,
-                    Hash = hash,
-                    IsZipped = false,
-                    IsSplit = false,
-                    IsDeduped = isDedupFile,
-                    IsFileRef = isFileRefFile,
-                    Version = 1,
-                    SourceLastWriteUtc = file.LastWriteTimeUtc,
-                    BackedUpUtc = DateTime.UtcNow,
-                }, ct);
-
-                importedCount++;
-                totalBytes += recordSize;
-
-                // Throttle progress reports to avoid flooding the UI thread.
-                long nowPost = progressSw.ElapsedMilliseconds;
-                if (nowPost - lastProgressMs >= ProgressCadence.IntervalMs)
-                {
-                    lastProgressMs = nowPost;
-                    progress?.Report(new ScanProgress
-                    {
-                        CurrentDirectory = fullSourcePath,
-                        FilesFound = importedCount,
-                        TotalBytes = totalBytes,
-                        FilesSkipped = skippedExisting,
-                    });
-                }
+                var d = JsonSerializer.Deserialize<DedupManifest>(json, _jsonOptions);
+                return d is null ? null : new StoredFileInfo(d.OriginalSize, d.OriginalHash ?? "", null, true, false);
+            }
+            catch (OperationCanceledException) { throw; }
+            catch
+            {
+                return null;
             }
         }
 
-        // Always report final state so the UI shows the true total.
-        progress?.Report(new ScanProgress
+        // A plain copy's content hash: what lets a .fileref resolve to it, and lets
+        // the next backup tell a re-saved but unchanged file from a changed one.
+        // Empty when hashing is skipped, or the file cannot be read - an empty hash
+        // only costs those two, while leaving the file out would leave the copy on
+        // disk untracked.
+        async Task<string> HashPlainAsync(FileInfo f, string sourcePath)
         {
-            CurrentDirectory = "",
-            FilesFound = importedCount,
-            TotalBytes = totalBytes,
-            FilesSkipped = skippedExisting,
-        });
+            if (skipHashing)
+                return "";
+            Report(sourcePath);
+            try
+            {
+                return await ComputeFileHashAsync(f.FullName, ct);
+            }
+            catch (OperationCanceledException) { throw; }
+            catch
+            {
+                return "";
+            }
+        }
 
-        // Update disc used bytes.
-        discRecord.BytesUsed = totalBytes;
-        await _catalog.UpdateDiscAsync(discRecord, ct);
+        // The preferred readable file among several forms of one file and version:
+        // plain (holds the bytes) before .dedup before .fileref.
+        async Task<(FileInfo File, StoredFileInfo Info)?> PickAsync(IEnumerable<FileInfo> candidates)
+        {
+            var ordered = candidates.OrderBy(StorageRank).ToList();
+            for (int i = 0; i < ordered.Count; i++)
+            {
+                var info = await ReadStoredAsync(ordered[i]);
+                if (info is null)
+                {
+                    unrecognized++;
+                    continue;
+                }
+                duplicates += ordered.Count - i - 1;
+                return (ordered[i], info.Value);
+            }
+            return null;
+        }
 
-        return importedCount;
+        try
+        {
+            foreach (var driveDir in rootDir.EnumerateDirectories())
+            {
+                // Drive folders are one or two letters ("C"). Everything else at
+                // the top - _blocks, the block/file stores, C_prev (read below,
+                // alongside its drive) - is not a drive.
+                string dirName = driveDir.Name;
+                if (dirName.StartsWith('_') || dirName.Length > 2)
+                    continue;
+
+                string driveRoot = dirName + @":\";
+                string prevRoot = Path.Combine(rootDir.FullName, dirName + "_prev");
+                bool hasPrev = Directory.Exists(prevRoot);
+
+                // Walk the current tree and the history tree together, folder by
+                // folder, so all of one source path's stored files are in hand at
+                // once. Folders that exist only in the history (a deleted folder
+                // whose versions remain) are walked too.
+                var folders = new Stack<string>();
+                folders.Push("");
+                while (folders.Count > 0)
+                {
+                    ct.ThrowIfCancellationRequested();
+                    string rel = folders.Pop();
+
+                    var groups = new Dictionary<string, SeedGroup>(StringComparer.OrdinalIgnoreCase);
+                    var subfolders = new HashSet<string>(StringComparer.OrdinalIgnoreCase);
+                    unrecognized += CollectSeedEntries(Path.Combine(driveDir.FullName, rel), false, groups, subfolders);
+                    if (hasPrev)
+                        unrecognized += CollectSeedEntries(Path.Combine(prevRoot, rel), true, groups, subfolders);
+
+                    foreach (string sub in subfolders)
+                    {
+                        // backup4all keeps superseded files in per-folder "_prev"
+                        // subfolders; they are not source locations.
+                        if (!sub.Equals("_prev", StringComparison.OrdinalIgnoreCase))
+                            folders.Push(Path.Combine(rel, sub));
+                    }
+
+                    foreach (var (logicalName, group) in groups)
+                    {
+                        var current = group.Current.Count > 0 ? await PickAsync(group.Current) : null;
+
+                        // The source path is where the file sits: drive folder plus
+                        // relative path, which is exactly how the engine placed it.
+                        // NOT a .fileref's own SourcePath, which a relocation (a
+                        // rename followed by continuous backup) moves without
+                        // rewriting: trusting it filed the whole history under the
+                        // old name, and could give two chains one path. One path for
+                        // every record of the file, so its versions form one chain.
+                        string sourcePath = Path.Combine(driveRoot, rel, logicalName);
+
+                        if (existingPaths.Contains(sourcePath))
+                        {
+                            skippedExisting++;
+                            continue;
+                        }
+
+                        var records = new List<FileRecord>();
+                        long bytes = 0;
+                        int highestPrevious = 0;
+
+                        foreach (var byVersion in group.Previous
+                                     .GroupBy(p => p.Version)
+                                     .OrderBy(g => g.Key))
+                        {
+                            var picked = await PickAsync(byVersion.Select(p => p.File));
+                            if (picked is not { } prev)
+                                continue;
+                            string hash = prev.Info.Hash ?? await HashPlainAsync(prev.File, sourcePath);
+                            records.Add(new FileRecord
+                            {
+                                DiscId = discRecord.Id,
+                                SourcePath = sourcePath,
+                                // The stored file itself, suffix and all, so
+                                // restore and verify can find it.
+                                DiscPath = Path.Combine(dirName + "_prev", rel, prev.File.Name),
+                                SizeBytes = prev.Info.Size,
+                                Hash = hash,
+                                IsDeduped = prev.Info.IsDeduped,
+                                IsFileRef = prev.Info.IsFileRef,
+                                Version = byVersion.Key,
+                                SourceLastWriteUtc = prev.File.LastWriteTimeUtc,
+                                BackedUpUtc = prev.File.LastWriteTimeUtc,
+                            });
+                            highestPrevious = Math.Max(highestPrevious, byVersion.Key);
+                        }
+                        int previousCount = records.Count;
+
+                        if (current is { } cur)
+                        {
+                            string hash = cur.Info.Hash ?? await HashPlainAsync(cur.File, sourcePath);
+                            records.Add(new FileRecord
+                            {
+                                DiscId = discRecord.Id,
+                                SourcePath = sourcePath,
+                                DiscPath = Path.Combine(dirName, rel, cur.File.Name),
+                                SizeBytes = cur.Info.Size,
+                                Hash = hash,
+                                IsDeduped = cur.Info.IsDeduped,
+                                IsFileRef = cur.Info.IsFileRef,
+                                Version = highestPrevious + 1,
+                                // The copy's own write time: when it was copied. The
+                                // next scan calls a source file changed only if it
+                                // was written after that.
+                                SourceLastWriteUtc = cur.File.LastWriteTimeUtc,
+                                BackedUpUtc = DateTime.UtcNow,
+                            });
+                            bytes = cur.Info.Size;
+                        }
+
+                        if (records.Count == 0)
+                            continue;
+
+                        pending.AddRange(records);
+                        files += records.Count - previousCount;
+                        versions += previousCount;
+                        totalBytes += bytes;
+                        Report(sourcePath);
+                    }
+
+                    if (pending.Count >= 2000 || flushSw.ElapsedMilliseconds >= 2000)
+                        await FlushAsync();
+                }
+            }
+
+            await FlushAsync();
+        }
+        catch
+        {
+            // Keep the whole paths already processed: a re-run carries on after
+            // them instead of hashing them all again.
+            try { await FlushAsync(); } catch { /* the original error matters more */ }
+            throw;
+        }
+        finally
+        {
+            try
+            {
+                discRecord.BytesUsed = totalBytes;
+                await _catalog.UpdateDiscAsync(discRecord, CancellationToken.None);
+            }
+            catch { /* only a statistic */ }
+        }
+
+        // Always report final state so the UI shows the true total.
+        Report("", force: true);
+
+        return new SeedOutcome(files, versions, skippedExisting, duplicates, unrecognized);
+    }
+
+    /// <summary>plain = 0, .dedup = 1, .fileref = 2: the order a seed prefers them in.</summary>
+    private static int StorageRank(FileInfo f) =>
+        f.Name.EndsWith(".fileref", StringComparison.OrdinalIgnoreCase) ? 2
+        : f.Name.EndsWith(".dedup", StringComparison.OrdinalIgnoreCase) ? 1
+        : 0;
+
+    /// <summary>
+    /// List one destination folder for the seed: file entries grouped by the
+    /// source file name they hold (storage suffix, and for history the
+    /// <c>.vN</c>, removed), and subfolder names added to
+    /// <paramref name="subfolders"/>. Returns how many history files had names
+    /// that are not <c>name.vN</c>.
+    /// </summary>
+    private static int CollectSeedEntries(
+        string folder, bool isHistory,
+        Dictionary<string, SeedGroup> groups, HashSet<string> subfolders)
+    {
+        if (!Directory.Exists(folder))
+            return 0;
+
+        List<FileSystemInfo> entries;
+        try
+        {
+            entries = new DirectoryInfo(folder).EnumerateFileSystemInfos().ToList();
+        }
+        catch (Exception ex) when (ex is IOException or UnauthorizedAccessException)
+        {
+            return 0;
+        }
+
+        int unrecognized = 0;
+        foreach (var entry in entries)
+        {
+            if (entry is DirectoryInfo dir)
+            {
+                subfolders.Add(dir.Name);
+                continue;
+            }
+            if (entry is not FileInfo file)
+                continue;
+
+            // A partial copy left by an interrupted backup (written there, then
+            // renamed into place); never real content.
+            if (file.Name.EndsWith(".lbtmp", StringComparison.OrdinalIgnoreCase))
+                continue;
+
+            string name = file.Name;
+            if (name.EndsWith(".fileref", StringComparison.OrdinalIgnoreCase))
+                name = name[..^".fileref".Length];
+            else if (name.EndsWith(".dedup", StringComparison.OrdinalIgnoreCase))
+                name = name[..^".dedup".Length];
+
+            if (isHistory)
+            {
+                int dot = name.LastIndexOf(".v", StringComparison.OrdinalIgnoreCase);
+                if (dot <= 0
+                    || !int.TryParse(name.AsSpan(dot + 2), System.Globalization.NumberStyles.None,
+                        System.Globalization.CultureInfo.InvariantCulture, out int version)
+                    || version < 1)
+                {
+                    unrecognized++;
+                    continue;
+                }
+                name = name[..dot];
+                if (!groups.TryGetValue(name, out var g))
+                    groups[name] = g = new SeedGroup();
+                g.Previous.Add((version, file));
+            }
+            else
+            {
+                if (!groups.TryGetValue(name, out var g))
+                    groups[name] = g = new SeedGroup();
+                g.Current.Add(file);
+            }
+        }
+        return unrecognized;
     }
 }

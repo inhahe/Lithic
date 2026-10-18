@@ -1,5 +1,56 @@
 # LithicBackup — Known Issues & Tech Debt
 
+## FIXED: an imported set said "Never backed up" and began re-copying its whole backup (2026-10-18, 1.10.0)
+
+Seen in use, on the first move of two sets to a new computer: both exported "with
+all options", imported with their backup drives attached, and showed "Never backed
+up". About a minute after the import the Worker started a full backup of one,
+planned as 1,223,361 files / 1.64 TB, **all new**, writing to the drive that
+already held them; the other set's continuous backup wrote over its destination
+too. Four faults lined up:
+
+- **Export carried settings only.** No catalog, no `LastBackupUtc`. The imported
+  set's catalog was empty, so it had backed up nothing as far as it knew.
+- **An imported set ran at once.** The Worker's clocks for a set with no
+  `LastBackupUtc` start at `MinValue`, so the continuous safety-net scan (or an
+  interval schedule) was overdue the moment the set appeared.
+- **Nothing noticed the destination already held a backup.** Every file was
+  "new", so it was copied again over its existing copy, and a file changed since
+  the old computer's last backup lost its previous version (overwritten in place:
+  with no record, there was nothing to move into `_prev`).
+- **Version numbers restarted at 1 over existing history, and the `_prev` move
+  overwrote.** Once a file changed again, its copy went to `name.v1` on top of the
+  old computer's version 1, then `.v2`, and so on. **Seeding had the same flaw**:
+  it skipped `{drive}_prev` and recorded every current copy as version 1. (Seeding
+  an existing set also ticked whole top-level folders in its selection.)
+
+Fixed: export includes the history (and import restores it, remapping disc ids);
+imported, cleared and seeded sets hold automated backups until a backup is run in
+the app; the GUI asks and the Worker refuses when a history-less set's destination
+already holds its files; the engine never overwrites a `_prev` file it does not
+own, and checks which file holds a record's content before renumbering (so a
+history exported before the old computer's last backups is not mislabelled); the
+seed imports `_prev` with its numbers and takes source paths from where files sit.
+Design: "An empty catalog is not an empty destination" in design.md. Pinned by
+`tools\history_transfer_test`.
+
+Found on the way, older than all of this: **restore of a directory set failed for
+every version backed up before a drive-letter change** ("Backup folder not
+found"), because it located files only through each disc record's label, the
+destination path at the time - and the drive-letter following never updated those.
+That is the situation of every set moved to a computer where its drive has
+another letter. Restore now falls back to the set's current destination.
+
+**Open:**
+- An imported set keeps the old computer's volume identities
+  (`DestinationVolumeId`, `SourceVolumeMappings`). They resolved on the computer
+  above (the log shows `i:` followed to `F:`), but where Windows gives the drive
+  a different volume GUID, the destination reads "not connected" until **Change
+  Destination** re-captures it.
+- **Duplicate** with "Backup history" (`CopyBackupSetCatalogAsync`) still copies
+  discs, files and chunks but not `DeduplicationBlocks`, so block dedup in the copy
+  starts without its index. Import does copy them.
+
 ## FIXED: a paused backup held the set's write lock, stalling the Worker; other run-boundary hazards (2026-10-11)
 
 Found by the second code review (Opus, max) of the progress work. None was seen in

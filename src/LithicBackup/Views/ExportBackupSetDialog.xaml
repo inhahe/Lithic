@@ -1,0 +1,45 @@
+<Window x:Class="LithicBackup.Views.ExportBackupSetDialog"
+        xmlns="http://schemas.microsoft.com/winfx/2006/xaml/presentation"
+        xmlns:x="http://schemas.microsoft.com/winfx/2006/xaml"
+        Title="{Binding Title}"
+        Icon="/Assets/LithicBackup.ico"
+        Width="480" SizeToContent="Height"
+        WindowStartupLocation="CenterOwner"
+        ResizeMode="NoResize"
+        ShowInTaskbar="False"
+        Style="{StaticResource MainWindowStyle}">
+
+    <StackPanel Margin="16">
+        <TextBlock Text="The export always includes the set's settings: sources, destination, options, retention and schedule."
+                   TextWrapping="Wrap"
+                   Foreground="{StaticResource TextSecondaryBrush}"
+                   FontSize="11" Margin="0,0,0,14" />
+
+        <CheckBox Content="Backup history (records of files already backed up, and their versions)"
+                  IsChecked="{Binding IncludeHistory}"
+                  IsEnabled="{Binding HasHistory}"
+                  Margin="0,0,0,4" />
+        <TextBlock Text="Lets the set carry on where it left off on another computer that uses the same backup drive. Without it, the imported set knows nothing about what is already backed up: its first backup copies everything again, unless you seed it from the destination."
+                   Foreground="{StaticResource TextDimBrush}"
+                   FontSize="11" FontStyle="Italic"
+                   TextWrapping="Wrap"
+                   Margin="20,0,0,4" />
+        <TextBlock Text="{Binding HistorySizeText}"
+                   Foreground="{StaticResource TextDimBrush}"
+                   FontSize="11"
+                   TextWrapping="Wrap"
+                   Margin="20,0,0,0" />
+
+        <!-- Buttons -->
+        <StackPanel Orientation="Horizontal" HorizontalAlignment="Right"
+                    Margin="0,16,0,0">
+            <Button Content="Cancel" Padding="16,8" Margin="0,0,8,0"
+                    Cursor="Hand" IsCancel="True"
+                    Click="Cancel_Click" />
+            <Button Style="{StaticResource PrimaryButton}"
+                    Content="Export..." Padding="16,8"
+                    Cursor="Hand" IsDefault="True"
+                    Click="OK_Click" />
+        </StackPanel>
+    </StackPanel>
+</Window>

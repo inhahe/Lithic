@@ -740,7 +740,7 @@
                         <Button Command="{Binding SeedFromExistingCommand}"
                                 Padding="10,6" Margin="0,0,8,0" Cursor="Hand"
                                 Visibility="{Binding IsEditMode, Converter={StaticResource BoolToVis}}"
-                                ToolTip="Import files from an existing mirror backup (e.g. backup4all) in the destination directory so future backups are incremental.">
+                                ToolTip="Record what an existing backup in the destination already holds (a Lithic Backup destination, including its version history, or a mirror such as backup4all) so future backups copy only what changed. Use it when a set has no history but its destination does: imported without its history, re-created, or after Clear Backup History.">
                             <StackPanel Orientation="Horizontal">
                                 <TextBlock Text="Seed from Existing Backup" />
                                 <TextBlock Text=" ..." Visibility="{Binding IsSeeding, Converter={StaticResource BoolToVis}}" />
@@ -754,7 +754,7 @@
                                   VerticalContentAlignment="Center"
                                   Margin="0,0,12,0"
                                   Visibility="{Binding IsEditMode, Converter={StaticResource BoolToVis}}"
-                                  ToolTip="Skip SHA-256 hashing during import. Much faster — incremental detection uses file size and timestamps, not content hashes." />
+                                  ToolTip="Skip SHA-256 hashing of plain copies during import. Much faster — incremental detection uses file size and timestamps, not content hashes. Leave it off if the backup used file-level dedup: a .fileref finds its content by hash, so references to unhashed copies would not resolve on restore." />
                         <TextBlock Text="{Binding SeedResult}"
                                    Foreground="{StaticResource TextSecondaryBrush}"
                                    FontSize="11" VerticalAlignment="Center"

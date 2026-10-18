@@ -159,6 +159,9 @@ public class RestoreService : IRestoreService
         long bytesCompleted = 0;
         var errors = new List<string>();
 
+        // Each set's current destination, looked up once (see FindDiscRootAsync).
+        var currentDestinations = new Dictionary<int, string?>();
+
         foreach (var discGroup in byDisc)
         {
             ct.ThrowIfCancellationRequested();
@@ -192,7 +195,7 @@ public class RestoreService : IRestoreService
             else
             {
                 // No callback — assume disc is already mounted; try common drive letters.
-                discRoot = FindDiscRoot(disc.Label);
+                discRoot = await FindDiscRootAsync(disc, currentDestinations, ct);
                 if (discRoot is null)
                 {
                     // Directory-mode backups store their data in a folder whose
@@ -827,6 +830,43 @@ public class RestoreService : IRestoreService
         && (Path.IsPathRooted(label)
             || label.Contains('\\')
             || label.Contains('/'));
+
+    /// <summary>
+    /// <see cref="FindDiscRoot"/>, falling back to the set's current destination
+    /// for a directory-mode "disc" whose recorded folder is gone.
+    /// </summary>
+    /// <remarks>
+    /// A directory backup's disc record is labelled with the destination folder
+    /// as it was when that backup ran (<c>i:\lithicbackup</c>). Nothing updates
+    /// those labels when the destination is followed to a new drive letter, or
+    /// when the set is imported on a computer where the drive has another letter,
+    /// so every version backed up before the change failed to restore with
+    /// "Backup folder not found" although the files sat at the same relative
+    /// paths under the set's current destination (<c>F:\lithicbackup</c>). Only
+    /// Change Destination relabelled them, and only discs whose label matched the
+    /// path being changed from. The label still wins whenever its folder exists.
+    /// </remarks>
+    private async Task<string?> FindDiscRootAsync(
+        DiscRecord disc, Dictionary<int, string?> currentDestinations, CancellationToken ct)
+    {
+        string? root = FindDiscRoot(disc.Label);
+        if (root is not null)
+            return root;
+        if (disc.MediaType != MediaType.Directory && !LooksLikeDirectoryPath(disc.Label))
+            return null;
+
+        if (!currentDestinations.TryGetValue(disc.BackupSetId, out string? current))
+        {
+            var set = await _catalog.GetBackupSetAsync(disc.BackupSetId, ct);
+            var opts = set?.JobOptions;
+            current = opts?.TargetDirectory;
+            if (current is not null && opts!.CreateSubdirectory && !string.IsNullOrWhiteSpace(opts.SubdirectoryName))
+                current = Path.Combine(current, opts.SubdirectoryName.Trim());
+            currentDestinations[disc.BackupSetId] = current;
+        }
+
+        return current is not null && Directory.Exists(current) ? current : null;
+    }
 
     /// <summary>
     /// Try to find a mounted disc or directory backup target.
