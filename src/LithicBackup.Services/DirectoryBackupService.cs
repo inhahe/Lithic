@@ -323,43 +323,29 @@ public class DirectoryBackupService
         // percentage cap and the free-memory reserve hold continuously. See the
         // memory-runaway entry in known-issues.md. A policy that admits nothing
         // (e.g. Fixed 0 GB) simply disables buffering (still correct).
-        // The policy is re-read from machine settings while the backup runs (at
-        // most ~once a second) so lowering the budget in the GUI mid-backup takes
-        // effect on a long-running job instead of being frozen at whatever it was
-        // when the job started. job.MemoryBudget is the seed and the fallback when
-        // settings can't be read. MachineSettings.Load() is a cheap, exception-safe
-        // JSON read of the file the GUI writes, which every account reads, so a
-        // change in the GUI reaches the Worker's run too. See the "memory not
-        // released after lowering budget mid-run" entry in known-issues.md.
-        var seedPolicy = job.MemoryBudget ?? MemoryBudgetOptions.Default;
-        var livePolicy = seedPolicy;
-        var policyClock = System.Diagnostics.Stopwatch.StartNew();
-        long lastPolicyReadMs = long.MinValue;
-        MemoryBudgetOptions CurrentPolicy()
-        {
-            long now = policyClock.ElapsedMilliseconds;
-            if (now - lastPolicyReadMs >= 1000)
-            {
-                lastPolicyReadMs = now;
-                try { livePolicy = MachineSettings.Load().MemoryBudget ?? seedPolicy; }
-                catch { /* keep the last good policy */ }
-            }
-            return livePolicy;
-        }
+        // The policy follows the machine settings while the backup runs, so
+        // lowering the budget in the GUI mid-backup reaches a long-running job, the
+        // Worker's included, instead of staying at whatever it was when the job
+        // started; until they are saved, job.MemoryBudget stands (LiveMemoryPolicy).
+        // See the "memory not released after lowering budget mid-run" entry in
+        // known-issues.md.
+        var livePolicy = new LiveMemoryPolicy(job.MemoryBudget ?? MemoryBudgetOptions.Default);
+        MemoryBudgetOptions CurrentPolicy() => livePolicy.Current();
 
         // Reclaim (LOH-compacting GC) is throttled to at most once every few
         // seconds: it's a blocking gen-2 collection, and if a Fixed cap is set
         // below the process's irreducible baseline the budget stays "over" forever,
         // so an unthrottled reclaim-per-file would grind the backup to a halt for no
-        // further benefit.
+        // further benefit. Null until the first: a "minimum" start time would
+        // overflow the subtraction and throttle every reclaim away.
         var reclaimClock = System.Diagnostics.Stopwatch.StartNew();
-        long lastReclaimMs = long.MinValue;
+        long? lastReclaimMs = null;
         void MaybeReclaim()
         {
             if (!MemoryBudget.IsOverBudget(CurrentPolicy()))
                 return;
             long now = reclaimClock.ElapsedMilliseconds;
-            if (now - lastReclaimMs < 3000)
+            if (lastReclaimMs is { } last && now - last < 3000)
                 return;
             lastReclaimMs = now;
             MemoryBudget.ReclaimNow();

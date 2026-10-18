@@ -29,7 +29,6 @@ public class MainViewModel : ViewModelBase
     private readonly IDestinationResolver? _destinationResolver;
     private readonly ISourceResolver? _sourceResolver;
     private readonly UserSettings _settings;
-    private readonly MachineSettings _machineSettings;
 
     private string _statusText = "Ready";
     private string _backgroundStatusText = "";
@@ -71,11 +70,9 @@ public class MainViewModel : ViewModelBase
         FileHashCache? fileHashCache = null,
         IDestinationResolver? destinationResolver = null,
         UserSettings? settings = null,
-        ISourceResolver? sourceResolver = null,
-        MachineSettings? machineSettings = null)
+        ISourceResolver? sourceResolver = null)
     {
         _settings = settings ?? new UserSettings();
-        _machineSettings = machineSettings ?? new MachineSettings();
         _catalog = catalog;
         _burner = burner;
         _scanner = scanner;
@@ -2740,6 +2737,8 @@ public class MainViewModel : ViewModelBase
             effectiveTargetDir = Path.Combine(effectiveTargetDir, opts.SubdirectoryName.Trim());
         }
 
+        // Read now, not kept from startup: another account's app may have saved since.
+        var machineSettings = MachineSettings.Load();
         var job = new BackupJob
         {
             BackupSetId = backupSet.Id,
@@ -2761,8 +2760,8 @@ public class MainViewModel : ViewModelBase
             ExcludedExtensions = opts.ExcludedExtensions,
             RetentionTiers = opts.RetentionTiers,
             TierSets = opts.TierSets,
-            MemoryBudget = _machineSettings.MemoryBudget,
-            StagingMode = _machineSettings.DiscStagingMode,
+            MemoryBudget = machineSettings.MemoryBudget,
+            StagingMode = machineSettings.DiscStagingMode,
         };
 
         bool isDir = job.TargetDirectory is not null;
@@ -3033,6 +3032,8 @@ public class MainViewModel : ViewModelBase
             && !string.IsNullOrWhiteSpace(opts.SubdirectoryName))
             effectiveTargetDir = Path.Combine(effectiveTargetDir, opts.SubdirectoryName.Trim());
 
+        // Read now, not kept from startup: another account's app may have saved since.
+        var machineSettings = MachineSettings.Load();
         var job = new BackupJob
         {
             BackupSetId = backupSet.Id,
@@ -3054,8 +3055,8 @@ public class MainViewModel : ViewModelBase
             ExcludedExtensions = opts.ExcludedExtensions,
             RetentionTiers = opts.RetentionTiers,
             TierSets = opts.TierSets,
-            MemoryBudget = _machineSettings.MemoryBudget,
-            StagingMode = _machineSettings.DiscStagingMode,
+            MemoryBudget = machineSettings.MemoryBudget,
+            StagingMode = machineSettings.DiscStagingMode,
         };
 
         bool isDir = job.TargetDirectory is not null;
@@ -3509,6 +3510,8 @@ public class MainViewModel : ViewModelBase
             effectiveTargetDir = Path.Combine(effectiveTargetDir, opts.SubdirectoryName.Trim());
         }
 
+        // Read now, not kept from startup: another account's app may have saved since.
+        var machineSettings = MachineSettings.Load();
         var job = new BackupJob
         {
             BackupSetId = backupSet.Id,
@@ -3530,8 +3533,8 @@ public class MainViewModel : ViewModelBase
             ExcludedExtensions = opts.ExcludedExtensions,
             RetentionTiers = opts.RetentionTiers,
             TierSets = opts.TierSets,
-            MemoryBudget = _machineSettings.MemoryBudget,
-            StagingMode = _machineSettings.DiscStagingMode,
+            MemoryBudget = machineSettings.MemoryBudget,
+            StagingMode = machineSettings.DiscStagingMode,
         };
 
         bool isDir = job.TargetDirectory is not null;

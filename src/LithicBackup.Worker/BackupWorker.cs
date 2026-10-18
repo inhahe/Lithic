@@ -110,19 +110,29 @@ public sealed class BackupWorker : BackgroundService
     private readonly SemaphoreSlim _backupLock = new(1, 1);
 
     /// <summary>
-    /// Machine-global continuous-backup timing rules (size-tiered debounce +
-    /// mask-tiered max-wait), reloaded from <see cref="MachineSettings"/> at the top
-    /// of every poll cycle so edits in the GUI take effect without a restart.
-    /// These replace the old per-set <c>DebounceSeconds</c>/<c>MaxWaitSeconds</c>
-    /// fields (kept on <see cref="BackupSchedule"/> only for back-compat).
+    /// The settings the app saves for backups (<see cref="MachineSettings"/>), as
+    /// last read: reloaded at the top of a poll cycle when the file has been
+    /// written, so edits in the GUI take effect without a restart. A file that
+    /// cannot be read leaves these as they were.
+    /// </summary>
+    private MachineSettings _machine = new();
+
+    /// <summary>
+    /// The continuous-backup timing rules (size-tiered debounce + mask-tiered
+    /// max-wait) of <see cref="_machine"/>. These replace the old per-set
+    /// <c>DebounceSeconds</c>/<c>MaxWaitSeconds</c> fields (kept on
+    /// <see cref="BackupSchedule"/> only for back-compat).
     /// </summary>
     private ContinuousRules _rules = new();
 
     /// <summary>
-    /// <see cref="MachineSettings.LastWriteTimeUtc"/> when <see cref="_rules"/> was
+    /// <see cref="MachineSettings.LastWriteTimeUtc"/> when <see cref="_machine"/> was
     /// read; null before the first read, or when the time could not be told.
     /// </summary>
-    private DateTime? _rulesReadFromWriteTimeUtc;
+    private DateTime? _machineReadFromWriteTimeUtc;
+
+    /// <summary>Whether an unreadable settings file has been logged since the last good read.</summary>
+    private bool _machineUnreadableLogged;
 
     /// <summary>
     /// The catalog's <see cref="ICatalogRepository.GetBackupSetsChangeStampAsync"/>
@@ -454,15 +464,7 @@ public sealed class BackupWorker : BackgroundService
     /// </summary>
     private async Task ReloadBackupSetsAsync(CancellationToken ct)
     {
-        // Refresh machine-global continuous timing rules so GUI edits (size-tiered
-        // debounce, mask-tiered max-wait) apply on the next poll without a restart:
-        // re-read when the file has been written, not at every pass.
-        var settingsWritten = MachineSettings.LastWriteTimeUtc();
-        if (settingsWritten is null || settingsWritten != _rulesReadFromWriteTimeUtc)
-        {
-            _rules = MachineSettings.Load().ContinuousRules ?? new();
-            _rulesReadFromWriteTimeUtc = settingsWritten;
-        }
+        ReloadMachineSettings();
 
         // This runs at every pass, and push wake-ups can make that several times
         // a second; reading the sets parses every selection tree, megabytes for a
@@ -564,6 +566,41 @@ public sealed class BackupWorker : BackgroundService
         _loadedSetsStamp = stamp;
 
         await RemoveRedundantSelectionEntriesAsync(ct);
+    }
+
+    /// <summary>
+    /// Read the settings the app saves for backups again if the file has been
+    /// written since the last read, so GUI edits apply without a restart. A file
+    /// that cannot be read keeps the settings already in force (falling back to
+    /// the defaults then would be the very failure the file exists to prevent),
+    /// is logged once, and is tried again at the next pass.
+    /// </summary>
+    private void ReloadMachineSettings()
+    {
+        var written = MachineSettings.LastWriteTimeUtc();
+        if (written is not null && written == _machineReadFromWriteTimeUtc)
+            return;
+
+        switch (MachineSettings.TryLoad(out var machine))
+        {
+            case MachineSettings.LoadResult.Loaded:
+            case MachineSettings.LoadResult.Absent:
+                _machine = machine;
+                _rules = machine.ContinuousRules ?? new();
+                _machineReadFromWriteTimeUtc = written;
+                _machineUnreadableLogged = false;
+                break;
+
+            case MachineSettings.LoadResult.Unreadable:
+                if (!_machineUnreadableLogged)
+                {
+                    _machineUnreadableLogged = true;
+                    _logger.LogWarning(
+                        "Could not read the backup settings in {Path}; going on with the ones last read "
+                        + "until it can be read.", MachineSettings.DefaultPath);
+                }
+                break;
+        }
     }
 
     /// <summary>
@@ -1928,7 +1965,7 @@ public sealed class BackupWorker : BackgroundService
             if (await RefuseUntrackedDestinationAsync(state, targetDir, ct))
                 return;
 
-            var job = BuildJob(set, opts, targetDir);
+            var job = BuildJob(set, opts, targetDir, _machine);
 
             var retentionTiers = opts.RetentionTiers.Count > 0
                 ? opts.RetentionTiers
@@ -2006,7 +2043,7 @@ public sealed class BackupWorker : BackgroundService
                 return; // destination not connected — moves stay queued
             }
 
-            var job = BuildJob(set, opts, targetDir);
+            var job = BuildJob(set, opts, targetDir, _machine);
 
             // Snapshot and clear now that we hold the lock and a live destination;
             // anything we can't relocate is re-enqueued for the copy path below.
@@ -2297,7 +2334,7 @@ public sealed class BackupWorker : BackgroundService
 
             _logger.LogInformation("Starting backup for \"{Name}\" → {Target}", set.Name, targetDir);
 
-            var job = BuildJob(set, opts, targetDir);
+            var job = BuildJob(set, opts, targetDir, _machine);
 
             var (diff, totalBytes, totalFiles) = await _directoryBackup.PlanAsync(job, ct);
 
@@ -2453,10 +2490,10 @@ public sealed class BackupWorker : BackgroundService
     }
 
     /// <summary>Build a <see cref="BackupJob"/> from a set's saved options.</summary>
-    private static BackupJob BuildJob(BackupSet set, JobOptions opts, string targetDir)
+    /// <param name="machineSettings">The settings the app saves for backups, as last
+    /// read (<see cref="ReloadMachineSettings"/>).</param>
+    private static BackupJob BuildJob(BackupSet set, JobOptions opts, string targetDir, MachineSettings machineSettings)
     {
-        // The settings the app saves for every account, beside the catalog.
-        var machineSettings = MachineSettings.Load();
         return new BackupJob
         {
             BackupSetId = set.Id,

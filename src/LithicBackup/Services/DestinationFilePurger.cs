@@ -228,14 +228,17 @@ internal static class DestinationFilePurger
     private sealed class SweepProgress(IProgress<ProgressReport>? progress, Stopwatch sw)
     {
         private int _scanned;
-        private long _lastMs = long.MinValue;
+
+        // Null until the first report: a "minimum" start time would overflow the
+        // subtraction below and suppress every report.
+        private long? _lastMs;
 
         public void Tick()
         {
             _scanned++;
             if (progress is null) return;
             long nowMs = sw.ElapsedMilliseconds;
-            if (nowMs - _lastMs < ProgressCadence.IntervalMs) return;
+            if (_lastMs is { } last && nowMs - last < ProgressCadence.IntervalMs) return;
             _lastMs = nowMs;
             progress.Report($"Cleaning empty directories: {_scanned:N0} scanned");
         }

@@ -70,17 +70,31 @@ when the other process is running.
   `%LOCALAPPDATA%`; the Worker, as LocalSystem, would read the system profile's
   copy, so nothing it needs may live there.
   * **Only the app writes the machine file, and replaces it in one step**
-    (`AtomicFile.TryReplace`: a rename with POSIX semantics), so the Worker never
-    reads part of one. An ordinary replacing move fails while any handle has the
-    file open, and a virus scanner opens each new file: back-to-back saves under a
-    reader failed after a second of retries. The POSIX rename goes through while
-    handles that share delete access are open; the readers here share it and copy
-    the bytes out before parsing. The settings dialog says so if a save fails, and
-    adopts the new values only once written.
+    (`AtomicFile.TryReplace`: a rename with POSIX semantics), flushed to the disk
+    first and from a temporary file of its own, so no reader sees part of one,
+    even after a crash, and two saves at once cannot mix. An ordinary replacing
+    move fails while any handle has the file open, and a virus scanner opens each
+    new file: back-to-back saves under a reader failed after a second of retries.
+    The POSIX rename goes through while handles that share delete access are
+    open; the readers here share it and copy the bytes out before parsing.
+  * **Read it where it is used, never from a copy kept since startup**: another
+    account's app may have saved since. The GUI reads it for each job and when
+    the settings dialog opens; the dialog saves off the UI thread and says so if
+    the save fails.
+  * **An unreadable file is not the defaults.** `TryLoad` tells a missing file
+    (the defaults apply) from one that cannot be read; the Worker then keeps the
+    settings it last read, logs it once, and tries again at the next pass.
+  * **A running backup follows the file, not the defaults** (`LiveMemoryPolicy`):
+    it keeps the job's own memory budget until the file is written during the run.
   * **The app carries the machine settings over once**, on its first start without
     the machine file, from its own per-user file, where they used to be kept under
-    the same names. The Worker never seeds the file: its per-user file is the
-    system profile's, which nothing writes.
+    the same names; with several accounts, the first to start wins. The Worker
+    never seeds the file: its per-user file is the system profile's, which nothing
+    writes. `UserSettings` writes back fields it does not know, so the old ones
+    survive a carry-over that failed, to be tried at the next start.
+  * **Widening the shared folder's ACL changes nothing when it is already
+    widened.** Setting it makes Windows re-apply the inherited part to every file
+    beneath, and it runs at every start and every settings save.
 * **Writes to a set take turns, and the Worker gives way.** Every write to a set's
   database first takes a cross-process lock file (`set-<id>.db.writelock`,
   `SqliteSetDatabase.AcquireCrossProcessWriteAsync`). A waiter polls every 25 ms.

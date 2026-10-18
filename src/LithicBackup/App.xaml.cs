@@ -23,7 +23,6 @@ public partial class App : Application
     private WinForms.NotifyIcon? _notifyIcon;
     private WinForms.ToolStripMenuItem? _remindersItem;
     private UserSettings _settings = new();
-    private MachineSettings _machineSettings = new();
 
     // --- Single-instance enforcement ---
     /// <summary>Shared name for the per-session single-instance primitives.</summary>
@@ -347,17 +346,17 @@ public partial class App : Application
         var directoryBackupService = new DirectoryBackupService(
             _catalog, scanner, retentionService, deduplicationEngine, fileHashCache);
 
-        // --- Settings (load before building the view model so the memory
-        // budget and other preferences flow into backup jobs). The machine
-        // settings are carried over from this account's file the first time,
-        // which is where they were kept before the Worker could see them. ---
+        // --- Settings. This user's preferences are loaded for the view model; the
+        // settings that govern backups are read where they are used. They are
+        // carried over from this account's file if there is no machine file yet,
+        // since that is where they were kept before. ---
         _settings = UserSettings.Load();
-        _machineSettings = MachineSettings.LoadOrCarryOver();
+        MachineSettings.CarryOverIfMissing();
 
         var mainViewModel = new MainViewModel(
             _catalog, burner, scanner, orchestrator, restoreService, catalogFreeRestoreService,
             directoryBackupService, _trayService,
-            fileHashCache, destinationResolver, _settings, sourceResolver, _machineSettings);
+            fileHashCache, destinationResolver, _settings, sourceResolver);
         var mainWindow = new MainWindow { DataContext = mainViewModel };
 
         // --- System tray icon ---
@@ -689,7 +688,7 @@ public partial class App : Application
     /// </summary>
     internal void OpenSettings(Window owner)
     {
-        var dialog = new Views.SettingsDialog(_settings, _machineSettings) { Owner = owner };
+        var dialog = new Views.SettingsDialog(_settings) { Owner = owner };
         if (dialog.ShowDialog() == true && _remindersItem is not null)
             _remindersItem.Checked = !_settings.SuppressBackupSuggestions;
     }

@@ -14,20 +14,29 @@ namespace LithicBackup.Views;
 /// <summary>
 /// Editor for the backup settings every account shares (<see cref="MachineSettings"/>:
 /// memory budget, disc staging, continuous timing) and this user's preferences
-/// (<see cref="UserSettings"/>). Edits in-memory copies and writes them back to
-/// the supplied instances (and disk) only on Save.
+/// (<see cref="UserSettings"/>). The shared settings are read when the dialog
+/// opens, since another account's app may have saved them since this one started,
+/// and written only on Save, as are the edits to the supplied user settings.
 /// </summary>
 public partial class SettingsDialog : Window, INotifyPropertyChanged
 {
     private readonly UserSettings _settings;
-    private readonly MachineSettings _machineSettings;
 
-    public SettingsDialog(UserSettings settings, MachineSettings machineSettings)
+    public SettingsDialog(UserSettings settings)
     {
         _settings = settings;
-        _machineSettings = machineSettings;
         InitializeComponent();
         DataContext = this;
+
+        var loaded = MachineSettings.TryLoad(out var machineSettings);
+        if (loaded == MachineSettings.LoadResult.Unreadable)
+        {
+            Loaded += (_, _) => MessageBox.Show(this,
+                $"The backup settings in {MachineSettings.DefaultPath} could not be read, so the "
+                + "defaults are shown. Backups go on with the settings last read. Saving here "
+                + "replaces the file with what this window shows.",
+                "Settings not read", MessageBoxButton.OK, MessageBoxImage.Warning);
+        }
 
         // Seed editable fields from the persisted settings.
         var mb = machineSettings.MemoryBudget ?? new MemoryBudgetOptions();
@@ -405,17 +414,30 @@ public partial class SettingsDialog : Window, INotifyPropertyChanged
         RefreshPreview();
     }
 
-    private void OK_Click(object sender, RoutedEventArgs e)
+    private async void OK_Click(object sender, RoutedEventArgs e)
     {
-        // Saved before it is adopted: if the file cannot be written, the
-        // background service keeps the old settings, and so must this app.
         var machine = new MachineSettings
         {
             MemoryBudget = BuildOptions(),
             DiscStagingMode = _burnInPlace ? DiscStagingMode.InPlace : DiscStagingMode.TemporaryCopy,
             ContinuousRules = BuildContinuousRules(),
         };
-        if (!machine.Save())
+
+        // Off the UI thread: a save can wait about a second for a handle on the
+        // file. The window takes no input, and does not close, until it is done.
+        bool saved;
+        IsEnabled = false;
+        _saving = true;
+        try
+        {
+            saved = await Task.Run(() => machine.Save());
+        }
+        finally
+        {
+            _saving = false;
+            IsEnabled = true;
+        }
+        if (!saved)
         {
             MessageBox.Show(this,
                 "Lithic Backup could not save the backup settings (memory budget, disc staging and "
@@ -424,9 +446,6 @@ public partial class SettingsDialog : Window, INotifyPropertyChanged
                 "Settings not saved", MessageBoxButton.OK, MessageBoxImage.Warning);
             return;
         }
-        _machineSettings.MemoryBudget = machine.MemoryBudget;
-        _machineSettings.DiscStagingMode = machine.DiscStagingMode;
-        _machineSettings.ContinuousRules = machine.ContinuousRules;
 
         _settings.SuppressBackupSuggestions = _suppressBackupSuggestions;
         _settings.CheckForUpdates = _checkForUpdates;
@@ -438,6 +457,16 @@ public partial class SettingsDialog : Window, INotifyPropertyChanged
     }
 
     private void Cancel_Click(object sender, RoutedEventArgs e) => Close();
+
+    /// <summary>True while Save writes the backup settings; the window stays open meanwhile.</summary>
+    private bool _saving;
+
+    protected override void OnClosing(CancelEventArgs e)
+    {
+        if (_saving)
+            e.Cancel = true;
+        base.OnClosing(e);
+    }
 
     /// <summary>
     /// Persist the active tab regardless of how the dialog closed — it's UI

@@ -32,11 +32,33 @@ stream held it for milliseconds and fell into step with the retries). With it, 0
 saves in 300 failed in three runs, with 0 torn reads. If a save fails anyway, the
 settings dialog says so and keeps the old values.
 
+**From the code review (Opus, max), also fixed:**
+- **Older than this change: a running backup never re-read its memory budget, and
+  never gave freed memory back.** Both throttles in the backup engine started at
+  `long.MinValue`, so `now - last` overflowed to a negative number and every
+  re-read and every reclaim was throttled away, since 1.0.48. The empty-folder
+  sweep's progress (`DestinationFilePurger`) never reported for the same reason.
+  The live budget is now `LiveMemoryPolicy`, which also keeps the job's own budget
+  until the settings file is written during the run; re-reading at every look
+  would have replaced a job's explicit budget with the defaults.
+- The GUI kept a copy of the machine settings from startup, so an older session's
+  Save reverted settings another account had saved since; it now reads them when
+  it needs them.
+- One failed read made the Worker adopt the defaults until the next save; it now
+  keeps what it last read and logs once. A byte-order mark no longer makes the
+  file unreadable.
+- A failed carry-over, followed by any save of the per-user file, would have lost
+  the old values for good; `UserSettings` now keeps fields it does not know.
+- Saves flush before the rename, use a temporary file of their own, run off the UI
+  thread, and do not rewrite the folder's ACL when it is already widened.
+
 **Tested.** `tools\settings_split_test`: the carry-over, the machine file winning
-once it exists, defaults with neither file, saves under a reader (with the
-in-place write as a control), the write time moving, and `AtomicFile` replacing a
-file a reader holds, which `File.Move` cannot (also shown). The Worker reading the
-machine file is not tested end to end: that needs the service account.
+once it exists, defaults with neither file, absent and unreadable files told
+apart, a byte-order mark, saves under a reader (with a reader in the middle of an
+in-place write as a control), two saves at once, `AtomicFile` replacing a file a
+reader holds, which `File.Move` cannot (also shown), `UserSettings` keeping
+unknown fields, `LiveMemoryPolicy`, and the write time moving. The Worker reading
+the machine file is not tested end to end: that needs the service account.
 
 ## FIXED: with no backup drive connected, the Worker read and wrote gigabytes, and auto-include had filled the selections with build folders (2026-10-18, 1.12.0)
 

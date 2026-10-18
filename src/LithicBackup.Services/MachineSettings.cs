@@ -16,8 +16,10 @@ namespace LithicBackup.Services;
 /// it would read the system profile's copy, which nothing writes, and back up with
 /// the defaults whatever the user chose. The catalog is here for the same
 /// reason.</para>
-/// <para>Only the app writes the file, atomically, so the Worker never reads half
-/// of one. A setting added here must mean something to the Worker, or at least do
+/// <para>Only the app writes the file, atomically and flushed, so a reader sees
+/// the old settings or the new, never part of a file. Read it when it is needed,
+/// rather than keeping a copy from startup: another account's app may have saved
+/// since. A setting added here must mean something to the Worker, or at least do
 /// no harm there.</para>
 /// </remarks>
 public sealed class MachineSettings
@@ -48,6 +50,20 @@ public sealed class MachineSettings
     /// <summary>The machine settings file.</summary>
     public static string DefaultPath => Path.Combine(CatalogLocation.RootDirectory, "settings.json");
 
+    /// <summary>What <see cref="TryLoad"/> found.</summary>
+    public enum LoadResult
+    {
+        /// <summary>The file was read.</summary>
+        Loaded,
+
+        /// <summary>There is no file: the defaults are the settings.</summary>
+        Absent,
+
+        /// <summary>The file is there but could not be read or parsed. The defaults
+        /// are NOT the settings; a caller that had good ones should keep them.</summary>
+        Unreadable,
+    }
+
     /// <summary>
     /// When the settings file was last written, for a caller that polls the
     /// settings and reads them again only after they change. Null when it cannot
@@ -59,63 +75,110 @@ public sealed class MachineSettings
         catch { return null; }
     }
 
+    /// <summary>
+    /// Read the settings, telling a missing file (the defaults apply) apart from
+    /// one that cannot be read (they do not).
+    /// </summary>
+    /// <param name="settings">The settings read; the defaults unless
+    /// <see cref="LoadResult.Loaded"/>.</param>
+    /// <param name="path">The machine file; null for <see cref="DefaultPath"/>.</param>
+    public static LoadResult TryLoad(out MachineSettings settings, string? path = null)
+    {
+        path ??= DefaultPath;
+        settings = new MachineSettings();
+        byte[] bytes;
+        try
+        {
+            // Copied out and let go before parsing: the File.Move fallback of a
+            // save cannot replace the file while any handle is open.
+            using (var stream = new FileStream(
+                       path, FileMode.Open, FileAccess.Read, FileShare.ReadWrite | FileShare.Delete))
+            {
+                bytes = new byte[stream.Length];
+                stream.ReadExactly(bytes);
+            }
+        }
+        catch (Exception ex) when (ex is FileNotFoundException or DirectoryNotFoundException)
+        {
+            return LoadResult.Absent;
+        }
+        catch
+        {
+            return LoadResult.Unreadable;
+        }
+
+        var parsed = Parse(bytes);
+        if (parsed is null)
+            return LoadResult.Unreadable;
+        settings = parsed;
+        return LoadResult.Loaded;
+    }
+
     /// <summary>The saved settings, or the defaults when there are none or they cannot be read.</summary>
     public static MachineSettings Load(string? path = null)
-        => Read(path ?? DefaultPath) ?? new();
+    {
+        TryLoad(out var settings, path);
+        return settings;
+    }
 
     /// <summary>
-    /// The saved settings; if there is no machine file yet, those the calling
-    /// account's <see cref="UserSettings"/> file holds, under the same names from
-    /// when they lived there, saved as the machine file so the Worker sees them.
+    /// If there is no machine file yet, write one from the calling account's
+    /// <see cref="UserSettings"/> file, which held these settings under the same
+    /// names before they moved here, so that what the user chose there reaches
+    /// the Worker. With several accounts, the first to start the app wins: the
+    /// settings are one for the whole PC now.
     /// </summary>
     /// <remarks>
     /// For the app only. The Worker runs as LocalSystem, whose per-user file is
     /// one nothing writes, and seeding from it would put the defaults in place
-    /// before the user's app had carried over the real choices.
+    /// before the user's app had carried over the real choices. A carry-over that
+    /// fails is tried again at the next start: <see cref="UserSettings"/> keeps
+    /// the old fields it does not know.
     /// </remarks>
     /// <param name="path">The machine file; null for <see cref="DefaultPath"/>.</param>
     /// <param name="legacyUserSettingsPath">The per-user file to carry over from;
     /// null for this account's <see cref="UserSettings"/> file.</param>
-    public static MachineSettings LoadOrCarryOver(string? path = null, string? legacyUserSettingsPath = null)
+    /// <returns>Whether a machine file was written.</returns>
+    public static bool CarryOverIfMissing(string? path = null, string? legacyUserSettingsPath = null)
     {
-        path ??= DefaultPath;
-        if (File.Exists(path))
-            return Load(path);
-
-        var carried = Read(legacyUserSettingsPath ?? UserSettings.FilePath);
-        if (carried is null)
-            return new();
-
-        carried.Save(path);
-        return carried;
+        if (File.Exists(path ?? DefaultPath))
+            return false;
+        if (TryLoad(out var carried, legacyUserSettingsPath ?? UserSettings.FilePath) != LoadResult.Loaded)
+            return false;
+        return carried.Save(path);
     }
 
     /// <summary>
-    /// Write the settings, replacing the file in one step, so the Worker, which
-    /// reads it while the app runs, sees the old settings or the new ones, never
-    /// part of a file.
+    /// Write the settings, replacing the file in one step, so a reader sees the old
+    /// settings or the new ones, never part of a file, even after a crash.
     /// </summary>
-    /// <param name="path">The machine file; null for <see cref="DefaultPath"/>,
-    /// whose folder is created with an ACL every account can write.</param>
+    /// <remarks>
+    /// Can wait about a second for a handle that does not share delete access, so
+    /// keep it off the UI thread.
+    /// </remarks>
+    /// <param name="path">The machine file; null for <see cref="DefaultPath"/>.
+    /// That file's folder is created, whichever way it is named, with an ACL every
+    /// account can write.</param>
     /// <returns>Whether the file was written. Failures are not thrown, as for
     /// <see cref="UserSettings"/>.</returns>
     public bool Save(string? path = null)
     {
-        string? temp = null;
+        path = Path.GetFullPath(path ?? DefaultPath);
+        string temp = $"{path}.{Guid.NewGuid():N}.tmp";
         try
         {
-            if (path is null)
-            {
+            if (string.Equals(path, Path.GetFullPath(DefaultPath), StringComparison.OrdinalIgnoreCase))
                 CatalogLocation.SharedDirectory();
-                path = DefaultPath;
-            }
             else
-            {
                 Directory.CreateDirectory(Path.GetDirectoryName(path)!);
-            }
 
-            temp = path + ".tmp";
-            File.WriteAllText(temp, JsonSerializer.Serialize(this, new JsonSerializerOptions { WriteIndented = true }));
+            // Flushed to the disk before the rename: otherwise a crash soon after
+            // can leave the renamed file full of zeros, and both settings gone.
+            using (var stream = new FileStream(temp, FileMode.CreateNew, FileAccess.Write, FileShare.None))
+            {
+                JsonSerializer.Serialize(stream, this, new JsonSerializerOptions { WriteIndented = true });
+                stream.Flush(flushToDisk: true);
+            }
 
             // A POSIX-semantics replace goes through while readers that share
             // delete access have the file open (ours do, and virus scanners
@@ -133,28 +196,24 @@ public sealed class MachineSettings
         }
         catch
         {
-            try { if (temp is not null) File.Delete(temp); } catch { }
+            try { File.Delete(temp); } catch { }
             return false;
         }
     }
 
-    private static MachineSettings? Read(string path)
+    /// <summary>The settings in <paramref name="bytes"/>, or null when they are
+    /// not valid JSON. A UTF-8 byte-order mark, which some editors add, is
+    /// skipped: the span overload of the serializer does not.</summary>
+    private static MachineSettings? Parse(ReadOnlySpan<byte> bytes)
     {
+        ReadOnlySpan<byte> byteOrderMark = [0xEF, 0xBB, 0xBF];
+        if (bytes.StartsWith(byteOrderMark))
+            bytes = bytes[byteOrderMark.Length..];
         try
         {
-            // Copy the bytes and let go before parsing: a save cannot replace the
-            // file while any handle is open, and parsing a large file from the
-            // stream held it for milliseconds at a time.
-            byte[] bytes;
-            using (var stream = new FileStream(
-                       path, FileMode.Open, FileAccess.Read, FileShare.ReadWrite | FileShare.Delete))
-            {
-                bytes = new byte[stream.Length];
-                stream.ReadExactly(bytes);
-            }
             return JsonSerializer.Deserialize<MachineSettings>(bytes);
         }
-        catch
+        catch (JsonException)
         {
             return null;
         }

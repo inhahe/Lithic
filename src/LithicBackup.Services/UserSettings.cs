@@ -78,6 +78,14 @@ public class UserSettings
     /// <summary>Width of Cleanup's "Size" column. See <see cref="CleanupFilesColumnWidth"/>.</summary>
     public double CleanupSizeColumnWidth { get; set; } = 80;
 
+    /// <summary>
+    /// Fields in the file that this version does not know, written back as they
+    /// were: the backup settings this file held before <see cref="MachineSettings"/>
+    /// (kept until a carry-over succeeds), and any a newer version added.
+    /// </summary>
+    [System.Text.Json.Serialization.JsonExtensionData]
+    public Dictionary<string, JsonElement>? UnknownFields { get; set; }
+
     public static UserSettings Load()
     {
         try

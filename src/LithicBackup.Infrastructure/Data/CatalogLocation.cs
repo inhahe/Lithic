@@ -77,14 +77,7 @@ public static class CatalogLocation
     /// </summary>
     public static string Resolve()
     {
-        var sharedDir = Path.Combine(
-            Environment.GetFolderPath(Environment.SpecialFolder.CommonApplicationData),
-            AppFolderName);
-
-        Directory.CreateDirectory(sharedDir);
-        TryGrantSharedAccess(sharedDir);
-
-        var sharedDb = Path.Combine(sharedDir, DbFileName);
+        var sharedDb = Path.Combine(SharedDirectory(), DbFileName);
 
         if (!File.Exists(sharedDb))
             TryMigrateLegacyCatalog(sharedDb);
@@ -112,18 +105,7 @@ public static class CatalogLocation
     /// <c>C:\ProgramData\LithicBackup\logs</c> so a single location holds the
     /// rolling diagnostic log and any crash dumps from either process.
     /// </summary>
-    public static string LogsDirectory()
-    {
-        var logsDir = Path.Combine(
-            Environment.GetFolderPath(Environment.SpecialFolder.CommonApplicationData),
-            AppFolderName,
-            "logs");
-
-        Directory.CreateDirectory(logsDir);
-        TryGrantSharedAccess(logsDir);
-
-        return logsDir;
-    }
+    public static string LogsDirectory() => SharedSubdirectory("logs");
 
     /// <summary>
     /// Returns the shared directory where Windows Error Reporting writes native
@@ -132,18 +114,15 @@ public static class CatalogLocation
     /// produced by SYSTEM (service) is still readable by the interactive user.
     /// See <see cref="Diagnostics.NativeCrashDumps"/> for the WER registration.
     /// </summary>
-    public static string DumpsDirectory()
+    public static string DumpsDirectory() => SharedSubdirectory(Path.Combine("logs", "dumps"));
+
+    /// <summary>A folder under <see cref="RootDirectory"/>, created and widened like it.</summary>
+    private static string SharedSubdirectory(string relative)
     {
-        var dumpsDir = Path.Combine(
-            Environment.GetFolderPath(Environment.SpecialFolder.CommonApplicationData),
-            AppFolderName,
-            "logs",
-            "dumps");
-
-        Directory.CreateDirectory(dumpsDir);
-        TryGrantSharedAccess(dumpsDir);
-
-        return dumpsDir;
+        var dir = Path.Combine(RootDirectory, relative);
+        Directory.CreateDirectory(dir);
+        TryGrantSharedAccess(dir);
+        return dir;
     }
 
     /// <summary>
@@ -153,6 +132,12 @@ public static class CatalogLocation
     /// created by SYSTEM would leave the interactive user with read-only access
     /// (and vice-versa), recreating the split-catalog problem in a subtler form.
     /// </summary>
+    /// <remarks>
+    /// Changes nothing when both grants are already in place: setting a folder's
+    /// ACL makes Windows apply the inherited part again to everything beneath it,
+    /// the catalog, the set databases and the logs, and this runs at every start
+    /// and every settings save.
+    /// </remarks>
     private static void TryGrantSharedAccess(string dir)
     {
         try
@@ -162,6 +147,11 @@ public static class CatalogLocation
 
             // S-1-5-32-545 = BUILTIN\Users. Covers the interactive account.
             var users = new SecurityIdentifier(WellKnownSidType.BuiltinUsersSid, null);
+            // S-1-5-18 = LocalSystem (the service account).
+            var system = new SecurityIdentifier(WellKnownSidType.LocalSystemSid, null);
+            if (GrantsInheritedFullControl(security, users) && GrantsInheritedFullControl(security, system))
+                return;
+
             security.AddAccessRule(new FileSystemAccessRule(
                 users,
                 FileSystemRights.FullControl,
@@ -169,8 +159,6 @@ public static class CatalogLocation
                 PropagationFlags.None,
                 AccessControlType.Allow));
 
-            // S-1-5-18 = LocalSystem (the service account).
-            var system = new SecurityIdentifier(WellKnownSidType.LocalSystemSid, null);
             security.AddAccessRule(new FileSystemAccessRule(
                 system,
                 FileSystemRights.FullControl,
@@ -187,6 +175,25 @@ public static class CatalogLocation
             // SYSTEM can always access the file regardless, so this only matters
             // for the user-writes-SYSTEM-created-file case on locked-down boxes.
         }
+    }
+
+    /// <summary>
+    /// Whether <paramref name="security"/> already lets <paramref name="sid"/> do
+    /// everything, in this folder and everything created beneath it.
+    /// </summary>
+    private static bool GrantsInheritedFullControl(DirectorySecurity security, SecurityIdentifier sid)
+    {
+        foreach (FileSystemAccessRule rule in security.GetAccessRules(true, true, typeof(SecurityIdentifier)))
+        {
+            if (rule.AccessControlType == AccessControlType.Allow
+                && sid.Equals(rule.IdentityReference)
+                && (rule.FileSystemRights & FileSystemRights.FullControl) == FileSystemRights.FullControl
+                && rule.InheritanceFlags.HasFlag(InheritanceFlags.ContainerInherit)
+                && rule.InheritanceFlags.HasFlag(InheritanceFlags.ObjectInherit)
+                && rule.PropagationFlags == PropagationFlags.None)
+                return true;
+        }
+        return false;
     }
 
     /// <summary>

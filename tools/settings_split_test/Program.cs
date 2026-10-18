@@ -6,21 +6,30 @@
 //      they were kept before, under the same names, and writes the machine file.
 //   2. Once the machine file exists it wins; the per-user file is not read again.
 //   3. With neither file there are defaults, and nothing is written.
-//   4. A save replaces the file in one step: a reader looping alongside never
+//   4. A missing file and an unreadable one are told apart; a UTF-8 byte-order
+//      mark is read past.
+//   5. A save replaces the file in one step: a reader looping alongside never
 //      sees part of one, and no save fails because the reader has it open. A
-//      control writes the same file in place under the same reader, to show the
-//      step matters.
-//   5. The time the file was written moves with each save.
-//   6. AtomicFile replaces a file that a reader holds open sharing delete access,
+//      control shows that a reader in the middle of an in-place write does.
+//   6. Two saves at once both land whole, and leave no temporary file.
+//   7. AtomicFile replaces a file that a reader holds open sharing delete access,
 //      which File.Move cannot (shown alongside as a control).
+//   8. UserSettings writes back fields it does not know, so the old backup
+//      settings stay in the per-user file until a carry-over succeeds.
+//   9. LiveMemoryPolicy: a running backup keeps the job's own budget until the
+//      settings file is written, then follows it; it looks about once a second,
+//      and an unreadable file leaves the budget as it was.
+//  10. The time the file was written moves with each save.
 //
 // Every file lives in a temp folder; the real machine file is never touched.
 
+using System.Text;
 using System.Text.Json;
 using LithicBackup.Core.Models;
+using LithicBackup.Infrastructure.FileSystem;
 using LithicBackup.Services;
 
-Console.OutputEncoding = System.Text.Encoding.UTF8;
+Console.OutputEncoding = Encoding.UTF8;
 
 int failures = 0;
 void Check(bool cond, string msg)
@@ -31,8 +40,7 @@ void Check(bool cond, string msg)
 
 string root = Path.Combine(Path.GetTempPath(), "lithic_settings_" + Guid.NewGuid().ToString("N"));
 Directory.CreateDirectory(root);
-string machinePath = Path.Combine(root, "machine", "settings.json");
-string legacyPath = Path.Combine(root, "user", "settings.json");
+string Sub(string name) => Path.Combine(root, name, "settings.json");
 
 try
 {
@@ -41,7 +49,7 @@ try
     // settings at the top level, among the user's own preferences.
     var rules = new ContinuousRules();
     rules.MaxWaitTiers.Clear();
-    var legacy = new
+    string legacyJson = JsonSerializer.Serialize(new
     {
         SuppressBackupSuggestions = true,
         MemoryBudget = new MemoryBudgetOptions { Mode = MemoryBudgetMode.Fixed, FixedGb = 3 },
@@ -50,98 +58,127 @@ try
         ReconcileMode = ReconcileAfterEditMode.Never,
         ContinuousRules = rules,
         LastSettingsTab = 2,
-    };
+    });
+    string machinePath = Sub("machine");
+    string legacyPath = Sub("user");
     Directory.CreateDirectory(Path.GetDirectoryName(legacyPath)!);
-    File.WriteAllText(legacyPath, JsonSerializer.Serialize(legacy));
+    File.WriteAllText(legacyPath, legacyJson);
 
-    var carried = MachineSettings.LoadOrCarryOver(machinePath, legacyPath);
-    Check(carried.MemoryBudget.Mode == MemoryBudgetMode.Fixed && carried.MemoryBudget.FixedGb == 3
+    bool carriedOver = MachineSettings.CarryOverIfMissing(machinePath, legacyPath);
+    var carried = MachineSettings.Load(machinePath);
+    Check(carriedOver && carried.MemoryBudget.Mode == MemoryBudgetMode.Fixed && carried.MemoryBudget.FixedGb == 3
           && carried.DiscStagingMode == DiscStagingMode.InPlace
           && carried.ContinuousRules.MaxWaitTiers.Count == 0,
-        "1 the backup settings carry over from the per-user file");
-    var reread = MachineSettings.Load(machinePath);
-    Check(File.Exists(machinePath) && reread.MemoryBudget.FixedGb == 3 && reread.DiscStagingMode == DiscStagingMode.InPlace,
-        "1 and are written to the machine file, where the Worker reads them");
+        "1 the backup settings carry over from the per-user file into the machine file");
 
     // 2 ---------------------------------------------------------------------
     File.WriteAllText(legacyPath, JsonSerializer.Serialize(new
     {
         MemoryBudget = new MemoryBudgetOptions { Mode = MemoryBudgetMode.Fixed, FixedGb = 9 },
-        DiscStagingMode = DiscStagingMode.TemporaryCopy,
     }));
-    var second = MachineSettings.LoadOrCarryOver(machinePath, legacyPath);
-    Check(second.MemoryBudget.FixedGb == 3 && second.DiscStagingMode == DiscStagingMode.InPlace,
+    bool again = MachineSettings.CarryOverIfMissing(machinePath, legacyPath);
+    Check(!again && MachineSettings.Load(machinePath).MemoryBudget.FixedGb == 3,
         "2 once the machine file exists, the per-user file is not read again");
 
     // 3 ---------------------------------------------------------------------
-    string emptyMachine = Path.Combine(root, "none", "settings.json");
-    var defaults = MachineSettings.LoadOrCarryOver(emptyMachine, Path.Combine(root, "nobody", "settings.json"));
-    Check(defaults.DiscStagingMode == DiscStagingMode.TemporaryCopy
-          && defaults.MemoryBudget.Mode == new MemoryBudgetOptions().Mode
-          && !File.Exists(emptyMachine),
+    string emptyMachine = Sub("none");
+    bool fromNothing = MachineSettings.CarryOverIfMissing(emptyMachine, Sub("nobody"));
+    var defaults = MachineSettings.Load(emptyMachine);
+    Check(!fromNothing && !File.Exists(emptyMachine)
+          && defaults.DiscStagingMode == DiscStagingMode.TemporaryCopy
+          && defaults.MemoryBudget.Mode == new MemoryBudgetOptions().Mode,
         "3 with neither file there are defaults, and nothing is written");
 
     // 4 ---------------------------------------------------------------------
+    Check(MachineSettings.TryLoad(out _, emptyMachine) == MachineSettings.LoadResult.Absent,
+        "4 a missing file reads as absent");
+    string brokenPath = Sub("broken");
+    Directory.CreateDirectory(Path.GetDirectoryName(brokenPath)!);
+    File.WriteAllText(brokenPath, "{ \"MemoryBudget\": ");
+    Check(MachineSettings.TryLoad(out _, brokenPath) == MachineSettings.LoadResult.Unreadable,
+        "4 a broken file reads as unreadable, not as the defaults");
+    string bomPath = Sub("bom");
+    Directory.CreateDirectory(Path.GetDirectoryName(bomPath)!);
+    File.WriteAllText(bomPath, JsonSerializer.Serialize(new { DiscStagingMode = DiscStagingMode.InPlace }),
+        new UTF8Encoding(encoderShouldEmitUTF8Identifier: true));
+    Check(File.ReadAllBytes(bomPath)[0] == 0xEF
+          && MachineSettings.TryLoad(out var withBom, bomPath) == MachineSettings.LoadResult.Loaded
+          && withBom.DiscStagingMode == DiscStagingMode.InPlace,
+        "4 a file that starts with a byte-order mark is read");
+
+    // 5 ---------------------------------------------------------------------
     // The marker is InPlace: the default, TemporaryCopy, is what a torn or
     // unreadable file reads back as.
     var marked = new MachineSettings { DiscStagingMode = DiscStagingMode.InPlace };
     for (int i = 0; i < 400; i++)
         marked.ContinuousRules.MaxWaitTiers.Add(new MaxWaitMaskTier { Name = $"tier {i}", IncludeMasks = [$"*.pattern{i}"], MaxWaitSeconds = i });
-    string racePath = Path.Combine(root, "race", "settings.json");
+    string racePath = Sub("race");
     marked.Save(racePath);
 
-    (int torn, int failedSaves) Race(Action<int> write)
+    int torn = 0, failedSaves = 0;
+    using (var stop = new CancellationTokenSource())
     {
-        int torn = 0, failedSaves = 0;
-        using var stop = new CancellationTokenSource();
-        // Every 5 ms: some two hundred times as often as a running backup reads it.
+        // Every 5 ms, some two hundred times as often as a running backup looks.
         var reader = Task.Run(() =>
         {
             while (!stop.IsCancellationRequested)
             {
-                if (MachineSettings.Load(racePath).DiscStagingMode != DiscStagingMode.InPlace)
+                if (MachineSettings.TryLoad(out var seen, racePath) != MachineSettings.LoadResult.Loaded
+                    || seen.DiscStagingMode != DiscStagingMode.InPlace)
                     Interlocked.Increment(ref torn);
                 Thread.Sleep(5);
             }
         });
+        // Back to back: each save also meets the virus scanner looking at the
+        // file the previous one made.
         for (int i = 0; i < 300; i++)
         {
-            try { write(i); }
-            catch { failedSaves++; }
+            marked.MemoryBudget.FixedGb = i;
+            if (!marked.Save(racePath))
+                failedSaves++;
         }
         stop.Cancel();
         reader.Wait();
-        return (torn, failedSaves);
     }
+    Check(torn == 0, $"5 a reader alongside 300 saves never sees part of a file ({torn} torn reads)");
+    Check(failedSaves == 0 && MachineSettings.Load(racePath).MemoryBudget.FixedGb == 299,
+        $"5 and no save fails because the reader has the file open ({failedSaves} failed)");
 
-    // Back to back, against the reader every 5 ms: each save also meets the
-    // virus scanner looking at the file the previous one made.
-    int reported = 0;
-    var (tornAtomic, _) = Race(i =>
+    // The control, made certain rather than left to timing: the reader looks
+    // while an in-place write has written half the file.
+    byte[] whole = JsonSerializer.SerializeToUtf8Bytes(marked);
+    MachineSettings.LoadResult midWrite;
+    using (var stream = new FileStream(racePath, FileMode.Create, FileAccess.Write, FileShare.ReadWrite | FileShare.Delete))
     {
-        marked.MemoryBudget.FixedGb = i;
-        if (!marked.Save(racePath))
-            reported++;
-    });
-    Check(tornAtomic == 0, $"4 a reader alongside 300 saves never sees part of a file ({tornAtomic} torn reads)");
-    Check(reported == 0 && MachineSettings.Load(racePath).MemoryBudget.FixedGb == 299,
-        $"4 and no save fails because the reader has the file open ({reported} failed)");
-    Check(!File.Exists(racePath + ".tmp"), "4 no temporary file is left behind");
-
-    string json = JsonSerializer.Serialize(marked);
-    var (tornInPlace, _) = Race(_ =>
-    {
-        using var stream = new FileStream(racePath, FileMode.Create, FileAccess.Write, FileShare.ReadWrite | FileShare.Delete);
-        using var writer = new StreamWriter(stream);
-        writer.Write(json);
-    });
-    Console.WriteLine($"     control: writing the file in place, the same reader saw {tornInPlace} torn reads");
-    Check(tornInPlace > 0, "4 control: writing in place does tear, so replacing in one step is what prevents it");
+        stream.Write(whole, 0, whole.Length / 2);
+        stream.Flush();
+        midWrite = MachineSettings.TryLoad(out _, racePath);
+        stream.Write(whole, whole.Length / 2, whole.Length - whole.Length / 2);
+    }
+    Check(midWrite == MachineSettings.LoadResult.Unreadable,
+        "5 control: a reader in the middle of an in-place write gets part of a file, which the one-step replace prevents");
 
     // 6 ---------------------------------------------------------------------
-    // Held open with delete sharing, as the readers hold it: the POSIX replace
-    // goes through, and the reader keeps the old content; File.Move does not.
-    string heldPath = Path.Combine(root, "held", "settings.json");
+    string pairPath = Sub("pair");
+    var first = new MachineSettings { DiscStagingMode = DiscStagingMode.InPlace };
+    first.MemoryBudget.FixedGb = 1;
+    var second = new MachineSettings { DiscStagingMode = DiscStagingMode.InPlace };
+    second.MemoryBudget.FixedGb = 2;
+    bool okA = true, okB = true;
+    for (int i = 0; i < 50; i++)
+    {
+        var a = Task.Run(() => first.Save(pairPath));
+        var b = Task.Run(() => second.Save(pairPath));
+        okA &= a.Result;
+        okB &= b.Result;
+    }
+    double finalGb = MachineSettings.Load(pairPath).MemoryBudget.FixedGb;
+    bool leftovers = Directory.EnumerateFiles(Path.GetDirectoryName(pairPath)!, "*.tmp").Any();
+    Check(okA && okB && (finalGb == 1 || finalGb == 2) && !leftovers,
+        $"6 two saves at once both land whole and leave no temporary file (saved {okA}/{okB}, file holds {finalGb})");
+
+    // 7 ---------------------------------------------------------------------
+    string heldPath = Sub("held");
     Directory.CreateDirectory(Path.GetDirectoryName(heldPath)!);
     File.WriteAllText(heldPath, "old");
     File.WriteAllText(heldPath + ".new", "new");
@@ -151,23 +188,65 @@ try
         bool moveFailed = false;
         try { File.Move(heldPath + ".move", heldPath, overwrite: true); }
         catch (Exception ex) when (ex is IOException or UnauthorizedAccessException) { moveFailed = true; }
-        Check(moveFailed, "6 control: File.Move cannot replace a file a reader holds, even sharing delete");
+        Check(moveFailed, "7 control: File.Move cannot replace a file a reader holds, even sharing delete");
 
-        var result = LithicBackup.Infrastructure.FileSystem.AtomicFile.TryReplace(heldPath + ".new", heldPath);
+        var result = AtomicFile.TryReplace(heldPath + ".new", heldPath);
         string oldSeen = new StreamReader(held).ReadToEnd();
-        Check(result == LithicBackup.Infrastructure.FileSystem.AtomicFile.ReplaceResult.Replaced && oldSeen == "old",
-            $"6 AtomicFile replaces it all the same, and the reader keeps the old content ({result}, read \"{oldSeen}\")");
+        Check(result == AtomicFile.ReplaceResult.Replaced && oldSeen == "old",
+            $"7 AtomicFile replaces it all the same, and the reader keeps the old content ({result}, read \"{oldSeen}\")");
     }
-    Check(File.ReadAllText(heldPath) == "new", "6 and the path then names the new file");
+    Check(File.ReadAllText(heldPath) == "new", "7 and the path then names the new file");
 
-    // 5 ---------------------------------------------------------------------
+    // 8 ---------------------------------------------------------------------
+    var user = JsonSerializer.Deserialize<UserSettings>(legacyJson)!;
+    user.LastSettingsTab = 5;
+    using var rewritten = JsonDocument.Parse(JsonSerializer.Serialize(user));
+    var top = rewritten.RootElement;
+    Check(top.TryGetProperty("MemoryBudget", out var budget) && budget.GetProperty("FixedGb").GetDouble() == 3
+          && top.TryGetProperty("DiscStagingMode", out _) && top.TryGetProperty("ContinuousRules", out _)
+          && top.GetProperty("LastSettingsTab").GetInt32() == 5,
+        "8 the per-user file keeps the old backup settings when the app saves it, until they are carried over");
+
+    // 9 ---------------------------------------------------------------------
+    string livePath = Sub("live");
+    var fileBudget = new MachineSettings { MemoryBudget = new MemoryBudgetOptions { Mode = MemoryBudgetMode.Fixed, FixedGb = 9 } };
+    fileBudget.Save(livePath);
+    var seed = new MemoryBudgetOptions { Mode = MemoryBudgetMode.Fixed, FixedGb = 0 };
+    long clock = 0;
+    var policy = new LiveMemoryPolicy(seed, livePath, () => clock);
+    clock = 5000;
+    Check(policy.Current().FixedGb == 0,
+        "9 a running backup keeps the job's own budget while the settings file is unchanged");
+
+    Thread.Sleep(50);
+    fileBudget.MemoryBudget.FixedGb = 4;
+    fileBudget.Save(livePath);
+    clock = 5500;
+    double withinSecond = policy.Current().FixedGb;
+    clock = 6100;
+    double afterSecond = policy.Current().FixedGb;
+    Check(withinSecond == 0 && afterSecond == 4,
+        $"9 once the file is written it follows it, at the next look a second on ({withinSecond}, then {afterSecond})");
+
+    Thread.Sleep(50);
+    File.WriteAllText(livePath, "{ broken");
+    clock = 7200;
+    double whileBroken = policy.Current().FixedGb;
+    Thread.Sleep(50);
+    fileBudget.MemoryBudget.FixedGb = 6;
+    fileBudget.Save(livePath);
+    clock = 8300;
+    Check(whileBroken == 4 && policy.Current().FixedGb == 6,
+        $"9 an unreadable file leaves the budget as it was, and the next good save is followed ({whileBroken}, then 6)");
+
+    // 10 --------------------------------------------------------------------
     var before = MachineSettings.LastWriteTimeUtc(machinePath);
     Thread.Sleep(50);
-    reread.ContinuousRules.MaxWaitTiers.Add(new MaxWaitMaskTier { Name = "later", IncludeMasks = ["*.later"], MaxWaitSeconds = 5 });
-    reread.Save(machinePath);
+    carried.ContinuousRules.MaxWaitTiers.Add(new MaxWaitMaskTier { Name = "later", IncludeMasks = ["*.later"], MaxWaitSeconds = 5 });
+    carried.Save(machinePath);
     var after = MachineSettings.LastWriteTimeUtc(machinePath);
     Check(before is not null && after is not null && after > before,
-        "5 the file's write time moves with a save, which is what the Worker polls");
+        "10 the file's write time moves with a save, which is what the Worker polls");
 }
 finally
 {
