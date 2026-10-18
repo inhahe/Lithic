@@ -52,12 +52,33 @@ settings dialog says so and keeps the old values.
 - Saves flush before the rename, use a temporary file of their own, run off the UI
   thread, and do not rewrite the folder's ACL when it is already widened.
 
+**From the second review (Fable, xhigh), also fixed:**
+- The live budget took the file's write time when the run started, not when the
+  job read its budget, so a save made while the job was being planned was taken as
+  seen. Jobs now carry that write time (`BackupJob.MemoryBudgetWrittenUtc`).
+- The Worker read the settings once per pass, and a pass can run hours of
+  backups; it now refreshes before each job, through a `MachineSettingsReader`,
+  which the GUI's job building uses too, so the GUI no longer falls back to the
+  defaults on an unreadable file either. Its three copies of the job builder are
+  one.
+- A failed shared save also dropped the per-user edits made in the same dialog;
+  they are now saved first, and the message gives Windows' reason.
+- The old backup fields stayed in the per-user file for good, to be carried over
+  again if the machine file were ever deleted; the app drops them once it exists.
+- Temporary files a crash left beside the machine file were never removed.
+
+Not changed: an "access denied" from the rename is retried, not given up at once,
+because a virus scanner causes it too (measured); the message now names it. The
+carry-over still runs on the UI thread at startup: it can wait about a second, once,
+on the first start, and moving it off would let a backup started in that second
+use the defaults.
+
 **Tested.** `tools\settings_split_test`: the carry-over, the machine file winning
 once it exists, defaults with neither file, absent and unreadable files told
 apart, a byte-order mark, saves under a reader (with a reader in the middle of an
 in-place write as a control), two saves at once, `AtomicFile` replacing a file a
 reader holds, which `File.Move` cannot (also shown), `UserSettings` keeping
-unknown fields, `LiveMemoryPolicy`, and the write time moving. The Worker reading
+unknown fields and dropping them, `LiveMemoryPolicy` (including a save made while a job was planned), `MachineSettingsReader`, the sweep of abandoned temporary files, `TrySave`'s reason, and the write time moving. The Worker reading
 the machine file is not tested end to end: that needs the service account.
 
 ## FIXED: with no backup drive connected, the Worker read and wrote gigabytes, and auto-include had filled the selections with build folders (2026-10-18, 1.12.0)

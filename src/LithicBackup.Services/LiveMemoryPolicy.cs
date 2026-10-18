@@ -5,7 +5,7 @@ namespace LithicBackup.Services;
 
 /// <summary>
 /// The memory budget a running directory backup buffers against: the job's own
-/// until the machine settings file is written while the run goes on, then the
+/// until the machine settings file is written after that budget was read, then the
 /// file's. So lowering the budget in the app reaches a run already under way, the
 /// Worker's included, while a job given a budget of its own (a harness forcing
 /// streaming, say) keeps it unless someone actually saves new settings.
@@ -26,10 +26,16 @@ public sealed class LiveMemoryPolicy
     private long? _lastLookMs;
 
     /// <param name="seed">The job's budget, in force until the settings change.</param>
+    /// <param name="seedWrittenUtc">The settings file's write time when the seed
+    /// was read from it (<see cref="Core.Models.BackupJob.MemoryBudgetWrittenUtc"/>),
+    /// so a save made between then and now is followed at the first look; null
+    /// when the seed is the job's own, which stands until the file is next written.</param>
     /// <param name="settingsPath">The machine settings file; null for the real one.</param>
     /// <param name="clockMs">Milliseconds elapsed, for a test to drive; null for a
     /// stopwatch started now.</param>
-    public LiveMemoryPolicy(MemoryBudgetOptions seed, string? settingsPath = null, Func<long>? clockMs = null)
+    public LiveMemoryPolicy(
+        MemoryBudgetOptions seed, DateTime? seedWrittenUtc = null,
+        string? settingsPath = null, Func<long>? clockMs = null)
     {
         _current = seed;
         _settingsPath = settingsPath;
@@ -39,7 +45,7 @@ public sealed class LiveMemoryPolicy
             clockMs = () => stopwatch.ElapsedMilliseconds;
         }
         _clockMs = clockMs;
-        _seenWriteTimeUtc = MachineSettings.LastWriteTimeUtc(settingsPath);
+        _seenWriteTimeUtc = seedWrittenUtc ?? MachineSettings.LastWriteTimeUtc(settingsPath);
     }
 
     /// <summary>The budget in force now.</summary>

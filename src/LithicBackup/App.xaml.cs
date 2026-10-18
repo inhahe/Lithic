@@ -352,6 +352,8 @@ public partial class App : Application
         // since that is where they were kept before. ---
         _settings = UserSettings.Load();
         MachineSettings.CarryOverIfMissing();
+        if (File.Exists(MachineSettings.DefaultPath) && _settings.ForgetBackupSettings())
+            _settings.Save();
 
         var mainViewModel = new MainViewModel(
             _catalog, burner, scanner, orchestrator, restoreService, catalogFreeRestoreService,

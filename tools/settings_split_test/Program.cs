@@ -20,6 +20,10 @@
 //      settings file is written, then follows it; it looks about once a second,
 //      and an unreadable file leaves the budget as it was.
 //  10. The time the file was written moves with each save.
+//  11. MachineSettingsReader reads again only after a save, keeps the last good
+//      settings while the file is unreadable, and says so once.
+//  12. A save sweeps away temporary files a crash left more than a minute ago,
+//      and TrySave says why it failed.
 //
 // Every file lives in a temp folder; the real machine file is never touched.
 
@@ -206,6 +210,14 @@ try
           && top.TryGetProperty("DiscStagingMode", out _) && top.TryGetProperty("ContinuousRules", out _)
           && top.GetProperty("LastSettingsTab").GetInt32() == 5,
         "8 the per-user file keeps the old backup settings when the app saves it, until they are carried over");
+    bool forgot = user.ForgetBackupSettings();
+    using var pruned = JsonDocument.Parse(JsonSerializer.Serialize(user));
+    Check(forgot && !pruned.RootElement.TryGetProperty("MemoryBudget", out _)
+          && !pruned.RootElement.TryGetProperty("DiscStagingMode", out _)
+          && !pruned.RootElement.TryGetProperty("ContinuousRules", out _)
+          && pruned.RootElement.GetProperty("LastSettingsTab").GetInt32() == 5
+          && !user.ForgetBackupSettings(),
+        "8 once carried over they can be forgotten, so they cannot come back however old");
 
     // 9 ---------------------------------------------------------------------
     string livePath = Sub("live");
@@ -213,7 +225,7 @@ try
     fileBudget.Save(livePath);
     var seed = new MemoryBudgetOptions { Mode = MemoryBudgetMode.Fixed, FixedGb = 0 };
     long clock = 0;
-    var policy = new LiveMemoryPolicy(seed, livePath, () => clock);
+    var policy = new LiveMemoryPolicy(seed, settingsPath: livePath, clockMs: () => clock);
     clock = 5000;
     Check(policy.Current().FixedGb == 0,
         "9 a running backup keeps the job's own budget while the settings file is unchanged");
@@ -238,6 +250,63 @@ try
     clock = 8300;
     Check(whileBroken == 4 && policy.Current().FixedGb == 6,
         $"9 an unreadable file leaves the budget as it was, and the next good save is followed ({whileBroken}, then 6)");
+
+    // The seed was read, then the job was planned for a while, and a save landed
+    // before the run began: the run follows that save from its first look.
+    var readAt = MachineSettings.LastWriteTimeUtc(livePath);
+    Thread.Sleep(50);
+    fileBudget.MemoryBudget.FixedGb = 7;
+    fileBudget.Save(livePath);
+    long clock2 = 0;
+    var planned = new LiveMemoryPolicy(new MemoryBudgetOptions { Mode = MemoryBudgetMode.Fixed, FixedGb = 6 },
+        seedWrittenUtc: readAt, settingsPath: livePath, clockMs: () => clock2);
+    Check(planned.Current().FixedGb == 7,
+        "9 a save made while the job was being planned is followed from the run's first look");
+
+    // 11 --------------------------------------------------------------------
+    string readerPath = Sub("reader");
+    var good = new MachineSettings { DiscStagingMode = DiscStagingMode.InPlace };
+    good.Save(readerPath);
+    var reader11 = new MachineSettingsReader(readerPath);
+    bool firstUnreadable = reader11.Refresh();
+    var firstRead = reader11.Current;
+    reader11.Refresh();
+    Check(!firstUnreadable && firstRead.DiscStagingMode == DiscStagingMode.InPlace
+          && ReferenceEquals(firstRead, reader11.Current),
+        "11 the reader reads the file, and not again while it is unchanged");
+
+    Thread.Sleep(50);
+    File.WriteAllText(readerPath, "{ broken");
+    bool saidOnce = reader11.Refresh();
+    bool saidAgain = reader11.Refresh();
+    Check(saidOnce && !saidAgain && reader11.Unreadable
+          && reader11.Current.DiscStagingMode == DiscStagingMode.InPlace,
+        "11 an unreadable file keeps the last good settings, and is reported once");
+
+    Thread.Sleep(50);
+    good.DiscStagingMode = DiscStagingMode.TemporaryCopy;
+    good.MemoryBudget.FixedGb = 8;
+    good.Save(readerPath);
+    reader11.Refresh();
+    Check(!reader11.Unreadable && reader11.Current.MemoryBudget.FixedGb == 8,
+        "11 and the next good save is read");
+
+    // 12 --------------------------------------------------------------------
+    string sweepPath = Sub("sweep");
+    Directory.CreateDirectory(Path.GetDirectoryName(sweepPath)!);
+    string abandoned = $"{sweepPath}.{Guid.NewGuid():N}.tmp";
+    string recent = $"{sweepPath}.{Guid.NewGuid():N}.tmp";
+    File.WriteAllText(abandoned, "left by a crash");
+    File.SetLastWriteTimeUtc(abandoned, DateTime.UtcNow.AddHours(-1));
+    File.WriteAllText(recent, "another save, in progress");
+    new MachineSettings().Save(sweepPath);
+    Check(!File.Exists(abandoned) && File.Exists(recent),
+        "12 a save removes a temporary file abandoned an hour ago, and leaves one just made");
+
+    string blocker = Path.Combine(root, "not-a-folder");
+    File.WriteAllText(blocker, "a file where the folder should be");
+    bool savedIntoFile = new MachineSettings().TrySave(out string? why, Path.Combine(blocker, "settings.json"));
+    Check(!savedIntoFile && !string.IsNullOrEmpty(why), $"12 a save that cannot be made says why (\"{why}\")");
 
     // 10 --------------------------------------------------------------------
     var before = MachineSettings.LastWriteTimeUtc(machinePath);

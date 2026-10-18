@@ -37,12 +37,22 @@ public static class AtomicFile
     /// <param name="source">The new file, finished and closed, on the same volume.</param>
     /// <param name="destination">The file to replace; it need not exist.</param>
     public static ReplaceResult TryReplace(string source, string destination)
+        => TryReplace(source, destination, out _);
+
+    /// <inheritdoc cref="TryReplace(string, string)"/>
+    /// <param name="failure">Windows' reason, when the result is
+    /// <see cref="ReplaceResult.Busy"/>. "Access is denied" is often passing (a
+    /// virus scanner looking at the file), but if it lasts, the folder's
+    /// permissions are the likely cause.</param>
+    public static ReplaceResult TryReplace(string source, string destination, out string? failure)
     {
-        switch (TryRenamePosix(source, destination))
+        failure = null;
+        switch (TryRenamePosix(source, destination, out int error))
         {
             case PosixOutcome.Done:
                 return ReplaceResult.Replaced;
             case PosixOutcome.Busy:
+                failure = new System.ComponentModel.Win32Exception(error).Message;
                 return ReplaceResult.Busy;
         }
 
@@ -53,6 +63,7 @@ public static class AtomicFile
         }
         catch (Exception ex) when (ex is IOException or UnauthorizedAccessException)
         {
+            failure = ex.Message;
             return ReplaceResult.Busy;
         }
     }
@@ -79,12 +90,16 @@ public static class AtomicFile
     private static extern bool SetFileInformationByHandle(
         SafeFileHandle file, int fileInformationClass, IntPtr fileInformation, uint bufferSize);
 
-    private static PosixOutcome TryRenamePosix(string source, string destination)
+    private static PosixOutcome TryRenamePosix(string source, string destination, out int error)
     {
+        error = 0;
         using var handle = CreateFileW(
             Path.GetFullPath(source), Delete | Synchronize, ShareAll, IntPtr.Zero, OpenExisting, 0, IntPtr.Zero);
         if (handle.IsInvalid)
+        {
+            error = Marshal.GetLastWin32Error();
             return PosixOutcome.Busy;
+        }
 
         // FILE_RENAME_INFO: a DWORD of flags (in a union with a BOOLEAN), then a
         // HANDLE aligned to its size, a DWORD byte length, and the UTF-16 name.
@@ -108,7 +123,7 @@ public static class AtomicFile
             if (SetFileInformationByHandle(handle, FileRenameInfoEx, buffer, (uint)size))
                 return PosixOutcome.Done;
 
-            int error = Marshal.GetLastWin32Error();
+            error = Marshal.GetLastWin32Error();
             return error is ErrorInvalidParameter or ErrorNotSupported or ErrorInvalidFunction
                 ? PosixOutcome.Unsupported
                 : PosixOutcome.Busy;

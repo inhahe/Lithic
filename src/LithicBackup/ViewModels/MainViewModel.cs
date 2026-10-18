@@ -30,6 +30,10 @@ public class MainViewModel : ViewModelBase
     private readonly ISourceResolver? _sourceResolver;
     private readonly UserSettings _settings;
 
+    /// <summary>The backup settings every account shares, read again whenever they
+    /// are saved (by this app or another account's) and kept while unreadable.</summary>
+    private readonly MachineSettingsReader _machineSettings = new();
+
     private string _statusText = "Ready";
     private string _backgroundStatusText = "";
     private int _recorderCount;
@@ -2730,39 +2734,8 @@ public class MainViewModel : ViewModelBase
             alsoCheckDuplicates = answer == MessageBoxResult.Yes;
         }
 
-        string? effectiveTargetDir = opts.TargetDirectory;
-        if (effectiveTargetDir is not null && opts.CreateSubdirectory
-            && !string.IsNullOrWhiteSpace(opts.SubdirectoryName))
-        {
-            effectiveTargetDir = Path.Combine(effectiveTargetDir, opts.SubdirectoryName.Trim());
-        }
-
-        // Read now, not kept from startup: another account's app may have saved since.
-        var machineSettings = MachineSettings.Load();
-        var job = new BackupJob
-        {
-            BackupSetId = backupSet.Id,
-            Sources = sources,
-            ZipMode = opts.ZipMode,
-            FilesystemType = opts.FilesystemType,
-            CapacityOverrideBytes = opts.CapacityOverrideBytes,
-            VerifyAfterBurn = opts.VerifyAfterBurn,
-            VerifyAfterBackup = opts.VerifyAfterBackup,
-            IncludeCatalogOnDisc = opts.IncludeCatalogOnDisc,
-            AllowFileSplitting = opts.AllowFileSplitting,
-            TargetDirectory = effectiveTargetDir,
-            CreateSubdirectory = opts.CreateSubdirectory,
-            SubdirectoryName = opts.CreateSubdirectory ? opts.SubdirectoryName?.Trim() : null,
-            EnableFileDeduplication = opts.EnableFileDeduplication,
-            EnableDeduplication = opts.EnableDeduplication,
-            DeduplicationBlockSize = opts.DeduplicationBlockSize > 0
-                ? opts.DeduplicationBlockSize : 64 * 1024,
-            ExcludedExtensions = opts.ExcludedExtensions,
-            RetentionTiers = opts.RetentionTiers,
-            TierSets = opts.TierSets,
-            MemoryBudget = machineSettings.MemoryBudget,
-            StagingMode = machineSettings.DiscStagingMode,
-        };
+        var job = BuildJob(backupSet, opts, sources);
+        string? effectiveTargetDir = job.TargetDirectory;
 
         bool isDir = job.TargetDirectory is not null;
 
@@ -2875,6 +2848,56 @@ public class MainViewModel : ViewModelBase
     /// candidates. Exceptions propagate to the caller (which owns the
     /// row's IsChecking flag and CheckCts).
     /// </summary>
+    /// <summary>
+    /// A backup job for <paramref name="backupSet"/> from its saved options and
+    /// <paramref name="sources"/>, with the backup settings every account shares as
+    /// they are now (memory budget, disc staging), and the target folder including
+    /// the set's subfolder.
+    /// </summary>
+    /// <remarks>
+    /// The shared settings are read again if they have been saved since the last
+    /// job, by this app or another account's; while the file cannot be read, the
+    /// settings last read stay, and the status line says so once.
+    /// </remarks>
+    private BackupJob BuildJob(BackupSet backupSet, JobOptions opts, List<SourceSelection> sources)
+    {
+        string? targetDir = opts.TargetDirectory;
+        if (targetDir is not null && opts.CreateSubdirectory
+            && !string.IsNullOrWhiteSpace(opts.SubdirectoryName))
+            targetDir = Path.Combine(targetDir, opts.SubdirectoryName.Trim());
+
+        if (_machineSettings.Refresh())
+            StatusText = $"The backup settings in {MachineSettings.DefaultPath} could not be read; "
+                         + "backups go on with the ones last read.";
+        var machineSettings = _machineSettings.Current;
+
+        return new BackupJob
+        {
+            BackupSetId = backupSet.Id,
+            Sources = sources,
+            ZipMode = opts.ZipMode,
+            FilesystemType = opts.FilesystemType,
+            CapacityOverrideBytes = opts.CapacityOverrideBytes,
+            VerifyAfterBurn = opts.VerifyAfterBurn,
+            VerifyAfterBackup = opts.VerifyAfterBackup,
+            IncludeCatalogOnDisc = opts.IncludeCatalogOnDisc,
+            AllowFileSplitting = opts.AllowFileSplitting,
+            TargetDirectory = targetDir,
+            CreateSubdirectory = opts.CreateSubdirectory,
+            SubdirectoryName = opts.CreateSubdirectory ? opts.SubdirectoryName?.Trim() : null,
+            EnableFileDeduplication = opts.EnableFileDeduplication,
+            EnableDeduplication = opts.EnableDeduplication,
+            DeduplicationBlockSize = opts.DeduplicationBlockSize > 0
+                ? opts.DeduplicationBlockSize : 64 * 1024,
+            ExcludedExtensions = opts.ExcludedExtensions,
+            RetentionTiers = opts.RetentionTiers,
+            TierSets = opts.TierSets,
+            MemoryBudget = machineSettings.MemoryBudget,
+            MemoryBudgetWrittenUtc = _machineSettings.CurrentWrittenUtc,
+            StagingMode = machineSettings.DiscStagingMode,
+        };
+    }
+
     private async Task RunDuplicateAnalysisAsync(BackupSet backupSet, CancellationToken ct)
     {
         if (_fileHashCache is null) return;
@@ -3027,37 +3050,8 @@ public class MainViewModel : ViewModelBase
         if (opts is null || sources is null or { Count: 0 })
             return;
 
-        string? effectiveTargetDir = opts.TargetDirectory;
-        if (effectiveTargetDir is not null && opts.CreateSubdirectory
-            && !string.IsNullOrWhiteSpace(opts.SubdirectoryName))
-            effectiveTargetDir = Path.Combine(effectiveTargetDir, opts.SubdirectoryName.Trim());
-
-        // Read now, not kept from startup: another account's app may have saved since.
-        var machineSettings = MachineSettings.Load();
-        var job = new BackupJob
-        {
-            BackupSetId = backupSet.Id,
-            Sources = sources,
-            ZipMode = opts.ZipMode,
-            FilesystemType = opts.FilesystemType,
-            CapacityOverrideBytes = opts.CapacityOverrideBytes,
-            VerifyAfterBurn = opts.VerifyAfterBurn,
-            VerifyAfterBackup = opts.VerifyAfterBackup,
-            IncludeCatalogOnDisc = opts.IncludeCatalogOnDisc,
-            AllowFileSplitting = opts.AllowFileSplitting,
-            TargetDirectory = effectiveTargetDir,
-            CreateSubdirectory = opts.CreateSubdirectory,
-            SubdirectoryName = opts.CreateSubdirectory ? opts.SubdirectoryName?.Trim() : null,
-            EnableFileDeduplication = opts.EnableFileDeduplication,
-            EnableDeduplication = opts.EnableDeduplication,
-            DeduplicationBlockSize = opts.DeduplicationBlockSize > 0
-                ? opts.DeduplicationBlockSize : 64 * 1024,
-            ExcludedExtensions = opts.ExcludedExtensions,
-            RetentionTiers = opts.RetentionTiers,
-            TierSets = opts.TierSets,
-            MemoryBudget = machineSettings.MemoryBudget,
-            StagingMode = machineSettings.DiscStagingMode,
-        };
+        var job = BuildJob(backupSet, opts, sources);
+        string? effectiveTargetDir = job.TargetDirectory;
 
         bool isDir = job.TargetDirectory is not null;
 
@@ -3503,39 +3497,7 @@ public class MainViewModel : ViewModelBase
         }
 
         // Build the BackupJob directly from saved JobOptions.
-        string? effectiveTargetDir = opts.TargetDirectory;
-        if (effectiveTargetDir is not null && opts.CreateSubdirectory
-            && !string.IsNullOrWhiteSpace(opts.SubdirectoryName))
-        {
-            effectiveTargetDir = Path.Combine(effectiveTargetDir, opts.SubdirectoryName.Trim());
-        }
-
-        // Read now, not kept from startup: another account's app may have saved since.
-        var machineSettings = MachineSettings.Load();
-        var job = new BackupJob
-        {
-            BackupSetId = backupSet.Id,
-            Sources = sources,
-            ZipMode = opts.ZipMode,
-            FilesystemType = opts.FilesystemType,
-            CapacityOverrideBytes = opts.CapacityOverrideBytes,
-            VerifyAfterBurn = opts.VerifyAfterBurn,
-            VerifyAfterBackup = opts.VerifyAfterBackup,
-            IncludeCatalogOnDisc = opts.IncludeCatalogOnDisc,
-            AllowFileSplitting = opts.AllowFileSplitting,
-            TargetDirectory = effectiveTargetDir,
-            CreateSubdirectory = opts.CreateSubdirectory,
-            SubdirectoryName = opts.CreateSubdirectory ? opts.SubdirectoryName?.Trim() : null,
-            EnableFileDeduplication = opts.EnableFileDeduplication,
-            EnableDeduplication = opts.EnableDeduplication,
-            DeduplicationBlockSize = opts.DeduplicationBlockSize > 0
-                ? opts.DeduplicationBlockSize : 64 * 1024,
-            ExcludedExtensions = opts.ExcludedExtensions,
-            RetentionTiers = opts.RetentionTiers,
-            TierSets = opts.TierSets,
-            MemoryBudget = machineSettings.MemoryBudget,
-            StagingMode = machineSettings.DiscStagingMode,
-        };
+        var job = BuildJob(backupSet, opts, sources);
 
         bool isDir = job.TargetDirectory is not null;
 

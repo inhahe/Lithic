@@ -329,7 +329,8 @@ public class DirectoryBackupService
         // started; until they are saved, job.MemoryBudget stands (LiveMemoryPolicy).
         // See the "memory not released after lowering budget mid-run" entry in
         // known-issues.md.
-        var livePolicy = new LiveMemoryPolicy(job.MemoryBudget ?? MemoryBudgetOptions.Default);
+        var livePolicy = new LiveMemoryPolicy(
+            job.MemoryBudget ?? MemoryBudgetOptions.Default, job.MemoryBudgetWrittenUtc);
         MemoryBudgetOptions CurrentPolicy() => livePolicy.Current();
 
         // Reclaim (LOH-compacting GC) is throttled to at most once every few

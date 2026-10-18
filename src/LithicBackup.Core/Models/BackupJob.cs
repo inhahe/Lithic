@@ -46,10 +46,18 @@ public class BackupJob
     /// How much RAM a directory backup may use to buffer file contents in memory
     /// (so each file is read from disk only once for both analysis and writing).
     /// Null means use the built-in default policy. This is a machine/runtime
-    /// concern stamped onto the job from global user settings, not persisted
+    /// concern stamped onto the job from the machine settings, not persisted
     /// per-set.
     /// </summary>
     public MemoryBudgetOptions? MemoryBudget { get; set; }
+
+    /// <summary>
+    /// When the machine settings file <see cref="MemoryBudget"/> was taken from
+    /// had last been written, or null when the budget is the job's own. A running
+    /// backup follows the file once it has been written later than this, so a save
+    /// made while the job was being planned is not missed.
+    /// </summary>
+    public DateTime? MemoryBudgetWrittenUtc { get; set; }
 
     /// <summary>Whether to allow splitting large files across discs.</summary>
     public bool AllowFileSplitting { get; set; } = true;

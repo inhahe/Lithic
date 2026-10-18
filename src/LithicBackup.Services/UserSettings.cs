@@ -86,6 +86,22 @@ public class UserSettings
     [System.Text.Json.Serialization.JsonExtensionData]
     public Dictionary<string, JsonElement>? UnknownFields { get; set; }
 
+    /// <summary>
+    /// Drop the backup settings this file held before <see cref="MachineSettings"/>,
+    /// once the machine file exists: kept, they would be carried over again,
+    /// however old, if the machine file were ever deleted.
+    /// </summary>
+    /// <returns>Whether any were dropped, so the caller knows to save.</returns>
+    public bool ForgetBackupSettings()
+    {
+        if (UnknownFields is null)
+            return false;
+        bool removed = false;
+        foreach (var name in new[] { "MemoryBudget", "DiscStagingMode", "ContinuousRules" })
+            removed |= UnknownFields.Remove(name);
+        return removed;
+    }
+
     public static UserSettings Load()
     {
         try

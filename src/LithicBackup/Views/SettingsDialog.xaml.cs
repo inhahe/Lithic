@@ -416,6 +416,14 @@ public partial class SettingsDialog : Window, INotifyPropertyChanged
 
     private async void OK_Click(object sender, RoutedEventArgs e)
     {
+        // This user's preferences are a file of their own, so they are saved
+        // whatever becomes of the shared one.
+        _settings.SuppressBackupSuggestions = _suppressBackupSuggestions;
+        _settings.CheckForUpdates = _checkForUpdates;
+        _settings.ReconcileMode = _reconcileMode;
+        _settings.LastSettingsTab = SettingsTabs.SelectedIndex;
+        _settings.Save();
+
         var machine = new MachineSettings
         {
             MemoryBudget = BuildOptions(),
@@ -425,33 +433,29 @@ public partial class SettingsDialog : Window, INotifyPropertyChanged
 
         // Off the UI thread: a save can wait about a second for a handle on the
         // file. The window takes no input, and does not close, until it is done.
-        bool saved;
+        (bool Saved, string? Error) outcome;
         IsEnabled = false;
         _saving = true;
         try
         {
-            saved = await Task.Run(() => machine.Save());
+            outcome = await Task.Run(() => (machine.TrySave(out string? error), error));
         }
         finally
         {
             _saving = false;
             IsEnabled = true;
         }
-        if (!saved)
+        if (!outcome.Saved)
         {
             MessageBox.Show(this,
                 "Lithic Backup could not save the backup settings (memory budget, disc staging and "
-                + $"continuous timing) to {MachineSettings.DefaultPath}. Backups, including the "
-                + "background service's, go on using the previous ones. Try Save again, or Cancel.",
+                + $"continuous timing) to {MachineSettings.DefaultPath}: {outcome.Error}\n\n"
+                + "Backups, including the background service's, go on using the previous ones. Your "
+                + "other preferences were saved. Try Save again, or Cancel.",
                 "Settings not saved", MessageBoxButton.OK, MessageBoxImage.Warning);
             return;
         }
 
-        _settings.SuppressBackupSuggestions = _suppressBackupSuggestions;
-        _settings.CheckForUpdates = _checkForUpdates;
-        _settings.ReconcileMode = _reconcileMode;
-        _settings.LastSettingsTab = SettingsTabs.SelectedIndex;
-        _settings.Save();
         DialogResult = true;
         Close();
     }

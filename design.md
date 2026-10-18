@@ -78,20 +78,30 @@ when the other process is running.
     The POSIX rename goes through while handles that share delete access are
     open; the readers here share it and copy the bytes out before parsing.
   * **Read it where it is used, never from a copy kept since startup**: another
-    account's app may have saved since. The GUI reads it for each job and when
-    the settings dialog opens; the dialog saves off the UI thread and says so if
-    the save fails.
+    account's app may have saved since, and a Worker pass can run backups for
+    hours. The Worker and the GUI's job building read through a
+    `MachineSettingsReader`, refreshed before each job: one file-time query when
+    nothing changed. The settings dialog reads the file when it opens, saves this
+    user's preferences whatever becomes of the shared file, saves the shared one
+    off the UI thread, and gives Windows' reason if that fails.
   * **An unreadable file is not the defaults.** `TryLoad` tells a missing file
-    (the defaults apply) from one that cannot be read; the Worker then keeps the
-    settings it last read, logs it once, and tries again at the next pass.
+    (the defaults apply) from one that cannot be read; the reader then keeps the
+    settings it last read, the Worker logs it and the GUI's status line shows it,
+    once each, and the next look tries again.
   * **A running backup follows the file, not the defaults** (`LiveMemoryPolicy`):
-    it keeps the job's own memory budget until the file is written during the run.
+    it keeps the job's own memory budget until the file is written after that
+    budget was read. The job carries that write time
+    (`BackupJob.MemoryBudgetWrittenUtc`), so a save made while it was being
+    planned, which can take minutes, is followed from the run's first look.
   * **The app carries the machine settings over once**, on its first start without
     the machine file, from its own per-user file, where they used to be kept under
     the same names; with several accounts, the first to start wins. The Worker
     never seeds the file: its per-user file is the system profile's, which nothing
     writes. `UserSettings` writes back fields it does not know, so the old ones
-    survive a carry-over that failed, to be tried at the next start.
+    survive a carry-over that failed, to be tried at the next start; once the
+    machine file exists the app drops them, so they cannot come back, however old,
+    if it is ever deleted. A save also deletes temporary files a crash left more
+    than a minute ago.
   * **Widening the shared folder's ACL changes nothing when it is already
     widened.** Setting it makes Windows re-apply the inherited part to every file
     beneath, and it runs at every start and every settings save.

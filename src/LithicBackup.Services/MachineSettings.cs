@@ -161,8 +161,13 @@ public sealed class MachineSettings
     /// account can write.</param>
     /// <returns>Whether the file was written. Failures are not thrown, as for
     /// <see cref="UserSettings"/>.</returns>
-    public bool Save(string? path = null)
+    public bool Save(string? path = null) => TrySave(out _, path);
+
+    /// <inheritdoc cref="Save"/>
+    /// <param name="error">Why the file was not written, for the user, or null.</param>
+    public bool TrySave(out string? error, string? path = null)
     {
+        error = null;
         path = Path.GetFullPath(path ?? DefaultPath);
         string temp = $"{path}.{Guid.NewGuid():N}.tmp";
         try
@@ -171,6 +176,7 @@ public sealed class MachineSettings
                 CatalogLocation.SharedDirectory();
             else
                 Directory.CreateDirectory(Path.GetDirectoryName(path)!);
+            RemoveAbandonedTemporaryFiles(path);
 
             // Flushed to the disk before the rename: otherwise a crash soon after
             // can leave the renamed file full of zeros, and both settings gone.
@@ -185,20 +191,46 @@ public sealed class MachineSettings
             // usually do). One that does not share it is waited out: retried for
             // about a second, at uneven intervals so it cannot fall into step with
             // something that comes round regularly.
+            string? failure = null;
             for (int attempt = 1; attempt <= 50; attempt++)
             {
-                if (AtomicFile.TryReplace(temp, path) == AtomicFile.ReplaceResult.Replaced)
+                if (AtomicFile.TryReplace(temp, path, out failure) == AtomicFile.ReplaceResult.Replaced)
                     return true;
                 Thread.Sleep(5 + Random.Shared.Next(30));
             }
             File.Delete(temp);
+            error = $"{path} stayed in use for a second, or cannot be replaced: {failure}";
             return false;
         }
-        catch
+        catch (Exception ex)
         {
             try { File.Delete(temp); } catch { }
+            error = ex.Message;
             return false;
         }
+    }
+
+    /// <summary>
+    /// Delete temporary files a save left beside <paramref name="path"/> when the
+    /// app died between writing and renaming one. Only those more than a minute
+    /// old, so a save in progress in another account's app keeps its own.
+    /// </summary>
+    private static void RemoveAbandonedTemporaryFiles(string path)
+    {
+        try
+        {
+            var cutoff = DateTime.UtcNow - TimeSpan.FromMinutes(1);
+            foreach (var stale in Directory.EnumerateFiles(Path.GetDirectoryName(path)!, Path.GetFileName(path) + ".*.tmp"))
+            {
+                try
+                {
+                    if (File.GetLastWriteTimeUtc(stale) < cutoff)
+                        File.Delete(stale);
+                }
+                catch { }
+            }
+        }
+        catch { }
     }
 
     /// <summary>The settings in <paramref name="bytes"/>, or null when they are
