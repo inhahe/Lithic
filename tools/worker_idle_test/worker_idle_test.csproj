@@ -1,0 +1,23 @@
+<Project Sdk="Microsoft.NET.Sdk">
+
+  <PropertyGroup>
+    <OutputType>Exe</OutputType>
+    <!-- Never stamp the shipping version onto a harness (see design.md). -->
+    <ImportDirectoryBuildProps>false</ImportDirectoryBuildProps>
+    <TargetFramework>net8.0-windows</TargetFramework>
+    <ImplicitUsings>enable</ImplicitUsings>
+    <Nullable>enable</Nullable>
+    <AssemblyName>worker_idle_test</AssemblyName>
+    <!-- -p:OldCode=true: compile only the checks that also build against the
+         code before this change, to show they fail on it. -->
+    <DefineConstants Condition="'$(OldCode)' == 'true'">$(DefineConstants);OLD_CODE</DefineConstants>
+  </PropertyGroup>
+
+  <ItemGroup>
+    <ProjectReference Include="..\..\src\LithicBackup.Core\LithicBackup.Core.csproj" />
+    <ProjectReference Include="..\..\src\LithicBackup.Infrastructure\LithicBackup.Infrastructure.csproj" />
+    <ProjectReference Include="..\..\src\LithicBackup.Services\LithicBackup.Services.csproj" />
+    <ProjectReference Include="..\..\src\LithicBackup.Worker\LithicBackup.Worker.csproj" />
+  </ItemGroup>
+
+</Project>

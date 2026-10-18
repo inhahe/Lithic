@@ -1353,6 +1353,74 @@ like "nothing changed". Time it from the last **full scan**, never from the last
 run — every targeted continuous backup bumps the latter, so the busiest sets would
 be the ones that never qualified.
 
+## The Worker's loop must cost nothing while it cannot act
+
+The loop runs a pass at every poll and at every push wake-up, and the USN waiters
+fire on any change to a watched volume, up to four times a second each. So
+whatever a pass does, a busy machine does it several times a second. On
+2026-10-18, with both backup drives unplugged, that came to 70 MB/s of reads and
+35 MB/s of writes against the Worker's own catalog (known-issues.md). Four rules
+keep a pass cheap:
+
+* **The sets are read only when they may have changed.**
+  `ICatalogRepository.GetBackupSetsChangeStampAsync` moves after every write the
+  repository makes to the sets, and whenever `PRAGMA data_version` moves, which
+  reports every other connection's commits, the other process's included, but
+  never the connection's own: hence the counter beside it. A poller compares the
+  stamp before reading: the Worker's reload does, and so does the GUI's
+  `DestinationSpaceMonitor`. SQLite does not rewrite a row whose bytes are
+  unchanged, so writing a set back as it was moves no other connection's stamp,
+  correctly.
+* **SQLite never sorts the sets.** A row carries the set's selection tree, and
+  `ORDER BY` sorts whole rows: past its cache, through a temp file. Measured: 9.2
+  MB of rows cost 18.4 MB read and 9.2 MB written per read. `GetAllBackupSetsAsync`
+  sorts in code.
+* **A run that cannot start blocks the set until the next poll.** A destination
+  that is not connected, no source available, a destination holding a backup the
+  set does not track: each lasts until something outside the Worker changes, while
+  the reconcile flag, an overdue schedule and queued changes all survive the
+  attempt. `BlockRuns` holds the set's runs for one poll interval. A full backup
+  that throws holds the set's *full* backups for 1, 2, 4 … minutes, up to an hour,
+  but not its targeted runs, so continuous protection carries on while a
+  safety-net scan keeps failing. A blocked set's only wake-up deadline is the end
+  of its block (its overdue queue and its reconcile must not set the pace), and
+  while every continuous set is blocked the loop ignores push wake-ups. Each
+  condition is logged when it starts and when it ends, not at each attempt.
+* **An absent volume is not a volume without a journal.** "No usable journal" is
+  cached only for a volume that is there. Only such a volume's roots go on the
+  FileSystemWatcher fallback, and only roots that exist, so a root that appears
+  restarts the watcher (with the reconcile that implies) and a drive plugged in
+  later is read through its journal. Treating an unplugged drive as a fallback
+  volume flagged a reconcile at every service start and watched nothing.
+
+### Auto-include must not pin what can never be backed up
+
+`SourceSelection.MaterializeDirectory` pins each folder created under an
+auto-include parent, building the folders between as *partial* nodes, and a
+partial auto-include node pins every later folder created under it. So once a
+build tree has been reached, every folder each build creates is pinned: cargo
+makes new fingerprint, incremental and deps folders on every build. In the J: set
+26,732 of 31,289 entries lay inside `debug` and `release` trees that the set's own
+rules exclude; without them its selection JSON shrinks from 7.1 MB to 0.76 MB.
+
+The Worker therefore pins nothing inside a tree its rules exclude entirely
+(`IsPinCandidate`, through `DirectoryBackupService.BuildExcludedSubtreeTest`, the
+bottom-up form of the prune filter, needed because the journal hands over deep
+paths directly). It queues no changed file its rules exclude (`IsBackupCandidate`).
+And after each reload it removes the entries already there, with
+`SourceSelection.RemoveRedundantEntriesInExcludedFolders`.
+
+**The removal rule is what makes the removal safe, so keep it exact.** A node goes
+only when its parent includes unlisted descendants and the node, and everything it
+lists, include everything beneath them. Then no path's inclusion changes, even if
+the exclusion rule is deleted later: what the node said, its parent still says.
+Explicit exclusions, folders that back up only the children they list, and the
+children of parents that do not auto-include are choices, and stay. Checked on
+4,000 random trees and on both real sets (0 of 111,534 probes changed). The one
+thing lost is what pinning exists for: if the parent's auto-include is turned off
+later, those folders drop out with it, which costs nothing for folders whose files
+are excluded anyway.
+
 ## Threading rules that bite
 
 * **Nothing on the UI thread may do I/O at startup.** `App.OnStartup` constructs

@@ -1,5 +1,94 @@
 # LithicBackup — Known Issues & Tech Debt
 
+## FIXED: with no backup drive connected, the Worker read and wrote gigabytes, and auto-include had filled the selections with build folders (2026-10-18, 1.11.1)
+
+Seen in use on logoplex3, running 1.8.0. Neither backup drive was connected, yet
+from 01:19 to 03:09 the Worker read and wrote about 7 GB before it was stopped.
+After the PC restarted, one run read 51 GB and wrote 26 GB in 13 minutes. Every
+byte went to the Worker's own catalog and a SQLite temp file; nothing touched the
+sources or a destination. Five faults lined up:
+
+- **A run that could not start was retried at every pass.** Both sets wanted a
+  reconciling full backup from the moment the service started (next point), and by
+  morning their daily safety-net scans were due as well. With the destination
+  missing, the run returned "did not run", the reconcile flag and the overdue
+  schedule both stayed, and the next pass tried again, at least every 5 s
+  (`MinPollInterval`), logging "Skipping backup … destination drive not connected"
+  each time: 46,000 lines that morning.
+- **A missing source drive was taken for one without a change journal.** D: was no
+  longer in that PC. The Worker cached "no usable journal" for D:, put D:'s roots on
+  the FileSystemWatcher fallback, which silently skips folders that do not exist and
+  so watched nothing, and flagged a reconcile at every start because the fallback had
+  (re)started. Had D: come back, it would have stayed on that fallback, watched by
+  nothing, until the service restarted.
+- **Push wake-ups ran passes that could do nothing.** The USN waiters wake the loop
+  on any change to C: or E:, up to four times a second each. From 09:04 on, 87–92%
+  of the gaps between passes in the log were shorter than the loop's own 250 ms
+  floor, so push wake-ups were driving the loop. At night the volumes were quiet,
+  and it ran every 6.6 s instead.
+- **Every pass re-read every set, through a temp file.** `ReloadBackupSetsAsync` ran
+  `SELECT * FROM BackupSets ORDER BY Name` at each pass. With no index on `Name`,
+  SQLite sorts the whole rows, which held 7.1 MB and 2.0 MB of selection JSON, so
+  the sort spilled to a temp file. On a copy of the catalog, one read cost 18.4 MB
+  read and 9.2 MB written, in 4 KB operations: the Worker's own 2:1 ratio and
+  operation size. At about four passes a second, that is the 70 MB/s of reads and
+  35 MB/s of writes measured on the live process.
+- **Auto-include had pinned build output by the thousand.** `MaterializeDirectory`
+  pins each new folder under an auto-include parent, and the folders it creates in
+  between are partial nodes, each of which then pins every folder created under it
+  later. Cargo creates fresh fingerprint, incremental and deps folders on every
+  build. 26,732 of the J: set's 31,289 entries (85%) and 6,631 of the I: set's 9,369
+  (71%) lay inside `debug` and `release` trees that the sets' own rules
+  (`**/debug/**`, `**/release/**`) exclude, so they could never affect a backup. On
+  2026-09-22 the J: set had held 4,148 entries in 672 KB (see the entry on saved
+  choices for missing folders below).
+
+Fixed:
+- A run that cannot start (destination not connected, no source available, a
+  destination holding a backup the set does not track) blocks the set's runs until
+  the next poll, and a full backup that throws blocks the set's full backups (not
+  its targeted runs) for 1, 2, 4 … minutes, up to an hour. A blocked set's only
+  wake-up deadline is the end of its block, and
+  while every continuous set is blocked the loop ignores push wake-ups. The missing
+  destination, or source, is logged when it goes and when it comes back.
+- An absent volume is not a fallback volume. No "no journal" answer is cached for
+  it, no reconcile is flagged, and once it is plugged in its journal is read.
+- `ICatalogRepository.GetBackupSetsChangeStampAsync` (this repository's own writes
+  to the sets, plus `PRAGMA data_version`) tells a poller whether the sets may have
+  changed. The Worker reads them only then, and so does the GUI's
+  `DestinationSpaceMonitor`, which used to read them every 30 s.
+  `GetAllBackupSetsAsync` sorts in code.
+- New folders inside a tree the set's rules exclude entirely are not pinned, and
+  changed files the rules exclude are not queued. After each reload the Worker
+  removes the existing entries there that only say "included" under a parent that
+  already includes them (`SourceSelection.RemoveRedundantEntriesInExcludedFolders`):
+  no path's inclusion changes, now or if the rule is deleted later. On a copy of the
+  real catalog, J:'s selection JSON goes from 7.1 MB to 0.76 MB and I:'s from 2.0 MB
+  to 0.46 MB. Design: "The Worker's loop must cost nothing while it cannot act" in
+  design.md.
+
+**Tested.** `tools\worker_idle_test` runs the real Worker on a temp catalog with a
+destination it can switch off, the real catalog code, and the selection pruning on
+4,000 random trees (and, with `--catalog`, on a copy of a real catalog). With the
+destination off and a file changing every 100 ms for 18 s, the new code logged the
+missing destination once, looked for it 4 times, read the sets twice and ran 4
+passes. Built against the old code (`-p:OldCode=true`), the same run logged it 492
+times, read the sets 246 times and pinned 32 folders inside the excluded `debug`
+tree; reading the sets wrote 10.2 MB; the unplugged source drive was put on the
+fallback and its absence was logged 6 times in 14 s. Of the old code's checks, A2,
+C1, C2, C4 and C5 fail, and C3's "logged once" fails because it logged nothing.
+
+**Open:**
+- When volumes are busy and some set can run, each pass still commits the USN
+  cursor of every watched volume that had records: up to two SQLite commits per pass.
+  The passes are cheap now, and only happen while a backup could follow.
+- Saved entries for folders that no longer exist, outside excluded trees, still
+  accumulate from the Worker's pins (57 and 55 of them on 2026-09-22). That is by
+  design ("A saved choice for something that isn't on disk is kept" in design.md);
+  the editor's "Forget them" removes them.
+- A targeted continuous run that throws drops the files it was given, as before;
+  the daily safety-net scan picks them up.
+
 ## FIXED: an imported set said "Never backed up" and began re-copying its whole backup (2026-10-18, 1.10.0)
 
 Seen in use, on the first move of two sets to a new computer: both exported "with
