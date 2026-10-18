@@ -4991,7 +4991,10 @@ public class MainViewModel : ViewModelBase
         DirectoryBackupService.UntrackedBackup? found;
         try
         {
-            var roots = SourceSelection.CollectSelectedRoots(sources);
+            // What the selection covers, not the watch roots, which take in whole
+            // partial folders that auto-include new ones: probing all of such a
+            // folder would find another set's files in a shared destination.
+            var roots = SourceSelection.CollectCoveredEntries(sources);
             if (roots.Count == 0)
                 roots = backupSet.SourceRoots.ToList();
             found = await _directoryBackupService.FindUntrackedBackupAsync(backupSet.Id, roots, targetDirectory);

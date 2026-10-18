@@ -11,6 +11,14 @@ public class FileSystemMonitorImpl : IFileSystemMonitor
     private readonly Dictionary<string, FileSystemWatcher> _watchers = new(StringComparer.OrdinalIgnoreCase);
 
     /// <summary>
+    /// Roots whose watcher has reported an error since the last <see cref="Watch"/>:
+    /// a deleted root or a vanished volume shows up this way. Written from watcher
+    /// threads.
+    /// </summary>
+    private readonly System.Collections.Concurrent.ConcurrentDictionary<string, byte> _errored =
+        new(StringComparer.OrdinalIgnoreCase);
+
+    /// <summary>
     /// Largest buffer Windows allows for a <see cref="FileSystemWatcher"/> (64 KB).
     /// Using the maximum minimizes how often a burst of changes overflows and drops
     /// events; overflows that still happen are surfaced via <see cref="Overflow"/>.
@@ -33,6 +41,11 @@ public class FileSystemMonitorImpl : IFileSystemMonitor
     /// there, stops being watched, and a listed root that exists and is not
     /// watched starts. Watchers of roots that stay keep running and lose nothing.
     /// </summary>
+    /// <remarks>
+    /// Meant to be called often, so a watched root is looked at on disk only after
+    /// its watcher has reported an error. Listed roots that are not watched, because
+    /// they did not exist, are looked at on every call.
+    /// </remarks>
     /// <returns>The roots watching started for just now. Changes made under them
     /// before this call were seen by no watcher.</returns>
     public IReadOnlyList<string> Watch(IReadOnlyList<string> directories)
@@ -41,7 +54,8 @@ public class FileSystemMonitorImpl : IFileSystemMonitor
 
         foreach (var (root, watcher) in _watchers.ToList())
         {
-            if (wanted.Contains(root) && Directory.Exists(root))
+            bool gone = _errored.TryRemove(root, out _) && !Directory.Exists(root);
+            if (wanted.Contains(root) && !gone)
                 continue;
             watcher.EnableRaisingEvents = false;
             watcher.Dispose();
@@ -81,7 +95,10 @@ public class FileSystemMonitorImpl : IFileSystemMonitor
         // some change events were lost. We can't know which files those were,
         // so signal the owner to recheck this entire root.
         watcher.Error += (_, _) =>
+        {
+            _errored[dir] = 0;
             Overflow?.Invoke(this, new FileSystemMonitorOverflowEventArgs { Root = dir });
+        };
 
         return watcher;
     }

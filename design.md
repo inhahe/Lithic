@@ -1403,7 +1403,10 @@ keep a pass cheap:
 * **One full scan settles every reconcile pending when it starts.** The schedule's
   or the safety net's full backup runs first in a pass, and a set reconnected
   after a day usually has both that and a reconcile due: before, the second
-  whole-tree scan began the moment the first ended (`SettleReconcile`).
+  whole-tree scan began the moment the first ended (`SettleReconcile`). A clean
+  scan clears only the changes and moves queued before it began. The drain queues
+  more while it runs, and leaves some of them to the scan: its own paths, even when
+  they change again after it copied them, and every move. Those stay queued.
 * **An absent volume is not a volume without a journal.** "No usable journal" is
   cached only for a volume that is there, so a drive plugged in later is read
   through its journal. Treating an unplugged drive as a fallback volume flagged a
@@ -1413,7 +1416,9 @@ keep a pass cheap:
   of roots that are gone, and starts one for a root that exists and is not
   watched. Only the sets with a root that just started are flagged for a
   reconcile, since only there did no watcher see what changed; restarting every
-  watcher whenever one root came or went cost every fallback set a full scan.
+  watcher whenever one root came or went cost every fallback set a full scan. It
+  runs at every pass, so a watched root is looked at on disk only after its
+  watcher reports an error, which is how a deleted root or a vanished volume shows.
 
 ### Auto-include must not pin what can never be backed up
 
@@ -1440,6 +1445,10 @@ drive were pins under such a folder would have stopped reading that drive once
 they went. Such a folder is now a watch root of its own, which is also what a
 fallback watcher needs to see the folders it would adopt. Checked on random
 trees: every included path lies under a watch root, before and after removal.
+Watch roots answer "where do I watch", not "where does this set write": the
+untracked-destination probe (`FindUntrackedBackupAsync`, from the Worker and the
+GUI) takes `CollectCoveredEntries`, since probing a whole partial folder would
+find another set's files in a shared destination and refuse the set forever.
 
 **The removal rule is what makes the removal safe, so keep it exact.** A node goes
 only when its parent includes unlisted descendants and the node, and everything it

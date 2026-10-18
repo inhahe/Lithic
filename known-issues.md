@@ -88,6 +88,23 @@ From the code review (Opus, max), also fixed:
 - Two `0x08` bytes in a `GlobMatcher` doc comment, older than this batch: `...\build`
   had become a backspace followed by `uild`.
 
+From the second review (Fable, xhigh), also fixed:
+- Settling a reconcile cleared every queued change, including those the drain
+  queued during the scan and left to it; now only what was queued before the scan
+  began is cleared. (The reconcile step had the same loss; before the batch a
+  second scan often hid it.)
+- Making a partial auto-include folder a watch root also widened the
+  untracked-destination probe, which used the watch roots, so a set sharing a
+  destination could have been refused forever. The probe now uses what the
+  selection covers (`CollectCoveredEntries`), in the Worker and in the GUI.
+- Removing redundant entries no longer changes the Worker's copy of the set before
+  the save succeeds, which could have looked like a user edit and ended a failure
+  backoff.
+- `FileSystemMonitorImpl.Watch` looks at a watched root on disk only after its
+  watcher reports an error; the fallback's walk of a new folder skips wholly
+  excluded subtrees and unreadable folders; the settings file's time is read
+  without being able to stop the pass.
+
 **Tested.** `tools\worker_idle_test` runs the real Worker on a temp catalog with a
 destination it can switch off, the real catalog code, and the selection pruning on
 4,000 random trees (and, with `--catalog`, on a copy of a real catalog). With the

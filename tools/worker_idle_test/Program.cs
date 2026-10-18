@@ -271,6 +271,11 @@ void PartB()
         return node;
     }
 
+    int nodesBeforeCount = Flatten(roots).Count();
+    int counted = SourceSelection.CountRedundantEntriesInExcludedFolders(roots, PrunesDebug);
+    Check(counted == 6 && Flatten(roots).Count() == nodesBeforeCount,
+        $"B1 counting finds the six and changes nothing (counted {counted})");
+
     int removed = SourceSelection.RemoveRedundantEntriesInExcludedFolders(roots, PrunesDebug);
     var left = Flatten(roots).Select(n => n.Path).ToHashSet(StringComparer.OrdinalIgnoreCase);
 
@@ -573,6 +578,56 @@ async Task PartC()
         Check(retried && rig.Log.Count("was edited") == 1,
             "C5 editing the set lets its full backup start again at once, without waiting out the hold");
 #endif
+        await rig.DisposeAsync();
+    }
+
+    // C7 --------------------------------------------------------------------
+    // A set with no history whose selection is a partial folder that
+    // auto-includes new ones, sharing its destination with a set that backs up
+    // another part of that folder: the untracked-destination probe must look
+    // only where this set writes, not under the whole folder.
+    {
+        string dir = Path.Combine(root, "c7");
+        string src = Path.Combine(dir, "src");
+        string mine = Path.Combine(src, "mine");
+        string other = Path.Combine(src, "other");
+        string dst = Path.Combine(dir, "dst");
+        Directory.CreateDirectory(mine);
+        Directory.CreateDirectory(other);
+        File.WriteAllText(Path.Combine(mine, "a.txt"), "mine");
+
+        // Another set's backup of src\other, where the engine lays it out.
+        string drive = char.ToUpperInvariant(other[0]).ToString();
+        string otherCopy = Path.Combine(dst, drive, other.Substring(3));
+        Directory.CreateDirectory(otherCopy);
+        File.WriteAllText(Path.Combine(otherCopy, "x.txt"), "theirs");
+        bool laidOut = DirectoryBackupService.FindBackupContent(dst, new[] { other }) is not null;
+
+        var rig = await Rig.CreateAsync(Path.Combine(dir, "catalog.db"), stampedSetIds, set =>
+        {
+            set.SourceSelections =
+            [
+                new SourceSelection
+                {
+                    Path = src, IsDirectory = true, IsSelected = null, AutoIncludeNewSubdirectories = true,
+                    Children =
+                    [
+                        new SourceSelection { Path = mine, IsDirectory = true, IsSelected = true },
+                        new SourceSelection { Path = other, IsDirectory = true, IsSelected = false },
+                    ],
+                },
+            ];
+            set.SourceRoots = [src];
+            set.JobOptions!.TargetDirectory = dst;
+        });
+        rig.Destination.Connected = true;
+
+        await rig.Worker.StartAsync(CancellationToken.None);
+        bool ran = await WaitUntil(() => rig.Log.Count("Starting backup for") > 0, TimeSpan.FromSeconds(30));
+        int refused = rig.Log.Count("Not backing up");
+        Check(laidOut, "C7 the other set's copy sits where the untracked probe would look for it");
+        Check(ran && refused == 0,
+            $"C7 a destination shared with another set is not taken for this set's own untracked backup (ran {ran}, refused {refused})");
         await rig.DisposeAsync();
     }
 

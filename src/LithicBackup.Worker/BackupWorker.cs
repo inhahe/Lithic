@@ -1,4 +1,5 @@
 using System.Collections.Concurrent;
+using System.IO.Enumeration;
 using LithicBackup.Core;
 using LithicBackup.Core.Interfaces;
 using LithicBackup.Core.Models;
@@ -119,9 +120,9 @@ public sealed class BackupWorker : BackgroundService
 
     /// <summary>
     /// <see cref="UserSettings.LastWriteTimeUtc"/> when <see cref="_rules"/> was
-    /// read; MinValue before the first read, which no file time equals.
+    /// read; null before the first read, or when the time could not be told.
     /// </summary>
-    private DateTime _rulesReadFromWriteTimeUtc = DateTime.MinValue;
+    private DateTime? _rulesReadFromWriteTimeUtc;
 
     /// <summary>
     /// The catalog's <see cref="ICatalogRepository.GetBackupSetsChangeStampAsync"/>
@@ -317,18 +318,32 @@ public sealed class BackupWorker : BackgroundService
         => TimeSpan.FromMinutes(Math.Min(60, 1 << Math.Clamp(consecutiveFailures - 1, 0, 6)));
 
     /// <summary>
+    /// When the hold on everything this set has waiting ends, or null when some of
+    /// it can run now. Its runs may be blocked, or its reconcile, which its queued
+    /// changes wait for, may be backing off after failures. The one definition the
+    /// wake-up delay and the choice to heed push wake-ups both use.
+    /// </summary>
+    private static DateTime? HeldUntil(SetState state, DateTime nowUtc)
+    {
+        if (nowUtc < state.RunsBlockedUntilUtc)
+            return state.RunsBlockedUntilUtc;
+        if (state.NeedsReconcile && nowUtc < state.FullBackupsBlockedUntilUtc)
+            return state.FullBackupsBlockedUntilUtc;
+        return null;
+    }
+
+    /// <summary>
     /// Whether some active continuous set can run now, so that a change the push
-    /// waiters report can lead to a backup before the next poll. A set whose
-    /// reconcile is backing off cannot: its queued changes wait for the reconcile.
+    /// waiters report can lead to a backup before the next poll.
     /// </summary>
     private bool AnyContinuousSetCanRun()
     {
+        var now = DateTime.UtcNow;
         foreach (var state in _sets.Values)
         {
             if (state.IsActive
                 && state.BackupSet.JobOptions?.Schedule is { Mode: ScheduleMode.Continuous }
-                && !RunsBlocked(state)
-                && !(state.NeedsReconcile && FullBackupsBlocked(state)))
+                && HeldUntil(state, now) is null)
                 return true;
         }
         return false;
@@ -443,7 +458,7 @@ public sealed class BackupWorker : BackgroundService
         // debounce, mask-tiered max-wait) apply on the next poll without a restart:
         // re-read when the file has been written, not at every pass.
         var settingsWritten = UserSettings.LastWriteTimeUtc();
-        if (settingsWritten != _rulesReadFromWriteTimeUtc)
+        if (settingsWritten is null || settingsWritten != _rulesReadFromWriteTimeUtc)
         {
             _rules = UserSettings.Load().ContinuousRules ?? new();
             _rulesReadFromWriteTimeUtc = settingsWritten;
@@ -571,9 +586,9 @@ public sealed class BackupWorker : BackgroundService
                 || state.BackupSet.SourceSelections is not { Count: > 0 } loaded)
                 continue;
 
-            // Tried on the loaded copy first, which is ours to change: in the
-            // usual case nothing is removable and the catalog is not touched.
-            if (SourceSelection.RemoveRedundantEntriesInExcludedFolders(loaded, state.PrunesDirectory) == 0)
+            // Counted on the loaded copy, which stays as the catalog has it unless
+            // the save succeeds: usually nothing is removable and nothing is read.
+            if (SourceSelection.CountRedundantEntriesInExcludedFolders(loaded, state.PrunesDirectory) == 0)
                 continue;
 
             await ChangeSavedSelectionAsync(state, "remove redundant entries from", (set, selections) =>
@@ -690,9 +705,11 @@ public sealed class BackupWorker : BackgroundService
             {
                 // A reconcile pending when the scan starts is settled by it.
                 bool reconcilePending = state.NeedsReconcile;
+                var scanStartedUtc = DateTime.UtcNow;
+                int movesQueuedBefore = state.PendingMoves.Count;
                 var outcome = await RunFullBackupAsync(state, ct);
                 if (reconcilePending)
-                    SettleReconcile(state, outcome);
+                    SettleReconcile(state, outcome, scanStartedUtc, movesQueuedBefore);
             }
         }
     }
@@ -828,25 +845,14 @@ public sealed class BackupWorker : BackgroundService
                 || state.BackupSet.JobOptions?.Schedule is not { Mode: ScheduleMode.Continuous })
                 continue;
 
-            // Everything a blocked set has waiting needs a run, so nothing of its
-            // can happen before the block ends: that is its only deadline. Its
-            // overdue queue and its reconcile would otherwise set the pace, and
-            // drive the loop flat out against a destination that is not there.
-            if (nowUtc < state.RunsBlockedUntilUtc)
+            // Nothing a held set has waiting can happen before the hold ends, so
+            // that is its only deadline. Its overdue queue and its reconcile would
+            // otherwise set the pace, and drive the loop flat out against a
+            // destination that is not there.
+            if (HeldUntil(state, nowUtc) is { } heldUntil)
             {
-                var untilUnblocked = state.RunsBlockedUntilUtc - nowUtc;
-                if (untilUnblocked < delay)
-                    delay = untilUnblocked;
-                continue;
-            }
-
-            // Likewise a reconcile backing off after failures: queued changes
-            // wait for it, so the end of its backoff is the set's only deadline.
-            if (state.NeedsReconcile && nowUtc < state.FullBackupsBlockedUntilUtc)
-            {
-                var untilRetry = state.FullBackupsBlockedUntilUtc - nowUtc;
-                if (untilRetry < delay)
-                    delay = untilRetry;
+                if (heldUntil - nowUtc < delay)
+                    delay = heldUntil - nowUtc;
                 continue;
             }
 
@@ -1069,8 +1075,10 @@ public sealed class BackupWorker : BackgroundService
             if (!state.NeedsReconcile || FullBackupsBlocked(state))
                 continue;
 
+            var scanStartedUtc = DateTime.UtcNow;
+            int movesQueuedBefore = state.PendingMoves.Count;
             var outcome = await RunFullBackupAsync(state, ct);
-            SettleReconcile(state, outcome);
+            SettleReconcile(state, outcome, scanStartedUtc, movesQueuedBefore);
         }
 
         // 3b. Apply pending relocations. Moves are discrete, atomic events (no
@@ -1154,7 +1162,10 @@ public sealed class BackupWorker : BackgroundService
     /// followed at once by a second whole-tree scan of the same set. A scan that
     /// did not run (lock busy, or the set blocked) leaves it pending.
     /// </summary>
-    private void SettleReconcile(SetState state, ReconcileOutcome outcome)
+    /// <param name="scanStartedUtc">When the scan began, before it planned anything.</param>
+    /// <param name="movesQueuedBefore">How many moves were queued when it began.</param>
+    private void SettleReconcile(
+        SetState state, ReconcileOutcome outcome, DateTime scanStartedUtc, int movesQueuedBefore)
     {
         if (outcome == ReconcileOutcome.DidNotRun)
             return;
@@ -1169,13 +1180,20 @@ public sealed class BackupWorker : BackgroundService
 
         if (outcome == ReconcileOutcome.RanClean)
         {
-            // Only a CLEAN scan supersedes the queued per-file deltas. It
-            // walked the whole tree and compared every file, so those paths
-            // are accounted for.
-            state.Pending.Clear();
+            // Only a CLEAN scan supersedes the queued per-file deltas, and only
+            // those queued before it began: it walked the whole tree and compared
+            // every file, so they are accounted for. What the commit-boundary
+            // drain queued while it ran stays. The drain leaves the scan's own
+            // paths to the scan even when they change again after it copied them,
+            // and it never applies moves.
+            foreach (var path in state.Pending
+                         .Where(p => p.Value.Last < scanStartedUtc)
+                         .Select(p => p.Key)
+                         .ToList())
+                state.Pending.Remove(path);
             // A full scan reconciles the destination against the live source
-            // tree, so any queued relocations are already accounted for.
-            state.PendingMoves.Clear();
+            // tree, so the relocations queued before it are accounted for.
+            state.PendingMoves.RemoveRange(0, Math.Min(movesQueuedBefore, state.PendingMoves.Count));
         }
         else
         {
@@ -1231,10 +1249,7 @@ public sealed class BackupWorker : BackgroundService
             {
                 if (IsBackupCandidate(state, change.FullPath))
                 {
-                    state.Pending[change.FullPath] =
-                        state.Pending.TryGetValue(change.FullPath, out var t)
-                            ? (t.First, now)
-                            : (now, now);
+                    Touch(state, change.FullPath, now);
                     routed++;
                 }
             }
@@ -1688,8 +1703,7 @@ public sealed class BackupWorker : BackgroundService
                 }
                 else if (!state.IsExcludedFile(changedPath))
                 {
-                    state.Pending[changedPath] =
-                        state.Pending.TryGetValue(changedPath, out var t) ? (t.First, now) : (now, now);
+                    Touch(state, changedPath, now);
                 }
             }
         }
@@ -2157,29 +2171,43 @@ public sealed class BackupWorker : BackgroundService
     /// </summary>
     private static void EnqueueForBackup(SetState state, string path, bool isDirectory, DateTime now)
     {
-        if (isDirectory)
+        if (!isDirectory)
         {
-            IEnumerable<string> files;
-            try
-            {
-                files = Directory.EnumerateFiles(path, "*", SearchOption.AllDirectories);
-            }
-            catch (Exception ex) when (ex is IOException or UnauthorizedAccessException or DirectoryNotFoundException)
-            {
-                return;
-            }
+            Touch(state, path, now);
+            return;
+        }
 
+        // Wholly excluded subtrees are not entered, as in the scanner, and an
+        // unreadable folder part-way is skipped instead of ending the walk.
+        var prunes = state.PrunesDirectory;
+        var files = new FileSystemEnumerable<string>(
+            path, (ref FileSystemEntry entry) => entry.ToFullPath(),
+            new EnumerationOptions { RecurseSubdirectories = true, IgnoreInaccessible = true, AttributesToSkip = 0 })
+        {
+            ShouldIncludePredicate = (ref FileSystemEntry entry) => !entry.IsDirectory,
+            ShouldRecursePredicate = (ref FileSystemEntry entry) => !prunes(entry.ToFullPath()),
+        };
+
+        try
+        {
             foreach (var f in files)
             {
                 if (!state.IsExcludedFile(f))
-                    state.Pending[f] = state.Pending.TryGetValue(f, out var t) ? (t.First, now) : (now, now);
+                    Touch(state, f, now);
             }
         }
-        else
+        catch (Exception ex) when (ex is IOException or UnauthorizedAccessException)
         {
-            state.Pending[path] = state.Pending.TryGetValue(path, out var t) ? (t.First, now) : (now, now);
+            // The folder went while it was being read; what was queued stays.
         }
     }
+
+    /// <summary>
+    /// Queue a changed path for the set's per-file debounce: now is its latest
+    /// change, and the first is kept if it was queued already.
+    /// </summary>
+    private static void Touch(SetState state, string path, DateTime now)
+        => state.Pending[path] = state.Pending.TryGetValue(path, out var t) ? (t.First, now) : (now, now);
 
     /// <summary>
     /// Reconcile a source path that has left the set — either moved to a location
@@ -2379,8 +2407,14 @@ public sealed class BackupWorker : BackgroundService
         DirectoryBackupService.UntrackedBackup? found;
         try
         {
+            // What the selection covers, not the watch roots: those include whole
+            // partial folders that auto-include new ones, and probing all of such
+            // a folder would find another set's files in a shared destination.
+            var written = set.SourceSelections is { Count: > 0 } selections
+                ? SourceSelection.CollectCoveredEntries(selections)
+                : set.SourceRoots.ToList();
             found = await _directoryBackup.FindUntrackedBackupAsync(
-                set.Id, ResolveWatchRoots(set), targetDir, ct);
+                set.Id, written, targetDir, ct);
         }
         catch (OperationCanceledException) { throw; }
         catch (Exception ex)

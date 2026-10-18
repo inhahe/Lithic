@@ -101,9 +101,14 @@ public class UserSettings
     /// <summary>
     /// When the settings file was last written, for a caller that polls the
     /// settings and wants to read them only after they change. An unchanged value
-    /// means <see cref="Load"/> would return the same settings.
+    /// means <see cref="Load"/> would return the same settings. Null when it
+    /// cannot be told (the folder unreadable, say): read them, as before.
     /// </summary>
-    public static DateTime LastWriteTimeUtc() => File.GetLastWriteTimeUtc(SettingsPath);
+    public static DateTime? LastWriteTimeUtc()
+    {
+        try { return File.GetLastWriteTimeUtc(SettingsPath); }
+        catch { return null; }
+    }
 
     public static UserSettings Load()
     {

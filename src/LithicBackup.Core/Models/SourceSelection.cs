@@ -429,20 +429,32 @@ public class SourceSelection
     /// <returns>How many nodes were removed, descendants included.</returns>
     public static int RemoveRedundantEntriesInExcludedFolders(
         IReadOnlyList<SourceSelection> roots, Func<string, bool> prunesDirectory)
+        => RedundantEntries(roots, prunesDirectory, remove: true);
+
+    /// <summary>
+    /// How many nodes <see cref="RemoveRedundantEntriesInExcludedFolders"/> would
+    /// remove, leaving the tree as it is.
+    /// </summary>
+    public static int CountRedundantEntriesInExcludedFolders(
+        IReadOnlyList<SourceSelection> roots, Func<string, bool> prunesDirectory)
+        => RedundantEntries(roots, prunesDirectory, remove: false);
+
+    private static int RedundantEntries(
+        IReadOnlyList<SourceSelection> roots, Func<string, bool> prunesDirectory, bool remove)
     {
-        int removed = 0;
+        int found = 0;
         foreach (var root in roots)
         {
             if (!root.IsDirectory)
                 continue;
             bool inside = IsInsidePrunedDirectory(root.Path, prunesDirectory);
-            removed += RemoveRedundantChildren(root, inside, prunesDirectory);
+            found += RedundantChildren(root, inside, prunesDirectory, remove);
         }
-        return removed;
+        return found;
     }
 
-    private static int RemoveRedundantChildren(
-        SourceSelection parent, bool parentInside, Func<string, bool> prunesDirectory)
+    private static int RedundantChildren(
+        SourceSelection parent, bool parentInside, Func<string, bool> prunesDirectory, bool remove)
     {
         if (parent.Children.Count == 0)
             return 0;
@@ -466,11 +478,12 @@ public class SourceSelection
             if (inside && parentIncludesUnlisted && IncludesEverythingBeneath(child))
             {
                 removed += CountNodes(child);
-                parent.Children.RemoveAt(i);
+                if (remove)
+                    parent.Children.RemoveAt(i);
             }
             else if (child.IsDirectory)
             {
-                removed += RemoveRedundantChildren(child, inside, prunesDirectory);
+                removed += RedundantChildren(child, inside, prunesDirectory, remove);
             }
         }
         return removed;
