@@ -11,6 +11,21 @@ public interface ICatalogRepository : IDisposable
     Task<BackupSet> CreateBackupSetAsync(BackupSet set, CancellationToken ct = default);
     Task<BackupSet?> GetBackupSetAsync(int id, CancellationToken ct = default);
     Task<IReadOnlyList<BackupSet>> GetAllBackupSetsAsync(CancellationToken ct = default);
+
+    /// <summary>
+    /// A number that changes whenever the backup sets may have changed: after every
+    /// write this repository makes to them, and after any commit to the catalog by
+    /// another connection, the other process's included. While it stays the same,
+    /// <see cref="GetAllBackupSetsAsync"/> would return the same sets, so a caller
+    /// that polls can skip reading them. A read parses every set's selection tree,
+    /// which runs to megabytes for a set with thousands of entries.
+    /// </summary>
+    /// <remarks>
+    /// It may change when no set did (another process wrote a different table),
+    /// never the reverse. Compare stamps for equality only.
+    /// </remarks>
+    Task<long> GetBackupSetsChangeStampAsync(CancellationToken ct = default);
+
     Task UpdateBackupSetAsync(BackupSet set, CancellationToken ct = default);
 
     /// <summary>

@@ -57,6 +57,15 @@ public sealed class DestinationSpaceMonitor : IDisposable
     private readonly Dictionary<string, int> _lowSweepStreak = new(StringComparer.OrdinalIgnoreCase);
 
     /// <summary>
+    /// The sets as they were when the catalog's change stamp was
+    /// <see cref="_setsStamp"/>. Reading them parses every selection tree, and a
+    /// sweep runs every 30 seconds, so they are read again only when the stamp
+    /// says they may have changed. Only ever touched inside <see cref="_gate"/>.
+    /// </summary>
+    private IReadOnlyList<BackupSet>? _sets;
+    private long _setsStamp;
+
+    /// <summary>
     /// Free-space floor below which a destination drive is treated as "full".
     /// 1 GB is a practical cut-off: below it, continuous backups can no longer
     /// reliably write new file versions.
@@ -153,7 +162,13 @@ public sealed class DestinationSpaceMonitor : IDisposable
             IReadOnlyList<BackupSet> sets;
             try
             {
-                sets = await _catalog.GetAllBackupSetsAsync();
+                long stamp = await _catalog.GetBackupSetsChangeStampAsync();
+                if (_sets is null || stamp != _setsStamp)
+                {
+                    _sets = await _catalog.GetAllBackupSetsAsync();
+                    _setsStamp = stamp;
+                }
+                sets = _sets;
             }
             catch
             {

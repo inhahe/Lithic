@@ -40,6 +40,13 @@ public class SqliteCatalogRepository : ICatalogRepository
     // entirely), so cached entries never need invalidation.
     private readonly ConcurrentDictionary<int, int> _discToSet = new();
 
+    // GetBackupSetsChangeStampAsync's value. PRAGMA data_version reports commits
+    // by every OTHER connection and never this one's, so the stamp is bumped by
+    // this instance's own BackupSets writes as well as whenever data_version
+    // moves. Both fields are touched only under _masterGate.
+    private long _backupSetsStamp;
+    private long _lastDataVersion = -1;
+
     public SqliteCatalogRepository(string databasePath)
     {
         _master = new SqliteConnection($"Data Source={databasePath};Pooling=False");
@@ -216,6 +223,7 @@ public class SqliteCatalogRepository : ICatalogRepository
                 """;
             BindBackupSetWriteParameters(cmd, set);
             set.Id = Convert.ToInt32(cmd.ExecuteScalar());
+            _backupSetsStamp++;
             return set;
         }
         finally
@@ -249,12 +257,42 @@ public class SqliteCatalogRepository : ICatalogRepository
         try
         {
             using var cmd = _master.CreateCommand();
-            cmd.CommandText = "SELECT * FROM BackupSets ORDER BY Name";
+            // Sorted here, not by ORDER BY: SQLite sorts whole rows, a row holds
+            // the set's selection tree, and once the rows outgrow its cache the
+            // sort goes through a temp file. That turned each 9.2 MB read into
+            // 18.4 MB read and 9.2 MB written. Ordinal order is the BINARY
+            // collation's order, short of characters beyond U+FFFF.
+            cmd.CommandText = "SELECT * FROM BackupSets";
             var list = new List<BackupSet>();
-            using var r = cmd.ExecuteReader();
-            while (r.Read())
-                list.Add(ReadBackupSet(r));
+            using (var r = cmd.ExecuteReader())
+            {
+                while (r.Read())
+                    list.Add(ReadBackupSet(r));
+            }
+            list.Sort((a, b) => string.CompareOrdinal(a.Name, b.Name));
             return list;
+        }
+        finally
+        {
+            _masterGate.Release();
+        }
+    }
+
+    public async Task<long> GetBackupSetsChangeStampAsync(CancellationToken ct = default)
+    {
+        ct.ThrowIfCancellationRequested();
+        await _masterGate.WaitAsync(ct).ConfigureAwait(false);
+        try
+        {
+            using var cmd = _master.CreateCommand();
+            cmd.CommandText = "PRAGMA data_version";
+            long dataVersion = Convert.ToInt64(cmd.ExecuteScalar());
+            if (dataVersion != _lastDataVersion)
+            {
+                _lastDataVersion = dataVersion;
+                _backupSetsStamp++;
+            }
+            return _backupSetsStamp;
         }
         finally
         {
@@ -285,6 +323,7 @@ public class SqliteCatalogRepository : ICatalogRepository
             cmd.Parameters.AddWithValue("$id", set.Id);
             BindBackupSetWriteParameters(cmd, set);
             cmd.ExecuteNonQuery();
+            _backupSetsStamp++;
         }
         finally
         {
@@ -318,6 +357,7 @@ public class SqliteCatalogRepository : ICatalogRepository
             cmd.Parameters.AddWithValue("$id", set.Id);
             BindBackupSetWriteParameters(cmd, set);
             cmd.ExecuteNonQuery();
+            _backupSetsStamp++;
         }
         finally
         {
@@ -823,6 +863,7 @@ public class SqliteCatalogRepository : ICatalogRepository
             // One transaction, so a failure part-way cannot strand a set's discs
             // with no set, or a set with half its records gone.
             tx.Commit();
+            _backupSetsStamp++;
 
             // Committed - the set no longer exists, so its database can go.
             RemoveSetDatabaseFile(backupSetId);
