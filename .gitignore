@@ -75,3 +75,6 @@ __pycache__/
 *.dll
 *.msi
 *.pdb
+
+# Release scripts are local tooling and stay out of the repository.
+*release.bat
