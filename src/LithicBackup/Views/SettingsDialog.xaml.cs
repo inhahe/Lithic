@@ -12,32 +12,36 @@ using LithicBackup.ViewModels;
 namespace LithicBackup.Views;
 
 /// <summary>
-/// Editor for machine-global <see cref="UserSettings"/>. Edits an in-memory
-/// copy and writes it back to the supplied instance (and disk) only on Save.
+/// Editor for the backup settings every account shares (<see cref="MachineSettings"/>:
+/// memory budget, disc staging, continuous timing) and this user's preferences
+/// (<see cref="UserSettings"/>). Edits in-memory copies and writes them back to
+/// the supplied instances (and disk) only on Save.
 /// </summary>
 public partial class SettingsDialog : Window, INotifyPropertyChanged
 {
     private readonly UserSettings _settings;
+    private readonly MachineSettings _machineSettings;
 
-    public SettingsDialog(UserSettings settings)
+    public SettingsDialog(UserSettings settings, MachineSettings machineSettings)
     {
         _settings = settings;
+        _machineSettings = machineSettings;
         InitializeComponent();
         DataContext = this;
 
         // Seed editable fields from the persisted settings.
-        var mb = settings.MemoryBudget ?? new MemoryBudgetOptions();
+        var mb = machineSettings.MemoryBudget ?? new MemoryBudgetOptions();
         _isAuto = mb.Mode == MemoryBudgetMode.Auto;
         _percentOfTotal = mb.PercentOfTotal.ToString(CultureInfo.CurrentCulture);
         _reserveGb = mb.ReserveGb.ToString(CultureInfo.CurrentCulture);
         _fixedGb = mb.FixedGb.ToString(CultureInfo.CurrentCulture);
         _suppressBackupSuggestions = settings.SuppressBackupSuggestions;
-        _burnInPlace = settings.DiscStagingMode == DiscStagingMode.InPlace;
+        _burnInPlace = machineSettings.DiscStagingMode == DiscStagingMode.InPlace;
         _checkForUpdates = settings.CheckForUpdates;
         _reconcileMode = settings.ReconcileMode;
 
         // Seed the continuous-rule editors from the persisted (or default) rules.
-        LoadContinuousRows(settings.ContinuousRules ?? new ContinuousRules());
+        LoadContinuousRows(machineSettings.ContinuousRules ?? new ContinuousRules());
 
         // Reopen on the tab the user last used. Clamp in case the tab layout
         // changed since the index was saved.
@@ -403,14 +407,30 @@ public partial class SettingsDialog : Window, INotifyPropertyChanged
 
     private void OK_Click(object sender, RoutedEventArgs e)
     {
-        _settings.MemoryBudget = BuildOptions();
+        // Saved before it is adopted: if the file cannot be written, the
+        // background service keeps the old settings, and so must this app.
+        var machine = new MachineSettings
+        {
+            MemoryBudget = BuildOptions(),
+            DiscStagingMode = _burnInPlace ? DiscStagingMode.InPlace : DiscStagingMode.TemporaryCopy,
+            ContinuousRules = BuildContinuousRules(),
+        };
+        if (!machine.Save())
+        {
+            MessageBox.Show(this,
+                "Lithic Backup could not save the backup settings (memory budget, disc staging and "
+                + $"continuous timing) to {MachineSettings.DefaultPath}. Backups, including the "
+                + "background service's, go on using the previous ones. Try Save again, or Cancel.",
+                "Settings not saved", MessageBoxButton.OK, MessageBoxImage.Warning);
+            return;
+        }
+        _machineSettings.MemoryBudget = machine.MemoryBudget;
+        _machineSettings.DiscStagingMode = machine.DiscStagingMode;
+        _machineSettings.ContinuousRules = machine.ContinuousRules;
+
         _settings.SuppressBackupSuggestions = _suppressBackupSuggestions;
         _settings.CheckForUpdates = _checkForUpdates;
         _settings.ReconcileMode = _reconcileMode;
-        _settings.DiscStagingMode = _burnInPlace
-            ? DiscStagingMode.InPlace
-            : DiscStagingMode.TemporaryCopy;
-        _settings.ContinuousRules = BuildContinuousRules();
         _settings.LastSettingsTab = SettingsTabs.SelectedIndex;
         _settings.Save();
         DialogResult = true;

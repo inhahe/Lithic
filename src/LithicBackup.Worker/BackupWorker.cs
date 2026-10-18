@@ -111,7 +111,7 @@ public sealed class BackupWorker : BackgroundService
 
     /// <summary>
     /// Machine-global continuous-backup timing rules (size-tiered debounce +
-    /// mask-tiered max-wait), reloaded from <see cref="UserSettings"/> at the top
+    /// mask-tiered max-wait), reloaded from <see cref="MachineSettings"/> at the top
     /// of every poll cycle so edits in the GUI take effect without a restart.
     /// These replace the old per-set <c>DebounceSeconds</c>/<c>MaxWaitSeconds</c>
     /// fields (kept on <see cref="BackupSchedule"/> only for back-compat).
@@ -119,7 +119,7 @@ public sealed class BackupWorker : BackgroundService
     private ContinuousRules _rules = new();
 
     /// <summary>
-    /// <see cref="UserSettings.LastWriteTimeUtc"/> when <see cref="_rules"/> was
+    /// <see cref="MachineSettings.LastWriteTimeUtc"/> when <see cref="_rules"/> was
     /// read; null before the first read, or when the time could not be told.
     /// </summary>
     private DateTime? _rulesReadFromWriteTimeUtc;
@@ -457,10 +457,10 @@ public sealed class BackupWorker : BackgroundService
         // Refresh machine-global continuous timing rules so GUI edits (size-tiered
         // debounce, mask-tiered max-wait) apply on the next poll without a restart:
         // re-read when the file has been written, not at every pass.
-        var settingsWritten = UserSettings.LastWriteTimeUtc();
+        var settingsWritten = MachineSettings.LastWriteTimeUtc();
         if (settingsWritten is null || settingsWritten != _rulesReadFromWriteTimeUtc)
         {
-            _rules = UserSettings.Load().ContinuousRules ?? new();
+            _rules = MachineSettings.Load().ContinuousRules ?? new();
             _rulesReadFromWriteTimeUtc = settingsWritten;
         }
 
@@ -2455,8 +2455,8 @@ public sealed class BackupWorker : BackgroundService
     /// <summary>Build a <see cref="BackupJob"/> from a set's saved options.</summary>
     private static BackupJob BuildJob(BackupSet set, JobOptions opts, string targetDir)
     {
-        // Machine-global settings shared with the interactive app via settings.json.
-        var machineSettings = UserSettings.Load();
+        // The settings the app saves for every account, beside the catalog.
+        var machineSettings = MachineSettings.Load();
         return new BackupJob
         {
             BackupSetId = set.Id,

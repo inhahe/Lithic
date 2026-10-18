@@ -1,5 +1,43 @@
 # LithicBackup — Known Issues & Tech Debt
 
+## FIXED: the Worker never saw the settings the app saves (2026-10-18, 1.12.0)
+
+Found while fixing the entry below. `UserSettings` lived in
+`%LOCALAPPDATA%\LithicBackup\settings.json`, which is per user. The Worker runs as
+LocalSystem, so it read the system profile's file
+(`C:\Windows\System32\config\systemprofile\AppData\Local\LithicBackup`), which
+nothing writes. Everything the Worker took from settings was therefore the
+default, whatever the user chose in the app: the continuous timing rules (settle
+times, maximum waits), the memory budget, and the disc staging mode. design.md,
+the README and the code's own comments all said the settings were shared. The
+catalog had had the same split and had moved to `CommonApplicationData`.
+
+**Fix.** The settings that govern backups are `MachineSettings`, in
+`C:\ProgramData\LithicBackup\settings.json`: written by the app, read by the GUI's
+backups and the Worker. `UserSettings` keeps one user's app preferences. On its
+first start without the machine file, the app carries the three settings over from
+its per-user file, where they were kept under the same names; the Worker never
+seeds the file.
+
+**Saving had to be atomic, and that took more than a temp file and a move.** The
+Worker can read the file while the app saves it. A replace by `File.Move` fails
+while any handle has the file open, whatever that handle shares, and a virus
+scanner opens every new file. Back-to-back saves under a reader failed 162 times
+in 300 with ten 20 ms retries, still 20 with a second of retries, and 1 even when
+the saves were 50 ms apart. A plain in-place write, the control, tore the reader's
+view 6 to 265 times in 300. `AtomicFile.TryReplace` renames with POSIX semantics,
+which replaces the name while handles that share delete access are open; the
+readers share it and copy the bytes out before parsing (parsing from the open
+stream held it for milliseconds and fell into step with the retries). With it, 0
+saves in 300 failed in three runs, with 0 torn reads. If a save fails anyway, the
+settings dialog says so and keeps the old values.
+
+**Tested.** `tools\settings_split_test`: the carry-over, the machine file winning
+once it exists, defaults with neither file, saves under a reader (with the
+in-place write as a control), the write time moving, and `AtomicFile` replacing a
+file a reader holds, which `File.Move` cannot (also shown). The Worker reading the
+machine file is not tested end to end: that needs the service account.
+
 ## FIXED: with no backup drive connected, the Worker read and wrote gigabytes, and auto-include had filled the selections with build folders (2026-10-18, 1.12.0)
 
 Seen in use on logoplex3, running 1.8.0. Neither backup drive was connected, yet
@@ -131,25 +169,6 @@ C1, C2, C4 and C5 fail, and C3's "logged once" fails because it logged nothing.
   the editor's "Forget them" removes them.
 - A targeted continuous run that throws drops the files it was given, as before;
   the daily safety-net scan picks them up.
-
-## OPEN: the Worker never sees the settings the app saves (found 2026-10-18)
-
-`UserSettings` lives in `%LOCALAPPDATA%\LithicBackup\settings.json`, which is per
-user. The Worker runs as LocalSystem, so it reads the system profile's file
-(`C:\Windows\System32\config\systemprofile\AppData\Local\LithicBackup`), which the
-app never writes. Everything the Worker takes from settings is therefore the
-defaults, whatever the user chose in the app: the continuous timing rules (settle
-times, maximum waits), the memory budget and the disc staging mode. design.md says
-settings are "machine-global and read by both"; they are not. The catalog had the
-same problem and moved to `CommonApplicationData` (see "The catalog is shared, the
-caches are per-user" in design.md).
-
-**Fix:** split the settings. Those the Worker uses (continuous rules, memory
-budget, staging mode, and any future one) go to a file under
-`CatalogLocation.RootDirectory`, migrated from the per-user file on first run;
-window layout and other per-user UI state stay where they are. `BackupWorker`
-reads the machine file (it already re-reads only when the file's write time
-changes).
 
 ## FIXED: an imported set said "Never backed up" and began re-copying its whole backup (2026-10-18, 1.10.0)
 

@@ -93,6 +93,19 @@ public static class CatalogLocation
     }
 
     /// <summary>
+    /// Returns <see cref="RootDirectory"/>, creating it (and widening its ACL) so
+    /// both the interactive user and LocalSystem can write what goes in it, such
+    /// as the machine settings file. Does directory and ACL work, so not for hot
+    /// paths: those use <see cref="RootDirectory"/>.
+    /// </summary>
+    public static string SharedDirectory()
+    {
+        Directory.CreateDirectory(RootDirectory);
+        TryGrantSharedAccess(RootDirectory);
+        return RootDirectory;
+    }
+
+    /// <summary>
     /// Returns the shared directory for diagnostic logs and crash reports,
     /// creating it (and widening its ACL) so both the interactive user (GUI) and
     /// LocalSystem (service) can write to it. Lives alongside the catalog under

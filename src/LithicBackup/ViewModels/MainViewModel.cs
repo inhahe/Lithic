@@ -29,6 +29,7 @@ public class MainViewModel : ViewModelBase
     private readonly IDestinationResolver? _destinationResolver;
     private readonly ISourceResolver? _sourceResolver;
     private readonly UserSettings _settings;
+    private readonly MachineSettings _machineSettings;
 
     private string _statusText = "Ready";
     private string _backgroundStatusText = "";
@@ -70,9 +71,11 @@ public class MainViewModel : ViewModelBase
         FileHashCache? fileHashCache = null,
         IDestinationResolver? destinationResolver = null,
         UserSettings? settings = null,
-        ISourceResolver? sourceResolver = null)
+        ISourceResolver? sourceResolver = null,
+        MachineSettings? machineSettings = null)
     {
         _settings = settings ?? new UserSettings();
+        _machineSettings = machineSettings ?? new MachineSettings();
         _catalog = catalog;
         _burner = burner;
         _scanner = scanner;
@@ -2758,8 +2761,8 @@ public class MainViewModel : ViewModelBase
             ExcludedExtensions = opts.ExcludedExtensions,
             RetentionTiers = opts.RetentionTiers,
             TierSets = opts.TierSets,
-            MemoryBudget = _settings.MemoryBudget,
-            StagingMode = _settings.DiscStagingMode,
+            MemoryBudget = _machineSettings.MemoryBudget,
+            StagingMode = _machineSettings.DiscStagingMode,
         };
 
         bool isDir = job.TargetDirectory is not null;
@@ -3051,8 +3054,8 @@ public class MainViewModel : ViewModelBase
             ExcludedExtensions = opts.ExcludedExtensions,
             RetentionTiers = opts.RetentionTiers,
             TierSets = opts.TierSets,
-            MemoryBudget = _settings.MemoryBudget,
-            StagingMode = _settings.DiscStagingMode,
+            MemoryBudget = _machineSettings.MemoryBudget,
+            StagingMode = _machineSettings.DiscStagingMode,
         };
 
         bool isDir = job.TargetDirectory is not null;
@@ -3527,8 +3530,8 @@ public class MainViewModel : ViewModelBase
             ExcludedExtensions = opts.ExcludedExtensions,
             RetentionTiers = opts.RetentionTiers,
             TierSets = opts.TierSets,
-            MemoryBudget = _settings.MemoryBudget,
-            StagingMode = _settings.DiscStagingMode,
+            MemoryBudget = _machineSettings.MemoryBudget,
+            StagingMode = _machineSettings.DiscStagingMode,
         };
 
         bool isDir = job.TargetDirectory is not null;

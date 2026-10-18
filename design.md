@@ -61,10 +61,26 @@ when the other process is running.
   `installer\CustomActions\CustomAction.config`** — that file was missing from
   1.0.11 through 1.0.55, so this whole mechanism was silently dead. Full reasoning
   in `CLAUDE.md`.
-* **Settings** are meant to be machine-global and read by both, so a new setting
-  has to be meaningful (or harmless) in a service with no UI. Today they are not:
-  the file is per user, so the Worker reads the system profile's copy and gets the
-  defaults (known-issues.md: "the Worker never sees the settings the app saves").
+* **Settings come in two kinds, in two files.** `MachineSettings` govern backups
+  (memory budget, disc staging, continuous timing), so the Worker must see them:
+  one file, `C:\ProgramData\LithicBackup\settings.json`, beside the catalog for the
+  same reason the catalog is there. A new setting the Worker uses goes here, and
+  must be meaningful (or harmless) in a service with no UI. `UserSettings` are one
+  user's app preferences (prompts, update checks, layout), in that account's
+  `%LOCALAPPDATA%`; the Worker, as LocalSystem, would read the system profile's
+  copy, so nothing it needs may live there.
+  * **Only the app writes the machine file, and replaces it in one step**
+    (`AtomicFile.TryReplace`: a rename with POSIX semantics), so the Worker never
+    reads part of one. An ordinary replacing move fails while any handle has the
+    file open, and a virus scanner opens each new file: back-to-back saves under a
+    reader failed after a second of retries. The POSIX rename goes through while
+    handles that share delete access are open; the readers here share it and copy
+    the bytes out before parsing. The settings dialog says so if a save fails, and
+    adopts the new values only once written.
+  * **The app carries the machine settings over once**, on its first start without
+    the machine file, from its own per-user file, where they used to be kept under
+    the same names. The Worker never seeds the file: its per-user file is the
+    system profile's, which nothing writes.
 * **Writes to a set take turns, and the Worker gives way.** Every write to a set's
   database first takes a cross-process lock file (`set-<id>.db.writelock`,
   `SqliteSetDatabase.AcquireCrossProcessWriteAsync`). A waiter polls every 25 ms.

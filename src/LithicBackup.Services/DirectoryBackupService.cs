@@ -327,10 +327,10 @@ public class DirectoryBackupService
         // most ~once a second) so lowering the budget in the GUI mid-backup takes
         // effect on a long-running job instead of being frozen at whatever it was
         // when the job started. job.MemoryBudget is the seed and the fallback when
-        // settings can't be read. UserSettings.Load() is a cheap, exception-safe
-        // JSON read of the same file the GUI writes, so cross-process changes are
-        // visible. See the "memory not released after lowering budget mid-run"
-        // entry in known-issues.md.
+        // settings can't be read. MachineSettings.Load() is a cheap, exception-safe
+        // JSON read of the file the GUI writes, which every account reads, so a
+        // change in the GUI reaches the Worker's run too. See the "memory not
+        // released after lowering budget mid-run" entry in known-issues.md.
         var seedPolicy = job.MemoryBudget ?? MemoryBudgetOptions.Default;
         var livePolicy = seedPolicy;
         var policyClock = System.Diagnostics.Stopwatch.StartNew();
@@ -341,7 +341,7 @@ public class DirectoryBackupService
             if (now - lastPolicyReadMs >= 1000)
             {
                 lastPolicyReadMs = now;
-                try { livePolicy = UserSettings.Load().MemoryBudget ?? seedPolicy; }
+                try { livePolicy = MachineSettings.Load().MemoryBudget ?? seedPolicy; }
                 catch { /* keep the last good policy */ }
             }
             return livePolicy;
