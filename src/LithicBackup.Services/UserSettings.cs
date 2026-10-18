@@ -98,6 +98,13 @@ public class UserSettings
     /// <summary>Width of Cleanup's "Size" column. See <see cref="CleanupFilesColumnWidth"/>.</summary>
     public double CleanupSizeColumnWidth { get; set; } = 80;
 
+    /// <summary>
+    /// When the settings file was last written, for a caller that polls the
+    /// settings and wants to read them only after they change. An unchanged value
+    /// means <see cref="Load"/> would return the same settings.
+    /// </summary>
+    public static DateTime LastWriteTimeUtc() => File.GetLastWriteTimeUtc(SettingsPath);
+
     public static UserSettings Load()
     {
         try

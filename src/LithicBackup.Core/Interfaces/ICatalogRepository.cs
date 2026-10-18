@@ -26,6 +26,16 @@ public interface ICatalogRepository : IDisposable
     /// </remarks>
     Task<long> GetBackupSetsChangeStampAsync(CancellationToken ct = default);
 
+    /// <summary>
+    /// Every set's id, name and options, without the selection trees, in name
+    /// order. For a caller that polls the sets but needs only their options:
+    /// <see cref="GetAllBackupSetsAsync"/> parses each selection tree into tens of
+    /// thousands of objects for a large set. (SQLite still pages through each tree
+    /// to reach the options column stored after it, so the saving is the parsing,
+    /// not the reading.)
+    /// </summary>
+    Task<IReadOnlyList<BackupSetOptions>> GetAllBackupSetOptionsAsync(CancellationToken ct = default);
+
     Task UpdateBackupSetAsync(BackupSet set, CancellationToken ct = default);
 
     /// <summary>

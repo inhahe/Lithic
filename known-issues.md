@@ -1,6 +1,6 @@
 # LithicBackup — Known Issues & Tech Debt
 
-## FIXED: with no backup drive connected, the Worker read and wrote gigabytes, and auto-include had filled the selections with build folders (2026-10-18, 1.11.1)
+## FIXED: with no backup drive connected, the Worker read and wrote gigabytes, and auto-include had filled the selections with build folders (2026-10-18, 1.12.0)
 
 Seen in use on logoplex3, running 1.8.0. Neither backup drive was connected, yet
 from 01:19 to 03:09 the Worker read and wrote about 7 GB before it was stopped.
@@ -55,17 +55,38 @@ Fixed:
   it, no reconcile is flagged, and once it is plugged in its journal is read.
 - `ICatalogRepository.GetBackupSetsChangeStampAsync` (this repository's own writes
   to the sets, plus `PRAGMA data_version`) tells a poller whether the sets may have
-  changed. The Worker reads them only then, and so does the GUI's
-  `DestinationSpaceMonitor`, which used to read them every 30 s.
+  changed, and the Worker reads them only then. The GUI's `DestinationSpaceMonitor`,
+  which parsed every set every 30 s, reads only their options
+  (`GetAllBackupSetOptionsAsync`); a stamp would not help it, since the Worker's
+  journal-cursor commits move `data_version` at nearly every pass.
   `GetAllBackupSetsAsync` sorts in code.
 - New folders inside a tree the set's rules exclude entirely are not pinned, and
-  changed files the rules exclude are not queued. After each reload the Worker
-  removes the existing entries there that only say "included" under a parent that
-  already includes them (`SourceSelection.RemoveRedundantEntriesInExcludedFolders`):
-  no path's inclusion changes, now or if the rule is deleted later. On a copy of the
+  changed files the rules exclude, and moves with both ends in such trees, are not
+  queued. After each reload the Worker removes, from continuous sets, the existing
+  entries there that only say "included" under a parent that already includes them
+  and are not left expanded in the editor
+  (`SourceSelection.RemoveRedundantEntriesInExcludedFolders`): no path's inclusion
+  changes, now or if the rule is deleted later. On a copy of the
   real catalog, J:'s selection JSON goes from 7.1 MB to 0.76 MB and I:'s from 2.0 MB
   to 0.46 MB. Design: "The Worker's loop must cost nothing while it cannot act" in
   design.md.
+
+From the code review (Opus, max), also fixed:
+- A partial folder that auto-includes new ones gave no watch root, so a set whose
+  only entries on a drive were pins under one would have stopped reading that
+  drive once the pins went. Such a folder is now a watch root.
+- A safety-net or scheduled full scan left a pending reconcile in place, so a
+  second whole-tree scan began the moment the first ended: what happens when a
+  drive comes back after a day. A full scan that runs now settles it.
+- My first version restarted every fallback watcher, and flagged a reconcile on
+  every fallback set, whenever one root came or went. Watchers are now kept per
+  root (`FileSystemMonitorImpl.Watch`), and only the sets whose root just started
+  reconcile.
+- The failure backoff now ends early when the set's options or selection are
+  edited. Partly missing sources are logged when they change, not at each attempt.
+  The Worker re-reads its settings only when the file has been written.
+- Two `0x08` bytes in a `GlobMatcher` doc comment, older than this batch: `...\build`
+  had become a backspace followed by `uild`.
 
 **Tested.** `tools\worker_idle_test` runs the real Worker on a temp catalog with a
 destination it can switch off, the real catalog code, and the selection pruning on
@@ -79,6 +100,11 @@ fallback and its absence was logged 6 times in 14 s. Of the old code's checks, A
 C1, C2, C4 and C5 fail, and C3's "logged once" fails because it logged nothing.
 
 **Open:**
+- A journal wrap that the first drain of a safety-net scan discovers still flags
+  a reconcile once that scan ends, so a set whose journal wrapped during a long
+  outage can get a second full scan. The gap predates the first scan, so the
+  second is redundant, but a wrap found later in the scan may not be, and the
+  drain cannot tell them apart.
 - When volumes are busy and some set can run, each pass still commits the USN
   cursor of every watched volume that had records: up to two SQLite commits per pass.
   The passes are cheap now, and only happen while a backup could follow.
@@ -88,6 +114,25 @@ C1, C2, C4 and C5 fail, and C3's "logged once" fails because it logged nothing.
   the editor's "Forget them" removes them.
 - A targeted continuous run that throws drops the files it was given, as before;
   the daily safety-net scan picks them up.
+
+## OPEN: the Worker never sees the settings the app saves (found 2026-10-18)
+
+`UserSettings` lives in `%LOCALAPPDATA%\LithicBackup\settings.json`, which is per
+user. The Worker runs as LocalSystem, so it reads the system profile's file
+(`C:\Windows\System32\config\systemprofile\AppData\Local\LithicBackup`), which the
+app never writes. Everything the Worker takes from settings is therefore the
+defaults, whatever the user chose in the app: the continuous timing rules (settle
+times, maximum waits), the memory budget and the disc staging mode. design.md says
+settings are "machine-global and read by both"; they are not. The catalog had the
+same problem and moved to `CommonApplicationData` (see "The catalog is shared, the
+caches are per-user" in design.md).
+
+**Fix:** split the settings. Those the Worker uses (continuous rules, memory
+budget, staging mode, and any future one) go to a file under
+`CatalogLocation.RootDirectory`, migrated from the per-user file on first run;
+window layout and other per-user UI state stay where they are. `BackupWorker`
+reads the machine file (it already re-reads only when the file's write time
+changes).
 
 ## FIXED: an imported set said "Never backed up" and began re-copying its whole backup (2026-10-18, 1.10.0)
 

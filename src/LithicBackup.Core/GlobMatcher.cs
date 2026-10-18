@@ -111,13 +111,13 @@ public static class GlobMatcher
     /// name.</para>
     ///
     /// <para><b>It answers only about the directory it is given.</b> With
-    /// <c>**/build/**</c> it returns true for <c>...uild</c> but FALSE for
-    /// <c>...uild\sub</c>, whose files are equally excluded — the prefix
+    /// <c>**/build/**</c> it returns true for <c>...\build</c> but FALSE for
+    /// <c>...\build\sub</c>, whose files are equally excluded — the prefix
     /// regex is anchored, so the nested path does not match it. That is not a
     /// bug and needs no fix: the scan tests every directory before descending,
     /// so it prunes at <c>build</c> and never asks about anything beneath it.
     /// A caller that asks bottom-up tests each ancestor as well, through
-    /// <c>DirectoryBackupService.BuildExcludedSubtreeTest</c>.</para>
+    /// <see cref="Models.SourceSelection.IsInsidePrunedDirectory"/>.</para>
     ///
     /// <para><b>Soundness depends on <c>*</c> crossing separators here</b>
     /// (see <see cref="GlobToRegexPattern"/>: <c>*</c> becomes <c>.*</c>). That

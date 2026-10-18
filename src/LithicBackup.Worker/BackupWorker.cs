@@ -105,12 +105,6 @@ public sealed class BackupWorker : BackgroundService
     /// </summary>
     private readonly ConcurrentQueue<string> _fswOverflows = new();
 
-    /// <summary>
-    /// Roots the <see cref="_fsMonitor"/> is currently watching, kept sorted so we
-    /// only restart the watcher (and reconcile) when the set actually changes.
-    /// </summary>
-    private List<string> _fswRoots = new();
-
     /// <summary>Only one backup runs at a time.</summary>
     private readonly SemaphoreSlim _backupLock = new(1, 1);
 
@@ -122,6 +116,12 @@ public sealed class BackupWorker : BackgroundService
     /// fields (kept on <see cref="BackupSchedule"/> only for back-compat).
     /// </summary>
     private ContinuousRules _rules = new();
+
+    /// <summary>
+    /// <see cref="UserSettings.LastWriteTimeUtc"/> when <see cref="_rules"/> was
+    /// read; MinValue before the first read, which no file time equals.
+    /// </summary>
+    private DateTime _rulesReadFromWriteTimeUtc = DateTime.MinValue;
 
     /// <summary>
     /// The catalog's <see cref="ICatalogRepository.GetBackupSetsChangeStampAsync"/>
@@ -223,7 +223,8 @@ public sealed class BackupWorker : BackgroundService
     /// (rewriting source paths and persisting the change), and report source
     /// availability.  Returns <c>false</c> when no configured source location is
     /// currently reachable (the caller should skip the run rather than back up
-    /// nothing).  Partially-missing sources are logged and the run proceeds.
+    /// nothing).  Partially-missing sources are logged when they change, and the
+    /// run proceeds.
     /// </summary>
     /// <remarks>
     /// Like a missing destination, having no source blocks the set's runs until
@@ -264,12 +265,16 @@ public sealed class BackupWorker : BackgroundService
             _logger.LogInformation("A source location for \"{Name}\" is available again.", set.Name);
         }
 
-        if (resolution.MissingSources.Count > 0)
+        string? missing = resolution.MissingSources.Count > 0
+            ? string.Join(", ", resolution.MissingSources)
+            : null;
+        if (missing is not null && missing != state.PartlyMissingSources)
         {
             _logger.LogWarning(
                 "Some source locations for \"{Name}\" are not available and will be skipped: {Missing}.",
-                set.Name, string.Join(", ", resolution.MissingSources));
+                set.Name, missing);
         }
+        state.PartlyMissingSources = missing;
 
         return true;
     }
@@ -435,8 +440,14 @@ public sealed class BackupWorker : BackgroundService
     private async Task ReloadBackupSetsAsync(CancellationToken ct)
     {
         // Refresh machine-global continuous timing rules so GUI edits (size-tiered
-        // debounce, mask-tiered max-wait) apply on the next poll without a restart.
-        _rules = UserSettings.Load().ContinuousRules ?? new();
+        // debounce, mask-tiered max-wait) apply on the next poll without a restart:
+        // re-read when the file has been written, not at every pass.
+        var settingsWritten = UserSettings.LastWriteTimeUtc();
+        if (settingsWritten != _rulesReadFromWriteTimeUtc)
+        {
+            _rules = UserSettings.Load().ContinuousRules ?? new();
+            _rulesReadFromWriteTimeUtc = settingsWritten;
+        }
 
         // This runs at every pass, and push wake-ups can make that several times
         // a second; reading the sets parses every selection tree, megabytes for a
@@ -478,6 +489,17 @@ public sealed class BackupWorker : BackgroundService
             }
             else
             {
+                // An edit to the set may be what fixes a failing full backup, so it
+                // ends the backoff. Not a change of LastBackupUtc: every targeted
+                // run moves that, and would make the backoff pointless.
+                if (state.ConsecutiveFailures > 0 && SettingsDiffer(state.BackupSet, set))
+                {
+                    state.ConsecutiveFailures = 0;
+                    state.FullBackupsBlockedUntilUtc = DateTime.MinValue;
+                    _logger.LogInformation(
+                        "\"{Name}\" was edited, so its full backups, held after failing, may start again.",
+                        set.Name);
+                }
                 state.BackupSet = set;
             }
 
@@ -530,19 +552,23 @@ public sealed class BackupWorker : BackgroundService
     }
 
     /// <summary>
-    /// Remove from each set's saved selection the entries that lie inside folders
-    /// its own rules exclude entirely and record nothing but "included"
-    /// (<see cref="SourceSelection.RemoveRedundantEntriesInExcludedFolders"/>).
-    /// They are folders auto-include pinned before it learned to skip excluded
-    /// ones: they cannot change any backup, and every read of the set parses them.
-    /// Runs after each reload, so a rule the user adds later clears what it
-    /// covers too.
+    /// Remove from each continuous set's saved selection the entries that lie
+    /// inside folders its own rules exclude entirely and record nothing but
+    /// "included" (<see cref="SourceSelection.RemoveRedundantEntriesInExcludedFolders"/>).
+    /// They cannot change any backup, and every read of the set parses them. Runs
+    /// after each reload, so a rule the user adds later clears what it covers too.
     /// </summary>
+    /// <remarks>
+    /// Only active continuous sets, the ones the Worker pins folders into: the
+    /// entries in any other set were put there by the user.
+    /// </remarks>
     private async Task RemoveRedundantSelectionEntriesAsync(CancellationToken ct)
     {
         foreach (var state in _sets.Values)
         {
-            if (state.BackupSet.SourceSelections is not { Count: > 0 } loaded)
+            if (!state.IsActive
+                || state.BackupSet.JobOptions?.Schedule is not { Mode: ScheduleMode.Continuous }
+                || state.BackupSet.SourceSelections is not { Count: > 0 } loaded)
                 continue;
 
             // Tried on the loaded copy first, which is ours to change: in the
@@ -611,6 +637,16 @@ public sealed class BackupWorker : BackgroundService
     }
 
     /// <summary>
+    /// Whether two copies of a set differ in what the user edits: its options or
+    /// its selection. Serialises both, so call it only when it matters.
+    /// </summary>
+    private static bool SettingsDiffer(BackupSet before, BackupSet after)
+        => System.Text.Json.JsonSerializer.Serialize(before.JobOptions)
+               != System.Text.Json.JsonSerializer.Serialize(after.JobOptions)
+           || System.Text.Json.JsonSerializer.Serialize(before.SourceSelections)
+               != System.Text.Json.JsonSerializer.Serialize(after.SourceSelections);
+
+    /// <summary>
     /// Resolve the set of directories that are change-relevant for a backup set.
     /// Prefers the actually-selected directories from the selection tree; falls
     /// back to <see cref="BackupSet.SourceRoots"/> for legacy sets.
@@ -651,7 +687,13 @@ public sealed class BackupWorker : BackgroundService
             };
 
             if (shouldRun && !FullBackupsBlocked(state))
-                await RunFullBackupAsync(state, ct);
+            {
+                // A reconcile pending when the scan starts is settled by it.
+                bool reconcilePending = state.NeedsReconcile;
+                var outcome = await RunFullBackupAsync(state, ct);
+                if (reconcilePending)
+                    SettleReconcile(state, outcome);
+            }
         }
     }
 
@@ -966,62 +1008,7 @@ public sealed class BackupWorker : BackgroundService
                     string.Join(" | ", moves.Select(m =>
                         $"{(m.IsDirectory ? "DIR" : "file")} '{m.OldPath}' -> '{m.NewPath}'")));
 
-            foreach (var change in changes)
-            {
-                if (change.IsDirectory)
-                {
-                    // A brand-new directory that the set covers only through a
-                    // parent's auto-include rule should become a permanent explicit
-                    // selection. Skip plain metadata changes on existing directories
-                    // (their child files carry their own change records) and dirs
-                    // already gone by poll time.
-                    bool created = (change.Reason & UsnJournalReader.UsnReasonFileCreate) != 0;
-                    if (created && Directory.Exists(change.FullPath))
-                    {
-                        foreach (var state in continuousSets)
-                        {
-                            if (IsPinCandidate(state, change.FullPath))
-                                discoveredDirs.Add((state, change.FullPath));
-                        }
-                    }
-                    continue;
-                }
-
-                foreach (var state in continuousSets)
-                {
-                    if (IsBackupCandidate(state, change.FullPath))
-                    {
-                        state.Pending[change.FullPath] =
-                            state.Pending.TryGetValue(change.FullPath, out var t)
-                                ? (t.First, now)
-                                : (now, now);
-                    }
-                }
-            }
-
-            // Route same-volume relocations to every set either endpoint touches.
-            // The apply step (RunMovesAsync) decides, with catalog access, whether
-            // to relocate (both endpoints in the set), delete (item left the set),
-            // or back up fresh (item entered the set). Preserve journal order.
-            foreach (var move in moves)
-            {
-                foreach (var state in continuousSets)
-                {
-                    bool oldIn = PathBelongsToSet(state.BackupSet, move.OldPath);
-                    bool newIn = PathBelongsToSet(state.BackupSet, move.NewPath);
-                    if (oldIn || newIn)
-                    {
-                        state.PendingMoves.Add(move);
-                        // [rename-trace] step 2: this move was matched to a set and
-                        // queued for the apply step.
-                        _logger.LogDebug(
-                            "[rename-trace] step 2: queued move '{Old}' -> '{New}' (isDir={IsDir}) " +
-                            "for set \"{Name}\" (oldIn={OldIn}, newIn={NewIn})",
-                            move.OldPath, move.NewPath, move.IsDirectory,
-                            state.BackupSet.Name, oldIn, newIn);
-                    }
-                }
-            }
+            RouteJournalRecords(changes, moves, continuousSets, now, discoveredDirs);
         }
 
         // [rename-trace] Once-per-poll heartbeat so you can confirm the continuous
@@ -1083,39 +1070,7 @@ public sealed class BackupWorker : BackgroundService
                 continue;
 
             var outcome = await RunFullBackupAsync(state, ct);
-            if (outcome == ReconcileOutcome.DidNotRun)
-                continue;   // lock busy, or blocked (destination offline...) — retry later
-
-            // Cleared as soon as the scan RAN, even if files failed. Leaving it
-            // set would start another whole-tree scan on the very next poll, and
-            // for a set with a permanently unreadable file (a locked venv binary,
-            // say — this machine has ~78 of them) that is an endless full-scan
-            // loop. The failed files are covered by keeping their queued deltas
-            // below, which costs one cheap targeted retry instead.
-            state.NeedsReconcile = false;
-
-            if (outcome == ReconcileOutcome.RanClean)
-            {
-                // Only a CLEAN scan supersedes the queued per-file deltas. It
-                // walked the whole tree and compared every file, so those paths
-                // are accounted for.
-                state.Pending.Clear();
-                // A full scan reconciles the destination against the live source
-                // tree, so any queued relocations are already accounted for.
-                state.PendingMoves.Clear();
-            }
-            else
-            {
-                // Partial scan: the failed files' catalog rows still hold their
-                // OLD size/mtime, so the next debounce pass re-stats them, sees
-                // the difference and retries just those. Clearing here dropped
-                // them for good — the journal records that produced them were
-                // consumed and the cursor advanced past them before the scan ran,
-                // so nothing else would ever have reported them again.
-                _logger.LogInformation(
-                    "Keeping {Count} queued change(s) for \"{Name}\": the reconciling scan "
-                    + "did not complete cleanly.", state.Pending.Count, state.BackupSet.Name);
-            }
+            SettleReconcile(state, outcome);
         }
 
         // 3b. Apply pending relocations. Moves are discrete, atomic events (no
@@ -1190,6 +1145,139 @@ public sealed class BackupWorker : BackgroundService
         }
 
         return ready;
+    }
+
+    /// <summary>
+    /// Record what a full scan did to a set's pending reconcile. A scan that ran
+    /// settles it, whichever path started the scan: the reconcile step, or the
+    /// schedule's or the safety net's full backup, which would otherwise be
+    /// followed at once by a second whole-tree scan of the same set. A scan that
+    /// did not run (lock busy, or the set blocked) leaves it pending.
+    /// </summary>
+    private void SettleReconcile(SetState state, ReconcileOutcome outcome)
+    {
+        if (outcome == ReconcileOutcome.DidNotRun)
+            return;
+
+        // Cleared as soon as the scan RAN, even if files failed. Leaving it
+        // set would start another whole-tree scan on the very next poll, and
+        // for a set with a permanently unreadable file (a locked venv binary,
+        // say — this machine has ~78 of them) that is an endless full-scan
+        // loop. The failed files are covered by keeping their queued deltas
+        // below, which costs one cheap targeted retry instead.
+        state.NeedsReconcile = false;
+
+        if (outcome == ReconcileOutcome.RanClean)
+        {
+            // Only a CLEAN scan supersedes the queued per-file deltas. It
+            // walked the whole tree and compared every file, so those paths
+            // are accounted for.
+            state.Pending.Clear();
+            // A full scan reconciles the destination against the live source
+            // tree, so any queued relocations are already accounted for.
+            state.PendingMoves.Clear();
+        }
+        else
+        {
+            // Partial scan: the failed files' catalog rows still hold their
+            // OLD size/mtime, so the next debounce pass re-stats them, sees
+            // the difference and retries just those. Clearing here dropped
+            // them for good — the journal records that produced them were
+            // consumed and the cursor advanced past them before the scan ran,
+            // so nothing else would ever have reported them again.
+            _logger.LogInformation(
+                "Keeping {Count} queued change(s) for \"{Name}\": the reconciling scan "
+                + "did not complete cleanly.", state.Pending.Count, state.BackupSet.Name);
+        }
+    }
+
+    /// <summary>
+    /// Route one volume's journal records to the sets they concern: changed files
+    /// into each set's queue, new folders into <paramref name="discoveredDirs"/>
+    /// for pinning, and same-volume moves into each set's move list. The poll and
+    /// the drain inside a full scan both route through here, so they cannot route
+    /// differently.
+    /// </summary>
+    /// <returns>How many (file, set) pairs were queued.</returns>
+    private int RouteJournalRecords(
+        IReadOnlyList<UsnChange> changes, IReadOnlyList<UsnMove> moves,
+        IReadOnlyList<SetState> continuousSets, DateTime now,
+        List<(SetState State, string Dir)> discoveredDirs)
+    {
+        int routed = 0;
+
+        foreach (var change in changes)
+        {
+            if (change.IsDirectory)
+            {
+                // A brand-new directory that the set covers only through a
+                // parent's auto-include rule should become a permanent explicit
+                // selection. Skip plain metadata changes on existing directories
+                // (their child files carry their own change records) and dirs
+                // already gone by poll time.
+                bool created = (change.Reason & UsnJournalReader.UsnReasonFileCreate) != 0;
+                if (created && Directory.Exists(change.FullPath))
+                {
+                    foreach (var state in continuousSets)
+                    {
+                        if (IsPinCandidate(state, change.FullPath))
+                            discoveredDirs.Add((state, change.FullPath));
+                    }
+                }
+                continue;
+            }
+
+            foreach (var state in continuousSets)
+            {
+                if (IsBackupCandidate(state, change.FullPath))
+                {
+                    state.Pending[change.FullPath] =
+                        state.Pending.TryGetValue(change.FullPath, out var t)
+                            ? (t.First, now)
+                            : (now, now);
+                    routed++;
+                }
+            }
+        }
+
+        // Route same-volume relocations to every set either endpoint touches.
+        // The apply step (RunMovesAsync) decides, with catalog access, whether
+        // to relocate (both endpoints in the set), delete (item left the set),
+        // or back up fresh (item entered the set). Preserve journal order.
+        foreach (var move in moves)
+        {
+            foreach (var state in continuousSets)
+            {
+                bool oldIn = PathBelongsToSet(state.BackupSet, move.OldPath);
+                bool newIn = PathBelongsToSet(state.BackupSet, move.NewPath);
+                if (!(oldIn || newIn) || MovesWithinExcludedTrees(state, move))
+                    continue;
+
+                state.PendingMoves.Add(move);
+                // [rename-trace] step 2: this move was matched to a set and
+                // queued for the apply step.
+                _logger.LogDebug(
+                    "[rename-trace] step 2: queued move '{Old}' -> '{New}' (isDir={IsDir}) " +
+                    "for set \"{Name}\" (oldIn={OldIn}, newIn={NewIn})",
+                    move.OldPath, move.NewPath, move.IsDirectory,
+                    state.BackupSet.Name, oldIn, newIn);
+            }
+        }
+
+        return routed;
+    }
+
+    /// <summary>
+    /// Whether both ends of a move lie inside trees the set's rules exclude
+    /// entirely. Nothing there can be backed up, so there is nothing to relocate;
+    /// builds rename temporary files and folders there by the thousand, and
+    /// queued, they would wait in memory for as long as the destination is away.
+    /// </summary>
+    private static bool MovesWithinExcludedTrees(SetState state, UsnMove move)
+    {
+        string Folder(string path) => move.IsDirectory ? path : Path.GetDirectoryName(path) ?? path;
+        return state.IsInsideExcludedSubtree(Folder(move.OldPath))
+               && state.IsInsideExcludedSubtree(Folder(move.NewPath));
     }
 
     /// <summary>How often the journal may be drained from inside a full scan.</summary>
@@ -1274,45 +1362,7 @@ public sealed class BackupWorker : BackgroundService
             if (truncated)
                 _drainTruncatedDrives.Add(drive);
 
-            foreach (var change in changes)
-            {
-                if (change.IsDirectory)
-                {
-                    bool created = (change.Reason & UsnJournalReader.UsnReasonFileCreate) != 0;
-                    if (created && Directory.Exists(change.FullPath))
-                    {
-                        foreach (var state in continuousSets)
-                        {
-                            if (IsPinCandidate(state, change.FullPath))
-                                _drainDiscoveredDirs.Add((state, change.FullPath));
-                        }
-                    }
-                    continue;
-                }
-
-                foreach (var state in continuousSets)
-                {
-                    if (IsBackupCandidate(state, change.FullPath))
-                    {
-                        state.Pending[change.FullPath] =
-                            state.Pending.TryGetValue(change.FullPath, out var t)
-                                ? (t.First, now)
-                                : (now, now);
-                        routed++;
-                    }
-                }
-            }
-
-            foreach (var move in moves)
-            {
-                foreach (var state in continuousSets)
-                {
-                    bool oldIn = PathBelongsToSet(state.BackupSet, move.OldPath);
-                    bool newIn = PathBelongsToSet(state.BackupSet, move.NewPath);
-                    if (oldIn || newIn)
-                        state.PendingMoves.Add(move);
-                }
-            }
+            routed += RouteJournalRecords(changes, moves, continuousSets, now, _drainDiscoveredDirs);
         }
 
         // (b) Back up what has settled. Moves are left for the poll loop:
@@ -1560,40 +1610,36 @@ public sealed class BackupWorker : BackgroundService
     }
 
     /// <summary>
-    /// Point the fallback FileSystemWatcher at the current set of non-NTFS watch
-    /// roots across all continuous sets, restarting it only when that set actually
-    /// changes. Any (re)start — including the first one after a process restart,
-    /// when the watcher wasn't running at all — flags every affected set for a full
-    /// reconciling scan, since a watcher cannot see changes made while it wasn't
-    /// watching and a restart drops whatever was buffered.
+    /// Point the fallback FileSystemWatcher at the current non-NTFS watch roots
+    /// across all continuous sets. A root starts being watched when it is listed
+    /// and exists: at the first pass after a process start, and whenever a root
+    /// appears later (a drive plugged in, a folder re-created). Each set with a
+    /// root that just started is flagged for a full reconciling scan, since no
+    /// watcher saw what changed there before.
     /// </summary>
     /// <remarks>
-    /// Only roots that exist count, because those are all a watcher can watch: a
-    /// root that appears later changes the set and so starts watching it, with
-    /// the reconcile that implies. A volume that is not there at all is not a
-    /// fallback volume (<see cref="UsesFallbackVolume"/>): there is nothing to
-    /// watch, so it must not flag a reconcile, and once it is plugged in it is
-    /// read through its journal if it has one.
+    /// Roots that stay keep their watchers (<see cref="FileSystemMonitorImpl.Watch"/>),
+    /// so a root coming or going costs no other set a reconcile. A root that goes
+    /// simply stops being watched, and reconciles when it returns. A volume that
+    /// is not there at all is not a fallback volume (<see cref="UsesFallbackVolume"/>):
+    /// once it is plugged in it is read through its journal if it has one.
     /// </remarks>
     private void MaintainFallbackWatchers(IReadOnlyList<SetState> continuousSets)
     {
         var fallbackRoots = continuousSets
             .SelectMany(s => s.WatchRoots)
             .Where(UsesFallbackVolume)
-            .Where(Directory.Exists)
             .Distinct(StringComparer.OrdinalIgnoreCase)
-            .OrderBy(r => r, StringComparer.OrdinalIgnoreCase)
             .ToList();
 
-        if (fallbackRoots.SequenceEqual(_fswRoots, StringComparer.OrdinalIgnoreCase))
+        var started = _fsMonitor.Watch(fallbackRoots);
+        if (started.Count == 0)
             return;
 
-        _fsMonitor.Start(fallbackRoots);
-        _fswRoots = fallbackRoots;
-
+        var justStarted = new HashSet<string>(started, StringComparer.OrdinalIgnoreCase);
         foreach (var state in continuousSets)
         {
-            if (!state.NeedsReconcile && state.WatchRoots.Any(UsesFallbackVolume))
+            if (!state.NeedsReconcile && state.WatchRoots.Any(justStarted.Contains))
             {
                 state.NeedsReconcile = true;
                 _logger.LogInformation(
@@ -2458,6 +2504,9 @@ public sealed class BackupWorker : BackgroundService
         /// <summary>Whether the last full run found none of the set's sources available, so the change can be logged once.</summary>
         public bool SourcesMissing { get; set; }
 
+        /// <summary>The sources the last full run found missing while others were there, or null; logged when it changes.</summary>
+        public string? PartlyMissingSources { get; set; }
+
         /// <summary>Full backups in a row that threw; sets the backoff before the next attempt.</summary>
         public int ConsecutiveFailures { get; set; }
 
@@ -2494,8 +2543,9 @@ public sealed class BackupWorker : BackgroundService
                 return;
 
             IsExcludedFile = DirectoryBackupService.BuildExclusionFilter(excluded, tierSets) ?? (_ => false);
-            PrunesDirectory = DirectoryBackupService.BuildDirectoryPruneFilter(excluded, tierSets) ?? (_ => false);
-            IsInsideExcludedSubtree = DirectoryBackupService.BuildExcludedSubtreeTest(PrunesDirectory);
+            var prunes = DirectoryBackupService.BuildDirectoryPruneFilter(excluded, tierSets) ?? (_ => false);
+            PrunesDirectory = prunes;
+            IsInsideExcludedSubtree = directory => SourceSelection.IsInsidePrunedDirectory(directory, prunes);
             _exclusionRulesKey = key;
         }
 

@@ -83,10 +83,13 @@ try
 {
     if (Run("A"))
         await PartA();
-#if !OLD_CODE
     if (Run("B"))
+    {
+#if !OLD_CODE
         PartB();
 #endif
+        PartWatchRoots();
+    }
     if (Run("C"))
         await PartC();
 #if !OLD_CODE
@@ -194,6 +197,22 @@ async Task PartA()
     var names = all.Select(s => s.Name).ToList();
     Check(names.SequenceEqual(names.OrderBy(n => n, StringComparer.Ordinal)) && names.Count == 3,
         $"A2 the sets still come back in name order ({string.Join(", ", names)})");
+
+#if !OLD_CODE
+    // SQLite still pages through each selection to reach the options column
+    // stored after it; what the options-only read saves is parsing the trees.
+    long allocatedBefore = GC.GetTotalAllocatedBytes(precise: true);
+    var options = await repo.GetAllBackupSetOptionsAsync();
+    long optionsAllocated = GC.GetTotalAllocatedBytes(precise: true) - allocatedBefore;
+    allocatedBefore = GC.GetTotalAllocatedBytes(precise: true);
+    _ = await repo.GetAllBackupSetsAsync();
+    long setsAllocated = GC.GetTotalAllocatedBytes(precise: true) - allocatedBefore;
+    Check(options.Select(o => o.Name).SequenceEqual(names)
+          && options.All(o => o.JobOptions?.Schedule?.Mode == ScheduleMode.Continuous),
+        "A3 the options-only read returns every set, in name order, with its options");
+    Check(optionsAllocated < 1024 * 1024,
+        $"A3 and parses no selection tree ({optionsAllocated:N0} bytes allocated, against {setsAllocated:N0} for the whole sets)");
+#endif
 }
 
 // ---------------------------------------------------------------------------
@@ -240,12 +259,24 @@ void PartB()
             // A tree that lists a file without its folder.
             D(@"R:\y\sub", null, true,
                 F(@"R:\y\sub\debug\f.txt", true))),
+        // Left expanded in the editor: where the user looked.
+        D(@"R:\z", null, true,
+            Expanded(D(@"R:\z\debug", null, true,
+                D(@"R:\z\debug\pin", true, true)))),
     };
+
+    static SourceSelection Expanded(SourceSelection node)
+    {
+        node.IsExpanded = true;
+        return node;
+    }
 
     int removed = SourceSelection.RemoveRedundantEntriesInExcludedFolders(roots, PrunesDebug);
     var left = Flatten(roots).Select(n => n.Path).ToHashSet(StringComparer.OrdinalIgnoreCase);
 
-    Check(removed == 5, $"B1 removes the five redundant entries (removed {removed})");
+    Check(removed == 6, $"B1 removes the six redundant entries (removed {removed})");
+    Check(left.Contains(@"R:\z\debug") && !left.Contains(@"R:\z\debug\pin"),
+        "B1 a folder left expanded in the editor stays, though what it lists can go");
     Check(!left.Contains(@"R:\proj\target\debug\.fingerprint") && !left.Contains(@"R:\proj\target\debug\.fingerprint\a1"),
         "B1 pinned build folders inside debug go");
     Check(left.Contains(@"R:\proj\target\debug\mine") && left.Contains(@"R:\proj\target\debug"),
@@ -264,41 +295,9 @@ void PartB()
     // B2: random trees. Whether a path is included must come out the same for
     // every path, and nothing outside an excluded folder may go.
     var rng = new Random(20261018);
-    string[] names = ["a", "debug", "b"];
-    int mismatches = 0, outsideRemovals = 0, trials = 4000, totalRemoved = 0;
+    int mismatches = 0, outsideRemovals = 0, trials = 4000, totalRemoved = 0, uncovered = 0;
     string? firstMismatch = null;
-
-    var probes = new List<string>();
-    void AddProbes(string dir, int depth)
-    {
-        probes.Add(dir);
-        probes.Add(dir + Bs + "f.txt");
-        probes.Add(dir + Bs + "g.txt");
-        if (depth == 4) return;
-        foreach (var n in names) AddProbes(dir + Bs + n, depth + 1);
-    }
-    AddProbes(@"R:\r", 0);
-
-    SourceSelection RandomDir(string path, int depth)
-    {
-        var node = new SourceSelection
-        {
-            Path = path, IsDirectory = true,
-            IsSelected = rng.Next(3) switch { 0 => true, 1 => false, _ => null },
-            AutoIncludeNewSubdirectories = rng.Next(2) == 0,
-        };
-        if (depth < 3)
-        {
-            foreach (var n in names)
-                if (rng.Next(2) == 0) node.Children.Add(RandomDir(path + Bs + n, depth + 1));
-            if (rng.Next(3) == 0)
-                node.Children.Add(new SourceSelection { Path = path + Bs + "f.txt", IsDirectory = false, IsSelected = rng.Next(2) == 0 });
-            // Sometimes list something two levels down, skipping its folder.
-            if (rng.Next(6) == 0)
-                node.Children.Add(new SourceSelection { Path = path + Bs + "debug" + Bs + "g.txt", IsDirectory = false, IsSelected = true });
-        }
-        return node;
-    }
+    var probes = RandomTrees.Probes();
 
     bool InsideDebug(string path, bool isDirectory)
     {
@@ -310,7 +309,7 @@ void PartB()
 
     for (int t = 0; t < trials; t++)
     {
-        var tree = new List<SourceSelection> { RandomDir(@"R:\r", 0) };
+        var tree = RandomTrees.Generate(rng);
         var nodesBefore = Flatten(tree).Select(n => (n.Path, n.IsDirectory)).ToList();
         var included = probes.Select(p => SourceSelection.IsPathIncluded(tree, p)).ToArray();
 
@@ -331,12 +330,36 @@ void PartB()
                 firstMismatch ??= $"{probes[i]}: {included[i]} -> {includedAfter[i]}";
             }
         }
+        uncovered += RandomTrees.UncoveredByWatchRoots(tree, probes);
     }
 
     Check(totalRemoved > trials / 4, $"B2 the random trees exercise removal ({totalRemoved} nodes removed over {trials} trees)");
     Check(mismatches == 0, $"B2 no path changes inclusion ({mismatches} changed{(firstMismatch is null ? "" : "; first: " + firstMismatch)})");
     Check(outsideRemovals == 0, $"B2 nothing outside an excluded folder is removed ({outsideRemovals} removed)");
+    Check(uncovered == 0, $"B2 after removal, the watch roots still cover every included path ({uncovered} not covered)");
 }
+#endif
+
+// B4: compiles against the old code too.
+void PartWatchRoots()
+{
+    Console.WriteLine("B4. Watch roots cover every path the selection includes");
+    var rng = new Random(4);
+    var probes = RandomTrees.Probes();
+    int uncovered = 0, trials = 4000;
+    string? first = null;
+    for (int t = 0; t < trials; t++)
+    {
+        var tree = RandomTrees.Generate(rng);
+        int n = RandomTrees.UncoveredByWatchRoots(tree, probes, out var example);
+        uncovered += n;
+        first ??= example;
+    }
+    Check(uncovered == 0,
+        $"B4 every included path lies under a watch root, so its drive is read and a fallback watcher sees it "
+        + $"({uncovered} not covered over {trials} trees{(first is null ? "" : "; first: " + first)})");
+}
+#if !OLD_CODE
 
 async Task PartB3(string catalogPath)
 {
@@ -417,7 +440,6 @@ async Task PartC()
             set.JobOptions!.TargetDirectory = dst;
             set.JobOptions.ExcludedExtensions = ["**/debug/**"];
         });
-        rig.Destination.LivePath = dst;
         rig.Destination.Connected = false;
 
         await rig.Worker.StartAsync(CancellationToken.None);
@@ -468,6 +490,10 @@ async Task PartC()
         bool copied = await WaitUntil(() => FindFile(dst, "late.txt") is not null, TimeSpan.FromSeconds(60));
         Check(copied, "C3 once the destination is back, the waiting backup runs and copies a file changed while it was away");
         Check(rig.Log.Count("is connected again") == 1, "C3 its return is logged once");
+        // The safety net was due and a reconcile was pending: one scan serves both.
+        await Task.Delay(TimeSpan.FromSeconds(8));
+        int scans = rig.Log.Count("Starting backup for");
+        Check(scans == 1, $"C3 one full scan settles both the overdue safety net and the pending reconcile ({scans} scans)");
 
         await rig.DisposeAsync();
     }
@@ -497,7 +523,6 @@ async Task PartC()
                 set.SourceRoots = [gone];
                 set.JobOptions!.TargetDirectory = dst;
             });
-            rig.Destination.LivePath = dst;
             rig.Destination.Connected = true;
 
             await rig.Worker.StartAsync(CancellationToken.None);
@@ -527,7 +552,6 @@ async Task PartC()
             set.SourceRoots = [src];
             set.JobOptions!.TargetDirectory = dst;
         });
-        rig.Destination.LivePath = dst;
         rig.Destination.Connected = true;
         rig.Sources.Throw = true;
 
@@ -539,7 +563,75 @@ async Task PartC()
         Check(attempts == 1, $"C5 a full backup that throws is not started again at once ({attempts} attempts in 14 s)");
 #if !OLD_CODE
         Check(rig.Log.Count("no full backup of it starts for 1 minute") == 1, "C5 the wait is logged with the failure");
+
+        // An edit to the set ends the hold.
+        rig.Sources.Throw = false;
+        var edited = (await rig.Repo.GetBackupSetAsync(rig.SetId))!;
+        edited.JobOptions!.ExcludedExtensions.Add("*.never");
+        await rig.Repo.UpdateBackupSetMetadataAsync(edited);
+        bool retried = await WaitUntil(() => rig.Log.Count("Starting backup for") > 0, TimeSpan.FromSeconds(20));
+        Check(retried && rig.Log.Count("was edited") == 1,
+            "C5 editing the set lets its full backup start again at once, without waiting out the hold");
 #endif
+        await rig.DisposeAsync();
+    }
+
+    // C6 --------------------------------------------------------------------
+    {
+        string dir = Path.Combine(root, "c6");
+        string srcA = Path.Combine(dir, "a"), srcB = Path.Combine(dir, "b");
+        foreach (var d in new[] { srcA, srcB, srcA + "-dst", srcB + "-dst" })
+            Directory.CreateDirectory(d);
+        File.WriteAllText(Path.Combine(srcA, "one.txt"), "a");
+        File.WriteAllText(Path.Combine(srcB, "one.txt"), "b");
+
+        void Configure(BackupSet set, string name, string src)
+        {
+            set.Name = name;
+            set.SourceSelections = [ new SourceSelection { Path = src, IsDirectory = true, IsSelected = true } ];
+            set.SourceRoots = [src];
+            set.JobOptions!.TargetDirectory = src + "-dst";
+        }
+
+        var rig = await Rig.CreateAsync(Path.Combine(dir, "catalog.db"), stampedSetIds, s => Configure(s, "c6-a", srcA));
+        await rig.AddSetAsync(stampedSetIds, s => Configure(s, "c6-b", srcB));
+        rig.Destination.Connected = true;
+
+        await rig.Worker.StartAsync(CancellationToken.None);
+        bool settled = await WaitUntil(
+            () => rig.Log.Count("Backup completed for \"c6-a\"") + rig.Log.Count("Nothing to back up for \"c6-a\"") > 0
+                  && rig.Log.Count("Backup completed for \"c6-b\"") + rig.Log.Count("Nothing to back up for \"c6-b\"") > 0,
+            TimeSpan.FromSeconds(60));
+        await Task.Delay(TimeSpan.FromSeconds(6));
+
+        int watchA0 = rig.Log.Count("Watching \"c6-a\" via file-system watcher fallback");
+        int watchB0 = rig.Log.Count("Watching \"c6-b\" via file-system watcher fallback");
+        if (watchA0 == 0 || watchB0 == 0)
+        {
+            Console.WriteLine("     C6 skipped: this volume has a readable change journal (run unelevated to use the fallback)");
+        }
+        else
+        {
+            Directory.Delete(srcA, recursive: true);
+            await Task.Delay(TimeSpan.FromSeconds(8));
+            int watchB1 = rig.Log.Count("Watching \"c6-b\" via file-system watcher fallback");
+            Check(settled && watchB1 == watchB0,
+                $"C6 a fallback root that goes costs the other set no reconcile ({watchB1 - watchB0} flagged)");
+
+            // Back again: its set reconciles (its watcher's error, when the folder
+            // went, already flagged that), and it is watched once more, so a file
+            // written after the reconcile is backed up by the continuous path.
+            Directory.CreateDirectory(srcA);
+            File.WriteAllText(Path.Combine(srcA, "back.txt"), "again");
+            bool reconciled = await WaitUntil(() => FindFile(srcA + "-dst", "back.txt") is not null, TimeSpan.FromSeconds(60));
+            File.WriteAllText(Path.Combine(srcA, "later.txt"), "later");
+            bool watched = await WaitUntil(() => FindFile(srcA + "-dst", "later.txt") is not null, TimeSpan.FromSeconds(30));
+            int watchB2 = rig.Log.Count("Watching \"c6-b\" via file-system watcher fallback");
+            Check(reconciled && watched && watchB2 == watchB0,
+                $"C6 when it returns it is reconciled and watched again, and the other set is left alone "
+                + $"(reconciled {reconciled}, watched {watched}, other set flagged {watchB2 - watchB0} times)");
+        }
+
         await rig.DisposeAsync();
     }
 }
@@ -595,6 +687,80 @@ static async Task<bool> WaitUntil(Func<bool> condition, TimeSpan timeout)
     return condition();
 }
 
+/// <summary>Random selection trees over a small namespace, and every path in it.</summary>
+static class RandomTrees
+{
+    private static readonly string[] Names = ["a", "debug", "b"];
+    private const string Root = @"R:\r";
+
+    /// <summary>A random tree rooted at R:\r: any state, any auto-include flag,
+    /// files, an occasional expanded folder, and now and then a file listed two
+    /// levels down without its folder.</summary>
+    public static List<SourceSelection> Generate(Random rng) => [Dir(rng, Root, 0)];
+
+    private static SourceSelection Dir(Random rng, string path, int depth)
+    {
+        var node = new SourceSelection
+        {
+            Path = path, IsDirectory = true,
+            IsSelected = rng.Next(3) switch { 0 => true, 1 => false, _ => null },
+            AutoIncludeNewSubdirectories = rng.Next(2) == 0,
+            IsExpanded = rng.Next(8) == 0,
+        };
+        if (depth < 3)
+        {
+            foreach (var n in Names)
+                if (rng.Next(2) == 0) node.Children.Add(Dir(rng, $@"{path}\{n}", depth + 1));
+            if (rng.Next(3) == 0)
+                node.Children.Add(new SourceSelection { Path = $@"{path}\f.txt", IsDirectory = false, IsSelected = rng.Next(2) == 0 });
+            if (rng.Next(6) == 0)
+                node.Children.Add(new SourceSelection { Path = $@"{path}\debug\g.txt", IsDirectory = false, IsSelected = true });
+        }
+        return node;
+    }
+
+    /// <summary>Every folder to depth 4 under R:\r, and two files in each.</summary>
+    public static List<string> Probes()
+    {
+        var probes = new List<string>();
+        void Add(string dir, int depth)
+        {
+            probes.Add(dir);
+            probes.Add($@"{dir}\f.txt");
+            probes.Add($@"{dir}\g.txt");
+            if (depth == 4) return;
+            foreach (var n in Names) Add($@"{dir}\{n}", depth + 1);
+        }
+        Add(Root, 0);
+        return probes;
+    }
+
+    public static int UncoveredByWatchRoots(List<SourceSelection> tree, List<string> probes)
+        => UncoveredByWatchRoots(tree, probes, out _);
+
+    /// <summary>How many probes the tree includes that lie under none of its
+    /// watch roots (<see cref="SourceSelection.CollectSelectedRoots"/>).</summary>
+    public static int UncoveredByWatchRoots(List<SourceSelection> tree, List<string> probes, out string? example)
+    {
+        var roots = SourceSelection.CollectSelectedRoots(tree);
+        int uncovered = 0;
+        example = null;
+        foreach (var p in probes)
+        {
+            if (!SourceSelection.IsPathIncluded(tree, p))
+                continue;
+            bool covered = roots.Any(r => p.Equals(r, StringComparison.OrdinalIgnoreCase)
+                                          || p.StartsWith(r.TrimEnd('\\') + "\\", StringComparison.OrdinalIgnoreCase));
+            if (!covered)
+            {
+                uncovered++;
+                example ??= p;
+            }
+        }
+        return uncovered;
+    }
+}
+
 /// <summary>A Worker on its own temp catalog, with fakes it can be driven through.</summary>
 sealed class Rig
 {
@@ -625,16 +791,7 @@ sealed class Rig
             cmd.ExecuteNonQuery();
         }
 
-        var set = new BackupSet
-        {
-            Name = "idle-test",
-            CreatedUtc = DateTime.UtcNow,
-            DefaultMediaType = MediaType.Directory,
-            JobOptions = new JobOptions
-            {
-                Schedule = new BackupSchedule { Enabled = true, Mode = ScheduleMode.Continuous, PollIntervalSeconds = 5 },
-            },
-        };
+        var set = Template();
         configure(set);
         set = await repo.CreateBackupSetAsync(set);
         stampedSetIds.Add(set.Id);
@@ -651,6 +808,27 @@ sealed class Rig
             Repo = repo, Catalog = counter, Destination = destination, Sources = sources,
             Log = log, Worker = worker, SetId = set.Id,
         };
+    }
+
+    /// <summary>A continuous set with a 5 s poll, before the test configures it.</summary>
+    private static BackupSet Template() => new()
+    {
+        Name = "idle-test",
+        CreatedUtc = DateTime.UtcNow,
+        DefaultMediaType = MediaType.Directory,
+        JobOptions = new JobOptions
+        {
+            Schedule = new BackupSchedule { Enabled = true, Mode = ScheduleMode.Continuous, PollIntervalSeconds = 5 },
+        },
+    };
+
+    /// <summary>Add another set to the catalog; call before starting the Worker.</summary>
+    public async Task AddSetAsync(List<int> stampedSetIds, Action<BackupSet> configure)
+    {
+        var set = Template();
+        configure(set);
+        set = await Repo.CreateBackupSetAsync(set);
+        stampedSetIds.Add(set.Id);
     }
 
     public async Task DisposeAsync()
@@ -693,19 +871,19 @@ public class CountingCatalog : DispatchProxy
     }
 }
 
-/// <summary>A destination that is connected or not, as the test says.</summary>
+/// <summary>Every set's destination, connected or not as the test says; when
+/// connected, each set's own target directory.</summary>
 sealed class SwitchableDestination : IDestinationResolver
 {
     private int _calls;
     public volatile bool Connected;
-    public string LivePath { get; set; } = "";
     public int Calls => Volatile.Read(ref _calls);
 
     public DestinationResolution Resolve(JobOptions options)
     {
         Interlocked.Increment(ref _calls);
         return Connected
-            ? new DestinationResolution(LivePath, IsConnected: true, LetterChanged: false, options.TargetDirectory, MetadataChanged: false)
+            ? new DestinationResolution(options.TargetDirectory, IsConnected: true, LetterChanged: false, options.TargetDirectory, MetadataChanged: false)
             : new DestinationResolution(null, IsConnected: false, LetterChanged: false, options.TargetDirectory, MetadataChanged: false);
     }
 }

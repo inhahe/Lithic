@@ -71,7 +71,12 @@ public class SourceSelection
     ///         (<see cref="IncludesUnlistedDescendants"/>), and is descended like a
     ///         partial directory.</item>
     ///   <item><c>IsSelected == true</c> on a file — add its containing directory.</item>
-    ///   <item><c>IsSelected == null</c> (partial) — descend into children.</item>
+    ///   <item><c>IsSelected == null</c> (partial) — descend into children. Unless
+    ///         auto-include-new is on: then its unlisted descendants are in
+    ///         (<see cref="IncludesUnlistedDescendants"/>), so it is added and not
+    ///         descended. A watcher has to see the folders it would adopt, and a
+    ///         set whose only entries on a drive are such a folder still needs that
+    ///         drive's journal read.</item>
     /// </list>
     ///
     /// <para><b>Coarsening a selected file to its directory is lossy, and only
@@ -84,7 +89,7 @@ public class SourceSelection
     /// Use <see cref="CollectCoveredEntries"/> for that.</para>
     /// </remarks>
     public static List<string> CollectSelectedRoots(IEnumerable<SourceSelection> roots)
-        => Collect(roots, coarsenFilesToDirectories: true);
+        => Collect(roots, forWatching: true);
 
     /// <summary>
     /// The entries this selection actually covers, with a selected FILE returned
@@ -99,13 +104,16 @@ public class SourceSelection
     /// <c>"somefile.ext\"</c>.</para>
     /// </summary>
     public static List<string> CollectCoveredEntries(IEnumerable<SourceSelection> roots)
-        => Collect(roots, coarsenFilesToDirectories: false);
+        => Collect(roots, forWatching: false);
 
+    /// <param name="forWatching">True for <see cref="CollectSelectedRoots"/>: a
+    /// selected file stands for its directory, and a partial folder that
+    /// auto-includes new ones is a root of its own.</param>
     private static List<string> Collect(
-        IEnumerable<SourceSelection> roots, bool coarsenFilesToDirectories)
+        IEnumerable<SourceSelection> roots, bool forWatching)
     {
         var result = new List<string>();
-        CollectSelectedRootsRecursive(roots, result, coarsenFilesToDirectories);
+        CollectSelectedRootsRecursive(roots, result, forWatching);
 
         // De-duplicate and drop any directory already covered by an ancestor in
         // the result (e.g. a watched file's parent that sits under a watched dir).
@@ -132,7 +140,7 @@ public class SourceSelection
 
     private static void CollectSelectedRootsRecursive(
         IEnumerable<SourceSelection> nodes, List<string> result,
-        bool coarsenFilesToDirectories)
+        bool forWatching)
     {
         foreach (var node in nodes)
         {
@@ -147,7 +155,15 @@ public class SourceSelection
             if (node.IsSelected == true && node.IsDirectory && node.Children.Count > 0
                 && !IncludesUnlistedDescendants(node))
             {
-                CollectSelectedRootsRecursive(node.Children, result, coarsenFilesToDirectories);
+                CollectSelectedRootsRecursive(node.Children, result, forWatching);
+                continue;
+            }
+
+            // Partial, but taking in anything new beneath it: for watching, the
+            // whole folder (see CollectSelectedRoots).
+            if (forWatching && node.IsSelected == null && IncludesUnlistedDescendants(node))
+            {
+                result.Add(node.Path);
                 continue;
             }
 
@@ -157,7 +173,7 @@ public class SourceSelection
                 {
                     result.Add(node.Path);
                 }
-                else if (coarsenFilesToDirectories)
+                else if (forWatching)
                 {
                     var dir = System.IO.Path.GetDirectoryName(node.Path);
                     if (!string.IsNullOrEmpty(dir))
@@ -176,7 +192,7 @@ public class SourceSelection
 
             // IsSelected == null → partially selected; descend into children.
             if (node.IsDirectory)
-                CollectSelectedRootsRecursive(node.Children, result, coarsenFilesToDirectories);
+                CollectSelectedRootsRecursive(node.Children, result, forWatching);
         }
     }
 
@@ -389,22 +405,20 @@ public class SourceSelection
 
     /// <summary>
     /// Remove entries that lie inside folders the set excludes entirely and say no
-    /// more than "included". This undoes what <see cref="MaterializeDirectory"/>
-    /// did for folders whose files could never be backed up.
+    /// more than "included": pins <see cref="MaterializeDirectory"/> made for
+    /// folders whose files can never be backed up, which a build creates by the
+    /// thousand and every load of the set parses.
     /// </summary>
     /// <remarks>
-    /// <para>The Worker pins every folder created under an auto-include parent,
-    /// and a build makes thousands of them (cargo's fingerprint, incremental and
-    /// deps folders) under <c>debug</c> and <c>release</c> trees that the set's
-    /// own rules exclude. Every load of the set parses them.</para>
-    /// <para>A node goes only when removing it changes what the tree includes for
-    /// no path at all, now or after the exclusion rule is deleted: its parent
+    /// A node goes only when removing it changes what the tree includes for no
+    /// path at all, now or after the exclusion rule is deleted: its parent
     /// includes unlisted descendants (<see cref="IncludesUnlistedDescendants"/>),
     /// and it and everything it lists include everything beneath them. An
     /// excluded entry, a folder that backs up only the children it lists, and
-    /// anything under a parent that does not auto-include are choices, and stay.
-    /// The one difference is the one pinning exists for: if the parent's
-    /// auto-include is turned off later, these folders drop out with it.</para>
+    /// anything under a parent that does not auto-include are choices, and stay;
+    /// so does a folder left expanded in the editor, which records where the user
+    /// looked. The one difference is the one pinning exists for: if the parent's
+    /// auto-include is turned off later, these folders drop out with it.
     /// </remarks>
     /// <param name="roots">The set's top-level nodes, changed in place. A top-level
     /// node is never removed.</param>
@@ -421,7 +435,7 @@ public class SourceSelection
         {
             if (!root.IsDirectory)
                 continue;
-            bool inside = AnyPrunedFrom(root.Path, stopBefore: null, prunesDirectory);
+            bool inside = IsInsidePrunedDirectory(root.Path, prunesDirectory);
             removed += RemoveRedundantChildren(root, inside, prunesDirectory);
         }
         return removed;
@@ -447,7 +461,7 @@ public class SourceSelection
                 ? child.Path
                 : System.IO.Path.GetDirectoryName(child.Path) ?? child.Path;
             bool inside = parentInside
-                          || AnyPrunedFrom(childDirectory, stopBefore: parent.Path, prunesDirectory);
+                          || IsInsidePrunedDirectory(childDirectory, prunesDirectory, stopBefore: parent.Path);
 
             if (inside && parentIncludesUnlisted && IncludesEverythingBeneath(child))
             {
@@ -463,13 +477,22 @@ public class SourceSelection
     }
 
     /// <summary>
-    /// Whether <paramref name="directory"/> or a directory above it, up to but not
-    /// including <paramref name="stopBefore"/> (null: up to the volume root), is
-    /// pruned. Testing every level keeps the answer right for a tree that lists a
-    /// node without its intermediate folders.
+    /// Whether a directory lies inside a subtree whose every file is excluded:
+    /// <paramref name="prunesDirectory"/> holds for it or for a directory above it.
+    /// A prune filter answers only for the directory it is handed (a
+    /// <c>**/debug/**</c> rule prunes <c>…\debug</c>, not <c>…\debug\sub</c>),
+    /// which a top-down scan needs; anything that meets a deep path directly,
+    /// such as the Worker with a folder the journal reports as new, needs this.
     /// </summary>
-    private static bool AnyPrunedFrom(
-        string directory, string? stopBefore, Func<string, bool> prunesDirectory)
+    /// <param name="directory">An absolute directory path.</param>
+    /// <param name="prunesDirectory">Whether every file beneath one directory is
+    /// excluded, as <c>DirectoryBackupService.BuildDirectoryPruneFilter</c> answers.</param>
+    /// <param name="stopBefore">A directory above <paramref name="directory"/> already
+    /// known not to be inside a pruned subtree, where the walk stops; null walks to
+    /// the volume root. Testing every level below it keeps the answer right for a
+    /// tree that lists a node without its intermediate folders.</param>
+    public static bool IsInsidePrunedDirectory(
+        string directory, Func<string, bool> prunesDirectory, string? stopBefore = null)
     {
         for (string? dir = directory; !string.IsNullOrEmpty(dir); dir = System.IO.Path.GetDirectoryName(dir))
         {
@@ -483,15 +506,15 @@ public class SourceSelection
     }
 
     /// <summary>
-    /// Whether a node and every node it lists include every path beneath them, so
-    /// that, under a parent that includes unlisted descendants, the node records
-    /// nothing the parent does not already say.
+    /// Whether a node and every node it lists include every path beneath them, and
+    /// none is left expanded in the editor, so that, under a parent that includes
+    /// unlisted descendants, the node records nothing the parent does not already say.
     /// </summary>
     private static bool IncludesEverythingBeneath(SourceSelection node)
     {
         if (!node.IsDirectory)
             return node.IsSelected == true;
-        if (!IncludesUnlistedDescendants(node))
+        if (node.IsExpanded || !IncludesUnlistedDescendants(node))
             return false;
         foreach (var child in node.Children)
         {

@@ -278,6 +278,34 @@ public class SqliteCatalogRepository : ICatalogRepository
         }
     }
 
+    public async Task<IReadOnlyList<BackupSetOptions>> GetAllBackupSetOptionsAsync(CancellationToken ct = default)
+    {
+        ct.ThrowIfCancellationRequested();
+        await _masterGate.WaitAsync(ct).ConfigureAwait(false);
+        try
+        {
+            using var cmd = _master.CreateCommand();
+            cmd.CommandText = "SELECT Id, Name, JobOptionsJson FROM BackupSets";
+            var list = new List<BackupSetOptions>();
+            using (var r = cmd.ExecuteReader())
+            {
+                while (r.Read())
+                {
+                    list.Add(new BackupSetOptions(
+                        r.GetInt32(0),
+                        r.GetString(1),
+                        r.IsDBNull(2) ? null : JsonSerializer.Deserialize<JobOptions>(r.GetString(2))));
+                }
+            }
+            list.Sort((a, b) => string.CompareOrdinal(a.Name, b.Name));
+            return list;
+        }
+        finally
+        {
+            _masterGate.Release();
+        }
+    }
+
     public async Task<long> GetBackupSetsChangeStampAsync(CancellationToken ct = default)
     {
         ct.ThrowIfCancellationRequested();

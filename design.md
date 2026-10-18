@@ -61,8 +61,10 @@ when the other process is running.
   `installer\CustomActions\CustomAction.config`** — that file was missing from
   1.0.11 through 1.0.55, so this whole mechanism was silently dead. Full reasoning
   in `CLAUDE.md`.
-* **Settings** are machine-global and read by both, so a new setting has to be
-  meaningful (or harmless) in a service with no UI.
+* **Settings** are meant to be machine-global and read by both, so a new setting
+  has to be meaningful (or harmless) in a service with no UI. Today they are not:
+  the file is per user, so the Worker reads the system profile's copy and gets the
+  defaults (known-issues.md: "the Worker never sees the settings the app saves").
 * **Writes to a set take turns, and the Worker gives way.** Every write to a set's
   database first takes a cross-process lock file (`set-<id>.db.writelock`,
   `SqliteSetDatabase.AcquireCrossProcessWriteAsync`). A waiter polls every 25 ms.
@@ -932,9 +934,11 @@ can swallow nothing, since nothing is prefixed by `"somefile.ext\"`.
 
 **A separate, genuine difference worth knowing** (it was my first and wrong
 explanation for the above, so it is recorded to stop it being reached for again):
-`CollectSelectedRoots`/`CollectCoveredEntries` only collect **fully**-selected
-nodes, while `IsPathIncluded` additionally covers unlisted descendants of a
-**partially**-selected directory whose auto-include-new is on. That can make a
+`CollectCoveredEntries` only collects **fully**-selected nodes, while
+`IsPathIncluded` additionally covers unlisted descendants of a
+**partially**-selected directory whose auto-include-new is on. (`CollectSelectedRoots`,
+which answers "where do I watch", returns such a directory as a root itself: see
+"Auto-include must not pin what can never be backed up".) That can make a
 newly-added root whose files were already considered included — a real case, just
 not this one, since `D:\` here is partial with auto-include **off**. The flow now
 reports that case instead of returning silently.
@@ -1359,18 +1363,25 @@ The loop runs a pass at every poll and at every push wake-up, and the USN waiter
 fire on any change to a watched volume, up to four times a second each. So
 whatever a pass does, a busy machine does it several times a second. On
 2026-10-18, with both backup drives unplugged, that came to 70 MB/s of reads and
-35 MB/s of writes against the Worker's own catalog (known-issues.md). Four rules
+35 MB/s of writes against the Worker's own catalog (known-issues.md). These rules
 keep a pass cheap:
 
 * **The sets are read only when they may have changed.**
   `ICatalogRepository.GetBackupSetsChangeStampAsync` moves after every write the
   repository makes to the sets, and whenever `PRAGMA data_version` moves, which
   reports every other connection's commits, the other process's included, but
-  never the connection's own: hence the counter beside it. A poller compares the
-  stamp before reading: the Worker's reload does, and so does the GUI's
-  `DestinationSpaceMonitor`. SQLite does not rewrite a row whose bytes are
-  unchanged, so writing a set back as it was moves no other connection's stamp,
-  correctly.
+  never the connection's own: hence the counter beside it. The Worker's reload
+  compares the stamp before reading. It suits the Worker because the GUI writes
+  the catalog rarely; it does not suit the GUI, because the Worker commits its
+  journal cursors to the same database at nearly every pass, which moves every
+  other connection's `data_version`. So the GUI's `DestinationSpaceMonitor`, which
+  needs only each set's destination, reads `GetAllBackupSetOptionsAsync`: the
+  options without the selection trees, as a type no whole-set writer takes. That
+  saves parsing the trees, not reading them: the options column comes after the
+  selection in the row, and SQLite reaches it only by paging through the
+  selection's overflow pages. Keeping selections small is what keeps it cheap.
+  SQLite does not rewrite a row whose bytes are unchanged, so writing a set back
+  as it was moves no other connection's stamp, correctly.
 * **SQLite never sorts the sets.** A row carries the set's selection tree, and
   `ORDER BY` sorts whole rows: past its cache, through a temp file. Measured: 9.2
   MB of rows cost 18.4 MB read and 9.2 MB written per read. `GetAllBackupSetsAsync`
@@ -1382,16 +1393,27 @@ keep a pass cheap:
   attempt. `BlockRuns` holds the set's runs for one poll interval. A full backup
   that throws holds the set's *full* backups for 1, 2, 4 … minutes, up to an hour,
   but not its targeted runs, so continuous protection carries on while a
-  safety-net scan keeps failing. A blocked set's only wake-up deadline is the end
-  of its block (its overdue queue and its reconcile must not set the pace), and
-  while every continuous set is blocked the loop ignores push wake-ups. Each
-  condition is logged when it starts and when it ends, not at each attempt.
+  safety-net scan keeps failing (a set whose *reconcile* is failing backs up
+  nothing else meanwhile, as it never has before its reconcile runs). An edit to
+  the set's options or selection ends that hold early: it may be the fix. A
+  blocked set's only wake-up deadline is the end of its block (its overdue queue
+  and its reconcile must not set the pace), and while every continuous set is
+  blocked the loop ignores push wake-ups. Each condition is logged when it starts
+  and when it ends, not at each attempt.
+* **One full scan settles every reconcile pending when it starts.** The schedule's
+  or the safety net's full backup runs first in a pass, and a set reconnected
+  after a day usually has both that and a reconcile due: before, the second
+  whole-tree scan began the moment the first ended (`SettleReconcile`).
 * **An absent volume is not a volume without a journal.** "No usable journal" is
-  cached only for a volume that is there. Only such a volume's roots go on the
-  FileSystemWatcher fallback, and only roots that exist, so a root that appears
-  restarts the watcher (with the reconcile that implies) and a drive plugged in
-  later is read through its journal. Treating an unplugged drive as a fallback
-  volume flagged a reconcile at every service start and watched nothing.
+  cached only for a volume that is there, so a drive plugged in later is read
+  through its journal. Treating an unplugged drive as a fallback volume flagged a
+  reconcile at every service start and watched nothing.
+* **Fallback watchers come and go one root at a time.**
+  `FileSystemMonitorImpl.Watch` keeps the watchers of roots that stay, stops those
+  of roots that are gone, and starts one for a root that exists and is not
+  watched. Only the sets with a root that just started are flagged for a
+  reconcile, since only there did no watcher see what changed; restarting every
+  watcher whenever one root came or went cost every fallback set a full scan.
 
 ### Auto-include must not pin what can never be backed up
 
@@ -1404,18 +1426,28 @@ makes new fingerprint, incremental and deps folders on every build. In the J: se
 rules exclude; without them its selection JSON shrinks from 7.1 MB to 0.76 MB.
 
 The Worker therefore pins nothing inside a tree its rules exclude entirely
-(`IsPinCandidate`, through `DirectoryBackupService.BuildExcludedSubtreeTest`, the
+(`IsPinCandidate`, through `SourceSelection.IsInsidePrunedDirectory`, the
 bottom-up form of the prune filter, needed because the journal hands over deep
-paths directly). It queues no changed file its rules exclude (`IsBackupCandidate`).
-And after each reload it removes the entries already there, with
+paths directly). It queues no changed file its rules exclude (`IsBackupCandidate`)
+and no move with both ends inside such trees. And after each reload it removes the
+entries already there, in the continuous sets it pins into, with
 `SourceSelection.RemoveRedundantEntriesInExcludedFolders`.
+
+**Removing entries must not lose a drive's watch root.** The Worker reads only
+the drives its watch roots (`CollectSelectedRoots`) are on, and a partial folder
+that auto-includes new ones used to give no root: a set whose only entries on a
+drive were pins under such a folder would have stopped reading that drive once
+they went. Such a folder is now a watch root of its own, which is also what a
+fallback watcher needs to see the folders it would adopt. Checked on random
+trees: every included path lies under a watch root, before and after removal.
 
 **The removal rule is what makes the removal safe, so keep it exact.** A node goes
 only when its parent includes unlisted descendants and the node, and everything it
 lists, include everything beneath them. Then no path's inclusion changes, even if
 the exclusion rule is deleted later: what the node said, its parent still says.
-Explicit exclusions, folders that back up only the children they list, and the
-children of parents that do not auto-include are choices, and stay. Checked on
+Explicit exclusions, folders that back up only the children they list, the
+children of parents that do not auto-include, and folders left expanded in the
+editor are choices, and stay. Checked on
 4,000 random trees and on both real sets (0 of 111,534 probes changed). The one
 thing lost is what pinning exists for: if the parent's auto-include is turned off
 later, those folders drop out with it, which costs nothing for folders whose files
