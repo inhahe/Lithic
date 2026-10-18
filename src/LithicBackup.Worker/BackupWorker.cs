@@ -123,6 +123,20 @@ public sealed class BackupWorker : BackgroundService
     /// </summary>
     private ContinuousRules _rules = new();
 
+    /// <summary>
+    /// The catalog's <see cref="ICatalogRepository.GetBackupSetsChangeStampAsync"/>
+    /// when the sets were last read, so a pass reads them again only after they
+    /// may have changed. -1 before the first read.
+    /// </summary>
+    private long _loadedSetsStamp = -1;
+
+    /// <summary>
+    /// Whether each drive letter had a volume behind it, memoised for one pass:
+    /// every watch root asks, and a set can have hundreds. Cleared at the start of
+    /// each pass. Poll thread only.
+    /// </summary>
+    private readonly Dictionary<char, bool> _volumePresence = new();
+
     public BackupWorker(
         ILogger<BackupWorker> logger,
         ICatalogRepository catalog,
@@ -158,9 +172,15 @@ public sealed class BackupWorker : BackgroundService
     /// or <c>null</c> when the destination volume is not currently connected
     /// (the caller should skip the run).
     /// </summary>
-    private async Task<string?> ResolveDestinationAsync(BackupSet set, JobOptions opts, CancellationToken ct)
+    /// <remarks>
+    /// A missing destination blocks the set's runs until the next poll
+    /// (<see cref="BlockRuns"/>), and is logged when it goes and when it comes
+    /// back, not at each attempt.
+    /// </remarks>
+    private async Task<string?> ResolveDestinationAsync(SetState state, CancellationToken ct)
     {
-        var resolution = _destinationResolver.Resolve(opts);
+        var set = state.BackupSet;
+        var resolution = _destinationResolver.Resolve(set.JobOptions!);
 
         // Volume identity only - never the selection.
         if (resolution.MetadataChanged)
@@ -168,10 +188,24 @@ public sealed class BackupWorker : BackgroundService
 
         if (!resolution.IsConnected)
         {
-            _logger.LogWarning(
-                "Skipping backup for \"{Name}\": destination drive not connected ({Path}).",
-                set.Name, resolution.PreviousPath ?? "unknown path");
+            if (state.DestinationMissingSinceUtc is null)
+            {
+                state.DestinationMissingSinceUtc = DateTime.UtcNow;
+                _logger.LogWarning(
+                    "Skipping backup for \"{Name}\": destination drive not connected ({Path}). Its backups "
+                    + "wait until it is, and this is not logged again until then.",
+                    set.Name, resolution.PreviousPath ?? "unknown path");
+            }
+            BlockRuns(state);
             return null;
+        }
+
+        if (state.DestinationMissingSinceUtc is { } missingSince)
+        {
+            state.DestinationMissingSinceUtc = null;
+            _logger.LogInformation(
+                "Destination drive for \"{Name}\" is connected again ({Path}), after {Minutes:F0} minute(s).",
+                set.Name, resolution.LivePath, (DateTime.UtcNow - missingSince).TotalMinutes);
         }
 
         if (resolution.LetterChanged)
@@ -191,8 +225,13 @@ public sealed class BackupWorker : BackgroundService
     /// currently reachable (the caller should skip the run rather than back up
     /// nothing).  Partially-missing sources are logged and the run proceeds.
     /// </summary>
-    private async Task<bool> ResolveSourcesAsync(BackupSet set, CancellationToken ct)
+    /// <remarks>
+    /// Like a missing destination, having no source blocks the set's runs until
+    /// the next poll and is logged only when it starts and when it ends.
+    /// </remarks>
+    private async Task<bool> ResolveSourcesAsync(SetState state, CancellationToken ct)
     {
+        var set = state.BackupSet;
         var resolution = _sourceResolver.Resolve(set);
 
         if (resolution.MetadataChanged)
@@ -207,10 +246,22 @@ public sealed class BackupWorker : BackgroundService
 
         if (!resolution.AnyAvailable)
         {
-            _logger.LogWarning(
-                "Skipping backup for \"{Name}\": no source location is currently available ({Missing}).",
-                set.Name, string.Join(", ", resolution.MissingSources));
+            if (!state.SourcesMissing)
+            {
+                state.SourcesMissing = true;
+                _logger.LogWarning(
+                    "Skipping backup for \"{Name}\": no source location is currently available ({Missing}). "
+                    + "Its full backups wait until one is, and this is not logged again until then.",
+                    set.Name, string.Join(", ", resolution.MissingSources));
+            }
+            BlockRuns(state);
             return false;
+        }
+
+        if (state.SourcesMissing)
+        {
+            state.SourcesMissing = false;
+            _logger.LogInformation("A source location for \"{Name}\" is available again.", set.Name);
         }
 
         if (resolution.MissingSources.Count > 0)
@@ -221,6 +272,61 @@ public sealed class BackupWorker : BackgroundService
         }
 
         return true;
+    }
+
+    /// <summary>
+    /// Attempt no run of this set before the next poll, because the last one could
+    /// not start for a reason only something outside the Worker can end: the
+    /// destination is not connected, no source is, or the destination holds a
+    /// backup this set does not track. A pending reconcile, an overdue schedule
+    /// and queued changes all survive the failed attempt, so without this the
+    /// attempt was repeated at every pass, several a second while changes arrive.
+    /// Never shortens a longer block already in place.
+    /// </summary>
+    private void BlockRuns(SetState state)
+    {
+        var until = DateTime.UtcNow + ComputeEffectivePollInterval();
+        if (until > state.RunsBlockedUntilUtc)
+            state.RunsBlockedUntilUtc = until;
+    }
+
+    /// <summary>Whether <see cref="BlockRuns"/> holds this set's runs now.</summary>
+    private static bool RunsBlocked(SetState state) => DateTime.UtcNow < state.RunsBlockedUntilUtc;
+
+    /// <summary>
+    /// Whether no full backup of this set may start now: its runs are blocked, or
+    /// its full backups are backing off after failures (<see cref="FailureBackoff"/>).
+    /// </summary>
+    private static bool FullBackupsBlocked(SetState state)
+        => RunsBlocked(state) || DateTime.UtcNow < state.FullBackupsBlockedUntilUtc;
+
+    /// <summary>
+    /// How long to hold a set's full backups after they have thrown
+    /// <paramref name="consecutiveFailures"/> times in a row: 1 minute, doubling
+    /// to at most an hour. A failed full backup leaves its reconcile flag or its
+    /// overdue schedule in place, and each attempt can be a whole-tree scan before
+    /// it fails. Targeted runs are not held, so continuous protection carries on
+    /// while a safety-net scan keeps failing.
+    /// </summary>
+    private static TimeSpan FailureBackoff(int consecutiveFailures)
+        => TimeSpan.FromMinutes(Math.Min(60, 1 << Math.Clamp(consecutiveFailures - 1, 0, 6)));
+
+    /// <summary>
+    /// Whether some active continuous set can run now, so that a change the push
+    /// waiters report can lead to a backup before the next poll. A set whose
+    /// reconcile is backing off cannot: its queued changes wait for the reconcile.
+    /// </summary>
+    private bool AnyContinuousSetCanRun()
+    {
+        foreach (var state in _sets.Values)
+        {
+            if (state.IsActive
+                && state.BackupSet.JobOptions?.Schedule is { Mode: ScheduleMode.Continuous }
+                && !RunsBlocked(state)
+                && !(state.NeedsReconcile && FullBackupsBlocked(state)))
+                return true;
+        }
+        return false;
     }
 
     // ------------------------------------------------------------------
@@ -260,6 +366,7 @@ public sealed class BackupWorker : BackgroundService
             {
                 try
                 {
+                    _volumePresence.Clear();
                     await ReloadBackupSetsAsync(stoppingToken);
                     await CheckSchedulesAsync(stoppingToken);
                     await CheckContinuousAsync(stoppingToken);
@@ -282,7 +389,21 @@ public sealed class BackupWorker : BackgroundService
                 // clears any signal that fired during processing above.
                 try
                 {
-                    await _wake.WaitAsync(ComputeNextWakeDelay(DateTime.UtcNow), stoppingToken);
+                    var delay = ComputeNextWakeDelay(DateTime.UtcNow);
+                    if (AnyContinuousSetCanRun())
+                    {
+                        await _wake.WaitAsync(delay, stoppingToken);
+                    }
+                    else
+                    {
+                        // With every continuous set blocked, a reported change can
+                        // only be queued, which the next pass does as well. The
+                        // waiters fire on any change to a watched volume, up to
+                        // four times a second each, so heeding them here would run
+                        // passes that cannot back anything up.
+                        await Task.Delay(delay, stoppingToken);
+                        _wake.Wait(0);
+                    }
                 }
                 catch (OperationCanceledException) when (stoppingToken.IsCancellationRequested)
                 {
@@ -308,13 +429,22 @@ public sealed class BackupWorker : BackgroundService
     // ------------------------------------------------------------------
 
     /// <summary>
-    /// Reload backup sets from the catalog and update per-set state.
+    /// Reload backup sets from the catalog and update per-set state, if the
+    /// catalog reports that they may have changed since the last reload.
     /// </summary>
     private async Task ReloadBackupSetsAsync(CancellationToken ct)
     {
         // Refresh machine-global continuous timing rules so GUI edits (size-tiered
         // debounce, mask-tiered max-wait) apply on the next poll without a restart.
         _rules = UserSettings.Load().ContinuousRules ?? new();
+
+        // This runs at every pass, and push wake-ups can make that several times
+        // a second; reading the sets parses every selection tree, megabytes for a
+        // large one. Read before the sets, so a write that lands in between
+        // leaves the stamp different and is picked up by the next pass.
+        long stamp = await _catalog.GetBackupSetsChangeStampAsync(ct);
+        if (stamp == _loadedSetsStamp)
+            return;
 
         var allSets = await _catalog.GetAllBackupSetsAsync(ct);
         var seen = new HashSet<int>();
@@ -392,6 +522,9 @@ public sealed class BackupWorker : BackgroundService
             if (!seen.Contains(id))
                 _sets.TryRemove(id, out _);
         }
+
+        _loadedSetsStamp = stamp;
+
     }
 
     /// <summary>
@@ -434,7 +567,7 @@ public sealed class BackupWorker : BackgroundService
                 _ => false,
             };
 
-            if (shouldRun)
+            if (shouldRun && !FullBackupsBlocked(state))
                 await RunFullBackupAsync(state, ct);
         }
     }
@@ -570,15 +703,40 @@ public sealed class BackupWorker : BackgroundService
                 || state.BackupSet.JobOptions?.Schedule is not { Mode: ScheduleMode.Continuous })
                 continue;
 
+            // Everything a blocked set has waiting needs a run, so nothing of its
+            // can happen before the block ends: that is its only deadline. Its
+            // overdue queue and its reconcile would otherwise set the pace, and
+            // drive the loop flat out against a destination that is not there.
+            if (nowUtc < state.RunsBlockedUntilUtc)
+            {
+                var untilUnblocked = state.RunsBlockedUntilUtc - nowUtc;
+                if (untilUnblocked < delay)
+                    delay = untilUnblocked;
+                continue;
+            }
+
+            // Likewise a reconcile backing off after failures: queued changes
+            // wait for it, so the end of its backoff is the set's only deadline.
+            if (state.NeedsReconcile && nowUtc < state.FullBackupsBlockedUntilUtc)
+            {
+                var untilRetry = state.FullBackupsBlockedUntilUtc - nowUtc;
+                if (untilRetry < delay)
+                    delay = untilRetry;
+                continue;
+            }
+
             // Moves and pending reconciles are applied each cycle but gated on the
-            // backup lock / destination availability, so retry them soon.
+            // backup lock, so retry them soon.
             if (state.NeedsReconcile || state.PendingMoves.Count > 0)
             {
                 if (delay > MinPollInterval)
                     delay = MinPollInterval;
             }
 
-            if (state.Pending.Count == 0)
+            // Queued changes are not backed up while a reconcile is pending (it
+            // goes first, and a clean one supersedes them), so until then their
+            // debounce deadlines say nothing about when work can happen.
+            if (state.NeedsReconcile || state.Pending.Count == 0)
                 continue;
 
             foreach (var (path, t) in state.Pending)
@@ -838,12 +996,12 @@ public sealed class BackupWorker : BackgroundService
         //    already in progress or the destination is offline.
         foreach (var state in continuousSets)
         {
-            if (!state.NeedsReconcile)
+            if (!state.NeedsReconcile || FullBackupsBlocked(state))
                 continue;
 
             var outcome = await RunFullBackupAsync(state, ct);
             if (outcome == ReconcileOutcome.DidNotRun)
-                continue;   // lock busy / destination offline — retry next poll
+                continue;   // lock busy, or blocked (destination offline...) — retry later
 
             // Cleared as soon as the scan RAN, even if files failed. Leaving it
             // set would start another whole-tree scan on the very next poll, and
@@ -884,7 +1042,7 @@ public sealed class BackupWorker : BackgroundService
         //     new path.
         foreach (var state in continuousSets)
         {
-            if (state.NeedsReconcile || state.PendingMoves.Count == 0)
+            if (state.NeedsReconcile || state.PendingMoves.Count == 0 || RunsBlocked(state))
                 continue;
 
             await RunMovesAsync(state, ct);
@@ -894,7 +1052,7 @@ public sealed class BackupWorker : BackgroundService
         //    debounce window, or that have been pending past the max-wait cap.
         foreach (var state in continuousSets)
         {
-            if (state.NeedsReconcile || state.Pending.Count == 0)
+            if (state.NeedsReconcile || state.Pending.Count == 0 || RunsBlocked(state))
                 continue;
 
             var ready = SelectReadyPaths(state, now);
@@ -1001,6 +1159,9 @@ public sealed class BackupWorker : BackgroundService
             return;
         _lastFullScanDrainUtc = now;
 
+        // A full scan holds one pass for hours; volumes come and go meanwhile.
+        _volumePresence.Clear();
+
         var continuousSets = _sets.Values
             .Where(s => s.IsActive
                         && s.BackupSet.JobOptions?.Schedule is { Mode: ScheduleMode.Continuous })
@@ -1079,6 +1240,11 @@ public sealed class BackupWorker : BackgroundService
             ct.ThrowIfCancellationRequested();
 
             if (state.Pending.Count == 0)
+                continue;
+
+            // The set being scanned is running, so it is not blocked; any other
+            // set may be.
+            if (!ReferenceEquals(state, scanningSet) && RunsBlocked(state))
                 continue;
 
             // Only the set being scanned has paths to leave alone; a different set
@@ -1173,6 +1339,17 @@ public sealed class BackupWorker : BackgroundService
 
     private UsnJournalReader? GetJournalReader(char drive)
     {
+        // An absent volume has no journal, but that answer must not be cached as
+        // "no usable journal": the volume may be plugged in later, and is read
+        // from then on. A reader whose volume has gone is dropped, so a volume
+        // that turns up under the same letter is opened afresh.
+        if (!VolumeIsPresent(drive))
+        {
+            if (_journalReaders.Remove(drive, out var gone))
+                gone?.Dispose();
+            return null;
+        }
+
         if (!_journalReaders.TryGetValue(drive, out var reader))
         {
             reader = UsnJournalReader.TryOpen(drive);
@@ -1282,7 +1459,21 @@ public sealed class BackupWorker : BackgroundService
     private bool UsesFallbackVolume(string root)
     {
         var drive = GetDriveLetter(root);
-        return drive != '\0' && GetJournalReader(drive) is null;
+        return drive != NoDrive && VolumeIsPresent(drive) && GetJournalReader(drive) is null;
+    }
+
+    /// <summary>
+    /// Whether a volume is mounted at this drive letter, memoised for the pass
+    /// (<see cref="_volumePresence"/>). Poll thread only.
+    /// </summary>
+    private bool VolumeIsPresent(char drive)
+    {
+        if (!_volumePresence.TryGetValue(drive, out bool present))
+        {
+            present = Directory.Exists($"{drive}:\\");
+            _volumePresence[drive] = present;
+        }
+        return present;
     }
 
     /// <summary>
@@ -1293,11 +1484,20 @@ public sealed class BackupWorker : BackgroundService
     /// reconciling scan, since a watcher cannot see changes made while it wasn't
     /// watching and a restart drops whatever was buffered.
     /// </summary>
+    /// <remarks>
+    /// Only roots that exist count, because those are all a watcher can watch: a
+    /// root that appears later changes the set and so starts watching it, with
+    /// the reconcile that implies. A volume that is not there at all is not a
+    /// fallback volume (<see cref="UsesFallbackVolume"/>): there is nothing to
+    /// watch, so it must not flag a reconcile, and once it is plugged in it is
+    /// read through its journal if it has one.
+    /// </remarks>
     private void MaintainFallbackWatchers(IReadOnlyList<SetState> continuousSets)
     {
         var fallbackRoots = continuousSets
             .SelectMany(s => s.WatchRoots)
             .Where(UsesFallbackVolume)
+            .Where(Directory.Exists)
             .Distinct(StringComparer.OrdinalIgnoreCase)
             .OrderBy(r => r, StringComparer.OrdinalIgnoreCase)
             .ToList();
@@ -1577,7 +1777,7 @@ public sealed class BackupWorker : BackgroundService
         {
             var set = state.BackupSet;
             var opts = set.JobOptions!;
-            var targetDir = await ResolveDestinationAsync(set, opts, ct);
+            var targetDir = await ResolveDestinationAsync(state, ct);
             if (targetDir is null)
             {
                 // Destination not connected — requeue these paths for next poll.
@@ -1659,7 +1859,7 @@ public sealed class BackupWorker : BackgroundService
         {
             var set = state.BackupSet;
             var opts = set.JobOptions!;
-            var targetDir = await ResolveDestinationAsync(set, opts, ct);
+            var targetDir = await ResolveDestinationAsync(state, ct);
             if (targetDir is null)
             {
                 // [rename-trace] step 3: destination offline — moves wait.
@@ -1931,11 +2131,11 @@ public sealed class BackupWorker : BackgroundService
         {
             var set = state.BackupSet;
             var opts = set.JobOptions!;
-            var targetDir = await ResolveDestinationAsync(set, opts, ct);
+            var targetDir = await ResolveDestinationAsync(state, ct);
             if (targetDir is null)
                 return ReconcileOutcome.DidNotRun; // Destination not connected; retry later.
 
-            if (!await ResolveSourcesAsync(set, ct))
+            if (!await ResolveSourcesAsync(state, ct))
                 return ReconcileOutcome.DidNotRun; // No source available; retry later.
 
             if (await RefuseUntrackedDestinationAsync(state, targetDir, ct))
@@ -1951,6 +2151,7 @@ public sealed class BackupWorker : BackgroundService
             {
                 _logger.LogInformation("Nothing to back up for \"{Name}\".", set.Name);
                 state.LastRunUtc = DateTime.UtcNow;
+                state.ConsecutiveFailures = 0;
                 MarkFullScanCompleted(state);
                 return ReconcileOutcome.RanClean;
             }
@@ -1993,6 +2194,7 @@ public sealed class BackupWorker : BackgroundService
                         "  … and {More} more failed file(s).", result.FailedFiles.Count - 10);
             }
 
+            state.ConsecutiveFailures = 0;
             MarkFullScanCompleted(state);
             return result.Success
                 ? ReconcileOutcome.RanClean
@@ -2009,6 +2211,7 @@ public sealed class BackupWorker : BackgroundService
                 "Backup for \"{Name}\" stopped after its copy finished; retention did not complete.",
                 state.BackupSet.Name);
             state.LastRunUtc = DateTime.UtcNow;
+            state.ConsecutiveFailures = 0;
             MarkFullScanCompleted(state);
             return ex.FailedFiles.Count == 0
                 ? ReconcileOutcome.RanClean
@@ -2021,7 +2224,12 @@ public sealed class BackupWorker : BackgroundService
         }
         catch (Exception ex)
         {
-            _logger.LogError(ex, "Backup failed for \"{Name}\".", state.BackupSet.Name);
+            state.ConsecutiveFailures++;
+            var wait = FailureBackoff(state.ConsecutiveFailures);
+            state.FullBackupsBlockedUntilUtc = DateTime.UtcNow + wait;
+            _logger.LogError(ex,
+                "Backup failed for \"{Name}\" ({Count} in a row); no full backup of it starts for {Minutes:F0} minute(s).",
+                state.BackupSet.Name, state.ConsecutiveFailures, wait.TotalMinutes);
             return ReconcileOutcome.DidNotRun;
         }
         finally
@@ -2055,6 +2263,7 @@ public sealed class BackupWorker : BackgroundService
             _logger.LogWarning(ex,
                 "Could not check whether the destination of \"{Name}\" already holds a backup; skipping this run.",
                 set.Name);
+            BlockRuns(state);
             return true;
         }
 
@@ -2063,6 +2272,10 @@ public sealed class BackupWorker : BackgroundService
             state.RefusedUntrackedAt = null;
             return false;
         }
+
+        // Only the user, in the app, can end this, so asking again at every pass
+        // would only re-read the destination.
+        BlockRuns(state);
 
         if (!string.Equals(state.RefusedUntrackedAt, targetDir, StringComparison.OrdinalIgnoreCase))
         {
@@ -2141,6 +2354,32 @@ public sealed class BackupWorker : BackgroundService
         /// Used to pick which volumes to read and which changes are relevant.
         /// </summary>
         public List<string> WatchRoots { get; set; } = [];
+
+        /// <summary>
+        /// No run of this set (full, targeted or moves) is attempted before this
+        /// time. Set by <c>BlockRuns</c> when a run could not start.
+        /// </summary>
+        public DateTime RunsBlockedUntilUtc { get; set; }
+
+        /// <summary>
+        /// No full backup of this set (reconcile, safety net or schedule) starts
+        /// before this time: the backoff after full backups that threw
+        /// (<c>FailureBackoff</c>). Targeted runs and moves are not held by it.
+        /// </summary>
+        public DateTime FullBackupsBlockedUntilUtc { get; set; }
+
+        /// <summary>
+        /// When the destination was found not connected, or null while it is
+        /// connected (or not yet looked at). Lets the loss and the return each be
+        /// logged once.
+        /// </summary>
+        public DateTime? DestinationMissingSinceUtc { get; set; }
+
+        /// <summary>Whether the last full run found none of the set's sources available, so the change can be logged once.</summary>
+        public bool SourcesMissing { get; set; }
+
+        /// <summary>Full backups in a row that threw; sets the backoff before the next attempt.</summary>
+        public int ConsecutiveFailures { get; set; }
 
         /// <summary>
         /// Pending continuous-mode changes for this set: path → (first seen,
