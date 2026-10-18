@@ -2720,6 +2720,34 @@ public class DirectoryBackupService
         };
     }
 
+    /// <summary>
+    /// Bottom-up form of a filter from
+    /// <see cref="BuildDirectoryPruneFilter(IReadOnlyList{string}, IReadOnlyList{VersionTierSet})"/>:
+    /// whether a directory lies anywhere inside a subtree whose every file is
+    /// excluded, because the directory itself or one above it would be pruned.
+    ///
+    /// <para>The prune filter answers only for the directory it is handed:
+    /// <c>**/debug/**</c> prunes <c>…\debug</c> but not <c>…\debug\sub</c>. A
+    /// scan never needs more, since it tests each directory before descending into
+    /// it. A caller that meets a deep path directly does, as the Worker does with
+    /// a folder the change journal reports as new.</para>
+    /// </summary>
+    /// <param name="prune">The set's prune filter.</param>
+    /// <returns>A test taking an absolute directory path. It costs one prune test
+    /// per level of the path, so it suits single paths, not whole trees.</returns>
+    public static Func<string, bool> BuildExcludedSubtreeTest(Func<string, bool> prune)
+    {
+        return directoryPath =>
+        {
+            for (string? dir = directoryPath; !string.IsNullOrEmpty(dir); dir = Path.GetDirectoryName(dir))
+            {
+                if (prune(dir))
+                    return true;
+            }
+            return false;
+        };
+    }
+
     // -------------------------------------------------------------------
     // File I/O helpers
     // -------------------------------------------------------------------

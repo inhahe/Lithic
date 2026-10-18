@@ -116,7 +116,8 @@ public static class GlobMatcher
     /// regex is anchored, so the nested path does not match it. That is not a
     /// bug and needs no fix: the scan tests every directory before descending,
     /// so it prunes at <c>build</c> and never asks about anything beneath it.
-    /// Only widen this if some caller starts asking bottom-up.</para>
+    /// A caller that asks bottom-up tests each ancestor as well, through
+    /// <c>DirectoryBackupService.BuildExcludedSubtreeTest</c>.</para>
     ///
     /// <para><b>Soundness depends on <c>*</c> crossing separators here</b>
     /// (see <see cref="GlobToRegexPattern"/>: <c>*</c> becomes <c>.*</c>). That

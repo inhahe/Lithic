@@ -386,4 +386,126 @@ public class SourceSelection
             current = existing;
         }
     }
+
+    /// <summary>
+    /// Remove entries that lie inside folders the set excludes entirely and say no
+    /// more than "included". This undoes what <see cref="MaterializeDirectory"/>
+    /// did for folders whose files could never be backed up.
+    /// </summary>
+    /// <remarks>
+    /// <para>The Worker pins every folder created under an auto-include parent,
+    /// and a build makes thousands of them (cargo's fingerprint, incremental and
+    /// deps folders) under <c>debug</c> and <c>release</c> trees that the set's
+    /// own rules exclude. Every load of the set parses them.</para>
+    /// <para>A node goes only when removing it changes what the tree includes for
+    /// no path at all, now or after the exclusion rule is deleted: its parent
+    /// includes unlisted descendants (<see cref="IncludesUnlistedDescendants"/>),
+    /// and it and everything it lists include everything beneath them. An
+    /// excluded entry, a folder that backs up only the children it lists, and
+    /// anything under a parent that does not auto-include are choices, and stay.
+    /// The one difference is the one pinning exists for: if the parent's
+    /// auto-include is turned off later, these folders drop out with it.</para>
+    /// </remarks>
+    /// <param name="roots">The set's top-level nodes, changed in place. A top-level
+    /// node is never removed.</param>
+    /// <param name="prunesDirectory">Whether every file beneath a directory is
+    /// excluded, answered for that directory alone, as
+    /// <c>DirectoryBackupService.BuildDirectoryPruneFilter</c> does. The walk tests
+    /// each level itself.</param>
+    /// <returns>How many nodes were removed, descendants included.</returns>
+    public static int RemoveRedundantEntriesInExcludedFolders(
+        IReadOnlyList<SourceSelection> roots, Func<string, bool> prunesDirectory)
+    {
+        int removed = 0;
+        foreach (var root in roots)
+        {
+            if (!root.IsDirectory)
+                continue;
+            bool inside = AnyPrunedFrom(root.Path, stopBefore: null, prunesDirectory);
+            removed += RemoveRedundantChildren(root, inside, prunesDirectory);
+        }
+        return removed;
+    }
+
+    private static int RemoveRedundantChildren(
+        SourceSelection parent, bool parentInside, Func<string, bool> prunesDirectory)
+    {
+        if (parent.Children.Count == 0)
+            return 0;
+
+        // Removing children cannot change this. It is false exactly where the
+        // children matter to the parent: an excluded folder, a partial folder
+        // without auto-include, and a ticked folder that backs up only the
+        // children it lists.
+        bool parentIncludesUnlisted = IncludesUnlistedDescendants(parent);
+
+        int removed = 0;
+        for (int i = parent.Children.Count - 1; i >= 0; i--)
+        {
+            var child = parent.Children[i];
+            string childDirectory = child.IsDirectory
+                ? child.Path
+                : System.IO.Path.GetDirectoryName(child.Path) ?? child.Path;
+            bool inside = parentInside
+                          || AnyPrunedFrom(childDirectory, stopBefore: parent.Path, prunesDirectory);
+
+            if (inside && parentIncludesUnlisted && IncludesEverythingBeneath(child))
+            {
+                removed += CountNodes(child);
+                parent.Children.RemoveAt(i);
+            }
+            else if (child.IsDirectory)
+            {
+                removed += RemoveRedundantChildren(child, inside, prunesDirectory);
+            }
+        }
+        return removed;
+    }
+
+    /// <summary>
+    /// Whether <paramref name="directory"/> or a directory above it, up to but not
+    /// including <paramref name="stopBefore"/> (null: up to the volume root), is
+    /// pruned. Testing every level keeps the answer right for a tree that lists a
+    /// node without its intermediate folders.
+    /// </summary>
+    private static bool AnyPrunedFrom(
+        string directory, string? stopBefore, Func<string, bool> prunesDirectory)
+    {
+        for (string? dir = directory; !string.IsNullOrEmpty(dir); dir = System.IO.Path.GetDirectoryName(dir))
+        {
+            if (stopBefore is not null
+                && string.Equals(dir.TrimEnd('\\'), stopBefore.TrimEnd('\\'), StringComparison.OrdinalIgnoreCase))
+                return false;
+            if (prunesDirectory(dir))
+                return true;
+        }
+        return false;
+    }
+
+    /// <summary>
+    /// Whether a node and every node it lists include every path beneath them, so
+    /// that, under a parent that includes unlisted descendants, the node records
+    /// nothing the parent does not already say.
+    /// </summary>
+    private static bool IncludesEverythingBeneath(SourceSelection node)
+    {
+        if (!node.IsDirectory)
+            return node.IsSelected == true;
+        if (!IncludesUnlistedDescendants(node))
+            return false;
+        foreach (var child in node.Children)
+        {
+            if (!IncludesEverythingBeneath(child))
+                return false;
+        }
+        return true;
+    }
+
+    private static int CountNodes(SourceSelection node)
+    {
+        int count = 1;
+        foreach (var child in node.Children)
+            count += CountNodes(child);
+        return count;
+    }
 }

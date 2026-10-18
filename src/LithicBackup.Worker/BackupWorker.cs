@@ -514,6 +514,7 @@ public sealed class BackupWorker : BackgroundService
             // roots). Used to decide which volumes to read and which changes
             // are relevant.
             state.WatchRoots = ResolveWatchRoots(set);
+            state.ApplyExclusionRules(set.JobOptions);
         }
 
         // Remove sets that no longer exist in the catalog.
@@ -525,6 +526,88 @@ public sealed class BackupWorker : BackgroundService
 
         _loadedSetsStamp = stamp;
 
+        await RemoveRedundantSelectionEntriesAsync(ct);
+    }
+
+    /// <summary>
+    /// Remove from each set's saved selection the entries that lie inside folders
+    /// its own rules exclude entirely and record nothing but "included"
+    /// (<see cref="SourceSelection.RemoveRedundantEntriesInExcludedFolders"/>).
+    /// They are folders auto-include pinned before it learned to skip excluded
+    /// ones: they cannot change any backup, and every read of the set parses them.
+    /// Runs after each reload, so a rule the user adds later clears what it
+    /// covers too.
+    /// </summary>
+    private async Task RemoveRedundantSelectionEntriesAsync(CancellationToken ct)
+    {
+        foreach (var state in _sets.Values)
+        {
+            if (state.BackupSet.SourceSelections is not { Count: > 0 } loaded)
+                continue;
+
+            // Tried on the loaded copy first, which is ours to change: in the
+            // usual case nothing is removable and the catalog is not touched.
+            if (SourceSelection.RemoveRedundantEntriesInExcludedFolders(loaded, state.PrunesDirectory) == 0)
+                continue;
+
+            await ChangeSavedSelectionAsync(state, "remove redundant entries from", (set, selections) =>
+            {
+                int removed = SourceSelection.RemoveRedundantEntriesInExcludedFolders(
+                    selections, state.PrunesDirectory);
+                if (removed > 0)
+                {
+                    _logger.LogInformation(
+                        "Removed {Count} entries from the selection of \"{Name}\": they lie inside folders "
+                        + "its exclusion rules exclude entirely, so they could not affect any backup.",
+                        removed, set.Name);
+                }
+                return removed;
+            }, ct);
+        }
+    }
+
+    /// <summary>
+    /// Change a set's saved selection: read the set fresh from the catalog, apply
+    /// <paramref name="change"/> to its selection, save it if the change reports
+    /// doing anything, and adopt the saved copy for this pass and later ones.
+    /// </summary>
+    /// <remarks>
+    /// Read fresh rather than taken from the Worker's copy, which can be a pass
+    /// old: writing that back would undo an edit the GUI saved in the meantime.
+    /// Reading fresh confines the read-modify-write to milliseconds. (The reverse
+    /// race, the GUI saving over a change made while its editor was open, is
+    /// benign: the change is made again the next time it applies.)
+    /// Failures are logged and leave the set as it was.
+    /// </remarks>
+    /// <param name="purpose">Completes "Could not … the selection of set N", for the log.</param>
+    /// <param name="change">Edits the fresh selection in place and returns how many
+    /// things it changed; 0 means nothing to save.</param>
+    private async Task ChangeSavedSelectionAsync(
+        SetState state, string purpose,
+        Func<BackupSet, List<SourceSelection>, int> change, CancellationToken ct)
+    {
+        try
+        {
+            var fresh = await _catalog.GetBackupSetAsync(state.BackupSet.Id, ct);
+            if (fresh?.SourceSelections is not { Count: > 0 } selections)
+                return;
+
+            if (change(fresh, selections) == 0)
+                return;
+
+            await _catalog.UpdateBackupSetAsync(fresh, ct);
+            state.BackupSet = fresh;
+            state.WatchRoots = ResolveWatchRoots(fresh);
+        }
+        catch (OperationCanceledException) when (ct.IsCancellationRequested)
+        {
+            throw;
+        }
+        catch (Exception ex)
+        {
+            _logger.LogWarning(ex,
+                "Could not {Purpose} the selection of set {Id}.", purpose, state.BackupSet.Id);
+        }
     }
 
     /// <summary>
@@ -897,7 +980,7 @@ public sealed class BackupWorker : BackgroundService
                     {
                         foreach (var state in continuousSets)
                         {
-                            if (PathBelongsToSet(state.BackupSet, change.FullPath))
+                            if (IsPinCandidate(state, change.FullPath))
                                 discoveredDirs.Add((state, change.FullPath));
                         }
                     }
@@ -906,7 +989,7 @@ public sealed class BackupWorker : BackgroundService
 
                 foreach (var state in continuousSets)
                 {
-                    if (PathBelongsToSet(state.BackupSet, change.FullPath))
+                    if (IsBackupCandidate(state, change.FullPath))
                     {
                         state.Pending[change.FullPath] =
                             state.Pending.TryGetValue(change.FullPath, out var t)
@@ -1200,7 +1283,7 @@ public sealed class BackupWorker : BackgroundService
                     {
                         foreach (var state in continuousSets)
                         {
-                            if (PathBelongsToSet(state.BackupSet, change.FullPath))
+                            if (IsPinCandidate(state, change.FullPath))
                                 _drainDiscoveredDirs.Add((state, change.FullPath));
                         }
                     }
@@ -1209,7 +1292,7 @@ public sealed class BackupWorker : BackgroundService
 
                 foreach (var state in continuousSets)
                 {
-                    if (PathBelongsToSet(state.BackupSet, change.FullPath))
+                    if (IsBackupCandidate(state, change.FullPath))
                     {
                         state.Pending[change.FullPath] =
                             state.Pending.TryGetValue(change.FullPath, out var t)
@@ -1547,7 +1630,9 @@ public sealed class BackupWorker : BackgroundService
                     // A plain Changed on a directory is just its child list or
                     // timestamp updating — the child's own event covers the real
                     // change — so skip it to avoid re-walking the tree on every write.
-                    if (changeType is FileChangeType.Created or FileChangeType.Renamed)
+                    // Nothing in a wholly excluded tree is queued or pinned.
+                    if ((changeType is FileChangeType.Created or FileChangeType.Renamed)
+                        && !state.IsInsideExcludedSubtree(changedPath))
                     {
                         EnqueueForBackup(state, changedPath, isDirectory: true, now);
                         // A new folder covered only by auto-include should also become
@@ -1555,7 +1640,7 @@ public sealed class BackupWorker : BackgroundService
                         discoveredDirs.Add((state, changedPath));
                     }
                 }
-                else
+                else if (!state.IsExcludedFile(changedPath))
                 {
                     state.Pending[changedPath] =
                         state.Pending.TryGetValue(changedPath, out var t) ? (t.First, now) : (now, now);
@@ -1598,13 +1683,10 @@ public sealed class BackupWorker : BackgroundService
     /// of scope at that point without ever having been backed up as a real entry).
     /// </summary>
     /// <remarks>
-    /// Each affected set is re-read fresh from the catalog before mutation rather
-    /// than persisting the worker's in-memory copy: that copy can be up to a poll
-    /// interval stale, so writing it back would clobber any edit the GUI saved in
-    /// the meantime. Reading fresh confines the read-modify-write to a sub-second
-    /// window and preserves everything the user changed. (The reverse race — the
-    /// GUI overwriting a pin made while its editor was open — is benign: while
-    /// auto-include stays on the folder is simply re-pinned on its next change.)
+    /// Goes through <see cref="ChangeSavedSelectionAsync"/>, which re-reads the set
+    /// so that a GUI edit is not overwritten, and adopts the pinned tree so this
+    /// pass's later stages and later passes route against it. Callers pass only
+    /// folders outside wholly excluded trees (<see cref="IsPinCandidate"/>).
     /// Legacy root-only sets have no selection tree to pin into and are skipped.
     /// </remarks>
     private async Task MaterializeDiscoveredDirectoriesAsync(
@@ -1619,55 +1701,49 @@ public sealed class BackupWorker : BackgroundService
             if (state.BackupSet.SourceSelections is not { Count: > 0 })
                 continue; // legacy root-only set — nothing to pin into.
 
-            BackupSet? fresh;
-            try
-            {
-                fresh = await _catalog.GetBackupSetAsync(state.BackupSet.Id, ct);
-            }
-            catch (Exception ex)
-            {
-                _logger.LogWarning(ex,
-                    "Failed reloading set {Id} to pin auto-included folders — will retry next poll.",
-                    state.BackupSet.Id);
-                continue;
-            }
+            var dirs = group
+                .Select(d => d.Dir)
+                .Distinct(StringComparer.OrdinalIgnoreCase)
+                .ToList();
 
-            if (fresh?.SourceSelections is not { Count: > 0 })
-                continue;
-
-            bool changed = false;
-            foreach (var dir in group
-                         .Select(d => d.Dir)
-                         .Distinct(StringComparer.OrdinalIgnoreCase))
+            await ChangeSavedSelectionAsync(state, "pin auto-included folders into", (set, selections) =>
             {
-                if (SourceSelection.MaterializeDirectory(fresh.SourceSelections, dir))
+                int pinned = 0;
+                foreach (var dir in dirs)
                 {
-                    changed = true;
-                    _logger.LogInformation(
-                        "Auto-included new folder \"{Dir}\" into set \"{Name}\" as a permanent selection.",
-                        dir, fresh.Name);
+                    if (SourceSelection.MaterializeDirectory(selections, dir))
+                    {
+                        pinned++;
+                        _logger.LogInformation(
+                            "Auto-included new folder \"{Dir}\" into set \"{Name}\" as a permanent selection.",
+                            dir, set.Name);
+                    }
                 }
-            }
-
-            if (!changed)
-                continue;
-
-            try
-            {
-                await _catalog.UpdateBackupSetAsync(fresh, ct);
-                // Adopt the freshly-persisted copy so this poll's later stages and
-                // subsequent polls route against the pinned tree.
-                state.BackupSet = fresh;
-                state.WatchRoots = ResolveWatchRoots(fresh);
-            }
-            catch (Exception ex)
-            {
-                _logger.LogWarning(ex,
-                    "Failed persisting auto-included folders for set \"{Name}\" — will retry next poll.",
-                    fresh.Name);
-            }
+                return pinned;
+            }, ct);
         }
     }
+
+    /// <summary>
+    /// Whether a changed file should be queued for this set's continuous backup:
+    /// it is in the selection, and the set's rules do not exclude it. The backup
+    /// would skip an excluded file anyway; dropping it here keeps it out of the
+    /// queue, which a build can otherwise fill with thousands of them, held in
+    /// memory for as long as the destination stays unplugged. Moves are
+    /// routed by <see cref="PathBelongsToSet"/> alone, since a move into an
+    /// excluded folder is something <see cref="RunMovesAsync"/> must act on.
+    /// </summary>
+    private static bool IsBackupCandidate(SetState state, string path)
+        => PathBelongsToSet(state.BackupSet, path) && !state.IsExcludedFile(path);
+
+    /// <summary>
+    /// Whether a new folder should be considered for pinning into this set: it is
+    /// in the selection and not inside a tree the set's rules exclude entirely.
+    /// A pin there could never affect a backup, and builds create such folders by
+    /// the thousand.
+    /// </summary>
+    private static bool IsPinCandidate(SetState state, string directory)
+        => PathBelongsToSet(state.BackupSet, directory) && !state.IsInsideExcludedSubtree(directory);
 
     /// <summary>
     /// Whether a changed path belongs to a backup set, honoring the selection
@@ -2030,7 +2106,8 @@ public sealed class BackupWorker : BackgroundService
 
     /// <summary>
     /// Queue a path for a normal continuous backup. For a directory, enqueues
-    /// every file beneath it; for a file, enqueues the file itself.
+    /// every file beneath it that the set's rules do not exclude; for a file,
+    /// enqueues the file itself.
     /// </summary>
     private static void EnqueueForBackup(SetState state, string path, bool isDirectory, DateTime now)
     {
@@ -2047,7 +2124,10 @@ public sealed class BackupWorker : BackgroundService
             }
 
             foreach (var f in files)
-                state.Pending[f] = state.Pending.TryGetValue(f, out var t) ? (t.First, now) : (now, now);
+            {
+                if (!state.IsExcludedFile(f))
+                    state.Pending[f] = state.Pending.TryGetValue(f, out var t) ? (t.First, now) : (now, now);
+            }
         }
         else
         {
@@ -2380,6 +2460,44 @@ public sealed class BackupWorker : BackgroundService
 
         /// <summary>Full backups in a row that threw; sets the backoff before the next attempt.</summary>
         public int ConsecutiveFailures { get; set; }
+
+        /// <summary>
+        /// The set's exclusion rules as tests, rebuilt by <see cref="ApplyExclusionRules"/>
+        /// at each reload. <see cref="IsExcludedFile"/> is the backup's own per-file
+        /// filter; <see cref="PrunesDirectory"/> says whether every file beneath one
+        /// directory is excluded, answered for that directory alone;
+        /// <see cref="IsInsideExcludedSubtree"/> answers the same for the directory
+        /// or any of its ancestors.
+        /// </summary>
+        public Func<string, bool> IsExcludedFile { get; private set; } = _ => false;
+
+        /// <inheritdoc cref="IsExcludedFile"/>
+        public Func<string, bool> PrunesDirectory { get; private set; } = _ => false;
+
+        /// <inheritdoc cref="IsExcludedFile"/>
+        public Func<string, bool> IsInsideExcludedSubtree { get; private set; } = _ => false;
+
+        /// <summary>The rules the tests above were built from, so that an unchanged set does not recompile them.</summary>
+        private string? _exclusionRulesKey;
+
+        /// <summary>
+        /// Build the exclusion tests from the set's options, unless the rules are
+        /// the ones already built: they compile a regular expression per pattern,
+        /// and the sets are reloaded after every backup.
+        /// </summary>
+        public void ApplyExclusionRules(JobOptions? options)
+        {
+            var excluded = options?.ExcludedExtensions ?? [];
+            var tierSets = options?.TierSets ?? [];
+            string key = System.Text.Json.JsonSerializer.Serialize(new { excluded, tierSets });
+            if (key == _exclusionRulesKey)
+                return;
+
+            IsExcludedFile = DirectoryBackupService.BuildExclusionFilter(excluded, tierSets) ?? (_ => false);
+            PrunesDirectory = DirectoryBackupService.BuildDirectoryPruneFilter(excluded, tierSets) ?? (_ => false);
+            IsInsideExcludedSubtree = DirectoryBackupService.BuildExcludedSubtreeTest(PrunesDirectory);
+            _exclusionRulesKey = key;
+        }
 
         /// <summary>
         /// Pending continuous-mode changes for this set: path → (first seen,
