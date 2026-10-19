@@ -1310,13 +1310,34 @@ folder by folder, so all stored forms and versions of one source path are in han
 at once; it records each version under its own number (backup time = the version
 file's write time, which is when it was copied - copies do not carry the source
 timestamp - and what retention ages it by), numbers the current copy after them,
-keeps one stored form per file and version (plain, then `.dedup`, then
-`.fileref`), and commits whole paths in batches so a cancel can never leave a path
+and commits whole paths in batches so a cancel can never leave a path
 with history but no current copy (a re-run skips paths already present and would
 never fill the gap). A file's source path comes from where it sits, never from a
 `.fileref`'s own `SourcePath`: relocation moves manifests without rewriting it, so
 after a rename it named the old file. After a seed it ticks the folders it found
 only for a set with no sources yet; in an existing set that widened the selection.
+
+**Two stored forms at one current location are two versions.** `index` and
+`index.fileref` side by side were written by different backups. The newest (by
+write time, which is when it was copied) is the current copy; each older one is
+moved into `{drive}_prev` under the next free number and recorded, as the engine
+would have filed it. All hashing is done before any move, so a cancel cannot
+strand a moved file unrecorded; a file that cannot be moved stays where it is,
+untracked, and is counted. The seed used to keep the plain form whatever its age
+and leave the other untracked: on one real destination 23,190 `.fileref`s, every
+one an older pointer to EMPTY content (git's index and `.claude.json` are briefly
+zero bytes while being rewritten), which Cleanup's destination scan then listed as
+untracked straight after the seed. Keeping "plain first" could also record a stale
+plain copy as current, or leave out a plain copy that another file's `.fileref`
+needs for its content. They came from continuous backup applying a rename OVER a
+backed-up file (git's `index.lock` -> `index`) as a move: `MoveTargetedAsync`
+relocated the renamed file's `.fileref` beside the target's plain copy and merged
+the two chains. It now falls back when the target path already has a backup (any
+record, live or not, so no two chains ever share a path), which backs the target up
+as its next version; only a case-only rename, the same file, still relocates.
+Two forms of one numbered HISTORY version (`x.v3` and
+`x.v3.fileref`) cannot both be version 3, so there one is still kept (plain, then
+`.dedup`, then `.fileref`) and the other left untracked.
 
 **Catalog-writing work holds the set's row, wherever it was started.** Seeding
 and Clear Backup History call `BeginRowWork`/`EndRowWork`: the row goes into
@@ -1422,6 +1443,37 @@ close prompt silent (the edit was lost on closing). `TierSetViewModel.TiersEdite
 reports them, and the editor subscribes to every tier set it holds. A change in
 the NUMBER of tiers also invalidates the cached exclusion filter, since it can
 turn a set into an exclusion set. Pinned by `tools\editor_save_test` §16.
+
+## Opening a `.lithic` file reaches the one running window
+
+The installer associates `.lithic` with `LithicBackup.exe "%1"` (component
+`ExportFileAssociation`, non-advertised, so plain HKCR rows that uninstall
+removes). The app is single-instance per session, so a double-click while it runs
+starts a second process that must hand the file over and exit. It writes the
+path to `%LOCALAPPDATA%\LithicBackup\open-requests\` (`OpenRequestQueue`: one file
+per request, written under a temporary name and renamed so it is never read half
+written) and then sets the existing "show window" event. The running app, on that
+event or at the end of its own startup, takes every queued request and offers
+each in turn (`MainViewModel.OfferOpenedFilesAsync`: what the file holds, then
+Yes/No, then the ordinary import). A folder rather than a pipe because nothing
+has to be listening at the moment of the hand-over - the running app may still be
+on its splash screen - and requests opened together queue in order. Requests older
+than ten minutes are dropped unread, so one left behind by a crash does not pop up
+later. The GUI runs unelevated, so opening a file never prompts for elevation, and
+the queue is per user, as the single-instance names are per session.
+
+## A drive row's size is provisional until the drive is counted
+
+Drive rows take their size from `DriveInfo` (used space) so the tree shows
+something at once. That figure comes with no file count, and every "does this
+directory still need sizing" check asked `Size < 0`, so a drive was never counted
+- unless a filter queued it for its filtered size - and its count column, reading
+"size known, count not" as "never", stayed blank while every folder row said
+"Working...". `NeedsUnfilteredTotals` (no size, or only used space) is now the one
+check, in the scheduler and the tree, so drives are walked like folders (the walk
+is cache-backed: only changed folders are re-enumerated) and show "Working..."
+until it lands. The computed total then replaces the used space, so a drive row
+describes the same files as its count and as every other row.
 
 ## Continuous backup and full scans interleave; they do not run concurrently
 

@@ -280,6 +280,82 @@ internal static class Program
         var fileFilter = DirectoryBackupService.BuildExclusionFilter([], [keepOne, none, docs, junk]);
         Check(fileFilter is not null && !fileFilter(Path.Combine(tmpDir, "a.docx")) && fileFilter(Path.Combine(tmpDir, "a.bin")),
             "and per file, x\\tmp\\a.docx is backed up while x\\tmp\\a.bin is excluded");
+
+        await RenameOverExistingAsync(root);
+    }
+
+    /// <summary>
+    /// §11. git's atomic save: index.lock is created empty, caught by a backup
+    /// while empty (so stored as a .fileref to empty content), then renamed over
+    /// index. Relocating it put index.fileref beside the plain index - the
+    /// 23,190 stale pointers found on a real destination.
+    /// </summary>
+    static async Task RenameOverExistingAsync(string root)
+    {
+        Console.WriteLine();
+        Console.WriteLine("=== 11. A rename over a file that is already backed up ===");
+        string source = Path.Combine(root, "src11"), target = Path.Combine(root, "dst11");
+        Directory.CreateDirectory(source);
+        Directory.CreateDirectory(target);
+        Directory.CreateDirectory(Path.Combine(root, "cat11"));
+        var repo = new SqliteCatalogRepository(Path.Combine(root, "cat11", "catalog.db"));
+        var svc = new DirectoryBackupService(repo, new FileScanner(repo), new VersionRetentionService(repo));
+        var keepOne = new VersionTierSet { Name = "Default", Tiers = [new() { MaxAge = null, MaxVersions = 1 }] };
+        var set = await repo.CreateBackupSetAsync(new BackupSet
+        {
+            Name = "rename-over", SourceRoots = [source], CreatedUtc = DateTime.UtcNow,
+            DefaultMediaType = MediaType.Directory,
+            JobOptions = new JobOptions { TargetDirectory = target, TierSets = [keepOne], RetentionTiers = keepOne.Tiers },
+        });
+        BackupJob Job() => new()
+        {
+            BackupSetId = set.Id,
+            Sources = [new SourceSelection { Path = source, IsDirectory = true, IsSelected = true, AutoIncludeNewSubdirectories = true }],
+            EnableFileDeduplication = true, TargetDirectory = target, ZipMode = ZipMode.None,
+            TierSets = [keepOne], RetentionTiers = keepOne.Tiers,
+        };
+        async Task Backup()
+        {
+            var r = await svc.ExecuteAsync(Job(), target, keepOne.Tiers, null, CancellationToken.None);
+            if (!r.Success) throw new Exception("backup failed");
+        }
+
+        string empty = Path.Combine(source, "empty.txt");
+        string index = Path.Combine(source, "index");
+        string lockFile = Path.Combine(source, "index.lock");
+        await File.WriteAllTextAsync(empty, "");
+        await File.WriteAllTextAsync(index, "index version one");
+        await Backup();
+        await File.WriteAllTextAsync(lockFile, "");          // git creates index.lock
+        await Backup();                                       // ...and a backup catches it empty
+        var lockHead = (await repo.GetLatestVersionInfoAsync(set.Id))[lockFile];
+        Check(lockHead.IsFileRef, "index.lock, caught empty, is stored as a .fileref");
+
+        await File.WriteAllTextAsync(lockFile, "index version two");
+        File.Move(lockFile, index, overwrite: true);          // git renames it over index
+        var outcome = await svc.MoveTargetedAsync(Job(), target, lockFile, index, isDirectory: false, CancellationToken.None);
+        Check(outcome == TargetedMoveOutcome.FellBack, $"the rename over a backed-up file falls back (got {outcome})");
+        string indexCurrent = Path.Combine(target, index[..1], index[Path.GetPathRoot(index)!.Length..]);
+        Check(!File.Exists(indexCurrent + ".fileref"), "no index.fileref is put beside index");
+
+        // What the Worker does on a fallback: back the target up as its next
+        // version, and retire the vacated name.
+        var r2 = await svc.ExecuteTargetedAsync(Job(), target, [index], keepOne.Tiers, CancellationToken.None);
+        Check(r2.Success, "backing up index afterwards succeeds");
+        await repo.MarkFilesDeletedBySourcePathsAsync(set.Id, [lockFile]);
+        var indexRows = (await repo.GetFileRecordsByPathAsync(set.Id, index)).Where(r => !r.IsDeleted).OrderBy(r => r.Version).ToList();
+        Check(indexRows.Select(r => (r.Version, r.IsFileRef)).SequenceEqual([(1, false), (2, false)]),
+            $"index has one chain: v1 in the history, v2 current (got {string.Join(",", indexRows.Select(r => r.Version + (r.IsFileRef ? "r" : "p")))})");
+        Check(File.ReadAllText(indexCurrent) == "index version two", "and its current copy holds the new content");
+
+        // A rename to a name with no backup still just relocates.
+        string other = Path.Combine(source, "other.txt"), renamed = Path.Combine(source, "renamed.txt");
+        await File.WriteAllTextAsync(other, "something else entirely");
+        await Backup();
+        File.Move(other, renamed);
+        var moved = await svc.MoveTargetedAsync(Job(), target, other, renamed, isDirectory: false, CancellationToken.None);
+        Check(moved == TargetedMoveOutcome.Relocated, $"a rename to a new name still relocates (got {moved})");
+        Microsoft.Data.Sqlite.SqliteConnection.ClearAllPools();
     }
 
     /// <summary>

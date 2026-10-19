@@ -338,11 +338,37 @@ public class SourceSelectionNodeViewModel : ViewModelBase
     /// Total number of files. For files this is always 1; for directories it
     /// is the recursive count of all contained files. -1 means not yet computed.
     /// </summary>
+    /// <summary>
+    /// The size is a drive's used space (from <c>DriveInfo</c>, available at
+    /// once), standing in until the drive has been walked. Used space comes with
+    /// no file count, so the drive still needs its totals computed.
+    /// </summary>
+    private bool _sizeIsDriveUsage;
+
+    /// <summary>Show a drive's used space until its own totals are computed.</summary>
+    internal void SetDriveUsedSpace(long usedBytes)
+    {
+        _sizeIsDriveUsage = true;
+        Size = usedBytes;
+        OnPropertyChanged(nameof(FormattedFileCount));
+    }
+
+    /// <summary>
+    /// The recursive size and file count still have to be computed: there is no
+    /// size yet, or only a drive's used space, which has no count. Every "does
+    /// this directory still need sizing" check asks this; it used to ask
+    /// <c>Size &lt; 0</c>, so drive rows - sized from <c>DriveInfo</c> - were
+    /// never counted unless a filter made them walk for their filtered size.
+    /// </summary>
+    internal bool NeedsUnfilteredTotals => _size < 0 || (_sizeIsDriveUsage && _fileCount < 0);
+
     public int FileCount
     {
         get => _fileCount;
         internal set
         {
+            if (value >= 0)
+                _sizeIsDriveUsage = false;   // computed totals have replaced used space
             if (SetProperty(ref _fileCount, value))
             {
                 OnPropertyChanged(nameof(FormattedFileCount));
@@ -428,9 +454,10 @@ public class SourceSelectionNodeViewModel : ViewModelBase
     /// In "selected only" mode, partially-selected directories show the
     /// count of selected children only.
     /// Shows "Working..." while any contributing child's count is unknown.
-    /// Drive-letter nodes whose size was set from DriveInfo (not computed
-    /// recursively) show an empty string because a file count next to the
-    /// drive's used-space figure is not meaningful.</summary>
+    /// A drive row starts with its used space as a provisional size and no
+    /// count, and shows "Working..." until its walk lands, like any other
+    /// directory. It used to show nothing at all: the count column read "size
+    /// known, count not" as "will never have a count".</summary>
     public string FormattedFileCount
     {
         get
@@ -451,13 +478,13 @@ public class SourceSelectionNodeViewModel : ViewModelBase
                     var total = ComputeSelectedChildrenFileCount();
                     return total.HasValue ? total.Value.ToString("N0") : "Working...";
                 }
-                // _size >= 0 with _fileCount < 0 means the size was set
-                // externally (DriveInfo), not computed — no file count available.
-                if (_fileCount < 0) return _size >= 0 ? "" : "Working...";
+                // No count yet: "Working..." while one is coming (including a
+                // drive showing only its used space), blank when none will.
+                if (_fileCount < 0) return NeedsUnfilteredTotals ? "Working..." : "";
                 return _fileCount.ToString("N0");
             }
-            // Same check: drive-level nodes with DriveInfo size have no file count.
-            if (_fileCount < 0) return _size >= 0 ? "" : "Working...";
+            // Same check.
+            if (_fileCount < 0) return NeedsUnfilteredTotals ? "Working..." : "";
             return _fileCount.ToString("N0");
         }
     }
@@ -1740,7 +1767,7 @@ public class SourceSelectionNodeViewModel : ViewModelBase
 
         bool hasFilter = _scheduler.GlobalExcludeFilter is not null;
         var dirNodes = candidates.Where(c => c.IsDirectory
-            && (c._size < 0 || (hasFilter && c._filteredSize < 0))).ToList();
+            && (c.NeedsUnfilteredTotals || (hasFilter && c._filteredSize < 0))).ToList();
         if (dirNodes.Count > 0)
             _ = ComputePrioritySizesAsync(dirNodes);
     }
@@ -1875,7 +1902,7 @@ public class SourceSelectionNodeViewModel : ViewModelBase
         var gf = _scheduler.GlobalExcludeFilter;
         bool hasFilter = gf is not null;
         var dirNodes = Children.Where(c => c.IsDirectory
-            && (c._size < 0 || (hasFilter && c._filteredSize < 0))).ToList();
+            && (c.NeedsUnfilteredTotals || (hasFilter && c._filteredSize < 0))).ToList();
         if (dirNodes.Count > 0)
         {
             if (isVisible)
@@ -1885,7 +1912,7 @@ public class SourceSelectionNodeViewModel : ViewModelBase
                 // traversal) so the UI shows numbers instantly.  Filtered
                 // sizes are NOT computed inline — the scheduler handles them
                 // asynchronously so we don't block the UI.
-                var needsUnfiltered = dirNodes.Where(n => n._size < 0).ToList();
+                var needsUnfiltered = dirNodes.Where(n => n.NeedsUnfilteredTotals).ToList();
                 if (needsUnfiltered.Count > 0)
                 {
                     var scheduler = _scheduler;

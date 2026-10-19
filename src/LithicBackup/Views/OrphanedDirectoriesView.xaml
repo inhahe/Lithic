@@ -481,16 +481,15 @@
                            TextWrapping="Wrap" />
             </Border>
 
-            <!-- Action row: transient purge progress (left) + buttons (right) -->
+            <!-- Action row: transient purge progress (left) + buttons (right).
+                 The buttons are docked FIRST, so they get their width before the
+                 progress text does. The text came first and was docked left, so
+                 it was measured against the whole row: a long path took all of
+                 it, and the buttons were left with no room and drawn over. Now
+                 the text fills only what the buttons leave, and wraps there. -->
             <DockPanel>
-                <!-- Wrapped: it shows the full path of the file being deleted. -->
-                <TextBlock Text="{Binding PurgeStatusText}"
-                           Foreground="{StaticResource TextSecondaryBrush}"
-                           FontSize="11" VerticalAlignment="Center"
-                           TextWrapping="Wrap"
-                           Margin="0,0,12,0" />
-
-                <StackPanel Orientation="Horizontal" HorizontalAlignment="Right">
+                <StackPanel DockPanel.Dock="Right" Orientation="Horizontal"
+                            VerticalAlignment="Center">
                     <Button Content="Close" Command="{Binding CloseCommand}"
                             Padding="16,8" Margin="0,0,8,0" Cursor="Hand" />
                     <!-- Only present while a purge is running. A large cleanup
@@ -506,6 +505,13 @@
                             Command="{Binding PurgeSelectedCommand}"
                             ToolTip="Marks the selected catalog records as deleted and physically removes the matching files from the backup destination (when one is configured)." />
                 </StackPanel>
+
+                <!-- Wrapped: it shows the full path of the file being deleted. -->
+                <TextBlock Text="{Binding PurgeStatusText}"
+                           Foreground="{StaticResource TextSecondaryBrush}"
+                           FontSize="11" VerticalAlignment="Center"
+                           TextWrapping="Wrap"
+                           Margin="0,0,12,0" />
             </DockPanel>
         </DockPanel>
 

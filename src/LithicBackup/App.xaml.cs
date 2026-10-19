@@ -32,6 +32,23 @@ public partial class App : Application
     private RegisteredWaitHandle? _showInstanceWait;
     private bool _ownsSingleInstance;
 
+    // --- Opened export files (see OpenRequestQueue) ---
+    private string[] _startupArgs = [];
+    private MainViewModel? _mainViewModel;
+
+    /// <summary>
+    /// Offer every queued export file as a backup set. Nothing until the main
+    /// window exists; startup calls this again once it does.
+    /// </summary>
+    private void OfferOpenedFiles()
+    {
+        if (_mainViewModel is null)
+            return;
+        var files = OpenRequestQueue.TakeAll();
+        if (files.Count > 0)
+            _ = _mainViewModel.OfferOpenedFilesAsync(files);
+    }
+
     // --- Installer shutdown signal (IPC) ---
     // The upgrade installer needs the running GUI gone before its file-in-use
     // check (InstallValidate), or the upgrade fails with "The setup was unable to
@@ -131,6 +148,8 @@ public partial class App : Application
         if (SkipStartupForTests)
             return;
 
+        _startupArgs = e.Args;
+
         // --- Crash diagnostics ---
         // Install process-global exception capture as the very first thing, so
         // even a failure during startup is recorded. Writes full stack traces +
@@ -218,19 +237,27 @@ public partial class App : Application
 
         if (!_ownsSingleInstance)
         {
-            // Another instance owns the mutex — wake it and bow out before
-            // any windows or services are created.
+            // Another instance owns the mutex — hand it any export files this
+            // launch was asked to open (it offers them when it wakes), then wake
+            // it and bow out before any windows or services are created.
+            OpenRequestQueue.Enqueue(OpenRequestQueue.FilesFromArguments(_startupArgs));
             _showInstanceEvent.Set();
             Shutdown();
             return;
         }
 
         // We're the primary instance.  Listen for future launches asking us
-        // to bring the window forward.  The callback marshals onto the UI
-        // dispatcher; ShowMainWindow tolerates a not-yet-created window.
+        // to bring the window forward, and to offer the files they handed over.
+        // The callback marshals onto the UI dispatcher; ShowMainWindow tolerates
+        // a not-yet-created window, and files queued before the main window
+        // exists are picked up when startup finishes.
         _showInstanceWait = ThreadPool.RegisterWaitForSingleObject(
             _showInstanceEvent,
-            (_, _) => Current?.Dispatcher.BeginInvoke(new Action(ShowMainWindow)),
+            (_, _) => Current?.Dispatcher.BeginInvoke(new Action(() =>
+            {
+                ShowMainWindow();
+                OfferOpenedFiles();
+            })),
             state: null,
             millisecondsTimeOutInterval: Timeout.Infinite,
             executeOnlyOnce: false);
@@ -440,6 +467,13 @@ public partial class App : Application
         // Force it to the front with the same activation dance (Activate + brief
         // Topmost toggle) the tray "Open" path uses.
         ShowMainWindow();
+
+        // Export files this launch was asked to open (a .lithic double-clicked
+        // in Explorer), and any a second launch handed over while this one was
+        // still starting: offer each as a backup set.
+        _mainViewModel = mainViewModel;
+        OpenRequestQueue.Enqueue(OpenRequestQueue.FilesFromArguments(_startupArgs));
+        OfferOpenedFiles();
 
         // Start background monitoring if there are existing backup sets.
         _ = StartBackgroundMonitoringAsync();
@@ -702,12 +736,33 @@ public partial class App : Application
     internal void MinimizeToTray()
     {
         MainWindow?.Hide();
-        _notifyIcon?.ShowBalloonTip(
-            1500,
-            "Lithic Backup",
-            "Minimized to tray. Background monitoring continues.",
-            WinForms.ToolTipIcon.Info);
+        var (text, icon) = TrayBalloonText(Services.WorkerServiceHelper.GetStatus());
+        _notifyIcon?.ShowBalloonTip(1500, "Lithic Backup", text, icon);
     }
+
+    /// <summary>
+    /// What to say on minimizing to the tray. It used to be "Background
+    /// monitoring continues" whatever the state - read as "backups carry on",
+    /// though only the Worker service runs automated backups. What the app
+    /// itself keeps doing in the tray is suggesting a backup when files change
+    /// and warning when a destination fills up; with the service stopped or not
+    /// installed, no backup runs at all until it is started.
+    /// </summary>
+    internal static (string Text, WinForms.ToolTipIcon Icon) TrayBalloonText(Services.ServiceState state) => state switch
+    {
+        Services.ServiceState.Running or Services.ServiceState.StartPending =>
+            ("Minimized to tray. The background service keeps running your automated backups.",
+             WinForms.ToolTipIcon.Info),
+        Services.ServiceState.Stopped or Services.ServiceState.StopPending =>
+            ("Minimized to tray. The background service is stopped, so no automated backups will run "
+             + "until you start it (in the main window).",
+             WinForms.ToolTipIcon.Warning),
+        Services.ServiceState.NotInstalled =>
+            ("Minimized to tray. The background service is not installed, so no automated backups will run "
+             + "until you install it (in the main window).",
+             WinForms.ToolTipIcon.Warning),
+        _ => ("Minimized to tray.", WinForms.ToolTipIcon.Info),
+    };
 
     private void ShowMainWindow()
     {

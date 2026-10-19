@@ -259,6 +259,7 @@ internal static class Program
 #endif
 #if !OLD_CODE
         await UnitTestsAsync();
+        await LayoutAndSmallFixesAsync();
         await SeedHoldsTheRowAsync(dbPath);
 #endif
         Check(_dialogs.Unexpected.Count == 0,
@@ -727,6 +728,165 @@ internal static class Program
             held.Dispose();
         }
         await EnsureClosedAsync(ed2.Window);
+    }
+#endif
+
+#if !OLD_CODE
+    static IEnumerable<T> Descendants<T>(DependencyObject root) where T : DependencyObject
+    {
+        int n = System.Windows.Media.VisualTreeHelper.GetChildrenCount(root);
+        for (int i = 0; i < n; i++)
+        {
+            var c = System.Windows.Media.VisualTreeHelper.GetChild(root, i);
+            if (c is T t) yield return t;
+            foreach (var d in Descendants<T>(c)) yield return d;
+        }
+    }
+
+    static Rect BoundsIn(FrameworkElement e, System.Windows.Media.Visual ancestor) =>
+        e.TransformToAncestor(ancestor).TransformBounds(new Rect(e.RenderSize));
+
+    /// <summary>
+    /// 17-21: Cleanup's action row with a long path, the seed result line, the
+    /// tray balloon, drive-row counts, and opening a .lithic export.
+    /// </summary>
+    static async Task LayoutAndSmallFixesAsync()
+    {
+        string longPath = @"D:\" + string.Join(@"\", Enumerable.Repeat("a-rather-long-folder-name-without-spaces", 8)) + @"\file.bin";
+
+        // --- 17. Cleanup: the progress line wraps before the buttons ---
+        Console.WriteLine();
+        Console.WriteLine("=== 17. Cleanup's progress line wraps before its buttons ===");
+        var set = await DbSetAsync();
+        var cleanupVm = new OrphanedDirectoriesViewModel(_catalog, set) { PurgeStatusText = "Deleting files: " + longPath };
+        var host = new Window
+        {
+            Width = 900, Height = 700, Left = -20000, Top = -20000,
+            WindowStyle = WindowStyle.None, ShowInTaskbar = false, ShowActivated = false,
+            Content = new OrphanedDirectoriesView { DataContext = cleanupVm },
+        };
+        host.Show();
+        await Task.Delay(300);
+        host.UpdateLayout();
+        var content = (FrameworkElement)host.Content;
+        var buttons = Descendants<System.Windows.Controls.Button>(content)
+            .Where(b => b.Content is "Close" or "Clean Selected").ToList();
+        var status = Descendants<System.Windows.Controls.TextBlock>(content)
+            .FirstOrDefault(t => t.Text == cleanupVm.PurgeStatusText);
+        Check(buttons.Count == 2 && status is not null, "found the action row's buttons and progress line");
+        if (buttons.Count == 2 && status is not null)
+        {
+            var sb = BoundsIn(status, content);
+            foreach (var b in buttons)
+            {
+                var bb = BoundsIn(b, content);
+                Check(b.ActualWidth > 20 && bb.Right <= content.ActualWidth + 0.5,
+                    $"'{b.Content}' is fully on screen ({bb.Left:F0}-{bb.Right:F0} of {content.ActualWidth:F0})");
+                Check(sb.Right <= bb.Left + 0.5, $"and the progress line ends before it ({sb.Right:F0} <= {bb.Left:F0})");
+            }
+            Check(status.ActualHeight > status.FontSize * 2, "the long path wraps onto more lines");
+        }
+        host.Close();
+
+        // --- 18. the seed result line wraps instead of being cut off ---
+        Console.WriteLine();
+        Console.WriteLine("=== 18. the seed result line wraps ===");
+        var ed = await OpenEditorAsync("seed line");
+        if (ed is not null)
+        {
+            var tabs = Descendants<System.Windows.Controls.TabControl>(ed.Window).FirstOrDefault();
+            var general = tabs?.Items.OfType<System.Windows.Controls.TabItem>().FirstOrDefault(t => (t.Header as string) == "General");
+            if (general is not null) tabs!.SelectedItem = general;
+            ed.Vm.SeedResult = "Imported 1,223,361 files (210,521 earlier versions; 33 duplicate stored copies were left alone). "
+                               + "Run a backup next: it copies only what changed, and resumes automated backups.";
+            await Task.Delay(400);
+            ed.Window.UpdateLayout();
+            var line = Descendants<System.Windows.Controls.TextBlock>(ed.Window).FirstOrDefault(t => t.Text == ed.Vm.SeedResult);
+            Check(line is not null, "found the seed result line on the General tab");
+            if (line is not null)
+            {
+                var panel = (FrameworkElement)System.Windows.Media.VisualTreeHelper.GetParent(line);
+                Check(line.ActualWidth <= panel.ActualWidth + 0.5,
+                    $"it fits its panel ({line.ActualWidth:F0} <= {panel.ActualWidth:F0})");
+                Check(line.ActualHeight > line.FontSize * 2, "and wraps onto more lines rather than running off");
+            }
+            ed.Vm.SeedResult = "";
+            await EnsureClosedAsync(ed.Window);
+        }
+
+        // --- 19. the tray balloon says whether automated backups run ---
+        Console.WriteLine();
+        Console.WriteLine("=== 19. the tray balloon follows the service's state ===");
+        Check(App.TrayBalloonText(LithicBackup.Services.ServiceState.Running).Text.Contains("keeps running"),
+            "running: automated backups carry on");
+        Check(App.TrayBalloonText(LithicBackup.Services.ServiceState.Stopped).Text.Contains("is stopped, so no automated backups"),
+            "stopped: says no automated backups will run");
+        Check(App.TrayBalloonText(LithicBackup.Services.ServiceState.NotInstalled).Text.Contains("not installed"),
+            "not installed: says so");
+        Check(!App.TrayBalloonText(LithicBackup.Services.ServiceState.Stopped).Text.Contains("monitoring continues"),
+            "and none claims monitoring continues");
+
+        // --- 20. drive rows show Working... until counted ---
+        Console.WriteLine();
+        Console.WriteLine("=== 20. a drive row's file count ===");
+        var drive = new SourceSelectionNodeViewModel(@"Q:\", true, null);
+        drive.SetDriveUsedSpace(123_456_789);
+        Check(drive.FormattedFileCount == "Working...", $"with only its used space: \"{drive.FormattedFileCount}\"");
+        Check(drive.NeedsUnfilteredTotals, "and it is still to be counted");
+        drive.Size = 120_000_000;
+        drive.FileCount = 4_321;
+        Check(drive.FormattedFileCount == "4,321" && !drive.NeedsUnfilteredTotals, $"counted: \"{drive.FormattedFileCount}\"");
+        var folder = new SourceSelectionNodeViewModel(@"Q:\x", true, null);
+        Check(folder.FormattedFileCount == "Working..." && folder.NeedsUnfilteredTotals, "an uncounted folder: Working..., as before");
+
+        // --- 21. opening a .lithic export ---
+        Console.WriteLine();
+        Console.WriteLine("=== 21. opening a .lithic export offers to add it ===");
+        string q = Path.Combine(_root, "open-requests");
+        LithicBackup.Services.OpenRequestQueue.DirectoryOverride = q;
+        string export = Path.Combine(_root, "shared.lithic");
+        await BackupSetTransfer.ExportAsync(_catalog, set, export, includeHistory: false);
+        var fromArgs = LithicBackup.Services.OpenRequestQueue.FilesFromArguments(
+            ["--test-mode", export, Path.Combine(_root, "missing.lithic"), Path.Combine(_root, "notes.txt")]);
+        Check(fromArgs.Count == 1 && fromArgs[0] == export, "the command line yields just the existing export");
+        string second = Path.Combine(_root, "second.lithic");
+        File.Copy(export, second);
+        LithicBackup.Services.OpenRequestQueue.Enqueue([export, second]);
+        var taken = LithicBackup.Services.OpenRequestQueue.TakeAll();
+        Check(taken.SequenceEqual([export, second]), "queued requests come back once, in order");
+        Check(LithicBackup.Services.OpenRequestQueue.TakeAll().Count == 0, "and are gone after");
+        LithicBackup.Services.OpenRequestQueue.Enqueue([export]);
+        foreach (var f in Directory.GetFiles(q, "*.txt"))
+            File.SetLastWriteTimeUtc(f, DateTime.UtcNow.AddHours(-1));
+        Check(LithicBackup.Services.OpenRequestQueue.TakeAll().Count == 0, "a request left behind an hour ago is dropped");
+
+        int before = await SetCountAsync();
+        _dialogs.Expect("Open Backup Set", DialogWatcher.IDNO);
+        await _vm.OfferOpenedFilesAsync([export]);
+        Check(_dialogs.WasAnswered("Open Backup Set"), "it asks whether to add the set");
+        Check(await SetCountAsync() == before, "No adds nothing");
+        _dialogs.ClearExpectations();
+
+        _dialogs.Expect("Open Backup Set", DialogWatcher.IDYES);
+        _dialogs.Expect("Import Backup Set", DialogWatcher.IDOK);
+        await _vm.OfferOpenedFilesAsync([export]);
+        var sets = await _observer.GetAllBackupSetsAsync();
+        Check(sets.Count == before + 1, "Yes adds it");
+        var added = sets.Where(s => s.Id != _setId && s.Name == set.Name).OrderByDescending(s => s.Id).FirstOrDefault();
+        Check(added is { JobOptions.HoldAutomatedBackups: true } || added is { JobOptions: null },
+            "as an imported set, automated backups held");
+        _dialogs.ClearExpectations();
+        if (added is not null)
+            await _observer.DeleteBackupSetAsync(added.Id);
+
+        string junk = Path.Combine(_root, "junk.lithic");
+        File.WriteAllText(junk, "not an export");
+        _dialogs.Expect("Open Backup Set", DialogWatcher.IDOK);
+        await _vm.OfferOpenedFilesAsync([junk]);
+        Check(_dialogs.WasAnswered("Open Backup Set") && await SetCountAsync() == before,
+            "a file that is not an export says so and adds nothing");
+        _dialogs.ClearExpectations();
+        LithicBackup.Services.OpenRequestQueue.DirectoryOverride = null;
     }
 #endif
 

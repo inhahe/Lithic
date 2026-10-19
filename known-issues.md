@@ -1,5 +1,40 @@
 # LithicBackup — Known Issues & Tech Debt
 
+## FIXED: a seed left thousands of `.fileref` files untracked (2026-10-19, 1.14.0)
+
+Straight after seeding a set, Cleanup's destination scan listed 23,190 untracked
+files on it - exactly the number the seed had logged as "duplicate stored copies
+left untracked". Each was a `.fileref` beside a plain copy of the same file
+(`.git\index` and `index.fileref`, `.claude.json` and `.claude.json.fileref`).
+Inspected on the other set's drive, every such pointer was OLDER than the plain
+copy and pointed at EMPTY content (SHA-256 `e3b0c442…`): those files are briefly
+zero bytes while their programs rewrite them. The pairs came over from the old
+computer's destination (dated before the move).
+
+**Cause, reproduced:** continuous backup applied a rename OVER an already
+backed-up file as a move. git writes `index.lock`, which a backup can catch while
+still empty (so stored as a `.fileref` to empty content), and renames it over
+`index`. `MoveTargetedAsync` relocated `index.lock.fileref` to `index.fileref` -
+no collision with the plain `index`, so the move succeeded - and repointed its
+records to `index`: two version chains under one path. The next change filed the
+plain copy into `_prev` (its record had the higher number) and left the stale
+pointer at the current location for good. When both copies were plain the move
+collided and fell back, which is why only pointers piled up. A rename onto a path
+that already has a backup now falls back (the target is backed up as its next
+version, the vacated name retired); a case-only rename still relocates. Pinned by
+`tools\excess_versions_test` §11, which yields `1p,1r,2p` without the fix.
+
+The seed kept the plain form whatever its age and left the other untracked. For
+these, that was the right copy and deleting the leftovers lost nothing; but it
+could also have recorded a stale plain copy as current, or left out a plain copy
+that another file's `.fileref` needs. Now the newest form is current and older
+ones are moved into the history and recorded (design.md, "Two stored forms at one
+current location are two versions"). Pinned by `tools\history_transfer_test` §6.
+
+**Open:** destinations backed up by earlier versions can hold such pairs, and
+their catalogs two chains under one path (`index.lock`'s, repointed to `index`).
+Seeding sorts out the destination; an existing catalog is not repaired.
+
 ## FIXED: emptying Default could not be saved, would have excluded most files, and left its versions forever (2026-10-19, 1.13.0)
 
 Reported as "it's retaining versions of files I don't have in my tiers": large

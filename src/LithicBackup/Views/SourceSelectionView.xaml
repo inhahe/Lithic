@@ -755,35 +755,42 @@
                                   Margin="0,0,12,0"
                                   Visibility="{Binding IsEditMode, Converter={StaticResource BoolToVis}}"
                                   ToolTip="Skip SHA-256 hashing of plain copies during import. Much faster — incremental detection uses file size and timestamps, not content hashes. Leave it off if the backup used file-level dedup: a .fileref finds its content by hash, so references to unhashed copies would not resolve on restore." />
-                        <TextBlock Text="{Binding SeedResult}"
-                                   Foreground="{StaticResource TextSecondaryBrush}"
-                                   FontSize="11" VerticalAlignment="Center"
-                                   TextWrapping="Wrap" TextTrimming="CharacterEllipsis">
-                            <TextBlock.Style>
-                                <Style TargetType="TextBlock">
-                                    <Setter Property="Visibility" Value="Visible" />
-                                    <Style.Triggers>
-                                        <DataTrigger Binding="{Binding SeedResult}" Value="">
-                                            <Setter Property="Visibility" Value="Collapsed" />
-                                        </DataTrigger>
-                                    </Style.Triggers>
-                                </Style>
-                            </TextBlock.Style>
-                        </TextBlock>
                     </StackPanel>
+                    <!-- On its own line, below the buttons, so it can wrap. Inside
+                         the horizontal row above it had unlimited width, so it
+                         never wrapped and the window cut it off ("...Run a backup
+                         next: it copies only what changed, and resumes automated
+                         back"). -->
+                    <TextBlock Text="{Binding SeedResult}"
+                               Foreground="{StaticResource TextSecondaryBrush}"
+                               FontSize="11" Margin="0,4,0,0"
+                               TextWrapping="Wrap">
+                        <TextBlock.Style>
+                            <Style TargetType="TextBlock">
+                                <Setter Property="Visibility" Value="Visible" />
+                                <Style.Triggers>
+                                    <DataTrigger Binding="{Binding SeedResult}" Value="">
+                                        <Setter Property="Visibility" Value="Collapsed" />
+                                    </DataTrigger>
+                                </Style.Triggers>
+                            </Style>
+                        </TextBlock.Style>
+                    </TextBlock>
                 </StackPanel>
 
-                <!-- Clear backup history (edit mode) -->
-                <StackPanel Orientation="Horizontal" Margin="0,0,0,8"
+                <!-- Clear backup history (edit mode). The result line goes below
+                     the button, for the same reason as the seed's. -->
+                <StackPanel Margin="0,0,0,8"
                             Visibility="{Binding IsEditMode, Converter={StaticResource BoolToVis}}">
                     <Button Content="Clear Backup History"
                             Command="{Binding ClearHistoryCommand}"
-                            Padding="10,6" Margin="0,0,8,0" Cursor="Hand"
+                            HorizontalAlignment="Left"
+                            Padding="10,6" Cursor="Hand"
                             ToolTip="Delete this set's catalog records of what has been backed up (discs and file entries), keeping all settings. The next backup treats every source file as new. Files already on the destination are not deleted." />
                     <TextBlock Text="{Binding ClearHistoryResult}"
                                Foreground="{StaticResource TextSecondaryBrush}"
-                               FontSize="11" VerticalAlignment="Center"
-                               TextWrapping="Wrap" TextTrimming="CharacterEllipsis">
+                               FontSize="11" Margin="0,4,0,0"
+                               TextWrapping="Wrap">
                         <TextBlock.Style>
                             <Style TargetType="TextBlock">
                                 <Setter Property="Visibility" Value="Visible" />

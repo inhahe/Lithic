@@ -105,6 +105,32 @@
     </Component>
 
     <!--
+      The .lithic file type (backup set exports): opening one starts Lithic
+      Backup with its path, and the app asks whether to add it as a backup set
+      (App.xaml.cs / OpenRequestQueue hand it to an instance already running).
+      Machine-wide, so per CLAUDE.md it must leave with the product: everything
+      here is component-owned registry, which Windows Installer removes on
+      uninstall. Its own component, keyed on a value under Lithic's own key (as
+      WerLocalDumpsCleanup is), so adding it did not change the contents of the
+      executable's existing component.
+    -->
+    <Component Id="ExportFileAssociation"
+               Directory="INSTALLFOLDER"
+               Guid="6E2B9D41-3F7A-4C85-B1E0-9A4D2C7F5B13"
+               Bitness="always64">
+      <RegistryValue Root="HKLM" Key="SOFTWARE\Lithic\LithicBackup"
+                     Name="exportFileAssociation" Type="integer" Value="1" KeyPath="yes" />
+      <ProgId Id="LithicBackup.BackupSetExport"
+              Description="Lithic Backup set export"
+              Icon="AppExe" IconIndex="0"
+              Advertise="no">
+        <Extension Id="lithic" ContentType="application/x-lithic-backupset">
+          <Verb Id="open" Command="Open" TargetFile="AppExe" Argument="&quot;%1&quot;" />
+        </Extension>
+      </ProgId>
+    </Component>
+
+    <!--
       The Worker executable + the Windows service it backs.  The service runs as
       LocalSystem (matching the app's own sc.exe install) so it shares the
       ProgramData catalog with the interactive GUI.  Started on install; stopped
@@ -218,6 +244,7 @@
     <Feature Id="Main" Title="Lithic Backup" Level="1">
       <ComponentGroupRef Id="AppFiles" />
       <ComponentRef Id="AppExeComponent" />
+      <ComponentRef Id="ExportFileAssociation" />
       <ComponentRef Id="WorkerService" />
       <ComponentRef Id="AppShortcut" />
       <ComponentRef Id="WerLocalDumpsCleanup" />

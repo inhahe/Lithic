@@ -101,6 +101,29 @@ public static class BackupSetTransfer
     /// history cannot be imported, the set is removed again.
     /// </summary>
     /// <exception cref="InvalidDataException">The file is not a backup set export.</exception>
+    /// <summary>
+    /// What an export file holds, without importing anything: its settings, and
+    /// whether it carries the backup history. For asking before an import (a
+    /// .lithic file opened from Explorer).
+    /// </summary>
+    /// <exception cref="InvalidDataException">The file is not a backup set export.</exception>
+    public static async Task<(ExportedBackupSet Settings, bool HasHistory)> ReadSummaryAsync(
+        string path, CancellationToken ct = default)
+    {
+        if (IsZip(path))
+        {
+            using var zip = ZipFile.OpenRead(path);
+            var settings = zip.GetEntry(SettingsEntryName)
+                ?? throw new InvalidDataException(
+                    $"The file has no {SettingsEntryName}; it is not a backup set export.");
+            await using var s = settings.Open();
+            return (await DeserializeAsync(s, ct), zip.GetEntry(HistoryEntryName) is not null);
+        }
+
+        await using var f = File.OpenRead(path);
+        return (await DeserializeAsync(f, ct), false);
+    }
+
     public static async Task<BackupSetImportResult> ImportAsync(
         ICatalogRepository catalog, string path,
         IProgress<string>? status = null, CancellationToken ct = default)

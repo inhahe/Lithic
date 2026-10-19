@@ -130,7 +130,7 @@ public sealed class SizeComputeScheduler : IDisposable
         {
             if (!n.IsDirectory) continue;
             // Accept nodes that need unfiltered size OR filtered size.
-            if (n.Size < 0 || (gf is not null && n.FilteredSize < 0))
+            if (n.NeedsUnfilteredTotals || (gf is not null && n.FilteredSize < 0))
                 pending.Add(n);
         }
 
@@ -217,7 +217,7 @@ public sealed class SizeComputeScheduler : IDisposable
                 // Check if this node still needs work. A node might
                 // already have its unfiltered size (from cached recursive
                 // totals) but still need its filtered size computed.
-                bool needsUnfiltered = item.Node.Size < 0;
+                bool needsUnfiltered = item.Node.NeedsUnfilteredTotals;
                 var gf = GlobalExcludeFilter;
                 bool needsFiltered = gf is not null && item.Node.FilteredSize < 0;
 

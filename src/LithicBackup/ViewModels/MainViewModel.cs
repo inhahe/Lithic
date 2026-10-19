@@ -1186,8 +1186,9 @@ public class MainViewModel : ViewModelBase
 
             CrashLogger.Log(null,
                 $"GUI: seeded \"{backupSet.Name}\" from {dir}: {outcome.Files:N0} file(s), "
-                + $"{outcome.PreviousVersions:N0} earlier version(s), {outcome.SkippedExisting:N0} already in "
-                + $"the catalog, {outcome.DuplicateCopies:N0} duplicate stored cop(ies) left untracked, "
+                + $"{outcome.PreviousVersions:N0} earlier version(s) (of which {outcome.MovedToHistory:N0} older "
+                + $"cop(ies) moved from beside a newer one into the history), {outcome.SkippedExisting:N0} already in "
+                + $"the catalog, {outcome.DuplicateCopies:N0} stored cop(ies) left untracked, "
                 + $"{outcome.Unrecognized:N0} unrecognised file(s) left alone.");
 
             bool imported = outcome.Files + outcome.PreviousVersions > 0;
@@ -1197,10 +1198,14 @@ public class MainViewModel : ViewModelBase
                 var parts = new List<string>();
                 if (outcome.PreviousVersions > 0)
                     parts.Add($"{outcome.PreviousVersions:N0} earlier versions");
+                if (outcome.MovedToHistory > 0)
+                    parts.Add($"{outcome.MovedToHistory:N0} older copies found beside a newer one were moved into "
+                              + "the version history");
                 if (outcome.SkippedExisting > 0)
                     parts.Add($"{outcome.SkippedExisting:N0} files already in the catalog were skipped");
                 if (outcome.DuplicateCopies > 0)
-                    parts.Add($"{outcome.DuplicateCopies:N0} duplicate stored copies were left alone");
+                    parts.Add($"{outcome.DuplicateCopies:N0} stored copies could not be recorded and were left as "
+                              + "they are; Cleanup's destination scan lists them as untracked");
                 string detail = parts.Count > 0 ? $" ({string.Join("; ", parts)})" : "";
                 result = $"Imported {outcome.Files:N0} files{detail}. Run a backup next: it copies only "
                          + "what changed, and resumes automated backups.";
@@ -4747,10 +4752,86 @@ public class MainViewModel : ViewModelBase
         if (dialog.ShowDialog() != System.Windows.Forms.DialogResult.OK)
             return;
 
+        await ImportFromFileAsync(dialog.FileName);
+    }
+
+    /// <summary>One prompt at a time when several export files are opened at once.</summary>
+    private readonly SemaphoreSlim _openedFilesGate = new(1, 1);
+
+    /// <summary>
+    /// Export files opened with Lithic Backup (double-clicked in Explorer, or
+    /// handed over by a second launch): for each, show what it holds and ask
+    /// whether to add it as a backup set. One at a time, in order.
+    /// </summary>
+    public async Task OfferOpenedFilesAsync(IReadOnlyList<string> paths)
+    {
+        foreach (string path in paths)
+        {
+            await _openedFilesGate.WaitAsync();
+            try
+            {
+                await OfferImportAsync(path);
+            }
+            finally
+            {
+                _openedFilesGate.Release();
+            }
+        }
+    }
+
+    private async Task OfferImportAsync(string path)
+    {
+        var owner = Application.Current.MainWindow;
+        ExportedBackupSet settings;
+        bool hasHistory;
+        try
+        {
+            (settings, hasHistory) = await BackupSetTransfer.ReadSummaryAsync(path);
+        }
+        catch (Exception ex)
+        {
+            CrashLogger.Log(ex, $"Opening {path}");
+            MessageBox.Show(owner,
+                $"{Path.GetFileName(path)} is not a Lithic Backup set export, or could not be read.\n\n{ex.Message}",
+                "Open Backup Set", MessageBoxButton.OK, MessageBoxImage.Error);
+            return;
+        }
+
+        string destination = string.IsNullOrWhiteSpace(settings.JobOptions?.TargetDirectory)
+            ? "(none - a disc set, or not chosen yet)"
+            : settings.JobOptions!.TargetDirectory!;
+        string history = hasHistory
+            ? "included - it carries on from its existing backup"
+            : "not included (settings only)";
+        bool nameTaken = BackupSets.Any(r => string.Equals(r.Name, settings.Name, StringComparison.OrdinalIgnoreCase));
+
+        var answer = MessageBox.Show(owner,
+            $"Add \"{settings.Name}\" as a backup set?\n\n"
+            + $"File: {path}\n"
+            + $"Destination: {destination}\n"
+            + $"Backup history: {history}\n"
+            + (nameTaken ? $"\nYou already have a backup set named \"{settings.Name}\"; this adds a second one.\n" : "")
+            + "\nIts automated backups start paused until you run a backup yourself.",
+            "Open Backup Set",
+            MessageBoxButton.YesNo,
+            MessageBoxImage.Question,
+            MessageBoxResult.Yes);
+        if (answer != MessageBoxResult.Yes)
+        {
+            StatusText = $"Did not add \"{settings.Name}\" from {Path.GetFileName(path)}.";
+            return;
+        }
+
+        await ImportFromFileAsync(path);
+    }
+
+    /// <summary>Import an export file as a new backup set, and say what it brought.</summary>
+    private async Task ImportFromFileAsync(string fileName)
+    {
         try
         {
             var status = new Progress<string>(s => StatusText = $"Importing: {s}");
-            var result = await BackupSetTransfer.ImportAsync(_catalog, dialog.FileName, status);
+            var result = await BackupSetTransfer.ImportAsync(_catalog, fileName, status);
             var newSet = result.Set;
             await LoadBackupSetsAsync();
             SelectedBackupSet = BackupSets.FirstOrDefault(s => s.Id == newSet.Id)?.Model;
@@ -4779,8 +4860,8 @@ public class MainViewModel : ViewModelBase
         catch (Exception ex)
         {
             StatusText = $"Import failed: {ex.Message}";
-            CrashLogger.Log(ex, $"Import of {dialog.FileName}");
-            MessageBox.Show($"Could not import {Path.GetFileName(dialog.FileName)}.\n\n{ex.Message}",
+            CrashLogger.Log(ex, $"Import of {fileName}");
+            MessageBox.Show($"Could not import {Path.GetFileName(fileName)}.\n\n{ex.Message}",
                 "Import Backup Set", MessageBoxButton.OK, MessageBoxImage.Error);
         }
     }

@@ -330,18 +330,31 @@ Check(await repoB.GetFileRecordByPathAndVersionAsync(setD.Id, aPath, 1) is null,
 // 6. Two stored forms of one file.
 // ===================================================================
 Console.WriteLine();
-Console.WriteLine("=== 6. A plain copy and a .fileref of the same file ===");
+Console.WriteLine("=== 6. Two stored forms of one file at its current location ===");
+// What a real destination held 23,190 times: a stale .fileref to EMPTY content
+// (the file was briefly zero bytes when an earlier backup read it) beside the
+// newer plain copy. And the reverse: a newer .fileref beside an older plain
+// copy, which other references may need as their content.
 string target3 = Path.Combine(root, "dst3");
 CopyTree(snapshot, target3);
+const string EmptyHash = "e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855";
 string bCurrent = CurrentOf(target3, bPath);
 await File.WriteAllTextAsync(bCurrent + ".fileref", JsonSerializer.Serialize(new FileRefManifest
 {
-    OriginalName = "b.txt",
-    OriginalSize = new FileInfo(bCurrent).Length,
-    Hash = "00",
-    SourcePath = bPath,
-    ContentPath = "",
+    OriginalName = "b.txt", OriginalSize = 0, Hash = EmptyHash, SourcePath = bPath, ContentPath = "",
 }));
+File.SetLastWriteTimeUtc(bCurrent + ".fileref", DateTime.UtcNow.AddDays(-30));   // older than the plain copy
+
+string cCurrent = CurrentOf(target3, cPath);
+string bContentHash = Convert.ToHexString(SHA256.HashData(File.ReadAllBytes(bCurrent))).ToLowerInvariant();
+await File.WriteAllTextAsync(cCurrent + ".fileref", JsonSerializer.Serialize(new FileRefManifest
+{
+    OriginalName = "c.txt", OriginalSize = new FileInfo(bCurrent).Length, Hash = bContentHash,
+    SourcePath = cPath, ContentPath = Path.GetRelativePath(target3, bCurrent),
+}));
+File.SetLastWriteTimeUtc(cCurrent, DateTime.UtcNow.AddDays(-30));                // the plain copy is the older one
+string cOldContent = File.ReadAllText(cCurrent);
+
 var setE = await repoB.CreateBackupSetAsync(new BackupSet
 {
     Name = "two forms", SourceRoots = [source], SourceSelections = Selection(),
@@ -349,10 +362,33 @@ var setE = await repoB.CreateBackupSetAsync(new BackupSet
     JobOptions = new JobOptions { TargetDirectory = target3 },
 });
 var seededE = await svcB.SeedFromExistingDirectoryAsync(setE.Id, target3);
-var bRecords = await repoB.GetFileRecordsByPathAsync(setE.Id, bPath);
-Check(bRecords.Count == 1, $"one record for b.txt (got {bRecords.Count})");
-Check(bRecords.Count == 1 && !bRecords[0].IsFileRef, "and it is the plain copy, which holds the bytes");
-Check(seededE.DuplicateCopies == 1, $"the other form is counted as a duplicate (got {seededE.DuplicateCopies})");
+Check(seededE.MovedToHistory == 2 && seededE.DuplicateCopies == 0,
+    $"both older copies were moved into the history (moved {seededE.MovedToHistory}, left {seededE.DuplicateCopies})");
+
+var bRecords = (await repoB.GetFileRecordsByPathAsync(setE.Id, bPath)).OrderBy(r => r.Version).ToList();
+Check(bRecords.Select(r => (r.Version, r.IsFileRef)).SequenceEqual([(1, true), (2, false)]),
+    "b.txt: the stale pointer is version 1, the newer plain copy version 2 and current");
+Check(!File.Exists(bCurrent + ".fileref") && File.Exists(Path.Combine(target3, bRecords[0].DiscPath)),
+    "and the pointer now sits in the history where its record says");
+
+var cRecords = (await repoB.GetFileRecordsByPathAsync(setE.Id, cPath)).OrderBy(r => r.Version).ToList();
+Check(cRecords.Select(r => (r.Version, r.IsFileRef)).SequenceEqual([(1, false), (2, false), (3, true)]),
+    $"c.txt: its old history v1, the older plain copy v2, the newer pointer v3 and current " +
+    $"(got {string.Join(",", cRecords.Select(r => $"{r.Version}{(r.IsFileRef ? "r" : "p")}"))})");
+var cMoved = cRecords.FirstOrDefault(r => r.Version == 2);
+Check(cMoved is not null && File.ReadAllText(Path.Combine(target3, cMoved.DiscPath)) == cOldContent,
+    "the older plain copy kept its content in the history");
+
+var recordedPaths = (await repoB.GetAllFilesForBackupSetAsync(setE.Id))
+    .Where(r => !r.IsDeleted)
+    .Select(r => r.DiscPath.Replace('/', '\\'))
+    .ToHashSet(StringComparer.OrdinalIgnoreCase);
+var untracked = Directory.EnumerateFiles(target3, "*", SearchOption.AllDirectories)
+    .Select(p => Path.GetRelativePath(target3, p))
+    .Where(p => !recordedPaths.Contains(p))
+    .ToList();
+Check(untracked.Count == 0,
+    $"nothing at the destination is left untracked{(untracked.Count > 0 ? ": " + string.Join(", ", untracked) : "")}");
 
 // ===================================================================
 // 7. The catalog is behind the drive: the old computer backed up again

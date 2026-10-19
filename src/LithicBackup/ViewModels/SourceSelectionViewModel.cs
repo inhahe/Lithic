@@ -1556,7 +1556,7 @@ public class SourceSelectionViewModel : ViewModelBase, IDisposable
             {
                 var node = new SourceSelectionNodeViewModel(
                     dd.RootPath, true, root, getCatalogInfo: () => _catalogInfo);
-                if (dd.UsedSize >= 0) node.Size = dd.UsedSize;
+                if (dd.UsedSize >= 0) node.SetDriveUsedSpace(dd.UsedSize);
                 root.Children.Add(node);
             }
         }
@@ -1570,7 +1570,7 @@ public class SourceSelectionViewModel : ViewModelBase, IDisposable
                 var node = new SourceSelectionNodeViewModel(
                     drive.RootDirectory.FullName, true, root,
                     getCatalogInfo: () => _catalogInfo);
-                try { node.Size = drive.TotalSize - drive.AvailableFreeSpace; }
+                try { node.SetDriveUsedSpace(drive.TotalSize - drive.AvailableFreeSpace); }
                 catch { }
                 root.Children.Add(node);
             }
@@ -2287,7 +2287,7 @@ public class SourceSelectionViewModel : ViewModelBase, IDisposable
             if (node.IsSelected == false || !node.IsDirectory)
                 continue;
 
-            if (node.Size < 0)
+            if (node.NeedsUnfilteredTotals)
                 result.Add(node);
 
             // Only recurse into partially selected directories.

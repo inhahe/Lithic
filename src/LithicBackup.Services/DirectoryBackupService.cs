@@ -2351,6 +2351,29 @@ public class DirectoryBackupService
             return TargetedMoveOutcome.NothingToRelocate;
         }
 
+        // A rename OVER a file that is already backed up - the atomic-save
+        // pattern: git writes index.lock and renames it over index, editors do
+        // the same with temp files - is a new version of that file, not a move.
+        // Relocating carried the renamed file's copies onto the target's name and
+        // repointed its records there, beside the target's own chain: two
+        // histories with clashing version numbers under one path. When the copies
+        // collided (both plain) the move failed and fell back, harmlessly; when
+        // they did not - index.lock caught while still empty, so stored as a
+        // .fileref to empty content - index.fileref landed beside the plain
+        // index, and the next change filed the plain copy away and left the stale
+        // pointer at the current location. 23,190 of those were found on one
+        // destination. Fall back instead: the caller backs the target up as its
+        // next version and reconciles the vacated old path. (A case-only rename
+        // is the same file, and still relocates.)
+        if (!isDirectory
+            && !string.Equals(oldPath, newPath, StringComparison.OrdinalIgnoreCase)
+            && await _catalog.GetLastVersionAsync(setId, newPath, ct) is not null)
+        {
+            trace?.Invoke($"'{newPath}' already has a backup (a rename over an existing file) -> FellBack: " +
+                          "back it up as its next version.");
+            return TargetedMoveOutcome.FellBack;
+        }
+
         // A rename can carry a tracked file INTO a path the set excludes — move
         // foo.py into a build\ directory, or rename src\ to debug\ — and the
         // exclusion rules must apply to it exactly as they would to a file
@@ -3831,18 +3854,29 @@ public class DirectoryBackupService
 
     /// <summary>What a seed recorded; see <see cref="SeedFromExistingDirectoryAsync"/>.</summary>
     /// <param name="Files">Current copies recorded, one per source path.</param>
-    /// <param name="PreviousVersions">Earlier versions recorded from the <c>{drive}_prev</c> folders.</param>
+    /// <param name="PreviousVersions">
+    /// Earlier versions recorded: those in the <c>{drive}_prev</c> folders, plus
+    /// <paramref name="MovedToHistory"/>.
+    /// </param>
     /// <param name="SkippedExisting">Source paths left alone because the catalog already had them.</param>
     /// <param name="DuplicateCopies">
-    /// Stored files not recorded because another form of the same file and version
-    /// was (a plain copy and a <c>.fileref</c> of one file, say). They stay on disk.
+    /// Stored files left untracked: a second form of one numbered history version
+    /// (both <c>name.v3</c> and <c>name.v3.fileref</c>), or an older copy at the
+    /// current location that could not be moved into the history. They stay on
+    /// disk, and Cleanup's destination scan lists them.
+    /// </param>
+    /// <param name="MovedToHistory">
+    /// Older copies found at the current location beside a newer one (<c>index</c>
+    /// and <c>index.fileref</c>, written by different backups), moved into
+    /// <c>{drive}_prev</c> and recorded as earlier versions.
     /// </param>
     /// <param name="Unrecognized">
     /// Files left alone: a manifest that could not be read, or a file in a
     /// <c>_prev</c> folder not named <c>name.vN</c>.
     /// </param>
     public sealed record SeedOutcome(
-        int Files, int PreviousVersions, int SkippedExisting, int DuplicateCopies, int Unrecognized);
+        int Files, int PreviousVersions, int SkippedExisting, int DuplicateCopies, int Unrecognized,
+        int MovedToHistory = 0);
 
     /// <summary>The stored files of one source path found in one folder of the destination.</summary>
     private sealed class SeedGroup
@@ -3908,7 +3942,7 @@ public class DirectoryBackupService
             CreatedUtc = DateTime.UtcNow,
         }, ct);
 
-        int files = 0, versions = 0, skippedExisting = 0, duplicates = 0, unrecognized = 0;
+        int files = 0, versions = 0, skippedExisting = 0, duplicates = 0, unrecognized = 0, movedToHistory = 0;
         long totalBytes = 0;
         var progressSw = System.Diagnostics.Stopwatch.StartNew();
         long lastProgressMs = -ProgressCadence.IntervalMs;
@@ -4074,8 +4108,6 @@ public class DirectoryBackupService
 
                     foreach (var (logicalName, group) in groups)
                     {
-                        var current = group.Current.Count > 0 ? await PickAsync(group.Current) : null;
-
                         // The source path is where the file sits: drive folder plus
                         // relative path, which is exactly how the engine placed it.
                         // NOT a .fileref's own SourcePath, which a relocation (a
@@ -4120,11 +4152,84 @@ public class DirectoryBackupService
                             });
                             highestPrevious = Math.Max(highestPrevious, byVersion.Key);
                         }
+
+                        // Every readable stored form at the CURRENT location, newest
+                        // first. Two forms of one file there (index and
+                        // index.fileref) are two versions, written by different
+                        // backups: the newest is the current copy, and an older
+                        // one is an earlier version left where it was. The seed
+                        // used to take the plain copy whatever its age and leave
+                        // the other untracked - on a real destination 23,190
+                        // stale pointers (each to EMPTY content, from moments when
+                        // a git index or .claude.json was briefly zero bytes) that
+                        // Cleanup then listed as untracked. It could equally have
+                        // recorded a stale plain copy as current, or left out a
+                        // plain copy another file's .fileref needs.
+                        var forms = new List<(FileInfo File, StoredFileInfo Info, DateTime Written)>();
+                        foreach (var f in group.Current)
+                        {
+                            var info = await ReadStoredAsync(f);
+                            if (info is null) { unrecognized++; continue; }
+                            forms.Add((f, info.Value, f.LastWriteTimeUtc));
+                        }
+                        forms.Sort((a, b) =>
+                        {
+                            int byAge = b.Written.CompareTo(a.Written);
+                            return byAge != 0 ? byAge : StorageRank(a.File).CompareTo(StorageRank(b.File));
+                        });
+
+                        // Hash everything first: nothing below may be cancelled
+                        // between moving a file and recording it.
+                        var displaced = new List<(FileInfo File, StoredFileInfo Info, DateTime Written, string Hash)>();
+                        for (int i = forms.Count - 1; i >= 1; i--)   // oldest first
+                            displaced.Add((forms[i].File, forms[i].Info, forms[i].Written,
+                                forms[i].Info.Hash ?? await HashPlainAsync(forms[i].File, sourcePath)));
+                        string? currentHash = forms.Count == 0 ? null
+                            : forms[0].Info.Hash ?? await HashPlainAsync(forms[0].File, sourcePath);
+
+                        // File each older form into the history under the next free
+                        // number, as the engine would have when the newer copy was
+                        // written. One that cannot be moved is left where it is,
+                        // untracked (Cleanup's destination scan lists it).
+                        int nextVersion = highestPrevious + 1;
+                        foreach (var d in displaced)
+                        {
+                            int v = nextVersion;
+                            while (AnyPrevVersionFileExists(rootDir.FullName, sourcePath, v))
+                                v++;
+                            string prevAbs = GetPrevPath(rootDir.FullName, sourcePath, v, d.Info.IsDeduped, d.Info.IsFileRef);
+                            try
+                            {
+                                Directory.CreateDirectory(Path.GetDirectoryName(prevAbs)!);
+                                File.Move(d.File.FullName, prevAbs, overwrite: false);
+                            }
+                            catch (Exception ex) when (ex is IOException or UnauthorizedAccessException)
+                            {
+                                duplicates++;
+                                continue;
+                            }
+                            records.Add(new FileRecord
+                            {
+                                DiscId = discRecord.Id,
+                                SourcePath = sourcePath,
+                                DiscPath = GetPrevDiscPath(sourcePath, v, d.Info.IsDeduped, d.Info.IsFileRef),
+                                SizeBytes = d.Info.Size,
+                                Hash = d.Hash,
+                                IsDeduped = d.Info.IsDeduped,
+                                IsFileRef = d.Info.IsFileRef,
+                                Version = v,
+                                SourceLastWriteUtc = d.Written,
+                                BackedUpUtc = d.Written,
+                            });
+                            movedToHistory++;
+                            nextVersion = v + 1;
+                        }
                         int previousCount = records.Count;
 
-                        if (current is { } cur)
+                        if (forms.Count > 0)
                         {
-                            string hash = cur.Info.Hash ?? await HashPlainAsync(cur.File, sourcePath);
+                            var cur = forms[0];
+                            string hash = currentHash!;
                             records.Add(new FileRecord
                             {
                                 DiscId = discRecord.Id,
@@ -4134,11 +4239,11 @@ public class DirectoryBackupService
                                 Hash = hash,
                                 IsDeduped = cur.Info.IsDeduped,
                                 IsFileRef = cur.Info.IsFileRef,
-                                Version = highestPrevious + 1,
+                                Version = nextVersion,
                                 // The copy's own write time: when it was copied. The
                                 // next scan calls a source file changed only if it
                                 // was written after that.
-                                SourceLastWriteUtc = cur.File.LastWriteTimeUtc,
+                                SourceLastWriteUtc = cur.Written,
                                 BackedUpUtc = DateTime.UtcNow,
                             });
                             bytes = cur.Info.Size;
@@ -4181,7 +4286,7 @@ public class DirectoryBackupService
         // Always report final state so the UI shows the true total.
         Report("", force: true);
 
-        return new SeedOutcome(files, versions, skippedExisting, duplicates, unrecognized);
+        return new SeedOutcome(files, versions, skippedExisting, duplicates, unrecognized, movedToHistory);
     }
 
     /// <summary>plain = 0, .dedup = 1, .fileref = 2: the order a seed prefers them in.</summary>
