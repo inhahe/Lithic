@@ -1165,13 +1165,32 @@ public class OrphanedDirectoriesViewModel : ViewModelBase
         var jobOptions = _backupSet.JobOptions;
         if (jobOptions is null) return [];
 
-        // Build per-file tier selector: file path → retention tiers.
+        // Build per-file tier selector: file path → retention tiers, and whether
+        // the file is backed up with NO history at all.
         Func<string, IReadOnlyList<VersionRetentionTier>> tierSelector;
+        Func<string, bool> keepsNoHistory = _ => false;
 
         if (jobOptions.TierSets.Count > 0)
         {
             var resolver = VersionTierSet.BuildTierResolver(jobOptions.TierSets);
             tierSelector = path => resolver(path).Tiers;
+
+            // An empty Default: every file no other tier set matches is backed
+            // up and overwritten in place (the engine's keepVersions is false
+            // for it). Any earlier version such a file still has - kept from
+            // before the tiers were removed - is excess by definition, newest
+            // included. This used to be skipped as "no retention rules", along
+            // with the retention pass, so removing Default's tiers stopped new
+            // versions but left every old one on the destination for good:
+            // 88 GB of them on one real set. (A NON-Default set with no tiers
+            // and patterns excludes its files from backup instead; those are
+            // the configured-exclusion category's, and skipped below.)
+            // Only for a Default that is really there and empty. The resolver
+            // makes up an empty one when the list has none (old or hand-edited
+            // data), and the editor shows that set with the stock tiers - its
+            // files' versions must not all be offered for deletion.
+            if (jobOptions.TierSets.Any(t => t.KeepsNoHistory))
+                keepsNoHistory = path => resolver(path).KeepsNoHistory;
         }
         else if (jobOptions.RetentionTiers.Count > 0)
         {
@@ -1185,8 +1204,7 @@ public class OrphanedDirectoriesViewModel : ViewModelBase
 
         // Build skip-sets: files in orphaned dirs or matched by exclusion filter.
         // IsPathUnderRoot handles path-separator boundaries correctly.
-        var orphanedDirPaths = new DirectoryPrefixSet(
-            orphanedDirs.Select(i => i.DirectoryPath));
+        var alreadyOffered = AlreadyOfferedFilter(orphanedDirs);
         var excludedPaths = new HashSet<string>(
             excludedItems
                 .Where(i => i.MatchingSourcePaths is not null)
@@ -1198,7 +1216,7 @@ public class OrphanedDirectoriesViewModel : ViewModelBase
             .Where(f =>
             {
                 progress?.Bump();
-                if (orphanedDirPaths.ContainsPathUnder(f.SourcePath))
+                if (alreadyOffered(f.SourcePath))
                     return false;
                 if (excludedPaths.Contains(f.SourcePath))
                     return false;
@@ -1254,7 +1272,13 @@ public class OrphanedDirectoriesViewModel : ViewModelBase
 
             var tiers = tierSelector(group.Key);
             if (tiers.Count == 0)
-                continue; // 0 tiers = no retention rules (excluded or no history).
+            {
+                // Backed up with no history: every earlier version goes.
+                if (keepsNoHistory(group.Key))
+                    excessRecords.AddRange(versions);
+                // Otherwise excluded from backup: the exclusion category's.
+                continue;
+            }
 
             // Never delete the most recent prev version: we'd lose the
             // ability to roll back at all.  (Note: the "current" record is
@@ -1311,6 +1335,22 @@ public class OrphanedDirectoriesViewModel : ViewModelBase
 
                 previousBoundary = upperBoundary;
             }
+        }
+
+        // Never delete the last plain copy of content a surviving .fileref still
+        // resolves to by hash: that reference would become unrestorable. The
+        // engine's retention pass promotes such a reference before deleting; this
+        // purge cannot (it runs no copy), so the copy is simply kept and not
+        // listed. Needed for tiered retention too, but it became pressing when a
+        // tier set that keeps nothing made the newest earlier version, the
+        // likeliest anchor, deletable.
+        if (excessRecords.Count > 0)
+        {
+            var needed = _catalog.GetNeededContentCopiesAsync(
+                    _backupSet.Id, excessRecords.Select(r => r.Id).ToList())
+                .GetAwaiter().GetResult();
+            if (needed.Count > 0)
+                excessRecords.RemoveAll(r => needed.Contains(r.Id));
         }
 
         if (excessRecords.Count == 0)
@@ -1371,6 +1411,82 @@ public class OrphanedDirectoriesViewModel : ViewModelBase
         return firstSegment.EndsWith("_prev", StringComparison.OrdinalIgnoreCase);
     }
 
+    /// <summary>
+    /// Whether a source path is already offered by one of
+    /// <paramref name="items"/> (the removed-from-sources and deleted-from-disk
+    /// categories): one of the files an item lists, or - for an item without a
+    /// list - anything under its directory.
+    /// </summary>
+    /// <remarks>
+    /// This used to test the item's DIRECTORY for every item. A deleted-from-disk
+    /// item can be a folder that still exists, holding one missing file among
+    /// many that are present, so the directory test hid everything about the
+    /// present files from the later phases: no file in a folder with one deleted
+    /// sibling could show an excess version, a catalog duplicate, or a match for
+    /// a manual exclusion pattern.
+    /// </remarks>
+    private static Func<string, bool> AlreadyOfferedFilter(IReadOnlyCollection<OrphanedDirectoryItem> items)
+    {
+        var paths = new HashSet<string>(
+            items.Where(i => i.MatchingSourcePaths is not null).SelectMany(i => i.MatchingSourcePaths!),
+            StringComparer.OrdinalIgnoreCase);
+        var unlisted = items.Where(i => i.MatchingSourcePaths is null).Select(i => i.DirectoryPath).ToList();
+        if (unlisted.Count == 0)
+            return paths.Contains;
+        var dirs = new DirectoryPrefixSet(unlisted);
+        return p => paths.Contains(p) || dirs.ContainsPathUnder(p);
+    }
+
+    /// <summary>
+    /// Of the excess-version records a purge is about to delete, the ones that
+    /// must be kept because a surviving <c>.fileref</c> needs their bytes -
+    /// judged against everything the purge deletes, every ticked category
+    /// included. Rows of path-based categories are identified through
+    /// <see cref="_activeFiles"/> (every active row of each listed path, or of
+    /// every path under a directory for an item without a list), exactly the
+    /// rows the purge tombstones. Only excess versions can be held back: when
+    /// content's last copies are all in other categories, nothing here keeps
+    /// them (see known-issues.md).
+    /// </summary>
+    private HashSet<long> RecheckNeededCopies(
+        IReadOnlyList<(OrphanedReason Reason, string DirectoryPath,
+            List<string>? MatchingSourcePaths, List<FileRecord>? ExcessVersionRecords)> items,
+        int backupSetId, CancellationToken ct)
+    {
+        var excessIds = items
+            .Where(i => i.Reason == OrphanedReason.ExcessVersion && i.ExcessVersionRecords is not null)
+            .SelectMany(i => i.ExcessVersionRecords!)
+            .Select(r => r.Id)
+            .ToList();
+        if (excessIds.Count == 0)
+            return [];
+
+        var deleting = new HashSet<long>(excessIds);
+        foreach (var i in items.Where(i => i.Reason == OrphanedReason.CatalogDuplicate && i.ExcessVersionRecords is not null))
+            deleting.UnionWith(i.ExcessVersionRecords!.Select(r => r.Id));
+
+        static bool ByPath(OrphanedReason r) => r is not (OrphanedReason.ExcessVersion
+            or OrphanedReason.CatalogDuplicate or OrphanedReason.UntrackedFile or OrphanedReason.CatalogDeleted);
+        var paths = new HashSet<string>(
+            items.Where(i => ByPath(i.Reason) && i.MatchingSourcePaths is not null)
+                 .SelectMany(i => i.MatchingSourcePaths!),
+            StringComparer.OrdinalIgnoreCase);
+        var dirItems = items
+            .Where(i => ByPath(i.Reason) && i.MatchingSourcePaths is null && i.ExcessVersionRecords is null)
+            .Select(i => i.DirectoryPath)
+            .ToList();
+        var dirs = new DirectoryPrefixSet(dirItems);
+        if (_activeFiles is not null && (paths.Count > 0 || dirItems.Count > 0))
+        {
+            foreach (var f in _activeFiles)
+                if (paths.Contains(f.SourcePath) || (dirItems.Count > 0 && dirs.ContainsPathUnder(f.SourcePath)))
+                    deleting.Add(f.Id);
+        }
+
+        return _catalog.GetNeededContentCopiesAsync(backupSetId, deleting.ToList(), excessIds, ct)
+            .GetAwaiter().GetResult();
+    }
+
     // ------------------------------------------------------------------
     // Phase 5: Catalog-duplicate detection
     // ------------------------------------------------------------------
@@ -1398,8 +1514,7 @@ public class OrphanedDirectoriesViewModel : ViewModelBase
     {
         if (_activeFiles is null) return [];
 
-        var orphanedDirPaths = new DirectoryPrefixSet(
-            orphanedDirs.Select(i => i.DirectoryPath));
+        var alreadyOffered = AlreadyOfferedFilter(orphanedDirs);
         var excludedPaths = new HashSet<string>(
             excludedItems
                 .Where(i => i.MatchingSourcePaths is not null)
@@ -1413,7 +1528,7 @@ public class OrphanedDirectoriesViewModel : ViewModelBase
             {
                 progress?.Bump();
                 if (IsPreviousVersionPath(f.DiscPath)) return false;
-                if (orphanedDirPaths.ContainsPathUnder(f.SourcePath))
+                if (alreadyOffered(f.SourcePath))
                     return false;
                 if (excludedPaths.Contains(f.SourcePath)) return false;
                 return true;
@@ -1526,9 +1641,9 @@ public class OrphanedDirectoriesViewModel : ViewModelBase
             // double-count files. DirectoryPrefixSet answers "is this file inside
             // any of them" — a List here would bind .Contains to exact string
             // equality, which compiles and silently means something else.
-            var orphanedDirPaths = new DirectoryPrefixSet(Items
+            var orphanedDirPaths = AlreadyOfferedFilter(Items
                 .Where(i => i.Reason is OrphanedReason.RemovedFromSources or OrphanedReason.DeletedFromDisk)
-                .Select(i => i.DirectoryPath));
+                .ToList());
 
             // Also skip files already flagged by auto-detected exclusions.
             var alreadyFlaggedPaths = new HashSet<string>(
@@ -1544,7 +1659,7 @@ public class OrphanedDirectoriesViewModel : ViewModelBase
                     .Where(f =>
                     {
                         // Skip files already covered by an orphaned directory.
-                        if (orphanedDirPaths.ContainsPathUnder(f.SourcePath))
+                        if (orphanedDirPaths(f.SourcePath))
                             return false;
 
                         // Skip files already covered by auto-detected exclusions.
@@ -2163,9 +2278,13 @@ public class OrphanedDirectoriesViewModel : ViewModelBase
             // catalog methods are synchronous (ExecuteNonQuery /
             // Task.FromResult) and the filesystem walk for empty-dir
             // cleanup can iterate thousands of directories.
+            int keptForReferences = 0;
             var (catalogPurged, filesDeleted, deleteFailures, bytesFreed, alreadyAbsent) = await Task.Run(() =>
             {
                 int catPurged = 0;
+                // Excess-version records held back because a .fileref still needs
+                // their bytes (RecheckNeededCopies, inside the transaction).
+                HashSet<long> keptIds = [];
                 int fDeleted = 0;
                 int fFailed = 0;
                 int fAbsent = 0;
@@ -2229,6 +2348,19 @@ public class OrphanedDirectoriesViewModel : ViewModelBase
                 var tx = _catalog.BeginTransactionAsync(backupSetId, ct).GetAwaiter().GetResult();
                 try
                 {
+                    // The .fileref guard again, now, against EVERYTHING this purge
+                    // deletes. The scan-time pass only saw the Excess Versions list:
+                    // an excess copy could be listed because another plain copy of
+                    // its content survived - which a "deleted from disk" or
+                    // "excluded" item ticked alongside it then deleted too. And a
+                    // backup between the scan and Clean can have made a new
+                    // .fileref to a listed copy (a reverted file). This runs under
+                    // the purge's transaction, which holds the set's write lock, so
+                    // no reference can appear between this check and the delete.
+                    keptIds = RecheckNeededCopies(workItems.Select(w => (
+                        w.Reason, w.DirectoryPath, w.MatchingSourcePaths, w.ExcessVersionRecords)).ToList(),
+                        backupSetId, ct);
+
                     for (int i = 0; i < workItems.Count; i++)
                     {
                         // Throwing here is the point: tx.Complete() is never
@@ -2270,7 +2402,9 @@ public class OrphanedDirectoriesViewModel : ViewModelBase
                             // ("disc 0 has no owning set") only because DiscId = 0
                             // cannot be routed to a set, which is the single reason
                             // this was a broken cleanup and not a corrupted catalog.
-                            var records = wi.ExcessVersionRecords;
+                            var records = wi.ExcessVersionRecords
+                                .Where(r => !keptIds.Contains(r.Id)).ToList();
+                            doneUnits += wi.ExcessVersionRecords.Count - records.Count;
                             for (int off = 0; off < records.Count; off += PurgePathChunkSize)
                             {
                                 int len = Math.Min(PurgePathChunkSize, records.Count - off);
@@ -2359,6 +2493,12 @@ public class OrphanedDirectoriesViewModel : ViewModelBase
                         workItems.Where(w => w.DiscFilePaths is not null)
                                  .SelectMany(w => w.DiscFilePaths!),
                         StringComparer.OrdinalIgnoreCase);
+                    // Never delete the file of a record held back above.
+                    foreach (var kept in workItems
+                                 .Where(w => w.ExcessVersionRecords is not null)
+                                 .SelectMany(w => w.ExcessVersionRecords!)
+                                 .Where(r => keptIds.Contains(r.Id)))
+                        allDiscPaths.Remove(kept.DiscPath.Replace('/', '\\'));
 
                     // Cooperative, not throwing: the catalog transaction above
                     // has already committed, so a cancel here must still report
@@ -2382,13 +2522,18 @@ public class OrphanedDirectoriesViewModel : ViewModelBase
                         workItems.Where(w => w.MatchingSourcePaths is not null)
                                  .SelectMany(w => w.MatchingSourcePaths!),
                         StringComparer.OrdinalIgnoreCase);
+                    // Whole directories only for an item without a path list; a
+                    // listed item purged exactly its paths (purgedPaths), and its
+                    // directory can still hold files that are not gone.
                     var purgedDirs = new DirectoryPrefixSet(workItems
-                        .Where(w => w.Reason is OrphanedReason.RemovedFromSources or OrphanedReason.DeletedFromDisk)
+                        .Where(w => w.Reason is OrphanedReason.RemovedFromSources or OrphanedReason.DeletedFromDisk
+                                    && w.MatchingSourcePaths is null)
                         .Select(w => w.DirectoryPath));
                     var purgedRecordIds = new HashSet<long>(
                         workItems.Where(w => w.ExcessVersionRecords is not null)
                                  .SelectMany(w => w.ExcessVersionRecords!)
-                                 .Select(r => r.Id));
+                                 .Select(r => r.Id)
+                                 .Where(id => !keptIds.Contains(id)));
 
                     _activeFiles.RemoveAll(f =>
                         purgedPaths.Contains(f.SourcePath)
@@ -2396,6 +2541,7 @@ public class OrphanedDirectoriesViewModel : ViewModelBase
                         || purgedRecordIds.Contains(f.Id));
                 }
 
+                keptForReferences = keptIds.Count;
                 return (catPurged, fDeleted, fFailed, bytes, fAbsent);
             });
 
@@ -2413,6 +2559,9 @@ public class OrphanedDirectoriesViewModel : ViewModelBase
                 summary.Add($"deleted {filesDeleted:N0} file{(filesDeleted == 1 ? "" : "s")} ({FormatSizeText(bytesFreed)})");
             if (deleteFailures > 0)
                 summary.Add($"{deleteFailures:N0} deletion failure{(deleteFailures == 1 ? "" : "s")}");
+            if (keptForReferences > 0)
+                summary.Add($"kept {keptForReferences:N0} older cop{(keptForReferences == 1 ? "y" : "ies")} "
+                    + "that duplicate-file references still need");
             // Reported rather than ignored: a file the catalog expects but the
             // destination doesn't have is how a half-completed earlier purge — or
             // a destination that isn't really the one the catalog describes —

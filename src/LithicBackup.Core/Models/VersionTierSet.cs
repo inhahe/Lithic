@@ -44,6 +44,29 @@ public class VersionTierSet
     /// </summary>
     public List<string> FileExemptPatterns { get; set; } = [];
 
+    /// <summary>Whether this is the "Default" tier set, the fallback for unmatched files.</summary>
+    public bool IsDefault => string.Equals(Name, "Default", StringComparison.OrdinalIgnoreCase);
+
+    /// <summary>
+    /// Files this tier set resolves to are EXCLUDED from backup: it has no
+    /// tiers and is not Default. A no-tier Default means the opposite - its
+    /// files are backed up, with no history. The one definition every exclusion
+    /// check uses.
+    /// </summary>
+    /// <remarks>
+    /// The per-file exclusion filters tested <c>Tiers.Count == 0</c> alone. With
+    /// an empty Default and any exclusion set present (a "None" set with
+    /// patterns is enough), that excluded every file no other tier set matched -
+    /// on a real set, everything outside a list of text and code extensions
+    /// would silently have stopped being backed up, and Cleanup would have
+    /// offered to delete their backups as "matches configured exclusion". Only
+    /// a Save button that never enabled kept the edit from reaching the catalog.
+    /// </remarks>
+    public bool ExcludesFromBackup => Tiers.Count == 0 && !IsDefault;
+
+    /// <summary>Files this tier set resolves to are backed up with no earlier versions kept.</summary>
+    public bool KeepsNoHistory => Tiers.Count == 0 && IsDefault;
+
     /// <summary>
     /// Build a resolver function that maps a file path to its matching tier set.
     /// Tier sets are evaluated in <paramref name="tierSets"/> order; the first

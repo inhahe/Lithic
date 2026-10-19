@@ -1074,6 +1074,41 @@ public class DirectoryBackupService
                     keepVersions = true;
                 }
 
+                // No history for this file: the new copy replaces the old one in
+                // place, and the old one's live record has to go with it. It
+                // stayed active, still claiming the old content at a path that
+                // now held the new bytes - so a .fileref to the old content
+                // restored the NEW bytes (restore does not re-hash), a later file
+                // with the old content became a .fileref to nothing, and the
+                // stale row passed for a surviving copy in Cleanup's guard. Rare
+                // while no-history files only came from an empty Default with no
+                // exclusion set; the normal path once an empty Default stopped
+                // being mistaken for an exclusion.
+                FileRecord? replacedRecord = null;
+                if (!keepVersions && hasExistingInfo && !resurrecting)
+                {
+                    replacedRecord = await _catalog.GetFileRecordByPathAndVersionAsync(
+                        backupSetId, file.FullPath, existingInfo.MaxVersion, ct);
+                    if (replacedRecord is { IsDeleted: true })
+                        replacedRecord = null;
+
+                    // Its bytes are about to be overwritten. If they are the last
+                    // plain copy of content a .fileref still resolves to, move them
+                    // into that reference first (as retention does before deleting
+                    // a version). If that cannot be done, keep the old copy as an
+                    // earlier version instead: never orphan a reference.
+                    if (replacedRecord is { IsFileRef: false, IsDeduped: false }
+                        && !string.IsNullOrEmpty(replacedRecord.Hash)
+                        && File.Exists(Path.Combine(targetDirectory, replacedRecord.DiscPath))
+                        && !await KeepContentReachableAsync(backupSetId, replacedRecord, targetDirectory, ct))
+                    {
+                        keepVersions = true;
+                        replacedRecord = null;
+                    }
+                    if (replacedRecord is not null && !string.IsNullOrEmpty(replacedRecord.Hash))
+                        contentPathCache.Remove(replacedRecord.Hash);
+                }
+
                 // Move the existing current file to _prev when there is an earlier
                 // version and version history is enabled. The earlier version, not
                 // the diff, decides: the diff calls a reappeared path new, and can
@@ -1369,6 +1404,27 @@ public class DirectoryBackupService
                     SourceLastWriteUtc = file.LastWriteUtc,
                     BackedUpUtc = DateTime.UtcNow,
                 }, ct);
+
+                // Replaced in place (no history): retire the old record, in the
+                // same batch as the new one. Its stored file was overwritten when
+                // it shares the new copy's name; when the storage form changed
+                // (plain <-> .fileref/.dedup) it sits under another name, and
+                // nothing else would ever remove it.
+                if (replacedRecord is not null)
+                {
+                    await _catalog.MarkFileRecordsDeletedByIdsAsync(backupSetId, [replacedRecord.Id], ct);
+                    string newDiscPath = GetCurrentDiscPath(file.FullPath, isDeduped, isFileRef);
+                    if (!string.Equals(replacedRecord.DiscPath.Replace('/', '\\'), newDiscPath,
+                            StringComparison.OrdinalIgnoreCase))
+                    {
+                        try { ForceDeleteFile(Path.Combine(targetDirectory, replacedRecord.DiscPath)); }
+                        catch (Exception ex) when (ex is IOException or UnauthorizedAccessException)
+                        {
+                            // Left on disk; Cleanup's destination scan lists it as
+                            // catalog-deleted.
+                        }
+                    }
+                }
 
                 // A stubbed plain file holds placeholder content, so it would
                 // fail a hash read-back — skip it during verification.
@@ -2596,9 +2652,7 @@ public class DirectoryBackupService
             // Only pay the per-file cost if at least one non-default tier set
             // has 0 tiers (i.e. acts as an exclusion set).
             bool hasExclusionTierSet = tierSets.Any(ts =>
-                ts.Tiers.Count == 0
-                && ts.FilePatterns.Count > 0
-                && !string.Equals(ts.Name, "Default", StringComparison.OrdinalIgnoreCase));
+                ts.ExcludesFromBackup && ts.FilePatterns.Count > 0);
             if (hasExclusionTierSet)
                 tierResolver = resolver;
         }
@@ -2629,7 +2683,9 @@ public class DirectoryBackupService
 
             if (globalFilter?.Invoke(path) ?? false)
                 return true;
-            if (tierResolver is not null && tierResolver(path).Tiers.Count == 0)
+            // ExcludesFromBackup, not "no tiers": an empty Default backs its
+            // files up without history. See VersionTierSet.ExcludesFromBackup.
+            if (tierResolver is not null && tierResolver(path).ExcludesFromBackup)
                 return true;
             return false;
         };
@@ -2675,14 +2731,23 @@ public class DirectoryBackupService
         var zeroTierPatterns = new List<string>();
         foreach (var ts in tierSets)
         {
-            if (ts.Tiers.Count != 0)
+            if (ts.IsDefault)
+                continue;   // the fallback, consulted last whatever its position
+            if (!ts.ExcludesFromBackup)
+            {
+                // Tier sets are first-match, in this order. A set that versions
+                // files and is evaluated BEFORE a later excluding set can claim
+                // files inside that set's subtree (x\tmp\a.docx under "*.docx"
+                // before "*\tmp\*"), so no later set's patterns prove a subtree
+                // excluded. Stop collecting; the per-file filter still applies.
+                if (ts.FilePatterns.Count > 0)
+                    break;
                 continue;
+            }
             if (ts.FilePatterns.Count == 0)
                 continue;
             if (ts.FileExemptPatterns.Count > 0)
                 continue;   // an exemption can re-include a file below; cannot prune
-            if (string.Equals(ts.Name, "Default", StringComparison.OrdinalIgnoreCase))
-                continue;
             zeroTierPatterns.AddRange(ts.FilePatterns);
         }
 
@@ -3305,6 +3370,46 @@ public class DirectoryBackupService
         {
             return false;
         }
+    }
+
+    /// <summary>
+    /// The plain copy <paramref name="record"/> describes is about to be
+    /// overwritten in place (its file keeps no history). Make sure no surviving
+    /// <c>.fileref</c> is left resolving to its content with nowhere to find it:
+    /// if another plain copy of the content survives, point the references'
+    /// hints at it; otherwise promote one reference into a real plain file using
+    /// these bytes. The last-plain-copy guard of the retention pass, for an
+    /// overwrite instead of a delete. Returns <c>false</c> when a reference
+    /// needs the bytes and could not be given them; the caller then keeps the
+    /// old copy as an earlier version rather than overwrite it.
+    /// </summary>
+    private async Task<bool> KeepContentReachableAsync(
+        int backupSetId, FileRecord record, string targetDirectory, CancellationToken ct)
+    {
+        var others = (await _catalog.GetActiveRecordsByHashAsync(backupSetId, record.Hash, ct))
+            .Where(r => r.Id != record.Id)
+            .ToList();
+
+        var survivingPlain = others.FirstOrDefault(r => !r.IsFileRef && !r.IsDeduped);
+        if (survivingPlain is not null)
+        {
+            await UpdateFileRefContentPathsAsync(
+                backupSetId, record.Hash, survivingPlain.DiscPath, targetDirectory, ct);
+            return true;
+        }
+
+        var survivingRef = others.FirstOrDefault(r => r.IsFileRef);
+        if (survivingRef is null)
+            return true; // nothing refers to this content
+
+        if (!await TryPromoteFileRefToPlainAsync(
+                targetDirectory, Path.Combine(targetDirectory, record.DiscPath), survivingRef, ct))
+            return false;
+
+        // The promoted reference holds the bytes now, at its suffix-less path.
+        await UpdateFileRefContentPathsAsync(
+            backupSetId, record.Hash, survivingRef.DiscPath, targetDirectory, ct);
+        return true;
     }
 
     /// <summary>

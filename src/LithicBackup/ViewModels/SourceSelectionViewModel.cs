@@ -228,6 +228,17 @@ public class SourceSelectionViewModel : ViewModelBase, IDisposable
         Roots = [];
         RetentionTiers = [];
         TierSets = [];
+        // Tier edits happen inside each tier set (its tier rows), not on this
+        // view model, so they reach the unsaved-changes flag only through here.
+        TierSets.CollectionChanged += (_, e) =>
+        {
+            if (e.OldItems is not null)
+                foreach (TierSetViewModel ts in e.OldItems)
+                    ts.TiersEdited -= OnTierSetTiersEdited;
+            if (e.NewItems is not null)
+                foreach (TierSetViewModel ts in e.NewItems)
+                    ts.TiersEdited += OnTierSetTiersEdited;
+        };
         NextCommand = new RelayCommand(_ => OnNext(), _ => HasSelection && !IsEditMode);
         SaveCommand = new RelayCommand(_ => OnSave(), _ => _needsSave && IsEditMode && !_saving && !IsApplyingSelections);
         CancelCommand = new RelayCommand(_ => CancelRequested?.Invoke());
@@ -464,6 +475,35 @@ public class SourceSelectionViewModel : ViewModelBase, IDisposable
     }
 
     /// <summary>
+    /// A tier was added, removed or changed in one of the tier sets. Marks the
+    /// set unsaved, under the same init-time suspend as every other edit (the
+    /// restore adds every saved tier while it is off).
+    /// </summary>
+    /// <param name="countChanged">
+    /// The number of tiers changed. A set with patterns and no tiers excludes its
+    /// files from backup, so that can change which files the tree's sizes count:
+    /// the cached exclusion filter is rebuilt, and Apply is offered to refresh
+    /// the sizes, as for a pattern edit.
+    /// </param>
+    private void OnTierSetTiersEdited(bool countChanged)
+    {
+        if (!_dirtyTrackingArmed)
+            return;
+
+        if (!string.IsNullOrEmpty(_saveStatusText))
+            SaveStatusText = "";
+        if (!_needsSave)
+            _needsSave = true;
+
+        if (countChanged)
+        {
+            _excludeFilterDirty = true;
+            _filtersPendingApply = true;
+        }
+        CommandManager.InvalidateRequerySuggested();
+    }
+
+    /// <summary>
     /// Whether the user has edited filter patterns since the last Apply.
     /// Drives the Apply button's enabled state.
     /// </summary>
@@ -521,9 +561,7 @@ public class SourceSelectionViewModel : ViewModelBase, IDisposable
         if (tierModels.Count > 0)
         {
             bool hasExclusion = tierModels.Any(ts =>
-                ts.Tiers.Count == 0
-                && ts.FilePatterns.Count > 0
-                && !string.Equals(ts.Name, "Default", StringComparison.OrdinalIgnoreCase));
+                ts.ExcludesFromBackup && ts.FilePatterns.Count > 0);
             if (hasExclusion)
                 tierResolver = VersionTierSet.BuildTierResolver(tierModels);
         }
@@ -533,9 +571,8 @@ public class SourceSelectionViewModel : ViewModelBase, IDisposable
 
         _cachedExcludeFilter = path =>
         {
-            if (tierResolver(path).Tiers.Count == 0)
-                return true;
-            return false;
+            // Not "no tiers": an empty Default is backed up, without history.
+            return tierResolver(path).ExcludesFromBackup;
         };
         _cachedExcludeFilterSignature = ComputeExcludeFilterSignature(tierModels);
         return _cachedExcludeFilter;

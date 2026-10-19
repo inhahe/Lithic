@@ -980,7 +980,8 @@
                     <!-- "Default" description -->
                     <TextBlock Margin="20,0,0,4" FontSize="11" FontStyle="Italic"
                                Foreground="{StaticResource TextDimBrush}"
-                               Text="Fallback tier set — applies to all files not matched by another tier set.">
+                               TextWrapping="Wrap"
+                               Text="Fallback tier set — applies to all files not matched by another tier set. With no tiers, those files are still backed up, but no earlier versions are kept (Cleanup's Excess Versions then lists any they already have). In any other tier set, no tiers means its files are excluded from backup.">
                         <TextBlock.Style>
                             <Style TargetType="TextBlock">
                                 <Setter Property="Visibility" Value="Collapsed" />

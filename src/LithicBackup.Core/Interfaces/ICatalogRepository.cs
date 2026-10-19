@@ -302,6 +302,25 @@ public interface ICatalogRepository : IDisposable
     /// </summary>
     Task<IReadOnlyList<FileRecord>> GetActiveRecordsByHashAsync(int backupSetId, string hash, CancellationToken ct = default);
 
+    /// <summary>
+    /// Of the records in <paramref name="candidateIds"/>, which are about to be
+    /// deleted together, the ones that must be kept because a <c>.fileref</c>
+    /// still needs their bytes: a plain, hashed copy whose content is referenced
+    /// by an active <c>.fileref</c> that is NOT a candidate, while no plain copy
+    /// of that content outside the candidates survives. One is kept per such
+    /// content (the newest). The bulk form of the last-plain-copy guard the
+    /// backup engine's retention pass applies one record at a time.
+    /// </summary>
+    /// <param name="keepableIds">
+    /// The candidates that may be kept back (a subset of
+    /// <paramref name="candidateIds"/>); null means all of them. Cleanup's purge
+    /// deletes several categories at once but can hold back only excess versions:
+    /// content whose only copies are in other categories gets no keeper.
+    /// </param>
+    Task<HashSet<long>> GetNeededContentCopiesAsync(
+        int backupSetId, IReadOnlyCollection<long> candidateIds,
+        IReadOnlyCollection<long>? keepableIds = null, CancellationToken ct = default);
+
     // --- Lazy restore browser ---
 
     /// <summary>

@@ -1347,6 +1347,82 @@ restore with "Backup folder not found". `RestoreService.FindDiscRootAsync` keeps
 the label when its folder exists and otherwise falls back to the set's current
 destination, where the files sit at the same relative paths.
 
+## "No tiers" means two opposite things, so it has one definition
+
+A tier set with no tiers either **excludes** its files from backup (any set but
+Default: the "None" set, or a custom set emptied) or **backs them up with no
+history** (Default, the fallback for unmatched files: the engine's
+`keepVersions` is false, so the current copy is overwritten in place). Every
+check goes through `VersionTierSet.ExcludesFromBackup` / `KeepsNoHistory`; never
+test `Tiers.Count == 0` alone. The per-file exclusion filters (engine
+`BuildExclusionFilter`, editor `GetExcludeFilter`) did exactly that. They only
+consult the resolver once some set excludes by pattern - but a "None" set with
+patterns is the norm, and then an emptied Default excluded **every file no other
+set matched**: on a real set, everything outside a list of text and code
+extensions would have stopped being backed up, and Cleanup would have listed
+their backups under "matches configured exclusion" for deletion. Pinned by
+`tools\excess_versions_test` §7, which fails against the old check.
+
+**Earlier versions of no-history files are excess, and only Cleanup removes
+them.** Removing Default's tiers stops new versions, but the retention pass skips
+a path whose tiers are empty, so the versions it already had would stay for good
+(88 GB on one real set). Cleanup's Excess Versions now lists every earlier
+version of a `KeepsNoHistory` file, newest included (the tiered rule "never
+delete the newest earlier version" exists to keep a rollback, which a set that
+keeps none has declined). Automatic retention deliberately still skips them: an
+edit to one setting should not have the next backup delete tens of gigabytes
+unreviewed. Excluded files' versions stay the exclusion category's.
+
+**Cleanup must not delete a copy a `.fileref` needs.** A `.fileref` stores no
+bytes; it resolves by hash to an active plain copy. The engine's retention pass
+promotes a reference before deleting the last plain copy of its content; Cleanup's
+purge copies nothing, so it holds such copies back instead, via
+`ICatalogRepository.GetNeededContentCopiesAsync` (one per content, the newest;
+none when the reference is being deleted too). It asks twice. At scan time,
+against the Excess Versions list, so what is shown is what will go. And again in
+the purge, **inside its catalog transaction** (which holds the set's write lock,
+so no reference can appear in between), against everything being deleted in every
+ticked category (`RecheckNeededCopies`): an excess copy can be listed because a
+second plain copy survives, and that second copy can be in "deleted from disk",
+ticked too; and a backup between scan and Clean can make a new `.fileref` to a
+listed copy (a reverted file). Only excess versions can be held back. This
+applied to tiered excess versions all along; making the newest earlier version
+deletable made it likely, since that is the usual anchor.
+
+**Overwriting in place retires the old record.** With no history the new copy
+replaces the old one at the same path, and the old live record must be marked
+deleted in the same batch (`replacedRecord` in `ExecuteCoreAsync`). It stayed
+live, claiming the old content at a path that then held the new bytes: a
+`.fileref` to the old content restored the new bytes (restore does not re-hash),
+a later file with the old content became a reference to nothing, and the stale row
+counted as a surviving copy in Cleanup's guard. Before the overwrite,
+`KeepContentReachableAsync` gives the bytes to a reference that needs them
+(promotes it, as retention does); if that fails the old copy is kept as an earlier
+version rather than overwritten. A stored file left under another name when the
+storage form changes (plain to `.fileref`, say) is deleted. This path used to run
+only for an empty Default with no exclusion set, which is why nobody hit it.
+
+**Directory pruning respects first-match order.** `BuildDirectoryPruneFilter`
+skips a whole subtree for an excluding set's patterns, but tier sets are
+first-match: a set that keeps history and comes earlier can claim files inside
+(`x\tmp\a.docx` under `*.docx` ahead of `*\tmp\*`). Patterns of excluding sets are
+collected only until the first non-Default set that keeps history; "None" is
+always second, so the normal case prunes as before.
+
+**Cleanup's later phases skip exactly the files other categories offer.** They
+skipped every file under a removed or deleted-from-disk item's directory. A
+deleted-from-disk item can be a folder that still exists with one file missing,
+so its present files could show no excess version, catalog duplicate or manual
+exclusion match (`AlreadyOfferedFilter`; every such item lists its paths).
+
+**Tier edits are edits.** They live inside the tier sets - `TierSetViewModel.Tiers`
+and each `RetentionTierViewModel` - where the editor's dirty flag never looked,
+so adding or removing a tier or changing its numbers left Save disabled and the
+close prompt silent (the edit was lost on closing). `TierSetViewModel.TiersEdited`
+reports them, and the editor subscribes to every tier set it holds. A change in
+the NUMBER of tiers also invalidates the cached exclusion filter, since it can
+turn a set into an exclusion set. Pinned by `tools\editor_save_test` §16.
+
 ## Continuous backup and full scans interleave; they do not run concurrently
 
 The Worker is **one sequential poll loop** — `CheckSchedules` → `CheckContinuous`

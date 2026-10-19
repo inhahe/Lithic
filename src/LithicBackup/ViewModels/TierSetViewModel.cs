@@ -1,4 +1,6 @@
 using System.Collections.ObjectModel;
+using System.Collections.Specialized;
+using System.ComponentModel;
 using LithicBackup.Core.Models;
 
 namespace LithicBackup.ViewModels;
@@ -24,6 +26,40 @@ public class TierSetViewModel : ViewModelBase
         _name = name;
         IsBuiltIn = isBuiltIn;
         Tiers = [];
+        Tiers.CollectionChanged += OnTiersChanged;
+    }
+
+    /// <summary>
+    /// Raised when a tier is added or removed, or a tier's days or versions
+    /// change. Its argument says whether the NUMBER of tiers changed, which is
+    /// what decides if a set with patterns excludes its files (no tiers) or
+    /// versions them.
+    /// </summary>
+    /// <remarks>
+    /// The editor's unsaved-changes flag listened only to this set's own
+    /// properties (name and patterns), and these edits live one level down, in
+    /// the tier collection and the tier rows. So removing Default's last tier,
+    /// adding one, or changing "keep 3" to "keep 1" left Save disabled - and the
+    /// close prompt silent, so the edit was simply lost on closing.
+    /// </remarks>
+    public event Action<bool>? TiersEdited;
+
+    private void OnTiersChanged(object? sender, NotifyCollectionChangedEventArgs e)
+    {
+        if (e.OldItems is not null)
+            foreach (RetentionTierViewModel t in e.OldItems)
+                t.PropertyChanged -= OnTierPropertyChanged;
+        if (e.NewItems is not null)
+            foreach (RetentionTierViewModel t in e.NewItems)
+                t.PropertyChanged += OnTierPropertyChanged;
+        TiersEdited?.Invoke(true);
+    }
+
+    private void OnTierPropertyChanged(object? sender, PropertyChangedEventArgs e)
+    {
+        if (e.PropertyName is nameof(RetentionTierViewModel.MaxAgeDays)
+                           or nameof(RetentionTierViewModel.MaxVersions))
+            TiersEdited?.Invoke(false);
     }
 
     /// <summary>

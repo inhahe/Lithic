@@ -595,6 +595,11 @@ public class SqliteCatalogRepository : ICatalogRepository
     public Task<IReadOnlyList<FileRecord>> GetActiveRecordsByHashAsync(int backupSetId, string hash, CancellationToken ct = default)
         => GetSet(backupSetId).GetActiveRecordsByHashAsync(backupSetId, hash, ct);
 
+    public Task<HashSet<long>> GetNeededContentCopiesAsync(
+        int backupSetId, IReadOnlyCollection<long> candidateIds,
+        IReadOnlyCollection<long>? keepableIds = null, CancellationToken ct = default)
+        => GetSet(backupSetId).GetNeededContentCopiesAsync(backupSetId, candidateIds, keepableIds, ct);
+
     public Task<IReadOnlyList<RestoreTreeChild>> GetRestoreChildrenAsync(int backupSetId, string parentPrefix, CancellationToken ct = default)
         => GetSet(backupSetId).GetRestoreChildrenAsync(parentPrefix, ct);
 

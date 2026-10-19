@@ -286,7 +286,9 @@ public class OrphanedCategoryViewModel : ViewModelBase
         OrphanedReason.MatchesConfiguredExclusion =>
             "Files matching the backup set's configured exclusion rules (extensions or zero-tier sets).",
         OrphanedReason.ExcessVersion =>
-            "Older versions of files (stored under {drive}_prev) that exceed the configured retention tier limits.",
+            "Older versions of files (stored under {drive}_prev) that exceed the configured retention tier limits, "
+            + "including every older version of a file whose tier set keeps none (an empty Default). "
+            + "A copy that a duplicate-file reference still needs is kept and not listed.",
         OrphanedReason.UntrackedFile =>
             "Files in the destination directory that are not tracked by the catalog (e.g. leftover from a previous backup tool).",
         OrphanedReason.CatalogDeleted =>

@@ -1,5 +1,65 @@
 # LithicBackup — Known Issues & Tech Debt
 
+## FIXED: emptying Default could not be saved, would have excluded most files, and left its versions forever (2026-10-19, 1.13.0)
+
+Reported as "it's retaining versions of files I don't have in my tiers": large
+VMware files kept one earlier version each (52 GB for one VM). That was the
+set's Default tier set - "any age, keep 1" - which covers every file no other tier
+set matches; 88 GB of history on one set, 29 GB on the other. Trying to empty
+Default turned up three faults:
+
+- **Save never enabled.** Tier edits (removing or adding a tier, changing its
+  days or versions) live inside the tier sets, which the editor's dirty flag did
+  not watch. The close prompt missed them too, so the edit was lost on closing.
+- **The save would have stopped most files being backed up.** The exclusion
+  filters treated every no-tier set as an exclusion, Default included, as soon as
+  any set excluded by pattern - and the set's "None" set did. Everything outside
+  Custom 1's text and code extensions would have been skipped by the next backup,
+  and offered for deletion by Cleanup as excluded. A dead Save button was the
+  only thing in the way.
+- **The versions already kept would never have gone.** The retention pass and
+  Cleanup both skipped files whose tier set has no tiers.
+
+Fixed: tier edits enable Save; `VersionTierSet.ExcludesFromBackup` /
+`KeepsNoHistory` are the one definition every check uses; Cleanup's Excess
+Versions lists every earlier version of a file that falls to an empty Default
+(automatic retention still leaves them, by choice); and Cleanup no longer deletes
+an earlier copy that a surviving `.fileref` needs for its content, a hazard its
+excess-version purge always had. The README also described "None" wrongly, as
+"no version history; overwritten in place". Pinned by `tools\excess_versions_test`
+and `tools\editor_save_test` §16.
+
+The review (Opus) of that fix found four more, all fixed in the same release:
+- **Overwriting in place left the old record live** (high). With no history, the
+  new copy replaced the old at the same path, but the old record stayed active,
+  claiming the old content: a `.fileref` to it restored the new bytes, and a later
+  file with that content became a reference to nothing. It used to need an empty
+  Default AND no exclusion set, so it never came up; the exclusion fix made it the
+  normal path. The old record is now retired, and a reference that needs the old
+  bytes is given them first.
+- **Cleanup's `.fileref` guard ran only at scan time, only on its own list.** The
+  purge now re-checks inside its transaction against every ticked category.
+- **Directory pruning ignored first-match order** (old): an excluding set's
+  subtree was skipped even when an earlier set that keeps history matched files in
+  it, which were then never backed up.
+- **An empty Default was assumed when a set's tier list had no Default at all**
+  (old or hand-edited data): Cleanup now lists versions as excess only for a
+  Default that is really there and empty.
+
+Also found while testing, older: Cleanup's later phases skipped every file in the
+folder of a "deleted from disk" item, so a folder with one deleted file showed no
+excess versions, catalog duplicates or manual-exclusion matches for the rest.
+
+**Open:**
+- Automatic retention still leaves the earlier versions of an emptied Default's
+  files; only Cleanup removes them, after review. By choice.
+- Cleanup can hold back only excess versions. If the last plain copies of content
+  a `.fileref` needs are all in other ticked categories (deleted from disk,
+  removed from sources, excluded), the purge deletes them and that reference
+  becomes unrestorable - as it always could.
+- A tier list with no Default still makes the engine keep no history for
+  unmatched files, while the editor shows such a set with the stock tiers.
+
 ## FIXED: the Worker never saw the settings the app saves (2026-10-18, 1.12.0)
 
 Found while fixing the entry below. `UserSettings` lived in

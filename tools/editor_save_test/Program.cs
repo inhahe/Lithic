@@ -253,6 +253,7 @@ internal static class Program
         await ExitAnswerYesSavesBeforeReturningAsync();
         await StandaloneLargestFilesAsync();
         await NewSetAsync();
+        await TierEditsEnableSaveAsync();
 #if !OLD_CODE
         await ForgetMissingInEditorAsync();
 #endif
@@ -488,6 +489,80 @@ internal static class Program
         Check(_counter.Writes == w0, $"no catalog write (writes: {_counter.Writes - w0})");
         Check(Json((await DbSetAsync()).SourceSelections) == Json(dbBefore.SourceSelections),
             "the saved selection is unchanged");
+        await EnsureClosedAsync(ed.Window);
+    }
+
+    /// <summary>
+    /// Removing, adding or editing a retention tier is an edit like any other.
+    /// Those edits live inside the tier sets (their tier rows), which the dirty
+    /// flag never listened to: removing Default's last tier left Save disabled,
+    /// and the close prompt silent, so the edit was lost on closing.
+    /// </summary>
+    static async Task TierEditsEnableSaveAsync()
+    {
+        Console.WriteLine();
+        Console.WriteLine("=== 16. tier edits enable Save, are saved, and are asked about on X ===");
+
+        static TierSetViewModel? DefaultOf(Editor e) => e.Vm.TierSets.FirstOrDefault(t => t.Name == "Default");
+        static VersionTierSet? DbDefault(BackupSet s) => s.JobOptions?.TierSets.FirstOrDefault(t => t.Name == "Default");
+
+        // --- remove every tier from Default, then Save ---
+        var ed = await OpenEditorAsync("tiers: remove");
+        if (ed is null) return;
+        var def = DefaultOf(ed);
+        Check(def is { Tiers.Count: > 0 }, $"Default starts with tiers ({def?.Tiers.Count})");
+        Check(!ed.Vm.SaveCommand.CanExecute(null), "Save starts disabled");
+        ed.Vm.SelectedTierSet = def;
+        await Task.Delay(300);
+        ed.Vm.MarkClean();   // selecting a tier set is not what this tests
+        foreach (var tier in def!.Tiers.ToList())
+            tier.RemoveCommand.Execute(null);
+        Check(def.Tiers.Count == 0, "every tier is removed from Default");
+        Check(ed.Vm.SaveCommand.CanExecute(null), "removing them enables Save");
+
+        int w0 = _counter.Writes;
+        ed.Vm.SaveCommand.Execute(null);
+        Check(await WaitClosedAsync(ed.Window), "Save closes the editor");
+        var db = await DbSetAsync();
+        Check(_counter.Writes - w0 == 1, $"with one write (writes: {_counter.Writes - w0})");
+        Check(DbDefault(db) is { Tiers.Count: 0 }, "the saved Default has no tiers");
+        Check(db.JobOptions?.RetentionTiers.Count == 0, "nor do the saved flat retention tiers");
+        await EnsureClosedAsync(ed.Window);
+
+        // --- reopen: still empty; add a tier and give it a limit ---
+        ed = await OpenEditorAsync("tiers: add");
+        if (ed is null) return;
+        def = DefaultOf(ed);
+        Check(def is { Tiers.Count: 0 }, "reopened, Default still has no tiers");
+        ed.Vm.SelectedTierSet = def;
+        await Task.Delay(300);
+        ed.Vm.MarkClean();
+        ed.Vm.AddRetentionTierCommand.Execute(null);
+        Check(ed.Vm.SaveCommand.CanExecute(null), "adding a tier enables Save");
+        def!.Tiers[0].MaxVersions = "2";
+        ed.Vm.SaveCommand.Execute(null);
+        Check(await WaitClosedAsync(ed.Window), "Save closes the editor");
+        db = await DbSetAsync();
+        Check(DbDefault(db) is { Tiers: [{ MaxVersions: 2, MaxAge: null }] }, "the saved Default keeps 2 versions");
+        await EnsureClosedAsync(ed.Window);
+
+        // --- change only the number, close with X, answer No ---
+        ed = await OpenEditorAsync("tiers: edit");
+        if (ed is null) return;
+        def = DefaultOf(ed);
+        ed.Vm.SelectedTierSet = def;
+        await Task.Delay(300);
+        ed.Vm.MarkClean();
+        def!.Tiers[0].MaxVersions = "5";
+        Check(ed.Vm.SaveCommand.CanExecute(null), "changing a tier's versions enables Save");
+        w0 = _counter.Writes;
+        _dialogs.Expect("Unsaved Changes", DialogWatcher.IDNO);
+        ed.Window.Close();
+        bool closed = await WaitClosedAsync(ed.Window);
+        Check(_dialogs.WasAnswered("Unsaved Changes"), "X asks \"Save before closing?\" about it");
+        Check(closed && _counter.Writes == w0, "and No closes without writing");
+        _dialogs.ClearExpectations();
+        Check(DbDefault(await DbSetAsync()) is { Tiers: [{ MaxVersions: 2 }] }, "the saved Default still keeps 2");
         await EnsureClosedAsync(ed.Window);
     }
 

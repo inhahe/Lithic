@@ -1430,6 +1430,88 @@ internal sealed class SqliteSetDatabase : IDisposable
         return list;
     }
 
+    /// <summary>See <see cref="ICatalogRepository.GetNeededContentCopiesAsync"/>.</summary>
+    public async Task<HashSet<long>> GetNeededContentCopiesAsync(
+        int backupSetId, IReadOnlyCollection<long> candidateIds,
+        IReadOnlyCollection<long>? keepableIds = null, CancellationToken ct = default)
+    {
+        ct.ThrowIfCancellationRequested();
+        var keep = new HashSet<long>();
+        if (candidateIds.Count == 0)
+            return keep;
+
+        using var _ = await LockAsync(ct).ConfigureAwait(false);
+
+        // The candidates go into a TEMP table: connection-local, in the temp
+        // database, so filling it takes no write lock on the set and waits on no
+        // other process. Tens of thousands of ids are normal (every earlier
+        // version of every file in a tier set that keeps none).
+        Execute("CREATE TEMP TABLE IF NOT EXISTS DeleteCandidates (Id INTEGER PRIMARY KEY)");
+        Execute("CREATE TEMP TABLE IF NOT EXISTS KeepableCandidates (Id INTEGER PRIMARY KEY)");
+        Execute("DELETE FROM temp.DeleteCandidates");
+        Execute("DELETE FROM temp.KeepableCandidates");
+        try
+        {
+            // One statement, not a loop in a transaction of our own: this
+            // connection may already be inside one (a backup in this process),
+            // and SQLite transactions do not nest.
+            using (var ins = _connection.CreateCommand())
+            {
+                ins.CommandText = """
+                    INSERT OR IGNORE INTO temp.DeleteCandidates (Id)
+                    SELECT value FROM json_each($ids)
+                    """;
+                ins.Parameters.AddWithValue("$ids", System.Text.Json.JsonSerializer.Serialize(candidateIds));
+                ins.ExecuteNonQuery();
+
+                ins.CommandText = """
+                    INSERT OR IGNORE INTO temp.KeepableCandidates (Id)
+                    SELECT value FROM json_each($ids)
+                    """;
+                ins.Parameters.Clear();
+                ins.Parameters.AddWithValue("$ids",
+                    System.Text.Json.JsonSerializer.Serialize(keepableIds ?? candidateIds));
+                ins.ExecuteNonQuery();
+            }
+
+            // "Plain" means what can anchor a .fileref: real bytes under the
+            // file's own name - the same definition as the retention guard and
+            // GetActiveRecordsByHashAsync (split and zipped copies are outside
+            // the file-level dedup pool). Hash = is a BINARY compare on purpose:
+            // every writer stores lower-case hex, and it lets IX_Files_Active_Hash
+            // serve both EXISTS probes.
+            using var cmd = _connection.CreateCommand();
+            cmd.CommandText = """
+                SELECT MAX(p.Id)
+                FROM Files p
+                INNER JOIN temp.KeepableCandidates c ON c.Id = p.Id
+                WHERE p.IsDeleted = 0 AND p.Hash <> ''
+                  AND p.IsFileRef = 0 AND p.IsDeduped = 0 AND p.IsSplit = 0 AND p.IsZipped = 0
+                  AND EXISTS (SELECT 1 FROM Discs d WHERE d.Id = p.DiscId AND d.BackupSetId = $setId)
+                  AND EXISTS (
+                      SELECT 1 FROM Files r
+                      WHERE r.Hash = p.Hash AND r.IsDeleted = 0 AND r.IsFileRef = 1
+                        AND r.Id NOT IN (SELECT Id FROM temp.DeleteCandidates))
+                  AND NOT EXISTS (
+                      SELECT 1 FROM Files q
+                      WHERE q.Hash = p.Hash AND q.IsDeleted = 0
+                        AND q.IsFileRef = 0 AND q.IsDeduped = 0 AND q.IsSplit = 0 AND q.IsZipped = 0
+                        AND q.Id NOT IN (SELECT Id FROM temp.DeleteCandidates))
+                GROUP BY p.Hash
+                """;
+            cmd.Parameters.AddWithValue("$setId", backupSetId);
+            using var r = cmd.ExecuteReader();
+            while (r.Read())
+                keep.Add(r.GetInt64(0));
+        }
+        finally
+        {
+            Execute("DELETE FROM temp.DeleteCandidates");
+            Execute("DELETE FROM temp.KeepableCandidates");
+        }
+        return keep;
+    }
+
     public async Task<int> MarkFilesDeletedByDirectoryAsync(int backupSetId, string directoryPrefix, CancellationToken ct = default)
     {
         ct.ThrowIfCancellationRequested();
