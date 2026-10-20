@@ -333,8 +333,17 @@ Check(dHeads[aPath].MaxVersion == 4, $"the new copy is numbered after it: v4 (go
 var dA = await repoB.GetFileRecordByPathAndVersionAsync(setD.Id, aPath, 3);
 Check(dA is not null && dA.DiscPath.EndsWith("a.txt.v3", StringComparison.OrdinalIgnoreCase),
     "the catalog's record of the old copy says v3 and points at a.txt.v3");
-Check(await repoB.GetFileRecordByPathAndVersionAsync(setD.Id, aPath, 1) is null,
-    "no record still claims version 1 (which belongs to the untracked file)");
+// Versions 1 and 2 are the earlier catalog's, on the drive in no record: they are
+// recorded as themselves now, where they were left untracked (Restore could not
+// see them, Cleanup listed them for deletion).
+var dA1 = await repoB.GetFileRecordByPathAndVersionAsync(setD.Id, aPath, 1);
+var dA2 = await repoB.GetFileRecordByPathAndVersionAsync(setD.Id, aPath, 2);
+Check(dA1 is not null && dA1.DiscPath.EndsWith("a.txt.v1", StringComparison.OrdinalIgnoreCase)
+      && string.Equals(dA1.Hash, Sha(a1), StringComparison.OrdinalIgnoreCase),
+    "version 1 is the old a.txt.v1 itself, recorded under its own content, not the renumbered copy");
+Check(dA2 is not null && dA2.DiscPath.EndsWith("a.txt.v2", StringComparison.OrdinalIgnoreCase)
+      && string.Equals(dA2.Hash, Sha(a2), StringComparison.OrdinalIgnoreCase),
+    "and version 2 the old a.txt.v2");
 
 // ===================================================================
 // 6. Two stored forms of one file.
@@ -467,6 +476,63 @@ Check(f3 is not null && File.ReadAllText(Path.Combine(target7, f3.DiscPath)) == 
     "the version the old computer backed up after the export is recorded as v3");
 
 // ===================================================================
+// 7b. The old computer backed up twice more after the export.
+// ===================================================================
+// The free-number search steps over the old computer's intermediate version;
+// it is on the drive and was in no record - invisible to Restore, and listed
+// by Cleanup as untracked. Each such version is now recorded under its number.
+Console.WriteLine();
+Console.WriteLine("=== 7b. ... and twice more: the version in between is recorded too ===");
+string source7b = Path.Combine(root, "src7b"), target7b = Path.Combine(root, "dst7b");
+Directory.CreateDirectory(source7b);
+Directory.CreateDirectory(target7b);
+string gPath = Path.Combine(source7b, "g.txt");
+async Task Backup7b(DirectoryBackupService svc, int setId)
+{
+    var job = new BackupJob
+    {
+        BackupSetId = setId,
+        Sources = [new SourceSelection { Path = source7b, IsDirectory = true, IsSelected = true }],
+        EnableFileDeduplication = true, TargetDirectory = target7b, ZipMode = ZipMode.None,
+    };
+    var r = await svc.ExecuteAsync(job, target7b, null, null, CancellationToken.None);
+    if (!r.Success)
+        throw new Exception("backup failed: " + string.Join("; ", r.FailedFiles.Select(f => f.Error)));
+}
+var repoA7b = NewCatalog(Path.Combine(root, "A7b"));
+var svcA7b = NewService(repoA7b);
+var setA7b = await repoA7b.CreateBackupSetAsync(new BackupSet
+{
+    Name = "behind twice", SourceRoots = [source7b], CreatedUtc = DateTime.UtcNow,
+    DefaultMediaType = MediaType.Directory, JobOptions = new JobOptions { TargetDirectory = target7b },
+});
+string[] gContents = ["g one", "g two, longer", "g three, longer still", "g four, the old computer's last", "g five, on the new computer"];
+await File.WriteAllTextAsync(gPath, gContents[0]);
+await Backup7b(svcA7b, setA7b.Id);
+await File.WriteAllTextAsync(gPath, gContents[1]);
+await Backup7b(svcA7b, setA7b.Id);
+string export7b = Path.Combine(root, "behind twice.lithic");
+await BackupSetTransfer.ExportAsync(repoA7b, (await repoA7b.GetBackupSetAsync(setA7b.Id))!, export7b, includeHistory: true);
+await File.WriteAllTextAsync(gPath, gContents[2]);     // after the export, twice
+await Backup7b(svcA7b, setA7b.Id);
+await File.WriteAllTextAsync(gPath, gContents[3]);
+await Backup7b(svcA7b, setA7b.Id);
+
+var repoB7b = NewCatalog(Path.Combine(root, "B7b"));
+var svcB7b = NewService(repoB7b);
+var setB7b = (await BackupSetTransfer.ImportAsync(repoB7b, export7b)).Set;
+await File.WriteAllTextAsync(gPath, gContents[4]);
+await Backup7b(svcB7b, setB7b.Id);
+var gRecords = (await repoB7b.GetFileRecordsByPathAsync(setB7b.Id, gPath)).Where(r => !r.IsDeleted).OrderBy(r => r.Version).ToList();
+Check(gRecords.Select(r => r.Version).SequenceEqual([1, 2, 3, 4, 5]),
+    $"versions 1 to 5, the old computer's v3 among them (got {string.Join(",", gRecords.Select(r => r.Version))})");
+Check(gRecords.Count == 5 && gRecords.All(r =>
+        File.Exists(Path.Combine(target7b, r.DiscPath))
+        && File.ReadAllText(Path.Combine(target7b, r.DiscPath)) == gContents[r.Version - 1]
+        && string.Equals(Sha(Path.Combine(target7b, r.DiscPath)), r.Hash, StringComparison.OrdinalIgnoreCase)),
+    "each holds its own content, under the hash that content has");
+
+// ===================================================================
 // 8. Restore after the destination moved (a new drive letter).
 // ===================================================================
 Console.WriteLine();
@@ -529,7 +595,7 @@ else
 
 Console.WriteLine();
 // Closed before the folder goes, or SQLite's open files keep it from going.
-foreach (var repo in new[] { repoA, repoB, repoA7, repoB7 })
+foreach (var repo in new[] { repoA, repoB, repoA7, repoB7, repoA7b, repoB7b })
     repo.Dispose();
 Microsoft.Data.Sqlite.SqliteConnection.ClearAllPools();
 try { Directory.Delete(root, recursive: true); } catch { /* temp; best effort */ }

@@ -1171,7 +1171,12 @@ public class DirectoryBackupService
                         // Either way the new copy is numbered after the fresh number,
                         // and no file on disk is replaced.
                         int prevVersion = oldVersion;
+                        // Which case: the record's own .vN holds its content.
+                        bool catalogBehind = false;
+                        // The newer copy at the current path, when the catalog is
+                        // behind and it can be read; it gets a record of its own.
                         StoredFileInfo? unrecordedCopy = null;
+                        bool hashPlain = !string.IsNullOrEmpty(existingInfo.Hash);
                         if (AnyPrevVersionFileExists(targetDirectory, file.FullPath, oldVersion))
                         {
                             prevVersion = Math.Max(version, oldVersion + 1);
@@ -1180,25 +1185,26 @@ public class DirectoryBackupService
                             version = prevVersion + 1;
 
                             var atCurrent = await DescribeStoredCopyAsync(
-                                oldCurrentPath, oldDeduped, oldFileRef, existingInfo, ct);
+                                oldCurrentPath, oldDeduped, oldFileRef, hashPlain, ct);
                             if (!StoredCopyMatches(atCurrent, existingInfo))
                             {
                                 string recordedPrev = GetPrevPath(
                                     targetDirectory, file.FullPath, oldVersion, oldDeduped, oldFileRef);
-                                if (File.Exists(recordedPrev)
+                                catalogBehind = File.Exists(recordedPrev)
                                     && StoredCopyMatches(
                                         await DescribeStoredCopyAsync(
-                                            recordedPrev, oldDeduped, oldFileRef, existingInfo, ct),
-                                        existingInfo))
+                                            recordedPrev, oldDeduped, oldFileRef, hashPlain, ct),
+                                        existingInfo);
+                                if (catalogBehind && atCurrent is not null)
                                 {
                                     // Hash the newer copy for its own record (the
                                     // match check may have stopped at its size).
-                                    unrecordedCopy = string.IsNullOrEmpty(atCurrent?.Hash)
+                                    unrecordedCopy = string.IsNullOrEmpty(atCurrent.Value.Hash)
                                                      && !oldDeduped && !oldFileRef
                                         ? new StoredFileInfo(
                                             new FileInfo(oldCurrentPath).Length,
                                             await ComputeFileHashAsync(oldCurrentPath, ct),
-                                            null, false, false)
+                                            false, false)
                                         : atCurrent;
                                 }
                             }
@@ -1223,9 +1229,9 @@ public class DirectoryBackupService
                         // Where the old record's bytes are now: the copy just moved,
                         // or - when the catalog was behind the drive - the .vN of
                         // its own number that was already there.
-                        string oldRecordDiscPath = unrecordedCopy is null
-                            ? prevDiscPath
-                            : GetPrevDiscPath(file.FullPath, oldVersion, oldDeduped, oldFileRef);
+                        string oldRecordDiscPath = catalogBehind
+                            ? GetPrevDiscPath(file.FullPath, oldVersion, oldDeduped, oldFileRef)
+                            : prevDiscPath;
 
                         // Load the specific old record on-demand (not pre-loaded)
                         // to update its DiscPath to the new _prev location.
@@ -1240,7 +1246,7 @@ public class DirectoryBackupService
                             // the new copy's (version = prevVersion + 1) is next.
                             // Not when the catalog was behind: the record keeps the
                             // number its .vN is named with.
-                            if (unrecordedCopy is null)
+                            if (!catalogBehind)
                                 oldRecord.Version = prevVersion;
                             // Resurrection: the old version is a tombstone (its
                             // file was deleted-and-recreated). Now that it holds
@@ -1274,6 +1280,19 @@ public class DirectoryBackupService
                             if (!oldDeduped && !oldFileRef && !string.IsNullOrEmpty(newer.Hash))
                                 SetContentPath(newer.Hash, prevDiscPath);
                         }
+
+                        // The numbers the search for a free one stepped over are
+                        // versions on the drive that no record holds: a later
+                        // writer's (the catalog behind), or an earlier catalog's
+                        // history - the record's own old number included, since
+                        // the record moved past it. Each is recorded under its own
+                        // number, as the newer copy is; left out, it was invisible
+                        // to Restore and listed by Cleanup as untracked.
+                        int firstUnrecorded = catalogBehind ? oldVersion + 1 : oldVersion;
+                        if (firstUnrecorded < prevVersion)
+                            await RecordStoredVersionsAsync(
+                                backupSetId, discRecord.Id, targetDirectory, file.FullPath,
+                                firstUnrecorded, prevVersion, ct);
 
                         // The old record's plain copy holds the real bytes for its
                         // content hash; any .fileref pointing at it must have its
@@ -3307,14 +3326,16 @@ public class DirectoryBackupService
         || File.Exists(GetPrevPath(targetDir, fullPath, version, false, true));
 
     /// <summary>
-    /// Size and content hash of a stored copy, for telling which file holds a
-    /// record's content (the _prev move in ExecuteCoreAsync). A manifest's figures
-    /// come from the manifest. A plain copy is hashed only when the record has a
-    /// hash to compare against; otherwise only its size is read. Null when it
-    /// cannot be read.
+    /// Size and content hash of a stored copy. A manifest's figures come from the
+    /// manifest; a plain copy is read, and hashed when <paramref name="hashPlain"/>
+    /// is set. Null when it cannot be read.
     /// </summary>
+    /// <param name="hashPlain">
+    /// Hash a plain copy, not only stat it: whether the caller needs its content
+    /// (to compare with a record's hash, or to record one), or only its size.
+    /// </param>
     private static async Task<StoredFileInfo?> DescribeStoredCopyAsync(
-        string path, bool isDeduped, bool isFileRef, FileVersionInfo record, CancellationToken ct)
+        string path, bool isDeduped, bool isFileRef, bool hashPlain, CancellationToken ct)
     {
         try
         {
@@ -3322,17 +3343,17 @@ public class DirectoryBackupService
             {
                 var m = JsonSerializer.Deserialize<FileRefManifest>(
                     await File.ReadAllTextAsync(path, ct), _jsonOptions);
-                return m is null ? null : new StoredFileInfo(m.OriginalSize, m.Hash ?? "", null, false, true);
+                return m is null ? null : new StoredFileInfo(m.OriginalSize, m.Hash ?? "", false, true);
             }
             if (isDeduped)
             {
                 var d = JsonSerializer.Deserialize<DedupManifest>(
                     await File.ReadAllTextAsync(path, ct), _jsonOptions);
-                return d is null ? null : new StoredFileInfo(d.OriginalSize, d.OriginalHash ?? "", null, true, false);
+                return d is null ? null : new StoredFileInfo(d.OriginalSize, d.OriginalHash ?? "", true, false);
             }
             long size = new FileInfo(path).Length;
-            string? hash = string.IsNullOrEmpty(record.Hash) ? null : await ComputeFileHashAsync(path, ct);
-            return new StoredFileInfo(size, hash, null, false, false);
+            string? hash = hashPlain ? await ComputeFileHashAsync(path, ct) : null;
+            return new StoredFileInfo(size, hash, false, false);
         }
         catch (OperationCanceledException) { throw; }
         catch
@@ -3350,6 +3371,49 @@ public class DirectoryBackupService
         && (!string.IsNullOrEmpty(c.Hash) && !string.IsNullOrEmpty(record.Hash)
             ? string.Equals(c.Hash, record.Hash, StringComparison.OrdinalIgnoreCase)
             : c.Size == record.SizeBytes);
+
+    /// <summary>
+    /// Record the stored versions <paramref name="from"/> up to (not including)
+    /// <paramref name="to"/> of a path that are on the drive in no record, each
+    /// under its own number and in the form found (plain before .dedup before
+    /// .fileref, as a seed prefers). A number a record already has, live or not, is
+    /// left alone: a version number is never given twice. Its write time stands in
+    /// for when it was backed up, as for any copy recorded after the fact.
+    /// </summary>
+    private async Task RecordStoredVersionsAsync(
+        int backupSetId, int discId, string targetDirectory, string sourcePath,
+        int from, int to, CancellationToken ct)
+    {
+        var taken = (await _catalog.GetFileRecordsByPathAsync(backupSetId, sourcePath, ct))
+            .Select(r => r.Version).ToHashSet();
+        for (int v = from; v < to; v++)
+        {
+            if (taken.Contains(v))
+                continue;
+            foreach (var (deduped, fileRef) in new[] { (false, false), (true, false), (false, true) })
+            {
+                string stored = GetPrevPath(targetDirectory, sourcePath, v, deduped, fileRef);
+                if (!File.Exists(stored)
+                    || await DescribeStoredCopyAsync(stored, deduped, fileRef, hashPlain: true, ct) is not { } info)
+                    continue;
+                DateTime written = File.GetLastWriteTimeUtc(stored);
+                await _catalog.CreateFileRecordAsync(new FileRecord
+                {
+                    DiscId = discId,
+                    SourcePath = sourcePath,
+                    DiscPath = GetPrevDiscPath(sourcePath, v, deduped, fileRef),
+                    SizeBytes = info.Size,
+                    Hash = info.Hash ?? "",
+                    IsDeduped = deduped,
+                    IsFileRef = fileRef,
+                    Version = v,
+                    SourceLastWriteUtc = written,
+                    BackedUpUtc = written,
+                }, ct);
+                break;
+            }
+        }
+    }
 
     // ------------------------------------------------------------------
     // Untracked backup at the destination
@@ -3949,8 +4013,7 @@ public class DirectoryBackupService
     }
 
     /// <summary>What a stored file says about the source file it holds.</summary>
-    private readonly record struct StoredFileInfo(
-        long Size, string? Hash, string? SourcePath, bool IsDeduped, bool IsFileRef);
+    private readonly record struct StoredFileInfo(long Size, string? Hash, bool IsDeduped, bool IsFileRef);
 
     /// <summary>
     /// Record what an existing backup at <paramref name="targetDir"/> holds as
@@ -4063,31 +4126,11 @@ public class DirectoryBackupService
         // the tiny JSON file: seeding the manifest's own length would make every
         // such file look changed to the next backup and force a needless re-copy.
         // Null for a manifest that cannot be read.
-        async Task<StoredFileInfo?> ReadStoredAsync(FileInfo f)
-        {
-            bool isFileRef = f.Name.EndsWith(".fileref", StringComparison.OrdinalIgnoreCase);
-            bool isDedup = f.Name.EndsWith(".dedup", StringComparison.OrdinalIgnoreCase);
-            if (!isFileRef && !isDedup)
-                return new StoredFileInfo(f.Length, null, null, false, false);
-            try
-            {
-                string json = await File.ReadAllTextAsync(f.FullName, ct);
-                if (isFileRef)
-                {
-                    var m = JsonSerializer.Deserialize<FileRefManifest>(json, _jsonOptions);
-                    return m is null ? null : new StoredFileInfo(
-                        m.OriginalSize, m.Hash ?? "",
-                        string.IsNullOrEmpty(m.SourcePath) ? null : m.SourcePath, false, true);
-                }
-                var d = JsonSerializer.Deserialize<DedupManifest>(json, _jsonOptions);
-                return d is null ? null : new StoredFileInfo(d.OriginalSize, d.OriginalHash ?? "", null, true, false);
-            }
-            catch (OperationCanceledException) { throw; }
-            catch
-            {
-                return null;
-            }
-        }
+        Task<StoredFileInfo?> ReadStoredAsync(FileInfo f) => DescribeStoredCopyAsync(
+            f.FullName,
+            isDeduped: f.Name.EndsWith(".dedup", StringComparison.OrdinalIgnoreCase),
+            isFileRef: f.Name.EndsWith(".fileref", StringComparison.OrdinalIgnoreCase),
+            hashPlain: false, ct);
 
         // A plain copy's content hash: what lets a .fileref resolve to it, and lets
         // the next backup tell a re-saved but unchanged file from a changed one.
