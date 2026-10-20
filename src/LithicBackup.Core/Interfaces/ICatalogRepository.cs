@@ -493,12 +493,6 @@ public interface ICatalogRepository : IDisposable
     Task<IReadOnlyList<FileSearchResult>> SearchFilesAcrossSetsAsync(
         string pathSubstring, CancellationToken ct = default);
 
-    // --- Database export ---
-
-    /// <summary>
-    /// Export a backup set's catalog database to a file (for writing onto a disc).
-    /// </summary>
-    Task ExportDatabaseAsync(int backupSetId, string destinationPath, CancellationToken ct = default);
 
     // --- Cleanup coordination ---
 
@@ -583,10 +577,12 @@ public interface ICatalogRepository : IDisposable
     long GetSetHistorySizeBytes(int backupSetId);
 
     /// <summary>
-    /// Write a consistent snapshot of the set's history database (discs, files,
-    /// chunks, dedup blocks) to <paramref name="destinationPath"/>, for carrying
-    /// the set to another machine. Reads through its own connection, so it never
-    /// waits on, or interleaves with, a backup running on the set.
+    /// Write a consistent, self-contained snapshot of the set's history database
+    /// (discs, files, chunks, dedup blocks) to <paramref name="destinationPath"/>:
+    /// for carrying the set to another machine, and the catalog written onto a
+    /// disc. Reads through its own connection, so it never waits on, or
+    /// interleaves with, a backup running on the set - and holds only what is
+    /// committed.
     /// </summary>
     Task ExportSetHistoryAsync(int backupSetId, string destinationPath, CancellationToken ct = default);
 

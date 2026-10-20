@@ -16,7 +16,7 @@ public sealed record BackupSetImportResult(BackupSet Set, bool IncludedHistory, 
 ///
 /// <para><b>Two formats, told apart by their first bytes.</b> Settings only:
 /// the <see cref="ExportedBackupSet"/> as indented JSON - what every version
-/// before 1.10 wrote, and still what is written when the history is left out,
+/// before 1.11 wrote, and still what is written when the history is left out,
 /// so such a file stays readable and importable by older versions. With
 /// history: a zip holding <c>backupset.json</c> (the same JSON) and
 /// <c>history.db</c>, a snapshot of the set's per-set catalog database.</para>

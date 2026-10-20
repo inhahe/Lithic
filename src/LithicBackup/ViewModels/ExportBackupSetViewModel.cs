@@ -16,7 +16,7 @@ public class ExportBackupSetViewModel : ViewModelBase
         HistorySizeText = !hasHistory
             ? "This set has no backup history yet, so there is none to include."
             : historyBytes > 0
-                ? $"About {FormatSize(historyBytes)} before compression."
+                ? $"About {ByteSize.Readable(historyBytes)} before compression."
                 : "";
     }
 
@@ -38,12 +38,4 @@ public class ExportBackupSetViewModel : ViewModelBase
     /// <summary>The history's size, or why the option is unavailable.</summary>
     public string HistorySizeText { get; }
 
-    private static string FormatSize(long bytes)
-    {
-        string[] units = ["bytes", "KB", "MB", "GB", "TB"];
-        double size = bytes;
-        int i = 0;
-        while (size >= 1024 && i < units.Length - 1) { size /= 1024; i++; }
-        return i == 0 ? $"{bytes:N0} bytes" : $"{size:N1} {units[i]}";
-    }
 }

@@ -388,7 +388,7 @@ C1, C2, C4 and C5 fail, and C3's "logged once" fails because it logged nothing.
 - A targeted continuous run that throws drops the files it was given, as before;
   the daily safety-net scan picks them up.
 
-## FIXED: an imported set said "Never backed up" and began re-copying its whole backup (2026-10-18, 1.10.0)
+## FIXED: an imported set said "Never backed up" and began re-copying its whole backup (2026-10-18, 1.11.0)
 
 Seen in use, on the first move of two sets to a new computer: both exported "with
 all options", imported with their backup drives attached, and showed "Never backed

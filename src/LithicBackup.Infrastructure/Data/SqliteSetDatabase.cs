@@ -1935,19 +1935,8 @@ internal sealed class SqliteSetDatabase : IDisposable
     }
 
     // ---------------------------------------------------------------
-    // Export + catalog clearing
+    // Catalog clearing
     // ---------------------------------------------------------------
-
-    public async Task ExportDatabaseAsync(string destinationPath, CancellationToken ct = default)
-    {
-        ct.ThrowIfCancellationRequested();
-        using var _ = await LockAsync(ct).ConfigureAwait(false);
-
-        using var cmd = _connection.CreateCommand();
-        cmd.CommandText = "VACUUM INTO $path";
-        cmd.Parameters.AddWithValue("$path", destinationPath);
-        cmd.ExecuteNonQuery();
-    }
 
     /// <summary>
     /// Source and stored paths of every record written at or after

@@ -1106,13 +1106,11 @@ public class MainViewModel : ViewModelBase
 
             // Hold automated backups until the user runs one. A full backup the
             // Worker started mid-seed would find every file the seed had not
-            // reached yet missing from the catalog and copy it all again. Written
-            // to the catalog now, and to the editor's copy so its Save keeps it.
+            // reached yet missing from the catalog and copy it all again. The
+            // editor's Save keeps the stored hold (CarryStoredHoldAsync).
             try
             {
-                if (await SetAutomationHoldAsync(backupSet.Id, hold: true) is { JobOptions: not null }
-                    && backupSet.JobOptions is not null)
-                    backupSet.JobOptions.HoldAutomatedBackups = true;
+                await SetAutomationHoldAsync(backupSet.Id, hold: true);
             }
             catch (Exception ex)
             {
@@ -1290,8 +1288,6 @@ public class MainViewModel : ViewModelBase
                 // chance to seed it. (It would also be refused there now, but only
                 // while the destination holds files at this set's paths.)
                 await SetAutomationHoldAsync(backupSet.Id, hold: true);
-                if (backupSet.JobOptions is not null)
-                    backupSet.JobOptions.HoldAutomatedBackups = true;
 
                 await Task.Run(() => _catalog.ClearBackupSetCatalogAsync(backupSet.Id));
                 sourceSelection.ClearHistoryResult =
@@ -3902,8 +3898,8 @@ public class MainViewModel : ViewModelBase
                 _jsonOptions) ?? new JobOptions();
         ApplyVmSettingsToJobOptions(opts, vm);
         // Not an editor setting: seeding and Clear Backup History write it to the
-        // catalog themselves (and into the editor's copy, so Save keeps it). Left
-        // in, it made those two actions look like unsaved edits.
+        // catalog themselves, and Save keeps whatever is stored. Left in, a set
+        // opened while held would differ from its edits by it.
         opts.HoldAutomatedBackups = false;
         return JsonSerializer.Serialize(new { Name = vm.SetName, JobOptions = opts }, _jsonOptions);
     }

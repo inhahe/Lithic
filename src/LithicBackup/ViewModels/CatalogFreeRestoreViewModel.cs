@@ -167,7 +167,7 @@ public class CatalogFreeRestoreViewModel : ViewModelBase
                 CurrentFile = p.CurrentFile;
                 RestorePercentage = p.Percentage;
                 ProgressText = $"{p.FilesCompleted:N0}/{p.TotalFiles:N0} files " +
-                               $"({FormatBytes(p.BytesCompleted)}/{FormatBytes(p.TotalBytes)})";
+                               $"({ByteSize.Readable(p.BytesCompleted)}/{ByteSize.Readable(p.TotalBytes)})";
             });
 
             var result = await Task.Run(
@@ -179,7 +179,7 @@ public class CatalogFreeRestoreViewModel : ViewModelBase
                 : "Restore completed with errors.";
 
             ResultDetail = $"Files restored: {result.FilesRestored:N0}\n" +
-                           $"Data restored: {FormatBytes(result.BytesRestored)}";
+                           $"Data restored: {ByteSize.Readable(result.BytesRestored)}";
 
             if (result.Errors.Count > 0)
             {
@@ -207,16 +207,4 @@ public class CatalogFreeRestoreViewModel : ViewModelBase
         }
     }
 
-    private static string FormatBytes(long bytes)
-    {
-        string[] units = ["B", "KB", "MB", "GB", "TB"];
-        double size = bytes;
-        int unit = 0;
-        while (size >= 1024 && unit < units.Length - 1)
-        {
-            size /= 1024;
-            unit++;
-        }
-        return unit == 0 ? $"{bytes:N0} B" : $"{size:N1} {units[unit]}";
-    }
 }

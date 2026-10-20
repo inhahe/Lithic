@@ -702,8 +702,6 @@ public class SqliteCatalogRepository : ICatalogRepository
     // Database export (routed)
     // ---------------------------------------------------------------
 
-    public Task ExportDatabaseAsync(int backupSetId, string destinationPath, CancellationToken ct = default)
-        => GetSet(backupSetId).ExportDatabaseAsync(destinationPath, ct);
 
     // ---------------------------------------------------------------
     // Cleanup coordination

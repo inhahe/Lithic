@@ -641,25 +641,11 @@ public partial class SettingsDialog : Window, INotifyPropertyChanged
         if (freed == 0 && rows == 0)
             return (cancelled ? "Stopped before anything was freed." : nothingToDoMessage) + kept;
 
-        string summary = $"Freed {FormatBytes(freed)}" +
+        string summary = $"Freed {ViewModels.ByteSize.Readable(freed)}" +
                          (rows > 0 ? $" by dropping {rows:N0} stale entries." : ".");
         return (cancelled ? "Stopped. " + summary : summary) + kept;
     }
 
-    internal static string FormatBytes(long bytes)
-    {
-        string[] units = { "bytes", "KB", "MB", "GB", "TB" };
-        double value = bytes;
-        int unit = 0;
-        while (value >= 1024 && unit < units.Length - 1)
-        {
-            value /= 1024;
-            unit++;
-        }
-        return unit == 0
-            ? $"{bytes:N0} {units[unit]}"
-            : $"{value:N1} {units[unit]}";
-    }
 
     /// <summary>A single cache's line in the Caches tab.</summary>
     public sealed class CacheRow
@@ -681,9 +667,9 @@ public partial class SettingsDialog : Window, INotifyPropertyChanged
             }
 
             long reclaimable = Math.Max(0, r.FileBytes - r.UsedBytes);
-            string detail = $"{FormatBytes(r.FileBytes)} on disk, {r.Rows:N0} entries";
+            string detail = $"{ViewModels.ByteSize.Readable(r.FileBytes)} on disk, {r.Rows:N0} entries";
             if (reclaimable > 1024 * 1024)
-                detail += $" ({FormatBytes(reclaimable)} already free inside the file)";
+                detail += $" ({ViewModels.ByteSize.Readable(reclaimable)} already free inside the file)";
 
             string note = "";
             if (r.IsLegacyLayout && r.Rows > 0)

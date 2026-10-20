@@ -873,7 +873,7 @@ public class BackupOrchestrator : IBackupOrchestrator
                 if (plan.Job.IncludeCatalogOnDisc && discIndex == allocations.Count - 1)
                 {
                     catalogStagedPath = Path.Combine(stagingDir, "LithicBackup-Catalog.db");
-                    await _catalog.ExportDatabaseAsync(backupSetId, catalogStagedPath, ct);
+                    await _catalog.ExportSetHistoryAsync(backupSetId, catalogStagedPath, ct);
                 }
 
                 // Burn.
