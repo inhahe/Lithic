@@ -2660,12 +2660,40 @@ public sealed class BackupWorker : BackgroundService
                 "Not backing up \"{Name}\": it has no backup history, but its destination already holds " +
                 "backed-up files ({Example}{More}). A backup now would copy everything again over them{History}. " +
                 "Open the set in Lithic Backup and use Seed from Existing Backup in its editor, or run a backup " +
-                "there to go ahead anyway.",
+                "there to go ahead anyway. Its automated backups are paused until then, which its row in Lithic " +
+                "Backup shows.",
                 set.Name, found.OccupiedPaths[0],
                 found.OccupiedPaths.Count > 1 ? $" and {found.OccupiedPaths.Count - 1} more" : "",
                 found.HasVersionHistory ? ", and the version history kept there would not be part of the set" : "");
         }
+
+        // A log line alone left a scheduled set unbacked-up with nothing in the
+        // app to say why. Held, its row says its automated backups are paused, and
+        // the next backup run there asks whether to seed or to back up anyway.
+        await HoldAutomatedBackupsAsync(set, ct);
         return true;
+    }
+
+    /// <summary>
+    /// Hold the set's automated backups until the user runs one in the app,
+    /// written on a fresh copy of the set (see <see cref="PersistResolvedAsync"/>).
+    /// </summary>
+    private async Task HoldAutomatedBackupsAsync(BackupSet set, CancellationToken ct)
+    {
+        try
+        {
+            var fresh = await _catalog.GetBackupSetAsync(set.Id, ct);
+            if (fresh?.JobOptions is { HoldAutomatedBackups: false } opts)
+            {
+                opts.HoldAutomatedBackups = true;
+                await _catalog.UpdateBackupSetMetadataAsync(fresh, ct);
+            }
+        }
+        catch (OperationCanceledException) { throw; }
+        catch (Exception ex)
+        {
+            _logger.LogWarning(ex, "Could not pause the automated backups of \"{Name}\".", set.Name);
+        }
     }
 
     /// <summary>Build a <see cref="BackupJob"/> from a set's saved options.</summary>

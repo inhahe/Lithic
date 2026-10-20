@@ -794,6 +794,39 @@ async Task PartC()
         Check(after.ExcludedExtensions.Contains("*.edited-meanwhile"),
             "C9 and an edit saved after the Worker read the set survives it");
     }
+
+    // C10 -------------------------------------------------------------------
+    // A set with no history whose destination already holds its backup is
+    // refused - and held, so its row in the app says its automated backups are
+    // paused. A log line alone left it unbacked-up with nothing on screen.
+    {
+        string dir = Path.Combine(root, "c10");
+        string src = Path.Combine(dir, "src");
+        string dst = Path.Combine(dir, "dst");
+        Directory.CreateDirectory(src);
+        File.WriteAllText(Path.Combine(src, "a.txt"), "mine");
+        string drive = char.ToUpperInvariant(src[0]).ToString();
+        string copy = Path.Combine(dst, drive, src.Substring(3));
+        Directory.CreateDirectory(copy);
+        File.WriteAllText(Path.Combine(copy, "a.txt"), "an older backup of it");
+
+        var rig = await Rig.CreateAsync(Path.Combine(dir, "catalog.db"), stampedSetIds, set =>
+        {
+            set.SourceSelections = [ new SourceSelection { Path = src, IsDirectory = true, IsSelected = true } ];
+            set.SourceRoots = [src];
+            set.JobOptions!.TargetDirectory = dst;
+        });
+        rig.Destination.Connected = true;
+        await rig.Worker.StartAsync(CancellationToken.None);
+        bool refused = await WaitUntil(() => rig.Log.Count("Not backing up") > 0, TimeSpan.FromSeconds(60));
+        bool held = await WaitUntil(
+            () => rig.Repo.GetBackupSetAsync(rig.SetId).GetAwaiter().GetResult()!.JobOptions!.HoldAutomatedBackups,
+            TimeSpan.FromSeconds(10));
+        Check(refused && rig.Log.Count("Starting backup for") == 0, "C10 a set with no history over a destination holding its backup is refused");
+        Check(held, "C10 and held, so the app shows its automated backups as paused");
+        Check(File.ReadAllText(Path.Combine(copy, "a.txt")) == "an older backup of it", "C10 nothing was copied over the backup");
+        await rig.DisposeAsync();
+    }
 #endif
 }
 
