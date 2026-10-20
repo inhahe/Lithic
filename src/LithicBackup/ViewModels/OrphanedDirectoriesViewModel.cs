@@ -1511,12 +1511,13 @@ public class OrphanedDirectoriesViewModel : ViewModelBase, IConfirmClose
             .SelectMany(i => i.ExcessVersionRecords!)
             .Select(r => r.Id)
             .ToList();
-        if (excessIds.Count == 0)
-            return [];
-
         var deleting = new HashSet<long>(excessIds);
-        foreach (var i in items.Where(i => i.Reason == OrphanedReason.CatalogDuplicate && i.ExcessVersionRecords is not null))
-            deleting.UnionWith(i.ExcessVersionRecords!.Select(r => r.Id));
+        // A catalog duplicate is never kept: its twin, at the same path, stays.
+        var duplicates = new HashSet<long>(items
+            .Where(i => i.Reason == OrphanedReason.CatalogDuplicate && i.ExcessVersionRecords is not null)
+            .SelectMany(i => i.ExcessVersionRecords!)
+            .Select(r => r.Id));
+        deleting.UnionWith(duplicates);
 
         static bool ByPath(OrphanedReason r) => r is not (OrphanedReason.ExcessVersion
             or OrphanedReason.CatalogDuplicate or OrphanedReason.UntrackedFile or OrphanedReason.CatalogDeleted);
@@ -1536,8 +1537,25 @@ public class OrphanedDirectoriesViewModel : ViewModelBase, IConfirmClose
                     deleting.Add(f.Id);
         }
 
-        return _catalog.GetNeededContentCopiesAsync(backupSetId, deleting.ToList(), excessIds, ct)
-            .GetAwaiter().GetResult();
+        if (deleting.Count == 0)
+            return [];
+
+        // Keep an excess version where one will do - it is history, while a file
+        // in a category purged by path is one the user wants gone - and any other
+        // record where none will: a file deleted from disk can hold the last copy
+        // of content another file's .fileref still needs. Only excess versions
+        // were considered, so a purge without one checked nothing at all.
+        var kept = excessIds.Count == 0
+            ? []
+            : _catalog.GetNeededContentCopiesAsync(backupSetId, deleting.ToList(), excessIds, ct)
+                .GetAwaiter().GetResult();
+        // A kept copy survives, so content it covers needs no second one.
+        var rest = deleting.Where(id => !kept.Contains(id)).ToList();
+        var keepable = rest.Where(id => !duplicates.Contains(id)).ToList();
+        if (keepable.Count > 0)
+            kept.UnionWith(_catalog.GetNeededContentCopiesAsync(backupSetId, rest, keepable, ct)
+                .GetAwaiter().GetResult());
+        return kept;
     }
 
     // ------------------------------------------------------------------
@@ -2745,6 +2763,14 @@ public class OrphanedDirectoriesViewModel : ViewModelBase, IConfirmClose
                         }
                     }
 
+                    // A copy kept for a reference (above) is skipped by the
+                    // excess-version branch, but a category purged by source path
+                    // retires every record of its file, the kept one included.
+                    // It stays live, as its file stays on disk.
+                    if (keptIds.Count > 0)
+                        catPurged -= _catalog.MarkFileRecordsLiveByIdsAsync(backupSetId, keptIds, ct)
+                            .GetAwaiter().GetResult();
+
                     // Force a final true N/N before the disk-delete phase takes
                     // over, so the catalog phase never ends mid-throttle on a
                     // stale number.
@@ -2813,12 +2839,17 @@ public class OrphanedDirectoriesViewModel : ViewModelBase, IConfirmClose
                                 allDiscPaths.Remove(d);
                     }
 
-                    // Never delete the file of a record held back above.
+                    // Never delete the file of a record held back above, whichever
+                    // category listed it.
                     foreach (var kept in workItems
                                  .Where(w => w.ExcessVersionRecords is not null)
                                  .SelectMany(w => w.ExcessVersionRecords!)
                                  .Where(r => keptIds.Contains(r.Id)))
                         allDiscPaths.Remove(kept.DiscPath.Replace('/', '\\'));
+                    if (keptIds.Count > 0 && _activeFiles is not null)
+                        foreach (var f in _activeFiles)
+                            if (keptIds.Contains(f.Id))
+                                allDiscPaths.Remove(f.DiscPath.Replace('/', '\\'));
 
                     // Nor one a live record still points at.
                     foreach (var used in stillInUse)
@@ -2861,10 +2892,10 @@ public class OrphanedDirectoriesViewModel : ViewModelBase, IConfirmClose
                                  .Select(r => r.Id)
                                  .Where(id => !keptIds.Contains(id)));
 
-                    _activeFiles.RemoveAll(f =>
-                        purgedPaths.Contains(f.SourcePath)
-                        || purgedDirs.ContainsPathUnder(f.SourcePath)
-                        || purgedRecordIds.Contains(f.Id));
+                    _activeFiles.RemoveAll(f => !keptIds.Contains(f.Id)
+                        && (purgedPaths.Contains(f.SourcePath)
+                            || purgedDirs.ContainsPathUnder(f.SourcePath)
+                            || purgedRecordIds.Contains(f.Id)));
                 }
 
                 keptForReferences = keptIds.Count;
@@ -2899,7 +2930,7 @@ public class OrphanedDirectoriesViewModel : ViewModelBase, IConfirmClose
             if (deleteFailures > 0)
                 summary.Add($"{deleteFailures:N0} deletion failure{(deleteFailures == 1 ? "" : "s")}");
             if (keptForReferences > 0)
-                summary.Add($"kept {keptForReferences:N0} older cop{(keptForReferences == 1 ? "y" : "ies")} "
+                summary.Add($"kept {keptForReferences:N0} cop{(keptForReferences == 1 ? "y" : "ies")} "
                     + "that duplicate-file references still need");
             if (leftAloneSinceScan > 0)
                 summary.Add($"left {leftAloneSinceScan:N0} file{(leftAloneSinceScan == 1 ? "" : "s")} alone "

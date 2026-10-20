@@ -982,6 +982,7 @@ internal sealed class SqliteSetDatabase : IDisposable
             WHERE d.BackupSetId = $setId
               AND f.SourcePath = $path COLLATE NOCASE
               AND f.Version = $ver
+            ORDER BY f.IsDeleted, f.Id DESC
             LIMIT 1
             """;
         cmd.Parameters.AddWithValue("$setId", backupSetId);
@@ -1549,7 +1550,12 @@ internal sealed class SqliteSetDatabase : IDisposable
             // "Plain" means what can anchor a .fileref: real bytes under the
             // file's own name - the same definition as the retention guard and
             // GetActiveRecordsByHashAsync (split and zipped copies are outside
-            // the file-level dedup pool). Hash = is a BINARY compare on purpose:
+            // the file-level dedup pool). A surviving copy (q) must also be the
+            // newest live row of its file at its stored path, and not the
+            // candidate's own path: an older row there is stale - its bytes were
+            // overwritten in place, as copies that keep no history were before
+            // their replaced rows were retired - and the candidate's path is the
+            // candidate's file. Hash = is a BINARY compare on purpose:
             // every writer stores lower-case hex, and it lets IX_Files_Active_Hash
             // serve both EXISTS probes.
             using var cmd = _connection.CreateCommand();
@@ -1568,7 +1574,12 @@ internal sealed class SqliteSetDatabase : IDisposable
                       SELECT 1 FROM Files q
                       WHERE q.Hash = p.Hash AND q.IsDeleted = 0
                         AND q.IsFileRef = 0 AND q.IsDeduped = 0 AND q.IsSplit = 0 AND q.IsZipped = 0
-                        AND q.Id NOT IN (SELECT Id FROM temp.DeleteCandidates))
+                        AND q.DiscPath <> p.DiscPath
+                        AND q.Id NOT IN (SELECT Id FROM temp.DeleteCandidates)
+                        AND NOT EXISTS (
+                            SELECT 1 FROM Files n
+                            WHERE n.SourcePath = q.SourcePath COLLATE NOCASE AND n.IsDeleted = 0
+                              AND n.DiscPath = q.DiscPath AND n.Id > q.Id))
                 GROUP BY p.Hash
                 """;
             cmd.Parameters.AddWithValue("$setId", backupSetId);
@@ -1754,6 +1765,19 @@ internal sealed class SqliteSetDatabase : IDisposable
         cmd.Parameters.AddWithValue("$id", fileId);
         cmd.Parameters.AddWithValue("$old", expectedDiscPath);
         return cmd.ExecuteNonQuery() == 1;
+    }
+
+    /// <summary>See <see cref="ICatalogRepository.MarkFileRecordsLiveByIdsAsync"/>.</summary>
+    public async Task<int> MarkFileRecordsLiveByIdsAsync(IReadOnlyCollection<long> fileIds, CancellationToken ct = default)
+    {
+        ct.ThrowIfCancellationRequested();
+        if (fileIds.Count == 0)
+            return 0;
+        using var _ = await WriteLockAsync(ct).ConfigureAwait(false);
+        using var cmd = _connection.CreateCommand();
+        cmd.CommandText = "UPDATE Files SET IsDeleted = 0 WHERE IsDeleted = 1 AND Id IN (SELECT value FROM json_each($ids))";
+        cmd.Parameters.AddWithValue("$ids", System.Text.Json.JsonSerializer.Serialize(fileIds));
+        return cmd.ExecuteNonQuery();
     }
 
     public async Task<int> CountFilesUnderSourcePrefixAsync(

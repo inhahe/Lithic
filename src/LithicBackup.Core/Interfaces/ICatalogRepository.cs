@@ -434,6 +434,14 @@ public interface ICatalogRepository : IDisposable
     Task<IReadOnlyList<(long Id, string DiscPath)>> GetUnhashedPossibleAnchorsAsync(
         int backupSetId, IReadOnlyCollection<long>? among, CancellationToken ct = default);
 
+    /// <summary>
+    /// Undo the retirement of these records (inside the caller's transaction): a
+    /// purge that has to keep a copy a reference needs, after a category it
+    /// purges by source path retired every record of that copy's file.
+    /// </summary>
+    /// <returns>How many records were retired and are live again.</returns>
+    Task<int> MarkFileRecordsLiveByIdsAsync(int backupSetId, IReadOnlyCollection<long> fileIds, CancellationToken ct = default);
+
     /// <summary>Give a record the content hash it lacks; a record that has one is left as it is.</summary>
     /// <returns>Whether the record was changed.</returns>
     Task<bool> SetHashIfMissingAsync(int backupSetId, long fileId, string hash, CancellationToken ct = default);

@@ -1103,11 +1103,24 @@ public class DirectoryBackupService
                 // exclusion set; the normal path once an empty Default stopped
                 // being mistaken for an exclusion.
                 FileRecord? replacedRecord = null;
+                // Every live record of the copy being replaced: the record, and any
+                // duplicate of it at the same stored path (a seed run twice) - all
+                // describe the bytes about to be overwritten.
+                List<long> replacedIds = [];
                 if (!keepVersions && hasExistingInfo && !resurrecting)
                 {
                     replacedRecord = await _catalog.GetFileRecordByPathAndVersionAsync(
                         backupSetId, file.FullPath, existingInfo.MaxVersion, ct);
-                    if (replacedRecord is { IsDeleted: true })
+                    // Only the current copy is replaced in place. When the newest
+                    // live record is an earlier version under _prev (the current
+                    // copy's record was pruned as missing, or a seed found only
+                    // history), that version is not being overwritten, and is not
+                    // this backup's to retire or delete: retention decides.
+                    if (replacedRecord is { IsDeleted: true }
+                        || (replacedRecord is not null && !string.Equals(
+                            replacedRecord.DiscPath.Replace('/', '\\'),
+                            GetCurrentDiscPath(file.FullPath, replacedRecord.IsDeduped, replacedRecord.IsFileRef),
+                            StringComparison.OrdinalIgnoreCase)))
                         replacedRecord = null;
 
                     // Its bytes are about to be overwritten. If they are the last
@@ -1115,13 +1128,26 @@ public class DirectoryBackupService
                     // into that reference first (as retention does before deleting
                     // a version). If that cannot be done, keep the old copy as an
                     // earlier version instead: never orphan a reference.
+                    if (replacedRecord is not null)
+                    {
+                        string replacedPath = replacedRecord.DiscPath.Replace('/', '\\');
+                        replacedIds = (await _catalog.GetFileRecordsByPathAsync(backupSetId, file.FullPath, ct))
+                            .Where(r => !r.IsDeleted && string.Equals(
+                                r.DiscPath.Replace('/', '\\'), replacedPath, StringComparison.OrdinalIgnoreCase))
+                            .Select(r => r.Id)
+                            .Append(replacedRecord.Id)
+                            .Distinct()
+                            .ToList();
+                    }
                     if (replacedRecord is { IsFileRef: false, IsDeduped: false }
                         && !string.IsNullOrEmpty(replacedRecord.Hash)
                         && File.Exists(Path.Combine(targetDirectory, replacedRecord.DiscPath))
-                        && !await KeepContentReachableAsync(backupSetId, replacedRecord, targetDirectory, ct))
+                        && !await EnsureContentReachableAsync(
+                            backupSetId, replacedRecord, targetDirectory, replacedIds.ToHashSet(), ct))
                     {
                         keepVersions = true;
                         replacedRecord = null;
+                        replacedIds = [];
                     }
                     if (replacedRecord is not null && !string.IsNullOrEmpty(replacedRecord.Hash))
                         contentPathCache.Remove(replacedRecord.Hash);
@@ -1425,6 +1451,14 @@ public class DirectoryBackupService
                     prefixSet.Add(prefix);
                 }
 
+                // Replaced in place (no history): retire the old record in the
+                // same batch as the new one, and before it - both run whatever the
+                // token says, so a cancel cannot commit the new record with the
+                // old still live, and a Retry after a failure here cannot record
+                // the same version twice.
+                if (replacedIds.Count > 0)
+                    await _catalog.MarkFileRecordsDeletedByIdsAsync(backupSetId, replacedIds, CancellationToken.None);
+
                 // Create catalog record.
                 await _catalog.CreateFileRecordAsync(new FileRecord
                 {
@@ -1440,16 +1474,14 @@ public class DirectoryBackupService
                     Version = version,
                     SourceLastWriteUtc = file.LastWriteUtc,
                     BackedUpUtc = DateTime.UtcNow,
-                }, ct);
+                }, CancellationToken.None);
 
-                // Replaced in place (no history): retire the old record, in the
-                // same batch as the new one. Its stored file was overwritten when
-                // it shares the new copy's name; when the storage form changed
-                // (plain <-> .fileref/.dedup) it sits under another name, and
-                // nothing else would ever remove it.
+                // The replaced record's stored file was overwritten when it shares
+                // the new copy's name; when the storage form changed (plain <->
+                // .fileref/.dedup) it sits under another name, and nothing else
+                // would ever remove it.
                 if (replacedRecord is not null)
                 {
-                    await _catalog.MarkFileRecordsDeletedByIdsAsync(backupSetId, [replacedRecord.Id], ct);
                     string newDiscPath = GetCurrentDiscPath(file.FullPath, isDeduped, isFileRef);
                     if (!string.Equals(replacedRecord.DiscPath.Replace('/', '\\'), newDiscPath,
                             StringComparison.OrdinalIgnoreCase))
@@ -1945,51 +1977,11 @@ public class DirectoryBackupService
                     // bytes, before deleting.
                     if (!fileRecord.IsFileRef && !fileRecord.IsDeduped
                         && !string.IsNullOrEmpty(fileRecord.Hash)
-                        && File.Exists(prevPath))
+                        && File.Exists(prevPath)
+                        && !await EnsureContentReachableAsync(
+                            backupSetId, fileRecord, targetDirectory, toDeleteIds, ct))
                     {
-                        var others = (await _catalog.GetActiveRecordsByHashAsync(
-                                backupSetId, fileRecord.Hash, ct))
-                            .Where(r => r.Id != fileRecord.Id)
-                            .ToList();
-
-                        var survivingPlain = others.FirstOrDefault(r =>
-                            !r.IsFileRef && !r.IsDeduped && !toDeleteIds.Contains(r.Id));
-                        bool anotherPlainSurvives = survivingPlain is not null;
-
-                        if (!anotherPlainSurvives)
-                        {
-                            var survivingRef = others.FirstOrDefault(r =>
-                                r.IsFileRef && !toDeleteIds.Contains(r.Id));
-
-                            if (survivingRef is not null)
-                            {
-                                // Promote the surviving reference to a plain copy
-                                // (it becomes the content's new home), then fall
-                                // through to delete this one. If promotion fails,
-                                // keep this file so nothing is ever orphaned.
-                                if (!await TryPromoteFileRefToPlainAsync(
-                                        targetDirectory, prevPath, survivingRef, ct))
-                                {
-                                    continue; // leave this file + record intact
-                                }
-
-                                // The promoted reference now holds the bytes at its
-                                // suffix-less path; repoint every other .fileref's
-                                // ContentPath hint to it (best-effort).
-                                await UpdateFileRefContentPathsAsync(
-                                    backupSetId, fileRecord.Hash,
-                                    survivingRef.DiscPath, targetDirectory, ct);
-                            }
-                        }
-                        else
-                        {
-                            // A different plain copy survives; the bytes don't move,
-                            // but this deleted plain may have been a .fileref's
-                            // ContentPath target. Repoint hints to the survivor.
-                            await UpdateFileRefContentPathsAsync(
-                                backupSetId, fileRecord.Hash,
-                                survivingPlain!.DiscPath, targetDirectory, ct);
-                        }
+                        continue; // a reference needs these bytes: leave file and record
                     }
 
                     // Remove the physical file, then flip the catalog bit ONLY
@@ -2007,11 +1999,13 @@ public class DirectoryBackupService
                         continue; // leave file + record consistent; retry next run
                     }
 
-                    // Mark as deleted in catalog only if the file is really gone.
+                    // Mark as deleted in catalog only if the file is really gone. By
+                    // id: the record was read before the copy loop, and written back
+                    // whole it would undo anything a writer changed since.
                     if (!File.Exists(prevPath))
                     {
                         fileRecord.IsDeleted = true;
-                        await _catalog.UpdateFileRecordAsync(fileRecord, ct);
+                        await _catalog.MarkFileRecordsDeletedByIdsAsync(backupSetId, [fileRecord.Id], ct);
                     }
                 }
             }
@@ -3523,28 +3517,42 @@ public class DirectoryBackupService
     }
 
     /// <summary>
-    /// The plain copy <paramref name="record"/> describes is about to be
-    /// overwritten in place (its file keeps no history). Make sure no surviving
-    /// <c>.fileref</c> is left resolving to its content with nowhere to find it:
-    /// if another plain copy of the content survives, point the references'
-    /// hints at it; otherwise promote one reference into a real plain file using
-    /// these bytes. The last-plain-copy guard of the retention pass, for an
-    /// overwrite instead of a delete. Returns <c>false</c> when a reference
-    /// needs the bytes and could not be given them; the caller then keeps the
-    /// old copy as an earlier version rather than overwrite it.
+    /// The plain copy <paramref name="going"/> describes is about to be deleted
+    /// (retention) or overwritten in place (a file that keeps no history). Make
+    /// sure no surviving <c>.fileref</c> is left resolving to its content with
+    /// nowhere to find it: if another plain copy survives, repoint the references
+    /// whose hint named this one; otherwise promote one reference into a real
+    /// plain file using these bytes. Returns <c>false</c> when a reference needs
+    /// the bytes and could not be given them; the caller keeps them.
     /// </summary>
-    private async Task<bool> KeepContentReachableAsync(
-        int backupSetId, FileRecord record, string targetDirectory, CancellationToken ct)
+    /// <param name="alsoGoing">Records going in the same pass, which survive no more than this one.</param>
+    /// <remarks>
+    /// A row at the same stored path is not another copy: it is this file, and
+    /// goes with it (a catalog duplicate, a seed run twice).
+    /// </remarks>
+    private async Task<bool> EnsureContentReachableAsync(
+        int backupSetId, FileRecord going, string targetDirectory,
+        IReadOnlySet<long>? alsoGoing, CancellationToken ct)
     {
-        var others = (await _catalog.GetActiveRecordsByHashAsync(backupSetId, record.Hash, ct))
-            .Where(r => r.Id != record.Id)
+        string goingPath = going.DiscPath.Replace('/', '\\');
+        var others = (await _catalog.GetActiveRecordsByHashAsync(backupSetId, going.Hash, ct))
+            .Where(r => r.Id != going.Id && alsoGoing?.Contains(r.Id) != true
+                        && !string.Equals(r.DiscPath.Replace('/', '\\'), goingPath, StringComparison.OrdinalIgnoreCase))
             .ToList();
 
-        var survivingPlain = others.FirstOrDefault(r => !r.IsFileRef && !r.IsDeduped);
+        FileRecord? survivingPlain = null;
+        foreach (var r in others.Where(r => !r.IsFileRef && !r.IsDeduped))
+        {
+            if (await IsCurrentRowAtItsPathAsync(backupSetId, r, ct))
+            {
+                survivingPlain = r;
+                break;
+            }
+        }
         if (survivingPlain is not null)
         {
             await UpdateFileRefContentPathsAsync(
-                backupSetId, record.Hash, survivingPlain.DiscPath, targetDirectory, ct);
+                backupSetId, going.Hash, survivingPlain.DiscPath, targetDirectory, ct, onlyIfHintIs: going.DiscPath);
             return true;
         }
 
@@ -3553,13 +3561,28 @@ public class DirectoryBackupService
             return true; // nothing refers to this content
 
         if (!await TryPromoteFileRefToPlainAsync(
-                targetDirectory, Path.Combine(targetDirectory, record.DiscPath), survivingRef, ct))
+                targetDirectory, Path.Combine(targetDirectory, going.DiscPath), survivingRef, ct))
             return false;
 
-        // The promoted reference holds the bytes now, at its suffix-less path.
+        // The promoted reference holds the bytes now, at its suffix-less path;
+        // every other reference's hint goes there.
         await UpdateFileRefContentPathsAsync(
-            backupSetId, record.Hash, survivingRef.DiscPath, targetDirectory, ct);
+            backupSetId, going.Hash, survivingRef.DiscPath, targetDirectory, ct);
         return true;
+    }
+
+    /// <summary>
+    /// Whether no newer live row of the same file sits at <paramref name="row"/>'s
+    /// stored path. An older one is stale: its bytes were overwritten in place (as
+    /// copies that keep no history were, before their replaced rows were retired),
+    /// so it is no copy of the content it names.
+    /// </summary>
+    private async Task<bool> IsCurrentRowAtItsPathAsync(int backupSetId, FileRecord row, CancellationToken ct)
+    {
+        string path = row.DiscPath.Replace('/', '\\');
+        return !(await _catalog.GetFileRecordsByPathAsync(backupSetId, row.SourcePath, ct)).Any(n =>
+            !n.IsDeleted && n.Id > row.Id
+            && string.Equals(n.DiscPath.Replace('/', '\\'), path, StringComparison.OrdinalIgnoreCase));
     }
 
     /// <summary>
@@ -3685,9 +3708,14 @@ public class DirectoryBackupService
     /// to rewrite a manifest leaves a stale hint that catalog-free restore
     /// recovers from via its hash-verify + scan fallback.
     /// </summary>
+    /// <param name="onlyIfHintIs">
+    /// Rewrite only manifests whose hint names this stored path; null for all.
+    /// When another copy of the content survives, only the hints that named the
+    /// copy going are wrong, and the rest are left as they are.
+    /// </param>
     private async Task UpdateFileRefContentPathsAsync(
         int backupSetId, string hash, string newContentDiscPath,
-        string targetDirectory, CancellationToken ct)
+        string targetDirectory, CancellationToken ct, string? onlyIfHintIs = null)
     {
         if (string.IsNullOrEmpty(hash))
             return;
@@ -3720,6 +3748,10 @@ public class DirectoryBackupService
 
                 // Don't repoint a reference at itself.
                 if (string.Equals(m.ContentPath, newContentDiscPath, StringComparison.OrdinalIgnoreCase))
+                    continue;
+                if (onlyIfHintIs is not null && !string.Equals(
+                        m.ContentPath?.Replace('/', '\\'), onlyIfHintIs.Replace('/', '\\'),
+                        StringComparison.OrdinalIgnoreCase))
                     continue;
 
                 m.ContentPath = newContentDiscPath;

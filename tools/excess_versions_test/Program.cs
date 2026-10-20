@@ -286,6 +286,217 @@ internal static class Program
         await ReconcileAfterChangesAsync(root);
         await TransactionOwnerAsync(root);
         await UnhashedAnchorsAsync(root);
+        await InPlaceOverwriteAsync(root);
+        await KeptCopyAcrossCategoriesAsync(root);
+    }
+
+    /// <summary>
+    /// §17. Every copy of content a .fileref needs is in files deleted from disk,
+    /// and only that category is cleaned. The purge's guard considered excess
+    /// versions only, so it checked nothing, and the last copy went; and a copy it
+    /// did keep was then retired with the rest of its file's records by the
+    /// category purged by path. The copy is kept now, live, with its file.
+    /// </summary>
+    static async Task KeptCopyAcrossCategoriesAsync(string root)
+    {
+        Console.WriteLine();
+        Console.WriteLine("=== 17. A kept copy stays live when its own file is purged by path ===");
+        string source = Path.Combine(root, "src17"), target = Path.Combine(root, "dst17");
+        Directory.CreateDirectory(source);
+        Directory.CreateDirectory(target);
+        Directory.CreateDirectory(Path.Combine(root, "cat17"));
+        using var repo = new SqliteCatalogRepository(Path.Combine(root, "cat17", "catalog.db"));
+        var svc = new DirectoryBackupService(repo, new FileScanner(repo), new VersionRetentionService(repo));
+        List<SourceSelection> Sel() =>
+            [new SourceSelection { Path = source, IsDirectory = true, IsSelected = true, AutoIncludeNewSubdirectories = true }];
+        var keepOne = new VersionTierSet { Name = "Default", Tiers = [new() { MaxAge = null, MaxVersions = 1 }] };
+        var set = await repo.CreateBackupSetAsync(new BackupSet
+        {
+            Name = "kept-copy", SourceRoots = [source], SourceSelections = Sel(),
+            CreatedUtc = DateTime.UtcNow, DefaultMediaType = MediaType.Directory,
+            JobOptions = new JobOptions { TargetDirectory = target, TierSets = [keepOne], RetentionTiers = keepOne.Tiers },
+        });
+        async Task Backup(bool dedup)
+        {
+            var opts = (await repo.GetBackupSetAsync(set.Id))!.JobOptions!;
+            var job = new BackupJob
+            {
+                BackupSetId = set.Id, Sources = Sel(), EnableFileDeduplication = dedup,
+                TargetDirectory = target, ZipMode = ZipMode.None,
+                TierSets = opts.TierSets, RetentionTiers = opts.RetentionTiers,
+            };
+            var tiers = opts.RetentionTiers.Count > 0 ? opts.RetentionTiers : VersionRetentionService.DefaultTiers;
+            var r = await svc.ExecuteAsync(job, target, tiers, null, CancellationToken.None);
+            if (!r.Success) throw new Exception("backup failed");
+        }
+
+        string h = Path.Combine(source, "h.bin"), k = Path.Combine(source, "k.bin"), m = Path.Combine(source, "m.bin");
+        await File.WriteAllTextAsync(h, "content H");
+        await Backup(dedup: false);
+        await File.WriteAllTextAsync(h, "h changed");
+        await Backup(dedup: false);                       // h.bin.v1: plain, content H
+        await File.WriteAllTextAsync(k, "content H");
+        await Backup(dedup: false);                       // k.bin: a second plain copy of H
+        await File.WriteAllTextAsync(m, "content H");
+        await Backup(dedup: true);                        // m.bin: a .fileref to H
+        string hHash = (await repo.GetLatestVersionInfoAsync(set.Id))[k].Hash;
+
+        var s = (await repo.GetBackupSetAsync(set.Id))!;
+        s.JobOptions!.TierSets = [new VersionTierSet { Name = "Default", Tiers = [] }];
+        s.JobOptions.RetentionTiers = [];
+        await repo.UpdateBackupSetAsync(s);
+        File.Delete(k);
+        File.Delete(h);                                   // h.bin's own records go by path too
+
+        var vm = new OrphanedDirectoriesViewModel(repo, s);
+        vm.ScanCatalogCommand.Execute(null);
+        await WaitFor(() => !vm.IsLoading && vm.Categories.Count > 0, 60000);
+        // h.bin's earlier version is listed with h.bin, under deleted from disk: no
+        // excess version is involved, which is what left the purge unguarded.
+        var deletedPaths = vm.Items.Where(i => i.Reason == OrphanedReason.DeletedFromDisk)
+            .SelectMany(i => i.MatchingSourcePaths ?? []).ToHashSet(StringComparer.OrdinalIgnoreCase);
+        bool listed = deletedPaths.Contains(h) && deletedPaths.Contains(k);
+        Check(listed, "h.bin and k.bin, both copies of H, are listed as deleted from disk");
+        if (!listed) return;
+        foreach (var c in vm.Categories)
+            foreach (var n in c.RootNodes)
+                n.IsChecked = c.Reason == OrphanedReason.DeletedFromDisk;
+        vm.PurgeSelectedCommand.Execute(null);
+        await WaitFor(() => vm.IsPurging, 3000);
+        await WaitFor(() => !vm.IsPurging, 60000);
+        string? anchor = await repo.GetActivePlainContentPathByHashAsync(set.Id, hHash);
+        Check(vm.SummaryText.Contains("kept 1", StringComparison.Ordinal), $"the purge keeps one copy for m.bin (\"{vm.SummaryText}\")");
+        Check(anchor is not null && File.Exists(Path.Combine(target, anchor))
+              && File.ReadAllText(Path.Combine(target, anchor)) == "content H",
+            $"and that copy is still live, so m.bin's content resolves ({anchor ?? "no live copy"})");
+        Microsoft.Data.Sqlite.SqliteConnection.ClearAllPools();
+    }
+
+    /// <summary>
+    /// §16. A file that keeps no history is overwritten in place, and the records
+    /// of the copy it replaces retired. Only the current copy's: an earlier
+    /// version that happens to be the newest live record is not being replaced.
+    /// And all of them: a duplicate record of the copy (a seed run twice) is not
+    /// another copy of its content, here or in Cleanup's guard.
+    /// </summary>
+    static async Task InPlaceOverwriteAsync(string root)
+    {
+        Console.WriteLine();
+        Console.WriteLine("=== 16. Overwriting in place retires the current copy's records - all of them, and nothing else ===");
+        string source = Path.Combine(root, "src16"), target = Path.Combine(root, "dst16");
+        Directory.CreateDirectory(source);
+        Directory.CreateDirectory(target);
+        Directory.CreateDirectory(Path.Combine(root, "cat16"));
+        using var repo = new SqliteCatalogRepository(Path.Combine(root, "cat16", "catalog.db"));
+        var keepOne = new VersionTierSet { Name = "Default", Tiers = [new() { MaxAge = null, MaxVersions = 1 }] };
+        List<SourceSelection> Sel() =>
+            [new SourceSelection { Path = source, IsDirectory = true, IsSelected = true, AutoIncludeNewSubdirectories = true }];
+        var set = await repo.CreateBackupSetAsync(new BackupSet
+        {
+            Name = "in-place", SourceRoots = [source], SourceSelections = Sel(), CreatedUtc = DateTime.UtcNow,
+            DefaultMediaType = MediaType.Directory,
+            JobOptions = new JobOptions { TargetDirectory = target, EnableFileDeduplication = true, TierSets = [keepOne], RetentionTiers = keepOne.Tiers },
+        });
+        async Task Backup()
+        {
+            var svc = new DirectoryBackupService(repo, new FileScanner(repo), new VersionRetentionService(repo));
+            var opts = (await repo.GetBackupSetAsync(set.Id))!.JobOptions!;
+            var job = new BackupJob
+            {
+                BackupSetId = set.Id, Sources = Sel(), EnableFileDeduplication = true, TargetDirectory = target,
+                ZipMode = ZipMode.None, TierSets = opts.TierSets, RetentionTiers = opts.RetentionTiers,
+            };
+            var tiers = opts.RetentionTiers.Count > 0 ? opts.RetentionTiers : VersionRetentionService.DefaultTiers;
+            var r = await svc.ExecuteAsync(job, target, tiers, null, CancellationToken.None);
+            if (!r.Success) throw new Exception("backup failed: " + string.Join("; ", r.FailedFiles.Select(f => f.Error)));
+        }
+        async Task EmptyDefault()
+        {
+            var s = (await repo.GetBackupSetAsync(set.Id))!;
+            s.JobOptions!.TierSets = [new VersionTierSet { Name = "Default", Tiers = [] }];
+            s.JobOptions.RetentionTiers = [];
+            await repo.UpdateBackupSetAsync(s);
+        }
+
+        // (a) The newest live record is an earlier version: the current copy went
+        //     missing and its record was pruned.
+        string p = Path.Combine(source, "p.txt");
+        await File.WriteAllTextAsync(p, "p one");
+        await Backup();
+        await File.WriteAllTextAsync(p, "p two, longer");
+        await Backup();
+        var pRows = (await repo.GetFileRecordsByPathAsync(set.Id, p)).Where(r => !r.IsDeleted).OrderBy(r => r.Version).ToList();
+        Check(pRows.Count == 2, $"p.txt has an earlier version and a current copy ({pRows.Count} live)");
+        if (pRows.Count != 2) return;
+        File.Delete(Path.Combine(target, pRows[1].DiscPath));
+        await repo.MarkFileRecordsDeletedByIdsAsync(set.Id, [pRows[1].Id]);
+        await EmptyDefault();
+        await File.WriteAllTextAsync(p, "p three, with no history now");
+        await Backup();
+        var v1 = (await repo.GetFileRecordsByPathAsync(set.Id, p)).Single(r => r.Id == pRows[0].Id);
+        Check(!v1.IsDeleted && File.Exists(Path.Combine(target, v1.DiscPath))
+              && File.ReadAllText(Path.Combine(target, v1.DiscPath)) == "p one",
+            "an earlier version that was the newest live record is left alone (it used to be deleted)");
+
+        // (b) Two live records of one current copy, whose content a .fileref needs.
+        string q = Path.Combine(source, "q.txt"), r = Path.Combine(source, "r.txt");
+        await File.WriteAllTextAsync(q, "q and r share this");
+        await File.WriteAllTextAsync(r, "q and r share this");
+        await Backup();
+        var heads = await repo.GetLatestVersionInfoAsync(set.Id);
+        string plainOne = heads[q].IsFileRef ? r : q, refOne = heads[q].IsFileRef ? q : r;
+        string shared = heads[plainOne].Hash;
+        var original = (await repo.GetFileRecordsByPathAsync(set.Id, plainOne)).Single(x => !x.IsDeleted);
+        var twin = await repo.CreateFileRecordAsync(new FileRecord
+        {
+            DiscId = original.DiscId, SourcePath = original.SourcePath, DiscPath = original.DiscPath,
+            SizeBytes = original.SizeBytes, Hash = original.Hash, Version = original.Version,
+            SourceLastWriteUtc = original.SourceLastWriteUtc, BackedUpUtc = original.BackedUpUtc,
+        });
+        await File.WriteAllTextAsync(plainOne, "the plain one changed");
+        await Backup();
+        var plainRows = await repo.GetFileRecordsByPathAsync(set.Id, plainOne);
+        Check(plainRows.Where(x => x.Id == original.Id || x.Id == twin.Id).All(x => x.IsDeleted),
+            "both records of the replaced copy are retired, the duplicate too");
+        string? home = await repo.GetActivePlainContentPathByHashAsync(set.Id, shared);
+        Check(home is not null && File.Exists(Path.Combine(target, home))
+              && File.ReadAllText(Path.Combine(target, home)) == "q and r share this",
+            $"and the .fileref that needed its content was given it, the duplicate not counting as a copy ({home ?? "none"})");
+
+        // (c) Cleanup's guard, on its own: a duplicate at the candidate's path is
+        //     not a surviving copy.
+        var disc = await repo.CreateDiscAsync(new DiscRecord
+        {
+            BackupSetId = set.Id, Label = target, SequenceNumber = 9, MediaType = MediaType.Directory,
+            FilesystemType = FilesystemType.UDF, Status = BurnSessionStatus.Completed,
+        });
+        FileRecord Row(string disc_, bool isRef) => new()
+        {
+            DiscId = disc.Id, SourcePath = Path.Combine(source, isRef ? "needs.txt" : "anchor.txt"),
+            DiscPath = disc_, SizeBytes = 5, Hash = "cafe", IsFileRef = isRef, Version = 1,
+            SourceLastWriteUtc = DateTime.UtcNow, BackedUpUtc = DateTime.UtcNow,
+        };
+        var anchorRow = await repo.CreateFileRecordAsync(Row(@"C_prev\x\anchor.txt.v1", false));
+        await repo.CreateFileRecordAsync(Row(@"C_prev\x\anchor.txt.v1", false));       // its duplicate
+        await repo.CreateFileRecordAsync(Row(@"C\x\needs.txt.fileref", true));
+        var needed = await repo.GetNeededContentCopiesAsync(set.Id, [anchorRow.Id]);
+        Check(needed.Contains(anchorRow.Id), "Cleanup's guard keeps a copy whose only 'other copy' is its own duplicate");
+
+        // (d) ... nor a stale row: an older live row at another file's current
+        //     path, whose bytes a newer row of that file has since replaced.
+        FileRecord At(string sourceName, string discPath, string hash, int version, bool isRef = false) => new()
+        {
+            DiscId = disc.Id, SourcePath = Path.Combine(source, sourceName), DiscPath = discPath,
+            SizeBytes = 5, Hash = hash, IsFileRef = isRef, Version = version,
+            SourceLastWriteUtc = DateTime.UtcNow, BackedUpUtc = DateTime.UtcNow,
+        };
+        await repo.CreateFileRecordAsync(At("x1.txt", @"C\x\x1.txt", "beef", 1));           // stale
+        await repo.CreateFileRecordAsync(At("x1.txt", @"C\x\x1.txt", "f00d", 2));           // what is there now
+        await repo.CreateFileRecordAsync(At("y.txt", @"C\x\y.txt.fileref", "beef", 1, isRef: true));
+        var lastCopy = await repo.CreateFileRecordAsync(At("z.txt", @"C_prev\x\z.txt.v1", "beef", 1));
+        var neededToo = await repo.GetNeededContentCopiesAsync(set.Id, [lastCopy.Id]);
+        Check(neededToo.Contains(lastCopy.Id), "nor a stale row whose bytes a newer row of its file replaced");
+        Microsoft.Data.Sqlite.SqliteConnection.ClearAllPools();
     }
 
     /// <summary>

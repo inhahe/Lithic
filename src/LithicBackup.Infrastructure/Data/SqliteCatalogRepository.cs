@@ -626,6 +626,9 @@ public class SqliteCatalogRepository : ICatalogRepository
         int backupSetId, IReadOnlyCollection<long>? among, CancellationToken ct = default)
         => GetSet(backupSetId).GetUnhashedPossibleAnchorsAsync(among, ct);
 
+    public Task<int> MarkFileRecordsLiveByIdsAsync(int backupSetId, IReadOnlyCollection<long> fileIds, CancellationToken ct = default)
+        => GetSet(backupSetId).MarkFileRecordsLiveByIdsAsync(fileIds, ct);
+
     public Task<bool> SetHashIfMissingAsync(int backupSetId, long fileId, string hash, CancellationToken ct = default)
         => GetSet(backupSetId).SetHashIfMissingAsync(fileId, hash, ct);
 
