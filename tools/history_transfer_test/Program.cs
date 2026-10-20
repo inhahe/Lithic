@@ -481,8 +481,49 @@ string restoredF = Path.Combine(restoreTo, source7[Path.GetPathRoot(source7)!.Le
 Check(File.Exists(restoredF) && File.ReadAllText(restoredF) == "f four, on the new computer",
     "and restored the latest content");
 
+// ===================================================================
+// 9. Restore before any backup has followed the drive to its new letter.
+// ===================================================================
 Console.WriteLine();
+Console.WriteLine("=== 9. Restore follows the destination's volume, not its stored path ===");
+// An imported set keeps the old computer's path until a backup follows the
+// drive; restore must find the folder through the volume identity instead.
+string moved9 = Path.Combine(root, "dst9_moved");
+Directory.Move(moved7, moved9);
+var volumes = new Win32VolumeResolver();
+string? volumeId = volumes.GetVolumeId(moved9);
+string? mount = volumeId is null ? null : volumes.GetCurrentMountPoint(volumeId);
+var stored9 = (await repoB7.GetBackupSetAsync(setB7.Id))!;
+char unused = Enumerable.Range('M', 14).Select(c => (char)c).First(c => !Directory.Exists($"{c}:\\"));
+stored9.JobOptions!.TargetDirectory = $"{unused}:\\{Path.GetFileName(moved9)}";   // the old computer's letter
+stored9.JobOptions.DestinationVolumeId = volumeId;
+stored9.JobOptions.DestinationSubpath = mount is null ? null : Path.GetRelativePath(mount, moved9);
+await repoB7.UpdateBackupSetMetadataAsync(stored9);
+if (volumeId is null || mount is null)
+{
+    Check(false, "the temp folder's volume identity can be read");
+}
+else
+{
+    var following = new RestoreService(repoB7, new DestinationResolver(volumes));
+    var picked9 = await following.MaterializeSelectionAsync(setB7.Id, [source7], []);
+    string restoreTo9 = Path.Combine(root, "restored9");
+    var restored9 = await following.RestoreAsync(picked9,
+        new Dictionary<string, string> { [source7[..1].ToUpperInvariant()] = restoreTo9 });
+    Check(restored9.FilesRestored == 1 && restored9.Errors.Count == 0,
+        $"with the stored path on {unused}:, the restore finds the files through the volume ({restored9.FilesRestored} restored, "
+        + $"{restored9.Errors.Count} error(s){(restored9.Errors.Count > 0 ? ": " + restored9.Errors[0] : "")})");
+    Check((await repoB7.GetBackupSetAsync(setB7.Id))!.JobOptions!.TargetDirectory!.StartsWith($"{unused}:"),
+        "and saves nothing: the stored path is left for a backup to update");
+}
+
+Console.WriteLine();
+// Closed before the folder goes, or SQLite's open files keep it from going.
+foreach (var repo in new[] { repoA, repoB, repoA7, repoB7 })
+    repo.Dispose();
+Microsoft.Data.Sqlite.SqliteConnection.ClearAllPools();
 try { Directory.Delete(root, recursive: true); } catch { /* temp; best effort */ }
+Check(!Directory.Exists(root), "the harness leaves no temp folder behind");
 if (failures == 0)
 {
     Console.WriteLine("ALL PASS");

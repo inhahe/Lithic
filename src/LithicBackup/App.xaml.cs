@@ -353,7 +353,7 @@ public partial class App : Application
             fileSystemMonitor: burnMonitor);
 
         // Restore service.
-        var restoreService = new RestoreService(_catalog);
+        var restoreService = new RestoreService(_catalog, destinationResolver);
 
         // Catalog-free (disaster-recovery) restore service — reconstructs files
         // from a backup destination tree alone, no catalog required.

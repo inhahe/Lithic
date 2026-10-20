@@ -13,6 +13,7 @@ namespace LithicBackup.Services;
 public class RestoreService : IRestoreService
 {
     private readonly ICatalogRepository _catalog;
+    private readonly IDestinationResolver? _destinationResolver;
 
     /// <summary>
     /// Callback invoked when a disc needs to be inserted. Receives the disc
@@ -21,9 +22,14 @@ public class RestoreService : IRestoreService
     /// </summary>
     public Func<string, Task<string?>>? DiscInsertCallback { get; set; }
 
-    public RestoreService(ICatalogRepository catalog)
+    /// <param name="destinationResolver">
+    /// Follows a set's destination to the drive letter it has now, by its volume
+    /// identity, as a backup does; without one, the stored path is used as it is.
+    /// </param>
+    public RestoreService(ICatalogRepository catalog, IDestinationResolver? destinationResolver = null)
     {
         _catalog = catalog;
+        _destinationResolver = destinationResolver;
     }
 
     /// <summary>
@@ -860,6 +866,12 @@ public class RestoreService : IRestoreService
             var set = await _catalog.GetBackupSetAsync(disc.BackupSetId, ct);
             var opts = set?.JobOptions;
             current = opts?.TargetDirectory;
+            // The stored path is where the destination was when a backup last
+            // ran; a set imported where its drive has another letter keeps the old
+            // computer's until one does. Follow the volume instead. Nothing is
+            // saved: restore only reads, and the next backup records the move.
+            if (opts is not null && _destinationResolver?.Resolve(opts) is { IsConnected: true, LivePath: { } live })
+                current = live;
             if (current is not null && opts!.CreateSubdirectory && !string.IsNullOrWhiteSpace(opts.SubdirectoryName))
                 current = Path.Combine(current, opts.SubdirectoryName.Trim());
             currentDestinations[disc.BackupSetId] = current;
