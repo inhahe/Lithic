@@ -1509,11 +1509,41 @@ internal sealed class SqliteSetDatabase : IDisposable
         IReadOnlyCollection<long>? keepableIds = null, CancellationToken ct = default)
     {
         ct.ThrowIfCancellationRequested();
-        var keep = new HashSet<long>();
         if (candidateIds.Count == 0)
-            return keep;
-
+            return [];
         using var _ = await LockAsync(ct).ConfigureAwait(false);
+        return NeededContentCopies(backupSetId, candidateIds, keepableIds);
+    }
+
+    /// <summary>See <see cref="ICatalogRepository.RetireRecordsKeepingNeededCopiesAsync"/>.</summary>
+    public async Task<HashSet<long>> RetireRecordsKeepingNeededCopiesAsync(
+        int backupSetId, IReadOnlyCollection<long> candidateIds,
+        IReadOnlyCollection<long>? keepableIds = null, CancellationToken ct = default)
+    {
+        ct.ThrowIfCancellationRequested();
+        if (candidateIds.Count == 0)
+            return [];
+        // One write lock for both: nothing can add or retire a reference between
+        // deciding what is needed and retiring the rest.
+        using var _ = await WriteLockAsync(ct).ConfigureAwait(false);
+        var kept = NeededContentCopies(backupSetId, candidateIds, keepableIds);
+        using var cmd = _connection.CreateCommand();
+        cmd.CommandText = "UPDATE Files SET IsDeleted = 1 WHERE IsDeleted = 0 AND Id IN (SELECT value FROM json_each($ids))";
+        cmd.Parameters.AddWithValue("$ids",
+            System.Text.Json.JsonSerializer.Serialize(candidateIds.Where(id => !kept.Contains(id)).ToList()));
+        cmd.ExecuteNonQuery();
+        return kept;
+    }
+
+    /// <summary>
+    /// Which of the candidates are the last plain copy of content a live
+    /// <c>.fileref</c> still needs, with the candidates gone; the caller holds the
+    /// gate.
+    /// </summary>
+    private HashSet<long> NeededContentCopies(
+        int backupSetId, IReadOnlyCollection<long> candidateIds, IReadOnlyCollection<long>? keepableIds)
+    {
+        var keep = new HashSet<long>();
 
         // The candidates go into a TEMP table: connection-local, in the temp
         // database, so filling it takes no write lock on the set and waits on no
@@ -1558,11 +1588,14 @@ internal sealed class SqliteSetDatabase : IDisposable
             // candidate's file. Hash = is a BINARY compare on purpose:
             // every writer stores lower-case hex, and it lets IX_Files_Active_Hash
             // serve both EXISTS probes.
+            // CROSS JOIN pins the candidates as the outer loop: with no
+            // statistics SQLite rates both tables alike, and driving from Files
+            // in hash order would walk every live row to check a handful.
             using var cmd = _connection.CreateCommand();
             cmd.CommandText = """
                 SELECT MAX(p.Id)
-                FROM Files p
-                INNER JOIN temp.KeepableCandidates c ON c.Id = p.Id
+                FROM temp.KeepableCandidates c
+                CROSS JOIN Files p ON c.Id = p.Id
                 WHERE p.IsDeleted = 0 AND p.Hash <> ''
                   AND p.IsFileRef = 0 AND p.IsDeduped = 0 AND p.IsSplit = 0 AND p.IsZipped = 0
                   AND EXISTS (SELECT 1 FROM Discs d WHERE d.Id = p.DiscId AND d.BackupSetId = $setId)

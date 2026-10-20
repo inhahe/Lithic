@@ -1960,7 +1960,7 @@ public class MainViewModel : ViewModelBase
             removed.Select(f => f.DiscPath.Replace('/', '\\')),
             StringComparer.OrdinalIgnoreCase);
 
-        int catPurged = 0, filesDeleted = 0, delFailures = 0, alreadyAbsent = 0;
+        int catPurged = 0, filesDeleted = 0, delFailures = 0, alreadyAbsent = 0, keptForReferences = 0;
         long bytesFreed = 0;
         try
         {
@@ -1971,7 +1971,7 @@ public class MainViewModel : ViewModelBase
             // Not cancellable: the user already confirmed the deletion, and
             // aborting mid-purge would leave the catalog and destination out of
             // step (Cleanup can always finish a partial purge later).
-            var (_, purge) = await Views.ProgressDialog.RunAsync<(int Cat, int Files, int Fail, long Bytes, int Absent)>(
+            var (_, purge) = await Views.ProgressDialog.RunAsync<(int Cat, int Files, int Fail, long Bytes, int Absent, int Kept)>(
                 Application.Current.MainWindow,
                 "Removing files from destination",
                 "Deleting backed-up copies of the removed folders\u2026",
@@ -1986,7 +1986,9 @@ public class MainViewModel : ViewModelBase
                     var progressSw = System.Diagnostics.Stopwatch.StartNew();
                     long lastReportMs = -ProgressCadence.IntervalMs; // fire first report immediately
                     var tx = _catalog.BeginTransactionAsync(backupSet.Id).GetAwaiter().GetResult();
-                    int purged = 0;
+                    int purged = 0, kept = 0;
+                    // Every live record of the removed paths, by id, with its stored file.
+                    var candidates = new Dictionary<long, string>();
                     try
                     {
                         for (int i = 0; i < sourcePaths.Count; i++)
@@ -2007,10 +2009,23 @@ public class MainViewModel : ViewModelBase
                                     pct));
                             }
 
-                            purged += _catalog
-                                .MarkFilesDeletedBySourcePathsAsync(backupSet.Id, new[] { path })
-                                .GetAwaiter().GetResult();
+                            foreach (var r in _catalog.GetFileRecordsByPathAsync(backupSet.Id, path)
+                                         .GetAwaiter().GetResult())
+                                if (!r.IsDeleted)
+                                    candidates[r.Id] = r.DiscPath;
                         }
+
+                        // All at once, so a copy one removed file holds for another's
+                        // reference is judged against every removal. A copy a file
+                        // still in the sources needs for its .fileref stays, with its
+                        // file: removing a folder must not orphan a file outside it.
+                        var keptIds = _catalog.RetireRecordsKeepingNeededCopiesAsync(
+                                backupSet.Id, candidates.Keys.ToList())
+                            .GetAwaiter().GetResult();
+                        purged = candidates.Count - keptIds.Count;
+                        kept = keptIds.Count;
+                        foreach (long id in keptIds)
+                            discPaths.Remove(candidates[id].Replace('/', '\\'));
                         tx.Complete();
                     }
                     finally
@@ -2039,10 +2054,10 @@ public class MainViewModel : ViewModelBase
                             reconcile.ApplyAsync(backupSet.Id, report, targetDir, progress, ct)
                                 .GetAwaiter().GetResult();
                     }
-                    return (purged, fd, ff, bytes, absent);
+                    return (purged, fd, ff, bytes, absent, kept);
                 });
 
-            (catPurged, filesDeleted, delFailures, bytesFreed, alreadyAbsent) = purge;
+            (catPurged, filesDeleted, delFailures, bytesFreed, alreadyAbsent, keptForReferences) = purge;
         }
         catch (Exception ex)
         {
@@ -2059,6 +2074,9 @@ public class MainViewModel : ViewModelBase
             parts.Add($"{delFailures:N0} deletion failure{(delFailures == 1 ? "" : "s")}");
         if (alreadyAbsent > 0)
             parts.Add($"{alreadyAbsent:N0} already absent");
+        if (keptForReferences > 0)
+            parts.Add($"kept {keptForReferences:N0} cop{(keptForReferences == 1 ? "y" : "ies")} that duplicate-file "
+                      + "references of other files still need");
         StatusText = parts.Count > 0
             ? "Removed sources: " + string.Join(", ", parts) + "."
             : "No destination files needed removal.";

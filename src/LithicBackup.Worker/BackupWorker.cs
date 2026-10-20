@@ -2334,10 +2334,14 @@ public sealed class BackupWorker : BackgroundService
 
         try
         {
-            if (isDirectory)
-                await _catalog.MarkFilesDeletedByDirectoryAsync(set.Id, oldPath, ct);
-            else
-                await _catalog.MarkFilesDeletedBySourcePathsAsync(set.Id, new[] { oldPath }, ct);
+            // The old name's records go, but not one that is the last copy of
+            // content another file's .fileref resolves to: its stored file stays
+            // where it is, and the reference needs a live record to find it by.
+            var records = isDirectory
+                ? await _catalog.GetFileRecordsUnderDirectoryAsync(set.Id, oldPath, ct)
+                : await _catalog.GetFileRecordsByPathAsync(set.Id, oldPath, ct);
+            var live = records.Where(r => !r.IsDeleted).Select(r => r.Id).ToList();
+            await _catalog.RetireRecordsKeepingNeededCopiesAsync(set.Id, live, ct: ct);
             return true;
         }
         catch (Exception ex)

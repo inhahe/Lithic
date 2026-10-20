@@ -288,6 +288,57 @@ internal static class Program
         await UnhashedAnchorsAsync(root);
         await InPlaceOverwriteAsync(root);
         await KeptCopyAcrossCategoriesAsync(root);
+        await GuardedRetireAsync(root);
+    }
+
+    /// <summary>
+    /// §18. RetireRecordsKeepingNeededCopiesAsync, which removing a folder's
+    /// backups after an edit, Verify's repair and the Worker after a rename now
+    /// retire through: none of them checked whether a record held the last copy
+    /// another file's .fileref needed.
+    /// </summary>
+    static async Task GuardedRetireAsync(string root)
+    {
+        Console.WriteLine();
+        Console.WriteLine("=== 18. Retiring records keeps the copy a live reference needs ===");
+        Directory.CreateDirectory(Path.Combine(root, "cat18"));
+        using var repo = new SqliteCatalogRepository(Path.Combine(root, "cat18", "catalog.db"));
+        var set = await repo.CreateBackupSetAsync(new BackupSet
+        {
+            Name = "guarded-retire", SourceRoots = [@"C:\x"], CreatedUtc = DateTime.UtcNow,
+            DefaultMediaType = MediaType.Directory, JobOptions = new JobOptions { TargetDirectory = Path.Combine(root, "dst18") },
+        });
+        var disc = await repo.CreateDiscAsync(new DiscRecord
+        {
+            BackupSetId = set.Id, Label = "d", SequenceNumber = 1, MediaType = MediaType.Directory,
+            FilesystemType = FilesystemType.UDF, Status = BurnSessionStatus.Completed,
+        });
+        async Task<FileRecord> Add(string name, string hash, bool isRef = false) => await repo.CreateFileRecordAsync(new FileRecord
+        {
+            DiscId = disc.Id, SourcePath = $@"C:\x\{name}", DiscPath = $@"C\x\{name}" + (isRef ? ".fileref" : ""),
+            SizeBytes = 5, Hash = hash, IsFileRef = isRef, Version = 1,
+            SourceLastWriteUtc = DateTime.UtcNow, BackedUpUtc = DateTime.UtcNow,
+        });
+        async Task<bool> Live(FileRecord r) => !(await repo.GetFileRecordsByPathAsync(set.Id, r.SourcePath)).Single(x => x.Id == r.Id).IsDeleted;
+
+        var anchor = await Add("a.txt", "aaaa");
+        var reference = await Add("f.txt", "aaaa", isRef: true);
+        var other = await Add("o.txt", "bbbb");
+        var kept = await repo.RetireRecordsKeepingNeededCopiesAsync(set.Id, [anchor.Id, other.Id]);
+        Check(kept.SetEquals([anchor.Id]) && await Live(anchor) && !await Live(other),
+            "the last copy of content a live .fileref needs stays live, and the rest are retired");
+
+        var anchor2 = await Add("a2.txt", "cccc");
+        var reference2 = await Add("f2.txt", "cccc", isRef: true);
+        var none = await repo.RetireRecordsKeepingNeededCopiesAsync(set.Id, [anchor2.Id, reference2.Id]);
+        Check(none.Count == 0 && !await Live(anchor2) && !await Live(reference2),
+            "retired together with the only reference to it, the copy goes too");
+
+        var broken = await Add("b.txt", "dddd");
+        await Add("g.txt", "dddd", isRef: true);
+        var notKeepable = await repo.RetireRecordsKeepingNeededCopiesAsync(set.Id, [broken.Id], keepableIds: []);
+        Check(notKeepable.Count == 0 && !await Live(broken), "a copy the caller does not allow to be kept is retired");
+        Microsoft.Data.Sqlite.SqliteConnection.ClearAllPools();
     }
 
     /// <summary>

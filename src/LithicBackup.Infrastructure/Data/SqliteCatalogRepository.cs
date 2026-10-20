@@ -626,6 +626,11 @@ public class SqliteCatalogRepository : ICatalogRepository
         int backupSetId, IReadOnlyCollection<long>? among, CancellationToken ct = default)
         => GetSet(backupSetId).GetUnhashedPossibleAnchorsAsync(among, ct);
 
+    public Task<HashSet<long>> RetireRecordsKeepingNeededCopiesAsync(
+        int backupSetId, IReadOnlyCollection<long> candidateIds,
+        IReadOnlyCollection<long>? keepableIds = null, CancellationToken ct = default)
+        => GetSet(backupSetId).RetireRecordsKeepingNeededCopiesAsync(backupSetId, candidateIds, keepableIds, ct);
+
     public Task<int> MarkFileRecordsLiveByIdsAsync(int backupSetId, IReadOnlyCollection<long> fileIds, CancellationToken ct = default)
         => GetSet(backupSetId).MarkFileRecordsLiveByIdsAsync(fileIds, ct);
 

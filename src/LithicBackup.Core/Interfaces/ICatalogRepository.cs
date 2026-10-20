@@ -435,6 +435,20 @@ public interface ICatalogRepository : IDisposable
         int backupSetId, IReadOnlyCollection<long>? among, CancellationToken ct = default);
 
     /// <summary>
+    /// Retire these records, except any that is the last plain copy of content a
+    /// live <c>.fileref</c> still needs once they are gone: that one stays live,
+    /// so the reference keeps a copy to resolve to. Decided and done under one
+    /// write lock. For work that retires a file's records wholesale - removing a
+    /// folder's backups after an edit, Verify's repair, the Worker after a rename
+    /// - none of which may orphan another file's reference.
+    /// </summary>
+    /// <param name="keepableIds">Only these may be the copy kept (a copy known to be broken cannot); null for any candidate.</param>
+    /// <returns>The ids kept live; the caller must not delete their stored files.</returns>
+    Task<HashSet<long>> RetireRecordsKeepingNeededCopiesAsync(
+        int backupSetId, IReadOnlyCollection<long> candidateIds,
+        IReadOnlyCollection<long>? keepableIds = null, CancellationToken ct = default);
+
+    /// <summary>
     /// Undo the retirement of these records (inside the caller's transaction): a
     /// purge that has to keep a copy a reference needs, after a category it
     /// purges by source path retired every record of that copy's file.

@@ -43,6 +43,9 @@ public class VerifyIntegrityViewModel : ViewModelBase
     /// marks deleted so the next backup copies them again.
     /// </summary>
     private readonly List<string> _repairablePaths = [];
+
+    /// <summary>The destination the last verification read, for the repair.</summary>
+    private string? _verifiedTargetDir;
     private int _repairableCount;
     private bool _isRepairing;
     private bool _repaired;
@@ -285,6 +288,7 @@ public class VerifyIntegrityViewModel : ViewModelBase
             string effectiveTargetDir = targetDir!;
             if (opts!.CreateSubdirectory && !string.IsNullOrWhiteSpace(opts.SubdirectoryName))
                 effectiveTargetDir = Path.Combine(effectiveTargetDir, opts.SubdirectoryName.Trim());
+            _verifiedTargetDir = effectiveTargetDir;
 
             // Build the source selection tree (fall back to legacy SourceRoots).
             List<SourceSelection> sources;
@@ -425,10 +429,32 @@ public class VerifyIntegrityViewModel : ViewModelBase
         CommandManager.InvalidateRequerySuggested();
         try
         {
-            int marked = await _catalog.MarkFilesDeletedBySourcePathsAsync(
-                _backupSet.Id, _repairablePaths);
+            // Every live record of the paths, and which of them may be kept for
+            // another file's .fileref: an intact earlier version may - its file is
+            // there - but not the current copy, which must go for the next backup
+            // to copy the file again (and that copy is a copy of the content too).
+            var candidates = new List<long>();
+            var keepable = new List<long>();
+            foreach (var path in _repairablePaths)
+            {
+                var live = (await _catalog.GetFileRecordsByPathAsync(_backupSet.Id, path))
+                    .Where(r => !r.IsDeleted).ToList();
+                long newest = live.Count == 0 ? -1 : live.MaxBy(r => r.Version)!.Id;
+                foreach (var r in live)
+                {
+                    candidates.Add(r.Id);
+                    if (r.Id != newest && _verifiedTargetDir is not null
+                        && File.Exists(Path.Combine(_verifiedTargetDir, r.DiscPath)))
+                        keepable.Add(r.Id);
+                }
+            }
+            var kept = await _catalog.RetireRecordsKeepingNeededCopiesAsync(_backupSet.Id, candidates, keepable);
+            int marked = candidates.Count - kept.Count;
             Repaired = true;
-            SummaryText = $"Flagged {marked:N0} file(s) for re-backup. "
+            SummaryText = $"Flagged {marked:N0} file(s) for re-backup"
+                + (kept.Count > 0
+                    ? $", keeping {kept.Count:N0} earlier cop{(kept.Count == 1 ? "y" : "ies")} that duplicate-file references still need. "
+                    : ". ")
                 + "Close this window and run Backup to copy them to the destination again.";
         }
         catch (Exception ex)
