@@ -618,6 +618,13 @@ public class SqliteCatalogRepository : ICatalogRepository
     public Task<int> MarkFilesDeletedBySourcePathsAsync(int backupSetId, IEnumerable<string> sourcePaths, CancellationToken ct = default)
         => GetSet(backupSetId).MarkFilesDeletedBySourcePathsAsync(backupSetId, sourcePaths, ct);
 
+    public Task<IReadOnlyList<(long Id, string DiscPath)>> GetUnhashedPossibleAnchorsAsync(
+        int backupSetId, IReadOnlyCollection<long>? among, CancellationToken ct = default)
+        => GetSet(backupSetId).GetUnhashedPossibleAnchorsAsync(among, ct);
+
+    public Task<bool> SetHashIfMissingAsync(int backupSetId, long fileId, string hash, CancellationToken ct = default)
+        => GetSet(backupSetId).SetHashIfMissingAsync(fileId, hash, ct);
+
     public Task<bool> FlipFileRefToPlainIfUnchangedAsync(
         int backupSetId, long fileId, string expectedDiscPath, string newDiscPath, CancellationToken ct = default)
         => GetSet(backupSetId).FlipFileRefToPlainIfUnchangedAsync(fileId, expectedDiscPath, newDiscPath, ct);

@@ -417,6 +417,21 @@ public interface ICatalogRepository : IDisposable
         int backupSetId, IReadOnlyList<long> fileIds, CancellationToken ct = default);
 
     /// <summary>
+    /// Live plain copies with no content hash whose size is that of a live
+    /// <c>.fileref</c>: the only copies such a reference could be resolving to
+    /// that no guard can recognise, since every guard matches by hash. A seed with
+    /// Skip hashing records plain copies without one. With
+    /// <paramref name="among"/>, only those of these record ids.
+    /// </summary>
+    /// <returns>Each record's id and stored path.</returns>
+    Task<IReadOnlyList<(long Id, string DiscPath)>> GetUnhashedPossibleAnchorsAsync(
+        int backupSetId, IReadOnlyCollection<long>? among, CancellationToken ct = default);
+
+    /// <summary>Give a record the content hash it lacks; a record that has one is left as it is.</summary>
+    /// <returns>Whether the record was changed.</returns>
+    Task<bool> SetHashIfMissingAsync(int backupSetId, long fileId, string hash, CancellationToken ct = default);
+
+    /// <summary>
     /// Turn a live <c>.fileref</c> row into a plain one, only if it is still the
     /// live .fileref at <paramref name="expectedDiscPath"/> the caller read.
     /// Writes two columns: for a caller acting on records it read a while ago

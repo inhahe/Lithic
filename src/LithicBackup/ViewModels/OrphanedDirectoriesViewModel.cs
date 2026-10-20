@@ -2560,6 +2560,18 @@ public class OrphanedDirectoriesViewModel : ViewModelBase, IConfirmClose
                         Task.Delay(250, ct).GetAwaiter().GetResult();
                 }
 
+                // -- 0b. Hash the plain copies a .fileref might resolve to that
+                //       have no hash (a seed with Skip hashing records them so):
+                //       the re-check below finds a reference's last copy by hash,
+                //       and would let one without a hash be deleted. --
+                if (targetDir is not null)
+                {
+                    ((IProgress<Services.ProgressReport>)progress).Report(
+                        "Cleaning up: checking copies that duplicate-file references may need...");
+                    Services.ContentAnchors.HashUnhashedAnchorsAsync(_catalog, backupSetId, targetDir, among: null, ct)
+                        .GetAwaiter().GetResult();
+                }
+
                 // -- 1. Catalog updates inside a single transaction. --
                 ((IProgress<Services.ProgressReport>)progress).Report("Cleaning up: starting the catalog update...");
                 var tx = _catalog.BeginTransactionAsync(backupSetId, ct,

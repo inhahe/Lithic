@@ -1880,6 +1880,22 @@ public class DirectoryBackupService
                 }
 
                 var toDeleteIds = toDelete.Select(f => f.Id).ToHashSet();
+
+                // The last-plain-copy guard below matches by hash: give one to any
+                // plain copy about to go that a .fileref might resolve to and that
+                // has none (a seed with Skip hashing records them so).
+                var unhashed = toDelete
+                    .Where(f => string.IsNullOrEmpty(f.Hash) && !f.IsFileRef && !f.IsDeduped)
+                    .Select(f => f.Id).ToList();
+                if (unhashed.Count > 0)
+                {
+                    var hashed = await ContentAnchors.HashUnhashedAnchorsAsync(
+                        _catalog, backupSetId, targetDirectory, unhashed, ct);
+                    foreach (var f in toDelete)
+                        if (hashed.TryGetValue(f.Id, out var h))
+                            f.Hash = h;
+                }
+
                 var removing = PhaseProgress.Begin(progress, "Removing expired versions", toDelete.Count);
 
                 for (int i = 0; i < toDelete.Count; i++)
@@ -4329,6 +4345,12 @@ public class DirectoryBackupService
             }
             catch { /* only a statistic */ }
         }
+
+        // Skip hashing leaves plain copies without a hash, and the copies a
+        // .fileref resolves to must have one, or nothing that deletes a version
+        // can tell it is a reference's last copy. Only copies of a reference's
+        // size are read; a set seeded before this gets its hashes here too.
+        await ContentAnchors.HashUnhashedAnchorsAsync(_catalog, backupSetId, targetDir, among: null, ct);
 
         // Always report final state so the UI shows the true total.
         Report("", force: true);

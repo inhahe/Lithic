@@ -285,6 +285,141 @@ internal static class Program
         await CleanupWhileInUseAsync(root);
         await ReconcileAfterChangesAsync(root);
         await TransactionOwnerAsync(root);
+        await UnhashedAnchorsAsync(root);
+    }
+
+    /// <summary>
+    /// §15. A seed with Skip hashing (the editor's default) recorded plain copies
+    /// with no hash, and the guards that keep a .fileref's last plain copy -
+    /// retention's and Cleanup's - match by hash, so they could delete it. The seed
+    /// now hashes every plain copy of a live reference's size, and Cleanup and
+    /// retention do the same for any still without a hash before deleting.
+    /// </summary>
+    static async Task UnhashedAnchorsAsync(string root)
+    {
+        Console.WriteLine();
+        Console.WriteLine("=== 15. Copies a .fileref needs get a hash, however they were seeded ===");
+        string source = Path.Combine(root, "src15"), target = Path.Combine(root, "dst15");
+        Directory.CreateDirectory(source);
+        Directory.CreateDirectory(target);
+        var keepAll = new VersionTierSet { Name = "Default", Tiers = [new() { MaxAge = null, MaxVersions = null }] };
+        List<SourceSelection> Sel() =>
+            [new SourceSelection { Path = source, IsDirectory = true, IsSelected = true, AutoIncludeNewSubdirectories = true }];
+        BackupSet NewSet(string name) => new()
+        {
+            Name = name, SourceRoots = [source], SourceSelections = Sel(), CreatedUtc = DateTime.UtcNow,
+            DefaultMediaType = MediaType.Directory,
+            JobOptions = new JobOptions { TargetDirectory = target, EnableFileDeduplication = true, TierSets = [keepAll], RetentionTiers = keepAll.Tiers },
+        };
+        async Task Backup(ICatalogRepository repo, int setId)
+        {
+            var svc = new DirectoryBackupService(repo, new FileScanner(repo), new VersionRetentionService(repo));
+            var opts = (await repo.GetBackupSetAsync(setId))!.JobOptions!;
+            var job = new BackupJob
+            {
+                BackupSetId = setId, Sources = Sel(), EnableFileDeduplication = true, TargetDirectory = target,
+                ZipMode = ZipMode.None, TierSets = opts.TierSets, RetentionTiers = opts.RetentionTiers,
+            };
+            var tiers = opts.RetentionTiers.Count > 0 ? opts.RetentionTiers : VersionRetentionService.DefaultTiers;
+            var r = await svc.ExecuteAsync(job, target, tiers, null, CancellationToken.None);
+            if (!r.Success) throw new Exception("backup failed");
+        }
+
+        // Set A makes the layout: dupA and dupB share content, one is stored plain
+        // and the other as a .fileref to it; changing the plain one moves its old
+        // copy - the only plain copy of the shared content - into the history.
+        Directory.CreateDirectory(Path.Combine(root, "cat15a"));
+        string dupA = Path.Combine(source, "dupA.bin"), dupB = Path.Combine(source, "dupB.bin");
+        string lonely = Path.Combine(source, "lonely.bin");
+        string shared = "shared content for section fifteen";
+        string sharedHash, plainDup;
+        using (var repoA = new SqliteCatalogRepository(Path.Combine(root, "cat15a", "catalog.db")))
+        {
+            var setA = await repoA.CreateBackupSetAsync(NewSet("anchors-a"));
+            await File.WriteAllTextAsync(dupA, shared);
+            await File.WriteAllTextAsync(dupB, shared);
+            await File.WriteAllTextAsync(lonely, "a lonely file, first");
+            await Backup(repoA, setA.Id);
+            var heads = await repoA.GetLatestVersionInfoAsync(setA.Id);
+            plainDup = heads[dupA].IsFileRef ? dupB : dupA;
+            sharedHash = heads[plainDup].Hash;
+            await File.WriteAllTextAsync(plainDup, "the plain one changed, and is longer now");
+            await File.WriteAllTextAsync(lonely, "a lonely file, second and longer");
+            await Backup(repoA, setA.Id);
+        }
+        Microsoft.Data.Sqlite.SqliteConnection.ClearAllPools();
+
+        // Set B adopts that destination by seeding it, without hashing.
+        string catB = Path.Combine(root, "cat15b");
+        Directory.CreateDirectory(catB);
+        using var repo = new SqliteCatalogRepository(Path.Combine(catB, "catalog.db"));
+        var set = await repo.CreateBackupSetAsync(NewSet("anchors-b"));
+        var seeder = new DirectoryBackupService(repo, new FileScanner(repo), new VersionRetentionService(repo));
+        await seeder.SeedFromExistingDirectoryAsync(set.Id, target, null, CancellationToken.None, skipHashing: true);
+
+        static bool IsPrev(FileRecord f) => f.DiscPath.Replace('/', '\\').Split('\\')[0].EndsWith("_prev", StringComparison.OrdinalIgnoreCase);
+        var all = (await repo.GetAllFilesForBackupSetAsync(set.Id)).Where(f => !f.IsDeleted).ToList();
+        var anchor = all.SingleOrDefault(f => IsPrev(f) && !f.IsFileRef && f.SizeBytes == shared.Length);
+        var lonelyPrev = all.SingleOrDefault(f => f.SourcePath == lonely && IsPrev(f));
+        Check(all.Any(f => f.IsFileRef && f.Hash == sharedHash), "the seed records the .fileref to the shared content");
+        Check(anchor is not null && anchor.Hash == sharedHash,
+            $"and hashes the plain copy it resolves to, though hashing was skipped (\"{anchor?.Hash}\")");
+        Check(lonelyPrev is not null && lonelyPrev.Hash == "",
+            "while a plain copy no reference could need keeps no hash (it is not read)");
+        if (anchor is null) return;
+
+        string setDb = Directory.EnumerateFiles(Path.Combine(catB, "sets"), $"set-{set.Id}.db").Single();
+        void ForgetAnchorHash()
+        {
+            using var conn = new Microsoft.Data.Sqlite.SqliteConnection($"Data Source={setDb};Pooling=False");
+            conn.Open();
+            using var cmd = conn.CreateCommand();
+            cmd.CommandText = "UPDATE Files SET Hash = '' WHERE Id = $id";
+            cmd.Parameters.AddWithValue("$id", anchor.Id);
+            cmd.ExecuteNonQuery();
+        }
+
+        // Default keeps nothing now, so every earlier version is excess.
+        var s = (await repo.GetBackupSetAsync(set.Id))!;
+        var emptyDefault = new VersionTierSet { Name = "Default", Tiers = [] };
+        s.JobOptions!.TierSets = [emptyDefault];
+        s.JobOptions.RetentionTiers = [];
+        await repo.UpdateBackupSetAsync(s);
+
+        // Cleanup, with the anchor's hash gone again (a set seeded before this).
+        ForgetAnchorHash();
+        var vm = new OrphanedDirectoriesViewModel(repo, s);
+        vm.ScanCatalogCommand.Execute(null);
+        await WaitFor(() => !vm.IsLoading && vm.Categories.Count > 0, 60000);
+        foreach (var c in vm.Categories)
+            foreach (var n in c.RootNodes)
+                n.IsChecked = c.Reason == OrphanedReason.ExcessVersion;
+        bool listed = vm.Items.Any(i => i.Reason == OrphanedReason.ExcessVersion
+                                        && i.ExcessVersionRecords!.Any(r => r.Id == anchor.Id));
+        vm.PurgeSelectedCommand.Execute(null);
+        await WaitFor(() => vm.IsPurging, 3000);
+        await WaitFor(() => !vm.IsPurging, 60000);
+        string anchorPath = Path.Combine(target, anchor.DiscPath);
+        Check(listed && File.Exists(anchorPath) && File.ReadAllText(anchorPath) == shared,
+            $"Cleanup, listing the hash-less copy as excess, still keeps it (\"{vm.SummaryText}\")");
+
+        // Retention, with the hash gone once more: keep one earlier version, and
+        // change the file whose old copy is the anchor again, so the anchor is now
+        // the excess one and retention deletes it.
+        ForgetAnchorHash();
+        var keepOne = new VersionTierSet { Name = "Default", Tiers = [new() { MaxAge = null, MaxVersions = 1 }] };
+        s = (await repo.GetBackupSetAsync(set.Id))!;
+        s.JobOptions!.TierSets = [keepOne];
+        s.JobOptions.RetentionTiers = keepOne.Tiers;
+        await repo.UpdateBackupSetAsync(s);
+        await File.WriteAllTextAsync(plainDup, "the plain one changed a second time, longer again");
+        await Backup(repo, set.Id);
+        var anchorNow = (await repo.GetAllFilesForBackupSetAsync(set.Id)).Single(f => f.Id == anchor.Id);
+        Check(anchorNow.IsDeleted, "retention does delete the hash-less copy, now an excess version");
+        string? home = await repo.GetActivePlainContentPathByHashAsync(set.Id, sharedHash);
+        Check(home is not null && File.Exists(Path.Combine(target, home)) && File.ReadAllText(Path.Combine(target, home)) == shared,
+            $"and, having made the .fileref a plain copy first, leaves its content a home ({home ?? "none"})");
+        Microsoft.Data.Sqlite.SqliteConnection.ClearAllPools();
     }
 
     /// <summary>

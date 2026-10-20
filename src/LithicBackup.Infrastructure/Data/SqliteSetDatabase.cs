@@ -1465,6 +1465,43 @@ internal sealed class SqliteSetDatabase : IDisposable
         return list;
     }
 
+    /// <summary>See <see cref="ICatalogRepository.GetUnhashedPossibleAnchorsAsync"/>.</summary>
+    public async Task<IReadOnlyList<(long Id, string DiscPath)>> GetUnhashedPossibleAnchorsAsync(
+        IReadOnlyCollection<long>? among, CancellationToken ct = default)
+    {
+        ct.ThrowIfCancellationRequested();
+        if (among is { Count: 0 })
+            return [];
+        using var _ = await LockAsync(ct).ConfigureAwait(false);
+
+        using var cmd = _connection.CreateCommand();
+        cmd.CommandText = """
+            SELECT p.Id, p.DiscPath FROM Files p
+            WHERE p.IsDeleted = 0 AND p.Hash = ''
+              AND p.IsFileRef = 0 AND p.IsDeduped = 0 AND p.IsSplit = 0 AND p.IsZipped = 0
+              AND p.SizeBytes IN (SELECT r.SizeBytes FROM Files r WHERE r.IsDeleted = 0 AND r.IsFileRef = 1)
+            """ + (among is null ? "" : " AND p.Id IN (SELECT value FROM json_each($ids))");
+        if (among is not null)
+            cmd.Parameters.AddWithValue("$ids", System.Text.Json.JsonSerializer.Serialize(among));
+        var list = new List<(long, string)>();
+        using var r = cmd.ExecuteReader();
+        while (r.Read())
+            list.Add((r.GetInt64(0), r.GetString(1)));
+        return list;
+    }
+
+    /// <summary>See <see cref="ICatalogRepository.SetHashIfMissingAsync"/>.</summary>
+    public async Task<bool> SetHashIfMissingAsync(long fileId, string hash, CancellationToken ct = default)
+    {
+        ct.ThrowIfCancellationRequested();
+        using var _ = await WriteLockAsync(ct).ConfigureAwait(false);
+        using var cmd = _connection.CreateCommand();
+        cmd.CommandText = "UPDATE Files SET Hash = $hash WHERE Id = $id AND Hash = ''";
+        cmd.Parameters.AddWithValue("$id", fileId);
+        cmd.Parameters.AddWithValue("$hash", hash);
+        return cmd.ExecuteNonQuery() == 1;
+    }
+
     /// <summary>See <see cref="ICatalogRepository.GetNeededContentCopiesAsync"/>.</summary>
     public async Task<HashSet<long>> GetNeededContentCopiesAsync(
         int backupSetId, IReadOnlyCollection<long> candidateIds,
