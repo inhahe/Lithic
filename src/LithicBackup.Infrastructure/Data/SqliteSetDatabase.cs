@@ -13,13 +13,15 @@ namespace LithicBackup.Infrastructure.Data;
 /// <b>In-process concurrency.</b>  A single <see cref="SqliteConnection"/> is not
 /// safe for concurrent command execution, so every operation is serialised
 /// through a <see cref="SemaphoreSlim"/> gate.  A transaction holds the gate for
-/// its whole lifetime; calls made <i>inside</i> a transaction must not re-acquire
-/// the gate (the semaphore is not reentrant — that would self-deadlock), so a
-/// <see cref="_inTransaction"/> flag short-circuits the lock for them.  The flag
-/// is only correct under the application's invariant that at most one logical
-/// operation touches a given set at a time <i>within one process</i> (the GUI
-/// gates per-set commands so a set that is backing up cannot also be
-/// restored/cleaned).
+/// its whole lifetime; calls made <i>inside</i> it, by the flow that began it,
+/// must not re-acquire the gate (the semaphore is not reentrant — that would
+/// self-deadlock), so they skip it. Only that flow: it carries a token
+/// (<see cref="_flow"/>, an <see cref="AsyncLocal{T}"/>) that the open
+/// transaction names as its owner (<see cref="_txOwner"/>). Any other flow -
+/// the editor's plan check while a seed commits, Backup Coverage or a Cleanup scan
+/// while a backup runs - waits at the gate for the transaction to end instead of
+/// running its commands on the shared connection, inside someone else's
+/// transaction, from another thread.
 /// </para>
 /// <para>
 /// <b>Cross-process concurrency (GUI + Worker).</b>  The interactive GUI and the
@@ -47,7 +49,22 @@ internal sealed class SqliteSetDatabase : IDisposable
 {
     private readonly SqliteConnection _connection;
     private readonly SemaphoreSlim _gate = new(1, 1);
-    private volatile bool _inTransaction;
+
+    /// <summary>
+    /// The token of the flow this code runs in, once it has begun a transaction on
+    /// this set. It follows the flow through awaits and into the work it calls, so
+    /// everything that flow does inside its transaction carries it.
+    /// </summary>
+    private readonly AsyncLocal<FlowToken?> _flow = new();
+
+    /// <summary>The token of the flow whose transaction is open; null when none is.</summary>
+    private volatile FlowToken? _txOwner;
+
+    /// <summary>Identifies one flow of work to <see cref="_txOwner"/>; nothing else.</summary>
+    private sealed class FlowToken;
+
+    /// <summary>Whether the open transaction, if any, was begun by the flow asking.</summary>
+    private bool OwnsTransaction => _txOwner is { } owner && ReferenceEquals(_flow.Value, owner);
 
     /// <summary>
     /// Path of the per-set cross-process write-lock file.  A writer opens this
@@ -107,9 +124,9 @@ internal sealed class SqliteSetDatabase : IDisposable
 
     private async Task<Releaser> LockAsync(CancellationToken ct)
     {
-        // Reentrant short-circuit: a call made while this set's transaction is
-        // open is on the transaction-owning flow and must not block on the gate.
-        if (_inTransaction)
+        // Reentrant short-circuit: the flow that holds this set's transaction
+        // already holds the gate. Any other flow waits for it.
+        if (OwnsTransaction)
             return default;
 
         await _gate.WaitAsync(ct).ConfigureAwait(false);
@@ -124,9 +141,9 @@ internal sealed class SqliteSetDatabase : IDisposable
     /// </summary>
     private async Task<WriteReleaser> WriteLockAsync(CancellationToken ct)
     {
-        // Reentrant short-circuit: an inside-transaction write already holds both
-        // the file lock and the gate.
-        if (_inTransaction)
+        // Reentrant short-circuit: the flow that holds this set's transaction
+        // already holds both the file lock and the gate.
+        if (OwnsTransaction)
             return default;
 
         // Cross-process first, then in-process, so the release order (gate then
@@ -298,8 +315,26 @@ internal sealed class SqliteSetDatabase : IDisposable
         return false;
     }
 
-    public async Task<ICatalogTransaction> BeginTransactionAsync(
+    /// <summary>
+    /// Begin a transaction owned by the calling flow (see the class remarks).
+    /// </summary>
+    /// <remarks>
+    /// Not <c>async</c>, on purpose: an <see cref="AsyncLocal{T}"/> set in an async
+    /// method is gone when that method returns, while set here it lands in the
+    /// caller's own context, so the code that goes on to use the transaction carries
+    /// the token. A flow that already has one keeps it - a backup re-taking its
+    /// transaction after each commit does so from a helper, and the token is the
+    /// same object the rest of the run carries.
+    /// </remarks>
+    public Task<ICatalogTransaction> BeginTransactionAsync(
         CancellationToken ct, Action? onWaitingForOtherProcess = null)
+    {
+        var token = _flow.Value ??= new FlowToken();
+        return BeginTransactionCoreAsync(token, ct, onWaitingForOtherProcess);
+    }
+
+    private async Task<ICatalogTransaction> BeginTransactionCoreAsync(
+        FlowToken token, CancellationToken ct, Action? onWaitingForOtherProcess)
     {
         ct.ThrowIfCancellationRequested();
 
@@ -321,7 +356,7 @@ internal sealed class SqliteSetDatabase : IDisposable
         try
         {
             var tx = _connection.BeginTransaction();
-            _inTransaction = true;
+            _txOwner = token;
             return new TransactionScope(this, tx, fileLock);
         }
         catch
@@ -352,7 +387,7 @@ internal sealed class SqliteSetDatabase : IDisposable
 
     /// <summary>
     /// Commits on <see cref="Complete"/> + Dispose, otherwise rolls back, then
-    /// clears the in-transaction flag and releases the owning set's gate.
+    /// clears the transaction's owner and releases the owning set's gate.
     /// </summary>
     private sealed class TransactionScope : ICatalogTransaction
     {
@@ -386,7 +421,7 @@ internal sealed class SqliteSetDatabase : IDisposable
             {
                 _transaction.Dispose();
                 _transaction = null;
-                _owner._inTransaction = false;
+                _owner._txOwner = null;
                 _owner._gate.Release();
                 // Release the cross-process write lock last (reverse of the
                 // acquisition order in BeginTransactionAsync).

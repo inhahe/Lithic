@@ -284,6 +284,60 @@ internal static class Program
         await RenameOverExistingAsync(root);
         await CleanupWhileInUseAsync(root);
         await ReconcileAfterChangesAsync(root);
+        await TransactionOwnerAsync(root);
+    }
+
+    /// <summary>
+    /// §14. A set's open transaction lets only the flow that began it skip the
+    /// set's gate. A process-wide flag let every flow skip it, so a read from
+    /// another flow - the editor's plan check while a seed committed, Backup
+    /// Coverage or a Cleanup scan while a backup ran - ran on the shared
+    /// connection, inside that transaction, from another thread.
+    /// </summary>
+    static async Task TransactionOwnerAsync(string root)
+    {
+        Console.WriteLine();
+        Console.WriteLine("=== 14. Only the flow that owns a transaction skips the set's gate ===");
+        Directory.CreateDirectory(Path.Combine(root, "cat14"));
+        using var repo = new SqliteCatalogRepository(Path.Combine(root, "cat14", "catalog.db"));
+        var set = await repo.CreateBackupSetAsync(new BackupSet
+        {
+            Name = "tx-owner", SourceRoots = [@"C:\nowhere"], CreatedUtc = DateTime.UtcNow,
+            DefaultMediaType = MediaType.Directory, JobOptions = new JobOptions { TargetDirectory = Path.Combine(root, "dst14") },
+        });
+
+        // Another flow: started before the transaction, so it carries no part of it.
+        var go = new TaskCompletionSource(TaskCreationOptions.RunContinuationsAsynchronously);
+        var reader = Task.Run(async () =>
+        {
+            await go.Task;
+            var sw = System.Diagnostics.Stopwatch.StartNew();
+            await repo.GetLatestVersionInfoAsync(set.Id);
+            return sw.Elapsed;
+        });
+
+        var tx = await repo.BeginTransactionAsync(set.Id);
+        go.SetResult();
+        await Task.Delay(1500);
+        Check(!reader.IsCompleted, "a read from another flow waits while the transaction is open");
+        var own = repo.GetLatestVersionInfoAsync(set.Id);
+        Check(await Task.WhenAny(own, Task.Delay(5000)) == own, "a read by the flow that owns it does not");
+        tx.Dispose();
+        var waited = await reader;
+        Check(waited >= TimeSpan.FromSeconds(1.2), $"and the other flow's read runs once it ends (waited {waited.TotalSeconds:F1} s)");
+
+        // A helper that re-takes the transaction (as a backup does after each
+        // commit) gives it to the same flow, which goes on using it.
+        async Task<ICatalogTransaction> Retake() => await repo.BeginTransactionAsync(set.Id);
+        var first = await repo.BeginTransactionAsync(set.Id);
+        first.Complete();
+        first.Dispose();
+        var second = await Retake();
+        var afterRetake = repo.GetLatestVersionInfoAsync(set.Id);
+        Check(await Task.WhenAny(afterRetake, Task.Delay(5000)) == afterRetake,
+            "a transaction re-taken in a helper still belongs to the flow that called it");
+        second.Dispose();
+        Microsoft.Data.Sqlite.SqliteConnection.ClearAllPools();
     }
 
     /// <summary>
