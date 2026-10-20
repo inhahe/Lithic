@@ -618,6 +618,14 @@ public class SqliteCatalogRepository : ICatalogRepository
     public Task<int> MarkFilesDeletedBySourcePathsAsync(int backupSetId, IEnumerable<string> sourcePaths, CancellationToken ct = default)
         => GetSet(backupSetId).MarkFilesDeletedBySourcePathsAsync(backupSetId, sourcePaths, ct);
 
+    public Task<bool> FlipFileRefToPlainIfUnchangedAsync(
+        int backupSetId, long fileId, string expectedDiscPath, string newDiscPath, CancellationToken ct = default)
+        => GetSet(backupSetId).FlipFileRefToPlainIfUnchangedAsync(fileId, expectedDiscPath, newDiscPath, ct);
+
+    public Task<bool> MarkFileRecordDeletedIfUnchangedAsync(
+        int backupSetId, long fileId, string expectedDiscPath, CancellationToken ct = default)
+        => GetSet(backupSetId).MarkFileRecordDeletedIfUnchangedAsync(fileId, expectedDiscPath, ct);
+
     public Task<int> MarkFileRecordsDeletedByIdsAsync(
         int backupSetId, IReadOnlyList<long> fileIds, CancellationToken ct = default)
         => GetSet(backupSetId).MarkFileRecordsDeletedByIdsAsync(backupSetId, fileIds, ct);
@@ -685,6 +693,92 @@ public class SqliteCatalogRepository : ICatalogRepository
 
     public Task ExportDatabaseAsync(int backupSetId, string destinationPath, CancellationToken ct = default)
         => GetSet(backupSetId).ExportDatabaseAsync(destinationPath, ct);
+
+    // ---------------------------------------------------------------
+    // Cleanup coordination
+    // ---------------------------------------------------------------
+
+    public Task<IReadOnlyList<(string SourcePath, string DiscPath)>> GetRecordsWrittenSinceAsync(
+        int backupSetId, DateTime sinceUtc, CancellationToken ct = default)
+        => GetSet(backupSetId).GetRecordsWrittenSinceAsync(sinceUtc, ct);
+
+    public Task<IReadOnlyList<string>> FindDiscPathsInUseAsync(
+        int backupSetId, IReadOnlyCollection<string> discPaths, CancellationToken ct = default)
+        => GetSet(backupSetId).FindDiscPathsInUseAsync(discPaths, ct);
+
+    /// <summary>How often a held activity marker is refreshed, and how old one may get.</summary>
+    private static readonly TimeSpan ActivityMarkerRefresh = TimeSpan.FromSeconds(5);
+    private static readonly TimeSpan ActivityMarkerStale = TimeSpan.FromSeconds(30);
+
+    private const string CleaningSuffix = ".cleaning";
+    private const string BackingUpSuffix = ".backingup";
+    private const string InAppSuffix = ".inapp";
+
+    public IDisposable HoldSetForCleanup(int backupSetId) => new ActivityMarker(SetDbPath(backupSetId) + CleaningSuffix);
+
+    public bool IsSetBeingCleaned(int backupSetId) => IsMarkerLive(SetDbPath(backupSetId) + CleaningSuffix);
+
+    public IDisposable HoldSetInApp(int backupSetId) => new ActivityMarker(SetDbPath(backupSetId) + InAppSuffix);
+
+    public bool IsSetHeldInApp(int backupSetId) => IsMarkerLive(SetDbPath(backupSetId) + InAppSuffix);
+
+    public IDisposable HoldSetForBackgroundBackup(int backupSetId) => new ActivityMarker(SetDbPath(backupSetId) + BackingUpSuffix);
+
+    public bool IsSetBeingBackedUpInBackground(int backupSetId) => IsMarkerLive(SetDbPath(backupSetId) + BackingUpSuffix);
+
+    private static bool IsMarkerLive(string path)
+    {
+        try
+        {
+            var fi = new FileInfo(path);
+            return fi.Exists && DateTime.UtcNow - fi.LastWriteTimeUtc < ActivityMarkerStale;
+        }
+        catch (Exception ex) when (ex is IOException or UnauthorizedAccessException)
+        {
+            return false;
+        }
+    }
+
+    /// <summary>
+    /// The marker file of <see cref="HoldSetForCleanup"/> and
+    /// <see cref="HoldSetForBackgroundBackup"/>: created at once, touched every
+    /// <see cref="ActivityMarkerRefresh"/> so a reader can tell a live hold from
+    /// one whose process died, deleted on dispose. Best effort: a marker that
+    /// cannot be written is no worse than the time before markers existed, and
+    /// must not stop the work it describes.
+    /// </summary>
+    private sealed class ActivityMarker : IDisposable
+    {
+        private readonly string _path;
+        private readonly Timer _timer;
+        private int _disposed;
+
+        public ActivityMarker(string path)
+        {
+            _path = path;
+            Touch();
+            _timer = new Timer(_ => Touch(), null, ActivityMarkerRefresh, ActivityMarkerRefresh);
+        }
+
+        private void Touch()
+        {
+            if (Volatile.Read(ref _disposed) != 0) return;
+            try
+            {
+                if (File.Exists(_path)) File.SetLastWriteTimeUtc(_path, DateTime.UtcNow);
+                else File.WriteAllText(_path, Environment.ProcessId.ToString());
+            }
+            catch (Exception ex) when (ex is IOException or UnauthorizedAccessException) { }
+        }
+
+        public void Dispose()
+        {
+            if (Interlocked.Exchange(ref _disposed, 1) != 0) return;
+            _timer.Dispose();
+            try { File.Delete(_path); }
+            catch (Exception ex) when (ex is IOException or UnauthorizedAccessException) { }
+        }
+    }
 
     // ---------------------------------------------------------------
     // Backup history transfer (set export/import)
@@ -1040,7 +1134,7 @@ public class SqliteCatalogRepository : ICatalogRepository
         var path = SetDbPath(setId);
         // ".writelock" is the cross-process write-lock marker file created beside
         // the set DB by SqliteSetDatabase; remove it too so it isn't orphaned.
-        foreach (var suffix in new[] { "", "-wal", "-shm", ".writelock" })
+        foreach (var suffix in new[] { "", "-wal", "-shm", ".writelock", CleaningSuffix, BackingUpSuffix, InAppSuffix })
         {
             try { if (File.Exists(path + suffix)) File.Delete(path + suffix); }
             catch { /* best effort */ }

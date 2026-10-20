@@ -145,6 +145,7 @@ public partial class MainWindow : Window
         // with ShutdownMode.OnExplicitShutdown, so a stray task window would
         // keep the process alive with no way back to the main UI.
         (DataContext as ViewModels.MainViewModel)?.CloseTaskWindows();
+        (DataContext as ViewModels.MainViewModel)?.ReleaseAppHolds();
 
         base.OnClosing(e);
     }

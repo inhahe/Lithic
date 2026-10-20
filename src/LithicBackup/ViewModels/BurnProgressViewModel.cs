@@ -176,6 +176,17 @@ public class BurnProgressViewModel : ViewModelBase
         set => SetProperty(ref _resultDetail, value);
     }
 
+    /// <summary>
+    /// Something about the run the user can act on (<see cref="BackupProgress.Advisory"/>),
+    /// kept up until the next run starts; empty when there is none.
+    /// </summary>
+    public string AdvisoryText
+    {
+        get => _advisoryText;
+        private set => SetProperty(ref _advisoryText, value);
+    }
+    private string _advisoryText = "";
+
     /// <summary>Files that failed during the backup, displayed in a scrollable list.</summary>
     public ObservableCollection<FailedFile> FailedFiles { get; } = [];
 
@@ -267,6 +278,13 @@ public class BurnProgressViewModel : ViewModelBase
     /// </summary>
     public void OnBackupProgress(BackupProgress progress)
     {
+        // An advisory carries nothing else, and stays up whatever comes next.
+        if (!string.IsNullOrEmpty(progress.Advisory))
+        {
+            AdvisoryText = progress.Advisory;
+            return;
+        }
+
         // Status-message reports (e.g. "Verifying backup...") always go through
         // without throttling.  Also update numeric fields when provided so
         // progress bars reflect the actual state (e.g. 100% after copying).
@@ -437,7 +455,9 @@ public class BurnProgressViewModel : ViewModelBase
             string rate = perSecond >= 1
                 ? $"{perSecond:N0} files/s"
                 : $"{1 / perSecond:N0} s per file";
-            StatsText = Stats(rate, Eta((total - done) / perSecond));
+            // Never below zero: a phase that finds more than it counted on would
+            // otherwise show a negative time left.
+            StatsText = Stats(rate, Eta(Math.Max(0, total - done) / perSecond));
         }
         else
         {
@@ -468,9 +488,28 @@ public class BurnProgressViewModel : ViewModelBase
     /// <param name="remaining">Time left, or null while there is no estimate yet.</param>
     private string Stats(string? figures, TimeSpan? remaining)
     {
-        string times = $"{FormatTimeSpan(_stopwatch.Elapsed)} elapsed  ·  ~"
-            + (remaining is { } left ? FormatTimeSpan(left) : "--:--") + " remaining";
+        // "about", not "~": in this font a tilde in front of "1492:01:56" reads as
+        // a minus sign, and a time left of minus 1,492 hours looks like a bug.
+        string times = $"{FormatTimeSpan(_stopwatch.Elapsed)} elapsed  ·  "
+            + (remaining is { } left ? $"about {FormatRemaining(left)}" : "--:--") + " remaining";
         return figures is null ? times : $"{figures}  ·  {times}";
+    }
+
+    /// <summary>
+    /// A time-left estimate as people read one: minutes and seconds, hours up to
+    /// two days, then days. "1492:01:56" is correct and unreadable; "62 days" is
+    /// what it means.
+    /// </summary>
+    public static string FormatRemaining(TimeSpan left)
+    {
+        if (left < TimeSpan.Zero)
+            left = TimeSpan.Zero;
+        if (left.TotalDays >= 2)
+        {
+            int days = (int)Math.Round(left.TotalDays);
+            return $"{days:N0} days";
+        }
+        return FormatTimeSpan(left);
     }
 
     private static string BytesText(BackupProgress progress)
@@ -494,6 +533,7 @@ public class BurnProgressViewModel : ViewModelBase
         IsComplete = false;
         StatusText = IsDirectoryMode ? "Copying files..." : "Burning...";
         StatsText = "";
+        AdvisoryText = "";
         _copyRemaining = null;
         _copyStartMs = null;
         _phase = null;

@@ -416,6 +416,27 @@ public interface ICatalogRepository : IDisposable
     Task<int> MarkFileRecordsDeletedByIdsAsync(
         int backupSetId, IReadOnlyList<long> fileIds, CancellationToken ct = default);
 
+    /// <summary>
+    /// Turn a live <c>.fileref</c> row into a plain one, only if it is still the
+    /// live .fileref at <paramref name="expectedDiscPath"/> the caller read.
+    /// Writes two columns: for a caller acting on records it read a while ago
+    /// (reconcile, between Analyze and Apply), a whole-row
+    /// <see cref="UpdateFileRecordAsync"/> would put back every column as it was
+    /// then - un-retiring a row a cleanup has retired since, or pointing a row a
+    /// backup has moved into the history back at the current copy.
+    /// </summary>
+    /// <returns>Whether the row was changed.</returns>
+    Task<bool> FlipFileRefToPlainIfUnchangedAsync(
+        int backupSetId, long fileId, string expectedDiscPath, string newDiscPath, CancellationToken ct = default);
+
+    /// <summary>
+    /// Retire a live row only if it still stores its content at
+    /// <paramref name="expectedDiscPath"/>; see <see cref="FlipFileRefToPlainIfUnchangedAsync"/>.
+    /// </summary>
+    /// <returns>Whether the row was changed.</returns>
+    Task<bool> MarkFileRecordDeletedIfUnchangedAsync(
+        int backupSetId, long fileId, string expectedDiscPath, CancellationToken ct = default);
+
     // --- Source drive remap ---
 
     /// <summary>
@@ -456,6 +477,74 @@ public interface ICatalogRepository : IDisposable
     /// Export a backup set's catalog database to a file (for writing onto a disc).
     /// </summary>
     Task ExportDatabaseAsync(int backupSetId, string destinationPath, CancellationToken ct = default);
+
+    // --- Cleanup coordination ---
+
+    /// <summary>
+    /// Every record (live or not) written at or after <paramref name="sinceUtc"/>:
+    /// its source path and stored path. Cleanup asks this inside its purge
+    /// transaction, to leave alone anything backed up again since its scan.
+    /// </summary>
+    Task<IReadOnlyList<(string SourcePath, string DiscPath)>> GetRecordsWrittenSinceAsync(
+        int backupSetId, DateTime sinceUtc, CancellationToken ct = default);
+
+    /// <summary>
+    /// Which of <paramref name="discPaths"/> (stored paths relative to the
+    /// destination) a live record still stores its content at. Cleanup asks this
+    /// inside its purge transaction, after retiring what it purges: a stored file
+    /// a live record points at is never deleted, however the scan listed it - a
+    /// seed run since the scan records files under their original timestamps,
+    /// where <see cref="GetRecordsWrittenSinceAsync"/> cannot see them.
+    /// </summary>
+    Task<IReadOnlyList<string>> FindDiscPathsInUseAsync(
+        int backupSetId, IReadOnlyCollection<string> discPaths, CancellationToken ct = default);
+
+    /// <summary>
+    /// Mark the set as being cleaned up until the returned handle is disposed: a
+    /// marker beside the set's database, refreshed while held, which the Worker
+    /// checks before backing the set up and while it does
+    /// (<see cref="IsSetBeingCleaned"/>). A purge deletes backed-up files after
+    /// its catalog transaction commits, and a backup writing a copy at one of
+    /// those paths meanwhile would lose it.
+    /// </summary>
+    IDisposable HoldSetForCleanup(int backupSetId);
+
+    /// <summary>
+    /// Whether a cleanup is holding the set (<see cref="HoldSetForCleanup"/>). A
+    /// marker not refreshed for a while - its process gone - does not count.
+    /// </summary>
+    bool IsSetBeingCleaned(int backupSetId);
+
+    /// <summary>
+    /// Mark the set as held by work in the app - a backup, a seed, clearing its
+    /// history, a cleanup: whatever has its row busy - until the returned handle
+    /// is disposed. The Worker treats it as it does <see cref="HoldSetForCleanup"/>:
+    /// it starts no run on the set, and stops one that is going. The app does not
+    /// give the set's write lock up to the Worker during its own work, so a Worker
+    /// run that waited for it sat for the whole of it - and since the Worker runs
+    /// one backup at a time, so did every other set's. Measured: a quick update of
+    /// one set, made from inside another set's full backup, waited three hours
+    /// behind a backup in the app, holding the full backup with it.
+    /// </summary>
+    IDisposable HoldSetInApp(int backupSetId);
+
+    /// <summary>Whether <see cref="HoldSetInApp"/> holds the set. Stale markers do not count.</summary>
+    bool IsSetHeldInApp(int backupSetId);
+
+    /// <summary>
+    /// The Worker's side of the same handshake: held for each of its runs on the
+    /// set. Taken BEFORE the Worker checks <see cref="IsSetBeingCleaned"/>, as a
+    /// cleanup takes its own before checking
+    /// <see cref="IsSetBeingBackedUpInBackground"/>, so of two that start
+    /// together at least one sees the other. The Worker always gives way.
+    /// </summary>
+    IDisposable HoldSetForBackgroundBackup(int backupSetId);
+
+    /// <summary>
+    /// Whether the Worker is running a backup of the set
+    /// (<see cref="HoldSetForBackgroundBackup"/>). Stale markers do not count.
+    /// </summary>
+    bool IsSetBeingBackedUpInBackground(int backupSetId);
 
     // --- Backup history transfer (set export/import) ---
 

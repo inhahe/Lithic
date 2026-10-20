@@ -282,7 +282,334 @@ internal static class Program
             "and per file, x\\tmp\\a.docx is backed up while x\\tmp\\a.bin is excluded");
 
         await RenameOverExistingAsync(root);
+        await CleanupWhileInUseAsync(root);
+        await ReconcileAfterChangesAsync(root);
     }
+
+    /// <summary>
+    /// §13. Reconcile's Apply acts on records read at Analyze, which can be long
+    /// before. It wrote them back whole, undoing whatever had happened since: a
+    /// row Cleanup retired came back to life, and a row a backup moved into the
+    /// history was pointed back at the current copy. Now it changes only rows
+    /// still as Analyze read them.
+    /// </summary>
+    static async Task ReconcileAfterChangesAsync(string root)
+    {
+        Console.WriteLine();
+        Console.WriteLine("=== 13. Reconcile Apply changes only rows still as Analyze read them ===");
+        string source = Path.Combine(root, "src13"), target = Path.Combine(root, "dst13");
+        Directory.CreateDirectory(source);
+        Directory.CreateDirectory(target);
+        Directory.CreateDirectory(Path.Combine(root, "cat13"));
+        var repo = new SqliteCatalogRepository(Path.Combine(root, "cat13", "catalog.db"));
+        var set = await repo.CreateBackupSetAsync(new BackupSet
+        {
+            Name = "reconcile-stale", SourceRoots = [source], CreatedUtc = DateTime.UtcNow,
+            DefaultMediaType = MediaType.Directory, JobOptions = new JobOptions { TargetDirectory = target },
+        });
+        var disc = await repo.CreateDiscAsync(new DiscRecord
+        {
+            BackupSetId = set.Id, Label = target, SequenceNumber = 1, MediaType = MediaType.Directory,
+            FilesystemType = FilesystemType.UDF, Status = BurnSessionStatus.Completed,
+        });
+        string Rel(string name) { string p = Path.Combine(source, name); return Path.Combine(p[..1], p[Path.GetPathRoot(p)!.Length..]); }
+        async Task<FileRecord> Add(string name, bool isRef, string? content)
+        {
+            string rel = Rel(name);
+            string hash = "0";
+            if (content is not null)
+            {
+                Directory.CreateDirectory(Path.GetDirectoryName(Path.Combine(target, rel))!);
+                await File.WriteAllTextAsync(Path.Combine(target, rel), content);   // the materialised plain copy
+                hash = Convert.ToHexString(System.Security.Cryptography.SHA256.HashData(
+                    System.Text.Encoding.UTF8.GetBytes(content))).ToLowerInvariant();
+            }
+            return await repo.CreateFileRecordAsync(new FileRecord
+            {
+                DiscId = disc.Id, SourcePath = Path.Combine(source, name), DiscPath = isRef ? rel + ".fileref" : rel,
+                SizeBytes = content?.Length ?? 5, Hash = hash, IsFileRef = isRef, Version = 1,
+                SourceLastWriteUtc = DateTime.UtcNow, BackedUpUtc = DateTime.UtcNow,
+            });
+        }
+        var flipKept = await Add("a.txt", isRef: true, "content a");
+        var flipRetired = await Add("b.txt", isRef: true, "content b");
+        await File.WriteAllTextAsync(Path.Combine(target, Rel("b.txt") + ".fileref"), "manifest");
+        var pruneKept = await Add("c.txt", isRef: false, content: null);
+        var pruneMoved = await Add("d.txt", isRef: false, content: null);
+
+        var reconcile = new CatalogReconcileService(repo);
+        var report = await reconcile.AnalyzeAsync(set.Id, target);
+        Check(report.Flips.Count == 2 && report.Prunes.Count == 2,
+            $"Analyze: two stale references to flip and two missing rows to prune (got {report.Flips.Count}, {report.Prunes.Count})");
+
+        // Since Analyze: Cleanup retires b.txt, and a backup moves d.txt's row
+        // into the history (a full-record update, as the engine makes one).
+        await repo.MarkFileRecordsDeletedByIdsAsync(set.Id, [flipRetired.Id]);
+        var d = (await repo.GetFileRecordsByPathAsync(set.Id, pruneMoved.SourcePath)).Single();
+        d.DiscPath = Path.Combine("C_prev", Rel("d.txt")[2..]) + ".v1";
+        Directory.CreateDirectory(Path.GetDirectoryName(Path.Combine(target, d.DiscPath))!);
+        await File.WriteAllTextAsync(Path.Combine(target, d.DiscPath), "d, now in the history");
+        await repo.UpdateFileRecordAsync(d);
+
+        var result = await reconcile.ApplyAsync(set.Id, report, target);
+        Check(result.Flipped == 1 && result.Pruned == 1 && result.Skipped == 2,
+            $"Apply: one flip and one prune, two skipped as changed since (got {result.Flipped}/{result.Pruned}/{result.Skipped})");
+        var rows = (await repo.GetAllFilesForBackupSetAsync(set.Id)).ToDictionary(r => r.Id);
+        Check(rows[flipKept.Id] is { IsFileRef: false, IsDeleted: false } a && a.DiscPath == Rel("a.txt"),
+            "a.txt, unchanged, was flipped to its plain copy");
+        Check(rows[flipRetired.Id].IsDeleted && rows[flipRetired.Id].IsFileRef,
+            "b.txt, retired by Cleanup since, stays retired (it used to come back to life)");
+        Check(File.Exists(Path.Combine(target, Rel("b.txt") + ".fileref")), "and its manifest was not deleted");
+        Check(rows[pruneKept.Id].IsDeleted, "c.txt, still missing, was pruned");
+        Check(!rows[pruneMoved.Id].IsDeleted && rows[pruneMoved.Id].DiscPath == d.DiscPath,
+            "d.txt, moved into the history since, keeps its row and its new path");
+        Microsoft.Data.Sqlite.SqliteConnection.ClearAllPools();
+    }
+
+    static async Task<bool> WaitFor(Func<bool> cond, int ms)
+    {
+        var sw = System.Diagnostics.Stopwatch.StartNew();
+        while (!cond() && sw.ElapsedMilliseconds < ms)
+            await Task.Delay(25);
+        return cond();
+    }
+
+    /// <summary>
+    /// §12. A purge works from a scan that can be hours old, while the set's row
+    /// and the background service could back it up. Files backed up again since
+    /// the scan, and untracked files a seed has adopted since, are left alone;
+    /// the purge holds the row (hooks) and the background service (markers), and
+    /// waits for a background run that is going.
+    /// </summary>
+    static async Task CleanupWhileInUseAsync(string root)
+    {
+        Console.WriteLine();
+        Console.WriteLine("=== 12. Cleanup while the set is in use ===");
+        string source = Path.Combine(root, "src12"), target = Path.Combine(root, "dst12");
+        string catDir = Path.Combine(root, "cat12");
+        Directory.CreateDirectory(source);
+        Directory.CreateDirectory(Path.Combine(source, "sub"));
+        Directory.CreateDirectory(target);
+        Directory.CreateDirectory(catDir);
+        var repo = new SqliteCatalogRepository(Path.Combine(catDir, "catalog.db"));
+        var svc = new DirectoryBackupService(repo, new FileScanner(repo), new VersionRetentionService(repo));
+        var keepOne = new VersionTierSet { Name = "Default", Tiers = [new() { MaxAge = null, MaxVersions = 1 }] };
+        List<SourceSelection> Sel() =>
+            [new SourceSelection { Path = source, IsDirectory = true, IsSelected = true, AutoIncludeNewSubdirectories = true }];
+        var set = await repo.CreateBackupSetAsync(new BackupSet
+        {
+            Name = "cleanup-in-use", SourceRoots = [source], SourceSelections = Sel(),
+            CreatedUtc = DateTime.UtcNow, DefaultMediaType = MediaType.Directory,
+            JobOptions = new JobOptions { TargetDirectory = target, TierSets = [keepOne], RetentionTiers = keepOne.Tiers },
+        });
+        BackupJob Job() => new()
+        {
+            BackupSetId = set.Id, Sources = Sel(), EnableFileDeduplication = false,
+            TargetDirectory = target, ZipMode = ZipMode.None, TierSets = [keepOne], RetentionTiers = keepOne.Tiers,
+        };
+        string Rel(string sourcePath) => Path.Combine(sourcePath[..1], sourcePath[Path.GetPathRoot(sourcePath)!.Length..]);
+        string Stored(string sourcePath) => Path.Combine(target, Rel(sourcePath));
+
+        string back = Path.Combine(source, "comes-back.txt");
+        string gone = Path.Combine(source, "gone.txt");
+        string keepMe = Path.Combine(source, "keep-me.txt");
+        string gone2 = Path.Combine(source, "sub", "gone-later.txt");
+        await File.WriteAllTextAsync(back, "comes back, first content");
+        await File.WriteAllTextAsync(gone, "gone for good");
+        await File.WriteAllTextAsync(keepMe, "deleted, but unticked in Cleanup");
+        await File.WriteAllTextAsync(gone2, "purged in the second cleanup");
+        var r0 = await svc.ExecuteAsync(Job(), target, keepOne.Tiers, null, CancellationToken.None);
+        Check(r0.Success, "the set is backed up");
+        foreach (var f in new[] { back, gone, keepMe, gone2 })
+            File.Delete(f);
+
+        // Stray copies where files would be stored, with no record: untracked.
+        string adoptedNow = Path.Combine(source, "adopted-now.txt");
+        string adoptedOld = Path.Combine(source, "adopted-old.txt");
+        string strayKeep = Path.Combine(source, "stray-keep.txt");
+        string strayGone = Path.Combine(source, "stray-gone.txt");
+        foreach (var f in new[] { adoptedNow, adoptedOld, strayKeep, strayGone })
+        {
+            Directory.CreateDirectory(Path.GetDirectoryName(Stored(f))!);
+            await File.WriteAllTextAsync(Stored(f), "stray copy of " + Path.GetFileName(f));
+        }
+
+        var calls = new List<string>();
+        bool markerHeldDuringPurge = false;
+        var hooks = new RowWorkHooks
+        {
+            DescribeBusy = () => null,
+            Begin = _ => calls.Add("begin"),
+            Progress = t =>
+            {
+                calls.Add("progress");
+                markerHeldDuringPurge |= repo.IsSetBeingCleaned(set.Id);
+            },
+            End = (t, err) => calls.Add("end:" + (err ? "error:" : "") + t),
+        };
+        var s = (await repo.GetBackupSetAsync(set.Id))!;
+        var vm = new OrphanedDirectoriesViewModel(repo, s) { RowWork = hooks };
+        var bothLines = new List<string>();
+        vm.PropertyChanged += (_, e) =>
+        {
+            if (e.PropertyName == nameof(OrphanedDirectoriesViewModel.PurgeStatusText)
+                && vm.PurgeStatusText.Length > 0 && vm.PurgeStatusText == vm.SummaryText)
+                bothLines.Add(vm.PurgeStatusText);
+        };
+
+        vm.ScanCatalogCommand.Execute(null);
+        await WaitFor(() => !vm.IsLoading && vm.Categories.Count > 0, 60000);
+        vm.ScanDestinationCommand.Execute(null);
+        Check(vm.IsScanningDestination && !vm.ScanCatalogCommand.CanExecute(null)
+              && !vm.ReconcileAnalyzeCommand.CanExecute(null) && !vm.ScanExcludedCommand.CanExecute(null),
+            "while the destination scan runs, the other actions wait (a catalog scan used not to)");
+        await Task.Delay(100);
+        await WaitFor(() => !vm.IsScanningDestination, 60000);
+        var listedDeleted = vm.Items.Where(i => i.Reason == OrphanedReason.DeletedFromDisk)
+            .SelectMany(i => i.MatchingSourcePaths ?? []).ToHashSet(StringComparer.OrdinalIgnoreCase);
+        Check(listedDeleted.SetEquals([back, gone, keepMe, gone2]),
+            $"the scan lists the four deleted files (got {string.Join(", ", listedDeleted.Select(Path.GetFileName))})");
+        var listedStrays = vm.Items.Where(i => i.Reason == OrphanedReason.UntrackedFile)
+            .SelectMany(i => i.DiscFilePaths ?? []).Select(Path.GetFileName).ToHashSet(StringComparer.OrdinalIgnoreCase);
+        Check(listedStrays.SetEquals(["adopted-now.txt", "adopted-old.txt", "stray-keep.txt", "stray-gone.txt"]),
+            $"and the four stray copies as untracked (got {string.Join(", ", listedStrays)})");
+
+        // Since the scan: comes-back.txt returns and is backed up again (as the
+        // background service would, one path), and two strays are adopted - one
+        // recorded now, as a seed records a current copy, one under its old
+        // time, as a seed records an earlier version.
+        await File.WriteAllTextAsync(back, "comes back, second content");
+        var rt = await svc.ExecuteTargetedAsync(Job(), target, [back], keepOne.Tiers, CancellationToken.None);
+        Check(rt.Success, "comes-back.txt is backed up again after the scan");
+        var disc = await repo.CreateDiscAsync(new DiscRecord
+        {
+            BackupSetId = set.Id, Label = target, SequenceNumber = 9, MediaType = MediaType.Directory,
+            FilesystemType = FilesystemType.UDF, Status = BurnSessionStatus.Completed,
+        });
+        foreach (var (f, when) in new[] { (adoptedNow, DateTime.UtcNow), (adoptedOld, new DateTime(2020, 1, 1, 0, 0, 0, DateTimeKind.Utc)) })
+            await repo.CreateFileRecordAsync(new FileRecord
+            {
+                DiscId = disc.Id, SourcePath = f, DiscPath = Rel(f), SizeBytes = new FileInfo(Stored(f)).Length,
+                Hash = "adopted", Version = 1, SourceLastWriteUtc = when, BackedUpUtc = when,
+            });
+
+        // Tick both categories, then untick: the sub directory (for later), one
+        // file row of a deleted directory, one stray's row.
+        static IEnumerable<OrphanedNodeViewModel> All(OrphanedNodeViewModel n) => n.Children.SelectMany(All).Prepend(n);
+        OrphanedCategoryViewModel Cat(OrphanedReason r) => vm.Categories.Single(c => c.Reason == r);
+        OrphanedNodeViewModel Row(OrphanedReason r, string name) => Cat(r).RootNodes.SelectMany(All)
+            .Single(n => n.File is not null && n.Name.Equals(name, StringComparison.OrdinalIgnoreCase));
+        foreach (var c in vm.Categories)
+            foreach (var n in c.RootNodes)
+                n.IsChecked = c.Reason is OrphanedReason.DeletedFromDisk or OrphanedReason.UntrackedFile;
+        Cat(OrphanedReason.DeletedFromDisk).RootNodes.SelectMany(All)
+            .Single(n => n.Item is not null && n.Item.DirectoryPath.EndsWith("sub", StringComparison.OrdinalIgnoreCase))
+            .IsChecked = false;
+        Row(OrphanedReason.DeletedFromDisk, "keep-me.txt").IsChecked = false;
+        Row(OrphanedReason.UntrackedFile, "stray-keep.txt").IsChecked = false;
+
+        vm.PurgeSelectedCommand.Execute(null);
+        await WaitFor(() => vm.IsPurging, 3000);
+        await WaitFor(() => !vm.IsPurging, 60000);
+        Check(!vm.IsPurging, $"the purge finished (\"{vm.SummaryText}\")");
+        Check(vm.SummaryText.Contains("left 1 file alone", StringComparison.Ordinal),
+            "and says it left one file alone that was backed up again since the scan");
+        Check(vm.SummaryText.Contains("kept 1 stored file", StringComparison.Ordinal),
+            "and that it kept one stored file the catalog uses again");
+        Check(vm.SummaryText.Contains("deleted 2 files", StringComparison.Ordinal),
+            "and deleted two files: gone.txt's copy and the ticked stray");
+
+        var backNow = await repo.GetActiveLatestRecordByPathAsync(set.Id, back);
+        Check(backNow is not null && File.Exists(Path.Combine(target, backNow.DiscPath))
+              && File.ReadAllText(Path.Combine(target, backNow.DiscPath)) == "comes back, second content",
+            "comes-back.txt keeps its live record and its new stored copy");
+        Check((await repo.GetFileRecordsByPathAsync(set.Id, gone)).All(r => r.IsDeleted) && !File.Exists(Stored(gone)),
+            "gone.txt was purged: records retired, stored copy deleted");
+        Check(await repo.GetActiveLatestRecordByPathAsync(set.Id, keepMe) is not null && File.Exists(Stored(keepMe)),
+            "keep-me.txt, its row unticked, keeps its record and its copy");
+        Check(await repo.GetActiveLatestRecordByPathAsync(set.Id, gone2) is not null && File.Exists(Stored(gone2)),
+            "the unticked sub directory was not touched");
+        Check(File.Exists(Stored(adoptedNow)), "the stray adopted since the scan (recorded now) is kept");
+        Check(File.Exists(Stored(adoptedOld)), "the stray adopted under an old time is kept too");
+        Check(File.Exists(Stored(strayKeep)), "the stray whose row was unticked is kept");
+        Check(!File.Exists(Stored(strayGone)), "the ticked stray was deleted");
+
+        var leftDeleted = vm.Items.Where(i => i.Reason == OrphanedReason.DeletedFromDisk).ToList();
+        Check(leftDeleted.SelectMany(i => i.MatchingSourcePaths ?? []).ToHashSet(StringComparer.OrdinalIgnoreCase)
+                  .SetEquals([keepMe, gone2]),
+            "keep-me.txt stays listed beside the sub directory");
+        Check(vm.Items.Where(i => i.Reason == OrphanedReason.UntrackedFile)
+                  .SelectMany(i => i.DiscFilePaths ?? []).Select(Path.GetFileName).SequenceEqual(["stray-keep.txt"]),
+            "and the unticked stray stays listed");
+        Check(vm.Categories.All(c => c.RootNodes.SelectMany(All).All(n => n.IsChecked == false)),
+            "what is left shows unticked, as it was");
+
+        Check(calls.FirstOrDefault() == "begin", "the row was held before anything else");
+        Check(calls.Count(c => c == "progress") >= 3, $"each stage went to the row ({calls.Count(c => c == "progress")} lines)");
+        Check(calls.LastOrDefault() is { } last && last.StartsWith("end:Cleanup: Purged", StringComparison.Ordinal),
+            $"and it was released with the result (\"{calls.LastOrDefault()}\")");
+        Check(markerHeldDuringPurge, "the set was marked as being cleaned while the purge ran");
+        Check(!repo.IsSetBeingCleaned(set.Id), "and is not any more");
+        Check(bothLines.Any(t => t.StartsWith("Cleaning up:", StringComparison.Ordinal))
+              && bothLines.Any(t => t.StartsWith("Updating catalog", StringComparison.Ordinal)),
+            $"the stages showed in both status lines ({bothLines.Count} updates)");
+        Check(vm.PurgeStatusText.Length == 0, "the line by Close is cleared at the end");
+
+        Console.WriteLine();
+        Console.WriteLine("=== 12b. Only a subdirectory ticked; the purge waits for a background run ===");
+        using (repo.HoldSetForBackgroundBackup(set.Id))
+        {
+            Check(repo.IsSetBeingBackedUpInBackground(set.Id), "a background run's marker is seen");
+            // The parent directory (keep-me.txt's) stays unticked; ticking the
+            // sub directory leaves it part-ticked, which used to purge it too.
+            Cat(OrphanedReason.DeletedFromDisk).RootNodes.SelectMany(All)
+                .Single(n => n.Item is not null && n.Item.DirectoryPath.EndsWith("sub", StringComparison.OrdinalIgnoreCase))
+                .IsChecked = true;
+            calls.Clear();
+            vm.PurgeSelectedCommand.Execute(null);
+            bool waiting = await WaitFor(() => vm.SummaryText.Contains("waiting for the background service", StringComparison.Ordinal), 5000);
+            Check(waiting, $"the purge says it is waiting for the background service (\"{vm.SummaryText}\")");
+            await Task.Delay(1000);
+            Check(vm.IsPurging && await repo.GetActiveLatestRecordByPathAsync(set.Id, gone2) is not null,
+                "and changes nothing while the run goes on");
+            Check(!vm.ScanCatalogCommand.CanExecute(null) && !vm.ScanDestinationCommand.CanExecute(null)
+                  && !vm.ReconcileAnalyzeCommand.CanExecute(null) && !vm.PurgeSelectedCommand.CanExecute(null),
+                "and nothing else in the window can start meanwhile");
+        }
+        Check(!repo.IsSetBeingBackedUpInBackground(set.Id), "the run's marker goes when it ends");
+        await WaitFor(() => !vm.IsPurging, 60000);
+        Check(!vm.IsPurging && (await repo.GetFileRecordsByPathAsync(set.Id, gone2)).All(r => r.IsDeleted)
+              && !File.Exists(Stored(gone2)),
+            $"then the purge carries on and purges the sub directory (\"{vm.SummaryText}\")");
+        Check(await repo.GetActiveLatestRecordByPathAsync(set.Id, keepMe) is not null && File.Exists(Stored(keepMe)),
+            "and not its unticked parent: keep-me.txt is still backed up");
+
+        Console.WriteLine();
+        Console.WriteLine("=== 12c. Markers and the in-use query ===");
+        string? markerPath;
+        using (repo.HoldSetForCleanup(set.Id))
+        {
+            markerPath = Directory.EnumerateFiles(catDir, "*.cleaning", SearchOption.AllDirectories).SingleOrDefault();
+            Check(markerPath is not null && repo.IsSetBeingCleaned(set.Id), "a held cleanup marker exists and counts");
+        }
+        Check(markerPath is not null && !File.Exists(markerPath), "it is deleted when released");
+        if (markerPath is not null)
+        {
+            File.WriteAllText(markerPath, "12345");
+            File.SetLastWriteTimeUtc(markerPath, DateTime.UtcNow.AddMinutes(-2));
+            Check(!repo.IsSetBeingCleaned(set.Id), "one left behind by a process that died does not count");
+            File.Delete(markerPath);
+        }
+        string oldRel = Rel(adoptedOld);
+        var inUse = await repo.FindDiscPathsInUseAsync(set.Id,
+            [oldRel.Replace('\\', '/').ToUpperInvariant(), Rel(gone), Rel(Path.Combine(source, "never.txt"))]);
+        Check(inUse.Count == 1 && inUse[0] == oldRel.Replace('\\', '/').ToUpperInvariant(),
+            $"FindDiscPathsInUseAsync: only the live record's path, as given, whatever its case and slashes (got {inUse.Count})");
+        Check(ConfirmCloseWhenIdle(vm), "Close is not questioned when no purge is running");
+        Microsoft.Data.Sqlite.SqliteConnection.ClearAllPools();
+    }
+
+    static bool ConfirmCloseWhenIdle(IConfirmClose flow) => flow.ConfirmClose(canCancel: true);
 
     /// <summary>
     /// §11. git's atomic save: index.lock is created empty, caught by a backup

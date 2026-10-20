@@ -365,6 +365,13 @@
                                                                                                            FontSize="10" Margin="0,3,0,0"
                                                                                                            Text="{Binding StatsText, Mode=OneWay}"
                                                                                                            Visibility="{Binding StatsText, Converter={StaticResource NonEmptyVis}}" />
+                                                                                                <!-- Something about the run to act on, e.g. that creating files on
+                                                                                                     the destination is pathologically slow, and why. Stays up. -->
+                                                                                                <TextBlock Foreground="{StaticResource WarningBrush}"
+                                                                                                           FontSize="11" Margin="0,4,0,0"
+                                                                                                           TextWrapping="Wrap"
+                                                                                                           Text="{Binding AdvisoryText, Mode=OneWay}"
+                                                                                                           Visibility="{Binding AdvisoryText, Converter={StaticResource NonEmptyVis}}" />
 
                                                                                                 <!-- Simulated burner failure injection (test mode only) -->
                                                                                                 <Border Visibility="{Binding DataContext.IsTestMode,

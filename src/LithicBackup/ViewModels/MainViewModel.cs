@@ -103,6 +103,9 @@ public class MainViewModel : ViewModelBase
             mainWindow: () => Application.Current?.MainWindow);
 
         BackupSets = [];
+        // While a row is working - a backup, a seed, clearing its history, a
+        // cleanup - the Worker gives way to it (ICatalogRepository.HoldSetInApp).
+        BackupSets.CollectionChanged += OnBackupSetRowsChanged;
 
         // Creating a new set is always allowed — concurrent backups mean there
         // is no global "busy" state to block on.
@@ -3306,7 +3309,7 @@ public class MainViewModel : ViewModelBase
         {
             row.LastResultIsError = progressVm.HasFailedFiles
                 || progressVm.StatusText.Contains("failed", StringComparison.OrdinalIgnoreCase);
-            row.LastResultText = resultText ?? progressVm.StatusText;
+            row.LastResultText = WithAdvisory(resultText ?? progressVm.StatusText, progressVm);
             CrashLogger.Log(null,
                 $"GUI: targeted backup for \"{row.Name}\" finished"
                 + (row.LastResultIsError ? " WITH ERRORS" : "") + $": {row.LastResultText}");
@@ -4208,12 +4211,12 @@ public class MainViewModel : ViewModelBase
             // line so it stays visible after the panel is dismissed.
             row.LastResultIsError = progressVm.HasFailedFiles
                 || progressVm.StatusText.Contains("failed", StringComparison.OrdinalIgnoreCase);
-            row.LastResultText = progressVm.StatusText;
+            row.LastResultText = WithAdvisory(progressVm.StatusText, progressVm);
 
             CrashLogger.Log(null,
                 $"GUI: backup for \"{row.Name}\" finished"
                 + (row.LastResultIsError ? " WITH ERRORS" : "")
-                + $": {progressVm.StatusText}");
+                + $": {row.LastResultText}");
             row.Progress = null;                // dismiss this row's progress panel
             row.IsRunning = false;
             _ = LoadBackupSetsAsync();
@@ -4487,9 +4490,40 @@ public class MainViewModel : ViewModelBase
         // here: it would falsely signal "busy/unresponsive", and because the load
         // outlives this method it would also linger as a busy pointer if the user
         // navigated away before the load finished.
+        //
+        // Its purge holds the set's row the way a seed does (see RowWorkHooks):
+        // the row shows each stage and refuses Backup, Modify, Restore and Delete
+        // until it ends, whether or not the Cleanup window is still open. A
+        // backup started from the row mid-purge used to write records and files
+        // the purge was in the middle of retiring and deleting.
+        const string CleaningActivity = "being cleaned up";
         _taskWindows.Show(
             Services.TaskKinds.Cleanup, fresh.Id, fresh.Name,
-            () => new OrphanedDirectoriesViewModel(_catalog, fresh),
+            () => new OrphanedDirectoriesViewModel(_catalog, fresh)
+            {
+                RowWork = new RowWorkHooks
+                {
+                    DescribeBusy = () => RowFor(setId) is { IsRunning: true } r
+                        ? r.BusyActivity ?? "backing up"
+                        : null,
+                    Begin = cts =>
+                    {
+                        BeginRowWork(RowFor(setId), CleaningActivity, "Cleaning up…", cts);
+                        CommandManager.InvalidateRequerySuggested();
+                    },
+                    Progress = text =>
+                    {
+                        if (RowFor(setId) is { BusyActivity: CleaningActivity } r)
+                            r.RunningStatusText = text;
+                    },
+                    End = (text, isError) =>
+                    {
+                        if (RowFor(setId) is { BusyActivity: CleaningActivity } r)
+                            EndRowWork(r, text, isError);
+                        CommandManager.InvalidateRequerySuggested();
+                    },
+                },
+            },
             (vm, close) => ((OrphanedDirectoriesViewModel)vm).DoneRequested += close);
         StatusText = "Review files and directories that can be cleaned up.";
     }
@@ -4974,6 +5008,87 @@ public class MainViewModel : ViewModelBase
         };
         editor.PropertyChanged += onChanged;
     }
+
+    /// <summary>Holds on sets whose row is working, by set id (see <see cref="SyncAppHold"/>).</summary>
+    private readonly Dictionary<int, IDisposable> _appHolds = [];
+
+    private void OnBackupSetRowsChanged(object? sender, System.Collections.Specialized.NotifyCollectionChangedEventArgs e)
+    {
+        // A move is the same row at another index: nothing to hold or let go.
+        if (e.Action == System.Collections.Specialized.NotifyCollectionChangedAction.Move)
+            return;
+        if (e.OldItems is not null)
+            foreach (BackupSetRowViewModel row in e.OldItems)
+            {
+                row.PropertyChanged -= OnRowPropertyChanged;
+                ReleaseAppHold(row.Id);
+            }
+        if (e.Action == System.Collections.Specialized.NotifyCollectionChangedAction.Reset)
+            lock (_appHolds)
+                foreach (int id in _appHolds.Keys.Where(id => RowFor(id) is null).ToList())
+                    ReleaseAppHold(id);
+        if (e.NewItems is not null)
+            foreach (BackupSetRowViewModel row in e.NewItems)
+            {
+                row.PropertyChanged += OnRowPropertyChanged;
+                SyncAppHold(row);
+            }
+    }
+
+    private void OnRowPropertyChanged(object? sender, System.ComponentModel.PropertyChangedEventArgs e)
+    {
+        if (sender is not BackupSetRowViewModel row)
+            return;
+        if (e.PropertyName == nameof(BackupSetRowViewModel.Progress) && row.Progress is { } progress)
+            progress.PropertyChanged += (_, pe) =>
+            {
+                if (pe.PropertyName == nameof(BurnProgressViewModel.IsComplete))
+                    SyncAppHold(row);
+            };
+        if (e.PropertyName is nameof(BackupSetRowViewModel.IsRunning) or nameof(BackupSetRowViewModel.Progress))
+            SyncAppHold(row);
+    }
+
+    /// <summary>
+    /// Hold the set against the Worker while its row is working, and let go when
+    /// it stops. Working, not merely busy: a finished backup's panel can stay up,
+    /// row still running, until it is dismissed - with failed files, for as long
+    /// as nobody looks - and the Worker must not wait on that.
+    /// </summary>
+    private void SyncAppHold(BackupSetRowViewModel row)
+    {
+        bool working = row.IsRunning && row.Progress is not { IsComplete: true };
+        lock (_appHolds)
+        {
+            if (working && !_appHolds.ContainsKey(row.Id))
+                _appHolds[row.Id] = _catalog.HoldSetInApp(row.Id);
+            else if (!working)
+                ReleaseAppHold(row.Id);
+        }
+    }
+
+    private void ReleaseAppHold(int setId)
+    {
+        lock (_appHolds)
+            if (_appHolds.Remove(setId, out var hold))
+                hold.Dispose();
+    }
+
+    /// <summary>Let the Worker carry on with every set: the app is exiting.</summary>
+    public void ReleaseAppHolds()
+    {
+        lock (_appHolds)
+            foreach (int id in _appHolds.Keys.ToList())
+                ReleaseAppHold(id);
+    }
+
+    /// <summary>
+    /// A finished run's result line, with what its panel advised (that creating
+    /// files on the destination was pathologically slow, say) - which would
+    /// otherwise go with the panel.
+    /// </summary>
+    private static string WithAdvisory(string result, BurnProgressViewModel progressVm)
+        => string.IsNullOrEmpty(progressVm.AdvisoryText) ? result : $"{result} {progressVm.AdvisoryText}";
 
     /// <summary>Release a row held by <see cref="BeginRowWork"/>, leaving <paramref name="result"/> on it.</summary>
     private static void EndRowWork(BackupSetRowViewModel? row, string result, bool isError)

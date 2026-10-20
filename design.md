@@ -639,6 +639,38 @@ count that — the unit of iteration usually is not it.
 backup makes before copying its first file. See "A targeted run shows the same
 progress as any other backup" below.
 
+### When creating a name is the whole cost, say so
+
+A backup into the j: set copied 1.8 GB in nine hours. Its process ran one core
+flat out with almost no I/O, and every stack sample sat in `File.Move` after a
+copy's write. The destination folder held 1.4 million files whose names all began
+"unknown artist - ", on a drive with 8.3 short-name creation on: Windows looks
+for an unused short alias for every new long name, and in that folder it took
+**779 ms per file** (7 ms in an empty folder on the same drive; **4.2 ms** in the
+same folder once `fsutil 8dot3name set G: 1` had turned short names off). The
+copy creates two names per file - its `.lbtmp` and the promotion over it - and
+that was the entire run. Nothing on screen said so; the estimate read
+"~1492:01:56", whose tilde the user took for a minus sign.
+
+* **`SlowFileCreationMonitor`** times exactly that - the temp file's open plus
+  the promotion (`OpenTemp`, `Promote`) - in every plain copy. An average of
+  250 ms over 32 files warns once per run: on a line of its own in the panel
+  (`BackupProgress.Advisory`, kept up until the next run, and appended to the
+  row's result line), and through `DirectoryBackupService.Advisory`, which the
+  Worker logs as a warning at once rather than when a days-long run ends. The odd
+  slow file does not trigger it.
+* **`ShortNameSetting.IsCreationEnabled`** asks the volume through a handle to the
+  folder (`FSCTL_QUERY_PERSISTENT_VOLUME_STATE`), which needs no elevation where
+  `fsutil` is refused. When short names are on, the warning gives the command;
+  otherwise it names the drive, its connection, or an antivirus scanner.
+* **Time left is said as people read it**: "about 05:30", "about 30:00:00", and
+  past two days "about 62 days" (`FormatRemaining`), never "~", and never below
+  zero - a phase that finds more files than it counted on clamps rather than
+  going negative.
+
+Pinned by `tools\targeted_progress_test` §18, which also checks
+`ShortNameSetting` against the short name Windows actually gives a new file.
+
 ### One cadence for every progress display
 
 `ProgressCadence` (Core) holds the one interval at which progress reaches the
@@ -1213,6 +1245,94 @@ Reading the names as well costs 64.0 ms — **+9%** — which is what makes per-
 detection affordable. Sixteen at a time, the same figure `CacheMaintenance`
 measured for the same kind of work.
 
+## A purge acts on an old scan, beside writers that are not old
+
+Clean Selected deletes what a scan found, and the scan can be hours old. Meanwhile
+the set's row could back it up or seed it, and the Worker could back it up on its
+own schedule. The purge's catalog half runs in one transaction under the set's
+cross-process write lock, which keeps a writer out of *that* half only: the lock
+is taken per batch, and a backup copies a file before it records it, so a copy
+made during the disk half, at a path the purge then deletes, ended as a live
+record with nothing behind it. Every guard below exists because of one of those
+writers.
+
+**The row.** The purge holds the set's row exactly as a seed does
+(`BeginRowWork` with `BusyActivity` "being cleaned up", through `RowWorkHooks`,
+because Cleanup is a task window and cannot reach `MainViewModel`), so nothing
+can be started from the row until it ends, the row's Abort cancels it, and each
+stage is shown there as well as in both of the window's status lines. It is
+refused while the row is busy. Closing the window mid-purge asks first
+(`IConfirmClose`); the purge carries on with the row as its only display.
+
+**The Worker: two markers and a handshake.** `HoldSetForCleanup` writes
+`set-N.db.cleaning`; each Worker run on the set holds `set-N.db.backingup`
+(`StartSetRun`). Both are refreshed every 5 s and ignored once 30 s stale, so a
+process that died cannot hold a set for good. Each side **announces before it
+checks** - the Worker takes its marker and then looks for a cleanup, the purge
+takes its marker and then looks for a run - so of two that start together at
+least one sees the other, and the Worker always gives way: it drops its marker
+and keeps its work queued. A full or targeted run that is already going watches
+for the cleanup marker every second and cancels itself (`SetRun.StoppedForCleanup`
+tells that apart from shutdown: the run returns DidNotRun, or requeues its paths,
+rather than counting as a failure with backoff). The purge waits for the run's
+marker to go before it touches anything, and that wait is cancellable and changes
+nothing. Relocations are not stopped - they are quick renames over a queue that is
+cleared as they start - so the purge just waits for them. A journal drain inside
+a full scan backs up the scanned set under the scan's run (`SetState.ActiveRun`);
+it must not announce itself again or end the marker. Markers are best effort: one
+that cannot be written is the state of things before markers existed, and must
+not stop the work.
+
+**Re-checks under the lock.** Inside the transaction, before anything is retired:
+every record written since the earlier of the two scans began
+(`GetRecordsWrittenSinceAsync`; `BackedUpUtc` is round-trip UTC text, so a text
+comparison is a time comparison) names a source path backed up again since; those
+paths are not tombstoned, and neither their stored copies nor anything written
+since is deleted. The one exception is the file of an excess version retired by
+id: a newer version only makes it more excess, and version numbers are never
+reused. That check cannot see a seed, which records what it adopts under the
+files' own times, so after retiring everything, still under the lock, the purge
+asks which of the files it is about to delete a live record still points at
+(`FindDiscPathsInUseAsync`, one pass over the live rows' `DiscPath`, since that
+column has no index) and deletes none of them. That rule needs no knowledge of
+what ran since; it is the invariant itself.
+
+**A row is what is purged.** The file rows under a directory have checkboxes, and
+used to be display-only: a part-ticked directory was purged whole, unticked files
+included, and a directory unticked itself but part-ticked by a ticked
+subdirectory was purged too. `GetCheckedSelections` now takes an item's own
+selection from its file rows, and `Restrict` narrows the item to what the ticked
+rows stand for: a source path (with its stored files, attributed through the
+scan's records), a record id, or a stored path. A stored file that cannot be
+attributed is in no part and is never deleted on a row's behalf; a catalog-side
+item without a path list, which would be purged by directory prefix, purges
+nothing when part-ticked. The unticked rest stays listed, unticked, and
+`SettleCheckState` makes a rebuilt tree's boxes agree with its items - they used
+to show ticked over an unticked leftover, and Clean Selected then did nothing.
+
+**One operation at a time in the window** (`IsBusy`). Scan catalog, scan for
+exclusions, scan destination, Analyze, Apply and Clean Selected each wait for any
+of the others. A catalog scan used to block the rest while a reconcile or a
+destination scan blocked only itself, so Clean Selected could run during Apply
+and a catalog scan during either. Nothing is gained by overlapping them: they
+walk the same drive, and the two writers act on lists the others produce.
+
+**Reconcile's Apply writes only what it re-checked.** Apply acts on records read
+at Analyze, which can be long before, and wrote them back whole through
+`UpdateFileRecordAsync` - undoing whatever had happened since: a row Cleanup had
+retired came back to life (and its manifest was deleted), and a row a backup had
+moved into the history was retired at, or flipped to, its old path. It now uses
+`FlipFileRefToPlainIfUnchangedAsync` and `MarkFileRecordDeletedIfUnchangedAsync`,
+which write two columns and one, and only where the row is still live at the
+path Analyze read; anything else is skipped and counted. That holds whatever
+changed the row - this window, the row, or the Worker - so it needs no
+coordination of its own. The rule generalises: **a record read some time ago may
+be used to find a row, never to overwrite it.**
+
+Pinned by `tools\excess_versions_test` §12 and §13, against real backups and a
+real destination scan; reverting the selection rule fails six of §12's checks,
+and reverting Apply fails four of §13's.
+
 ## A configured destination is not a present one
 
 A backup set's destination is a saved **path string** (`JobOptions.TargetDirectory`).
@@ -1356,7 +1476,9 @@ The post-save reconcile prompts are skipped while the row is busy. A duplicate
 analysis is read-only and blocks nothing; if the editor closes mid-run it moves to
 the row's `BackgroundWorkText` line with Stop (`CarryDedupAnalysisToRow`).
 Pinned by `tools\editor_save_test` §15, which freezes a seed by holding the set's
-cross-process write lock.
+cross-process write lock. Cleanup's purge holds the row the same way, and also
+holds the set against the Worker; see "A purge acts on an old scan, beside
+writers that are not old".
 
 **Restore follows the destination, not the disc label.** A directory backup's
 disc record is labelled with the destination folder as it was when that run
@@ -1524,6 +1646,41 @@ dropped after its retry, and a journal that silently stops advancing looks exact
 like "nothing changed". Time it from the last **full scan**, never from the last
 run — every targeted continuous backup bumps the latter, so the busiest sets would
 be the ones that never qualified.
+
+## The Worker gives way to the app, set by set
+
+The app never steps aside for the Worker on a set's write lock
+(`YieldToWaitingWriters` is the Worker's alone: the work the user is watching
+goes first). That is right for the lock, and it made a Worker run that wanted a
+set the app was backing up wait for the whole of that backup. Because the loop is
+sequential (above), so did everything else the Worker had to do. Measured: a
+journal drain inside the i: set's full backup made a quick update of the j: set,
+which waited for j:'s lock from 13:37 to 16:48 behind a backup in the app, and the
+i: backup sat with it at zero CPU and zero I/O.
+
+So the app says when it is working on a set, and the Worker does not ask for the
+lock at all:
+
+* **`HoldSetInApp`**, a marker beside the set's database like the cleanup one
+  (refreshed every 5 s, ignored once 30 s stale), is held by `MainViewModel` while
+  the set's row is *working*: running and not yet complete. Not merely running - a
+  finished backup's panel keeps the row running until it is dismissed, and with
+  failed files on it nobody may dismiss it for days. The review window before a
+  backup is modal and inside the run, so the Worker waits while you review; you are
+  about to back that set up anyway.
+* **The Worker treats it as it treats a cleanup** (`AppWorkOn`): `StartSetRun`
+  announces the run, then checks, and returns null if the app has the set - the
+  caller keeps the work queued, exactly as for a destination that is not connected.
+  A run already going watches every second and cancels itself
+  (`SetRun.StoppedForApp`); a full run returns DidNotRun, a targeted one requeues
+  its paths, and neither counts as a failure with backoff. A journal drain inside
+  another set's full scan therefore skips the held set and the scan carries on.
+* Moves are announced but not stopped (quick renames over a queue cleared as they
+  start); the app's backup waits on the lock for them, briefly.
+
+Pinned by `tools\worker_idle_test` C8, on the real loop: held from the start,
+nothing runs; taken mid-copy, the run stops (715 of 4,000 files) and copies nothing
+more; let go, it finishes.
 
 ## The Worker's loop must cost nothing while it cannot act
 

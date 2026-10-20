@@ -64,6 +64,15 @@ public enum TargetedMoveOutcome
 /// </summary>
 public class DirectoryBackupService
 {
+    /// <summary>
+    /// A run found something the user should act on (see
+    /// <see cref="SlowFileCreationMonitor"/>): the set, and the message. Raised as
+    /// it is found, not at the end, since the run it describes can last days. The
+    /// Worker logs it; a run started in the app also gets it as a progress report
+    /// (<see cref="BackupProgress.Advisory"/>).
+    /// </summary>
+    public event Action<int?, string>? Advisory;
+
     private readonly ICatalogRepository _catalog;
     private readonly IFileScanner _scanner;
     private readonly VersionRetentionService _retention;
@@ -199,6 +208,15 @@ public class DirectoryBackupService
         }
 
         var filesToBackup = diff.NewFiles.Concat(diff.ChangedFiles).ToList();
+
+        // Times creating each copy on the destination, and says once if that is
+        // pathologically slow (see SlowFileCreationMonitor).
+        var creations = new SlowFileCreationMonitor(message =>
+        {
+            progress?.Report(new BackupProgress { Advisory = message });
+            Advisory?.Invoke(job.BackupSetId, message);
+        });
+
         if (filesToBackup.Count == 0)
         {
             return new BackupResult
@@ -1340,7 +1358,7 @@ public class DirectoryBackupService
                     // already read (by the block-dedup pre-pass or the file-dedup
                     // hash read above), so it is not read from disk a second time.
                     await WritePlainFromBufferAsync(
-                        contentBuffer, currentPath, ct, fileProgress, waitMidFile);
+                        contentBuffer, currentPath, ct, fileProgress, waitMidFile, creations);
                 }
                 else if (deferHashToCopy)
                 {
@@ -1351,12 +1369,12 @@ public class DirectoryBackupService
                     // is plain without reading it), so capture them here for the
                     // content-path seeding and catalog record below.
                     (hash, contentSize) = await CopyFileWithHashAsync(
-                        file.FullPath, currentPath, ct, fileProgress, waitMidFile);
+                        file.FullPath, currentPath, ct, fileProgress, waitMidFile, creations);
                 }
                 else
                 {
                     // Plain copy (hash already computed above; file not buffered).
-                    await CopyFileAsync(file.FullPath, currentPath, ct, fileProgress, waitMidFile);
+                    await CopyFileAsync(file.FullPath, currentPath, ct, fileProgress, waitMidFile, creations);
                 }
 
                 // If this file was stored as a plain named copy, its content now
@@ -2808,10 +2826,12 @@ public class DirectoryBackupService
     /// Awaited between chunks; returns once the backup is not paused. The same
     /// for the other copy helpers.
     /// </param>
+    /// <param name="creations">Told what creating the copy cost; see <see cref="SlowFileCreationMonitor"/>.</param>
     private static async Task CopyFileAsync(
         string sourcePath, string destPath, CancellationToken ct,
         Action<long>? onProgress = null,
-        Func<Task>? waitIfPaused = null)
+        Func<Task>? waitIfPaused = null,
+        SlowFileCreationMonitor? creations = null)
     {
         string? destDir = Path.GetDirectoryName(destPath);
         if (destDir is not null)
@@ -2824,6 +2844,7 @@ public class DirectoryBackupService
         // crash) would leave a corrupt "current" file that the next backup
         // run would promote to _prev as a bogus version.
         string tempPath = destPath + ".lbtmp";
+        TimeSpan created = TimeSpan.Zero;
 
         try
         {
@@ -2833,9 +2854,7 @@ public class DirectoryBackupService
                 // (e.g. a note still open in KeyNote NF) can still be backed up,
                 // instead of failing with a sharing violation and being skipped.
                 FileShare.ReadWrite, bufferSize: 81920, useAsync: true))
-            await using (var dstStream = new FileStream(
-                tempPath, FileMode.Create, FileAccess.Write,
-                FileShare.None, bufferSize: 81920, useAsync: true))
+            await using (var dstStream = OpenTemp(tempPath, ref created))
             {
                 if (onProgress is null && waitIfPaused is null)
                 {
@@ -2859,7 +2878,7 @@ public class DirectoryBackupService
             }
 
             // Atomic promotion of the fully-written temp file.
-            File.Move(tempPath, destPath, overwrite: true);
+            Promote(tempPath, destPath, created, creations);
         }
         catch
         {
@@ -2882,13 +2901,15 @@ public class DirectoryBackupService
     private static async Task<(string Hash, long Size)> CopyFileWithHashAsync(
         string sourcePath, string destPath, CancellationToken ct,
         Action<long>? onProgress = null,
-        Func<Task>? waitIfPaused = null)
+        Func<Task>? waitIfPaused = null,
+        SlowFileCreationMonitor? creations = null)
     {
         string? destDir = Path.GetDirectoryName(destPath);
         if (destDir is not null)
             Directory.CreateDirectory(destDir);
 
         string tempPath = destPath + ".lbtmp";
+        TimeSpan created = TimeSpan.Zero;
 
         try
         {
@@ -2901,9 +2922,7 @@ public class DirectoryBackupService
                 // (e.g. a note still open in KeyNote NF) can still be backed up,
                 // instead of failing with a sharing violation and being skipped.
                 FileShare.ReadWrite, bufferSize: 81920, useAsync: true))
-            await using (var dstStream = new FileStream(
-                tempPath, FileMode.Create, FileAccess.Write,
-                FileShare.None, bufferSize: 81920, useAsync: true))
+            await using (var dstStream = OpenTemp(tempPath, ref created))
             {
                 var buffer = new byte[81920];
                 int read;
@@ -2919,7 +2938,7 @@ public class DirectoryBackupService
             }
 
             // Atomic promotion of the fully-written temp file.
-            File.Move(tempPath, destPath, overwrite: true);
+            Promote(tempPath, destPath, created, creations);
 
             string hash = Convert.ToHexString(hasher.GetHashAndReset()).ToLowerInvariant();
             return (hash, totalCopied);
@@ -2942,19 +2961,19 @@ public class DirectoryBackupService
     private static async Task WritePlainFromBufferAsync(
         byte[] content, string destPath, CancellationToken ct,
         Action<long>? onProgress = null,
-        Func<Task>? waitIfPaused = null)
+        Func<Task>? waitIfPaused = null,
+        SlowFileCreationMonitor? creations = null)
     {
         string? destDir = Path.GetDirectoryName(destPath);
         if (destDir is not null)
             Directory.CreateDirectory(destDir);
 
         string tempPath = destPath + ".lbtmp";
+        TimeSpan created = TimeSpan.Zero;
 
         try
         {
-            await using (var dstStream = new FileStream(
-                tempPath, FileMode.Create, FileAccess.Write,
-                FileShare.None, bufferSize: 81920, useAsync: true))
+            await using (var dstStream = OpenTemp(tempPath, ref created))
             {
                 const int chunk = 81920;
                 int offset = 0;
@@ -2970,7 +2989,7 @@ public class DirectoryBackupService
             }
 
             // Atomic promotion of the fully-written temp file.
-            File.Move(tempPath, destPath, overwrite: true);
+            Promote(tempPath, destPath, created, creations);
         }
         catch
         {
@@ -2978,6 +2997,34 @@ public class DirectoryBackupService
             catch { /* best effort — nothing more we can do here */ }
             throw;
         }
+    }
+
+    /// <summary>
+    /// Create a copy's temp file, adding what that took to
+    /// <paramref name="created"/>: with <see cref="Promote"/>, the two moments a
+    /// copy creates a name on the destination, which is what a folder holding a
+    /// great many files on a drive making 8.3 short names makes slow.
+    /// </summary>
+    private static FileStream OpenTemp(string tempPath, ref TimeSpan created)
+    {
+        long started = System.Diagnostics.Stopwatch.GetTimestamp();
+        var stream = new FileStream(
+            tempPath, FileMode.Create, FileAccess.Write,
+            FileShare.None, bufferSize: 81920, useAsync: true);
+        created += System.Diagnostics.Stopwatch.GetElapsedTime(started);
+        return stream;
+    }
+
+    /// <summary>
+    /// Move a fully written temp file into place, and tell
+    /// <paramref name="creations"/> what creating the copy cost in all.
+    /// </summary>
+    private static void Promote(string tempPath, string destPath, TimeSpan created, SlowFileCreationMonitor? creations)
+    {
+        long started = System.Diagnostics.Stopwatch.GetTimestamp();
+        File.Move(tempPath, destPath, overwrite: true);
+        created += System.Diagnostics.Stopwatch.GetElapsedTime(started);
+        creations?.Record(destPath, created);
     }
 
     /// <summary>Lowercase-hex SHA-256 of an in-memory buffer.</summary>

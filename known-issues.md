@@ -1,5 +1,85 @@
 # LithicBackup — Known Issues & Tech Debt
 
+## FIXED: a backup crawled at 0.8 s a file with nothing to say why, showed "~1492:01:56" left, and held the Worker for hours (2026-10-20, 1.15.0)
+
+Reported: "in 8 hours it's only copied about 1 GB on the j: set, and the time left
+says -1492:01:56". Three things, all found on the live run:
+
+1. **Why it was slow.** The app's process ran one core flat out with almost no
+   I/O; three stack samples were all in `File.Move`, after a copy's write. The
+   destination folder (`D:\music creation\modarchive\samples\samples`) held 1.4
+   million files named "unknown artist - …", on a drive (G:) with 8.3 short-name
+   creation on. Creating a file there took **779 ms**, against 7 ms in an empty
+   folder on the same drive. After `fsutil 8dot3name set G: 1`: **4.2 ms**. Not a
+   Lithic bug, but Lithic said nothing. It now times name creation in every plain
+   copy and, when that averages over 250 ms, says so once: on the progress panel,
+   on the row's result line, and in the Worker's log, with the fsutil command when
+   the volume makes short names (`SlowFileCreationMonitor`, `ShortNameSetting`).
+2. **"-1492:01:56" was "~1492:01:56"** - about 62 days, correct at that rate, its
+   tilde read as a minus sign. Long estimates now read "about 62 days"; none can
+   be negative.
+3. **The Worker sat for three hours.** Its i: full backup made a quick update of
+   j: at a commit boundary, which waited for j:'s write lock - held by the app's
+   backup, which by design never gives it up to the Worker - from 13:37 until the
+   app's backup was cancelled at 16:38. The Worker runs one backup at a time, so
+   everything waited. Now the app marks a set it is working on
+   (`HoldSetInApp`), and the Worker treats that as it treats a cleanup: it starts
+   nothing on the set, stops a run that is going within a second, keeps the work,
+   and carries on after.
+
+See design.md: "When creating a name is the whole cost, say so" and "The Worker
+gives way to the app, set by set". Pinned by `tools\targeted_progress_test` §18
+and `tools\worker_idle_test` C8.
+
+## FIXED: a cleanup could delete what a backup was writing, and files the user had unticked; reconcile undid later changes (2026-10-20, 1.15.0)
+
+Reported as: the purging stage looked finished (the line by Close stayed empty
+until the first report, so the user might just press Close), and Backup and the
+other row actions were still offered while it ran - "is this a risk?" It was, in
+four ways, and two more turned up while fixing it:
+
+1. **A backup from the row during the purge.** Nothing held the row. A backup
+   writing the set while the purge retired its rows and deleted their files
+   could record a copy at a path the purge then deleted: a live record with no
+   file behind it. The purge now holds the row like a seed (Backup, Modify,
+   Restore, Delete wait; Abort stops it; each stage shows on the row) and is
+   refused while the row is busy.
+2. **A background backup.** The Worker never knew. Its runs now announce
+   themselves (`.backingup` marker), check for a cleanup (`.cleaning` marker)
+   before they start, and a run already going stops within a second when a
+   cleanup begins; the purge waits for it before changing anything. The catalog
+   write lock alone could not do this: it is held per batch, and a copy is made
+   before its record.
+3. **Files backed up again since the scan.** The scan can be hours old. A file
+   listed as deleted from disk that came back and was backed up again was
+   tombstoned by path - its new record with it - and its new copy deleted. Now
+   left alone, and counted in the summary.
+4. **Untracked files a seed adopted since the destination scan** were deleted
+   from under their new records. The purge now never deletes a stored file a live
+   record points at (checked under the lock, after retiring; a seed records under
+   the files' own times, so "written since the scan" cannot see it).
+5. **Unticked file rows were purged anyway.** The rows under a directory had live
+   checkboxes but were display-only: unticking a file left its directory
+   part-ticked, and a part-ticked directory was purged whole. A directory
+   unticked itself, with one subdirectory ticked, was purged too. Only the ticked
+   rows are purged now; the rest stay listed, unticked.
+6. **After a purge, an unticked leftover showed ticked** (its rebuilt tree's
+   ancestors defaulted to ticked), and Clean Selected then did nothing.
+
+7. **Reconcile's Apply undid changes made since its Analyze.** Asked next: why a
+   catalog scan greys out the window's other buttons while a reconcile does not.
+   The asymmetry was a bug in its own right (Clean Selected could run during
+   Apply, a catalog scan during a destination scan or a reconcile); the window
+   now runs one operation at a time. Behind it was a worse one: Apply wrote back
+   whole the records it had read at Analyze, so a row cleaned up since came back
+   to life (its manifest deleted), and a row a backup had moved into the history
+   since was retired or flipped at its old path. Apply now changes only rows still
+   live at the path Analyze read, and skips the rest.
+
+Also: every stage now shows in both status lines, and closing the window
+mid-purge asks first. See design.md, "A purge acts on an old scan, beside
+writers that are not old". Pinned by `tools\excess_versions_test` §12 and §13.
+
 ## FIXED: a seed left thousands of `.fileref` files untracked (2026-10-19, 1.14.0)
 
 Straight after seeding a set, Cleanup's destination scan listed 23,190 untracked

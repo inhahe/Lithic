@@ -22,7 +22,9 @@
 //      C3 when the destination returns, the waiting backup runs;
 //      C4 a source on a drive letter with nothing behind it flags no reconcile
 //         and is logged once;
-//      C5 a full backup that throws is not started again at once.
+//      C5 a full backup that throws is not started again at once;
+//      C8 while the app works on a set, the Worker starts no run on it, stops
+//         one that is going, and carries on after.
 //
 // Build with -p:OldCode=true to compile only what also builds against the code
 // before the change (A2 and C), and watch it fail there.
@@ -689,6 +691,64 @@ async Task PartC()
 
         await rig.DisposeAsync();
     }
+
+#if !OLD_CODE
+    // C8 --------------------------------------------------------------------
+    // While the app works on a set (ICatalogRepository.HoldSetInApp) the Worker
+    // gives way: it starts no run on the set, stops one that is going, keeps the
+    // work, and carries on after. It used to wait for the set's write lock, which
+    // the app does not give up, and so sat for as long as the app's backup ran -
+    // three hours, measured, holding every other set's backup with it.
+    {
+        string dir = Path.Combine(root, "c8");
+        string src = Path.Combine(dir, "src");
+        string dst = Path.Combine(dir, "dst");
+        Directory.CreateDirectory(src);
+        Directory.CreateDirectory(dst);
+        const int fileCount = 4000;
+        for (int i = 0; i < fileCount; i++)
+            File.WriteAllText(Path.Combine(src, $"f{i:D5}.txt"), new string('x', 512) + i);
+        int Copied() => Directory.EnumerateFiles(dst, "*.txt", SearchOption.AllDirectories).Count();
+
+        var rig = await Rig.CreateAsync(Path.Combine(dir, "catalog.db"), stampedSetIds, set =>
+        {
+            set.SourceSelections = [ new SourceSelection { Path = src, IsDirectory = true, IsSelected = true } ];
+            set.SourceRoots = [src];
+            set.JobOptions!.TargetDirectory = dst;
+        });
+        rig.Destination.Connected = true;
+
+        // Held from the start: nothing runs.
+        var hold = rig.Repo.HoldSetInApp(rig.SetId);
+        await rig.Worker.StartAsync(CancellationToken.None);
+        await Task.Delay(TimeSpan.FromSeconds(12));
+        int started = rig.Log.Count("Starting backup for");
+        int waits = rig.Log.Count("wait: Lithic Backup is working on it");
+        Check(started == 0 && Copied() == 0,
+            $"C8 while the app holds the set, the Worker starts no backup of it ({started} started, {Copied()} copied)");
+        Check(waits == 1, $"C8 the wait is logged once ({waits} times)");
+
+        // Let go: the full backup runs. Take the set again while it is copying.
+        hold.Dispose();
+        bool copying = await WaitUntil(() => Copied() >= 200, TimeSpan.FromSeconds(90));
+        hold = rig.Repo.HoldSetInApp(rig.SetId);
+        bool paused = await WaitUntil(() => rig.Log.Count("paused: Lithic Backup is working on it") > 0, TimeSpan.FromSeconds(10));
+        int copiedAtPause = Copied();
+        await Task.Delay(TimeSpan.FromSeconds(4));
+        int copiedLater = Copied();
+        Check(copying && paused, $"C8 a backup that is going stops within seconds when the app takes the set (copying {copying}, paused {paused})");
+        Check(copiedLater == copiedAtPause && copiedAtPause < fileCount,
+            $"C8 and copies nothing more meanwhile ({copiedAtPause}, then {copiedLater}, of {fileCount})");
+        Check(rig.Log.Count("Backup failed for") == 0, "C8 a stop for the app is not counted as a failure");
+
+        // Let go again: it carries on and finishes.
+        hold.Dispose();
+        bool finished = await WaitUntil(() => Copied() == fileCount, TimeSpan.FromSeconds(180));
+        Check(finished, $"C8 when the app lets go, the backup carries on and finishes ({Copied()} of {fileCount})");
+        Check(rig.Log.Count("is done with") >= 1, "C8 and the Worker says the app is done with the set");
+        await rig.DisposeAsync();
+    }
+#endif
 }
 
 // ---------------------------------------------------------------------------

@@ -185,9 +185,18 @@ public sealed class CatalogReconcileService
             string strippedAbs = Path.Combine(targetDirectory, f.NewDiscPath);
             if (!File.Exists(strippedAbs)) { skipped++; continue; } // plain vanished — leave the row alone
 
+            // Only if the row is still what Analyze read. Written whole from that
+            // snapshot, it un-retired a row Cleanup had retired since, and pointed
+            // a row a backup had since moved into the history back at the
+            // current copy - which by then held different content.
+            if (!await _catalog.FlipFileRefToPlainIfUnchangedAsync(
+                    backupSetId, f.Record.Id, f.OldDiscPath, f.NewDiscPath, ct))
+            {
+                skipped++;
+                continue;
+            }
             f.Record.IsFileRef = false;
             f.Record.DiscPath = f.NewDiscPath;
-            await _catalog.UpdateFileRecordAsync(f.Record, ct);
             flipped++;
 
             // Remove the now-redundant .fileref manifest, if it's still there.
@@ -220,8 +229,13 @@ public sealed class CatalogReconcileService
                     if (plain is not null && File.Exists(plain)) { skipped++; continue; }
                 }
 
+                // Only if the row is still what Analyze read (see the flips).
+                if (!await _catalog.MarkFileRecordDeletedIfUnchangedAsync(backupSetId, r.Id, r.DiscPath, ct))
+                {
+                    skipped++;
+                    continue;
+                }
                 r.IsDeleted = true;
-                await _catalog.UpdateFileRecordAsync(r, ct);
                 pruned++;
             }
         }

@@ -201,4 +201,12 @@ public class BackupProgress
     /// instead of the byte totals.
     /// </summary>
     public long PhaseFilesTotal { get; init; }
+
+    /// <summary>
+    /// Something the user should know about the run and can act on - that
+    /// creating files on the destination is pathologically slow, and why. A
+    /// report carrying one carries nothing else; the display keeps it up until
+    /// the run ends.
+    /// </summary>
+    public string? Advisory { get; init; }
 }

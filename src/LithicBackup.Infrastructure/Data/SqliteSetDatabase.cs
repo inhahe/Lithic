@@ -1639,6 +1639,51 @@ internal sealed class SqliteSetDatabase : IDisposable
         return total;
     }
 
+    /// <summary>
+    /// Turn a live <c>.fileref</c> row into a plain one at
+    /// <paramref name="newDiscPath"/> - only if it is still the live .fileref at
+    /// <paramref name="expectedDiscPath"/> that the caller read. Two columns, not
+    /// the whole row: reconcile acts on records read when it analyzed, and
+    /// writing those back whole undid whatever happened since - a cleanup's
+    /// retirement of the row, a backup moving it into the history.
+    /// </summary>
+    /// <returns>Whether the row was changed.</returns>
+    public async Task<bool> FlipFileRefToPlainIfUnchangedAsync(
+        long fileId, string expectedDiscPath, string newDiscPath, CancellationToken ct = default)
+    {
+        ct.ThrowIfCancellationRequested();
+        using var _ = await WriteLockAsync(ct).ConfigureAwait(false);
+
+        using var cmd = _connection.CreateCommand();
+        cmd.CommandText = """
+            UPDATE Files SET IsFileRef = 0, DiscPath = $new
+            WHERE Id = $id AND IsDeleted = 0 AND IsFileRef = 1 AND DiscPath = $old
+            """;
+        cmd.Parameters.AddWithValue("$id", fileId);
+        cmd.Parameters.AddWithValue("$old", expectedDiscPath);
+        cmd.Parameters.AddWithValue("$new", newDiscPath);
+        return cmd.ExecuteNonQuery() == 1;
+    }
+
+    /// <summary>
+    /// Retire a live row, only if it still stores its content at
+    /// <paramref name="expectedDiscPath"/>, as when the caller read it. See
+    /// <see cref="FlipFileRefToPlainIfUnchangedAsync"/>.
+    /// </summary>
+    /// <returns>Whether the row was changed.</returns>
+    public async Task<bool> MarkFileRecordDeletedIfUnchangedAsync(
+        long fileId, string expectedDiscPath, CancellationToken ct = default)
+    {
+        ct.ThrowIfCancellationRequested();
+        using var _ = await WriteLockAsync(ct).ConfigureAwait(false);
+
+        using var cmd = _connection.CreateCommand();
+        cmd.CommandText = "UPDATE Files SET IsDeleted = 1 WHERE Id = $id AND IsDeleted = 0 AND DiscPath = $old";
+        cmd.Parameters.AddWithValue("$id", fileId);
+        cmd.Parameters.AddWithValue("$old", expectedDiscPath);
+        return cmd.ExecuteNonQuery() == 1;
+    }
+
     public async Task<int> CountFilesUnderSourcePrefixAsync(
         int backupSetId, string sourcePrefix, CancellationToken ct = default)
     {
@@ -1830,6 +1875,62 @@ internal sealed class SqliteSetDatabase : IDisposable
         cmd.CommandText = "VACUUM INTO $path";
         cmd.Parameters.AddWithValue("$path", destinationPath);
         cmd.ExecuteNonQuery();
+    }
+
+    /// <summary>
+    /// Source and stored paths of every record written at or after
+    /// <paramref name="sinceUtc"/>. BackedUpUtc is stored as round-trip ("o")
+    /// UTC text, which sorts as it reads, so a text comparison is a time
+    /// comparison. A full scan, but of one narrow column, once per purge.
+    /// </summary>
+    public async Task<IReadOnlyList<(string SourcePath, string DiscPath)>> GetRecordsWrittenSinceAsync(
+        DateTime sinceUtc, CancellationToken ct = default)
+    {
+        ct.ThrowIfCancellationRequested();
+        using var _ = await LockAsync(ct).ConfigureAwait(false);
+
+        using var cmd = _connection.CreateCommand();
+        cmd.CommandText = "SELECT SourcePath, DiscPath FROM Files WHERE BackedUpUtc >= $since";
+        cmd.Parameters.AddWithValue("$since", sinceUtc.ToUniversalTime().ToString("o"));
+        var list = new List<(string, string)>();
+        using var r = cmd.ExecuteReader();
+        while (r.Read())
+            list.Add((r.GetString(0), r.GetString(1)));
+        return list;
+    }
+
+    /// <summary>
+    /// Which of <paramref name="discPaths"/> a live record still stores its
+    /// content at. Paths compare without regard to case or slash direction; the
+    /// result holds them as given. One pass over the live rows' DiscPath column,
+    /// checked against the set in memory: DiscPath has no index, so asking
+    /// about the paths in batches would scan the table once per batch.
+    /// </summary>
+    public async Task<IReadOnlyList<string>> FindDiscPathsInUseAsync(
+        IReadOnlyCollection<string> discPaths, CancellationToken ct = default)
+    {
+        ct.ThrowIfCancellationRequested();
+        if (discPaths.Count == 0)
+            return [];
+
+        var wanted = new Dictionary<string, string>(StringComparer.OrdinalIgnoreCase);
+        foreach (var p in discPaths)
+            wanted.TryAdd(p.Replace('/', '\\'), p);
+
+        using var _ = await LockAsync(ct).ConfigureAwait(false);
+        using var cmd = _connection.CreateCommand();
+        cmd.CommandText = "SELECT DiscPath FROM Files WHERE IsDeleted = 0";
+        var found = new List<string>();
+        using var r = cmd.ExecuteReader();
+        long n = 0;
+        while (r.Read())
+        {
+            if ((++n & 0xFFFF) == 0)
+                ct.ThrowIfCancellationRequested();
+            if (wanted.Remove(r.GetString(0).Replace('/', '\\'), out var given))
+                found.Add(given);
+        }
+        return found;
     }
 
     /// <summary>Whether this set holds any file record, deleted ones included.</summary>

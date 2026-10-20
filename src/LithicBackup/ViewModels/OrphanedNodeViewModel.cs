@@ -121,20 +121,78 @@ public class OrphanedNodeViewModel : ViewModelBase
     }
 
     /// <summary>
-    /// Collect all wrapped items at or below this node whose checkbox is
-    /// not unchecked.  Used by the purge logic to gather what to delete.
+    /// The file row this leaf shows, for a file leaf under an item's directory;
+    /// null for directory nodes.
     /// </summary>
-    internal IEnumerable<OrphanedDirectoryItem> GetCheckedItems()
+    public OrphanedFileInfo? File { get; init; }
+
+    /// <summary>
+    /// Every wrapped item at or below this node with something ticked, and the
+    /// rows of it that are not (null when every row is). Used by the purge to
+    /// gather what to delete.
+    ///
+    /// <para>An item's own selection is its file rows, not its node's box: that
+    /// box also rolls up the item's subdirectories. Yielding the item whenever
+    /// the box was not clear purged a directory whole when one of its file rows
+    /// was unticked, and purged it even when the user had unticked it and then
+    /// ticked only a subdirectory, which leaves it part-ticked too.</para>
+    /// </summary>
+    internal IEnumerable<(OrphanedDirectoryItem Item, IReadOnlyList<OrphanedFileInfo>? Unticked)> GetCheckedSelections()
     {
         if (IsChecked == false)
             yield break;
 
-        if (Item is not null && IsChecked != false)
-            yield return Item;
+        if (Item is not null)
+        {
+            int rows = 0;
+            List<OrphanedFileInfo>? unticked = null;
+            foreach (var child in Children)
+            {
+                if (child.File is null)
+                    continue;
+                rows++;
+                if (child.IsChecked == false)
+                    (unticked ??= []).Add(child.File);
+            }
+
+            if (rows == 0)
+            {
+                // No rows to say: only a box that is fully ticked selects it.
+                if (IsChecked == true)
+                    yield return (Item, null);
+            }
+            else if (unticked is null)
+                yield return (Item, null);
+            else if (unticked.Count < rows)
+                yield return (Item, unticked);
+        }
 
         foreach (var child in Children)
-            foreach (var item in child.GetCheckedItems())
-                yield return item;
+            if (child.File is null)
+                foreach (var selection in child.GetCheckedSelections())
+                    yield return selection;
+    }
+
+    /// <summary>
+    /// Make a freshly built tree's boxes agree with its items: an item's file
+    /// rows take the item's state, and every node with children shows their
+    /// roll-up. Interior nodes and file rows default to ticked, so after a purge
+    /// left an unticked item behind, its rebuilt tree showed it ticked while the
+    /// purge read it as not, and Clean Selected did nothing at all.
+    /// </summary>
+    internal void SettleCheckState()
+    {
+        foreach (var child in Children)
+        {
+            if (child.File is not null && Item is not null)
+                child._isChecked = Item.IsSelected;
+            child.SettleCheckState();
+        }
+
+        if (Children.Count > 0)
+            _isChecked = Children.All(c => c._isChecked == true) ? true
+                : Children.All(c => c._isChecked == false) ? false
+                : null;
     }
 
     /// <summary>
@@ -393,14 +451,14 @@ public class OrphanedCategoryViewModel : ViewModelBase
     }
 
     /// <summary>
-    /// Enumerate every wrapped <see cref="OrphanedDirectoryItem"/> in this
-    /// category whose corresponding tree node is checked.
+    /// Every wrapped <see cref="OrphanedDirectoryItem"/> in this category with
+    /// something ticked; see <see cref="OrphanedNodeViewModel.GetCheckedSelections"/>.
     /// </summary>
-    internal IEnumerable<OrphanedDirectoryItem> GetCheckedItems()
+    internal IEnumerable<(OrphanedDirectoryItem Item, IReadOnlyList<OrphanedFileInfo>? Unticked)> GetCheckedSelections()
     {
         foreach (var root in RootNodes)
-            foreach (var item in root.GetCheckedItems())
-                yield return item;
+            foreach (var selection in root.GetCheckedSelections())
+                yield return selection;
     }
 
     private void WireCheckNotifications(OrphanedNodeViewModel node)

@@ -19,7 +19,7 @@ namespace LithicBackup.ViewModels;
 /// that match user-typed exclusion patterns so the user can purge them
 /// from the catalog.
 /// </summary>
-public class OrphanedDirectoriesViewModel : ViewModelBase
+public class OrphanedDirectoriesViewModel : ViewModelBase, IConfirmClose
 {
     private readonly ICatalogRepository _catalog;
     private readonly BackupSet _backupSet;
@@ -70,6 +70,39 @@ public class OrphanedDirectoriesViewModel : ViewModelBase
 
     public event Action? DoneRequested;
 
+    /// <summary>
+    /// Holds the set's row in the main window while a purge runs, and shows its
+    /// progress there; null outside the app (tests).
+    /// </summary>
+    public RowWorkHooks? RowWork { get; init; }
+
+    /// <summary>
+    /// When the catalog scan and the destination scan whose results are showing
+    /// began. A purge leaves alone every file backed up since the earlier of
+    /// the two (see the purge's re-check).
+    /// </summary>
+    private DateTime? _catalogScanStartedUtc;
+    private DateTime? _destinationScanStartedUtc;
+
+    /// <summary>
+    /// Closing mid-purge does not stop it, so say so first; it carries on, with
+    /// its progress and result on the set's row in the main window.
+    /// </summary>
+    public bool ConfirmClose(bool canCancel)
+    {
+        if (!IsPurging || !canCancel)
+            return true;
+        var answer = System.Windows.MessageBox.Show(
+            "The cleanup is still running.\n\n"
+            + "If you close this window it carries on in the background, with its progress and "
+            + "its result on the set's row in the main window. Close it anyway?",
+            "Cleanup",
+            System.Windows.MessageBoxButton.YesNo,
+            System.Windows.MessageBoxImage.Question,
+            System.Windows.MessageBoxResult.No);
+        return answer == System.Windows.MessageBoxResult.Yes;
+    }
+
     public OrphanedDirectoriesViewModel(ICatalogRepository catalog, BackupSet backupSet)
     {
         _catalog = catalog;
@@ -100,9 +133,15 @@ public class OrphanedDirectoriesViewModel : ViewModelBase
         // hidden exactly when results appeared. A third such path would be easy
         // to add and easy to forget; this cannot miss one.
         Categories.CollectionChanged += (_, _) => OnPropertyChanged(nameof(HasCategories));
+        // One operation at a time (IsBusy): each of these either writes the
+        // catalog and the destination (Clean Selected, Apply) or reads them to
+        // produce a list that the writers act on, and they all walk the same
+        // drive. A catalog scan used to block the others while a reconcile or a
+        // destination scan blocked only itself, so Clean Selected could run
+        // during Apply, and a catalog scan during either.
         PurgeSelectedCommand = new RelayCommand(
             _ => PurgeSelected(),
-            _ => !IsPurging && Categories.Any(c => c.HasCheckedItems));
+            _ => !IsBusy && Categories.Any(c => c.HasCheckedItems));
         // Enabled only while a purge is actually running, and only once — a
         // second press has nothing left to do and the disabled button is the
         // feedback that the first one registered.
@@ -110,22 +149,23 @@ public class OrphanedDirectoriesViewModel : ViewModelBase
             _ => CancelPurge(),
             _ => IsPurging && _purgeCts is { IsCancellationRequested: false });
         ScanCatalogCommand = new RelayCommand(
-            _ => _ = LoadAsync(),
-            _ => !IsLoading && !IsPurging);
-        ScanExcludedCommand = new RelayCommand(_ => _ = ScanForExcludedAsync(), _ => !IsLoading && !IsPurging);
+            _ => { if (!IsBusy) _ = LoadAsync(); },
+            _ => !IsBusy);
+        ScanExcludedCommand = new RelayCommand(
+            _ => { if (!IsBusy) _ = ScanForExcludedAsync(); },
+            _ => !IsBusy);
         ScanDestinationCommand = new RelayCommand(
-            _ => _ = ScanDestinationAsync(),
-            _ => !IsLoading && !IsPurging && !IsScanningDestination && _destinationAvailable);
+            _ => { if (!IsBusy) _ = ScanDestinationAsync(); },
+            _ => !IsBusy && _destinationAvailable);
         SortByNameCommand = new RelayCommand(_ => ToggleSort(CleanupSortColumn.Name));
         SortByFilesCommand = new RelayCommand(_ => ToggleSort(CleanupSortColumn.Files));
         SortBySizeCommand = new RelayCommand(_ => ToggleSort(CleanupSortColumn.Size));
         ReconcileAnalyzeCommand = new RelayCommand(
-            _ => _ = ReconcileAnalyzeAsync(),
-            _ => !IsLoading && !IsPurging && !IsReconciling && _destinationAvailable);
+            _ => { if (!IsBusy) _ = ReconcileAnalyzeAsync(); },
+            _ => !IsBusy && _destinationAvailable);
         ReconcileApplyCommand = new RelayCommand(
-            _ => _ = ReconcileApplyAsync(),
-            _ => !IsLoading && !IsPurging && !IsReconciling
-                 && _destinationAvailable && _reconcileReport?.HasChanges == true);
+            _ => { if (!IsBusy) _ = ReconcileApplyAsync(); },
+            _ => !IsBusy && _destinationAvailable && _reconcileReport?.HasChanges == true);
         CloseCommand = new RelayCommand(_ => DoneRequested?.Invoke());
 
         // The catalog classification (read every record + group/classify into
@@ -209,6 +249,12 @@ public class OrphanedDirectoriesViewModel : ViewModelBase
     /// first scan had produced anything.
     /// </summary>
     public bool HasCategories => Categories.Count > 0;
+
+    /// <summary>
+    /// Whether one of the window's operations is running: a scan, a reconcile,
+    /// or a cleanup. Every action waits for it (see the constructor).
+    /// </summary>
+    public bool IsBusy => IsLoading || IsScanningDestination || IsReconciling || IsPurging;
 
     public bool IsLoading
     {
@@ -492,6 +538,8 @@ public class OrphanedDirectoriesViewModel : ViewModelBase
     private async Task LoadAsync()
     {
         IsLoading = true;
+        // Before the catalog is read: a purge leaves alone anything written since.
+        _catalogScanStartedUtc = DateTime.UtcNow;
         SummaryText = "Loading catalogue...";
 
         // A DispatcherTimer polls a thread-safe progress counter at the shared
@@ -1012,9 +1060,11 @@ public class OrphanedDirectoriesViewModel : ViewModelBase
                     }
 
                     // Add per-file leaf rows under this directory so the user
-                    // can see exactly which files would be purged.  These are
-                    // display-only: GetCheckedItems still yields the wrapped
-                    // OrphanedDirectoryItem, not synthetic per-file items.
+                    // can see exactly which files would be purged - and untick
+                    // the ones to keep: the purge takes only the ticked rows
+                    // (GetCheckedSelections). They used to be display-only
+                    // under live checkboxes, so a part-ticked directory was
+                    // purged whole, the unticked files with it.
                     if (item.Files is not null)
                     {
                         // Annotation is a secondary key because it used to be
@@ -1030,6 +1080,7 @@ public class OrphanedDirectoriesViewModel : ViewModelBase
                                 file.DisplayName, file.Path,
                                 isDirectory: false, parent: existing)
                             {
+                                File = file,
                                 Annotation = file.Annotation,
                                 Depth = existing.Depth + 1,
                                 FileCount = 1,
@@ -1048,6 +1099,7 @@ public class OrphanedDirectoriesViewModel : ViewModelBase
         // here (e.g. "mIRC → backups" into "mIRC\backups").  Users prefer to
         // see the real directory hierarchy expanded out one segment at a time
         // so they can read paths the same way they appear on disk.
+        root.SettleCheckState();
         return root.Children;
     }
 
@@ -1382,7 +1434,8 @@ public class OrphanedDirectoriesViewModel : ViewModelBase
                         Path.GetFileName(r.SourcePath),
                         r.SourcePath,
                         r.SizeBytes,
-                        $"(backed up {r.BackedUpUtc.ToLocalTime():yyyy-MM-dd HH:mm})"))
+                        $"(backed up {r.BackedUpUtc.ToLocalTime():yyyy-MM-dd HH:mm})")
+                    { RecordId = r.Id })
                     .ToList(),
                 DiscFilePaths = _targetDir is null ? null
                     : records.Select(r => r.DiscPath.Replace('/', '\\')).ToList(),
@@ -1574,7 +1627,8 @@ public class OrphanedDirectoriesViewModel : ViewModelBase
                         Path.GetFileName(r.SourcePath),
                         r.SourcePath,
                         r.SizeBytes,
-                        $"(seeded {r.BackedUpUtc.ToLocalTime():yyyy-MM-dd HH:mm})"))
+                        $"(seeded {r.BackedUpUtc.ToLocalTime():yyyy-MM-dd HH:mm})")
+                    { RecordId = r.Id })
                     .ToList(),
                 // Intentionally NULL: every duplicate points at the same
                 // physical file as the surviving record.  Deleting the file
@@ -1763,6 +1817,8 @@ public class OrphanedDirectoriesViewModel : ViewModelBase
         // during that gap.
         IsScanningDestination = true;
         DestinationScanStatusText = "Scanning destination directory...";
+        // Before the catalog snapshot is taken: a purge leaves alone anything written since.
+        _destinationScanStartedUtc = DateTime.UtcNow;
 
         // Yield at Background priority so WPF actually renders the disabled
         // button before the work below starts.
@@ -1895,7 +1951,8 @@ public class OrphanedDirectoriesViewModel : ViewModelBase
                                 // path so the user always sees something
                                 // meaningful.
                                 h.SourcePath ?? h.DiscRel,
-                                h.Size))
+                                h.Size)
+                            { DiscRel = h.DiscRel })
                             .ToList(),
                         DiscFilePaths = hitList.Select(h => h.DiscRel).ToList(),
                     };
@@ -2195,16 +2252,112 @@ public class OrphanedDirectoriesViewModel : ViewModelBase
         SummaryText = "Cancelling...";
     }
 
+    /// <summary>
+    /// The source path each stored file of these items belongs to, for the
+    /// source-side categories (a row there is a source path, and its stored
+    /// files - current copy and versions - are in the item's DiscFilePaths with
+    /// nothing to say whose they are). One pass over the scan's records, and
+    /// only when some item is part-ticked.
+    /// </summary>
+    private Dictionary<string, string> SourcePathsByDiscPath(IEnumerable<OrphanedDirectoryItem> items)
+    {
+        var map = new Dictionary<string, string>(StringComparer.OrdinalIgnoreCase);
+        var sources = new HashSet<string>(
+            items.Where(i => i.ExcessVersionRecords is null && i.MatchingSourcePaths is not null)
+                 .SelectMany(i => i.MatchingSourcePaths!),
+            StringComparer.OrdinalIgnoreCase);
+        if (sources.Count == 0 || _activeFiles is null)
+            return map;
+        foreach (var f in _activeFiles)
+            if (sources.Contains(f.SourcePath))
+                map.TryAdd(f.DiscPath.Replace('/', '\\'), f.SourcePath);
+        return map;
+    }
+
+    /// <summary>
+    /// The part of <paramref name="item"/> that <paramref name="rows"/> (some
+    /// of its file rows) stand for: their source paths, records or stored
+    /// files, and nothing else. A stored file that cannot be attributed to a
+    /// row is in no part, so it is never deleted on a row's behalf.
+    /// </summary>
+    private static OrphanedDirectoryItem Restrict(
+        OrphanedDirectoryItem item, IReadOnlyCollection<OrphanedFileInfo> rows,
+        IReadOnlyDictionary<string, string> sourceByDisc)
+    {
+        List<string>? matching = item.MatchingSourcePaths;
+        List<FileRecord>? records = item.ExcessVersionRecords;
+        List<string>? discs = item.DiscFilePaths;
+
+        if (records is not null)
+        {
+            var ids = rows.Select(r => r.RecordId).OfType<long>().ToHashSet();
+            records = records.Where(r => ids.Contains(r.Id)).ToList();
+            if (discs is not null)
+            {
+                var keep = records.Select(r => r.DiscPath.Replace('/', '\\'))
+                    .ToHashSet(StringComparer.OrdinalIgnoreCase);
+                discs = discs.Where(keep.Contains).ToList();
+            }
+            if (matching is not null)
+            {
+                var paths = records.Select(r => r.SourcePath).ToHashSet(StringComparer.OrdinalIgnoreCase);
+                matching = matching.Where(paths.Contains).ToList();
+            }
+        }
+        else if (matching is not null)
+        {
+            var paths = rows.Select(r => r.Path).ToHashSet(StringComparer.OrdinalIgnoreCase);
+            matching = matching.Where(paths.Contains).ToList();
+            discs = discs?.Where(d => sourceByDisc.TryGetValue(d, out var src) && paths.Contains(src)).ToList();
+        }
+        else if (item.Reason is OrphanedReason.UntrackedFile or OrphanedReason.CatalogDeleted)
+        {
+            var keep = rows.Select(r => r.DiscRel).OfType<string>().ToHashSet(StringComparer.OrdinalIgnoreCase);
+            discs = discs?.Where(keep.Contains).ToList();
+        }
+        else
+        {
+            // A catalog-side item without a path list would be purged by
+            // directory prefix, the whole of it, which no part of it may be.
+            // Nothing in it can be told apart, so its parts purge nothing.
+            matching = [];
+            discs = discs is null ? null : [];
+        }
+
+        return new OrphanedDirectoryItem
+        {
+            DirectoryPath = item.DirectoryPath,
+            Reason = item.Reason,
+            FileCount = rows.Count,
+            TotalSizeBytes = rows.Sum(r => r.Size),
+            MatchingSourcePaths = matching,
+            ExcessVersionRecords = records,
+            Files = [.. rows],
+            DiscFilePaths = discs,
+            IsSelected = item.IsSelected,
+        };
+    }
+
     private async void PurgeSelected()
     {
-        // Selected items live on the tree leaves; each leaf node keeps the
-        // wrapped item's IsSelected in sync with its IsChecked, so we can
-        // iterate the flat Items list to find what to purge.
-        var selected = Categories
-            .SelectMany(c => c.GetCheckedItems())
-            .Distinct()
+        // What is ticked, per item: all of it, or all but the file rows the user
+        // unticked (see OrphanedNodeViewModel.GetCheckedSelections).
+        var selections = Categories
+            .SelectMany(c => c.GetCheckedSelections())
+            .DistinctBy(s => s.Item)
             .ToList();
-        if (selected.Count == 0) return;
+        if (selections.Count == 0 || IsBusy) return;
+
+        // Not while the set is backing up (or seeding) in the main window: the
+        // backup is writing exactly the catalog rows and files this would delete.
+        if (RowWork?.DescribeBusy() is { } busy)
+        {
+            string msg = $"This set is {busy} right now, so it was not cleaned. Clean it up when that has finished.";
+            SummaryText = msg;
+            System.Windows.MessageBox.Show(msg, "Cleanup",
+                System.Windows.MessageBoxButton.OK, System.Windows.MessageBoxImage.Information);
+            return;
+        }
 
         // Refuse outright if the set has a destination that isn't reachable.
         //
@@ -2232,14 +2385,54 @@ public class OrphanedDirectoriesViewModel : ViewModelBase
             return;
         }
 
+        // A part-ticked item is purged as the part made of its ticked rows, and
+        // what is left of it - its unticked rows - stays listed, unticked.
+        var selected = new List<OrphanedDirectoryItem>(selections.Count);
+        var afterPurge = new List<(OrphanedDirectoryItem Old, OrphanedDirectoryItem? Remaining)>(selections.Count);
+        var partial = selections.Where(s => s.Unticked is not null).ToList();
+        var sourceByDisc = SourcePathsByDiscPath(partial.Select(s => s.Item));
+        foreach (var (item, unticked) in selections)
+        {
+            if (unticked is null)
+            {
+                selected.Add(item);
+                afterPurge.Add((item, null));
+                continue;
+            }
+            var untickedRows = new HashSet<OrphanedFileInfo>(unticked, ReferenceEqualityComparer.Instance);
+            selected.Add(Restrict(item, item.Files!.Where(f => !untickedRows.Contains(f)).ToList(), sourceByDisc));
+            var remaining = Restrict(item, unticked, sourceByDisc);
+            remaining.IsSelected = false;
+            afterPurge.Add((item, remaining));
+        }
+
         _purgeCts?.Dispose();
         _purgeCts = new CancellationTokenSource();
         var ct = _purgeCts.Token;
 
         IsPurging = true;
-        SummaryText = "Purging...";
-        PurgeStatusText = "";
         LastCleanupResultText = "";
+
+        // Every stage shows in BOTH lines - the header and the line beside Close -
+        // and on the set's row in the main window. The line by Close used to stay
+        // empty until the first progress report, which can be a long wait (for the
+        // background service's batch, for the re-checks below), so the part of the
+        // window next to the button looked finished.
+        void ShowStage(string text)
+        {
+            SummaryText = text;
+            PurgeStatusText = text;
+            RowWork?.Progress(text);
+        }
+
+        // Hold the set: its row in the main window, and the background service,
+        // which checks this marker before backing the set up. Released when the
+        // purge ends, however it ends.
+        RowWork?.Begin(_purgeCts);
+        using var cleaningHold = _catalog.HoldSetForCleanup(_backupSet.Id);
+        ShowStage("Cleaning up: getting started...");
+        string rowResult = "Cleanup finished.";
+        bool rowError = false;
 
         try
         {
@@ -2268,23 +2461,32 @@ public class OrphanedDirectoriesViewModel : ViewModelBase
             // Cleanup surfaces progress as text labels (not a percentage bar), so
             // it only needs the report's Text; the shared DestinationFilePurger now
             // speaks ProgressReport (text + optional percent).
-            var progress = new Progress<Services.ProgressReport>(report =>
-            {
-                PurgeStatusText = report.Text;
-                SummaryText = report.Text;
-            });
+            var progress = new Progress<Services.ProgressReport>(report => ShowStage(report.Text));
+            var since = new[] { _catalogScanStartedUtc, _destinationScanStartedUtc }
+                .Where(t => t is not null).Min();
 
             // Run all DB work + disk deletion on a background thread — the
             // catalog methods are synchronous (ExecuteNonQuery /
             // Task.FromResult) and the filesystem walk for empty-dir
             // cleanup can iterate thousands of directories.
             int keptForReferences = 0;
+            int leftAloneSinceScan = 0;
+            int keptInUse = 0;
             var (catalogPurged, filesDeleted, deleteFailures, bytesFreed, alreadyAbsent) = await Task.Run(() =>
             {
                 int catPurged = 0;
                 // Excess-version records held back because a .fileref still needs
                 // their bytes (RecheckNeededCopies, inside the transaction).
                 HashSet<long> keptIds = [];
+                // Source paths backed up again since the scan, and stored paths
+                // belonging to them or written since: left alone (see the re-check).
+                var backedUpAgain = new HashSet<string>(StringComparer.OrdinalIgnoreCase);
+                var rewrittenDiscPaths = new HashSet<string>(StringComparer.OrdinalIgnoreCase);
+                int leftAlone = 0;
+                // Stored files a live record points at once the catalog update
+                // is done: never deleted (see FindDiscPathsInUseAsync).
+                var stillInUse = new HashSet<string>(StringComparer.OrdinalIgnoreCase);
+                int inUseKept = 0;
                 int fDeleted = 0;
                 int fFailed = 0;
                 int fAbsent = 0;
@@ -2344,10 +2546,57 @@ public class OrphanedDirectoriesViewModel : ViewModelBase
                         $"Updating catalog {doneUnits:N0}/{totalUnits:N0} ({pct}%){suffix}");
                 }
 
+                // -- 0. Wait for the background service to stop backing this set
+                //       up. It stops a run within a second of seeing the marker
+                //       taken above, and starts none while the marker is there;
+                //       a run already going used to carry on copying through the
+                //       purge, writing files at the paths it then deleted. A
+                //       cancel here changes nothing (see the catch). --
+                if (_catalog.IsSetBeingBackedUpInBackground(backupSetId))
+                {
+                    ((IProgress<Services.ProgressReport>)progress).Report(
+                        "Cleaning up: waiting for the background service to pause its backup of this set...");
+                    while (_catalog.IsSetBeingBackedUpInBackground(backupSetId))
+                        Task.Delay(250, ct).GetAwaiter().GetResult();
+                }
+
                 // -- 1. Catalog updates inside a single transaction. --
-                var tx = _catalog.BeginTransactionAsync(backupSetId, ct).GetAwaiter().GetResult();
+                ((IProgress<Services.ProgressReport>)progress).Report("Cleaning up: starting the catalog update...");
+                var tx = _catalog.BeginTransactionAsync(backupSetId, ct,
+                        onWaitingForOtherProcess: () => ((IProgress<Services.ProgressReport>)progress).Report(
+                            "Cleaning up: waiting for the background backup of this set to pause..."))
+                    .GetAwaiter().GetResult();
                 try
                 {
+                    // Anything backed up since the scan is left alone. The scan's
+                    // findings predate it: a file listed as deleted from disk may
+                    // have come back and been backed up again - by the app or the
+                    // background service - and tombstoning its path would mark the
+                    // new record deleted and delete its new copy, since the purge
+                    // works by path. Checked here, under the set's write lock, so
+                    // nothing can be written between this and the tombstoning;
+                    // after it, the cleanup marker keeps the service off the set.
+                    if (since is { } sinceUtc)
+                    {
+                        ((IProgress<Services.ProgressReport>)progress).Report(
+                            "Cleaning up: checking for files backed up since the scan...");
+                        foreach (var (src, disc) in _catalog.GetRecordsWrittenSinceAsync(backupSetId, sinceUtc, ct)
+                                     .GetAwaiter().GetResult())
+                        {
+                            backedUpAgain.Add(src);
+                            rewrittenDiscPaths.Add(disc.Replace('/', '\\'));
+                        }
+                        // The stored copies those paths had when scanned are the
+                        // ones the items list; keep them too.
+                        if (backedUpAgain.Count > 0 && _activeFiles is not null)
+                            foreach (var f in _activeFiles)
+                                if (backedUpAgain.Contains(f.SourcePath))
+                                    rewrittenDiscPaths.Add(f.DiscPath.Replace('/', '\\'));
+                    }
+
+                    ((IProgress<Services.ProgressReport>)progress).Report(
+                        "Cleaning up: checking which older copies duplicate-file references still need...");
+
                     // The .fileref guard again, now, against EVERYTHING this purge
                     // deletes. The scan-time pass only saw the Excess Versions list:
                     // an excess copy could be listed because another plain copy of
@@ -2437,7 +2686,11 @@ public class OrphanedDirectoriesViewModel : ViewModelBase
                             // already re-entrant inside the open transaction
                             // (it is invoked once per work item today), so the
                             // extra calls cost one statement prepare per chunk.
-                            var paths = wi.MatchingSourcePaths;
+                            var paths = backedUpAgain.Count == 0
+                                ? wi.MatchingSourcePaths
+                                : wi.MatchingSourcePaths.Where(p => !backedUpAgain.Contains(p)).ToList();
+                            leftAlone += wi.MatchingSourcePaths.Count - paths.Count;
+                            doneUnits += wi.MatchingSourcePaths.Count - paths.Count;
                             for (int off = 0; off < paths.Count; off += PurgePathChunkSize)
                             {
                                 int len = Math.Min(PurgePathChunkSize, paths.Count - off);
@@ -2460,8 +2713,21 @@ public class OrphanedDirectoriesViewModel : ViewModelBase
                             // has no path list still purges something rather
                             // than silently doing nothing. If you add a category,
                             // give it MatchingSourcePaths.
-                            catPurged += _catalog.MarkFilesDeletedByDirectoryAsync(
-                                backupSetId, wi.DirectoryPath, ct).GetAwaiter().GetResult();
+                            // Not at all if something under it was backed up
+                            // again since the scan: this marks by prefix and could
+                            // not leave that one path out.
+                            string prefix = wi.DirectoryPath.TrimEnd('\\') + "\\";
+                            if (backedUpAgain.Any(p => p.StartsWith(prefix, StringComparison.OrdinalIgnoreCase)))
+                            {
+                                leftAlone++;
+                                if (wi.DiscFilePaths is not null)
+                                    rewrittenDiscPaths.UnionWith(wi.DiscFilePaths);
+                            }
+                            else
+                            {
+                                catPurged += _catalog.MarkFilesDeletedByDirectoryAsync(
+                                    backupSetId, wi.DirectoryPath, ct).GetAwaiter().GetResult();
+                            }
                             doneUnits++;
                             ReportUnits(dirPath);
                         }
@@ -2472,6 +2738,30 @@ public class OrphanedDirectoriesViewModel : ViewModelBase
                     // stale number.
                     doneUnits = totalUnits;
                     ReportUnits(string.Empty, force: true);
+
+                    // Last, still under the lock and after retiring everything
+                    // above: which of the files about to be deleted does a live
+                    // record still store its content at? None should - but the
+                    // scan predates whatever ran since, and a seed records the
+                    // files it adopts under their original timestamps, so the
+                    // "backed up since the scan" check cannot see it. Adopting an
+                    // untracked file and then cleaning with it still ticked
+                    // deleted the file the seed had just recorded.
+                    if (targetDir is not null)
+                    {
+                        var candidates = workItems
+                            .Where(w => w.DiscFilePaths is not null)
+                            .SelectMany(w => w.DiscFilePaths!)
+                            .Distinct(StringComparer.OrdinalIgnoreCase)
+                            .ToList();
+                        if (candidates.Count > 0)
+                        {
+                            ((IProgress<Services.ProgressReport>)progress).Report(
+                                "Cleaning up: making sure nothing the catalog still uses is deleted...");
+                            stillInUse.UnionWith(_catalog.FindDiscPathsInUseAsync(backupSetId, candidates, ct)
+                                .GetAwaiter().GetResult());
+                        }
+                    }
 
                     tx.Complete();
                 }
@@ -2493,12 +2783,35 @@ public class OrphanedDirectoriesViewModel : ViewModelBase
                         workItems.Where(w => w.DiscFilePaths is not null)
                                  .SelectMany(w => w.DiscFilePaths!),
                         StringComparer.OrdinalIgnoreCase);
+                    // Nothing backed up again since the scan - the stored copies
+                    // of those paths, and anything written since - except the
+                    // files of excess versions being retired by id: a newer
+                    // version only makes them more excess, and new versions never
+                    // reuse their numbers, so no new copy shares their path.
+                    if (rewrittenDiscPaths.Count > 0)
+                    {
+                        var retiredById = workItems
+                            .Where(w => w.Reason == OrphanedReason.ExcessVersion && w.ExcessVersionRecords is not null)
+                            .SelectMany(w => w.ExcessVersionRecords!)
+                            .Where(r => !keptIds.Contains(r.Id))
+                            .Select(r => r.DiscPath.Replace('/', '\\'))
+                            .ToHashSet(StringComparer.OrdinalIgnoreCase);
+                        foreach (var d in rewrittenDiscPaths)
+                            if (!retiredById.Contains(d))
+                                allDiscPaths.Remove(d);
+                    }
+
                     // Never delete the file of a record held back above.
                     foreach (var kept in workItems
                                  .Where(w => w.ExcessVersionRecords is not null)
                                  .SelectMany(w => w.ExcessVersionRecords!)
                                  .Where(r => keptIds.Contains(r.Id)))
                         allDiscPaths.Remove(kept.DiscPath.Replace('/', '\\'));
+
+                    // Nor one a live record still points at.
+                    foreach (var used in stillInUse)
+                        if (allDiscPaths.Remove(used))
+                            inUseKept++;
 
                     // Cooperative, not throwing: the catalog transaction above
                     // has already committed, so a cancel here must still report
@@ -2520,7 +2833,8 @@ public class OrphanedDirectoriesViewModel : ViewModelBase
                 {
                     var purgedPaths = new HashSet<string>(
                         workItems.Where(w => w.MatchingSourcePaths is not null)
-                                 .SelectMany(w => w.MatchingSourcePaths!),
+                                 .SelectMany(w => w.MatchingSourcePaths!)
+                                 .Where(p => !backedUpAgain.Contains(p)),
                         StringComparer.OrdinalIgnoreCase);
                     // Whole directories only for an item without a path list; a
                     // listed item purged exactly its paths (purgedPaths), and its
@@ -2542,12 +2856,25 @@ public class OrphanedDirectoriesViewModel : ViewModelBase
                 }
 
                 keptForReferences = keptIds.Count;
+                leftAloneSinceScan = leftAlone;
+                keptInUse = inUseKept;
                 return (catPurged, fDeleted, fFailed, bytes, fAbsent);
             });
 
             // Back on the UI thread — update the observable collection.
-            foreach (var item in selected)
-                Items.Remove(item);
+            foreach (var (old, remaining) in afterPurge)
+            {
+                int at = Items.IndexOf(old);
+                if (at < 0)
+                    continue;
+                if (remaining is null)
+                    Items.RemoveAt(at);
+                else
+                {
+                    remaining.PropertyChanged += (_, _) => OnPropertyChanged(nameof(IsAllSelected));
+                    Items[at] = remaining;
+                }
+            }
 
             RebuildCategories();
 
@@ -2562,6 +2889,12 @@ public class OrphanedDirectoriesViewModel : ViewModelBase
             if (keptForReferences > 0)
                 summary.Add($"kept {keptForReferences:N0} older cop{(keptForReferences == 1 ? "y" : "ies")} "
                     + "that duplicate-file references still need");
+            if (leftAloneSinceScan > 0)
+                summary.Add($"left {leftAloneSinceScan:N0} file{(leftAloneSinceScan == 1 ? "" : "s")} alone "
+                    + "that had been backed up again since the scan");
+            if (keptInUse > 0)
+                summary.Add($"kept {keptInUse:N0} stored file{(keptInUse == 1 ? "" : "s")} that the catalog "
+                    + "uses again (adopted by a seed, or backed up, since the scan)");
             // Reported rather than ignored: a file the catalog expects but the
             // destination doesn't have is how a half-completed earlier purge — or
             // a destination that isn't really the one the catalog describes —
@@ -2589,6 +2922,8 @@ public class OrphanedDirectoriesViewModel : ViewModelBase
                     + " files\" the next time you scan it.";
 
             SummaryText = composed;
+            rowResult = "Cleanup: " + composed;
+            rowError = deleteFailures > 0;
 
             // Stamp the persistent result line with a timestamp so users
             // know which cleanup the message refers to if they come back
@@ -2609,17 +2944,21 @@ public class OrphanedDirectoriesViewModel : ViewModelBase
                 + "backed-up files were deleted.";
             SummaryText = msg;
             LastCleanupResultText = $"Last cleanup at {DateTime.Now:HH:mm:ss}: {msg}";
+            rowResult = msg;
         }
         catch (Exception ex)
         {
             SummaryText = $"Cleanup failed: {ex.Message}";
             LastCleanupResultText =
                 $"Last cleanup at {DateTime.Now:HH:mm:ss} failed: {ex.Message}";
+            rowResult = $"Cleanup failed: {ex.Message}";
+            rowError = true;
         }
         finally
         {
             PurgeStatusText = "";
             IsPurging = false;
+            RowWork?.End(rowResult, rowError);
             _purgeCts?.Dispose();
             _purgeCts = null;
         }
@@ -3027,7 +3366,22 @@ public class OrphanedDirectoriesViewModel : ViewModelBase
 /// suffix back off.</para>
 /// </param>
 public sealed record OrphanedFileInfo(
-    string DisplayName, string Path, long Size, string? Annotation = null);
+    string DisplayName, string Path, long Size, string? Annotation = null)
+{
+    /// <summary>
+    /// The record this row is, in the categories that list records (excess
+    /// versions, catalog duplicates). In the source-side categories a row is a
+    /// source path, <see cref="Path"/>.
+    /// </summary>
+    public long? RecordId { get; init; }
+
+    /// <summary>
+    /// The stored file this row is, in the destination-scan categories
+    /// (untracked, catalog-deleted): its path relative to the destination, as
+    /// in <see cref="OrphanedDirectoryItem.DiscFilePaths"/>.
+    /// </summary>
+    public string? DiscRel { get; init; }
+}
 
 public enum OrphanedReason
 {
@@ -3122,12 +3476,13 @@ public class OrphanedDirectoryItem : ViewModelBase
     public List<FileRecord>? ExcessVersionRecords { get; set; }
 
     /// <summary>
-    /// Per-file display rows shown as leaf children under this directory in
-    /// the tree.  Populated by every classification phase so the user can
-    /// see exactly which files would be affected without having to guess
-    /// from the file count.  This is display-only — purge logic still
-    /// operates at the directory / record / source-path granularity
-    /// described above.
+    /// Per-file rows shown as leaf children under this directory in the tree.
+    /// Populated by every classification phase so the user can see exactly
+    /// which files would be affected, and untick any of them: a row stands for
+    /// a source path (<see cref="OrphanedFileInfo.Path"/>), a record
+    /// (<see cref="OrphanedFileInfo.RecordId"/>) or a stored file
+    /// (<see cref="OrphanedFileInfo.DiscRel"/>), and the purge narrows the item
+    /// to its ticked rows (<c>OrphanedDirectoriesViewModel.Restrict</c>).
     /// </summary>
     public List<OrphanedFileInfo>? Files { get; set; }
 

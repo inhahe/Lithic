@@ -152,6 +152,13 @@ public sealed class BackupWorker : BackgroundService
         _destinationResolver = destinationResolver;
         _sourceResolver = sourceResolver;
 
+        // Said as the run finds it: a run this is about can last days.
+        _directoryBackup.Advisory += (setId, message) =>
+        {
+            string name = setId is { } id && _sets.TryGetValue(id, out var s) ? s.BackupSet.Name : $"set {setId}";
+            _logger.LogWarning("Backup of \"{Name}\": {Advisory}", name, message);
+        };
+
         // Watcher events arrive on thread-pool threads; buffer them and let the
         // poll loop route them, so per-set state stays single-threaded. Waking the
         // loop makes the non-NTFS fallback push-driven too, matching the USN path.
@@ -1920,8 +1927,31 @@ public sealed class BackupWorker : BackgroundService
     private async Task ExecuteTargetedPathsAsync(
         SetState state, IReadOnlyList<string> paths, CancellationToken ct)
     {
+        void Requeue()
+        {
+            // Exactly as for a destination that is not connected.
+            var now = DateTime.UtcNow;
+            foreach (var p in paths)
+                state.Pending.TryAdd(p, (now, now));
+        }
+
+        // Inside the full scan of this same set (its journal drain), the scan's
+        // run is already announced and watching; this is part of it.
+        var outer = state.ActiveRun;
+        SetRun? run = null;
         try
         {
+            if (outer is null)
+            {
+                run = StartSetRun(state, stopForApp: true, ct);
+                if (run is null)
+                {
+                    Requeue();
+                    return;
+                }
+                ct = run.Token;
+            }
+
             var set = state.BackupSet;
             var opts = set.JobOptions!;
             var targetDir = await ResolveDestinationAsync(state, ct);
@@ -1973,6 +2003,15 @@ public sealed class BackupWorker : BackgroundService
                         "  … and {More} more failed file(s).", result.FailedFiles.Count - 10);
             }
         }
+        catch (OperationCanceledException) when ((run ?? outer)?.StoppedForApp == true)
+        {
+            // Before the general case: the run's token is `ct` now, so that one
+            // would match too, and drop the paths.
+            Requeue();
+            _logger.LogInformation(
+                "Continuous backup for \"{Name}\" paused: Lithic Backup is working on it. "
+                + "Its changes are backed up when that is done.", state.BackupSet.Name);
+        }
         catch (OperationCanceledException) when (ct.IsCancellationRequested)
         {
             _logger.LogInformation("Continuous backup for \"{Name}\" cancelled.", state.BackupSet.Name);
@@ -1980,6 +2019,10 @@ public sealed class BackupWorker : BackgroundService
         catch (Exception ex)
         {
             _logger.LogError(ex, "Continuous backup failed for \"{Name}\".", state.BackupSet.Name);
+        }
+        finally
+        {
+            run?.Dispose();
         }
     }
 
@@ -2002,8 +2045,15 @@ public sealed class BackupWorker : BackgroundService
             return; // another backup in progress — moves stay queued for next poll
         }
 
+        SetRun? run = null;
         try
         {
+            // Announced, so a cleanup waits for the moves, but not stopped by
+            // one: they are quick renames, and the queue is cleared below.
+            run = StartSetRun(state, stopForApp: false, ct);
+            if (run is null)
+                return; // moves stay queued until the app is done with the set
+
             var set = state.BackupSet;
             var opts = set.JobOptions!;
             var targetDir = await ResolveDestinationAsync(state, ct);
@@ -2171,6 +2221,7 @@ public sealed class BackupWorker : BackgroundService
         }
         finally
         {
+            run?.Dispose();
             _backupLock.Release();
         }
     }
@@ -2274,6 +2325,118 @@ public sealed class BackupWorker : BackgroundService
     }
 
     /// <summary>
+    /// What Lithic Backup is doing with the set, if anything that the Worker must
+    /// give way to: cleaning it up (<see cref="ICatalogRepository.HoldSetForCleanup"/>),
+    /// or working on it some other way - a backup, a seed - with its row busy
+    /// (<see cref="ICatalogRepository.HoldSetInApp"/>). Null when nothing is.
+    /// </summary>
+    private string? AppWorkOn(int setId)
+        => _catalog.IsSetBeingCleaned(setId) ? "it is being cleaned up in Lithic Backup"
+            : _catalog.IsSetHeldInApp(setId) ? "Lithic Backup is working on it"
+            : null;
+
+    /// <summary>
+    /// True while the app is working on this set (<see cref="AppWorkOn"/>): its
+    /// backups wait, keeping their queued work, until it is done. A purge deletes
+    /// backed-up files after its catalog transaction commits, and a copy written
+    /// at one of those paths meanwhile would be deleted with them; a backup in the
+    /// app does not give the set's write lock up, so a run that waited for it held
+    /// the Worker - every set - for as long as that backup ran. Logged once per
+    /// wait. Asked by <see cref="StartSetRun"/>, after the run has announced itself.
+    /// </summary>
+    private bool AppHoldsSet(SetState state)
+    {
+        if (AppWorkOn(state.BackupSet.Id) is not { } why)
+        {
+            if (state.LoggedAppWait)
+                _logger.LogInformation("Lithic Backup is done with \"{Name}\"; its backups carry on.", state.BackupSet.Name);
+            state.LoggedAppWait = false;
+            return false;
+        }
+        if (!state.LoggedAppWait)
+        {
+            _logger.LogInformation(
+                "Backups of \"{Name}\" wait: {Why}.", state.BackupSet.Name, why);
+            state.LoggedAppWait = true;
+        }
+        return true;
+    }
+
+    /// <summary>
+    /// Start a run on a set, or null if the app is working on it
+    /// (<see cref="AppWorkOn"/>; the caller keeps the work for later, as for a
+    /// destination that is not connected). The run announces itself before it
+    /// checks (<see cref="ICatalogRepository.HoldSetForBackgroundBackup"/>), and
+    /// with <paramref name="stopForApp"/> watches for app work that begins while
+    /// it runs and cancels <see cref="SetRun.Token"/> within a second: a purge
+    /// waits for the run's marker to go before it deletes anything, a backup in
+    /// the app waits for the set's lock, and a full backup can run for hours.
+    /// Checking only at the start let a run that was already going copy files at
+    /// the very paths the purge then deleted.
+    /// </summary>
+    private SetRun? StartSetRun(SetState state, bool stopForApp, CancellationToken ct)
+    {
+        int setId = state.BackupSet.Id;
+        var marker = _catalog.HoldSetForBackgroundBackup(setId);
+        if (AppHoldsSet(state))
+        {
+            marker.Dispose();
+            return null;
+        }
+        var run = new SetRun(state, marker, stopForApp ? () => AppWorkOn(setId) is not null : null, ct);
+        state.ActiveRun = run;
+        return run;
+    }
+
+    /// <summary>One Worker run on one set; see <see cref="StartSetRun"/>.</summary>
+    private sealed class SetRun : IDisposable
+    {
+        private static readonly TimeSpan WatchInterval = TimeSpan.FromSeconds(1);
+
+        private readonly SetState _state;
+        private readonly IDisposable _marker;
+        private readonly CancellationTokenSource _cts;
+        private readonly Timer? _watch;
+        private int _stopped;
+        private int _disposed;
+
+        public SetRun(SetState state, IDisposable marker, Func<bool>? appWorking, CancellationToken ct)
+        {
+            _state = state;
+            _marker = marker;
+            _cts = CancellationTokenSource.CreateLinkedTokenSource(ct);
+            Token = _cts.Token;
+            if (appWorking is not null)
+                _watch = new Timer(_ =>
+                {
+                    if (Volatile.Read(ref _disposed) != 0 || !appWorking())
+                        return;
+                    Interlocked.Exchange(ref _stopped, 1);
+                    try { _cts.Cancel(); }
+                    catch (ObjectDisposedException) { }
+                }, null, WatchInterval, WatchInterval);
+        }
+
+        public CancellationToken Token { get; }
+
+        /// <summary>Whether the app's work on the set, not shutdown, stopped the run.</summary>
+        public bool StoppedForApp => Volatile.Read(ref _stopped) != 0;
+
+        public void Dispose()
+        {
+            if (Interlocked.Exchange(ref _disposed, 1) != 0)
+                return;
+            _watch?.Dispose();
+            if (ReferenceEquals(_state.ActiveRun, this))
+                _state.ActiveRun = null;
+            // Last: a cleanup waiting on the marker must not start while this
+            // run can still write.
+            _marker.Dispose();
+            _cts.Dispose();
+        }
+    }
+
+    /// <summary>
     /// Run a full scan-and-backup (scheduled interval/daily runs, and continuous
     /// reconciliation after a journal gap). Returns <c>true</c> when the scan
     /// actually ran, and whether it reconciled cleanly.
@@ -2292,25 +2455,32 @@ public sealed class BackupWorker : BackgroundService
             return ReconcileOutcome.DidNotRun;
         }
 
+        SetRun? run = null;
         try
         {
+            run = StartSetRun(state, stopForApp: true, ct);
+            if (run is null)
+                return ReconcileOutcome.DidNotRun; // retried once the app is done with the set
+            // The run's own token from here: a cleanup of the set stops it.
+            var runCt = run.Token;
+
             var set = state.BackupSet;
             var opts = set.JobOptions!;
-            var targetDir = await ResolveDestinationAsync(state, ct);
+            var targetDir = await ResolveDestinationAsync(state, runCt);
             if (targetDir is null)
                 return ReconcileOutcome.DidNotRun; // Destination not connected; retry later.
 
-            if (!await ResolveSourcesAsync(state, ct))
+            if (!await ResolveSourcesAsync(state, runCt))
                 return ReconcileOutcome.DidNotRun; // No source available; retry later.
 
-            if (await RefuseUntrackedDestinationAsync(state, targetDir, ct))
+            if (await RefuseUntrackedDestinationAsync(state, targetDir, runCt))
                 return ReconcileOutcome.DidNotRun; // Until the user seeds or backs up in the app.
 
             _logger.LogInformation("Starting backup for \"{Name}\" → {Target}", set.Name, targetDir);
 
             var job = BuildJob(set, opts, targetDir);
 
-            var (diff, totalBytes, totalFiles) = await _directoryBackup.PlanAsync(job, ct);
+            var (diff, totalBytes, totalFiles) = await _directoryBackup.PlanAsync(job, runCt);
 
             if (totalFiles == 0)
             {
@@ -2333,7 +2503,7 @@ public sealed class BackupWorker : BackgroundService
             // Hand over the plan's diff: without it ExecuteAsync scans the whole
             // tree and diffs it against the catalog all over again.
             var result = await _directoryBackup.ExecuteAsync(
-                job, targetDir, retentionTiers, progress: null, ct,
+                job, targetDir, retentionTiers, progress: null, runCt,
                 precomputedDiff: diff,
                 onCommitBoundary: (excluded, innerCt) =>
                     DrainJournalDuringFullScanAsync(state, excluded, innerCt));
@@ -2365,7 +2535,8 @@ public sealed class BackupWorker : BackgroundService
                 ? ReconcileOutcome.RanClean
                 : ReconcileOutcome.RanWithFailures;
         }
-        catch (BackupCanceledException ex) when (ct.IsCancellationRequested && ex.CopyFinished)
+        catch (BackupCanceledException ex) when (ex.CopyFinished
+                                                 && (ct.IsCancellationRequested || run?.StoppedForApp == true))
         {
             // Stopped during verification or retention: every file was copied and
             // committed, so the scan did its job, and repeating hours of it after
@@ -2387,6 +2558,14 @@ public sealed class BackupWorker : BackgroundService
             _logger.LogInformation("Backup for \"{Name}\" cancelled.", state.BackupSet.Name);
             return ReconcileOutcome.DidNotRun;
         }
+        catch (OperationCanceledException) when (run?.StoppedForApp == true)
+        {
+            // Whole paths were committed as it went; the next run carries on.
+            _logger.LogInformation(
+                "Backup for \"{Name}\" paused: Lithic Backup is working on it. It runs again when that is done.",
+                state.BackupSet.Name);
+            return ReconcileOutcome.DidNotRun;
+        }
         catch (Exception ex)
         {
             state.ConsecutiveFailures++;
@@ -2399,6 +2578,7 @@ public sealed class BackupWorker : BackgroundService
         }
         finally
         {
+            run?.Dispose();
             _backupLock.Release();
         }
     }
@@ -2516,6 +2696,16 @@ public sealed class BackupWorker : BackgroundService
 
         /// <summary>Whether the set was held at the last reload (to log the change once).</summary>
         public bool WasHeld { get; set; }
+
+        /// <summary>Whether "waiting for the app" has been logged for the current wait.</summary>
+        public bool LoggedAppWait { get; set; }
+
+        /// <summary>
+        /// The Worker's run on this set, while there is one (see StartSetRun). A
+        /// targeted backup the full scan's journal drain makes of this set runs
+        /// inside it, and must neither announce itself again nor end the marker.
+        /// </summary>
+        public SetRun? ActiveRun { get; set; }
 
         /// <summary>
         /// The destination this set was last refused at because its catalog is

@@ -27,6 +27,14 @@
 //
 // Section 14: a version another writer (the Worker's continuous backup) adds while
 // a run is under way is followed, not given the same number again.
+//
+// Section 18: a run that would take 62 days says "about 62 days", not
+// "~1492:01:56" (whose tilde read as a minus sign), and never a negative time;
+// an advisory stays on the panel; and SlowFileCreationMonitor warns once, with
+// the fsutil command when the drive makes 8.3 names - a real backup spent 779 ms
+// creating each file in a folder of 1.4 million on such a drive, 4.2 ms with
+// short names off. ShortNameSetting is checked against the short names Windows
+// actually gives a new file.
 
 using System.Collections.Concurrent;
 using System.Diagnostics;
@@ -61,6 +69,7 @@ internal static class Program
         {
             await RunAsync(root);
             await FullPathTestsAsync(root);
+            await AdvisoryTestsAsync(root);
         }
         catch (Exception ex)
         {
@@ -75,6 +84,104 @@ internal static class Program
         Console.WriteLine();
         Console.WriteLine(_failures == 0 ? $"ALL {_checks} CHECKS PASSED" : $"{_failures} OF {_checks} CHECK(S) FAILED");
         return _failures == 0 ? 0 : 1;
+    }
+
+    static async Task AdvisoryTestsAsync(string root)
+    {
+        Console.WriteLine();
+        Console.WriteLine("=== 18. long estimates, advisories, slow file creation ===");
+        string F(TimeSpan t) => LithicBackup.ViewModels.BurnProgressViewModel.FormatRemaining(t);
+        Check(F(TimeSpan.FromHours(1492) + TimeSpan.FromMinutes(1) + TimeSpan.FromSeconds(56)) == "62 days",
+            $"1492:01:56 left reads as 62 days (\"{F(TimeSpan.FromHours(1492))}\")");
+        Check(F(TimeSpan.FromHours(30)) == "30:00:00", $"under two days it stays in hours (\"{F(TimeSpan.FromHours(30))}\")");
+        Check(F(TimeSpan.FromMinutes(5)) == "05:00", "under an hour, minutes and seconds");
+        Check(F(TimeSpan.FromSeconds(-90)) == "00:00", $"never a negative time (\"{F(TimeSpan.FromSeconds(-90))}\")");
+
+        // A copy going at about a byte a second, of ten million: months.
+        var dvm = new LithicBackup.ViewModels.BurnProgressViewModel { IsDirectoryMode = true };
+        dvm.StartBurn();
+        static BackupProgress Bytes(long done) => new()
+        {
+            CurrentDisc = 1, TotalDiscs = 1, CurrentFile = @"D:\x\slow.flac",
+            BytesWrittenTotal = done, BytesTotalAll = 10_000_000, OverallPercentage = done / 100_000.0,
+        };
+        dvm.OnBackupProgress(Bytes(0));
+        await Task.Delay(1100);
+        dvm.OnBackupProgress(Bytes(1));
+        Check(dvm.StatsText.Contains("about ") && dvm.StatsText.EndsWith(" days remaining") && !dvm.StatsText.Contains('~'),
+            $"the panel says a long copy will take days, with no tilde (\"{dvm.StatsText}\")");
+
+        string stats = dvm.StatsText, status = dvm.StatusText;
+        dvm.OnBackupProgress(new BackupProgress { Advisory = "Creating files on G: is slow." });
+        Check(dvm.AdvisoryText == "Creating files on G: is slow." && dvm.StatsText == stats && dvm.StatusText == status,
+            "an advisory goes on its own line and leaves the rest of the panel as it was");
+        await Task.Delay(1100);
+        dvm.OnBackupProgress(Bytes(2));
+        Check(dvm.AdvisoryText == "Creating files on G: is slow.", "it stays up as the run goes on");
+        dvm.CompleteBurn(true, "");
+        dvm.StartBurn();
+        Check(dvm.AdvisoryText == "", "and the next run starts without it");
+        dvm.CompleteBurn(true, "");
+
+        // The monitor: a window of 32, a quarter of a second, once.
+        var said = new List<string>();
+        var monitor = new SlowFileCreationMonitor(said.Add, _ => true);
+        for (int i = 0; i < SlowFileCreationMonitor.Window - 1; i++)
+            monitor.Record($@"G:\b\samples\f{i}.flac", TimeSpan.FromMilliseconds(780));
+        Check(said.Count == 0, "no warning before a full window of files");
+        monitor.Record(@"G:\b\samples\f31.flac", TimeSpan.FromMilliseconds(780));
+        Check(said.Count == 1, "a full window averaging 780 ms warns");
+        Check(said.Count == 1 && said[0].Contains("780 ms") && said[0].Contains(@"G:\b\samples")
+              && said[0].Contains("fsutil 8dot3name set G: 1"),
+            $"naming the time, the folder and, as short names are on, the command that fixes it (\"{(said.Count > 0 ? said[0] : "")}\")");
+        for (int i = 0; i < 100; i++)
+            monitor.Record($@"G:\b\samples\g{i}.flac", TimeSpan.FromSeconds(2));
+        Check(said.Count == 1 && monitor.HasWarned, "once per run");
+
+        var quiet = new List<string>();
+        var fast = new SlowFileCreationMonitor(quiet.Add, _ => true);
+        for (int i = 0; i < 500; i++)
+            fast.Record($@"G:\b\f{i}", TimeSpan.FromMilliseconds(i % 50 == 0 ? 3000 : 5));
+        Check(quiet.Count == 0, "the odd slow file among fast ones does not warn");
+
+        var noShort = new List<string>();
+        var off = new SlowFileCreationMonitor(noShort.Add, _ => false);
+        for (int i = 0; i < SlowFileCreationMonitor.Window; i++)
+            off.Record($@"H:\b\f{i}", TimeSpan.FromMilliseconds(600));
+        Check(noShort.Count == 1 && !noShort[0].Contains("fsutil") && noShort[0].Contains("antivirus"),
+            "with short names off it warns without the fsutil advice");
+
+        // ShortNameSetting against what Windows actually does with a new long name.
+        string probeDir = Path.Combine(root, "shortnames");
+        Directory.CreateDirectory(probeDir);
+        string longName = Path.Combine(probeDir, "a rather long file name for the short name probe.txt");
+        File.WriteAllText(longName, "x");
+        var buffer = new System.Text.StringBuilder(1024);
+        uint got = Native.GetShortPathNameW(longName, buffer, (uint)buffer.Capacity);
+        bool? reported = ShortNameSetting.IsCreationEnabled(probeDir);
+        if (got == 0)
+        {
+            Console.WriteLine("     (GetShortPathName failed; short-name check skipped)");
+        }
+        else
+        {
+            bool actual = !string.Equals(Path.GetFileName(buffer.ToString()), Path.GetFileName(longName),
+                StringComparison.OrdinalIgnoreCase);
+            Check(reported == actual,
+                $"ShortNameSetting says {reported} for {Path.GetPathRoot(probeDir)}, and a new long name there "
+                + $"{(actual ? "got" : "did not get")} a short one (\"{Path.GetFileName(buffer.ToString())}\")");
+        }
+        Check(ShortNameSetting.IsCreationEnabled(Path.Combine(probeDir, "no such folder")) is null,
+            "a path that is not there gets no answer rather than a wrong one");
+        foreach (var drive in new[] { @"G:\", @"H:\" })
+            if (Directory.Exists(drive))
+                Console.WriteLine($"     ({drive} makes short names: {ShortNameSetting.IsCreationEnabled(drive)})");
+    }
+
+    static class Native
+    {
+        [System.Runtime.InteropServices.DllImport("kernel32.dll", CharSet = System.Runtime.InteropServices.CharSet.Unicode)]
+        public static extern uint GetShortPathNameW(string longPath, System.Text.StringBuilder shortPath, uint size);
     }
 
     sealed class Recorder : IProgress<BackupProgress>
@@ -880,7 +987,7 @@ internal static class Program
         svm.OnBackupProgress(Data(@"D:\x\a.bin", 0));   // then the copy starts
         await Task.Delay(600);
         svm.OnBackupProgress(Data(@"D:\x\a.bin", 50));  // and is half done 0.6 s later
-        Check(svm.StatsText.EndsWith("~00:00 remaining") || svm.StatsText.EndsWith("~00:01 remaining"),
+        Check(svm.StatsText.EndsWith("about 00:00 remaining") || svm.StatsText.EndsWith("about 00:01 remaining"),
             $"the copy's time left follows its own rate, not the phases' time before it (\"{svm.StatsText}\")");
 
         svm.CancelCommand.Execute(null);
