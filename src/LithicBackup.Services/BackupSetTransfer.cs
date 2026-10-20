@@ -66,7 +66,10 @@ public static class BackupSetTransfer
             }
             else
             {
-                historyDb = Path.Combine(Path.GetTempPath(), $"lithic-export-{Guid.NewGuid():N}.db");
+                // Beside the export, on the drive the user chose for it: a history
+                // is gigabytes, and the system drive may not have room for it.
+                historyDb = Path.Combine(Path.GetDirectoryName(Path.GetFullPath(path))!,
+                    $"{Path.GetFileName(path)}.{Guid.NewGuid():N}.history.partial");
                 status?.Report("Copying the backup history…");
                 await catalog.ExportSetHistoryAsync(set.Id, historyDb, ct);
 
@@ -95,13 +98,6 @@ public static class BackupSetTransfer
     }
 
     /// <summary>
-    /// Create a backup set from an export file, with its backup history if the
-    /// file has it. Automated backups arrive paused
-    /// (<see cref="JobOptions.HoldAutomatedBackups"/>). All or nothing: if the
-    /// history cannot be imported, the set is removed again.
-    /// </summary>
-    /// <exception cref="InvalidDataException">The file is not a backup set export.</exception>
-    /// <summary>
     /// What an export file holds, without importing anything: its settings, and
     /// whether it carries the backup history. For asking before an import (a
     /// .lithic file opened from Explorer).
@@ -124,6 +120,13 @@ public static class BackupSetTransfer
         return (await DeserializeAsync(f, ct), false);
     }
 
+    /// <summary>
+    /// Create a backup set from an export file, with its backup history if the
+    /// file has it. Automated backups arrive paused
+    /// (<see cref="JobOptions.HoldAutomatedBackups"/>). All or nothing: if the
+    /// history cannot be imported, the set is removed again.
+    /// </summary>
+    /// <exception cref="InvalidDataException">The file is not a backup set export.</exception>
     public static async Task<BackupSetImportResult> ImportAsync(
         ICatalogRepository catalog, string path,
         IProgress<string>? status = null, CancellationToken ct = default)
@@ -144,7 +147,8 @@ public static class BackupSetTransfer
                 if (zip.GetEntry(HistoryEntryName) is { } history)
                 {
                     status?.Report("Extracting the backup history…");
-                    historyDb = Path.Combine(Path.GetTempPath(), $"lithic-import-{Guid.NewGuid():N}.db");
+                    // Beside the catalog, whose volume must hold the history anyway.
+                    historyDb = Path.Combine(catalog.DataDirectory, $"lithic-import-{Guid.NewGuid():N}.db");
                     await Task.Run(() => history.ExtractToFile(historyDb), ct);
                 }
             }

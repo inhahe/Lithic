@@ -10,6 +10,13 @@ public interface ICatalogRepository : IDisposable
     // --- Backup Sets ---
     Task<BackupSet> CreateBackupSetAsync(BackupSet set, CancellationToken ct = default);
     Task<BackupSet?> GetBackupSetAsync(int id, CancellationToken ct = default);
+
+    /// <summary>
+    /// The folder the catalog lives in. A work file that becomes catalog data -
+    /// an import's staged history - goes here, on the volume that has to hold the
+    /// result anyway, not in the system's temp folder.
+    /// </summary>
+    string DataDirectory { get; }
     Task<IReadOnlyList<BackupSet>> GetAllBackupSetsAsync(CancellationToken ct = default);
 
     /// <summary>

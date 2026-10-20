@@ -32,6 +32,9 @@ public class SqliteCatalogRepository : ICatalogRepository
     private readonly SemaphoreSlim _masterGate = new(1, 1);
     private readonly string _setsDir;
 
+    /// <inheritdoc />
+    public string DataDirectory { get; }
+
     private readonly ConcurrentDictionary<int, SqliteSetDatabase> _sets = new();
     private readonly object _setsLock = new();
 
@@ -59,6 +62,7 @@ public class SqliteCatalogRepository : ICatalogRepository
         InitializeSchema();
 
         var dir = Path.GetDirectoryName(Path.GetFullPath(databasePath))!;
+        DataDirectory = dir;
         _setsDir = Path.Combine(dir, "sets");
         Directory.CreateDirectory(_setsDir);
 

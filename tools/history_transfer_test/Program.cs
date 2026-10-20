@@ -156,10 +156,15 @@ var snapshotHashes = HashTree(snapshot);
 Console.WriteLine();
 Console.WriteLine("=== 1. Export with history -> import on a new computer ===");
 string exportFile = Path.Combine(root, "laptop docs.lithic");
+// Anything either direction stages in the system's temp folder, however briefly.
+var stagedInTemp = new System.Collections.Concurrent.ConcurrentBag<string>();
+using var tempWatch = new FileSystemWatcher(Path.GetTempPath(), "lithic-*") { EnableRaisingEvents = true };
+tempWatch.Created += (_, e) => stagedInTemp.Add(e.Name ?? "");
 await BackupSetTransfer.ExportAsync(repoA, setAStored, exportFile, includeHistory: true);
 byte[] head = File.ReadAllBytes(exportFile)[..4];
 Check(head[0] == 0x50 && head[1] == 0x4B, "an export with history is a zip");
 Check(!File.Exists(exportFile + ".partial"), "no partial file is left behind");
+Check(!Directory.EnumerateFiles(root, "*.history.partial").Any(), "nor the history it staged beside the export");
 
 var repoB = NewCatalog(Path.Combine(root, "B"));
 var svcB = NewService(repoB);
@@ -182,6 +187,11 @@ for (int i = 1; i <= discsA.Count + 2; i++)
 var otherDiscIds = (await repoB.GetDiscsForBackupSetAsync(other.Id)).Select(d => d.Id).ToHashSet();
 
 var imported = await BackupSetTransfer.ImportAsync(repoB, exportFile);
+Check(!Directory.EnumerateFiles(repoB.DataDirectory, "lithic-import-*").Any(),
+    "the import's staged history, kept beside the catalog, is gone afterwards");
+await Task.Delay(500);   // let the watcher's last events arrive
+tempWatch.EnableRaisingEvents = false;
+Check(stagedInTemp.IsEmpty, $"and neither direction staged anything in the system's temp folder ({string.Join(", ", stagedInTemp)})");
 var setB = (await repoB.GetBackupSetAsync(imported.Set.Id))!;
 Check(imported.IncludedHistory, "the import found the history");
 Check(imported.FileRecords == allA.Count, $"every file record came across ({imported.FileRecords} of {allA.Count})");

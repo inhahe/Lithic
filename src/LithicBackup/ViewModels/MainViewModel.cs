@@ -4776,7 +4776,9 @@ public class MainViewModel : ViewModelBase
         try
         {
             var status = new Progress<string>(s => StatusText = $"Exporting \"{set.Name}\": {s}");
-            await BackupSetTransfer.ExportAsync(_catalog, set, file, withHistory, status);
+            // Off the UI thread: the catalog work in it is synchronous SQLite, and a
+            // history is gigabytes.
+            await Task.Run(() => BackupSetTransfer.ExportAsync(_catalog, set, file, withHistory, status));
             StatusText = withHistory
                 ? $"Exported \"{set.Name}\" with its backup history to {file} ({FormatBytes(new FileInfo(file).Length)} bytes)."
                 : $"Exported \"{set.Name}\" (settings only) to {file}.";
@@ -4880,7 +4882,9 @@ public class MainViewModel : ViewModelBase
         try
         {
             var status = new Progress<string>(s => StatusText = $"Importing: {s}");
-            var result = await BackupSetTransfer.ImportAsync(_catalog, fileName, status);
+            // Off the UI thread: creating the set and allocating a disc id for each
+            // of a long-lived set's tens of thousands of runs is synchronous SQLite.
+            var result = await Task.Run(() => BackupSetTransfer.ImportAsync(_catalog, fileName, status));
             var newSet = result.Set;
             await LoadBackupSetsAsync();
             SelectedBackupSet = BackupSets.FirstOrDefault(s => s.Id == newSet.Id)?.Model;
