@@ -748,6 +748,52 @@ async Task PartC()
         Check(rig.Log.Count("is done with") >= 1, "C8 and the Worker says the app is done with the set");
         await rig.DisposeAsync();
     }
+
+    // C9 --------------------------------------------------------------------
+    // A resolver's change (a volume identity, a drive letter) is saved on the
+    // catalog's current copy of the set, not the Worker's, which can be hours
+    // old. Written back whole, the Worker's copy undid what had been saved since.
+    {
+        string dir = Path.Combine(root, "c9");
+        string src = Path.Combine(dir, "src");
+        string dst = Path.Combine(dir, "dst");
+        Directory.CreateDirectory(src);
+        Directory.CreateDirectory(dst);
+        File.WriteAllText(Path.Combine(src, "one.txt"), "one");
+
+        var rig = await Rig.CreateAsync(Path.Combine(dir, "catalog.db"), stampedSetIds, set =>
+        {
+            set.SourceSelections = [ new SourceSelection { Path = src, IsDirectory = true, IsSelected = true } ];
+            set.SourceRoots = [src];
+            set.JobOptions!.TargetDirectory = dst;
+        });
+        rig.Destination.Connected = true;
+        bool edited = false;
+        rig.Destination.Mutate = options =>
+        {
+            if (options.DestinationVolumeId == "moved")
+                return false;
+            if (!edited)
+            {
+                // The user saves an edit after the Worker read the set.
+                edited = true;
+                var saved = rig.Repo.GetBackupSetAsync(rig.SetId).GetAwaiter().GetResult()!;
+                saved.JobOptions!.ExcludedExtensions.Add("*.edited-meanwhile");
+                rig.Repo.UpdateBackupSetAsync(saved).GetAwaiter().GetResult();
+            }
+            options.DestinationVolumeId = "moved";
+            return true;
+        };
+
+        await rig.Worker.StartAsync(CancellationToken.None);
+        bool ran = await WaitUntil(() => edited && rig.Log.Count("Starting backup for") > 0, TimeSpan.FromSeconds(60));
+        await rig.DisposeAsync();
+        using var check = new SqliteCatalogRepository(Path.Combine(dir, "catalog.db"));
+        var after = (await check.GetBackupSetAsync(rig.SetId))!.JobOptions!;
+        Check(ran && after.DestinationVolumeId == "moved", $"C9 the resolver's change is saved (\"{after.DestinationVolumeId}\")");
+        Check(after.ExcludedExtensions.Contains("*.edited-meanwhile"),
+            "C9 and an edit saved after the Worker read the set survives it");
+    }
 #endif
 }
 
@@ -994,11 +1040,15 @@ sealed class SwitchableDestination : IDestinationResolver
     public volatile bool Connected;
     public int Calls => Volatile.Read(ref _calls);
 
+    /// <summary>Applied to the options before answering, as a volume-identity backfill would be; true when it changed them.</summary>
+    public Func<JobOptions, bool>? Mutate;
+
     public DestinationResolution Resolve(JobOptions options)
     {
         Interlocked.Increment(ref _calls);
+        bool changed = Mutate?.Invoke(options) ?? false;
         return Connected
-            ? new DestinationResolution(options.TargetDirectory, IsConnected: true, LetterChanged: false, options.TargetDirectory, MetadataChanged: false)
+            ? new DestinationResolution(options.TargetDirectory, IsConnected: true, LetterChanged: false, options.TargetDirectory, MetadataChanged: changed)
             : new DestinationResolution(null, IsConnected: false, LetterChanged: false, options.TargetDirectory, MetadataChanged: false);
     }
 }

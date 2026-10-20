@@ -193,7 +193,8 @@ public sealed class BackupWorker : BackgroundService
 
         // Volume identity only - never the selection.
         if (resolution.MetadataChanged)
-            await _catalog.UpdateBackupSetMetadataAsync(set, ct);
+            await PersistResolvedAsync(set, fresh => _destinationResolver.Resolve(fresh.JobOptions!),
+                metadataOnly: true, ct);
 
         if (!resolution.IsConnected)
         {
@@ -228,6 +229,30 @@ public sealed class BackupWorker : BackgroundService
     }
 
     /// <summary>
+    /// Save a drive-letter move or volume identity the resolver applied to the
+    /// Worker's copy of a set, by applying it again to the catalog's current copy
+    /// and writing that. The Worker's copy is from the last reload, which during
+    /// another set's long scan can be hours old; written back whole, it would undo
+    /// whatever was saved since - an edit to the selection, a hold on automated
+    /// backups placed by a seed.
+    /// </summary>
+    /// <param name="stale">The Worker's copy, already resolved; it names the set.</param>
+    /// <param name="resolve">The same resolution, made on the fresh copy.</param>
+    /// <param name="metadataOnly">Write the set's metadata only (options, volume ids), not its selection.</param>
+    private async Task PersistResolvedAsync(
+        BackupSet stale, Action<BackupSet> resolve, bool metadataOnly, CancellationToken ct)
+    {
+        var fresh = await _catalog.GetBackupSetAsync(stale.Id, ct);
+        if (fresh?.JobOptions is null)
+            return;
+        resolve(fresh);
+        if (metadataOnly)
+            await _catalog.UpdateBackupSetMetadataAsync(fresh, ct);
+        else
+            await _catalog.UpdateBackupSetAsync(fresh, ct);
+    }
+
+    /// <summary>
     /// Follow the set's source drives across any drive-letter reassignment
     /// (rewriting source paths and persisting the change), and report source
     /// availability.  Returns <c>false</c> when no configured source location is
@@ -245,7 +270,7 @@ public sealed class BackupWorker : BackgroundService
         var resolution = _sourceResolver.Resolve(set);
 
         if (resolution.MetadataChanged)
-            await _catalog.UpdateBackupSetAsync(set, ct);
+            await PersistResolvedAsync(set, fresh => _sourceResolver.Resolve(fresh), metadataOnly: false, ct);
 
         if (resolution.LetterChanges.Count > 0)
         {
