@@ -4925,14 +4925,15 @@ public class MainViewModel : ViewModelBase
     /// Returns the set as stored, or null if it no longer exists. A set with no
     /// saved options has no schedule to hold and is left alone.
     /// </summary>
-    /// <param name="markBackedUpIfNever">
-    /// Also stamp <see cref="BackupSet.LastBackupUtc"/> when it is empty: a full
-    /// check that found every file already backed up has, in effect, backed the
-    /// set up, and "Never backed up" would then be wrong (it is what a freshly
-    /// seeded set showed indefinitely, since a backup with nothing to copy never
-    /// set it).
+    /// <param name="markBackedUp">
+    /// Also stamp <see cref="BackupSet.LastBackupUtc"/> with now: a full check that
+    /// found every file already backed up has backed the set up, though a backup
+    /// with nothing to copy writes nothing. The Worker times its next whole-tree
+    /// scan from that stamp when a hold ends, and a set imported with its history
+    /// carries the old computer's, so stamping only an empty one left the release
+    /// followed by a redundant full scan.
     /// </param>
-    private async Task<BackupSet?> SetAutomationHoldAsync(int setId, bool hold, bool markBackedUpIfNever = false)
+    private async Task<BackupSet?> SetAutomationHoldAsync(int setId, bool hold, bool markBackedUp = false)
     {
         var fresh = await _catalog.GetBackupSetAsync(setId);
         if (fresh is null)
@@ -4944,7 +4945,7 @@ public class MainViewModel : ViewModelBase
             opts.HoldAutomatedBackups = hold;
             changed = true;
         }
-        if (markBackedUpIfNever && fresh.LastBackupUtc is null)
+        if (markBackedUp)
         {
             fresh.LastBackupUtc = DateTime.UtcNow;
             changed = true;
@@ -5161,7 +5162,7 @@ public class MainViewModel : ViewModelBase
     {
         try
         {
-            var stored = await SetAutomationHoldAsync(row.Id, hold: false, markBackedUpIfNever: nothingToBackUp);
+            var stored = await SetAutomationHoldAsync(row.Id, hold: false, markBackedUp: nothingToBackUp);
             if (stored is not null)
                 row.UpdateModel(stored);
         }
