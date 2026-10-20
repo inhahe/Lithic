@@ -1164,6 +1164,7 @@ public class MainViewModel : ViewModelBase
             DirectoryBackupService.SeedOutcome outcome;
             try
             {
+                await WaitForBackgroundRunAsync(row, backupSet.Id, $"Seeding from {dir}", rowCts.Token);
                 outcome = await Task.Run(() =>
                     _directoryBackupService.SeedFromExistingDirectoryAsync(
                         backupSet.Id, dir, scanProgress, rowCts.Token,
@@ -1282,6 +1283,8 @@ public class MainViewModel : ViewModelBase
             BeginRowWork(row, "clearing its history", "Clearing backup history…", cancel: null);
             try
             {
+                await WaitForBackgroundRunAsync(row, backupSet.Id, "Clearing backup history");
+
                 // Hold first: with an empty catalog, the Worker's next run would
                 // be a full re-copy over the destination before the user had a
                 // chance to seed it. (It would also be refused there now, but only
@@ -3516,6 +3519,18 @@ public class MainViewModel : ViewModelBase
         if (isDir && !await ConfirmBackupOverUntrackedDestinationAsync(backupSet, sources, job.TargetDirectory!))
             return;
 
+        // That prompt is modal only to its window, and the editor is not: a seed
+        // can have taken the row while it was up.
+        if (row.IsRunning)
+        {
+            if (row.BusyActivity is { } busyNow)
+                MessageBox.Show(
+                    $"\"{row.Name}\" is {busyNow} right now, so it can't be backed up "
+                    + "yet. Back it up when that has finished.",
+                    "Backup", MessageBoxButton.OK, MessageBoxImage.Information);
+            return;
+        }
+
         // Targeted run: the caller already knows exactly which files to copy, so
         // skip the scan-and-diff entirely.
         if (onlyThesePaths is not null)
@@ -5007,6 +5022,25 @@ public class MainViewModel : ViewModelBase
             }
         };
         editor.PropertyChanged += onChanged;
+    }
+
+    /// <summary>
+    /// Wait until the Worker has stopped any backup of the set it was running.
+    /// Holding the set's row tells it to stop (<see cref="SyncAppHold"/>) and it
+    /// does within a second; work that writes the set's catalog - a seed, clearing
+    /// its history - waits for that before writing, as a cleanup does, or its
+    /// first writes would land beside the Worker's last.
+    /// </summary>
+    /// <param name="what">What is waiting, for the row's status line.</param>
+    private async Task WaitForBackgroundRunAsync(
+        BackupSetRowViewModel? row, int setId, string what, CancellationToken ct = default)
+    {
+        if (!_catalog.IsSetBeingBackedUpInBackground(setId))
+            return;
+        if (row is not null)
+            row.RunningStatusText = $"{what}: waiting for the background service to pause its backup of this set…";
+        while (_catalog.IsSetBeingBackedUpInBackground(setId))
+            await Task.Delay(250, ct);
     }
 
     /// <summary>Holds on sets whose row is working, by set id (see <see cref="SyncAppHold"/>).</summary>

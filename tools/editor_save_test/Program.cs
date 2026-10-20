@@ -728,6 +728,29 @@ internal static class Program
             held.Dispose();
         }
         await EnsureClosedAsync(ed2.Window);
+
+        // --- the background service is backing the set up ---
+        // Holding the row tells it to stop; the seed waits until it has, rather
+        // than recording files beside the service's last batch.
+        await _observer.ClearBackupSetCatalogAsync(_setId);
+        var ed3 = await OpenEditorAsync("seed after the service");
+        if (ed3 is null) return;
+        var serviceRun = _catalog.HoldSetForBackgroundBackup(_setId);
+        try
+        {
+            ed3.Vm.SeedFromExistingCommand.Execute(null);
+            Check(await WaitFor(() => row.RunningStatusText.Contains("waiting for the background service", StringComparison.Ordinal), 10000),
+                $"a seed waits while the service is still backing the set up (\"{row.RunningStatusText}\")");
+            await Task.Delay(1000);
+            Check((await _observer.GetLatestVersionInfoAsync(_setId)).Count == 0, "and records nothing meanwhile");
+        }
+        finally
+        {
+            serviceRun.Dispose();
+        }
+        Check(await WaitFor(() => !row.IsRunning, 20000) && row.LastResultText.StartsWith("Seeded:", StringComparison.Ordinal),
+            $"once the service has stopped, the seed goes ahead and finishes (\"{row.LastResultText}\")");
+        await EnsureClosedAsync(ed3.Window);
     }
 #endif
 
