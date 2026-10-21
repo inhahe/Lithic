@@ -66,11 +66,8 @@ public class VerifyIntegrityViewModel : ViewModelBase, IDisposable
 
         Issues = [];
 
-        CloseCommand = new RelayCommand(_ =>
-        {
-            Dispose();
-            DoneRequested?.Invoke();
-        });
+        // The window's closing disposes this, which stops the work.
+        CloseCommand = new RelayCommand(_ => DoneRequested?.Invoke());
 
         RepairCommand = new RelayCommand(async _ => await RepairAsync(), _ => CanRepair);
         VerifyCommand = new RelayCommand(async _ => await RunVerificationAsync(), _ => CanVerify);
@@ -236,10 +233,7 @@ public class VerifyIntegrityViewModel : ViewModelBase, IDisposable
     /// <summary>Starts (or restarts) verification using the current <see cref="VerifyContents"/> setting.</summary>
     public ICommand VerifyCommand { get; }
 
-    /// <summary>
-    /// Stop the work under way: Close does, and so does the window closing any
-    /// other way (its task window disposes it).
-    /// </summary>
+    /// <summary>Its task window has closed, however: the work under way stops.</summary>
     public void Dispose() => _cts?.Cancel();
 
     // --- Logic ---

@@ -1917,13 +1917,33 @@ are excluded anyway.
   a flow that is `IDisposable` when its window closes, however it was closed;
   Cleanup, Verify, Coverage and Largest Files cancel their scans there. A
   purge, a write the user confirmed, carries on, on its own token.
-* **Await catalog calls in background work; don't block on them.** Work under a
-  progress window or `Task.Run` awaits (`ProgressDialog.RunAsync` takes async
-  work). It stays on a background thread all the same: the catalog's async
-  methods do their SQLite work synchronously before returning. Awaiting inside
-  a catalog transaction is safe: its owner is an `AsyncLocal` flow token, which
-  survives an await, and its locks are not thread-bound. Only saving at exit
-  blocks, because the process will not wait for an async save.
+* **Await catalog calls; don't block on them.** Work under a progress window
+  awaits (`ProgressDialog.RunAsync` takes async work). The UI thread may await
+  a set's catalog call directly: every way into a set's gate
+  (`SqliteSetDatabase.LockAsync`, `WriteLockAsync`) first hops off a thread
+  with a SynchronizationContext, since the catalog's async methods do their
+  SQLite work before they first truly await, and a read of millions of rows
+  ran on the UI thread. Awaiting inside a catalog transaction is safe: its
+  owner is an `AsyncLocal` flow token, which survives an await or a hop, and
+  its locks are not thread-bound. Only saving at exit blocks, because the
+  process will not wait for an async save.
+* **A deleted set stays deleted for the session.** `DeleteBackupSetAsync`
+  marks the set deleted, and only after releasing the master gate closes its
+  database. `SqliteSetDatabase.CloseAsync` waits for whatever holds the set's
+  gate, so a read under way finishes first. A call that reaches the set
+  afterwards gets `BackupSetDeletedException`; neither a late caller nor a
+  reader holding an old reference re-creates the database. The search across
+  sets skips a set deleted under it.
+* **"Everything under a folder" is a range on the NOCASE path index, bounded
+  exactly: `'P\' <= path < 'P]'`.** `]` is the character after `\` in NOCASE
+  order (which folds only ASCII letters), so the range holds the paths under P
+  whatever they contain; no sentinel "above every character" exists, since a
+  file name can hold U+10FFFF. The restore browser's skip-scan moves its
+  inclusive cursor to `P]` past a folder and just past a file, and throws if
+  it ever stops advancing. These queries name their index (`INDEXED BY`): a
+  planner that cannot use it fails loudly instead of reading every file of the
+  set per folder, as a join, an OR or a stray `ORDER BY` once led it to do.
+  `tools\path_range_test` holds them to one meaning and checks the cost.
 
 ## Verifying changes
 

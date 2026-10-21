@@ -9,9 +9,13 @@
 //   - in any letter case (Windows paths ignore it);
 //   - and the path itself, when it names a file;
 //   - but no sibling that merely starts with the same name ("a bar", "a!", "a]");
-//   - including names whose first character lies beyond U+FFFF (an emoji):
-//     a range's upper bound of "prefix + U+FFFF" sorts BELOW them in UTF-8,
-//     so such a folder vanished from all of these reads;
+//   - including names whose first character lies beyond U+FFFF (an emoji),
+//     and one starting with U+10FFFF itself: a range's upper bound must not be
+//     a sentinel "above every character", for in UTF-8 an emoji sorted above
+//     U+FFFF, and no sentinel lies above every character a name can hold;
+//   - and the restore browser lists a folder whose subfolder holds such names
+//     without listing the subfolder again (with U+FFFF, forever);
+//   - and a remap of a prefix holding an emoji cuts exactly the prefix;
 //
 // and that reading or counting a small folder costs a sliver of the whole set:
 // the planner reads every file of the set for a query shaped wrong (an OR, a
@@ -47,6 +51,7 @@ var disc = await repo.CreateDiscAsync(new DiscRecord
 });
 
 const string Emoji = "\U0001F600";   // beyond U+FFFF: a surrogate pair, four bytes in UTF-8
+const string Highest = "\U0010FFFF"; // the highest code point, which NTFS allows in a name
 string[] under =
 [
     @"C:\pr\a\one.txt",
@@ -54,6 +59,7 @@ string[] under =
     @"C:\PR\A\three.txt",                     // another letter case of the same folder
     $@"C:\pr\a\{Emoji} emoji\four.txt",
     $@"C:\pr\a\{Emoji}.txt",
+    $@"C:\pr\a\{Highest}x.txt",
 ];
 string[] beside =
 [
@@ -62,6 +68,7 @@ string[] beside =
     @"C:\pr\a]\z.txt",                        // ']' sorts right after '\'
     @"C:\pr\b\other.txt",
     @"C:\pr\file.txt",
+    $@"C:\pr\{Emoji} photos\abc.jpg",
 ];
 const int Bulk = 300_000;                     // elsewhere in the set, for the cost check
 
@@ -113,14 +120,28 @@ var (count, bytes) = await repo.GetActiveSubtreeStatsAsync(set.Id, @"C:\pr\a");
 Check(count == under.Length && bytes == 100L * under.Length,
     $"its file count and size ({count}, {bytes:N0} bytes)");
 var children = await repo.GetRestoreChildrenAsync(set.Id, @"C:\pr\a");
-string[] wantChildren = ["sub", $"{Emoji} emoji", "one.txt", "three.txt", $"{Emoji}.txt"];
+string[] wantChildren = ["sub", $"{Emoji} emoji", "one.txt", "three.txt", $"{Emoji}.txt", $"{Highest}x.txt"];
 Check(Same(children.Select(c => c.Name), wantChildren) && children.Count == wantChildren.Length,
     $"the restore browser's children of it: {Show(children.Select(c => c.Name))}");
 
+// Listing the folder above: "a" holds names past U+FFFF, which a cursor jumped
+// past "a" with a sentinel would land below, listing "a" again - for ever, so
+// the listing gets a deadline.
+using (var deadline = new CancellationTokenSource(TimeSpan.FromSeconds(15)))
+{
+    string[] wantTop = ["a", "a bar", "a!", "a]", "b", "bulk", $"{Emoji} photos", "file.txt"];
+    IReadOnlyList<RestoreTreeChild>? top = null;
+    try { top = await repo.GetRestoreChildrenAsync(set.Id, @"C:\pr", deadline.Token); }
+    catch (OperationCanceledException) { }
+    Check(top is not null && Same(top.Select(c => c.Name), wantTop) && top.Count == wantTop.Length,
+        top is null ? "the restore browser's children of C:\\pr: it did not finish in 15 s"
+                    : $"the restore browser's children of C:\\pr, each once: {Show(top.Select(c => c.Name))}");
+}
+
 Console.WriteLine();
 Console.WriteLine("=== a small folder costs a sliver of the whole set ===");
-// Warm both, then take the best of five: the cost of reading 5 records of
-// 300,010 must not be the cost of reading all of them.
+// Warm both, then take the best of five: the cost of reading a handful of
+// records among 300,000 must not be the cost of reading all of them.
 await repo.GetFileRecordsUnderDirectoryAsync(set.Id, @"C:\pr\a");
 await repo.GetFileRecordsUnderDirectoryAsync(set.Id, @"C:\pr");
 long Best(Func<Task> read)
@@ -138,7 +159,7 @@ long small = Best(() => repo.GetFileRecordsUnderDirectoryAsync(set.Id, @"C:\pr\a
 long all = Best(() => repo.GetFileRecordsUnderDirectoryAsync(set.Id, @"C:\pr"));
 double ms(long ticks) => ticks * 1000.0 / Stopwatch.Frequency;
 Check(small * 50 < all,
-    $"reading the 5 records under C:\\pr\\a takes {ms(small):F2} ms, against {ms(all):F0} ms for all {Bulk + under.Length + beside.Length:N0}");
+    $"reading the {under.Length} records under C:\\pr\\a takes {ms(small):F2} ms, against {ms(all):F0} ms for all {Bulk + under.Length + beside.Length:N0}");
 long countSmall = Best(() => repo.CountFilesUnderSourcePrefixAsync(set.Id, @"C:\pr\a"));
 long countAll = Best(() => repo.CountFilesUnderSourcePrefixAsync(set.Id, @"C:\pr"));
 Check(countSmall * 50 < countAll,
@@ -155,6 +176,10 @@ Check(moved == under.Length && after.Count == under.Length,
     $"the remap moved {moved} paths, and {after.Count} are now under the new name");
 Check(beside.All(leftBeside.Contains),
     $"and left the siblings where they were: {Show(leftBeside.Where(p => !p.Contains(@"\renamed\")))}");
+int movedPhotos = await repo.RemapSourcePathPrefixAsync(set.Id, $@"C:\pr\{Emoji} photos", @"C:\pr\photos");
+var photos = await repo.GetFileRecordsUnderDirectoryAsync(set.Id, @"C:\pr\photos");
+Check(movedPhotos == 1 && photos.Count == 1 && photos[0].SourcePath == @"C:\pr\photos\abc.jpg",
+    $"a prefix holding an emoji is cut exactly: {Show(photos.Select(r => r.SourcePath))}");
 
 Console.WriteLine();
 repo.Dispose();

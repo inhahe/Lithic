@@ -10,9 +10,18 @@ namespace LithicBackup.ViewModels;
 /// Lets users search for a file or directory by name substring and see
 /// which backup sets contain matches, with per-set summary info.
 /// </summary>
-public class FindFileViewModel : ViewModelBase
+public class FindFileViewModel : ViewModelBase, IDisposable
 {
     private readonly ICatalogRepository _catalog;
+
+    /// <summary>
+    /// Cancelled when the window has closed: a search reads every file of every
+    /// set, holding each set's gate while it does, for nobody once it is gone.
+    /// </summary>
+    private readonly CancellationTokenSource _closed = new();
+
+    /// <summary>Its task window has closed: a search under way stops.</summary>
+    public void Dispose() => _closed.Cancel();
 
     private string _searchText = "";
     private string _statusText = "Enter a file or directory name to search across all backup sets.";
@@ -89,10 +98,7 @@ public class FindFileViewModel : ViewModelBase
 
         try
         {
-            // Off the UI thread: the catalog's async methods do their SQLite work
-            // before they return, and a search reads every file of every set.
-            string text = SearchText.Trim();
-            var results = await Task.Run(() => _catalog.SearchFilesAcrossSetsAsync(text));
+            var results = await _catalog.SearchFilesAcrossSetsAsync(SearchText.Trim(), _closed.Token);
 
             foreach (var result in results)
                 Results.Add(new FileSearchResultViewModel(result));
@@ -105,6 +111,10 @@ public class FindFileViewModel : ViewModelBase
                 1 => "Found matches in 1 backup set.",
                 _ => $"Found matches in {Results.Count} backup sets.",
             };
+        }
+        catch (OperationCanceledException) when (_closed.IsCancellationRequested)
+        {
+            // The window closed mid-search.
         }
         catch (Exception ex)
         {

@@ -853,6 +853,35 @@ using (var cts = new CancellationTokenSource())
         "and the extracted history is cleaned up");
 }
 
+// ===================================================================
+// 11. A set deleted while a read of it is under way.
+// ===================================================================
+// The read of the large history takes most of a second. The delete waits for
+// it rather than closing the database under it, and the deleted set, asked for
+// again, is refused rather than made anew.
+Console.WriteLine();
+Console.WriteLine("=== 11. Deleting a set while a read of it is under way ===");
+{
+    var readStarted = new TaskCompletionSource();
+    var reading = Task.Run(() => repoP.GetAllFilesForBackupSetAsync(setP.Id, default,
+        new SyncProgress<int>(_ => readStarted.TrySetResult())));
+    await readStarted.Task;                       // rows are being read
+    await repoP.DeleteBackupSetAsync(setP.Id);
+    Exception? readError = null;
+    IReadOnlyList<FileRecord>? read = null;
+    try { read = await reading; }
+    catch (Exception ex) { readError = ex; }
+    Check(readError is null && read?.Count == LargeRecords,
+        $"a read under way when its set is deleted finishes ({read?.Count ?? 0:N0} records"
+        + (readError is null ? ")" : $"; {readError.GetType().Name}: {readError.Message})"));
+    Check(!File.Exists(setPFile), "and the set's database goes once it has");
+    bool refused = false;
+    try { await repoP.GetAllFilesForBackupSetAsync(setP.Id); }
+    catch (InvalidOperationException) { refused = true; }
+    Check(refused && !File.Exists(setPFile),
+        $"asked for again, the deleted set is refused, and no database is made for it (refused: {refused})");
+}
+
 Console.WriteLine();
 // Closed before the folder goes, or SQLite's open files keep it from going.
 foreach (var repo in new[] { repoA, repoB, repoA7, repoB7, repoA7b, repoB7b, repoP, repoQ })

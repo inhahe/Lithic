@@ -117,8 +117,16 @@ public class SqliteCatalogRepository : ICatalogRepository
 
     private string SetDbPath(int setId) => Path.Combine(_setsDir, $"set-{setId}.db");
 
+    /// <summary>
+    /// Sets deleted in this session. A reader that read the set list before the
+    /// delete must not re-create the deleted set's database by asking for it.
+    /// </summary>
+    private readonly ConcurrentDictionary<int, byte> _deletedSets = new();
+
     private SqliteSetDatabase GetSet(int setId)
     {
+        if (_deletedSets.ContainsKey(setId))
+            throw new BackupSetDeletedException(setId);
         if (_sets.TryGetValue(setId, out var db))
             return db;
 
@@ -688,7 +696,15 @@ public class SqliteCatalogRepository : ICatalogRepository
         foreach (var set in sets)
         {
             ct.ThrowIfCancellationRequested();
-            var partial = await GetSet(set.Id).SearchAsync(pathSubstring, ct).ConfigureAwait(false);
+            FileSearchResult? partial;
+            try
+            {
+                partial = await GetSet(set.Id).SearchAsync(pathSubstring, ct).ConfigureAwait(false);
+            }
+            catch (BackupSetDeletedException)
+            {
+                continue;   // deleted since the list was read
+            }
             if (partial is null)
                 continue;
             list.Add(new FileSearchResult
@@ -1039,13 +1055,18 @@ public class SqliteCatalogRepository : ICatalogRepository
             tx.Commit();
             _backupSetsStamp++;
 
-            // Committed - the set no longer exists, so its database can go.
-            RemoveSetDatabaseFile(backupSetId);
+            // Committed - the set no longer exists: nothing may open its
+            // database again, and it goes below.
+            _deletedSets[backupSetId] = 0;
         }
         finally
         {
             _masterGate.Release();
         }
+
+        // Outside the master gate: closing waits for a read of the set under way,
+        // and a flow holding the set's gate may be waiting for the master one.
+        await RemoveSetDatabaseFileAsync(backupSetId).ConfigureAwait(false);
 
         // Forget cached disc->set entries for this set.
         foreach (var kvp in _discToSet)
@@ -1173,10 +1194,15 @@ public class SqliteCatalogRepository : ICatalogRepository
         BackedUpUtc = f.BackedUpUtc,
     };
 
-    private void RemoveSetDatabaseFile(int setId)
+    /// <summary>
+    /// Close a deleted set's database - once whatever is reading it has finished -
+    /// and remove its files. The set is already marked deleted, so nothing can
+    /// open it again meanwhile.
+    /// </summary>
+    private async Task RemoveSetDatabaseFileAsync(int setId)
     {
         if (_sets.TryRemove(setId, out var db))
-            db.Dispose();
+            await db.CloseAsync().ConfigureAwait(false);
 
         var path = SetDbPath(setId);
         // ".writelock" is the cross-process write-lock marker file created beside

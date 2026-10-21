@@ -59,11 +59,8 @@ public class BackupCoverageViewModel : ViewModelBase, IDisposable
         NotBackedUpFiles = [];
         ChangedFiles = [];
 
-        CloseCommand = new RelayCommand(_ =>
-        {
-            Dispose();
-            DoneRequested?.Invoke();
-        });
+        // The window's closing disposes this, which stops the work.
+        CloseCommand = new RelayCommand(_ => DoneRequested?.Invoke());
 
         ComputeActualSizeCommand = new RelayCommand(
             _ => _ = ComputeActualSizeAsync(),
@@ -157,10 +154,7 @@ public class BackupCoverageViewModel : ViewModelBase, IDisposable
 
     public ICommand CloseCommand { get; }
 
-    /// <summary>
-    /// Stop the scan and the size estimate: Close does, and so does the window
-    /// closing any other way (its task window disposes it).
-    /// </summary>
+    /// <summary>Its task window has closed, however: the scan and the size estimate stop.</summary>
     public void Dispose()
     {
         _cts?.Cancel();

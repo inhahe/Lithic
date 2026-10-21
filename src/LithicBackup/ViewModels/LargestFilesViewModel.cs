@@ -105,11 +105,9 @@ public class LargestFilesViewModel : ViewModelBase, IConfirmClose, IDisposable
         _filesView = CollectionViewSource.GetDefaultView(_filesCollection);
 
         // Closing goes through the host window, which asks ConfirmClose first.
-        CloseCommand = new RelayCommand(_ =>
-        {
-            _cts?.Cancel();
-            DoneRequested?.Invoke();
-        });
+        // Its closing stops the scan: the task window disposes this, and the
+        // editor's window calls CancelScan.
+        CloseCommand = new RelayCommand(_ => DoneRequested?.Invoke());
 
         SaveCommand = new RelayCommand(_ => OnSave(), _ => !IsLoading && HasUnsavedChanges);
 

@@ -60,6 +60,9 @@ internal sealed class SqliteSetDatabase : IDisposable
     /// <summary>The token of the flow whose transaction is open; null when none is.</summary>
     private volatile FlowToken? _txOwner;
 
+    /// <summary>Set by <see cref="CloseAsync"/>: the set was deleted.</summary>
+    private volatile bool _closed;
+
     /// <summary>Identifies one flow of work to <see cref="_txOwner"/>; nothing else.</summary>
     private sealed class FlowToken;
 
@@ -124,13 +127,71 @@ internal sealed class SqliteSetDatabase : IDisposable
 
     private async Task<Releaser> LockAsync(CancellationToken ct)
     {
+        await new OffUiThread();
+
         // Reentrant short-circuit: the flow that holds this set's transaction
         // already holds the gate. Any other flow waits for it.
         if (OwnsTransaction)
             return default;
 
-        await _gate.WaitAsync(ct).ConfigureAwait(false);
+        await EnterGateAsync(ct).ConfigureAwait(false);
         return new Releaser(this);
+    }
+
+    /// <summary>
+    /// Take the gate, and give it straight back with
+    /// <see cref="BackupSetDeletedException"/> if the set has been deleted
+    /// meanwhile (<see cref="CloseAsync"/>). Every way into the gate is this one.
+    /// </summary>
+    private async Task EnterGateAsync(CancellationToken ct)
+    {
+        await _gate.WaitAsync(ct).ConfigureAwait(false);
+        if (_closed)
+        {
+            _gate.Release();
+            throw new BackupSetDeletedException(SetId);
+        }
+    }
+
+    /// <summary>
+    /// The set has been deleted: wait for whatever holds the gate to finish (a
+    /// read under way, an open transaction), then close the connection so the
+    /// files can go. Every call after that is refused with
+    /// <see cref="BackupSetDeletedException"/> rather than reading a disposed
+    /// connection. The gate itself is left alive for those late callers to take.
+    /// </summary>
+    public async Task CloseAsync()
+    {
+        await _gate.WaitAsync().ConfigureAwait(false);
+        try
+        {
+            _closed = true;
+            _connection.Dispose();
+        }
+        finally
+        {
+            _gate.Release();
+        }
+    }
+
+    /// <summary>
+    /// Awaited first by every call that takes the gate, so the work after it runs
+    /// on the thread pool when the call came from the UI thread (a
+    /// SynchronizationContext). The catalog's async methods do their SQLite work
+    /// before they first truly await, so with the gate free a read of millions of
+    /// rows ran on the UI thread and froze the window. The transaction's owner
+    /// (an AsyncLocal) flows with the hop; the gate and the write lock are not
+    /// bound to a thread.
+    /// </summary>
+    private readonly struct OffUiThread : System.Runtime.CompilerServices.ICriticalNotifyCompletion
+    {
+        public OffUiThread GetAwaiter() => this;
+        public bool IsCompleted => SynchronizationContext.Current is null;
+        public void GetResult() { }
+        public void OnCompleted(Action continuation) =>
+            ThreadPool.QueueUserWorkItem(static c => ((Action)c!)(), continuation);
+        public void UnsafeOnCompleted(Action continuation) =>
+            ThreadPool.UnsafeQueueUserWorkItem(static c => ((Action)c!)(), continuation);
     }
 
     /// <summary>
@@ -141,6 +202,8 @@ internal sealed class SqliteSetDatabase : IDisposable
     /// </summary>
     private async Task<WriteReleaser> WriteLockAsync(CancellationToken ct)
     {
+        await new OffUiThread();
+
         // Reentrant short-circuit: the flow that holds this set's transaction
         // already holds both the file lock and the gate.
         if (OwnsTransaction)
@@ -151,7 +214,7 @@ internal sealed class SqliteSetDatabase : IDisposable
         var fileLock = await AcquireCrossProcessWriteAsync(ct).ConfigureAwait(false);
         try
         {
-            await _gate.WaitAsync(ct).ConfigureAwait(false);
+            await EnterGateAsync(ct).ConfigureAwait(false);
         }
         catch
         {
@@ -345,7 +408,7 @@ internal sealed class SqliteSetDatabase : IDisposable
             .ConfigureAwait(false);
         try
         {
-            await _gate.WaitAsync(ct).ConfigureAwait(false);
+            await EnterGateAsync(ct).ConfigureAwait(false);
         }
         catch
         {
@@ -1049,17 +1112,17 @@ internal sealed class SqliteSetDatabase : IDisposable
 
         using var cmd = _connection.CreateCommand();
         cmd.CommandText = """
-            SELECT f.* FROM Files f
+            SELECT f.* FROM Files f INDEXED BY IX_Files_SourcePath_NoCase
             WHERE f.SourcePath >= $prefix COLLATE NOCASE AND f.SourcePath < $upper COLLATE NOCASE
               AND EXISTS (SELECT 1 FROM Discs d WHERE d.Id = f.DiscId AND d.BackupSetId = $setId)
             UNION ALL
-            SELECT f.* FROM Files f
+            SELECT f.* FROM Files f INDEXED BY IX_Files_SourcePath_NoCase
             WHERE f.SourcePath = $exact COLLATE NOCASE
               AND EXISTS (SELECT 1 FROM Discs d WHERE d.Id = f.DiscId AND d.BackupSetId = $setId)
             """;
         cmd.Parameters.AddWithValue("$setId", backupSetId);
         cmd.Parameters.AddWithValue("$prefix", prefix);
-        cmd.Parameters.AddWithValue("$upper", prefix + PathUpperSentinel);
+        cmd.Parameters.AddWithValue("$upper", PathRangeEnd(prefix));
         cmd.Parameters.AddWithValue("$exact", directoryPrefix);
 
         var list = new List<FileRecord>();
@@ -1072,15 +1135,29 @@ internal sealed class SqliteSetDatabase : IDisposable
     // Lazy restore browser
     // ---------------------------------------------------------------
 
-    // A string that compares greater than any real source path sharing a given
-    // prefix, used as the exclusive upper bound of a "everything under P" range,
-    // and to jump a cursor past a subtree. The set databases store text as UTF-8
-    // and COLLATE NOCASE compares its bytes (folding ASCII letters only), so the
-    // bound must sort above every character's encoding: U+10FFFF, the highest
-    // code point (F4 8F BF BF), does, and is a non-character no path holds.
-    // U+FFFF (EF BF BF) did not - every character beyond it (an emoji, F0 ...)
-    // sorts higher, so a name starting with one fell outside the range.
-    private const string PathUpperSentinel = "\U0010FFFF";
+    /// <summary>
+    /// The exclusive upper bound of "every path under <paramref name="prefix"/>",
+    /// a folder's path ending in its separator: the prefix with that '\' raised
+    /// to ']', the next character in NOCASE order (which folds ASCII letters
+    /// only) as in binary. So 'P\' &lt;= path &lt; 'P]' holds exactly the paths
+    /// under P, whatever characters follow - no sentinel above "every character"
+    /// is needed, and none exists that a file name cannot hold. The empty prefix
+    /// (the roots) is bounded above every first character a source path has: a
+    /// drive letter, or a UNC path's '\'.
+    /// </summary>
+    private static string PathRangeEnd(string prefix)
+    {
+        if (prefix.Length == 0)
+            return "\u0080";
+        System.Diagnostics.Debug.Assert(prefix[^1] == '\\', "a range's prefix ends in its separator");
+        return prefix[..^1] + "]";
+    }
+
+    /// <summary>
+    /// The least string above <paramref name="path"/> that is not a version of
+    /// it: no source path holds a control character, so nothing lies between.
+    /// </summary>
+    private static string JustAfter(string path) => path + "\u0001";
 
     /// <summary>
     /// List the direct children (subdirectories + files directly inside) of a
@@ -1098,7 +1175,6 @@ internal sealed class SqliteSetDatabase : IDisposable
         // Normalise to a directory prefix WITH a trailing separator so a child is
         // simply the next path segment after it.  Empty parent = list the roots.
         string prefix = parentPrefix.Length == 0 ? "" : parentPrefix.TrimEnd('\\') + "\\";
-        string upper = prefix + PathUpperSentinel;
 
         var dirs = new List<RestoreTreeChild>();
         var files = new List<RestoreTreeChild>();
@@ -1106,21 +1182,25 @@ internal sealed class SqliteSetDatabase : IDisposable
         using var cmd = _connection.CreateCommand();
         cmd.CommandText = """
             SELECT SourcePath, SizeBytes, BackedUpUtc
-            FROM Files
+            FROM Files INDEXED BY IX_Files_Active_SourcePath_NoCase
             WHERE IsDeleted = 0
-              AND SourcePath > $cursor COLLATE NOCASE
+              AND SourcePath >= $cursor COLLATE NOCASE
               AND SourcePath < $upper COLLATE NOCASE
             ORDER BY SourcePath COLLATE NOCASE, Version DESC
             LIMIT 1
             """;
-        string cursor = prefix;                       // first child is strictly > prefix
+        // The next child is the first path at or above the cursor; after each,
+        // the cursor moves just past it (a file, all its versions) or past the
+        // whole subtree under it (a folder).
+        string cursor = prefix;
         var pCursor = cmd.Parameters.AddWithValue("$cursor", cursor);
-        cmd.Parameters.AddWithValue("$upper", upper);
+        cmd.Parameters.AddWithValue("$upper", PathRangeEnd(prefix));
 
         while (true)
         {
             ct.ThrowIfCancellationRequested();
             pCursor.Value = cursor;
+            string before = cursor;
 
             string sp;
             long size;
@@ -1142,7 +1222,7 @@ internal sealed class SqliteSetDatabase : IDisposable
                 files.Add(new RestoreTreeChild(
                     rest, sp, false, size,
                     DateTime.Parse(backedUp, null, DateTimeStyles.RoundtripKind)));
-                cursor = sp;                          // skip all versions of this path
+                cursor = JustAfter(sp);
             }
             else if (sep == 0)
             {
@@ -1154,11 +1234,11 @@ internal sealed class SqliteSetDatabase : IDisposable
                 if (share is not null)
                 {
                     dirs.Add(new RestoreTreeChild(share, share, true, 0, null));
-                    cursor = share + "\\" + PathUpperSentinel; // jump past this share's subtree
+                    cursor = PathRangeEnd(share + "\\");
                 }
                 else
                 {
-                    cursor = sp;
+                    cursor = JustAfter(sp);
                 }
             }
             else
@@ -1166,8 +1246,13 @@ internal sealed class SqliteSetDatabase : IDisposable
                 string name = rest.Substring(0, sep);
                 string full = prefix + name;
                 dirs.Add(new RestoreTreeChild(name, full, true, 0, null));
-                cursor = full + "\\" + PathUpperSentinel; // jump past this subtree
+                cursor = PathRangeEnd(full + "\\");
             }
+
+            // The listing ends only by running out of rows, so a cursor that did
+            // not move would list the same child forever.
+            if (cursor == before)
+                throw new InvalidOperationException($"The restore listing of '{prefix}' stopped advancing at '{sp}'.");
         }
 
         // Directories first, then files, each alphabetical (case-insensitive).
@@ -1210,7 +1295,7 @@ internal sealed class SqliteSetDatabase : IDisposable
         using var _ = await LockAsync(ct).ConfigureAwait(false);
 
         string prefix = directoryPrefix.Length == 0 ? "" : directoryPrefix.TrimEnd('\\') + "\\";
-        string upper = prefix + PathUpperSentinel;
+        string upper = PathRangeEnd(prefix);
 
         using var cmd = _connection.CreateCommand();
         cmd.CommandText = """
@@ -1221,7 +1306,7 @@ internal sealed class SqliteSetDatabase : IDisposable
                            PARTITION BY SourcePath COLLATE NOCASE
                            ORDER BY Version DESC, Id DESC
                        ) AS rn
-                FROM Files
+                FROM Files INDEXED BY IX_Files_Active_SourcePath_NoCase
                 WHERE IsDeleted = 0
                   AND SourcePath > $low COLLATE NOCASE
                   AND SourcePath < $upper COLLATE NOCASE
@@ -1246,7 +1331,7 @@ internal sealed class SqliteSetDatabase : IDisposable
         using var _ = await LockAsync(ct).ConfigureAwait(false);
 
         string prefix = directoryPrefix.Length == 0 ? "" : directoryPrefix.TrimEnd('\\') + "\\";
-        string upper = prefix + PathUpperSentinel;
+        string upper = PathRangeEnd(prefix);
 
         using var cmd = _connection.CreateCommand();
         cmd.CommandText = """
@@ -1256,7 +1341,7 @@ internal sealed class SqliteSetDatabase : IDisposable
                            PARTITION BY f.SourcePath COLLATE NOCASE
                            ORDER BY f.Version DESC, f.Id DESC
                        ) AS rn
-                FROM Files f
+                FROM Files f INDEXED BY IX_Files_Active_SourcePath_NoCase
                 WHERE f.IsDeleted = 0
                   AND f.SourcePath > $low COLLATE NOCASE
                   AND f.SourcePath < $upper COLLATE NOCASE
@@ -1788,14 +1873,14 @@ internal sealed class SqliteSetDatabase : IDisposable
         // folder: no LIKE pattern, so nothing in the path to escape.
         using var cmd = _connection.CreateCommand();
         cmd.CommandText = """
-            SELECT COUNT(*) FROM Files
+            SELECT COUNT(*) FROM Files INDEXED BY IX_Files_SourcePath_NoCase
             WHERE SourcePath >= $prefix COLLATE NOCASE AND SourcePath < $upper COLLATE NOCASE
               AND EXISTS (SELECT 1 FROM Discs d
                           WHERE d.Id = Files.DiscId AND d.BackupSetId = $setId)
             """;
         cmd.Parameters.AddWithValue("$setId", backupSetId);
         cmd.Parameters.AddWithValue("$prefix", prefix);
-        cmd.Parameters.AddWithValue("$upper", prefix + PathUpperSentinel);
+        cmd.Parameters.AddWithValue("$upper", PathRangeEnd(prefix));
         return Convert.ToInt32(cmd.ExecuteScalar());
     }
 
@@ -1812,20 +1897,21 @@ internal sealed class SqliteSetDatabase : IDisposable
 
         using var cmd = _connection.CreateCommand();
         // Replace only the leading prefix: keep the tail after it verbatim.
-        // SUBSTR is 1-based, so start at oldP.Length + 1. The paths are found by
-        // a range on IX_Files_SourcePath_NoCase, as for the reads of a folder.
+        // SUBSTR is 1-based and counts characters as length() does - not as
+        // .NET's Length, which counts a character beyond U+FFFF twice. The paths
+        // are found by a range on IX_Files_SourcePath_NoCase, as for the reads
+        // of a folder.
         cmd.CommandText = """
-            UPDATE Files
-            SET SourcePath = $new || SUBSTR(SourcePath, $prefixLen + 1)
+            UPDATE Files INDEXED BY IX_Files_SourcePath_NoCase
+            SET SourcePath = $new || SUBSTR(SourcePath, length($prefix) + 1)
             WHERE SourcePath >= $prefix COLLATE NOCASE AND SourcePath < $upper COLLATE NOCASE
               AND EXISTS (SELECT 1 FROM Discs d
                           WHERE d.Id = Files.DiscId AND d.BackupSetId = $setId)
             """;
         cmd.Parameters.AddWithValue("$setId", backupSetId);
         cmd.Parameters.AddWithValue("$new", newP);
-        cmd.Parameters.AddWithValue("$prefixLen", oldP.Length);
         cmd.Parameters.AddWithValue("$prefix", oldP);
-        cmd.Parameters.AddWithValue("$upper", oldP + PathUpperSentinel);
+        cmd.Parameters.AddWithValue("$upper", PathRangeEnd(oldP));
         return cmd.ExecuteNonQuery();
     }
 
@@ -2035,7 +2121,7 @@ internal sealed class SqliteSetDatabase : IDisposable
         var fileLock = await AcquireCrossProcessWriteAsync(ct).ConfigureAwait(false);
         try
         {
-            await _gate.WaitAsync(ct).ConfigureAwait(false);
+            await EnterGateAsync(ct).ConfigureAwait(false);
         }
         catch
         {
