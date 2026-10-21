@@ -1,5 +1,23 @@
 # LithicBackup — Known Issues & Tech Debt
 
+## TECH DEBT: "files under this folder" reads every file of the set
+
+`SqliteSetDatabase.GetFileRecordsUnderDirectoryAsync` (the post-edit scan's
+targeted path, and folder renames in the Worker and `DirectoryBackupService`)
+matches `SourcePath LIKE prefix% ESCAPE '\' OR SourcePath = path COLLATE NOCASE`.
+`LIKE` compares without case and `IX_Files_SourcePath` is a BINARY index, so
+SQLite cannot use the index for the prefix. `EXPLAIN QUERY PLAN` on a real set
+(2026-10-21): `SEARCH d USING COVERING INDEX IX_Discs_BackupSetId`, `SEARCH f
+USING INDEX IX_Files_DiscId`, `USE TEMP B-TREE FOR ORDER BY`. So every file of
+the set is read and filtered, once per toggled root: the "targeted" scan costs
+a full scan each time.
+
+**Fix:** query a range, `SourcePath >= $lo AND SourcePath < $hi`, as
+`GetActiveLatestRecordsUnderPrefixAsync` already does with its `$upper` bound.
+Index the column `COLLATE NOCASE` (or compare in that collation), since Windows
+paths ignore case. Check the new plan reads `SEARCH f USING INDEX ...
+(SourcePath>? AND SourcePath<?)`.
+
 ## TECH DEBT: most test harnesses leave their temp folder behind on every run
 
 **Seen 2026-10-21:** 286 `%TEMP%\lithic_<harness>_<guid>` folders, 712 MB,
