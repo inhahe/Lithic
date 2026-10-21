@@ -701,6 +701,7 @@ internal sealed class SqliteSetDatabase : IDisposable
         using var r = cmd.ExecuteReader();
         while (r.Read())
         {
+            ct.ThrowIfCancellationRequested();
             list.Add(ReadFile(r));
             // Reporting every few thousand rows keeps a large-set load (which can
             // read hundreds of thousands of rows over many seconds) from looking
@@ -748,6 +749,7 @@ internal sealed class SqliteSetDatabase : IDisposable
         using var r = cmd.ExecuteReader();
         while (r.Read())
         {
+            ct.ThrowIfCancellationRequested();
             list.Add(new FileRecord
             {
                 Id = r.GetInt64(0),
@@ -1048,7 +1050,10 @@ internal sealed class SqliteSetDatabase : IDisposable
         var list = new List<FileRecord>();
         using var r = cmd.ExecuteReader();
         while (r.Read())
+        {
+            ct.ThrowIfCancellationRequested();
             list.Add(ReadFile(r));
+        }
         return list;
     }
 

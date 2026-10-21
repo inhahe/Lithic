@@ -748,6 +748,28 @@ using (var cts = new CancellationTokenSource())
         $"cancelled while compressing, the export stops and leaves nothing behind (cancelled: {cancelled})");
 }
 
+// A cancel reaches a catalog read part-way, not only before it starts: the
+// read of a whole history (Cleanup, the post-edit scan) can take many seconds.
+using (var cts = new CancellationTokenSource())
+{
+    int readWhenCancelled = 0;
+    bool cancelled = false;
+    try
+    {
+        await repoP.GetAllFilesForBackupSetAsync(setP.Id, cts.Token, new SyncProgress<int>(read =>
+        {
+            if (readWhenCancelled == 0)
+            {
+                readWhenCancelled = read;
+                cts.Cancel();
+            }
+        }));
+    }
+    catch (OperationCanceledException) { cancelled = true; }
+    Check(cancelled && readWhenCancelled < LargeRecords,
+        $"a catalog read cancelled part-way stops there (cancelled after {readWhenCancelled:N0} of {LargeRecords:N0} records; stopped: {cancelled})");
+}
+
 // Import: extracting counts bytes, importing counts records, to the total.
 var repoQ = NewCatalog(Path.Combine(root, "Q"));
 var importReports = Recording(out var importProgress);

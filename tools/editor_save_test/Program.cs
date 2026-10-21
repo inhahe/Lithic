@@ -312,13 +312,8 @@ internal static class Program
         ];
         await _observer.UpdateBackupSetAsync(set);
         await _observer.ClearBackupSetCatalogAsync(_setId);
-        foreach (string entry in Directory.EnumerateFileSystemEntries(_dst))
-        {
-            if (Directory.Exists(entry))
-                Directory.Delete(entry, recursive: true);
-            else
-                File.Delete(entry);
-        }
+        Directory.Delete(_dst, recursive: true);
+        Directory.CreateDirectory(_dst);
         var backup = new DirectoryBackupService(
             _observer, new LithicBackup.Infrastructure.FileSystem.FileScanner(_observer),
             new VersionRetentionService(_observer));
@@ -328,8 +323,12 @@ internal static class Program
             TargetDirectory = _dst, ZipMode = ZipMode.None,
         }, _dst, null, null, CancellationToken.None);
         string CopyOf(string source) => Path.Combine(_dst, source[..1], source[Path.GetPathRoot(source)!.Length..]);
-        Check(ran.Success && File.Exists(CopyOf(_smallFile)) && File.Exists(CopyOf(_bigFile)),
-            "set-up: a and b are backed up");
+        if (!(ran.Success && File.Exists(CopyOf(_smallFile)) && File.Exists(CopyOf(_bigFile))))
+        {
+            Check(false, "set-up: a and b are backed up"
+                + string.Concat(ran.FailedFiles.Select(f => $"; {f.Path}: {f.Error}")));
+            return;
+        }
 
         // A main window that reconciles after every edit, without asking first.
         _vm = new MainViewModel(
@@ -365,7 +364,8 @@ internal static class Program
             "the scan found what the edit dropped, and asks about it");
         if (removal is null) return;
         string removalHeader = ((ReviewTreeViewModel)removal.DataContext).HeaderText.Split('\n')[0];
-        Check(removalHeader.StartsWith("1 file (5,000 bytes)", StringComparison.Ordinal),
+        // N0, as the header writes it: the separator is the locale's.
+        Check(removalHeader.StartsWith($"1 file ({5000:N0} bytes)", StringComparison.Ordinal),
             $"just b's file (\"{removalHeader}\")");
         removal.DialogResult = true;
 
@@ -376,7 +376,7 @@ internal static class Program
             "then the added folder's files are offered for backup");
         if (addition is null) return;
         string additionHeader = ((ReviewTreeViewModel)addition.DataContext).HeaderText.Split('\n')[0];
-        Check(additionHeader.StartsWith("1 file (3,000 bytes)", StringComparison.Ordinal),
+        Check(additionHeader.StartsWith($"1 file ({3000:N0} bytes)", StringComparison.Ordinal),
             $"just c's file (\"{additionHeader}\")");
         addition.DialogResult = false;
         await Task.Delay(500);
