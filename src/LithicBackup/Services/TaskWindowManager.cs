@@ -168,6 +168,8 @@ public sealed class TaskWindowManager
         {
             _open.Remove(key);
             _meta.Remove(key);
+            // The flow's window is gone: work it does only for the window stops.
+            (flow as IDisposable)?.Dispose();
         };
 
         _open[key] = window;

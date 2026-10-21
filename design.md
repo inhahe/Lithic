@@ -1904,9 +1904,12 @@ are excluded anyway.
   on a background task with `IProgress<T>` and a `CancellationToken`, reported in
   the view, and must survive being stopped part-way.
 * **A cancel reaches a catalog read part-way.** `SqliteSetDatabase` reads rows
-  through `Rows(cmd, ct)`, which checks the token before each row, so a read of
-  a whole set (seconds, for millions of rows) stops at the next row rather than
-  at its end. A new read with a token in hand uses it.
+  through `Rows(cmd, ct)`, which checks the token before each row and, while
+  the read runs, puts an SQLite progress handler on the connection that aborts
+  the statement once the token is cancelled. The handler matters as much as
+  the check: a read ordered by source path sorts the whole set before its first
+  row (`USE TEMP B-TREE FOR ORDER BY`), which no check between rows reaches. A
+  new read with a token in hand uses it.
 * **Await catalog calls in background work; don't block on them.** Work under a
   progress window or `Task.Run` awaits (`ProgressDialog.RunAsync` takes async
   work). It stays on a background thread all the same: the catalog's async

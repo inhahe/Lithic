@@ -19,7 +19,7 @@ namespace LithicBackup.ViewModels;
 /// that match user-typed exclusion patterns so the user can purge them
 /// from the catalog.
 /// </summary>
-public class OrphanedDirectoriesViewModel : ViewModelBase, IConfirmClose
+public class OrphanedDirectoriesViewModel : ViewModelBase, IConfirmClose, IDisposable
 {
     private readonly ICatalogRepository _catalog;
     private readonly BackupSet _backupSet;
@@ -85,34 +85,35 @@ public class OrphanedDirectoriesViewModel : ViewModelBase, IConfirmClose
     private DateTime? _destinationScanStartedUtc;
 
     /// <summary>
-    /// Cancelled when the window closes. A catalog scan stops with it: nobody will
-    /// see its result, and its read holds the set's gate for as long as it runs.
-    /// A purge has its own token and carries on (<see cref="ConfirmClose"/>).
+    /// Cancelled when the window has closed (<see cref="Dispose"/>). The scans stop
+    /// with it - nobody will see their result, and their catalog reads hold the
+    /// set's gate while they run. A purge has its own token and carries on.
     /// </summary>
     private readonly CancellationTokenSource _closed = new();
 
     /// <summary>
+    /// The window showing this has closed: stop the catalog and destination scans.
+    /// A purge carries on, as <see cref="ConfirmClose"/> told the user.
+    /// </summary>
+    public void Dispose() => _closed.Cancel();
+
+    /// <summary>
     /// Closing mid-purge does not stop it, so say so first; it carries on, with
-    /// its progress and result on the set's row in the main window. A catalog
-    /// scan under way does stop.
+    /// its progress and result on the set's row in the main window.
     /// </summary>
     public bool ConfirmClose(bool canCancel)
     {
-        if (IsPurging && canCancel)
-        {
-            var answer = System.Windows.MessageBox.Show(
-                "The cleanup is still running.\n\n"
-                + "If you close this window it carries on in the background, with its progress and "
-                + "its result on the set's row in the main window. Close it anyway?",
-                "Cleanup",
-                System.Windows.MessageBoxButton.YesNo,
-                System.Windows.MessageBoxImage.Question,
-                System.Windows.MessageBoxResult.No);
-            if (answer != System.Windows.MessageBoxResult.Yes)
-                return false;
-        }
-        _closed.Cancel();
-        return true;
+        if (!IsPurging || !canCancel)
+            return true;
+        var answer = System.Windows.MessageBox.Show(
+            "The cleanup is still running.\n\n"
+            + "If you close this window it carries on in the background, with its progress and "
+            + "its result on the set's row in the main window. Close it anyway?",
+            "Cleanup",
+            System.Windows.MessageBoxButton.YesNo,
+            System.Windows.MessageBoxImage.Question,
+            System.Windows.MessageBoxResult.No);
+        return answer == System.Windows.MessageBoxResult.Yes;
     }
 
     public OrphanedDirectoriesViewModel(ICatalogRepository catalog, BackupSet backupSet)
@@ -594,7 +595,7 @@ public class OrphanedDirectoriesViewModel : ViewModelBase, IConfirmClose
                             _backupSet.Id, _closed.Token, rowProgress))
                         .ToList();
 
-                    return await ClassifyAndBuildAsync(progress);
+                    return await ClassifyAndBuildAsync(progress, _closed.Token);
                 });
             }
             finally
@@ -624,6 +625,11 @@ public class OrphanedDirectoriesViewModel : ViewModelBase, IConfirmClose
             _catalogScanStartedUtc = startedUtc;
             UpdateSummaryText();
         }
+        catch (OperationCanceledException) when (_closed.IsCancellationRequested)
+        {
+            // The window closed mid-scan: nothing to show, and no one to show it to.
+            _activeFiles = listedFiles;
+        }
         catch (Exception ex)
         {
             _activeFiles = listedFiles;
@@ -644,14 +650,22 @@ public class OrphanedDirectoriesViewModel : ViewModelBase, IConfirmClose
     /// </summary>
     private async Task<(List<OrphanedDirectoryItem> AllItems,
              List<OrphanedCategoryViewModel> Categories)>
-        ClassifyAndBuildAsync(ClassifyProgress progress)
+        ClassifyAndBuildAsync(ClassifyProgress progress, CancellationToken ct)
     {
+        // Each phase starts by checking the token: a closed window's scan stops
+        // at the next phase rather than classifying everything for nobody.
+        void Phase(string name, int total)
+        {
+            ct.ThrowIfCancellationRequested();
+            progress.SetPhase(name, total);
+        }
+
         int totalFiles = _activeFiles!.Count;
 
         // Fresh volume probes each pass: a drive can be plugged in between scans.
         _rootAvailability.Clear();
 
-        progress.SetPhase("Grouping files by directory", totalFiles);
+        Phase("Grouping files by directory", totalFiles);
 
         // Group files by parent directory.
         //
@@ -697,7 +711,7 @@ public class OrphanedDirectoriesViewModel : ViewModelBase, IConfirmClose
         // ----------------------------------------------------------------
 
         // --- Phase 1: RemovedFromSources ---
-        progress.SetPhase("Finding orphaned directories", totalFiles);
+        Phase("Finding orphaned directories", totalFiles);
         var removedDirs = new List<OrphanedDirectoryItem>();
         foreach (var group in dirGroups)
         {
@@ -743,7 +757,7 @@ public class OrphanedDirectoriesViewModel : ViewModelBase, IConfirmClose
         var collapsedRemoved = removedDirs;
 
         // --- Phase 2: MatchesConfiguredExclusion ---
-        progress.SetPhase("Detecting excluded files", totalFiles);
+        Phase("Detecting excluded files", totalFiles);
         var excludedItems = DetectExcludedFiles(collapsedRemoved, progress);
 
         // --- Phase 3: DeletedFromDisk ---
@@ -757,7 +771,7 @@ public class OrphanedDirectoriesViewModel : ViewModelBase, IConfirmClose
         var collapsedRemovedPaths = new DirectoryPrefixSet(
             collapsedRemoved.Select(r => r.DirectoryPath));
 
-        progress.SetPhase("Checking deleted files and directories", totalFiles);
+        Phase("Checking deleted files and directories", totalFiles);
         var deletedDirs = new List<OrphanedDirectoryItem>();
         _unavailableRoots.Clear();
         _rootAvailability.Clear();
@@ -839,7 +853,7 @@ public class OrphanedDirectoriesViewModel : ViewModelBase, IConfirmClose
         // by no category at all. Measured on a real set: 174 files / 4.8 GB
         // stranded in a single folder that way.
         int candidateFiles = candidates.Sum(g => g.Count());
-        progress.SetPhase("Confirming deleted files", candidateFiles);
+        Phase("Confirming deleted files", candidateFiles);
 
         // Results are written by index, not appended, so the output order stays
         // identical run to run despite the work completing out of order.
@@ -918,16 +932,16 @@ public class OrphanedDirectoriesViewModel : ViewModelBase, IConfirmClose
         }
 
         // --- Phase 4: ExcessVersion ---
-        progress.SetPhase("Detecting excess versions", totalFiles);
+        Phase("Detecting excess versions", totalFiles);
         var phase1And3 = collapsedRemoved.Concat(deletedDirs).ToList();
-        var excessItems = await DetectExcessVersionsAsync(phase1And3, excludedItems, progress);
+        var excessItems = await DetectExcessVersionsAsync(phase1And3, excludedItems, progress, ct);
 
         // --- Phase 5: CatalogDuplicate ---
         // Distinct from ExcessVersion: these are stray catalog rows for
         // CURRENT-location files (e.g. left over from a non-idempotent
         // re-seed).  They share a SourcePath with a survivor but don't
         // correspond to any real "_prev" copy on disk.
-        progress.SetPhase("Detecting catalog duplicates", totalFiles);
+        Phase("Detecting catalog duplicates", totalFiles);
         var duplicateItems = DetectCatalogDuplicates(phase1And3, excludedItems, progress);
 
         // Build the flat item list.
@@ -942,7 +956,7 @@ public class OrphanedDirectoriesViewModel : ViewModelBase, IConfirmClose
         // Build per-reason trees as view-model objects (still off the UI
         // thread).  Categories will be added to the bound collection on the
         // UI thread by the caller.
-        progress.SetPhase("Building directory trees", allItems.Count);
+        Phase("Building directory trees", allItems.Count);
         var categories = new List<OrphanedCategoryViewModel>();
         foreach (var group in allItems.GroupBy(i => i.Reason).OrderBy(g => (int)g.Key))
         {
@@ -1222,7 +1236,8 @@ public class OrphanedDirectoriesViewModel : ViewModelBase, IConfirmClose
     private async Task<List<OrphanedDirectoryItem>> DetectExcessVersionsAsync(
         List<OrphanedDirectoryItem> orphanedDirs,
         List<OrphanedDirectoryItem> excludedItems,
-        ClassifyProgress? progress = null)
+        ClassifyProgress? progress,
+        CancellationToken ct)
     {
         if (_activeFiles is null) return [];
 
@@ -1409,7 +1424,7 @@ public class OrphanedDirectoriesViewModel : ViewModelBase, IConfirmClose
         if (excessRecords.Count > 0)
         {
             var needed = await _catalog.GetNeededContentCopiesAsync(
-                _backupSet.Id, excessRecords.Select(r => r.Id).ToList(), ct: _closed.Token);
+                _backupSet.Id, excessRecords.Select(r => r.Id).ToList(), ct: ct);
             if (needed.Count > 0)
                 excessRecords.RemoveAll(r => needed.Contains(r.Id));
         }
@@ -1923,7 +1938,7 @@ public class OrphanedDirectoriesViewModel : ViewModelBase, IConfirmClose
                         }
                         // Otherwise the path is already answered; store nothing.
                     },
-                    CancellationToken.None,
+                    _closed.Token,
                     loadProgress).ConfigureAwait(false);
 
                 // The walk is parallel, enumerates each directory once, and
@@ -1932,7 +1947,7 @@ public class OrphanedDirectoriesViewModel : ViewModelBase, IConfirmClose
                 // which pins its verdicts against the original sequential walk,
                 // because this is what Cleanup offers to delete.
                 return Services.DestinationWalker.Walk(
-                    targetDir, discPathLookup, TryReconstructSourcePath, progress);
+                    targetDir, discPathLookup, TryReconstructSourcePath, progress, ct: _closed.Token);
             });
 
             // ---- UI thread from here on ----
@@ -1993,6 +2008,10 @@ public class OrphanedDirectoriesViewModel : ViewModelBase, IConfirmClose
             DestinationScanStatusText = newCount == 0
                 ? $"Destination scan complete — examined {filesScanned:N0} files, no extras found{skippedSuffix}."
                 : $"Destination scan complete — examined {filesScanned:N0} files, found {untracked.Count:N0} untracked + {catalogDeleted.Count:N0} catalog-deleted{skippedSuffix}.";
+        }
+        catch (OperationCanceledException) when (_closed.IsCancellationRequested)
+        {
+            // The window closed mid-scan.
         }
         catch (Exception ex)
         {

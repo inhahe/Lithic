@@ -141,7 +141,14 @@ internal static class Program
             try { _catalog?.Dispose(); } catch { }
             try { _observer?.Dispose(); } catch { }
             SqliteClearPools();
-            try { Directory.Delete(_root, recursive: true); } catch { }
+            // Retried briefly: a folder another process (a scanner) still has
+            // open is only marked for deletion, and stays visible until it lets go.
+            for (int attempt = 0; attempt < 20 && Directory.Exists(_root); attempt++)
+            {
+                try { Directory.Delete(_root, recursive: true); } catch { }
+                if (Directory.Exists(_root))
+                    Thread.Sleep(100);
+            }
         }
         Check(!Directory.Exists(_root), $"the harness leaves no temp folder behind ({_root})");
 

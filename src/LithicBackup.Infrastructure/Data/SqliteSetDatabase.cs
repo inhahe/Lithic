@@ -561,17 +561,55 @@ internal sealed class SqliteSetDatabase : IDisposable
     }
 
     /// <summary>
-    /// The rows <paramref name="cmd"/> returns, with <paramref name="ct"/> checked
-    /// before each: reading a whole set can take many seconds, and a cancel must
-    /// not wait for the last row. The reader is disposed when the loop ends.
+    /// The rows <paramref name="cmd"/> returns, ending in
+    /// <see cref="OperationCanceledException"/> as soon as <paramref name="ct"/> is
+    /// cancelled - between rows, and inside SQLite while it works. A read ordered
+    /// by source path sorts the whole set before its first row (a temp B-tree:
+    /// the indexes do not give that order), and that sort can be most of the read,
+    /// out of reach of any check between rows. The reader is disposed when the
+    /// loop ends.
     /// </summary>
     private static IEnumerable<SqliteDataReader> Rows(SqliteCommand cmd, CancellationToken ct)
     {
-        using var r = cmd.ExecuteReader();
-        while (r.Read())
+        ct.ThrowIfCancellationRequested();
+        var db = cmd.Connection!.Handle!;
+        // While the read runs, SQLite asks this every 10,000 instructions, and a
+        // non-zero answer aborts the statement with SQLITE_INTERRUPT. Removed
+        // after: the connection is the set's, and only this read holds it.
+        bool watched = ct.CanBeCanceled;
+        if (watched)
+            SQLitePCL.raw.sqlite3_progress_handler(db, 10_000, _ => ct.IsCancellationRequested ? 1 : 0, null);
+        try
         {
-            ct.ThrowIfCancellationRequested();
-            yield return r;
+            using var r = Interruptible(cmd.ExecuteReader, ct);
+            Func<bool> read = r.Read;
+            while (Interruptible(read, ct))
+            {
+                ct.ThrowIfCancellationRequested();
+                yield return r;
+            }
+        }
+        finally
+        {
+            if (watched)
+                SQLitePCL.raw.sqlite3_progress_handler(db, 0, null, null);
+        }
+    }
+
+    /// <summary>
+    /// <paramref name="step"/>, with an abort by <see cref="Rows"/>'s progress
+    /// handler surfacing as the cancel it is.
+    /// </summary>
+    private static T Interruptible<T>(Func<T> step, CancellationToken ct)
+    {
+        try
+        {
+            return step();
+        }
+        catch (SqliteException ex)
+            when (ex.SqliteErrorCode == SQLitePCL.raw.SQLITE_INTERRUPT && ct.IsCancellationRequested)
+        {
+            throw new OperationCanceledException(ct);
         }
     }
 
@@ -1823,6 +1861,17 @@ internal sealed class SqliteSetDatabase : IDisposable
         .Replace("%", "\\%")
         .Replace("_", "\\_");
 
+    private static FileChunk ReadChunk(SqliteDataReader r) => new()
+    {
+        Id = r.GetInt64(r.GetOrdinal("Id")),
+        FileRecordId = r.GetInt64(r.GetOrdinal("FileRecordId")),
+        DiscId = r.GetInt32(r.GetOrdinal("DiscId")),
+        Sequence = r.GetInt32(r.GetOrdinal("Sequence")),
+        Offset = r.GetInt64(r.GetOrdinal("Offset")),
+        Length = r.GetInt64(r.GetOrdinal("Length")),
+        DiscFilename = r.GetString(r.GetOrdinal("DiscFilename")),
+    };
+
     private static FileRecord ReadFile(SqliteDataReader r) => new()
     {
         Id = r.GetInt64(r.GetOrdinal("Id")),
@@ -1878,18 +1927,7 @@ internal sealed class SqliteSetDatabase : IDisposable
 
         var list = new List<FileChunk>();
         foreach (var r in Rows(cmd, ct))
-        {
-            list.Add(new FileChunk
-            {
-                Id = r.GetInt64(r.GetOrdinal("Id")),
-                FileRecordId = r.GetInt64(r.GetOrdinal("FileRecordId")),
-                DiscId = r.GetInt32(r.GetOrdinal("DiscId")),
-                Sequence = r.GetInt32(r.GetOrdinal("Sequence")),
-                Offset = r.GetInt64(r.GetOrdinal("Offset")),
-                Length = r.GetInt64(r.GetOrdinal("Length")),
-                DiscFilename = r.GetString(r.GetOrdinal("DiscFilename")),
-            });
-        }
+            list.Add(ReadChunk(r));
         return list;
     }
 
@@ -2244,18 +2282,7 @@ internal sealed class SqliteSetDatabase : IDisposable
         {
             cmd.CommandText = "SELECT * FROM FileChunks ORDER BY Id";
             foreach (var r in Rows(cmd, ct))
-            {
-                chunks.Add(new FileChunk
-                {
-                    Id = r.GetInt64(r.GetOrdinal("Id")),
-                    FileRecordId = r.GetInt64(r.GetOrdinal("FileRecordId")),
-                    DiscId = r.GetInt32(r.GetOrdinal("DiscId")),
-                    Sequence = r.GetInt32(r.GetOrdinal("Sequence")),
-                    Offset = r.GetInt64(r.GetOrdinal("Offset")),
-                    Length = r.GetInt64(r.GetOrdinal("Length")),
-                    DiscFilename = r.GetString(r.GetOrdinal("DiscFilename")),
-                });
-            }
+                chunks.Add(ReadChunk(r));
         }
 
         return new SetCatalogSnapshot(discs, files, chunks);

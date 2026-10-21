@@ -752,10 +752,12 @@ using (var cts = new CancellationTokenSource())
 // read of a whole history (the post-edit scan's fallback, a verify) can take
 // many seconds. The read reports every 5,000 records; cancelled at the first
 // report, it must report no more.
+long firstRowsMs = 0;
 using (var cts = new CancellationTokenSource())
 {
     int readWhenCancelled = 0, lastReported = 0;
     bool cancelled = false;
+    var readClock = System.Diagnostics.Stopwatch.StartNew();
     try
     {
         await repoP.GetAllFilesForBackupSetAsync(setP.Id, cts.Token, new SyncProgress<int>(read =>
@@ -763,6 +765,7 @@ using (var cts = new CancellationTokenSource())
             lastReported = read;
             if (readWhenCancelled == 0)
             {
+                firstRowsMs = readClock.ElapsedMilliseconds;
                 readWhenCancelled = read;
                 cts.Cancel();
             }
@@ -772,6 +775,27 @@ using (var cts = new CancellationTokenSource())
     Check(cancelled && lastReported == readWhenCancelled,
         $"a catalog read cancelled part-way stops there (cancelled at {readWhenCancelled:N0} of {LargeRecords:N0} records, "
         + $"last reported {lastReported:N0}; stopped: {cancelled})");
+}
+
+// ... including before its first row: ordered by source path, the read sorts the
+// whole set first, which is most of the time to its first rows (measured just above).
+Check(firstRowsMs >= 200, $"the read takes long enough to its first rows to time a cancel against ({firstRowsMs:N0} ms)");
+using (var cts = new CancellationTokenSource())
+{
+    int reported = 0;
+    bool cancelled = false;
+    long cancelAtMs = Math.Max(1, firstRowsMs / 10);
+    var readClock = System.Diagnostics.Stopwatch.StartNew();
+    cts.CancelAfter(TimeSpan.FromMilliseconds(cancelAtMs));
+    try
+    {
+        await repoP.GetAllFilesForBackupSetAsync(setP.Id, cts.Token, new SyncProgress<int>(read => reported = read));
+    }
+    catch (OperationCanceledException) { cancelled = true; }
+    long stoppedAtMs = readClock.ElapsedMilliseconds;
+    Check(cancelled && reported == 0 && stoppedAtMs < firstRowsMs / 2,
+        $"cancelled while it sorts, it stops there too (cancel at {cancelAtMs:N0} ms, stopped at {stoppedAtMs:N0} ms, "
+        + $"against {firstRowsMs:N0} ms to the first rows; rows reported: {reported:N0})");
 }
 
 // Import: extracting counts bytes, importing counts records, to the total.
