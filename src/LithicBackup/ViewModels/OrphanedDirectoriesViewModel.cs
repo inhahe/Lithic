@@ -570,7 +570,7 @@ public class OrphanedDirectoriesViewModel : ViewModelBase, IConfirmClose
              List<OrphanedCategoryViewModel> Categories) classified;
             try
             {
-                classified = await Task.Run(() =>
+                classified = await Task.Run(async () =>
                 {
                     progress.SetPhase("Loading catalog from database", 0);
                     var rowProgress = new SyncProgress<int>(progress.SetDone);
@@ -578,13 +578,11 @@ public class OrphanedDirectoriesViewModel : ViewModelBase, IConfirmClose
                     // never selected, so there is no second filtering pass and no
                     // moment where both the full list and the active list are
                     // alive at once.
-                    _activeFiles = _catalog
-                        .GetActiveFilesForClassificationAsync(
-                            _backupSet.Id, CancellationToken.None, rowProgress)
-                        .GetAwaiter().GetResult()
+                    _activeFiles = (await _catalog.GetActiveFilesForClassificationAsync(
+                            _backupSet.Id, CancellationToken.None, rowProgress))
                         .ToList();
 
-                    return ClassifyAndBuild(progress);
+                    return await ClassifyAndBuildAsync(progress);
                 });
             }
             finally
@@ -632,9 +630,9 @@ public class OrphanedDirectoriesViewModel : ViewModelBase, IConfirmClose
     /// thread: it only constructs view-model objects, never adds them to
     /// the bound <see cref="Items"/> / <see cref="Categories"/> collections.
     /// </summary>
-    private (List<OrphanedDirectoryItem> AllItems,
-             List<OrphanedCategoryViewModel> Categories)
-        ClassifyAndBuild(ClassifyProgress progress)
+    private async Task<(List<OrphanedDirectoryItem> AllItems,
+             List<OrphanedCategoryViewModel> Categories)>
+        ClassifyAndBuildAsync(ClassifyProgress progress)
     {
         int totalFiles = _activeFiles!.Count;
 
@@ -910,7 +908,7 @@ public class OrphanedDirectoriesViewModel : ViewModelBase, IConfirmClose
         // --- Phase 4: ExcessVersion ---
         progress.SetPhase("Detecting excess versions", totalFiles);
         var phase1And3 = collapsedRemoved.Concat(deletedDirs).ToList();
-        var excessItems = DetectExcessVersions(phase1And3, excludedItems, progress);
+        var excessItems = await DetectExcessVersionsAsync(phase1And3, excludedItems, progress);
 
         // --- Phase 5: CatalogDuplicate ---
         // Distinct from ExcessVersion: these are stray catalog rows for
@@ -1209,7 +1207,7 @@ public class OrphanedDirectoriesViewModel : ViewModelBase, IConfirmClose
     /// Replicates the core logic of VersionRetentionService.ComputeRetentionAsync
     /// using the already-loaded in-memory file list.
     /// </summary>
-    private List<OrphanedDirectoryItem> DetectExcessVersions(
+    private async Task<List<OrphanedDirectoryItem>> DetectExcessVersionsAsync(
         List<OrphanedDirectoryItem> orphanedDirs,
         List<OrphanedDirectoryItem> excludedItems,
         ClassifyProgress? progress = null)
@@ -1398,9 +1396,8 @@ public class OrphanedDirectoriesViewModel : ViewModelBase, IConfirmClose
         // likeliest anchor, deletable.
         if (excessRecords.Count > 0)
         {
-            var needed = _catalog.GetNeededContentCopiesAsync(
-                    _backupSet.Id, excessRecords.Select(r => r.Id).ToList())
-                .GetAwaiter().GetResult();
+            var needed = await _catalog.GetNeededContentCopiesAsync(
+                _backupSet.Id, excessRecords.Select(r => r.Id).ToList());
             if (needed.Count > 0)
                 excessRecords.RemoveAll(r => needed.Contains(r.Id));
         }
@@ -1500,7 +1497,7 @@ public class OrphanedDirectoriesViewModel : ViewModelBase, IConfirmClose
     /// content's last copies are all in other categories, nothing here keeps
     /// them (see known-issues.md).
     /// </summary>
-    private HashSet<long> RecheckNeededCopies(
+    private async Task<HashSet<long>> RecheckNeededCopiesAsync(
         IReadOnlyList<(OrphanedReason Reason, string DirectoryPath,
             List<string>? MatchingSourcePaths, List<FileRecord>? ExcessVersionRecords)> items,
         int backupSetId, CancellationToken ct)
@@ -1541,14 +1538,12 @@ public class OrphanedDirectoriesViewModel : ViewModelBase, IConfirmClose
         // were considered, so a purge without one checked nothing at all.
         var kept = excessIds.Count == 0
             ? []
-            : _catalog.GetNeededContentCopiesAsync(backupSetId, deleting.ToList(), excessIds, ct)
-                .GetAwaiter().GetResult();
+            : await _catalog.GetNeededContentCopiesAsync(backupSetId, deleting.ToList(), excessIds, ct);
         // A kept copy survives, so content it covers needs no second one.
         var rest = deleting.Where(id => !kept.Contains(id)).ToList();
         var keepable = rest.Where(id => !duplicates.Contains(id)).ToList();
         if (keepable.Count > 0)
-            kept.UnionWith(_catalog.GetNeededContentCopiesAsync(backupSetId, rest, keepable, ct)
-                .GetAwaiter().GetResult());
+            kept.UnionWith(await _catalog.GetNeededContentCopiesAsync(backupSetId, rest, keepable, ct));
         return kept;
     }
 
@@ -2483,11 +2478,11 @@ public class OrphanedDirectoriesViewModel : ViewModelBase, IConfirmClose
             int keptForReferences = 0;
             int leftAloneSinceScan = 0;
             int keptInUse = 0;
-            var (catalogPurged, filesDeleted, deleteFailures, bytesFreed, alreadyAbsent) = await Task.Run(() =>
+            var (catalogPurged, filesDeleted, deleteFailures, bytesFreed, alreadyAbsent) = await Task.Run(async () =>
             {
                 int catPurged = 0;
                 // Excess-version records held back because a .fileref still needs
-                // their bytes (RecheckNeededCopies, inside the transaction).
+                // their bytes (RecheckNeededCopiesAsync, inside the transaction).
                 HashSet<long> keptIds = [];
                 // Source paths backed up again since the scan or back on disk, and
                 // stored paths belonging to them or written since: left alone (see
@@ -2504,16 +2499,11 @@ public class OrphanedDirectoriesViewModel : ViewModelBase, IConfirmClose
                 int fAbsent = 0;
                 long bytes = 0;
 
-                // Shared throttle for both progress phases — matches the
-                // pattern used by every other long-running operation in
-                // the codebase (seed, scan, etc.).  Without this, large
-                // purges (tens or hundreds of thousands of work items)
-                // flood the UI thread with one Report() per iteration and
-                // visibly slow the work down — the user observed exactly
-                // this.  Negative initial value guarantees the first
-                // Report fires immediately.
-                var progressSw = System.Diagnostics.Stopwatch.StartNew();
-                long lastProgressMs = -ProgressCadence.IntervalMs;
+                // Shared throttle for both progress phases. Without one, large
+                // purges (tens or hundreds of thousands of work items) flood the
+                // UI thread with one Report() per iteration and visibly slow the
+                // work down - the user observed exactly this.
+                var cadence = new ProgressCadence();
 
                 // Count the thing the user is waiting on (design.md, "Long phases
                 // must name what they are doing").  A work item is a DIRECTORY,
@@ -2548,10 +2538,8 @@ public class OrphanedDirectoriesViewModel : ViewModelBase, IConfirmClose
                 // dividing by it — a purge of nothing is complete, not 1/1.
                 void ReportUnits(string dirPath, bool force = false)
                 {
-                    long nowMs = progressSw.ElapsedMilliseconds;
-                    if (!force && nowMs - lastProgressMs < ProgressCadence.IntervalMs)
+                    if (!cadence.IsDue() && !force)
                         return;
-                    lastProgressMs = nowMs;
                     int pct = totalUnits <= 0 ? 100 : (int)(doneUnits * 100L / totalUnits);
                     string suffix = string.IsNullOrEmpty(dirPath) ? "" : $": {dirPath}";
                     ((IProgress<Services.ProgressReport>)progress).Report(
@@ -2569,7 +2557,7 @@ public class OrphanedDirectoriesViewModel : ViewModelBase, IConfirmClose
                     ((IProgress<Services.ProgressReport>)progress).Report(
                         "Cleaning up: waiting for the background service to pause its backup of this set...");
                     while (_catalog.IsSetBeingBackedUpInBackground(backupSetId))
-                        Task.Delay(250, ct).GetAwaiter().GetResult();
+                        await Task.Delay(250, ct);
                 }
 
                 // -- 0b. Hash the plain copies a .fileref might resolve to that
@@ -2580,16 +2568,14 @@ public class OrphanedDirectoriesViewModel : ViewModelBase, IConfirmClose
                 {
                     ((IProgress<Services.ProgressReport>)progress).Report(
                         "Cleaning up: checking copies that duplicate-file references may need...");
-                    Services.ContentAnchors.HashUnhashedAnchorsAsync(_catalog, backupSetId, targetDir, among: null, ct)
-                        .GetAwaiter().GetResult();
+                    await Services.ContentAnchors.HashUnhashedAnchorsAsync(_catalog, backupSetId, targetDir, among: null, ct);
                 }
 
                 // -- 1. Catalog updates inside a single transaction. --
                 ((IProgress<Services.ProgressReport>)progress).Report("Cleaning up: starting the catalog update...");
-                var tx = _catalog.BeginTransactionAsync(backupSetId, ct,
-                        onWaitingForOtherProcess: () => ((IProgress<Services.ProgressReport>)progress).Report(
-                            "Cleaning up: waiting for the background backup of this set to pause..."))
-                    .GetAwaiter().GetResult();
+                var tx = await _catalog.BeginTransactionAsync(backupSetId, ct,
+                    onWaitingForOtherProcess: () => ((IProgress<Services.ProgressReport>)progress).Report(
+                        "Cleaning up: waiting for the background backup of this set to pause..."));
                 try
                 {
                     // Anything backed up since the scan is left alone. The scan's
@@ -2604,8 +2590,7 @@ public class OrphanedDirectoriesViewModel : ViewModelBase, IConfirmClose
                     {
                         ((IProgress<Services.ProgressReport>)progress).Report(
                             "Cleaning up: checking for files backed up since the scan...");
-                        foreach (var (src, disc) in _catalog.GetRecordsWrittenSinceAsync(backupSetId, sinceUtc, ct)
-                                     .GetAwaiter().GetResult())
+                        foreach (var (src, disc) in await _catalog.GetRecordsWrittenSinceAsync(backupSetId, sinceUtc, ct))
                         {
                             backedUpAgain.Add(src);
                             rewrittenDiscPaths.Add(disc.Replace('/', '\\'));
@@ -2638,7 +2623,7 @@ public class OrphanedDirectoriesViewModel : ViewModelBase, IConfirmClose
                     // .fileref to a listed copy (a reverted file). This runs under
                     // the purge's transaction, which holds the set's write lock, so
                     // no reference can appear between this check and the delete.
-                    keptIds = RecheckNeededCopies(workItems.Select(w => (
+                    keptIds = await RecheckNeededCopiesAsync(workItems.Select(w => (
                         w.Reason, w.DirectoryPath, w.MatchingSourcePaths, w.ExcessVersionRecords)).ToList(),
                         backupSetId, ct);
 
@@ -2697,8 +2682,7 @@ public class OrphanedDirectoriesViewModel : ViewModelBase, IConfirmClose
                                     records[k].IsDeleted = true;
                                 }
 
-                                catPurged += _catalog.MarkFileRecordsDeletedByIdsAsync(
-                                    backupSetId, ids, ct).GetAwaiter().GetResult();
+                                catPurged += await _catalog.MarkFileRecordsDeletedByIdsAsync(backupSetId, ids, ct);
                                 doneUnits += len;
                                 ReportUnits(dirPath);
                             }
@@ -2726,9 +2710,8 @@ public class OrphanedDirectoriesViewModel : ViewModelBase, IConfirmClose
                             for (int off = 0; off < paths.Count; off += PurgePathChunkSize)
                             {
                                 int len = Math.Min(PurgePathChunkSize, paths.Count - off);
-                                catPurged += _catalog.MarkFilesDeletedBySourcePathsAsync(
-                                    backupSetId, paths.GetRange(off, len), ct)
-                                    .GetAwaiter().GetResult();
+                                catPurged += await _catalog.MarkFilesDeletedBySourcePathsAsync(
+                                    backupSetId, paths.GetRange(off, len), ct);
                                 doneUnits += len;
                                 ReportUnits(dirPath);
                             }
@@ -2751,8 +2734,7 @@ public class OrphanedDirectoriesViewModel : ViewModelBase, IConfirmClose
                     // retires every record of its file, the kept one included.
                     // It stays live, as its file stays on disk.
                     if (keptIds.Count > 0)
-                        catPurged -= _catalog.MarkFileRecordsLiveByIdsAsync(backupSetId, keptIds, ct)
-                            .GetAwaiter().GetResult();
+                        catPurged -= await _catalog.MarkFileRecordsLiveByIdsAsync(backupSetId, keptIds, ct);
 
                     // Force a final true N/N before the disk-delete phase takes
                     // over, so the catalog phase never ends mid-throttle on a
@@ -2779,8 +2761,7 @@ public class OrphanedDirectoriesViewModel : ViewModelBase, IConfirmClose
                         {
                             ((IProgress<Services.ProgressReport>)progress).Report(
                                 "Cleaning up: making sure nothing the catalog still uses is deleted...");
-                            stillInUse.UnionWith(_catalog.FindDiscPathsInUseAsync(backupSetId, candidates, ct)
-                                .GetAwaiter().GetResult());
+                            stillInUse.UnionWith(await _catalog.FindDiscPathsInUseAsync(backupSetId, candidates, ct));
                         }
                     }
 
