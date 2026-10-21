@@ -74,7 +74,7 @@ async Task Backup(DirectoryBackupService svc, int setId, string dest)
 {
     var r = await svc.ExecuteAsync(Job(setId, dest), dest, null, null, CancellationToken.None);
     if (!r.Success)
-        throw new Exception("backup failed: " + string.Join("; ", r.FailedFiles.Select(f => f.Error)));
+        throw new Exception("backup failed: " + string.Join("; ", r.FailedFiles.Select(f => $"{f.Path}: {f.Error}")));
 }
 
 static Dictionary<string, string> HashTree(string dir) => Directory
@@ -447,7 +447,7 @@ async Task Backup7(DirectoryBackupService svc, int setId, string dest)
     };
     var r = await svc.ExecuteAsync(job, dest, null, null, CancellationToken.None);
     if (!r.Success)
-        throw new Exception("backup failed: " + string.Join("; ", r.FailedFiles.Select(f => f.Error)));
+        throw new Exception("backup failed: " + string.Join("; ", r.FailedFiles.Select(f => $"{f.Path}: {f.Error}")));
 }
 static string Sha(string p) => Convert.ToHexString(SHA256.HashData(File.ReadAllBytes(p)));
 
@@ -514,7 +514,7 @@ async Task Backup7b(DirectoryBackupService svc, int setId)
     };
     var r = await svc.ExecuteAsync(job, target7b, null, null, CancellationToken.None);
     if (!r.Success)
-        throw new Exception("backup failed: " + string.Join("; ", r.FailedFiles.Select(f => f.Error)));
+        throw new Exception("backup failed: " + string.Join("; ", r.FailedFiles.Select(f => $"{f.Path}: {f.Error}")));
 }
 var repoA7b = NewCatalog(Path.Combine(root, "A7b"));
 var svcA7b = NewService(repoA7b);

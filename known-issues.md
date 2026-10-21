@@ -1,5 +1,36 @@
 # LithicBackup — Known Issues & Tech Debt
 
+## OPEN: a directory backup can fail a file with "Permission denied: Access to the path is denied." once, then not again (seen 2026-10-21)
+
+**Seen.** `history_transfer_test` §5 ("Backing up anyway never overwrites old
+versions") failed once: its backup reported a failed file, `Permission denied:
+Access to the path is denied.` The rerun, and every run before and since,
+passed on the same code. The change under test (export/import progress)
+touches nothing on the backup path.
+
+**What the message says.** .NET writes "Access to the path is denied." without
+a path when the failing call has only a handle, not a name, so the denial came
+from an operation on a file already open, or from Windows refusing to open a
+name that is *delete-pending*. A file deleted or renamed while another process
+(Defender's real-time scan, the search indexer) still has it open stays
+delete-pending until that handle closes, and opening or creating that name in
+the meantime is refused with ERROR_ACCESS_DENIED. §5 writes a file and then
+replaces it at the same path in quick succession, in `%TEMP%`, which those
+scanners watch.
+
+**Why it matters beyond the harness.** A real backup hits the same race when
+it replaces a destination file a scanner has just opened. The file is
+reported as failed and retried by the next backup, so nothing is lost, but the
+run shows an error for a condition that lasts milliseconds.
+
+**Next step.** The harness now names the file in its failure message (it
+printed only the error). When it recurs, that says which operation it was: a
+superseded copy being renamed to `.vN`, or the new copy being written. The
+likely fix is a short, bounded retry (a few attempts over ~1 s) on
+ERROR_ACCESS_DENIED and ERROR_SHARING_VIOLATION for destination writes and
+renames in `DirectoryBackupService`, and `DescribeFileError` adding the path
+when the exception's message lacks it.
+
 ## FIXED: no backup set could be deleted in the session that created the catalog (2026-10-21)
 
 **Symptom.** `DeleteBackupSetAsync` threw "SQLite Error 1: no such table:
