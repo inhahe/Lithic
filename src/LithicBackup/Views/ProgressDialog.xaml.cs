@@ -123,12 +123,40 @@ public partial class ProgressDialog : Window
     /// catalog or the destination, where letting the user start a second
     /// operation on the same set mid-flight is the hazard the modality prevents.
     /// </param>
-    public static async Task<(bool Completed, T Result)> RunAsync<T>(
+    public static Task<(bool Completed, T Result)> RunAsync<T>(
         Window? owner,
         string title,
         string message,
         bool cancellable,
         Func<IProgress<ProgressReport>, CancellationToken, T> work,
+        bool modal = true)
+        => RunAsync(owner, title, message, cancellable,
+            (progress, token) => Task.FromResult(work(progress, token)), modal);
+
+    /// <summary>As below, for asynchronous work with no result: returns whether it completed.</summary>
+    public static async Task<bool> RunAsync(
+        Window? owner,
+        string title,
+        string message,
+        bool cancellable,
+        Func<IProgress<ProgressReport>, CancellationToken, Task> work,
+        bool modal = true)
+    {
+        var (completed, _) = await RunAsync(owner, title, message, cancellable,
+            async (progress, token) => { await work(progress, token); return true; }, modal);
+        return completed;
+    }
+
+    /// <summary>
+    /// As above, for work that is itself asynchronous: it is awaited, not
+    /// blocked on, so it ties up no thread while it waits on I/O.
+    /// </summary>
+    public static async Task<(bool Completed, T Result)> RunAsync<T>(
+        Window? owner,
+        string title,
+        string message,
+        bool cancellable,
+        Func<IProgress<ProgressReport>, CancellationToken, Task<T>> work,
         bool modal = true)
     {
         var cts = cancellable ? new CancellationTokenSource() : null;
@@ -144,6 +172,10 @@ public partial class ProgressDialog : Window
         // percent) falls back to the marquee for that step.
         var progress = new Progress<ProgressReport>(r =>
         {
+            // Once cancelled, "Cancelling…" stays: a report the work makes before
+            // it next checks the token must not make it look as if it carries on.
+            if (cts?.IsCancellationRequested == true)
+                return;
             vm.Detail = r.Text;
             if (r.Percent is double pct)
             {
@@ -161,11 +193,11 @@ public partial class ProgressDialog : Window
         Exception? error = null;
         bool cancelled = false;
 
-        var workTask = Task.Run(() =>
+        var workTask = Task.Run(async () =>
         {
             try
             {
-                result = work(progress, token);
+                result = await work(progress, token);
             }
             catch (OperationCanceledException)
             {

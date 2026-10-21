@@ -692,27 +692,46 @@ Check(exportGaps.Count == 0 || exportGaps.Max() < 3 * ProgressCadence.IntervalMs
     $"with no long silence between reports (longest {exportGaps.DefaultIfEmpty().Max()} ms)");
 
 // Cancelled while the history is being copied: the copy - one SQLite statement
-// - is interrupted, not waited out.
+// - is interrupted, not waited out. The cancel comes as soon as the copy is
+// seen writing, not from a report, so it lands early in the copy however fast
+// this machine copies, and the stop is measured against the whole copy's time.
+long copyMs = zipSteps.Count > 0 && copySteps.Count > 0 ? zipSteps[0].Ms - copySteps[0].Ms : 0;
+Check(copyMs >= 200, $"the history takes long enough to copy to time a cancel against ({copyMs:N0} ms)");
 string cancelledExport = Path.Combine(root, "cancelled.lithic");
 using (var cts = new CancellationTokenSource())
+using (var stopWatching = new CancellationTokenSource())
 {
     var cancelClock = System.Diagnostics.Stopwatch.StartNew();
-    long cancelledAtMs = -1;
-    Recording(out var cancelMidCopy, r =>
+    long cancelledAtMs = -1, writtenAtCancel = 0;
+    var watcher = Task.Run(() =>
     {
-        if (cancelledAtMs < 0 && r.Text.StartsWith("Step 1 of 2") && r.Percent > 0)
+        while (!stopWatching.IsCancellationRequested)
         {
-            cancelledAtMs = cancelClock.ElapsedMilliseconds;
-            cts.Cancel();
+            try
+            {
+                var copy = Directory.EnumerateFiles(root, "cancelled.lithic.*.history.partial").FirstOrDefault();
+                long length = copy is null ? 0 : new FileInfo(copy).Length;
+                if (length > 0)
+                {
+                    cancelledAtMs = cancelClock.ElapsedMilliseconds;
+                    writtenAtCancel = length;
+                    cts.Cancel();
+                    return;
+                }
+            }
+            catch (IOException) { /* the file went between listing and measuring */ }
+            Thread.Sleep(1);
         }
     });
     bool cancelled = false;
-    try { await BackupSetTransfer.ExportAsync(repoP, setPStored, cancelledExport, true, cancelMidCopy, cts.Token); }
+    try { await BackupSetTransfer.ExportAsync(repoP, setPStored, cancelledExport, true, null, cts.Token); }
     catch (OperationCanceledException) { cancelled = true; }
     long stopMs = cancelClock.ElapsedMilliseconds - cancelledAtMs;
-    Check(cancelled && cancelledAtMs >= 0 && stopMs < 150,
-        $"cancelled mid-copy, the export stops at once ({stopMs:N0} ms after the cancel, "
-        + $"{cancelledAtMs:N0} ms into an export that takes {fullExportMs:N0})");
+    stopWatching.Cancel();
+    await watcher;
+    Check(cancelled && cancelledAtMs >= 0 && stopMs < copyMs / 4,
+        $"cancelled mid-copy, the export stops at once ({stopMs:N0} ms after the cancel, which came with "
+        + $"{writtenAtCancel:N0} bytes copied, against {copyMs:N0} ms for the whole copy)");
     Check(!File.Exists(cancelledExport) && !File.Exists(cancelledExport + ".partial")
           && !Directory.EnumerateFiles(root, "cancelled.lithic.*").Any(),
         "and leaves nothing behind");

@@ -815,17 +815,29 @@ public class SqliteCatalogRepository : ICatalogRepository
 
     public long GetSetHistorySizeBytes(int backupSetId)
     {
-        long total = 0;
-        foreach (var suffix in new[] { "", "-wal" })
+        // The pages in use, as of the latest commit (WAL included): what a
+        // snapshot copies. The files' sizes overstate it - a write-ahead log
+        // keeps its largest size until checkpointed and truncated, and a purge
+        // leaves free pages - by as much as double after a big transaction.
+        string path = SetDbPath(backupSetId);
+        if (!File.Exists(path))
+            return 0;
+        try
         {
-            try
+            using var conn = new SqliteConnection($"Data Source={path};Mode=ReadOnly;Pooling=False");
+            conn.Open();
+            long Pragma(string name)
             {
-                var fi = new FileInfo(SetDbPath(backupSetId) + suffix);
-                if (fi.Exists) total += fi.Length;
+                using var cmd = conn.CreateCommand();
+                cmd.CommandText = $"PRAGMA {name}";
+                return Convert.ToInt64(cmd.ExecuteScalar());
             }
-            catch { /* best effort - only shown as an estimate */ }
+            return (Pragma("page_count") - Pragma("freelist_count")) * Pragma("page_size");
         }
-        return total;
+        catch (SqliteException)
+        {
+            return new FileInfo(path).Length;   // only an estimate; the file will do
+        }
     }
 
     public async Task ExportSetHistoryAsync(int backupSetId, string destinationPath, CancellationToken ct = default)
@@ -853,10 +865,13 @@ public class SqliteCatalogRepository : ICatalogRepository
                 using var cmd = conn.CreateCommand();
                 cmd.CommandText = "VACUUM INTO $path";
                 cmd.Parameters.AddWithValue("$path", destinationPath);
-                // One statement that can run for minutes: a cancel interrupts it
-                // (sqlite3_interrupt may be called from any thread) rather than
-                // waiting for the whole copy.
-                using var interrupt = ct.Register(() => SQLitePCL.raw.sqlite3_interrupt(conn.Handle));
+                // One statement that can run for minutes: a cancel stops it rather
+                // than waiting for the whole copy. SQLite asks this handler every
+                // thousand instructions, and a non-zero answer aborts the statement
+                // with SQLITE_INTERRUPT. Polled rather than pushed (sqlite3_interrupt),
+                // so a cancel that lands before the statement starts is not lost.
+                SQLitePCL.raw.sqlite3_progress_handler(conn.Handle, 1000,
+                    _ => ct.IsCancellationRequested ? 1 : 0, null);
                 try
                 {
                     cmd.ExecuteNonQuery();

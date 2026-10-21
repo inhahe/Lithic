@@ -2102,13 +2102,18 @@ internal sealed class SqliteSetDatabase : IDisposable
                 // so the count can be reported and a cancel lands between batches.
                 // All inside the one transaction: a cancel or failure rolls back
                 // everything, and the import stays all or nothing.
-                long total = 0, done = 0;
+                // Each table's id range and row count, read once: the counts make
+                // the total, the ranges drive the batches.
+                var ranges = new Dictionary<string, (long First, long Last, long Rows)>();
                 foreach (string table in new[] { "src.Files", "src.FileChunks", "src.DeduplicationBlocks" })
                 {
-                    using var count = _connection.CreateCommand();
-                    count.CommandText = $"SELECT COUNT(*) FROM {table}";
-                    total += Convert.ToInt64(count.ExecuteScalar());
+                    using var range = _connection.CreateCommand();
+                    range.CommandText = $"SELECT MIN(Id), MAX(Id), COUNT(*) FROM {table}";
+                    using var r = range.ExecuteReader();
+                    r.Read();
+                    ranges[table] = r.IsDBNull(0) ? (0, -1, 0) : (r.GetInt64(0), r.GetInt64(1), r.GetInt64(2));
                 }
+                long total = ranges.Values.Sum(t => t.Rows), done = 0;
                 rowsImported?.Report((0, total));
 
                 int files = (int)CopyInBatches("src.Files", """
@@ -2149,16 +2154,9 @@ internal sealed class SqliteSetDatabase : IDisposable
                 long CopyInBatches(string sourceTable, string insert)
                 {
                     const long IdsPerBatch = 50_000;
-                    long first, last, rowsInTable;
-                    using (var range = _connection.CreateCommand())
-                    {
-                        range.CommandText = $"SELECT MIN(Id), MAX(Id), COUNT(*) FROM {sourceTable}";
-                        using var r = range.ExecuteReader();
-                        r.Read();
-                        if (r.IsDBNull(0))
-                            return 0;
-                        (first, last, rowsInTable) = (r.GetInt64(0), r.GetInt64(1), r.GetInt64(2));
-                    }
+                    var (first, last, rowsInTable) = ranges[sourceTable];
+                    if (rowsInTable == 0)
+                        return 0;
 
                     using var cmd = _connection.CreateCommand();
                     cmd.CommandText = insert;

@@ -4832,17 +4832,12 @@ public class MainViewModel : ViewModelBase
             // A window of its own, with the step, a bar and Cancel: a history is
             // gigabytes and takes minutes, and the file appears only once complete.
             // Modeless: it only reads the catalog, so the rest of the app stays usable.
-            var (completed, _) = await Views.ProgressDialog.RunAsync(
+            bool completed = await Views.ProgressDialog.RunAsync(
                 Application.Current.MainWindow,
                 $"Export \"{set.Name}\"",
                 $"Exporting \"{set.Name}\" to {file}",
                 cancellable: true,
-                (progress, ct) =>
-                {
-                    BackupSetTransfer.ExportAsync(_catalog, set, file, withHistory, progress, ct)
-                        .GetAwaiter().GetResult();
-                    return true;
-                },
+                (progress, ct) => BackupSetTransfer.ExportAsync(_catalog, set, file, withHistory, progress, ct),
                 modal: false);
 
             if (!completed)
@@ -4994,10 +4989,13 @@ public class MainViewModel : ViewModelBase
                 "Import Backup Set",
                 $"Importing {fileName}",
                 cancellable: true,
-                (progress, ct) => BackupSetTransfer.ImportAsync(_catalog, fileName, progress, ct)
-                    .GetAwaiter().GetResult());
+                (progress, ct) => BackupSetTransfer.ImportAsync(_catalog, fileName, progress, ct));
             if (!completed)
             {
+                // The import creates its set before the history goes in and
+                // deletes it again on a cancel, and the list may have been
+                // reloaded (by a backup finishing) in between.
+                await LoadBackupSetsAsync();
                 StatusText = $"Import of {Path.GetFileName(fileName)} cancelled; no backup set was added.";
                 CrashLogger.Log(null, $"GUI: import of {fileName} cancelled after {clock.Elapsed:hh\\:mm\\:ss}.");
                 return;
@@ -5031,6 +5029,7 @@ public class MainViewModel : ViewModelBase
         }
         catch (Exception ex)
         {
+            await LoadBackupSetsAsync();   // as for a cancel: a set may have come and gone
             StatusText = $"Import failed: {ex.Message}";
             CrashLogger.Log(ex, $"Import of {fileName}");
             MessageBox.Show($"Could not import {Path.GetFileName(fileName)}.\n\n{ex.Message}",

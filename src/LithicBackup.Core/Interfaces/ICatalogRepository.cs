@@ -584,8 +584,9 @@ public interface ICatalogRepository : IDisposable
     Task<bool> HasFileRecordsAsync(int backupSetId, CancellationToken ct = default);
 
     /// <summary>
-    /// Approximate on-disk size of the set's history database in bytes (the
-    /// database file plus its write-ahead log), or 0 when it has none yet.
+    /// Approximate size of the set's history in bytes: the pages its database
+    /// has in use, about what <see cref="ExportSetHistoryAsync"/> writes. 0 when
+    /// it has none yet.
     /// </summary>
     long GetSetHistorySizeBytes(int backupSetId);
 

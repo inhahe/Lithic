@@ -75,8 +75,8 @@ public static class BackupSetTransfer
                     $"{Path.GetFileName(path)}.{Guid.NewGuid():N}.history.partial");
 
                 // The copy is one SQLite statement, but it writes its file as it
-                // goes, to about the size of the database it copies: its growth
-                // is the progress.
+                // goes, to about the size of the pages it copies: its growth is
+                // the progress.
                 long expected = Math.Max(1, catalog.GetSetHistorySizeBytes(set.Id));
                 string historyFile = historyDb;
                 progress?.Report(new ProgressReport(
