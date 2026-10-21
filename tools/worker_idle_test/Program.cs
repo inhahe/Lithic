@@ -718,15 +718,21 @@ async Task PartC()
         });
         rig.Destination.Connected = true;
 
-        // Held from the start: nothing runs.
+        // Held from the start: nothing runs, and nothing is even announced.
+        int announced = 0;
+        var markerWatch = new FileSystemWatcher(rig.Repo.DataDirectory, "*.backingup") { IncludeSubdirectories = true };
+        markerWatch.Created += (_, _) => Interlocked.Increment(ref announced);
+        markerWatch.EnableRaisingEvents = true;
         var hold = rig.Repo.HoldSetInApp(rig.SetId);
         await rig.Worker.StartAsync(CancellationToken.None);
         await Task.Delay(TimeSpan.FromSeconds(12));
+        markerWatch.Dispose();
         int started = rig.Log.Count("Starting backup for");
         int waits = rig.Log.Count("wait: Lithic Backup is working on it");
         Check(started == 0 && Copied() == 0,
             $"C8 while the app holds the set, the Worker starts no backup of it ({started} started, {Copied()} copied)");
         Check(waits == 1, $"C8 the wait is logged once ({waits} times)");
+        Check(announced == 0, $"C8 and announces no run it then drops ({announced} run markers created)");
 
         // Let go: the full backup runs. Take the set again while it is copying.
         hold.Dispose();

@@ -766,7 +766,11 @@ public class SqliteCatalogRepository : ICatalogRepository
     {
         private readonly string _path;
         private readonly Timer _timer;
-        private int _disposed;
+        // A refresh and the release are serialised: a refresh that had passed the
+        // released check as the marker was deleted would write it again, and the
+        // marker would count as live for a while after the hold had ended.
+        private readonly object _gate = new();
+        private bool _disposed;
 
         public ActivityMarker(string path)
         {
@@ -777,21 +781,28 @@ public class SqliteCatalogRepository : ICatalogRepository
 
         private void Touch()
         {
-            if (Volatile.Read(ref _disposed) != 0) return;
-            try
+            lock (_gate)
             {
-                if (File.Exists(_path)) File.SetLastWriteTimeUtc(_path, DateTime.UtcNow);
-                else File.WriteAllText(_path, Environment.ProcessId.ToString());
+                if (_disposed) return;
+                try
+                {
+                    if (File.Exists(_path)) File.SetLastWriteTimeUtc(_path, DateTime.UtcNow);
+                    else File.WriteAllText(_path, Environment.ProcessId.ToString());
+                }
+                catch (Exception ex) when (ex is IOException or UnauthorizedAccessException) { }
             }
-            catch (Exception ex) when (ex is IOException or UnauthorizedAccessException) { }
         }
 
         public void Dispose()
         {
-            if (Interlocked.Exchange(ref _disposed, 1) != 0) return;
+            lock (_gate)
+            {
+                if (_disposed) return;
+                _disposed = true;
+                try { File.Delete(_path); }
+                catch (Exception ex) when (ex is IOException or UnauthorizedAccessException) { }
+            }
             _timer.Dispose();
-            try { File.Delete(_path); }
-            catch (Exception ex) when (ex is IOException or UnauthorizedAccessException) { }
         }
     }
 

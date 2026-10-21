@@ -5110,7 +5110,7 @@ public class MainViewModel : ViewModelBase
         if (e.PropertyName == nameof(BackupSetRowViewModel.Progress) && row.Progress is { } progress)
             progress.PropertyChanged += (_, pe) =>
             {
-                if (pe.PropertyName == nameof(BurnProgressViewModel.IsComplete))
+                if (pe.PropertyName is nameof(BurnProgressViewModel.IsComplete) or nameof(BurnProgressViewModel.IsPaused))
                     SyncAppHold(row);
             };
         if (e.PropertyName is nameof(BackupSetRowViewModel.IsRunning) or nameof(BackupSetRowViewModel.Progress))
@@ -5118,14 +5118,15 @@ public class MainViewModel : ViewModelBase
     }
 
     /// <summary>
-    /// Hold the set against the Worker while its row is working, and let go when
-    /// it stops. Working, not merely busy: a finished backup's panel can stay up,
-    /// row still running, until it is dismissed - with failed files, for as long
-    /// as nobody looks - and the Worker must not wait on that.
+    /// Hold the set against the Worker while its row is working
+    /// (<see cref="BackupSetRowViewModel.IsWorking"/>), and let go when it stops -
+    /// or pauses: a paused backup commits and gives the set's write lock up so
+    /// that other writers can go on, and the Worker is one. Resuming takes the set
+    /// back, and the Worker stops what it started within a second.
     /// </summary>
     private void SyncAppHold(BackupSetRowViewModel row)
     {
-        bool working = row.IsRunning && row.Progress is not { IsComplete: true };
+        bool working = row.IsWorking && row.Progress is not { IsPaused: true };
         lock (_appHolds)
         {
             if (working && !_appHolds.ContainsKey(row.Id))

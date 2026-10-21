@@ -328,6 +328,20 @@ public sealed class BackupWorker : BackgroundService
             state.RunsBlockedUntilUtc = until;
     }
 
+    /// <summary>
+    /// After a run was refused because the app holds the set: attempt none for a
+    /// couple of seconds, rather than at every pass of the loop. Short, since the
+    /// hold can end at any moment and the work should follow it.
+    /// </summary>
+    private static void WaitForApp(SetState state)
+    {
+        var until = DateTime.UtcNow + AppHoldRecheck;
+        if (until > state.RunsBlockedUntilUtc)
+            state.RunsBlockedUntilUtc = until;
+    }
+
+    private static readonly TimeSpan AppHoldRecheck = TimeSpan.FromSeconds(2);
+
     /// <summary>Whether <see cref="BlockRuns"/> holds this set's runs now.</summary>
     private static bool RunsBlocked(SetState state) => DateTime.UtcNow < state.RunsBlockedUntilUtc;
 
@@ -1951,9 +1965,10 @@ public sealed class BackupWorker : BackgroundService
     private async Task ExecuteTargetedPathsAsync(
         SetState state, IReadOnlyList<string> paths, CancellationToken ct)
     {
+        // The paths were taken out of Pending to run; one that does not finish
+        // puts them back.
         void Requeue()
         {
-            // Exactly as for a destination that is not connected.
             var now = DateTime.UtcNow;
             foreach (var p in paths)
                 state.Pending.TryAdd(p, (now, now));
@@ -1981,10 +1996,7 @@ public sealed class BackupWorker : BackgroundService
             var targetDir = await ResolveDestinationAsync(state, ct);
             if (targetDir is null)
             {
-                // Destination not connected — requeue these paths for next poll.
-                var requeueNow = DateTime.UtcNow;
-                foreach (var p in paths)
-                    state.Pending.TryAdd(p, (requeueNow, requeueNow));
+                Requeue();   // for the next poll
                 return;
             }
 
@@ -2027,18 +2039,19 @@ public sealed class BackupWorker : BackgroundService
                         "  … and {More} more failed file(s).", result.FailedFiles.Count - 10);
             }
         }
-        catch (OperationCanceledException) when ((run ?? outer)?.StoppedForApp == true)
-        {
-            // Before the general case: the run's token is `ct` now, so that one
-            // would match too, and drop the paths.
-            Requeue();
-            _logger.LogInformation(
-                "Continuous backup for \"{Name}\" paused: Lithic Backup is working on it. "
-                + "Its changes are backed up when that is done.", state.BackupSet.Name);
-        }
         catch (OperationCanceledException) when (ct.IsCancellationRequested)
         {
-            _logger.LogInformation("Continuous backup for \"{Name}\" cancelled.", state.BackupSet.Name);
+            // Whatever stopped it - the app taking this set, the app taking the
+            // set whose full scan this ran inside (whose token this one is linked
+            // to), or the service stopping - nothing else would back these up.
+            Requeue();
+            if ((run ?? outer)?.StoppedForApp == true)
+                _logger.LogInformation(
+                    "Continuous backup for \"{Name}\" paused: Lithic Backup is working on it. "
+                    + "Its changes are backed up when that is done.", state.BackupSet.Name);
+            else
+                _logger.LogInformation("Continuous backup for \"{Name}\" stopped; its changes wait for the next run.",
+                    state.BackupSet.Name);
         }
         catch (Exception ex)
         {
@@ -2392,17 +2405,26 @@ public sealed class BackupWorker : BackgroundService
     /// with <paramref name="stopForApp"/> watches for app work that begins while
     /// it runs and cancels <see cref="SetRun.Token"/> within a second: a purge
     /// waits for the run's marker to go before it deletes anything, a backup in
-    /// the app waits for the set's lock, and a full backup can run for hours.
-    /// Checking only at the start let a run that was already going copy files at
-    /// the very paths the purge then deleted.
+    /// the app waits for the set's lock, and a full backup can run for hours: a
+    /// run that went on would copy files at the very paths the purge deletes.
     /// </summary>
     private SetRun? StartSetRun(SetState state, bool stopForApp, CancellationToken ct)
     {
         int setId = state.BackupSet.Id;
+        // Asked first without announcing anything: while the app holds the set,
+        // every attempt would otherwise create and delete the run's marker, and
+        // that churn itself wakes the loop. Then announced and asked again, so of
+        // a run and the app starting together one sees the other.
+        if (AppHoldsSet(state))
+        {
+            WaitForApp(state);
+            return null;
+        }
         var marker = _catalog.HoldSetForBackgroundBackup(setId);
         if (AppHoldsSet(state))
         {
             marker.Dispose();
+            WaitForApp(state);
             return null;
         }
         var run = new SetRun(state, marker, stopForApp ? () => AppWorkOn(setId) is not null : null, ct);

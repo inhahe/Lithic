@@ -1710,18 +1710,29 @@ lock at all:
 
 * **`HoldSetInApp`**, a marker beside the set's database like the cleanup one
   (refreshed every 5 s, ignored once 30 s stale), is held by `MainViewModel` while
-  the set's row is *working*: running and not yet complete. Not merely running - a
-  finished backup's panel keeps the row running until it is dismissed, and with
-  failed files on it nobody may dismiss it for days. The review window before a
-  backup is modal and inside the run, so the Worker waits while you review; you are
-  about to back that set up anyway.
+  the set's row is *working* (`BackupSetRowViewModel.IsWorking`: running and not
+  yet complete) and not paused. Not merely running - a finished backup's panel
+  keeps the row running until it is dismissed, and with failed files on it nobody
+  may dismiss it for days; the same predicate decides when Cleanup and the editor's
+  post-save removal refuse a busy set. Not paused - a paused backup commits and
+  gives the write lock up precisely so other writers can go on, and the Worker is
+  one; resuming takes the set back and the Worker stops within a second. The
+  review window before a backup is modal and inside the run, so the Worker waits
+  while you review; you are about to back that set up anyway.
 * **The Worker treats it as it treats a cleanup** (`AppWorkOn`): `StartSetRun`
-  announces the run, then checks, and returns null if the app has the set - the
-  caller keeps the work queued, exactly as for a destination that is not connected.
+  checks first without announcing anything, then announces the run and checks
+  again, and returns null if the app has the set - the caller keeps the work
+  queued, exactly as for a destination that is not connected, and the set's runs
+  are not attempted again for two seconds (`WaitForApp`), so a held set costs
+  the loop nothing: announcing and dropping a run at every pass made a marker
+  each time, which woke the loop again.
   A run already going watches every second and cancels itself
   (`SetRun.StoppedForApp`); a full run returns DidNotRun, a targeted one requeues
   its paths, and neither counts as a failure with backoff. A journal drain inside
-  another set's full scan therefore skips the held set and the scan carries on.
+  another set's full scan therefore skips the held set and the scan carries on;
+  and when the app takes the *scanning* set, the drain's targeted run of another
+  set, linked to the scan's token, is cancelled with it and requeues its paths
+  too (any cancellation does).
 * Moves are announced but not stopped (quick renames over a queue cleared as they
   start); the app's backup waits on the lock for them, briefly.
 
