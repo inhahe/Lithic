@@ -739,22 +739,40 @@ public partial class App : Application
     internal void MinimizeToTray()
     {
         MainWindow?.Hide();
-        var (text, icon) = TrayBalloonText(Services.WorkerServiceHelper.GetStatus());
+        bool anyAutomated = _mainViewModel?.BackupSets.Any(r => r.Model.RunsAutomatically()) ?? true;
+        _ = ShowTrayBalloonAsync(anyAutomated);
+    }
+
+    /// <summary>
+    /// Show <see cref="TrayBalloonText"/> once the service's state is known.
+    /// Asked off the UI thread: the answer comes from sc.exe, which can take a
+    /// while, and the window is already hidden.
+    /// </summary>
+    private async Task ShowTrayBalloonAsync(bool anySetRunsAutomatically)
+    {
+        var state = await Task.Run(Services.WorkerServiceHelper.GetStatus);
+        var (text, icon) = TrayBalloonText(state, anySetRunsAutomatically);
         _notifyIcon?.ShowBalloonTip(1500, "Lithic Backup", text, icon);
     }
 
     /// <summary>
-    /// What to say on minimizing to the tray. It used to be "Background
-    /// monitoring continues" whatever the state - read as "backups carry on",
-    /// though only the Worker service runs automated backups. What the app
-    /// itself keeps doing in the tray is suggesting a backup when files change
-    /// and warning when a destination fills up; with the service stopped or not
-    /// installed, no backup runs at all until it is started.
+    /// What to say on minimizing to the tray: whether automated backups go on.
+    /// Only the Worker service runs them. What the app itself keeps doing in the
+    /// tray is suggesting a backup when files change and warning when a
+    /// destination fills up.
     /// </summary>
-    internal static (string Text, WinForms.ToolTipIcon Icon) TrayBalloonText(Services.ServiceState state) => state switch
+    /// <param name="state">The Worker service's state.</param>
+    /// <param name="anySetRunsAutomatically">Whether any set is one the service
+    /// backs up on its own (<see cref="Core.Models.BackupSet.RunsAutomatically"/>).</param>
+    internal static (string Text, WinForms.ToolTipIcon Icon) TrayBalloonText(
+        Services.ServiceState state, bool anySetRunsAutomatically) => state switch
     {
-        Services.ServiceState.Running or Services.ServiceState.StartPending =>
+        Services.ServiceState.Running or Services.ServiceState.StartPending when anySetRunsAutomatically =>
             ("Minimized to tray. The background service keeps running your automated backups.",
+             WinForms.ToolTipIcon.Info),
+        Services.ServiceState.Running or Services.ServiceState.StartPending =>
+            ("Minimized to tray. No backup set runs automatically: none has a schedule turned on, "
+             + "or each waits for you to run a backup in the app first.",
              WinForms.ToolTipIcon.Info),
         Services.ServiceState.Stopped or Services.ServiceState.StopPending =>
             ("Minimized to tray. The background service is stopped, so no automated backups will run "

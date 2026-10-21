@@ -511,7 +511,7 @@ public sealed class BackupWorker : BackgroundService
             bool scheduled = schedule is { Enabled: true }
                              && set.JobOptions?.TargetDirectory is not null;
             bool held = set.JobOptions?.HoldAutomatedBackups == true;
-            bool active = scheduled && !held;
+            bool active = set.RunsAutomatically();
 
             if (!_sets.TryGetValue(set.Id, out var state))
             {

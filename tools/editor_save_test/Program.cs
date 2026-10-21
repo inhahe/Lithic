@@ -865,14 +865,21 @@ internal static class Program
         // --- 19. the tray balloon says whether automated backups run ---
         Console.WriteLine();
         Console.WriteLine("=== 19. the tray balloon follows the service's state ===");
-        Check(App.TrayBalloonText(LithicBackup.Services.ServiceState.Running).Text.Contains("keeps running"),
+        Check(App.TrayBalloonText(LithicBackup.Services.ServiceState.Running, true).Text.Contains("keeps running"),
             "running: automated backups carry on");
-        Check(App.TrayBalloonText(LithicBackup.Services.ServiceState.Stopped).Text.Contains("is stopped, so no automated backups"),
+        Check(App.TrayBalloonText(LithicBackup.Services.ServiceState.Running, false).Text.Contains("No backup set runs automatically"),
+            "running, but every set unscheduled or held: says none runs");
+        Check(App.TrayBalloonText(LithicBackup.Services.ServiceState.Stopped, true).Text.Contains("is stopped, so no automated backups"),
             "stopped: says no automated backups will run");
-        Check(App.TrayBalloonText(LithicBackup.Services.ServiceState.NotInstalled).Text.Contains("not installed"),
+        Check(App.TrayBalloonText(LithicBackup.Services.ServiceState.NotInstalled, true).Text.Contains("not installed"),
             "not installed: says so");
-        Check(!App.TrayBalloonText(LithicBackup.Services.ServiceState.Stopped).Text.Contains("monitoring continues"),
+        Check(!App.TrayBalloonText(LithicBackup.Services.ServiceState.Stopped, true).Text.Contains("monitoring continues"),
             "and none claims monitoring continues");
+        var heldSet = new BackupSet { JobOptions = new JobOptions
+            { TargetDirectory = @"X:\b", Schedule = new BackupSchedule { Enabled = true }, HoldAutomatedBackups = true } };
+        Check(!heldSet.RunsAutomatically(), "a held set does not run automatically");
+        heldSet.JobOptions.HoldAutomatedBackups = false;
+        Check(heldSet.RunsAutomatically(), "released, it does");
 
         // --- 20. a drive row takes its totals from its children ---
         Console.WriteLine();

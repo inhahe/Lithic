@@ -44,4 +44,12 @@ public class BackupSet
 
     public DateTime CreatedUtc { get; set; }
     public DateTime? LastBackupUtc { get; set; }
+
+    /// <summary>
+    /// Whether the Worker service backs this set up on its own: a directory set
+    /// with an enabled schedule, its automated backups not held until a backup
+    /// is run in the app (<see cref="JobOptions.HoldAutomatedBackups"/>).
+    /// </summary>
+    public bool RunsAutomatically() =>
+        JobOptions is { Schedule.Enabled: true, TargetDirectory: not null, HoldAutomatedBackups: false };
 }
