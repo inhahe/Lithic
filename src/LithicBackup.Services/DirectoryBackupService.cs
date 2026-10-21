@@ -4051,23 +4051,29 @@ public class DirectoryBackupService
     /// Reads Lithic Backup's own layout as well as plain mirrors (backup4all,
     /// robocopy): the current copy of each file under its drive folder
     /// (<c>C\Users\…</c>), and Lithic's version history under
-    /// <c>C_prev\…\name.vN</c>.
+    /// <c>C_prev\…\name.vN</c>. It writes to the destination in one case: an
+    /// older stored form at a file's current location is moved into the history
+    /// (below).
     /// </summary>
     /// <remarks>
-    /// <para><b>History is imported, and numbering continues after it.</b> The seed
-    /// used to skip <c>{drive}_prev</c> entirely and record every current copy as
-    /// version 1. The next time a file changed, its current copy was moved to
-    /// <c>name.v1</c> - on top of the real version 1 from the destination's earlier
-    /// life - and so on up the chain, one version lost per change. Now each version
-    /// file becomes a record with its own number, and the current copy is numbered
-    /// after the highest. (The backup engine also refuses to overwrite a version
-    /// file it does not own; see the _prev move in ExecuteCoreAsync.) A version's
-    /// backup time is its file's last-write time - when it was copied, since copies
-    /// do not carry the source's timestamp - which is what retention ages it by.</para>
+    /// <para><b>History is imported, and numbering continues after it.</b> Each
+    /// version file becomes a record with its own number, and the current copy is
+    /// numbered after the highest, so the next change files the current copy away
+    /// under a new number, never over a real earlier version. (The backup engine
+    /// also refuses to overwrite a version file it does not own; see the _prev move
+    /// in ExecuteCoreAsync.) A version's backup time is its file's last-write time
+    /// - when it was copied, since copies do not carry the source's timestamp -
+    /// which is what retention ages it by.</para>
     /// <para><b>One record per file and version.</b> A destination written by two
     /// catalogs can hold both <c>name</c> and <c>name.fileref</c> (or <c>.dedup</c>)
-    /// for one file. Only one is recorded: the plain copy (it holds the bytes), else
-    /// the <c>.dedup</c>, else the <c>.fileref</c>. The others stay on disk.</para>
+    /// for one file. At the current location these are versions written by
+    /// different backups: the newest is recorded as the current copy, and each
+    /// older one is moved into <c>{drive}_prev</c> and recorded as a version before
+    /// it (<see cref="SeedOutcome.MovedToHistory"/>), so a change finds one stored
+    /// form to file away. Of the forms of one numbered history version only one is
+    /// recorded: the plain copy (it holds the bytes), else the <c>.dedup</c>, else
+    /// the <c>.fileref</c>. The others stay on disk
+    /// (<see cref="SeedOutcome.DuplicateCopies"/>).</para>
     /// <para><b>A source path is all or nothing.</b> Its versions and current copy
     /// are committed together, in batches of whole paths, so cancelling never
     /// leaves a path with its history recorded and its current copy not: a re-run
