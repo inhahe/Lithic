@@ -137,9 +137,13 @@ internal static class Program
         }
         finally
         {
+            // Closed first: SQLite's open files keep the folder from going.
+            try { _catalog?.Dispose(); } catch { }
+            try { _observer?.Dispose(); } catch { }
             SqliteClearPools();
             try { Directory.Delete(_root, recursive: true); } catch { }
         }
+        Check(!Directory.Exists(_root), $"the harness leaves no temp folder behind ({_root})");
 
         Console.WriteLine();
         Console.WriteLine(_failures == 0

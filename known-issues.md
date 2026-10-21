@@ -1,5 +1,25 @@
 # LithicBackup — Known Issues & Tech Debt
 
+## TECH DEBT: most test harnesses leave their temp folder behind on every run
+
+**Seen 2026-10-21:** 286 `%TEMP%\lithic_<harness>_<guid>` folders, 712 MB,
+going back to 10/18 (deleted). By prefix: `dirdedup` 78, `excess` 46,
+`editsave` 45, `targeted` 22, `resurrect` 20, `est` 18, `purgeint` 18,
+`caserename` 15, `interleave` 15, `missing` 15, `lockfair` 12, `widen` 12,
+`destspace` 9, `est_inc` 6.
+
+**Cause.** Most harnesses end with `try { Directory.Delete(root, true) } catch { }`
+while their `SqliteCatalogRepository` instances are still open. SQLite holds
+the database files, the delete fails, and the empty catch hides it. A few never
+delete at all.
+
+**Fix, per harness:** dispose every repository it created (and call
+`SqliteConnection.ClearAllPools()`) before deleting, then
+`Check(!Directory.Exists(root), "the harness leaves no temp folder behind")`
+so a leak fails the run instead of accumulating. `history_transfer_test` and
+`editor_save_test` already do this. The second was fixed on 2026-10-21; every
+run of it had leaked about 2 MB.
+
 ## OPEN: a directory backup can fail a file with "Permission denied: Access to the path is denied." once, then not again (seen 2026-10-21)
 
 **Seen.** `history_transfer_test` §5 ("Backing up anyway never overwrites old
