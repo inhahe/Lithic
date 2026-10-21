@@ -177,11 +177,10 @@ internal sealed class SqliteSetDatabase : IDisposable
     /// <summary>
     /// Awaited first by every call that takes the gate, so the work after it runs
     /// on the thread pool when the call came from the UI thread (a
-    /// SynchronizationContext). The catalog's async methods do their SQLite work
-    /// before they first truly await, so with the gate free a read of millions of
-    /// rows ran on the UI thread and froze the window. The transaction's owner
-    /// (an AsyncLocal) flows with the hop; the gate and the write lock are not
-    /// bound to a thread.
+    /// SynchronizationContext): the catalog's async methods do their SQLite work
+    /// before they first truly await, and that work can be a read of millions of
+    /// rows. The transaction's owner (an AsyncLocal) flows with the hop; the gate
+    /// and the write lock are not bound to a thread.
     /// </summary>
     private readonly struct OffUiThread : System.Runtime.CompilerServices.ICriticalNotifyCompletion
     {

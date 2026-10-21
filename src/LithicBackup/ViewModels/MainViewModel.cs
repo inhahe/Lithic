@@ -2692,6 +2692,15 @@ public class MainViewModel : ViewModelBase
         if (result != MessageBoxResult.Yes)
             return;
 
+        // Its open windows (Cleanup, Coverage, Verify...) may be reading it: the
+        // delete waits for a read under way, and closing them stops theirs.
+        if (!_taskWindows.CloseForSet(backupSet.Id))
+        {
+            StatusText = $"\"{backupSet.Name}\" was not deleted: a window open on it was kept open.";
+            return;
+        }
+        StatusText = $"Deleting \"{backupSet.Name}\"…";
+
         try
         {
             await _catalog.DeleteBackupSetAsync(backupSet.Id);

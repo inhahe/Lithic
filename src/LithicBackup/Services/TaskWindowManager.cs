@@ -251,6 +251,25 @@ public sealed class TaskWindowManager
     }
 
     /// <summary>
+    /// Close every task window open on <paramref name="setId"/>: the set is about
+    /// to be deleted, and closing a window stops its reads, which the delete would
+    /// otherwise wait out. False when one stayed open - its flow asked and the
+    /// user kept it (unsaved changes) - so the delete does not go ahead under it.
+    /// </summary>
+    public bool CloseForSet(int setId)
+    {
+        var keys = _meta.Where(m => m.Value.SetId == setId).Select(m => m.Key).ToList();
+        foreach (string key in keys)
+        {
+            if (!_open.TryGetValue(key, out var window))
+                continue;
+            try { window.Close(); }
+            catch { /* a window already closing is not an error */ }
+        }
+        return keys.All(key => !_open.ContainsKey(key));
+    }
+
+    /// <summary>
     /// Close every task window. Called when the main window closes, so task
     /// windows never outlive the app and strand it with no visible UI (the app
     /// uses ShutdownMode.OnExplicitShutdown).

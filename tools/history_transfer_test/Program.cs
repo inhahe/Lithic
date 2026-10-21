@@ -24,7 +24,10 @@
 //      backup over an old destination files the old copy under a fresh number;
 //   6. a seed that finds both a plain copy and a .fileref of one file records one.
 //  10. export and import of a large history report rising progress through each
-//      step, and a cancel stops them part-way leaving nothing behind.
+//      step, and a cancel stops them part-way leaving nothing behind; so does a
+//      cancel of a catalog read, its sort included.
+//  11. a set deleted while a read of it is under way: the read finishes, the
+//      database goes after it, and the deleted set is not made anew.
 
 using System.Security.Cryptography;
 using System.Text.Json;
@@ -696,12 +699,15 @@ Check(exportGaps.Count == 0 || exportGaps.Max() < 3 * ProgressCadence.IntervalMs
 // seen writing, not from a report, so it lands early in the copy however fast
 // this machine copies, and the stop is measured against the whole copy's time.
 // A timed cancel needs a step long enough to time. One that a machine finishes
-// in a blink is reported as not measured there, rather than failed.
+// in a blink is reported as not measured there, rather than failed - and the
+// final verdict says so, so a skip is never read as a pass.
+var notMeasured = new List<string>();
 bool Measurable(long ms, string what)
 {
     if (ms >= 200)
         return true;
-    Console.WriteLine($"  - not measured: {what} took {ms:N0} ms here, too short to time a cancel against");
+    Console.WriteLine($"  - NOT MEASURED: {what} took {ms:N0} ms here, too short to time a cancel against");
+    notMeasured.Add(what);
     return false;
 }
 
@@ -862,7 +868,9 @@ using (var cts = new CancellationTokenSource())
 Console.WriteLine();
 Console.WriteLine("=== 11. Deleting a set while a read of it is under way ===");
 {
-    var readStarted = new TaskCompletionSource();
+    // Asynchronous continuations: the delete must run beside the read, not
+    // inside its progress callback on the reading thread.
+    var readStarted = new TaskCompletionSource(TaskCreationOptions.RunContinuationsAsynchronously);
     var reading = Task.Run(() => repoP.GetAllFilesForBackupSetAsync(setP.Id, default,
         new SyncProgress<int>(_ => readStarted.TrySetResult())));
     await readStarted.Task;                       // rows are being read
@@ -891,7 +899,9 @@ try { Directory.Delete(root, recursive: true); } catch { /* temp; best effort */
 Check(!Directory.Exists(root), "the harness leaves no temp folder behind");
 if (failures == 0)
 {
-    Console.WriteLine("ALL PASS");
+    Console.WriteLine(notMeasured.Count == 0
+        ? "ALL PASS"
+        : $"ALL PASS, but NOT MEASURED on this machine: {string.Join("; ", notMeasured)}");
     return 0;
 }
 Console.WriteLine($"{failures} CHECK(S) FAILED");

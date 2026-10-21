@@ -1915,8 +1915,10 @@ are excluded anyway.
   `VACUUM INTO` is watched too, safely, on a connection of its own.
 * **A task window's flow stops with the window.** `TaskWindowManager` disposes
   a flow that is `IDisposable` when its window closes, however it was closed;
-  Cleanup, Verify, Coverage and Largest Files cancel their scans there. A
-  purge, a write the user confirmed, carries on, on its own token.
+  Cleanup, Verify, Coverage, Largest Files and Find File cancel their work
+  there. A purge, a write the user confirmed, carries on, on its own token.
+  Deleting a set closes its task windows first (`CloseForSet`), and does not
+  go ahead if one is kept open.
 * **Await catalog calls; don't block on them.** Work under a progress window
   awaits (`ProgressDialog.RunAsync` takes async work). The UI thread may await
   a set's catalog call directly: every way into a set's gate

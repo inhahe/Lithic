@@ -22,13 +22,16 @@ restore browser's children, and now the count and the remap. The set
 databases store UTF-8 and NOCASE compares its bytes, and every character
 beyond U+FFFF (an emoji: `F0 ...`) sorts above `EF BF BF`. So a file or
 folder whose name starts with one fell outside the range: missing from the
-restore browser, from a restore of the folder, and from its counts. The
-bound is now U+10FFFF, the highest code point.
+restore browser, from a restore of the folder, and from its counts. And the
+restore browser's skip-scan, jumping past a subfolder to `sub\` + U+FFFF,
+landed below such a name and listed the subfolder again, for ever. No
+sentinel will do: NTFS allows even U+10FFFF in a name. The bound is now exact,
+`'P\' <= path < 'P]'`, since `]` follows `\` in NOCASE order as in binary.
 
 `path_range_test` holds all six reads to the same meaning: case variants,
-the path itself, look-alike siblings (`a bar`, `a!`, `a]`) and emoji names.
-It also checks the cost. Against the old code it fails four checks: the
-three emoji reads, and the read of a small folder.
+the path itself, look-alike siblings (`a bar`, `a!`, `a]`), emoji names and a
+name starting with U+10FFFF. It lists the parent of such a folder against a
+deadline, and remaps an emoji prefix. It also checks the cost.
 
 ## TECH DEBT: most test harnesses leave their temp folder behind on every run
 

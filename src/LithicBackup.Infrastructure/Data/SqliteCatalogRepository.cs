@@ -130,8 +130,12 @@ public class SqliteCatalogRepository : ICatalogRepository
         if (_sets.TryGetValue(setId, out var db))
             return db;
 
+        // Checked again under the lock the delete marks the set under, so a
+        // database is never opened for a set deleted between the two.
         lock (_setsLock)
         {
+            if (_deletedSets.ContainsKey(setId))
+                throw new BackupSetDeletedException(setId);
             return _sets.GetOrAdd(setId, id => new SqliteSetDatabase(id, SetDbPath(id)));
         }
     }
@@ -1056,8 +1060,13 @@ public class SqliteCatalogRepository : ICatalogRepository
             _backupSetsStamp++;
 
             // Committed - the set no longer exists: nothing may open its
-            // database again, and it goes below.
-            _deletedSets[backupSetId] = 0;
+            // database again (see GetSet), and it goes below. Its discs are
+            // unknown from now on, as they are once it has gone.
+            lock (_setsLock)
+                _deletedSets[backupSetId] = 0;
+            foreach (var kvp in _discToSet)
+                if (kvp.Value == backupSetId)
+                    _discToSet.TryRemove(kvp.Key, out _);
         }
         finally
         {
@@ -1067,11 +1076,6 @@ public class SqliteCatalogRepository : ICatalogRepository
         // Outside the master gate: closing waits for a read of the set under way,
         // and a flow holding the set's gate may be waiting for the master one.
         await RemoveSetDatabaseFileAsync(backupSetId).ConfigureAwait(false);
-
-        // Forget cached disc->set entries for this set.
-        foreach (var kvp in _discToSet)
-            if (kvp.Value == backupSetId)
-                _discToSet.TryRemove(kvp.Key, out _);
     }
 
     public async Task ClearBackupSetCatalogAsync(int backupSetId, CancellationToken ct = default)
