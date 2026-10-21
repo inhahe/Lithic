@@ -561,55 +561,28 @@ internal sealed class SqliteSetDatabase : IDisposable
     }
 
     /// <summary>
-    /// The rows <paramref name="cmd"/> returns, ending in
+    /// The rows <paramref name="cmd"/> - a read - returns, ending in
     /// <see cref="OperationCanceledException"/> as soon as <paramref name="ct"/> is
-    /// cancelled - between rows, and inside SQLite while it works. A read ordered
-    /// by source path sorts the whole set before its first row (a temp B-tree:
-    /// the indexes do not give that order), and that sort can be most of the read,
-    /// out of reach of any check between rows. The reader is disposed when the
-    /// loop ends.
+    /// cancelled: between rows, and inside SQLite while it works
+    /// (<see cref="SqliteCancellation"/>). A read ordered by source path sorts the
+    /// whole set before its first row (a temp B-tree: the indexes do not give that
+    /// order), and that sort can be most of the read. Reads only: these run on the
+    /// set's connection, often inside a transaction, where an aborted write would
+    /// roll the whole transaction back. The reader is disposed when the loop ends.
     /// </summary>
     private static IEnumerable<SqliteDataReader> Rows(SqliteCommand cmd, CancellationToken ct)
     {
+        System.Diagnostics.Debug.Assert(
+            cmd.CommandText.TrimStart().StartsWith("SELECT", StringComparison.OrdinalIgnoreCase),
+            "Rows is for reads: an aborted write rolls back the caller's transaction.");
         ct.ThrowIfCancellationRequested();
-        var db = cmd.Connection!.Handle!;
-        // While the read runs, SQLite asks this every 10,000 instructions, and a
-        // non-zero answer aborts the statement with SQLITE_INTERRUPT. Removed
-        // after: the connection is the set's, and only this read holds it.
-        bool watched = ct.CanBeCanceled;
-        if (watched)
-            SQLitePCL.raw.sqlite3_progress_handler(db, 10_000, _ => ct.IsCancellationRequested ? 1 : 0, null);
-        try
+        using var watch = SqliteCancellation.Watch(cmd.Connection!, ct);
+        using var r = SqliteCancellation.Interruptible(cmd.ExecuteReader, ct);
+        Func<bool> read = r.Read;
+        while (SqliteCancellation.Interruptible(read, ct))
         {
-            using var r = Interruptible(cmd.ExecuteReader, ct);
-            Func<bool> read = r.Read;
-            while (Interruptible(read, ct))
-            {
-                ct.ThrowIfCancellationRequested();
-                yield return r;
-            }
-        }
-        finally
-        {
-            if (watched)
-                SQLitePCL.raw.sqlite3_progress_handler(db, 0, null, null);
-        }
-    }
-
-    /// <summary>
-    /// <paramref name="step"/>, with an abort by <see cref="Rows"/>'s progress
-    /// handler surfacing as the cancel it is.
-    /// </summary>
-    private static T Interruptible<T>(Func<T> step, CancellationToken ct)
-    {
-        try
-        {
-            return step();
-        }
-        catch (SqliteException ex)
-            when (ex.SqliteErrorCode == SQLitePCL.raw.SQLITE_INTERRUPT && ct.IsCancellationRequested)
-        {
-            throw new OperationCanceledException(ct);
+            ct.ThrowIfCancellationRequested();
+            yield return r;
         }
     }
 
@@ -1552,7 +1525,7 @@ internal sealed class SqliteSetDatabase : IDisposable
         if (candidateIds.Count == 0)
             return [];
         using var _ = await LockAsync(ct).ConfigureAwait(false);
-        return NeededContentCopies(backupSetId, candidateIds, keepableIds);
+        return NeededContentCopies(backupSetId, candidateIds, keepableIds, ct);
     }
 
     /// <summary>See <see cref="ICatalogRepository.RetireRecordsKeepingNeededCopiesAsync"/>.</summary>
@@ -1566,7 +1539,7 @@ internal sealed class SqliteSetDatabase : IDisposable
         // One write lock for both: nothing can add or retire a reference between
         // deciding what is needed and retiring the rest.
         using var _ = await WriteLockAsync(ct).ConfigureAwait(false);
-        var kept = NeededContentCopies(backupSetId, candidateIds, keepableIds);
+        var kept = NeededContentCopies(backupSetId, candidateIds, keepableIds, ct);
         using var cmd = _connection.CreateCommand();
         cmd.CommandText = "UPDATE Files SET IsDeleted = 1 WHERE IsDeleted = 0 AND Id IN (SELECT value FROM json_each($ids))";
         cmd.Parameters.AddWithValue("$ids",
@@ -1578,10 +1551,12 @@ internal sealed class SqliteSetDatabase : IDisposable
     /// <summary>
     /// Which of the candidates are the last plain copy of content a live
     /// <c>.fileref</c> still needs, with the candidates gone; the caller holds the
-    /// gate.
+    /// gate. A cancel stops the search; the temp-table writes around it are not
+    /// watched, as this also runs inside a transaction (see <see cref="Rows"/>).
     /// </summary>
     private HashSet<long> NeededContentCopies(
-        int backupSetId, IReadOnlyCollection<long> candidateIds, IReadOnlyCollection<long>? keepableIds)
+        int backupSetId, IReadOnlyCollection<long> candidateIds, IReadOnlyCollection<long>? keepableIds,
+        CancellationToken ct)
     {
         var keep = new HashSet<long>();
 
@@ -1656,8 +1631,7 @@ internal sealed class SqliteSetDatabase : IDisposable
                 GROUP BY p.Hash
                 """;
             cmd.Parameters.AddWithValue("$setId", backupSetId);
-            using var r = cmd.ExecuteReader();
-            while (r.Read())
+            foreach (var r in Rows(cmd, ct))
                 keep.Add(r.GetInt64(0));
         }
         finally

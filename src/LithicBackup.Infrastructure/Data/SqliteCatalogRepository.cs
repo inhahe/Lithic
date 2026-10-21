@@ -866,21 +866,11 @@ public class SqliteCatalogRepository : ICatalogRepository
                 using var cmd = conn.CreateCommand();
                 cmd.CommandText = "VACUUM INTO $path";
                 cmd.Parameters.AddWithValue("$path", destinationPath);
-                // One statement that can run for minutes: a cancel stops it rather
-                // than waiting for the whole copy. SQLite asks this handler every
-                // thousand instructions, and a non-zero answer aborts the statement
-                // with SQLITE_INTERRUPT. Polled rather than pushed (sqlite3_interrupt),
-                // so a cancel that lands before the statement starts is not lost.
-                SQLitePCL.raw.sqlite3_progress_handler(conn.Handle, 1000,
-                    _ => ct.IsCancellationRequested ? 1 : 0, null);
-                try
-                {
-                    cmd.ExecuteNonQuery();
-                }
-                catch (SqliteException ex) when (ex.SqliteErrorCode == SQLitePCL.raw.SQLITE_INTERRUPT)
-                {
-                    throw new OperationCanceledException(ct);
-                }
+                // One statement that can run for minutes: a cancel stops it part-way
+                // rather than waiting for the whole copy. Safe to abort: it runs on a
+                // connection of its own, in no transaction.
+                using (SqliteCancellation.Watch(conn, ct))
+                    SqliteCancellation.Interruptible(cmd.ExecuteNonQuery, ct);
             }
             ct.ThrowIfCancellationRequested();
 

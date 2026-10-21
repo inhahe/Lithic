@@ -12,7 +12,7 @@ namespace LithicBackup.ViewModels;
 /// ViewModel for the Backup Coverage view. Scans the backup set's sources
 /// and compares against the catalog to show what is/isn't backed up.
 /// </summary>
-public class BackupCoverageViewModel : ViewModelBase
+public class BackupCoverageViewModel : ViewModelBase, IDisposable
 {
     private readonly ICatalogRepository _catalog;
     private readonly IFileScanner _scanner;
@@ -61,8 +61,7 @@ public class BackupCoverageViewModel : ViewModelBase
 
         CloseCommand = new RelayCommand(_ =>
         {
-            _cts?.Cancel();
-            _estimateCts?.Cancel();
+            Dispose();
             DoneRequested?.Invoke();
         });
 
@@ -157,6 +156,16 @@ public class BackupCoverageViewModel : ViewModelBase
     // --- Commands ---
 
     public ICommand CloseCommand { get; }
+
+    /// <summary>
+    /// Stop the scan and the size estimate: Close does, and so does the window
+    /// closing any other way (its task window disposes it).
+    /// </summary>
+    public void Dispose()
+    {
+        _cts?.Cancel();
+        _estimateCts?.Cancel();
+    }
 
     // --- Logic ---
 

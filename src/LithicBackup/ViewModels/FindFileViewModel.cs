@@ -89,7 +89,10 @@ public class FindFileViewModel : ViewModelBase
 
         try
         {
-            var results = await _catalog.SearchFilesAcrossSetsAsync(SearchText.Trim());
+            // Off the UI thread: the catalog's async methods do their SQLite work
+            // before they return, and a search reads every file of every set.
+            string text = SearchText.Trim();
+            var results = await Task.Run(() => _catalog.SearchFilesAcrossSetsAsync(text));
 
             foreach (var result in results)
                 Results.Add(new FileSearchResultViewModel(result));

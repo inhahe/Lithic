@@ -4106,8 +4106,7 @@ public class DirectoryBackupService
 
         int files = 0, versions = 0, skippedExisting = 0, duplicates = 0, unrecognized = 0, movedToHistory = 0;
         long totalBytes = 0;
-        var progressSw = System.Diagnostics.Stopwatch.StartNew();
-        long lastProgressMs = -ProgressCadence.IntervalMs;
+        var cadence = new ProgressCadence();
 
         // Idempotency guard: re-running the seed on the same destination must not
         // create duplicate records, so every source path the catalog already has
@@ -4144,10 +4143,8 @@ public class DirectoryBackupService
 
         void Report(string current, bool force = false)
         {
-            long now = progressSw.ElapsedMilliseconds;
-            if (!force && now - lastProgressMs < ProgressCadence.IntervalMs)
+            if (!cadence.IsDue() && !force)
                 return;
-            lastProgressMs = now;
             progress?.Report(new ScanProgress
             {
                 CurrentDirectory = current,

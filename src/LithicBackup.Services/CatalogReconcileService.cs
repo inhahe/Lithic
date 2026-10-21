@@ -45,7 +45,6 @@ public sealed class CatalogReconcileService
         IProgress<ProgressReport>? progress = null, CancellationToken ct = default)
     {
         var report = new ReconcileReport();
-        var sw = System.Diagnostics.Stopwatch.StartNew();
 
         progress?.Report("Loading catalog...");
         var all = await _catalog.GetAllFilesForBackupSetAsync(backupSetId, ct);
@@ -68,11 +67,11 @@ public sealed class CatalogReconcileService
 
         // --- Pass 1: flip stale filerefs. ---
         int processed = 0;
-        long lastReportMs = -ProgressCadence.IntervalMs; // fire the first report immediately
+        var cadence = new ProgressCadence();
         foreach (var r in active)
         {
             ct.ThrowIfCancellationRequested();
-            Report(progress, sw, ref lastReportMs, ref processed, total,
+            Report(progress, cadence, ref processed, total,
                 "Checking for materialised references");
 
             if (!r.IsFileRef || r.IsZipped || r.IsSplit)
@@ -108,11 +107,11 @@ public sealed class CatalogReconcileService
         if (report.TargetPresent)
         {
             processed = 0;
-            lastReportMs = -ProgressCadence.IntervalMs;
+            cadence = new ProgressCadence();
             foreach (var r in active)
             {
                 ct.ThrowIfCancellationRequested();
-                Report(progress, sw, ref lastReportMs, ref processed, total,
+                Report(progress, cadence, ref processed, total,
                     "Checking for missing content");
 
                 if (r.IsZipped || r.IsSplit)
@@ -301,18 +300,16 @@ public sealed class CatalogReconcileService
     }
 
     private static void Report(
-        IProgress<ProgressReport>? p, System.Diagnostics.Stopwatch sw, ref long lastReportMs,
+        IProgress<ProgressReport>? p, ProgressCadence cadence,
         ref int processed, int total, string phase)
     {
         processed++;
         if (p is null) return;
-        // Time-throttled + always report the final item, so the counter animates
-        // smoothly and lands on N/N (100%) — matching the app's other progress
-        // stages ("Updating catalog x/y (n%)", "Deleting backed-up files x/y (n%)").
-        long nowMs = sw.ElapsedMilliseconds;
-        if (nowMs - lastReportMs < ProgressCadence.IntervalMs && processed != total)
+        // At the cadence, and always the final item, so the counter lands on N/N
+        // (100%) - as the app's other progress stages do ("Updating catalog x/y
+        // (n%)", "Deleting backed-up files x/y (n%)").
+        if (!cadence.IsDue() && processed != total)
             return;
-        lastReportMs = nowMs;
         int pct = total == 0 ? 100 : (int)(processed * 100L / total);
         p.Report(new ProgressReport($"{phase} {processed:N0}/{total:N0} ({pct}%)", pct));
     }

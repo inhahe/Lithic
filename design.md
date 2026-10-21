@@ -1560,7 +1560,7 @@ none when the reference is being deleted too). It asks twice. At scan time,
 against the Excess Versions list, so what is shown is what will go. And again in
 the purge, **inside its catalog transaction** (which holds the set's write lock,
 so no reference can appear in between), against everything being deleted in every
-ticked category (`RecheckNeededCopies`): an excess copy can be listed because a
+ticked category (`RecheckNeededCopiesAsync`): an excess copy can be listed because a
 second plain copy survives, and that second copy can be in "deleted from disk",
 ticked too; and a backup between scan and Clean can make a new `.fileref` to a
 listed copy (a reverted file). Only excess versions can be held back. This
@@ -1905,11 +1905,18 @@ are excluded anyway.
   the view, and must survive being stopped part-way.
 * **A cancel reaches a catalog read part-way.** `SqliteSetDatabase` reads rows
   through `Rows(cmd, ct)`, which checks the token before each row and, while
-  the read runs, puts an SQLite progress handler on the connection that aborts
-  the statement once the token is cancelled. The handler matters as much as
-  the check: a read ordered by source path sorts the whole set before its first
-  row (`USE TEMP B-TREE FOR ORDER BY`), which no check between rows reaches. A
-  new read with a token in hand uses it.
+  the read runs, watches the connection (`SqliteCancellation`): an SQLite
+  progress handler that aborts the statement once the token is cancelled. The
+  watch matters as much as the check: a read ordered by source path sorts the
+  whole set before its first row (`USE TEMP B-TREE FOR ORDER BY`), which no
+  check between rows reaches. A new read with a token in hand uses it. **Reads
+  only:** a write aborted inside a transaction rolls the whole transaction back
+  and leaves the connection in autocommit; `Rows` asserts a SELECT. The export's
+  `VACUUM INTO` is watched too, safely, on a connection of its own.
+* **A task window's flow stops with the window.** `TaskWindowManager` disposes
+  a flow that is `IDisposable` when its window closes, however it was closed;
+  Cleanup, Verify, Coverage and Largest Files cancel their scans there. A
+  purge, a write the user confirmed, carries on, on its own token.
 * **Await catalog calls in background work; don't block on them.** Work under a
   progress window or `Task.Run` awaits (`ProgressDialog.RunAsync` takes async
   work). It stays on a background thread all the same: the catalog's async

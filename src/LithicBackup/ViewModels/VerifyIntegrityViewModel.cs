@@ -15,7 +15,7 @@ namespace LithicBackup.ViewModels;
 /// content.  Directory-mode backups only (optical sets are verified by inserting
 /// discs through the restore flow).
 /// </summary>
-public class VerifyIntegrityViewModel : ViewModelBase
+public class VerifyIntegrityViewModel : ViewModelBase, IDisposable
 {
     private readonly ICatalogRepository _catalog;
     private readonly IFileScanner _scanner;
@@ -68,7 +68,7 @@ public class VerifyIntegrityViewModel : ViewModelBase
 
         CloseCommand = new RelayCommand(_ =>
         {
-            _cts?.Cancel();
+            Dispose();
             DoneRequested?.Invoke();
         });
 
@@ -235,6 +235,12 @@ public class VerifyIntegrityViewModel : ViewModelBase
 
     /// <summary>Starts (or restarts) verification using the current <see cref="VerifyContents"/> setting.</summary>
     public ICommand VerifyCommand { get; }
+
+    /// <summary>
+    /// Stop the work under way: Close does, and so does the window closing any
+    /// other way (its task window disposes it).
+    /// </summary>
+    public void Dispose() => _cts?.Cancel();
 
     // --- Logic ---
 

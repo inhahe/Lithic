@@ -23,7 +23,7 @@ namespace LithicBackup.ViewModels;
 /// from the backup-set editor (<c>deferPersistence</c>), it hands each toggle to
 /// the editor, which saves or discards it along with the rest of the edit.
 /// </remarks>
-public class LargestFilesViewModel : ViewModelBase, IConfirmClose
+public class LargestFilesViewModel : ViewModelBase, IConfirmClose, IDisposable
 {
     private readonly IFileScanner _scanner;
     private readonly ICatalogRepository _catalog;
@@ -79,6 +79,9 @@ public class LargestFilesViewModel : ViewModelBase, IConfirmClose
 
     /// <summary>Cancel any running scan (e.g. when the host window closes).</summary>
     public void CancelScan() => _cts?.Cancel();
+
+    /// <summary>Its task window has closed: the scan stops.</summary>
+    public void Dispose() => CancelScan();
 
     /// <param name="deferPersistence">
     /// True when opened from the backup-set editor - see <see cref="DeferPersistence"/>.

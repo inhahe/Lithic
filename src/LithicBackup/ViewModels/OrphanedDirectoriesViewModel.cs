@@ -864,6 +864,9 @@ public class OrphanedDirectoriesViewModel : ViewModelBase, IConfirmClose, IDispo
             new System.Threading.Tasks.ParallelOptions
             {
                 MaxDegreeOfParallelism = DirectoryProbeParallelism,
+                // The longest phase (minutes of probing on a large set): it stops
+                // with the window, not at the next phase.
+                CancellationToken = ct,
             },
             i =>
             {
@@ -3024,8 +3027,10 @@ public class OrphanedDirectoriesViewModel : ViewModelBase, IConfirmClose, IDispo
         try
         {
             var progress = new Progress<Services.ProgressReport>(r => ReconcileStatusText = r.Text);
+            // Read-only, and only this window shows its report: it stops with the
+            // window. Apply, a write, carries on as the purge does.
             var report = await Task.Run(() =>
-                _reconcile.AnalyzeAsync(_backupSet.Id, _targetDir, progress));
+                _reconcile.AnalyzeAsync(_backupSet.Id, _targetDir, progress, _closed.Token));
 
             SetReconcileReport(report);
 
@@ -3055,6 +3060,10 @@ public class OrphanedDirectoriesViewModel : ViewModelBase, IConfirmClose, IDispo
                 ReconcileStatusText =
                     $"Found {string.Join(" and ", parts)}. Review, then click Apply.{suffix}";
             }
+        }
+        catch (OperationCanceledException) when (_closed.IsCancellationRequested)
+        {
+            // The window closed mid-analysis.
         }
         catch (Exception ex)
         {

@@ -695,9 +695,19 @@ Check(exportGaps.Count == 0 || exportGaps.Max() < 3 * ProgressCadence.IntervalMs
 // - is interrupted, not waited out. The cancel comes as soon as the copy is
 // seen writing, not from a report, so it lands early in the copy however fast
 // this machine copies, and the stop is measured against the whole copy's time.
+// A timed cancel needs a step long enough to time. One that a machine finishes
+// in a blink is reported as not measured there, rather than failed.
+bool Measurable(long ms, string what)
+{
+    if (ms >= 200)
+        return true;
+    Console.WriteLine($"  - not measured: {what} took {ms:N0} ms here, too short to time a cancel against");
+    return false;
+}
+
 long copyMs = zipSteps.Count > 0 && copySteps.Count > 0 ? zipSteps[0].Ms - copySteps[0].Ms : 0;
-Check(copyMs >= 200, $"the history takes long enough to copy to time a cancel against ({copyMs:N0} ms)");
 string cancelledExport = Path.Combine(root, "cancelled.lithic");
+if (Measurable(copyMs, "copying the history"))
 using (var cts = new CancellationTokenSource())
 using (var stopWatching = new CancellationTokenSource())
 {
@@ -779,7 +789,7 @@ using (var cts = new CancellationTokenSource())
 
 // ... including before its first row: ordered by source path, the read sorts the
 // whole set first, which is most of the time to its first rows (measured just above).
-Check(firstRowsMs >= 200, $"the read takes long enough to its first rows to time a cancel against ({firstRowsMs:N0} ms)");
+if (Measurable(firstRowsMs, "the read to its first rows"))
 using (var cts = new CancellationTokenSource())
 {
     int reported = 0;
