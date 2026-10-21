@@ -1,12 +1,10 @@
 // Regression test: earlier versions of files whose tier set keeps none.
 //
 // Removing every tier from a set's Default tier set means "back up the files no
-// other tier set matches, with no history". The engine honoured that for new
-// writes, but the versions those files already had were skipped by both the
-// retention pass and Cleanup's Excess Versions category ("0 tiers = no rules"),
-// so they stayed on the destination for good: 88 GB of them on one real set.
-//
-// Cleanup now lists every earlier version of such a file, newest included.
+// other tier set matches, with no history". The retention pass applies no rules
+// to a set with no tiers, so the versions those files already had are Cleanup's
+// to remove: its Excess Versions category lists every earlier version of such a
+// file, newest included.
 // Its purge has no .fileref promotion (the engine's retention pass does), so a
 // plain copy that a surviving .fileref still resolves to by hash is kept and
 // not listed; that guard covers tiered excess versions too.
@@ -217,8 +215,8 @@ internal static class Program
 
         Console.WriteLine();
         Console.WriteLine("=== 7. A backup with Default emptied and an exclusion set present ===");
-        // The exclusion filter used to treat ANY no-tier set as an exclusion,
-        // Default included, so this backup would have skipped big.vmdk entirely.
+        // Only a no-tier set that is NOT Default excludes: an empty Default backs
+        // big.vmdk up, with no history.
         var filter = DirectoryBackupService.BuildExclusionFilter([], [emptyDefault, noneWithLog, text]);
         Check(filter is not null && !filter(vmdk), "the exclusion filter does not exclude a file that falls to an empty Default");
         Check(filter is not null && filter(log), "it still excludes old.log, matched by the None set");
@@ -239,10 +237,10 @@ internal static class Program
 
         Console.WriteLine();
         Console.WriteLine("=== 8. Overwritten in place while a .fileref needs the old content ===");
-        // No history: the new copy replaces the old one. Its record used to stay
-        // live, claiming the old content at a path now holding the new bytes, so
-        // the .fileref restored the wrong content and a later identical file
-        // became a reference to nothing.
+        // No history: the new copy replaces the old one, and its record must not
+        // stay live claiming the old content at a path now holding the new bytes:
+        // the .fileref would restore the wrong content, and a later identical
+        // file would become a reference to nothing.
         string x1 = Path.Combine(source, "x1.bin"), x2 = Path.Combine(source, "x2.bin");
         await File.WriteAllTextAsync(x1, "shared content X");
         await File.WriteAllTextAsync(x2, "shared content X");
@@ -649,7 +647,7 @@ internal static class Program
         s.JobOptions.RetentionTiers = [];
         await repo.UpdateBackupSetAsync(s);
 
-        // Cleanup, with the anchor's hash gone again (a set seeded before this).
+        // Cleanup, with the anchor's hash gone again (as in a set seeded without hashing).
         ForgetAnchorHash();
         var vm = new OrphanedDirectoriesViewModel(repo, s);
         vm.ScanCatalogCommand.Execute(null);
@@ -1013,7 +1011,8 @@ internal static class Program
         {
             Check(repo.IsSetBeingBackedUpInBackground(set.Id), "a background run's marker is seen");
             // The parent directory (keep-me.txt's) stays unticked; ticking the
-            // sub directory leaves it part-ticked, which used to purge it too.
+            // sub directory leaves it part-ticked, and a part-ticked directory is
+            // not purged.
             Cat(OrphanedReason.DeletedFromDisk).RootNodes.SelectMany(All)
                 .Single(n => n.Item is not null && n.Item.DirectoryPath.EndsWith("sub", StringComparison.OrdinalIgnoreCase))
                 .IsChecked = true;
@@ -1066,8 +1065,8 @@ internal static class Program
     /// <summary>
     /// §11. git's atomic save: index.lock is created empty, caught by a backup
     /// while empty (so stored as a .fileref to empty content), then renamed over
-    /// index. Relocating it put index.fileref beside the plain index - the
-    /// 23,190 stale pointers found on a real destination.
+    /// index. Relocating it would put index.fileref beside the plain index: a
+    /// stale pointer at the current location.
     /// </summary>
     static async Task RenameOverExistingAsync(string root)
     {

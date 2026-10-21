@@ -483,10 +483,10 @@
 
             <!-- Action row: transient purge progress (left) + buttons (right).
                  The buttons are docked FIRST, so they get their width before the
-                 progress text does. The text came first and was docked left, so
-                 it was measured against the whole row: a long path took all of
-                 it, and the buttons were left with no room and drawn over. Now
-                 the text fills only what the buttons leave, and wraps there. -->
+                 progress text does: docked first, the text would be measured
+                 against the whole row, and a long path would leave the buttons no
+                 room. The text fills only what the buttons leave, and wraps
+                 there. -->
             <DockPanel>
                 <StackPanel DockPanel.Dock="Right" Orientation="Horizontal"
                             VerticalAlignment="Center">

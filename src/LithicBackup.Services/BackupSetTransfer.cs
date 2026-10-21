@@ -23,12 +23,10 @@ public sealed record BackupSetImportResult(BackupSet Set, bool IncludedHistory, 
 ///
 /// <para><b>Why the history matters.</b> Without it, the imported set's catalog
 /// says nothing has been backed up. On a new computer pointed at the same
-/// backup drive, its first backup copied every file again over the copies
-/// already there, and the version history on the drive was invisible to it.
-/// That is what happened to the first two sets ever moved this way: they
-/// arrived saying "Never backed up", and the Worker began a 1.6 TB re-copy a
-/// minute later. With the history, the set carries on exactly where it left
-/// off, as long as the destination and source paths still match.</para>
+/// backup drive, its first backup would copy every file again over the copies
+/// already there, and the version history on the drive would be invisible to
+/// it. With the history, the set carries on exactly where it left off, as long
+/// as the destination and source paths still match.</para>
 /// </summary>
 public static class BackupSetTransfer
 {

@@ -756,11 +756,9 @@
                                   Visibility="{Binding IsEditMode, Converter={StaticResource BoolToVis}}"
                                   ToolTip="Skip SHA-256 hashing of plain copies during import. Much faster — incremental detection uses file size and timestamps, not content hashes. Leave it off if the backup used file-level dedup: a .fileref finds its content by hash, so references to unhashed copies would not resolve on restore." />
                     </StackPanel>
-                    <!-- On its own line, below the buttons, so it can wrap. Inside
-                         the horizontal row above it had unlimited width, so it
-                         never wrapped and the window cut it off ("...Run a backup
-                         next: it copies only what changed, and resumes automated
-                         back"). -->
+                    <!-- On its own line, below the buttons, so it can wrap: in a
+                         horizontal row it has unlimited width, so it would never
+                         wrap, and the window would cut it off. -->
                     <TextBlock Text="{Binding SeedResult}"
                                Foreground="{StaticResource TextSecondaryBrush}"
                                FontSize="11" Margin="0,4,0,0"

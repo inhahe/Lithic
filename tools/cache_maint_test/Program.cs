@@ -69,9 +69,9 @@ public static class Program
         // What the survivors are compared against at the end: a second copy taken
         // now, not the live cache. The app keeps writing the live one while this
         // runs (a compaction of a real cache takes many minutes), and opening it
-        // also reads its write-ahead log, which File.Copy did not take - so it
-        // reported "column 9 differs for C:\" whenever a size was recomputed
-        // meanwhile, though the compaction had lost nothing.
+        // also reads its write-ahead log, which File.Copy did not take - so a
+        // size recomputed meanwhile would show as a difference, though the
+        // compaction had lost nothing.
         string originalDir = Path.Combine(work, "original");
         Directory.CreateDirectory(originalDir);
         string original = Path.Combine(originalDir, Path.GetFileName(source));

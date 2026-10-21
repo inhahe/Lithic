@@ -1177,8 +1177,8 @@ public class DirectoryBackupService
                         // of that number is already there. No record owns that file
                         // (the catalog's only record of this number is the live one,
                         // which says its copy is at the current path), so the
-                        // catalog and the drive disagree. Moving over it with
-                        // overwrite, as this did, destroyed a version every time.
+                        // catalog and the drive disagree, and moving over it
+                        // would destroy a version.
                         // Two ways to get here, told apart by which file actually
                         // holds the record's content:
                         //  * History the catalog never had: an earlier catalog of
@@ -4116,7 +4116,7 @@ public class DirectoryBackupService
         var existingPaths = new HashSet<string>(existing.Keys, StringComparer.OrdinalIgnoreCase);
 
         // Records of whole source paths, committed a batch at a time. One commit
-        // per record, as this used to do, is a million commits on a large backup.
+        // per record would be a million commits on a large backup.
         // Never committed while a file is being hashed, so the set's write lock is
         // only ever held for the inserts.
         var pending = new List<FileRecord>();
@@ -4299,14 +4299,11 @@ public class DirectoryBackupService
                         // first. Two forms of one file there (index and
                         // index.fileref) are two versions, written by different
                         // backups: the newest is the current copy, and an older
-                        // one is an earlier version left where it was. The seed
-                        // used to take the plain copy whatever its age and leave
-                        // the other untracked - on a real destination 23,190
-                        // stale pointers (each to EMPTY content, from moments when
-                        // a git index or .claude.json was briefly zero bytes) that
-                        // Cleanup then listed as untracked. It could equally have
-                        // recorded a stale plain copy as current, or left out a
-                        // plain copy another file's .fileref needs.
+                        // one is an earlier version left where it was. Taking the
+                        // plain copy whatever its age would record a stale one as
+                        // current, leave a stale .fileref untracked, or leave out
+                        // a plain copy another file's .fileref needs. The order is
+                        // by when each was written, which every form carries.
                         var forms = new List<(FileInfo File, StoredFileInfo Info, DateTime Written)>();
                         foreach (var f in group.Current)
                         {

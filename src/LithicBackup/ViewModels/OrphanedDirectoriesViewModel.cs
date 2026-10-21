@@ -136,9 +136,8 @@ public class OrphanedDirectoriesViewModel : ViewModelBase, IConfirmClose
         // One operation at a time (IsBusy): each of these either writes the
         // catalog and the destination (Clean Selected, Apply) or reads them to
         // produce a list that the writers act on, and they all walk the same
-        // drive. A catalog scan used to block the others while a reconcile or a
-        // destination scan blocked only itself, so Clean Selected could run
-        // during Apply, and a catalog scan during either.
+        // drive: Clean Selected during Apply, or a scan during either, would act
+        // on a list that is being changed under it.
         PurgeSelectedCommand = new RelayCommand(
             _ => PurgeSelected(),
             _ => !IsBusy && Categories.Any(c => c.HasCheckedItems));
@@ -1062,16 +1061,14 @@ public class OrphanedDirectoriesViewModel : ViewModelBase, IConfirmClose
                     // Add per-file leaf rows under this directory so the user
                     // can see exactly which files would be purged - and untick
                     // the ones to keep: the purge takes only the ticked rows
-                    // (GetCheckedSelections). They used to be display-only
-                    // under live checkboxes, so a part-ticked directory was
-                    // purged whole, the unticked files with it.
+                    // (GetCheckedSelections), so a part-ticked directory is
+                    // purged only in part.
                     if (item.Files is not null)
                     {
-                        // Annotation is a secondary key because it used to be
-                        // part of DisplayName: several versions of one file share
-                        // a name and were ordered by the timestamp appended to
-                        // it. The dates are written yyyy-MM-dd HH:mm, so ordering
-                        // them as text is still chronological.
+                        // Annotation is a secondary key: several versions of one
+                        // file share a name, and their annotations' timestamps
+                        // order them. The dates are written yyyy-MM-dd HH:mm, so
+                        // ordering them as text is chronological.
                         foreach (var file in item.Files
                             .OrderBy(f => f.DisplayName, StringComparer.OrdinalIgnoreCase)
                             .ThenBy(f => f.Annotation, StringComparer.OrdinalIgnoreCase))
@@ -1231,12 +1228,10 @@ public class OrphanedDirectoriesViewModel : ViewModelBase, IConfirmClose
             // up and overwritten in place (the engine's keepVersions is false
             // for it). Any earlier version such a file still has - kept from
             // before the tiers were removed - is excess by definition, newest
-            // included. This used to be skipped as "no retention rules", along
-            // with the retention pass, so removing Default's tiers stopped new
-            // versions but left every old one on the destination for good:
-            // 88 GB of them on one real set. (A NON-Default set with no tiers
-            // and patterns excludes its files from backup instead; those are
-            // the configured-exclusion category's, and skipped below.)
+            // included: nothing else removes them, since the retention pass
+            // applies no rules to a set with no tiers. (A NON-Default set with
+            // no tiers and patterns excludes its files from backup instead;
+            // those are the configured-exclusion category's, and skipped below.)
             // Only for a Default that is really there and empty. The resolver
             // makes up an empty one when the list has none (old or hand-edited
             // data), and the editor shows that set with the stock tiers - its
@@ -1471,12 +1466,11 @@ public class OrphanedDirectoriesViewModel : ViewModelBase, IConfirmClose
     /// list - anything under its directory.
     /// </summary>
     /// <remarks>
-    /// This used to test the item's DIRECTORY for every item. A deleted-from-disk
-    /// item can be a folder that still exists, holding one missing file among
-    /// many that are present, so the directory test hid everything about the
-    /// present files from the later phases: no file in a folder with one deleted
-    /// sibling could show an excess version, a catalog duplicate, or a match for
-    /// a manual exclusion pattern.
+    /// Not the item's directory: a deleted-from-disk item can be a folder that
+    /// still exists, holding one missing file among many that are present, and
+    /// testing the directory would hide the present files from the later phases
+    /// (no excess version, catalog duplicate or exclusion-pattern match could be
+    /// shown for a file beside one deleted sibling).
     /// </remarks>
     private static Func<string, bool> AlreadyOfferedFilter(IReadOnlyCollection<OrphanedDirectoryItem> items)
     {
@@ -2427,10 +2421,9 @@ public class OrphanedDirectoriesViewModel : ViewModelBase, IConfirmClose
         LastCleanupResultText = "";
 
         // Every stage shows in BOTH lines - the header and the line beside Close -
-        // and on the set's row in the main window. The line by Close used to stay
-        // empty until the first progress report, which can be a long wait (for the
-        // background service's batch, for the re-checks below), so the part of the
-        // window next to the button looked finished.
+        // and on the set's row in the main window. The first progress report can
+        // be a long wait (for the background service's batch, for the re-checks
+        // below), and an empty line beside Close looks finished.
         void ShowStage(string text)
         {
             SummaryText = text;
@@ -2562,9 +2555,9 @@ public class OrphanedDirectoriesViewModel : ViewModelBase, IConfirmClose
                 // -- 0. Wait for the background service to stop backing this set
                 //       up. It stops a run within a second of seeing the marker
                 //       taken above, and starts none while the marker is there;
-                //       a run already going used to carry on copying through the
-                //       purge, writing files at the paths it then deleted. A
-                //       cancel here changes nothing (see the catch). --
+                //       a run still going would write files at the paths the
+                //       purge deletes. A cancel here changes nothing (see the
+                //       catch). --
                 if (_catalog.IsSetBeingBackedUpInBackground(backupSetId))
                 {
                     ((IProgress<Services.ProgressReport>)progress).Report(
@@ -2730,9 +2723,9 @@ public class OrphanedDirectoriesViewModel : ViewModelBase, IConfirmClose
                         {
                             // A catalog-side item always lists its paths, and the
                             // catalog is purged by exactly those; one without a
-                            // list purges nothing (it used to purge its directory
-                            // by prefix, everything under it, listed or not). A
-                            // new category must give its items MatchingSourcePaths.
+                            // list purges nothing, rather than everything under its
+                            // directory, listed or not. A new category must give
+                            // its items MatchingSourcePaths.
                             System.Diagnostics.Debug.Fail($"Cleanup item without a path list: {wi.Reason} {wi.DirectoryPath}");
                             doneUnits++;
                             ReportUnits(dirPath);

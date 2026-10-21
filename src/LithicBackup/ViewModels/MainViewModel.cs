@@ -1129,10 +1129,9 @@ public class MainViewModel : ViewModelBase
             // From here the seed holds the set's row the way a backup does: its
             // progress shows there, Abort stops it, and the set cannot be backed
             // up, modified, restored or deleted until it ends - whether or not this
-            // editor is still open. Saving or closing the editor used to leave it
-            // running with nothing on screen to say so, and a backup started then
-            // copied every file the seed had not reached yet. The editor's own
-            // Cancel stops it too (the tokens are linked).
+            // editor is still open: a backup started mid-seed would copy every
+            // file the seed had not reached yet. The editor's own Cancel stops it
+            // too (the tokens are linked).
             using var rowCts = CancellationTokenSource.CreateLinkedTokenSource(
                 sourceSelection.SeedCancellationToken);
             BeginRowWork(row, "seeding", $"Seeding from {dir}…", rowCts);
@@ -4522,9 +4521,9 @@ public class MainViewModel : ViewModelBase
         //
         // Its purge holds the set's row the way a seed does (see RowWorkHooks):
         // the row shows each stage and refuses Backup, Modify, Restore and Delete
-        // until it ends, whether or not the Cleanup window is still open. A
-        // backup started from the row mid-purge used to write records and files
-        // the purge was in the middle of retiring and deleting.
+        // until it ends, whether or not the Cleanup window is still open: a
+        // backup started from the row mid-purge would write records and files
+        // the purge is in the middle of retiring and deleting.
         const string CleaningActivity = "being cleaned up";
         _taskWindows.Show(
             Services.TaskKinds.Cleanup, fresh.Id, fresh.Name,
@@ -5017,8 +5016,8 @@ public class MainViewModel : ViewModelBase
     /// <summary>
     /// An editor closed while its duplicate analysis was running: show the
     /// analysis's progress on the set's row, with Stop, and its summary on the
-    /// row's result line when it ends. It used to carry on hashing with nothing
-    /// on screen at all. Read-only, so the set's actions stay available.
+    /// row's result line when it ends, rather than hashing on with nothing on
+    /// screen. Read-only, so the set's actions stay available.
     /// </summary>
     private static void CarryDedupAnalysisToRow(SourceSelectionViewModel editor, BackupSetRowViewModel? row)
     {
@@ -5215,11 +5214,11 @@ public class MainViewModel : ViewModelBase
     /// the user choose. Returns whether to go ahead.
     /// </summary>
     /// <remarks>
-    /// A set imported onto a new computer without its history used to back up
-    /// here without a word, copying every file again over the copies already on
-    /// the drive, with the version history beside them invisible to the set.
-    /// Seeding records what is there instead; "back up anyway" remains for when
-    /// copying it all again is really what the user wants.
+    /// A set imported onto a new computer without its history would otherwise
+    /// back up here without a word, copying every file again over the copies
+    /// already on the drive, with the version history beside them invisible to
+    /// the set. Seeding records what is there instead; "back up anyway" remains
+    /// for when copying it all again is really what the user wants.
     /// </remarks>
     private async Task<bool> ConfirmBackupOverUntrackedDestinationAsync(
         BackupSet backupSet, IReadOnlyList<SourceSelection> sources, string targetDirectory)

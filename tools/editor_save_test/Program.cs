@@ -518,9 +518,9 @@ internal static class Program
 
     /// <summary>
     /// Removing, adding or editing a retention tier is an edit like any other.
-    /// Those edits live inside the tier sets (their tier rows), which the dirty
-    /// flag never listened to: removing Default's last tier left Save disabled,
-    /// and the close prompt silent, so the edit was lost on closing.
+    /// Those edits live inside the tier sets (their tier rows), one level below
+    /// what the dirty flag sees: missed, removing Default's last tier would leave
+    /// Save disabled and the close prompt silent, and the edit lost on closing.
     /// </summary>
     static async Task TierEditsEnableSaveAsync()
     {
@@ -652,9 +652,8 @@ internal static class Program
     /// <summary>
     /// A seed holds the set's row like a backup: progress on the row, Backup /
     /// Modify / Delete unavailable, and it carries on, visibly, after Save closes
-    /// the editor; the row's Abort stops it. Saving mid-seed used to leave it
-    /// running with nothing on screen, and a backup started then copied every file
-    /// the seed had not reached yet.
+    /// the editor; the row's Abort stops it, and no backup can start meanwhile,
+    /// which would copy every file the seed had not reached yet.
     ///
     /// The seed is frozen deterministically by holding the set's cross-process
     /// write lock (the seed's first write - its disc record - waits for it), so

@@ -350,10 +350,10 @@ Check(dA2 is not null && dA2.DiscPath.EndsWith("a.txt.v2", StringComparison.Ordi
 // ===================================================================
 Console.WriteLine();
 Console.WriteLine("=== 6. Two stored forms of one file at its current location ===");
-// What a real destination held 23,190 times: a stale .fileref to EMPTY content
-// (the file was briefly zero bytes when an earlier backup read it) beside the
-// newer plain copy. And the reverse: a newer .fileref beside an older plain
-// copy, which other references may need as their content.
+// A stale .fileref to EMPTY content (the file was briefly zero bytes when an
+// earlier backup read it) beside the newer plain copy. And the reverse: a
+// newer .fileref beside an older plain copy, which other references may need
+// as their content.
 string target3 = Path.Combine(root, "dst3");
 CopyTree(snapshot, target3);
 const string EmptyHash = "e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855";

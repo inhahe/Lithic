@@ -696,9 +696,9 @@ async Task PartC()
     // C8 --------------------------------------------------------------------
     // While the app works on a set (ICatalogRepository.HoldSetInApp) the Worker
     // gives way: it starts no run on the set, stops one that is going, keeps the
-    // work, and carries on after. It used to wait for the set's write lock, which
-    // the app does not give up, and so sat for as long as the app's backup ran -
-    // three hours, measured, holding every other set's backup with it.
+    // work, and carries on after, instead of waiting for the set's write lock,
+    // which the app does not give up: a wait as long as the app's backup, with
+    // every other set's backup held behind it.
     {
         string dir = Path.Combine(root, "c8");
         string src = Path.Combine(dir, "src");

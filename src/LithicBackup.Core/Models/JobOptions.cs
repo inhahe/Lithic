@@ -83,9 +83,9 @@ public class JobOptions
     /// and sources may be at other paths, and without history it would copy
     /// everything again), when its history is cleared, and when it is seeded
     /// (a full backup that started mid-seed would treat every file the seed had
-    /// not reached yet as new). An imported set with an overdue schedule used to
-    /// start a full 1.6 TB backup about a minute after the import, before anyone
-    /// had looked at it.</para>
+    /// not reached yet as new). Without it an imported set with an overdue
+    /// schedule would start a full backup within a minute of the import, before
+    /// anyone had looked at it.</para>
     ///
     /// <para>Kept out of the editor's unsaved-changes comparison
     /// (<c>MainViewModel.SnapshotEditorSettings</c>): it is written straight to
