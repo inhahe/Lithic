@@ -1623,11 +1623,29 @@ not tell a running export from a failed one. The steps report at the
   rest of the copy;
 - **compressing / extracting**: a counted stream copy instead of
   `CreateEntryFromFile` / `ExtractToFile`;
-- **importing the records**: the `INSERT ... SELECT` of files, chunks and dedup
-  blocks goes 50,000 source row ids at a time, inside the one transaction, so
-  the count moves and a cancel rolls the whole import back.
+- **importing the records**: until the first records go in (creating the set,
+  waiting for the set's write lock, which a backup may hold, sizing the
+  history) the step says "preparing" over a marquee; then the `INSERT ...
+  SELECT` of files, chunks and dedup blocks goes 50,000 source row ids at a
+  time, inside the one transaction, so the count moves and a cancel rolls the
+  whole import back.
 
-Each export and import is logged (start, end, size, duration, cancel).
+Each step ends with a report at 100%, so the line never shows a step
+unfinished while the next is getting ready. Each export and import is logged
+(start, end, size, duration, cancel).
+
+While a set exports, its row is `IsExporting`, which disables only Delete and
+a second Export of it: the export holds its database file open, so a delete
+would leave the file behind. Everything else may go on, a backup included,
+since `VACUUM INTO` reads a snapshot; the set is not held against the Worker
+either. An export's temporary files are named per run (`<file>.<guid>.partial`
+and `.history.partial`), so two exports to one file cannot delete each other's.
+
+On a real exit, `MainWindow` calls `ProgressDialog.CancelRunningWork`, which
+cancels whatever every progress dialog is running and waits up to 10 seconds
+for it to unwind. A process that simply ends runs no `finally`: an export
+would leave gigabytes of temporary files beside the export, and an import a
+set that claims a history its rolled-back transaction never wrote.
 
 ## Opening a `.lithic` file reaches the one running window
 

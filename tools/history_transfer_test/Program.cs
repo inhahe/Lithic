@@ -655,9 +655,22 @@ using (var raw = new Microsoft.Data.Sqlite.SqliteConnection(
         ins.ExecuteNonQuery();
     }
     tx.Commit();
+
+    // And 200 MB of free pages, as a purge leaves: the copy leaves them out, so
+    // the size its progress counts toward must too.
+    using var scratch = raw.CreateCommand();
+    scratch.CommandText = """
+        CREATE TABLE Scratch (b BLOB);
+        WITH RECURSIVE n(i) AS (SELECT 1 UNION ALL SELECT i + 1 FROM n WHERE i < 50000)
+        INSERT INTO Scratch SELECT zeroblob(4000) FROM n;
+        DROP TABLE Scratch;
+        """;
+    scratch.ExecuteNonQuery();
 }
 var setPStored = (await repoP.GetBackupSetAsync(setP.Id))!;
-Console.WriteLine($"  (history database: {repoP.GetSetHistorySizeBytes(setP.Id):N0} bytes)");
+string setPFile = Path.Combine(repoP.DataDirectory, "sets", $"set-{setP.Id}.db");
+Console.WriteLine($"  (history: {repoP.GetSetHistorySizeBytes(setP.Id):N0} bytes in use, "
+    + $"{FileLength.OrZero(setPFile) + FileLength.OrZero(setPFile + "-wal"):N0} on disk)");
 
 // Every report, in order, and when it came.
 List<(long Ms, ProgressReport Report)> Recording(out IProgress<ProgressReport> progress, Action<ProgressReport>? also = null)
@@ -685,8 +698,18 @@ Check(copySteps.Count > 0 && copySteps[0].Report.Percent == 0 && Rising(copyStep
     $"copying the history reports from 0%, rising ({string.Join(", ", copySteps.Select(r => $"{r.Report.Percent:F0}%"))})");
 Check(copySteps.Count > 1 && copySteps.Skip(1).All(r => r.Report.Text.Contains(" of about ")),
     $"counting bytes as the copy grows (\"{copySteps.LastOrDefault().Report.Text}\")");
-Check(zipSteps.Count > 0 && Rising(zipSteps.Select(r => r.Report.Percent)),
-    $"then compressing reports, rising ({string.Join(", ", zipSteps.Select(r => $"{r.Report.Percent:F0}%"))})");
+// The last report is the finished copy against the estimate it was measured
+// by: near 1 when the estimate counts what the copy writes, and far below it
+// when it counts free pages too.
+var copied = copySteps.Count == 0 ? null : System.Text.RegularExpressions.Regex.Match(
+    copySteps[^1].Report.Text, @"\(([\d,]+) of about ([\d,]+) bytes\)");
+double copiedShare = copied is { Success: true }
+    ? long.Parse(copied.Groups[1].Value.Replace(",", "")) / (double)long.Parse(copied.Groups[2].Value.Replace(",", ""))
+    : 0;
+Check(copySteps.Count > 0 && copySteps[^1].Report.Percent == 100 && copiedShare is > 0.85 and < 1.05,
+    $"and ends at 100%, having written {copiedShare:P0} of the estimate (\"{copySteps.LastOrDefault().Report.Text}\")");
+Check(zipSteps.Count > 0 && Rising(zipSteps.Select(r => r.Report.Percent)) && zipSteps[^1].Report.Percent == 100,
+    $"then compressing reports, rising to 100% ({string.Join(", ", zipSteps.Select(r => $"{r.Report.Percent:F0}%"))})");
 var exportGaps = exportReports.Zip(exportReports.Skip(1)).Select(p => p.Second.Ms - p.First.Ms).ToList();
 Check(exportGaps.Count == 0 || exportGaps.Max() < 3 * ProgressCadence.IntervalMs,
     $"with no long silence between reports (longest {exportGaps.DefaultIfEmpty().Max()} ms)");
@@ -732,9 +755,20 @@ using (var stopWatching = new CancellationTokenSource())
     Check(cancelled && cancelledAtMs >= 0 && stopMs < copyMs / 4,
         $"cancelled mid-copy, the export stops at once ({stopMs:N0} ms after the cancel, which came with "
         + $"{writtenAtCancel:N0} bytes copied, against {copyMs:N0} ms for the whole copy)");
-    Check(!File.Exists(cancelledExport) && !File.Exists(cancelledExport + ".partial")
-          && !Directory.EnumerateFiles(root, "cancelled.lithic.*").Any(),
+    Check(!File.Exists(cancelledExport) && !Directory.EnumerateFiles(root, "cancelled.lithic*").Any(),
         "and leaves nothing behind");
+}
+
+// Cancelled while compressing: the counted copy stops between blocks.
+string cancelledZip = Path.Combine(root, "cancelled-zip.lithic");
+using (var cts = new CancellationTokenSource())
+{
+    Recording(out var cancelOnZip, r => { if (r.Text.StartsWith("Step 2 of 2: compressing")) cts.Cancel(); });
+    bool cancelled = false;
+    try { await BackupSetTransfer.ExportAsync(repoP, setPStored, cancelledZip, true, cancelOnZip, cts.Token); }
+    catch (OperationCanceledException) { cancelled = true; }
+    Check(cancelled && !Directory.EnumerateFiles(root, "cancelled-zip.lithic*").Any(),
+        $"cancelled while compressing, the export stops and leaves nothing behind (cancelled: {cancelled})");
 }
 
 // Import: extracting counts bytes, importing counts records, to the total.
@@ -751,11 +785,27 @@ Check(recordSteps.Count > 0 && Rising(recordSteps.Select(r => r.Report.Percent))
       && recordSteps[^1].Report.Text.Contains($"{LargeRecords:N0} of {LargeRecords:N0} records"),
     $"importing counts the records up to all of them (\"{recordSteps.LastOrDefault().Report.Text}\")");
 
-// A cancel while the records go in adds no set, and stages nothing that stays.
+// A cancel while extracting, or while the records go in (when the set exists
+// already, and must go again), adds no set and stages nothing that stays.
 int setsInQ = (await repoQ.GetAllBackupSetsAsync()).Count;
 using (var cts = new CancellationTokenSource())
 {
-    Recording(out var cancelOnImport, r => { if (r.Text.StartsWith("Step 2 of 2")) cts.Cancel(); });
+    Recording(out var cancelOnExtract, r => { if (r.Text.StartsWith("Step 1 of 2: extracting")) cts.Cancel(); });
+    bool cancelled = false;
+    try { await BackupSetTransfer.ImportAsync(repoQ, bigExport, cancelOnExtract, cts.Token); }
+    catch (OperationCanceledException) { cancelled = true; }
+    int setsAfter = (await repoQ.GetAllBackupSetsAsync()).Count;
+    Check(cancelled && setsAfter == setsInQ
+          && !Directory.EnumerateFiles(repoQ.DataDirectory, "lithic-import-*").Any(),
+        $"cancelled while extracting, no backup set is added and nothing is left (cancelled: {cancelled}, sets {setsInQ} -> {setsAfter})");
+}
+using (var cts = new CancellationTokenSource())
+{
+    Recording(out var cancelOnImport, r =>
+    {
+        if (r.Text.StartsWith("Step 2 of 2") && r.Percent is not null)
+            cts.Cancel();
+    });
     bool cancelled = false;
     try { await BackupSetTransfer.ImportAsync(repoQ, bigExport, cancelOnImport, cts.Token); }
     catch (OperationCanceledException) { cancelled = true; }

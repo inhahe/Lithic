@@ -617,8 +617,8 @@ public interface ICatalogRepository : IDisposable
     /// of records, not paced by time.
     /// </param>
     Task<int> ImportSetHistoryAsync(
-        int backupSetId, string sourceDatabasePath, CancellationToken ct = default,
-        IProgress<(long Done, long Total)>? rowsImported = null);
+        int backupSetId, string sourceDatabasePath,
+        IProgress<(long Done, long Total)>? rowsImported = null, CancellationToken ct = default);
 
     // --- USN change-journal cursors ---
 

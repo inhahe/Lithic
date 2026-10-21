@@ -93,6 +93,32 @@ public partial class ProgressDialog : Window
     private bool _closed;
 
     /// <summary>
+    /// Work running under a dialog now, with its cancel (null when it cannot be
+    /// cancelled). See <see cref="CancelRunningWork"/>.
+    /// </summary>
+    private static readonly List<(CancellationTokenSource? Cancel, Task Work)> Running = [];
+
+    /// <summary>
+    /// The app is exiting: cancel the work every dialog is running and wait, up to
+    /// <paramref name="timeout"/>, for it to unwind. A process that simply ends
+    /// runs no clean-up, so an export would leave its gigabyte temporary files
+    /// beside the export, and an import a set without the history it claims.
+    /// </summary>
+    public static void CancelRunningWork(TimeSpan timeout)
+    {
+        Task[] work;
+        lock (Running)
+        {
+            foreach (var (cancel, _) in Running)
+                cancel?.Cancel();
+            work = Running.Select(r => r.Work).ToArray();
+        }
+        // Blocking is safe: the work runs on the thread pool, and a progress
+        // report only posts to this thread, never waits for it.
+        Task.WaitAll(work, timeout);
+    }
+
+    /// <summary>
     /// Run <paramref name="work"/> on a background thread while showing this
     /// dialog, marshalling its <c>IProgress&lt;string&gt;</c> reports to the
     /// dialog's detail line and closing the dialog when the work finishes.
@@ -209,6 +235,10 @@ public partial class ProgressDialog : Window
             }
         });
 
+        var entry = (cts, (Task)workTask);
+        lock (Running)
+            Running.Add(entry);
+
         // Close the dialog once the work is done — whether it completed, threw,
         // or was cancelled. BeginInvoke hops back to the UI thread that owns the
         // window. ForceClose flips the close gate so OnClosing lets it through.
@@ -228,6 +258,8 @@ public partial class ProgressDialog : Window
         // Work is essentially already finished here (its continuation is what
         // closed the dialog), but await to observe its outcome / rethrow.
         await workTask;
+        lock (Running)
+            Running.Remove(entry);
 
         // ShowDialog only returns once the dialog has closed, so the modal path
         // needs nothing more. Show() returns immediately, so close it here: the

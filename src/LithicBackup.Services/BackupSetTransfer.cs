@@ -58,7 +58,11 @@ public static class BackupSetTransfer
     {
         var exported = ExportedBackupSet.FromBackupSet(set, includeHistory);
         string json = JsonSerializer.Serialize(exported, JsonOptions);
-        string partial = path + ".partial";
+        // Beside the export, on the drive the user chose for it: a history is
+        // gigabytes, and the system drive may not have room for it. Named per
+        // run, so two exports to one file cannot delete each other's.
+        string stem = $"{Path.GetFullPath(path)}.{Guid.NewGuid():N}";
+        string partial = stem + ".partial";
 
         string? historyDb = null;
         try
@@ -69,10 +73,7 @@ public static class BackupSetTransfer
             }
             else
             {
-                // Beside the export, on the drive the user chose for it: a history
-                // is gigabytes, and the system drive may not have room for it.
-                historyDb = Path.Combine(Path.GetDirectoryName(Path.GetFullPath(path))!,
-                    $"{Path.GetFileName(path)}.{Guid.NewGuid():N}.history.partial");
+                historyDb = stem + ".history.partial";
 
                 // The copy is one SQLite statement, but it writes its file as it
                 // goes, to about the size of the pages it copies: its growth is
@@ -84,12 +85,15 @@ public static class BackupSetTransfer
                 var copying = catalog.ExportSetHistoryAsync(set.Id, historyDb, ct);
                 while (await Task.WhenAny(copying, Task.Delay(ProgressCadence.IntervalMs)) != copying)
                 {
-                    long written = SizeOf(historyFile);
+                    long written = FileLength.OrZero(historyFile);
                     progress?.Report(new ProgressReport(
                         $"Step 1 of 2: copying the backup history ({written:N0} of about {expected:N0} bytes)",
                         Math.Min(99, written * 100.0 / expected)));
                 }
                 await copying;
+                progress?.Report(new ProgressReport(
+                    $"Step 1 of 2: copying the backup history ({FileLength.OrZero(historyFile):N0} of about {expected:N0} bytes)",
+                    100));
 
                 await Task.Run(() =>
                 {
@@ -188,6 +192,11 @@ public static class BackupSetTransfer
             }
 
             bool withHistory = historyDb is not null;
+            // Until the first records go in - creating the set, waiting for the
+            // catalog's write lock, which a backup may hold, and sizing the history -
+            // there is nothing to count.
+            if (withHistory)
+                progress?.Report(new ProgressReport("Step 2 of 2: importing the backup history (preparing)", null));
             var newSet = await catalog.CreateBackupSetAsync(exported.ToBackupSet(withHistory), ct);
 
             int records = 0;
@@ -203,7 +212,7 @@ public static class BackupSetTransfer
                 });
                 try
                 {
-                    records = await catalog.ImportSetHistoryAsync(newSet.Id, historyDb!, ct, rows);
+                    records = await catalog.ImportSetHistoryAsync(newSet.Id, historyDb!, rows, ct);
                 }
                 catch
                 {
@@ -232,8 +241,8 @@ public static class BackupSetTransfer
     /// <summary>
     /// Copy <paramref name="input"/> to <paramref name="output"/>, reporting
     /// <paramref name="step"/> with the bytes copied of <paramref name="total"/>
-    /// at the <see cref="ProgressCadence"/>, and stopping for a cancel between
-    /// blocks.
+    /// at the <see cref="ProgressCadence"/> and once more when done, and stopping
+    /// for a cancel between blocks.
     /// </summary>
     private static void CopyCounting(
         Stream input, Stream output, long total, string step,
@@ -255,20 +264,7 @@ public static class BackupSetTransfer
             copied += read;
         }
         while (read > 0);
-    }
-
-    /// <summary>The file's length now, or 0 while it does not exist yet.</summary>
-    private static long SizeOf(string path)
-    {
-        try
-        {
-            var info = new FileInfo(path);
-            return info.Exists ? info.Length : 0;
-        }
-        catch (IOException)
-        {
-            return 0;
-        }
+        progress?.Report(new ProgressReport($"{step} ({copied:N0} of {total:N0} bytes)", 100));
     }
 
     private static async Task<ExportedBackupSet> DeserializeAsync(Stream s, CancellationToken ct)

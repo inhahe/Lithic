@@ -2,6 +2,7 @@ using System.Collections.Concurrent;
 using System.Globalization;
 using System.Text.Json;
 using Microsoft.Data.Sqlite;
+using LithicBackup.Core;
 using LithicBackup.Core.Interfaces;
 using LithicBackup.Core.Models;
 
@@ -834,9 +835,9 @@ public class SqliteCatalogRepository : ICatalogRepository
             }
             return (Pragma("page_count") - Pragma("freelist_count")) * Pragma("page_size");
         }
-        catch (SqliteException)
+        catch (Exception ex) when (ex is SqliteException or IOException or UnauthorizedAccessException)
         {
-            return new FileInfo(path).Length;   // only an estimate; the file will do
+            return FileLength.OrZero(path);   // only an estimate: the file's size will do
         }
     }
 
@@ -895,8 +896,8 @@ public class SqliteCatalogRepository : ICatalogRepository
     }
 
     public async Task<int> ImportSetHistoryAsync(
-        int backupSetId, string sourceDatabasePath, CancellationToken ct = default,
-        IProgress<(long Done, long Total)>? rowsImported = null)
+        int backupSetId, string sourceDatabasePath,
+        IProgress<(long Done, long Total)>? rowsImported = null, CancellationToken ct = default)
     {
         ct.ThrowIfCancellationRequested();
 
@@ -932,7 +933,7 @@ public class SqliteCatalogRepository : ICatalogRepository
             for (int i = 0; i < oldDiscIds.Count; i++)
                 map[oldDiscIds[i]] = newIds[i];
 
-            return await Task.Run(() => db.ImportHistoryFromAsync(sourceDatabasePath, map, ct, rowsImported), ct)
+            return await Task.Run(() => db.ImportHistoryFromAsync(sourceDatabasePath, map, rowsImported, ct), ct)
                 .ConfigureAwait(false);
         }
         catch
@@ -1000,26 +1001,16 @@ public class SqliteCatalogRepository : ICatalogRepository
             cmd.Transaction = tx;
             cmd.Parameters.AddWithValue("$setId", backupSetId);
 
-            // Clear the master's LEGACY per-file tables for this set first.
-            //
-            // Discs/Files/FileChunks/DeduplicationBlocks live in the master from
-            // before catalog data moved into per-set databases, and
-            // 001_InitialSchema still creates them in every catalog — including
-            // "Discs.BackupSetId INTEGER NOT NULL REFERENCES BackupSets(Id)".
-            // A set old enough to have rows there therefore could not be deleted
-            // at all: the final DELETE hit "SQLite Error 19: FOREIGN KEY
-            // constraint failed", the view model turned that into a status-bar
-            // line, and the set came back every time. Measured on a real
-            // catalog, one such set still held 3 discs and 33 files.
-            //
-            // Order matters — children before parents, or the same FK bites:
+            // Clear this set's rows from the master's legacy tables first
+            // (Discs/Files/FileChunks/DeduplicationBlocks, from before the per-set
+            // databases): Discs.BackupSetId references BackupSets(Id), so a set that
+            // still has rows there cannot be deleted otherwise. Children before
+            // parents, for the same reason:
             //   FileChunks/DeduplicationBlocks -> Files -> Discs -> BackupSets.
-            // Harmless for sets with no legacy rows, which delete nothing here.
             //
-            // Only the tables that exist: the one-time legacy migration drops them
-            // (DropLegacyTables), and they come back as empty shells only when the
-            // next launch re-runs 001. In between, an unconditional DELETE fails
-            // with "no such table" and no set can be deleted.
+            // Only the tables that exist: they may not, in this session. Whether
+            // the legacy migration has run (user_version) does not say whether rows
+            // remain, so the tables are looked for rather than assumed.
             var legacy = new HashSet<string>(StringComparer.OrdinalIgnoreCase);
             cmd.CommandText = """
                 SELECT name FROM sqlite_master

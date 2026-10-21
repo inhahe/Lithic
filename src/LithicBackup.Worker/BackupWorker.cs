@@ -932,7 +932,7 @@ public sealed class BackupWorker : BackgroundService
                 // demand a longer quiet period); max-wait depends on its name/path
                 // mask, and may be infinite (no cap) — in which case only the
                 // debounce deadline bounds the wake.
-                var debounce = TimeSpan.FromSeconds(_rules.ResolveDebounceSeconds(GetFileSizeSafe(path)));
+                var debounce = TimeSpan.FromSeconds(_rules.ResolveDebounceSeconds(FileLength.OrZero(path)));
                 var deadline = (t.Last + debounce) - nowUtc;
 
                 if (_rules.ResolveMaxWaitSeconds(path) is int maxWaitSec)
@@ -1191,7 +1191,8 @@ public sealed class BackupWorker : BackgroundService
             // append-only session files) is versioned anyway after its cap;
             // a file matching no max-wait tier has an infinite cap and is only
             // copied once it settles via debounce.
-            long size = GetFileSizeSafe(path);
+            // A file that cannot be measured counts as 0: the smallest tier.
+            long size = FileLength.OrZero(path);
             var debounceSeconds = _rules.ResolveDebounceSeconds(size);
             int? maxWaitSeconds = _rules.ResolveMaxWaitSeconds(path);
 
@@ -1888,18 +1889,6 @@ public sealed class BackupWorker : BackgroundService
             return SourceSelection.IsPathIncluded(set.SourceSelections, path);
 
         return set.SourceRoots.Any(root => IsUnderRoot(path, root));
-    }
-
-    /// <summary>
-    /// Current size of a file in bytes, or 0 if it can't be stat'd (missing,
-    /// locked, or a transient error). Used to pick the debounce size tier; 0
-    /// simply selects the smallest tier, which is the safe default for a file we
-    /// can't measure.
-    /// </summary>
-    private static long GetFileSizeSafe(string path)
-    {
-        try { return new FileInfo(path).Length; }
-        catch { return 0; }
     }
 
     /// <summary>"no drive letter" sentinel returned by <see cref="GetDriveLetter"/>.</summary>

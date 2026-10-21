@@ -2025,8 +2025,8 @@ internal sealed class SqliteSetDatabase : IDisposable
     /// dedup blocks, after each batch.
     /// </param>
     public async Task<int> ImportHistoryFromAsync(
-        string sourceDatabasePath, IReadOnlyDictionary<long, int> discIdMap, CancellationToken ct = default,
-        IProgress<(long Done, long Total)>? rowsImported = null)
+        string sourceDatabasePath, IReadOnlyDictionary<long, int> discIdMap,
+        IProgress<(long Done, long Total)>? rowsImported = null, CancellationToken ct = default)
     {
         ct.ThrowIfCancellationRequested();
 

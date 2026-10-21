@@ -117,6 +117,19 @@ public class BackupSetRowViewModel : ViewModelBase
         set { if (SetProperty(ref _isChecking, value)) CommandManager.InvalidateRequerySuggested(); }
     }
 
+    private bool _isExporting;
+    /// <summary>
+    /// True while the set is being exported. The export reads the set's database
+    /// on a connection of its own for minutes, so the set cannot be deleted
+    /// meanwhile (its database file is open and would be left behind), nor
+    /// exported a second time. Nothing else waits for it: it reads a snapshot.
+    /// </summary>
+    public bool IsExporting
+    {
+        get => _isExporting;
+        set { if (SetProperty(ref _isExporting, value)) CommandManager.InvalidateRequerySuggested(); }
+    }
+
     private string _runningStatusText = "";
     /// <summary>
     /// Scan-phase status shown inline on the row before the burn/copy progress

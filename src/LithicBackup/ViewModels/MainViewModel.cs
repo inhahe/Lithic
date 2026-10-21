@@ -165,7 +165,7 @@ public class MainViewModel : ViewModelBase
         // set's database, and a read here shares the backup's connection.
         ExportBackupSetCommand = new RelayCommand(
             _ => _ = ExportBackupSetAsync(),
-            _ => SelectedBackupSet is not null && SelectedRow is not { IsRunning: true });
+            _ => SelectedBackupSet is not null && SelectedRow is not { IsRunning: true } and not { IsExporting: true });
         ImportBackupSetCommand = new RelayCommand(
             _ => _ = ImportBackupSetAsync());
 
@@ -217,10 +217,10 @@ public class MainViewModel : ViewModelBase
             o => o is BackupSetRowViewModel r && !r.IsRunning);
         SetExportCommand = new RelayCommand(
             o => { if (o is BackupSetRowViewModel r) { SelectedBackupSet = r.Model; _ = ExportBackupSetAsync(); } },
-            o => o is BackupSetRowViewModel r && !r.IsRunning);
+            o => o is BackupSetRowViewModel r && !r.IsRunning && !r.IsExporting);
         SetDeleteCommand = new RelayCommand(
             o => { if (o is BackupSetRowViewModel r) _ = DeleteBackupSetAsync(r.Model); },
-            o => o is BackupSetRowViewModel r && !r.IsRunning);
+            o => o is BackupSetRowViewModel r && !r.IsRunning && !r.IsExporting);
         SetResumeAutomationCommand = new RelayCommand(
             o => { if (o is BackupSetRowViewModel r) _ = ResumeAutomatedBackupsAsync(r.Model); },
             o => o is BackupSetRowViewModel { IsAutomationHeld: true });
@@ -4779,9 +4779,15 @@ public class MainViewModel : ViewModelBase
         if (SelectedBackupSet is null) return;
         var set = SelectedBackupSet;
 
-        if (RowFor(set.Id)?.IsRunning == true)
+        var row = RowFor(set.Id);
+        if (row?.IsRunning == true)
         {
             StatusText = $"\"{set.Name}\" is backing up; export it when the backup has finished.";
+            return;
+        }
+        if (row?.IsExporting == true)
+        {
+            StatusText = $"\"{set.Name}\" is being exported already.";
             return;
         }
 
@@ -4831,14 +4837,26 @@ public class MainViewModel : ViewModelBase
         {
             // A window of its own, with the step, a bar and Cancel: a history is
             // gigabytes and takes minutes, and the file appears only once complete.
-            // Modeless: it only reads the catalog, so the rest of the app stays usable.
-            bool completed = await Views.ProgressDialog.RunAsync(
-                Application.Current.MainWindow,
-                $"Export \"{set.Name}\"",
-                $"Exporting \"{set.Name}\" to {file}",
-                cancellable: true,
-                (progress, ct) => BackupSetTransfer.ExportAsync(_catalog, set, file, withHistory, progress, ct),
-                modal: false);
+            // Modeless: it only reads the catalog, so the rest of the app stays
+            // usable, except deleting or exporting this set (IsExporting).
+            bool completed;
+            if (row is not null)
+                row.IsExporting = true;
+            try
+            {
+                completed = await Views.ProgressDialog.RunAsync(
+                    Application.Current.MainWindow,
+                    $"Export \"{set.Name}\"",
+                    $"Exporting \"{set.Name}\" to {file}",
+                    cancellable: true,
+                    (progress, ct) => BackupSetTransfer.ExportAsync(_catalog, set, file, withHistory, progress, ct),
+                    modal: false);
+            }
+            finally
+            {
+                if (row is not null)
+                    row.IsExporting = false;
+            }
 
             if (!completed)
             {
