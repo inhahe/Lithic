@@ -262,6 +262,7 @@ internal static class Program
         await LayoutAndSmallFixesAsync();
         await SeedHoldsTheRowAsync(dbPath);
         NoTierWarning();
+        await ReconcileAfterEditAsync();
 #endif
         Check(_dialogs.Unexpected.Count == 0,
             "no unexpected message box appeared"
@@ -287,6 +288,107 @@ internal static class Program
             "an empty Default never does (its files are backed up without history)");
         Check(!new TierSetViewModel("None", isBuiltIn: true).ExcludesForLackOfTiers,
             "nor \"None\", which says it excludes in its own words");
+    }
+
+    /// <summary>
+    /// 23: after an edit that drops one folder and adds another, the app looks for
+    /// what changed. The dropped folder's backed-up copies are offered for removal,
+    /// and Remove deletes them and retires their records, leaving the rest; the
+    /// added folder's files are offered for backup. The scans and the purge do
+    /// their catalog work inside progress windows, awaited there.
+    /// </summary>
+    static async Task ReconcileAfterEditAsync()
+    {
+        Console.WriteLine();
+        Console.WriteLine("=== 23. after an edit, a dropped folder's copies go and an added one's files are offered ===");
+
+        // a and b backed up, for real, to an emptied destination.
+        var set = await DbSetAsync();
+        set.SourceSelections =
+        [
+            Dir(_src, null, auto: false, expanded: true,
+                Dir(_a, true, auto: false),
+                Dir(_b, true, auto: false)),
+        ];
+        await _observer.UpdateBackupSetAsync(set);
+        await _observer.ClearBackupSetCatalogAsync(_setId);
+        foreach (string entry in Directory.EnumerateFileSystemEntries(_dst))
+        {
+            if (Directory.Exists(entry))
+                Directory.Delete(entry, recursive: true);
+            else
+                File.Delete(entry);
+        }
+        var backup = new DirectoryBackupService(
+            _observer, new LithicBackup.Infrastructure.FileSystem.FileScanner(_observer),
+            new VersionRetentionService(_observer));
+        var ran = await backup.ExecuteAsync(new BackupJob
+        {
+            BackupSetId = _setId, Sources = set.SourceSelections, EnableFileDeduplication = true,
+            TargetDirectory = _dst, ZipMode = ZipMode.None,
+        }, _dst, null, null, CancellationToken.None);
+        string CopyOf(string source) => Path.Combine(_dst, source[..1], source[Path.GetPathRoot(source)!.Length..]);
+        Check(ran.Success && File.Exists(CopyOf(_smallFile)) && File.Exists(CopyOf(_bigFile)),
+            "set-up: a and b are backed up");
+
+        // A main window that reconciles after every edit, without asking first.
+        _vm = new MainViewModel(
+            _catalog,
+            burner: null!,
+            scanner: new LithicBackup.Infrastructure.FileSystem.FileScanner(_catalog),
+            orchestrator: null!,
+            restoreService: null!,
+            catalogFreeRestoreService: null!,
+            directoryBackupService: new DirectoryBackupService(
+                _catalog,
+                new LithicBackup.Infrastructure.FileSystem.FileScanner(_catalog),
+                new VersionRetentionService(_catalog)),
+            settings: new UserSettings { ReconcileMode = ReconcileAfterEditMode.Always });
+        if (!await WaitFor(() => _vm.BackupSets.Any(r => r.Id == _setId), 10000))
+        {
+            Check(false, "the reconciling main window loaded the test set");
+            return;
+        }
+        var row = _vm.BackupSets.First(r => r.Id == _setId);
+
+        var ed = await OpenEditorAsync("reconcile");
+        if (ed is null) return;
+        await ToggleAsync(ed, _b, false);
+        await ToggleAsync(ed, _c, true);
+        ed.Vm.SaveCommand.Execute(null);
+        Check(await WaitClosedAsync(ed.Window), "Save closed the editor");
+
+        // Dropped: b's copy is offered for removal. Remove.
+        ReviewTreeDialog? removal = null;
+        Check(await WaitFor(() => (removal = Application.Current.Windows.OfType<ReviewTreeDialog>()
+                                      .FirstOrDefault()) is not null, 20000),
+            "the scan found what the edit dropped, and asks about it");
+        if (removal is null) return;
+        string removalHeader = ((ReviewTreeViewModel)removal.DataContext).HeaderText.Split('\n')[0];
+        Check(removalHeader.StartsWith("1 file (5,000 bytes)", StringComparison.Ordinal),
+            $"just b's file (\"{removalHeader}\")");
+        removal.DialogResult = true;
+
+        // Added: c's file is offered for backup. Not now.
+        ReviewTreeDialog? addition = null;
+        Check(await WaitFor(() => (addition = Application.Current.Windows.OfType<ReviewTreeDialog>()
+                                       .FirstOrDefault(w => w != removal)) is not null, 20000),
+            "then the added folder's files are offered for backup");
+        if (addition is null) return;
+        string additionHeader = ((ReviewTreeViewModel)addition.DataContext).HeaderText.Split('\n')[0];
+        Check(additionHeader.StartsWith("1 file (3,000 bytes)", StringComparison.Ordinal),
+            $"just c's file (\"{additionHeader}\")");
+        addition.DialogResult = false;
+        await Task.Delay(500);
+
+        Check(!File.Exists(CopyOf(_bigFile)) && File.Exists(CopyOf(_smallFile)),
+            "Remove deleted b's backed-up copy, and only that");
+        var live = (await _observer.GetAllFilesForBackupSetAsync(_setId))
+            .Where(r => !r.IsDeleted).Select(r => r.SourcePath).ToList();
+        Check(live.Count == 1 && string.Equals(live[0], _smallFile, StringComparison.OrdinalIgnoreCase),
+            $"and retired its record, leaving a's ({string.Join(", ", live)})");
+        Check(row.LastResultText.StartsWith("Removed sources: purged 1 catalog record, deleted 1 file", StringComparison.Ordinal),
+            $"the row says what was removed (\"{row.LastResultText}\")");
     }
 #endif
 

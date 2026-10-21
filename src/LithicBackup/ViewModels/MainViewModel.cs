@@ -1534,9 +1534,9 @@ public class MainViewModel : ViewModelBase
                 // the already-loaded (visible) nodes. Collapsed folders pick up their
                 // badges when expanded, since new child nodes read the shared catalog
                 // getter (which SetCatalogInfo populates here).
-                var catalogInfo = await Task.Run(() =>
+                var catalogInfo = await Task.Run(async () =>
                 {
-                    try { return _catalog.GetLatestVersionInfoAsync(backupSet.Id).GetAwaiter().GetResult(); }
+                    try { return await _catalog.GetLatestVersionInfoAsync(backupSet.Id); }
                     catch { return null as Dictionary<string, Core.Models.FileVersionInfo>; }
                 });
                 sourceSelection.SetCatalogInfo(catalogInfo);
@@ -1661,7 +1661,7 @@ public class MainViewModel : ViewModelBase
             "Updating backup",
             "Checking for backed-up files no longer covered by the set\u2026",
             cancellable: true,
-            (progress, ct) =>
+            async (progress, ct) =>
             {
                 // Removed: currently-active catalog files whose source path was
                 // covered before the edit but isn't covered any more.  Rather
@@ -1671,7 +1671,7 @@ public class MainViewModel : ViewModelBase
                 // toggled nodes (a removal can only be caused by unchecking that
                 // node or an ancestor of it), so scoping the reads to them is
                 // both correct and far cheaper.
-                var rem = ComputeRemovedFilesTargeted(
+                var rem = await ComputeRemovedFilesTargetedAsync(
                     backupSet.Id, originalSelections, newSelections, changedPaths,
                     progress, ct);
 
@@ -1758,7 +1758,7 @@ public class MainViewModel : ViewModelBase
     /// (e.g. a toggled folder that also gained files) never yields false
     /// removals.
     /// </summary>
-    private List<FileRecord> ComputeRemovedFilesTargeted(
+    private async Task<List<FileRecord>> ComputeRemovedFilesTargetedAsync(
         int backupSetId,
         IReadOnlyList<Core.Models.SourceSelection> originalSelections,
         IReadOnlyList<Core.Models.SourceSelection> newSelections,
@@ -1771,7 +1771,7 @@ public class MainViewModel : ViewModelBase
         // way to reconcile a whole-tree change than scanning every backed-up
         // file, so fall back to the full load in that (rare) case.
         if (changedPaths.Any(string.IsNullOrEmpty))
-            return ComputeRemovedFilesFull(backupSetId, originalSelections, newSelections, progress, ct);
+            return await ComputeRemovedFilesFullAsync(backupSetId, originalSelections, newSelections, progress, ct);
 
         // Nothing was recorded as changed, yet the JSON diff flagged a change — so
         // the edit was purely cosmetic (expansion state, which is display-only and
@@ -1789,29 +1789,22 @@ public class MainViewModel : ViewModelBase
         var seen = new HashSet<long>();
         var removed = new List<FileRecord>();
         long checkedCount = 0;
-        var sw = System.Diagnostics.Stopwatch.StartNew();
-        long lastReportMs = -ProgressCadence.IntervalMs;   // fire the first report immediately
+        var cadence = new ProgressCadence();
         foreach (var path in roots)
         {
             ct.ThrowIfCancellationRequested();
 
             // Matches the path itself and every descendant, so it works whether
             // the toggled node was a file or a directory.
-            var records = _catalog
-                .GetFileRecordsUnderDirectoryAsync(backupSetId, path)
-                .GetAwaiter().GetResult();
+            var records = await _catalog.GetFileRecordsUnderDirectoryAsync(backupSetId, path, ct);
 
             foreach (var f in records)
             {
                 ct.ThrowIfCancellationRequested();
                 checkedCount++;
 
-                long nowMs = sw.ElapsedMilliseconds;
-                if (progress is not null && nowMs - lastReportMs >= ProgressCadence.IntervalMs)
-                {
-                    lastReportMs = nowMs;
+                if (progress is not null && cadence.IsDue())
                     progress.Report($"Checked {checkedCount:N0} files, {removed.Count:N0} to remove\u2026");
-                }
 
                 if (f.IsDeleted || !seen.Add(f.Id))
                     continue;
@@ -1825,11 +1818,11 @@ public class MainViewModel : ViewModelBase
     }
 
     /// <summary>
-    /// Whole-table fallback for <see cref="ComputeRemovedFilesTargeted"/> used
+    /// Whole-table fallback for <see cref="ComputeRemovedFilesTargetedAsync"/> used
     /// when the change can't be localised (e.g. a bulk deselect-all).  Loads
     /// every catalog file and keeps those covered before the edit but not after.
     /// </summary>
-    private List<FileRecord> ComputeRemovedFilesFull(
+    private async Task<List<FileRecord>> ComputeRemovedFilesFullAsync(
         int backupSetId,
         IReadOnlyList<Core.Models.SourceSelection> originalSelections,
         IReadOnlyList<Core.Models.SourceSelection> newSelections,
@@ -1837,24 +1830,25 @@ public class MainViewModel : ViewModelBase
         CancellationToken ct)
     {
         progress?.Report("Loading backup catalog\u2026");
-        var all = _catalog
-            .GetAllFilesForBackupSetAsync(backupSetId)
-            .GetAwaiter().GetResult();
+        var loading = new ProgressCadence();
+        var all = await _catalog.GetAllFilesForBackupSetAsync(backupSetId, ct,
+            progress is null ? null : new SyncProgress<int>(read =>
+            {
+                if (loading.IsDue())
+                    progress.Report($"Loading backup catalog\u2026 {read:N0} records read");
+            }));
 
         var removed = new List<FileRecord>();
         long checkedCount = 0;
         int total = all.Count;
-        var sw = System.Diagnostics.Stopwatch.StartNew();
-        long lastReportMs = -ProgressCadence.IntervalMs;   // fire the first report immediately
+        var cadence = new ProgressCadence();
         foreach (var f in all)
         {
             ct.ThrowIfCancellationRequested();
             checkedCount++;
 
-            long nowMs = sw.ElapsedMilliseconds;
-            if (progress is not null && nowMs - lastReportMs >= ProgressCadence.IntervalMs)
+            if (progress is not null && cadence.IsDue())
             {
-                lastReportMs = nowMs;
                 int pct = total == 0 ? 100 : (int)(checkedCount * 100L / total);
                 progress.Report(new ProgressReport(
                     $"Checked {checkedCount:N0}/{total:N0} files, {removed.Count:N0} to remove\u2026",
@@ -2011,16 +2005,15 @@ public class MainViewModel : ViewModelBase
                 "Removing files from destination",
                 "Deleting backed-up copies of the removed folders\u2026",
                 cancellable: false,
-                (progress, ct) =>
+                async (progress, ct) =>
                 {
                     // Catalog marks inside a single transaction (mirrors Cleanup).
                     // Loop per source path so the marking shows live "x of y"
                     // progress (throttled to ProgressCadence.IntervalMs) instead of a
                     // single static "Updating catalog…" that looks frozen while
                     // thousands of rows are updated — the user observed exactly this.
-                    var progressSw = System.Diagnostics.Stopwatch.StartNew();
-                    long lastReportMs = -ProgressCadence.IntervalMs; // fire first report immediately
-                    var tx = _catalog.BeginTransactionAsync(backupSet.Id).GetAwaiter().GetResult();
+                    var cadence = new ProgressCadence();
+                    var tx = await _catalog.BeginTransactionAsync(backupSet.Id);
                     int purged = 0, kept = 0;
                     // Every live record of the removed paths, by id, with its stored file.
                     var candidates = new Dictionary<long, string>();
@@ -2029,13 +2022,10 @@ public class MainViewModel : ViewModelBase
                         for (int i = 0; i < sourcePaths.Count; i++)
                         {
                             var path = sourcePaths[i];
-                            long nowMs = progressSw.ElapsedMilliseconds;
                             // Always report the final item so a "N/N" lands before
                             // the disk-delete phase takes over; throttle the rest.
-                            if (nowMs - lastReportMs >= ProgressCadence.IntervalMs
-                                || i == sourcePaths.Count - 1)
+                            if (cadence.IsDue() || i == sourcePaths.Count - 1)
                             {
-                                lastReportMs = nowMs;
                                 int pct = sourcePaths.Count == 0
                                     ? 100 : (int)((i + 1) * 100L / sourcePaths.Count);
                                 progress.Report(new ProgressReport(
@@ -2044,8 +2034,7 @@ public class MainViewModel : ViewModelBase
                                     pct));
                             }
 
-                            foreach (var r in _catalog.GetFileRecordsByPathAsync(backupSet.Id, path)
-                                         .GetAwaiter().GetResult())
+                            foreach (var r in await _catalog.GetFileRecordsByPathAsync(backupSet.Id, path))
                                 if (!r.IsDeleted)
                                     candidates[r.Id] = r.DiscPath;
                         }
@@ -2054,9 +2043,8 @@ public class MainViewModel : ViewModelBase
                         // reference is judged against every removal. A copy a file
                         // still in the sources needs for its .fileref stays, with its
                         // file: removing a folder must not orphan a file outside it.
-                        var keptIds = _catalog.RetireRecordsKeepingNeededCopiesAsync(
-                                backupSet.Id, candidates.Keys.ToList())
-                            .GetAwaiter().GetResult();
+                        var keptIds = await _catalog.RetireRecordsKeepingNeededCopiesAsync(
+                            backupSet.Id, candidates.Keys.ToList());
                         purged = candidates.Count - keptIds.Count;
                         kept = keptIds.Count;
                         foreach (long id in keptIds)
@@ -2065,8 +2053,7 @@ public class MainViewModel : ViewModelBase
                         // deleted (another set path's version filed there, say),
                         // as in Cleanup's purge.
                         if (discPaths.Count > 0)
-                            discPaths.ExceptWith(_catalog.FindDiscPathsInUseAsync(backupSet.Id, discPaths.ToList())
-                                .GetAwaiter().GetResult());
+                            discPaths.ExceptWith(await _catalog.FindDiscPathsInUseAsync(backupSet.Id, discPaths.ToList()));
                         tx.Complete();
                     }
                     finally
@@ -2089,11 +2076,9 @@ public class MainViewModel : ViewModelBase
                         // exactly as manual Cleanup's reconcile step does.
                         progress.Report("Repairing catalog references\u2026");
                         var reconcile = new CatalogReconcileService(_catalog);
-                        var report = reconcile.AnalyzeAsync(backupSet.Id, targetDir, progress, ct)
-                            .GetAwaiter().GetResult();
+                        var report = await reconcile.AnalyzeAsync(backupSet.Id, targetDir, progress, ct);
                         if (report.HasChanges)
-                            reconcile.ApplyAsync(backupSet.Id, report, targetDir, progress, ct)
-                                .GetAwaiter().GetResult();
+                            await reconcile.ApplyAsync(backupSet.Id, report, targetDir, progress, ct);
                     }
                     return (purged, fd, ff, bytes, absent, kept);
                 });
@@ -2152,19 +2137,14 @@ public class MainViewModel : ViewModelBase
                 long scanned = 0;
                 long alreadyCovered = 0;
                 long coveredBytes = 0;
-                var sw = System.Diagnostics.Stopwatch.StartNew();
-                long lastReportMs = -ProgressCadence.IntervalMs;
+                var cadence = new ProgressCadence();
                 foreach (var (path, size) in EnumerateFilesUnderRoots(addedRoots))
                 {
                     ct.ThrowIfCancellationRequested();
                     scanned++;
 
-                    long nowMs = sw.ElapsedMilliseconds;
-                    if (nowMs - lastReportMs >= ProgressCadence.IntervalMs)
-                    {
-                        lastReportMs = nowMs;
+                    if (cadence.IsDue())
                         progress.Report($"Scanned {scanned:N0} files, {result.Count:N0} new\u2026");
-                    }
 
                     if (!SourceSelection.IsPathIncluded(newSelections, path))
                         continue;

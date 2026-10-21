@@ -191,12 +191,12 @@ public class BackupCoverageViewModel : ViewModelBase
             // Load catalog data on a background thread (can be slow for
             // large catalogs since the SQLite call is synchronous).
             ScanProgressText = "Loading catalog data...";
-            var (estimatedTotal, catalogInfo) = await Task.Run(() =>
+            var (estimatedTotal, catalogInfo) = await Task.Run(async () =>
             {
                 int count = 0;
-                try { count = _catalog.GetFileCountForBackupSetAsync(_backupSet.Id, ct).GetAwaiter().GetResult(); }
+                try { count = await _catalog.GetFileCountForBackupSetAsync(_backupSet.Id, ct); }
                 catch { }
-                var info = _catalog.GetLatestVersionInfoAsync(_backupSet.Id, ct).GetAwaiter().GetResult();
+                var info = await _catalog.GetLatestVersionInfoAsync(_backupSet.Id, ct);
                 return (count, info);
             });
 
