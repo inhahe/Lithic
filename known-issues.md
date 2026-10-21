@@ -1,22 +1,34 @@
 # LithicBackup — Known Issues & Tech Debt
 
-## TECH DEBT: "files under this folder" reads every file of the set
+## FIXED: "files under this folder" read every file of the set, and missed names starting with an emoji (2026-10-21)
 
-`SqliteSetDatabase.GetFileRecordsUnderDirectoryAsync` (the post-edit scan's
-targeted path, and folder renames in the Worker and `DirectoryBackupService`)
-matches `SourcePath LIKE prefix% ESCAPE '\' OR SourcePath = path COLLATE NOCASE`.
-`LIKE` compares without case and `IX_Files_SourcePath` is a BINARY index, so
-SQLite cannot use the index for the prefix. `EXPLAIN QUERY PLAN` on a real set
-(2026-10-21): `SEARCH d USING COVERING INDEX IX_Discs_BackupSetId`, `SEARCH f
-USING INDEX IX_Files_DiscId`, `USE TEMP B-TREE FOR ORDER BY`. So every file of
-the set is read and filtered, once per toggled root: the "targeted" scan costs
-a full scan each time.
+**Slow.** `GetFileRecordsUnderDirectoryAsync` serves the post-edit scan's
+targeted path and folder renames in the Worker and `DirectoryBackupService`.
+It read and filtered every file of the set for each folder it was asked
+about: 52 ms for a 5-file folder among 300,010 records in `path_range_test`,
+3 to 5 s per folder on a real 7.7M-row set. `IX_Files_SourcePath_NoCase`
+serves exactly this, but the query's shape kept the planner off it. The
+bundled SQLite (3.53.3), with no `sqlite_stat1`, walks every file by disc
+for a join on `Discs`, scans the table for a range OR-ed with the exact
+path, and walks the whole BINARY path index for an `ORDER BY SourcePath`.
+The `LIKE` was not the cause: SQLite's LIKE optimisation does use the NOCASE
+index (the count under a prefix, also a `LIKE`, was fast). Now two searches
+of the NOCASE index joined by `UNION ALL` (the range under the folder, and
+the path itself), the set checked with `EXISTS`, and no `ORDER BY`: 0.04 ms.
 
-**Fix:** query a range, `SourcePath >= $lo AND SourcePath < $hi`, as
-`GetActiveLatestRecordsUnderPrefixAsync` already does with its `$upper` bound.
-Index the column `COLLATE NOCASE` (or compare in that collation), since Windows
-paths ignore case. Check the new plan reads `SEARCH f USING INDEX ...
-(SourcePath>? AND SourcePath<?)`.
+**Wrong.** The other reads of a folder bound their range with
+`prefix + U+FFFF`: the latest record of each path, the count and size, the
+restore browser's children, and now the count and the remap. The set
+databases store UTF-8 and NOCASE compares its bytes, and every character
+beyond U+FFFF (an emoji: `F0 ...`) sorts above `EF BF BF`. So a file or
+folder whose name starts with one fell outside the range: missing from the
+restore browser, from a restore of the folder, and from its counts. The
+bound is now U+10FFFF, the highest code point.
+
+`path_range_test` holds all six reads to the same meaning: case variants,
+the path itself, look-alike siblings (`a bar`, `a!`, `a]`) and emoji names.
+It also checks the cost. Against the old code it fails four checks: the
+three emoji reads, and the read of a small folder.
 
 ## TECH DEBT: most test harnesses leave their temp folder behind on every run
 

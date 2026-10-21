@@ -1065,28 +1065,28 @@ internal sealed class SqliteSetDatabase : IDisposable
         ct.ThrowIfCancellationRequested();
         using var _ = await LockAsync(ct).ConfigureAwait(false);
 
-        var prefix = directoryPrefix.TrimEnd('\\') + "\\";
-        // Escape the escape character (backslash) FIRST — Windows source paths
-        // are full of separators, and under ESCAPE '\' every un-doubled '\'
-        // would swallow the following character, so an un-escaped prefix like
-        // "D:\some\dir\%" matches NOTHING.  Order matters: doubling backslashes
-        // after adding the "\[", "\%", "\_" escapes would corrupt those.
-        var escaped = prefix
-            .Replace("\\", "\\\\")
-            .Replace("[", "\\[")
-            .Replace("%", "\\%")
-            .Replace("_", "\\_");
+        // Everything under the path as a range, and the path itself (a toggled
+        // file), each a search of IX_Files_SourcePath_NoCase - Windows paths
+        // ignore case. Shaped for the planner, which otherwise reads every file
+        // of the set: two queries, not one with an OR, which it scans; an EXISTS
+        // for the set, not a join, which it walks by disc; and no ORDER BY,
+        // which it serves by walking the whole BINARY path index
+        // (path_range_test checks the cost).
+        string prefix = directoryPrefix.TrimEnd('\\') + "\\";
 
         using var cmd = _connection.CreateCommand();
         cmd.CommandText = """
             SELECT f.* FROM Files f
-            INNER JOIN Discs d ON f.DiscId = d.Id
-            WHERE d.BackupSetId = $setId
-              AND (f.SourcePath LIKE $prefix ESCAPE '\' OR f.SourcePath = $exact COLLATE NOCASE)
-            ORDER BY f.SourcePath, f.Version
+            WHERE f.SourcePath >= $prefix COLLATE NOCASE AND f.SourcePath < $upper COLLATE NOCASE
+              AND EXISTS (SELECT 1 FROM Discs d WHERE d.Id = f.DiscId AND d.BackupSetId = $setId)
+            UNION ALL
+            SELECT f.* FROM Files f
+            WHERE f.SourcePath = $exact COLLATE NOCASE
+              AND EXISTS (SELECT 1 FROM Discs d WHERE d.Id = f.DiscId AND d.BackupSetId = $setId)
             """;
         cmd.Parameters.AddWithValue("$setId", backupSetId);
-        cmd.Parameters.AddWithValue("$prefix", escaped + "%");
+        cmd.Parameters.AddWithValue("$prefix", prefix);
+        cmd.Parameters.AddWithValue("$upper", prefix + PathUpperSentinel);
         cmd.Parameters.AddWithValue("$exact", directoryPrefix);
 
         var list = new List<FileRecord>();
@@ -1100,11 +1100,14 @@ internal sealed class SqliteSetDatabase : IDisposable
     // ---------------------------------------------------------------
 
     // A string that compares greater than any real source path sharing a given
-    // prefix, used as the exclusive upper bound of a "everything under P" range.
-    // U+FFFF is a non-character never present in a Windows path, and COLLATE
-    // NOCASE (which only case-folds ASCII) leaves it maximal, so "P" .. "P\uFFFF"
-    // brackets exactly the paths under P on the NOCASE index.
-    private const string PathUpperSentinel = "\uFFFF";
+    // prefix, used as the exclusive upper bound of a "everything under P" range,
+    // and to jump a cursor past a subtree. The set databases store text as UTF-8
+    // and COLLATE NOCASE compares its bytes (folding ASCII letters only), so the
+    // bound must sort above every character's encoding: U+10FFFF, the highest
+    // code point (F4 8F BF BF), does, and is a non-character no path holds.
+    // U+FFFF (EF BF BF) did not - every character beyond it (an emoji, F0 ...)
+    // sorts higher, so a name starting with one fell outside the range.
+    private const string PathUpperSentinel = "\U0010FFFF";
 
     /// <summary>
     /// List the direct children (subdirectories + files directly inside) of a
@@ -1807,15 +1810,18 @@ internal sealed class SqliteSetDatabase : IDisposable
 
         var prefix = sourcePrefix.TrimEnd('\\') + "\\";
 
+        // A range on IX_Files_SourcePath_NoCase, like the other reads of a
+        // folder: no LIKE pattern, so nothing in the path to escape.
         using var cmd = _connection.CreateCommand();
         cmd.CommandText = """
             SELECT COUNT(*) FROM Files
-            WHERE SourcePath LIKE $prefix ESCAPE '\'
+            WHERE SourcePath >= $prefix COLLATE NOCASE AND SourcePath < $upper COLLATE NOCASE
               AND EXISTS (SELECT 1 FROM Discs d
                           WHERE d.Id = Files.DiscId AND d.BackupSetId = $setId)
             """;
         cmd.Parameters.AddWithValue("$setId", backupSetId);
-        cmd.Parameters.AddWithValue("$prefix", EscapeLikePrefix(prefix) + "%");
+        cmd.Parameters.AddWithValue("$prefix", prefix);
+        cmd.Parameters.AddWithValue("$upper", prefix + PathUpperSentinel);
         return Convert.ToInt32(cmd.ExecuteScalar());
     }
 
@@ -1832,34 +1838,22 @@ internal sealed class SqliteSetDatabase : IDisposable
 
         using var cmd = _connection.CreateCommand();
         // Replace only the leading prefix: keep the tail after it verbatim.
-        // SUBSTR is 1-based, so start at oldP.Length + 1.
+        // SUBSTR is 1-based, so start at oldP.Length + 1. The paths are found by
+        // a range on IX_Files_SourcePath_NoCase, as for the reads of a folder.
         cmd.CommandText = """
             UPDATE Files
             SET SourcePath = $new || SUBSTR(SourcePath, $prefixLen + 1)
-            WHERE SourcePath LIKE $prefix ESCAPE '\'
+            WHERE SourcePath >= $prefix COLLATE NOCASE AND SourcePath < $upper COLLATE NOCASE
               AND EXISTS (SELECT 1 FROM Discs d
                           WHERE d.Id = Files.DiscId AND d.BackupSetId = $setId)
             """;
         cmd.Parameters.AddWithValue("$setId", backupSetId);
         cmd.Parameters.AddWithValue("$new", newP);
         cmd.Parameters.AddWithValue("$prefixLen", oldP.Length);
-        cmd.Parameters.AddWithValue("$prefix", EscapeLikePrefix(oldP) + "%");
+        cmd.Parameters.AddWithValue("$prefix", oldP);
+        cmd.Parameters.AddWithValue("$upper", oldP + PathUpperSentinel);
         return cmd.ExecuteNonQuery();
     }
-
-    /// <summary>
-    /// Escape a literal path prefix for use in a <c>LIKE ... ESCAPE '\'</c>
-    /// pattern.  The escape character (backslash) must be doubled FIRST — Windows
-    /// paths are full of separators and under <c>ESCAPE '\'</c> every un-doubled
-    /// backslash would swallow the next character.  Then the LIKE wildcards
-    /// (<c>[</c>, <c>%</c>, <c>_</c>) are escaped.  Order matters: doubling
-    /// backslashes after adding those escapes would corrupt them.
-    /// </summary>
-    private static string EscapeLikePrefix(string prefix) => prefix
-        .Replace("\\", "\\\\")
-        .Replace("[", "\\[")
-        .Replace("%", "\\%")
-        .Replace("_", "\\_");
 
     private static FileChunk ReadChunk(SqliteDataReader r) => new()
     {

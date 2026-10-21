@@ -231,9 +231,10 @@ public interface ICatalogRepository : IDisposable
 
     /// <summary>
     /// All catalog records (every version, including deleted history) whose
-    /// SourcePath is the given directory or lies under it. Used to relocate an
-    /// entire subtree's destination copies when a source directory is
-    /// renamed/moved, and to gate whether that relocation is safe.
+    /// SourcePath is the given directory or lies under it, in any letter case,
+    /// in no particular order. Used to relocate an entire subtree's destination
+    /// copies when a source directory is renamed/moved, and to gate whether that
+    /// relocation is safe.
     /// </summary>
     Task<IReadOnlyList<FileRecord>> GetFileRecordsUnderDirectoryAsync(int backupSetId, string directoryPrefix, CancellationToken ct = default);
 
