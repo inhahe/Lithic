@@ -1903,6 +1903,17 @@ are excluded anyway.
 * Long-running user-invoked work (cache compaction, scans, verification) belongs
   on a background task with `IProgress<T>` and a `CancellationToken`, reported in
   the view, and must survive being stopped part-way.
+* **A cancel reaches a catalog read part-way.** `SqliteSetDatabase` reads rows
+  through `Rows(cmd, ct)`, which checks the token before each row, so a read of
+  a whole set (seconds, for millions of rows) stops at the next row rather than
+  at its end. A new read with a token in hand uses it.
+* **Await catalog calls in background work; don't block on them.** Work under a
+  progress window or `Task.Run` awaits (`ProgressDialog.RunAsync` takes async
+  work). It stays on a background thread all the same: the catalog's async
+  methods do their SQLite work synchronously before returning. Awaiting inside
+  a catalog transaction is safe: its owner is an `AsyncLocal` flow token, which
+  survives an await, and its locks are not thread-bound. Only saving at exit
+  blocks, because the process will not wait for an async save.
 
 ## Verifying changes
 
