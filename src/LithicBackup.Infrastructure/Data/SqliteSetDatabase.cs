@@ -2020,8 +2020,13 @@ internal sealed class SqliteSetDatabase : IDisposable
     /// allocated by the caller from the master catalog.
     /// </summary>
     /// <returns>The number of file records copied.</returns>
+    /// <param name="rowsImported">
+    /// Records copied so far, of all the snapshot's file records, file chunks and
+    /// dedup blocks, after each batch.
+    /// </param>
     public async Task<int> ImportHistoryFromAsync(
-        string sourceDatabasePath, IReadOnlyDictionary<long, int> discIdMap, CancellationToken ct = default)
+        string sourceDatabasePath, IReadOnlyDictionary<long, int> discIdMap, CancellationToken ct = default,
+        IProgress<(long Done, long Total)>? rowsImported = null)
     {
         ct.ThrowIfCancellationRequested();
 
@@ -2074,8 +2079,8 @@ internal sealed class SqliteSetDatabase : IDisposable
                     }
                 }
 
-                // Explicit column lists on both sides, so an export from a build
-                // whose tables carry extra columns still imports.
+                // Explicit column lists on both sides, here and below, so an export
+                // from a build whose tables carry extra columns still imports.
                 using (var cmd = _connection.CreateCommand())
                 {
                     cmd.CommandText = """
@@ -2093,40 +2098,87 @@ internal sealed class SqliteSetDatabase : IDisposable
                     cmd.ExecuteNonQuery();
                 }
 
-                int files;
-                using (var cmd = _connection.CreateCommand())
+                // The bulk of a history, copied a range of source row ids at a time
+                // so the count can be reported and a cancel lands between batches.
+                // All inside the one transaction: a cancel or failure rolls back
+                // everything, and the import stays all or nothing.
+                long total = 0, done = 0;
+                foreach (string table in new[] { "src.Files", "src.FileChunks", "src.DeduplicationBlocks" })
                 {
-                    cmd.CommandText = """
-                        INSERT INTO main.Files
-                            (Id, DiscId, SourcePath, DiscPath, SizeBytes, Hash,
-                             IsZipped, IsSplit, IsDeduped, IsFileRef, Version, IsDeleted,
-                             SourceLastWriteUtc, BackedUpUtc)
-                        SELECT f.Id, m.NewId, f.SourcePath, f.DiscPath, f.SizeBytes, f.Hash,
-                               f.IsZipped, f.IsSplit, f.IsDeduped, f.IsFileRef, f.Version, f.IsDeleted,
-                               f.SourceLastWriteUtc, f.BackedUpUtc
-                        FROM src.Files f
-                        INNER JOIN temp.DiscIdMap m ON m.OldId = f.DiscId
-                        """;
-                    files = cmd.ExecuteNonQuery();
+                    using var count = _connection.CreateCommand();
+                    count.CommandText = $"SELECT COUNT(*) FROM {table}";
+                    total += Convert.ToInt64(count.ExecuteScalar());
                 }
+                rowsImported?.Report((0, total));
 
-                Execute("""
+                int files = (int)CopyInBatches("src.Files", """
+                    INSERT INTO main.Files
+                        (Id, DiscId, SourcePath, DiscPath, SizeBytes, Hash,
+                         IsZipped, IsSplit, IsDeduped, IsFileRef, Version, IsDeleted,
+                         SourceLastWriteUtc, BackedUpUtc)
+                    SELECT f.Id, m.NewId, f.SourcePath, f.DiscPath, f.SizeBytes, f.Hash,
+                           f.IsZipped, f.IsSplit, f.IsDeduped, f.IsFileRef, f.Version, f.IsDeleted,
+                           f.SourceLastWriteUtc, f.BackedUpUtc
+                    FROM src.Files f
+                    INNER JOIN temp.DiscIdMap m ON m.OldId = f.DiscId
+                    WHERE f.Id > $after AND f.Id <= $upTo
+                    """);
+
+                CopyInBatches("src.FileChunks", """
                     INSERT INTO main.FileChunks
                         (Id, FileRecordId, DiscId, Sequence, Offset, Length, DiscFilename)
                     SELECT c.Id, c.FileRecordId, m.NewId, c.Sequence, c.Offset, c.Length, c.DiscFilename
                     FROM src.FileChunks c
                     INNER JOIN temp.DiscIdMap m ON m.OldId = c.DiscId
                     WHERE c.FileRecordId IN (SELECT Id FROM main.Files)
+                      AND c.Id > $after AND c.Id <= $upTo
                     """);
 
                 // Directory backups register blocks with DiscId 0 (no disc), which
                 // has no mapping and stays 0.
-                Execute("""
+                CopyInBatches("src.DeduplicationBlocks", """
                     INSERT INTO main.DeduplicationBlocks (Id, Hash, SizeBytes, ReferenceCount, DiscId)
                     SELECT b.Id, b.Hash, b.SizeBytes, b.ReferenceCount, COALESCE(m.NewId, b.DiscId)
                     FROM src.DeduplicationBlocks b
                     LEFT JOIN temp.DiscIdMap m ON m.OldId = b.DiscId
+                    WHERE b.Id > $after AND b.Id <= $upTo
                     """);
+
+                // Run an INSERT ... SELECT over sourceTable's row ids a range at a
+                // time ($after, $upTo); returns the rows inserted.
+                long CopyInBatches(string sourceTable, string insert)
+                {
+                    const long IdsPerBatch = 50_000;
+                    long first, last, rowsInTable;
+                    using (var range = _connection.CreateCommand())
+                    {
+                        range.CommandText = $"SELECT MIN(Id), MAX(Id), COUNT(*) FROM {sourceTable}";
+                        using var r = range.ExecuteReader();
+                        r.Read();
+                        if (r.IsDBNull(0))
+                            return 0;
+                        (first, last, rowsInTable) = (r.GetInt64(0), r.GetInt64(1), r.GetInt64(2));
+                    }
+
+                    using var cmd = _connection.CreateCommand();
+                    cmd.CommandText = insert;
+                    var after = cmd.Parameters.Add("$after", SqliteType.Integer);
+                    var upTo = cmd.Parameters.Add("$upTo", SqliteType.Integer);
+                    long inserted = 0, doneBefore = done;
+                    for (long from = first - 1; from < last; from += IdsPerBatch)
+                    {
+                        ct.ThrowIfCancellationRequested();
+                        after.Value = from;
+                        upTo.Value = from + IdsPerBatch;
+                        inserted += cmd.ExecuteNonQuery();
+                        done = doneBefore + Math.Min(inserted, rowsInTable);
+                        rowsImported?.Report((done, total));
+                    }
+                    // Rows the joins left out still count as dealt with.
+                    done = doneBefore + rowsInTable;
+                    rowsImported?.Report((done, total));
+                    return inserted;
+                }
 
                 Execute("DROP TABLE temp.DiscIdMap");
                 tx.Commit();

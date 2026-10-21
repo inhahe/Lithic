@@ -595,7 +595,10 @@ public interface ICatalogRepository : IDisposable
     /// for carrying the set to another machine, and the catalog written onto a
     /// disc. Reads through its own connection, so it never waits on, or
     /// interleaves with, a backup running on the set - and holds only what is
-    /// committed.
+    /// committed. The file is written as the copy goes, to about the size
+    /// <see cref="GetSetHistorySizeBytes"/> gives, so a caller can watch it grow
+    /// for progress. A cancel stops the copy part-way and throws
+    /// <see cref="OperationCanceledException"/>, leaving a partial file to delete.
     /// </summary>
     Task ExportSetHistoryAsync(int backupSetId, string destinationPath, CancellationToken ct = default);
 
@@ -604,9 +607,17 @@ public interface ICatalogRepository : IDisposable
     /// <paramref name="backupSetId"/>, which must have no history yet. Disc ids
     /// are re-allocated (they are unique across the whole catalog, and the
     /// snapshot's may already belong to another set here); everything else keeps
-    /// its numbers. All or nothing. Returns the number of file records imported.
+    /// its numbers. All or nothing, a cancel included. Returns the number of file
+    /// records imported.
     /// </summary>
-    Task<int> ImportSetHistoryAsync(int backupSetId, string sourceDatabasePath, CancellationToken ct = default);
+    /// <param name="rowsImported">
+    /// Records copied so far, of all the snapshot holds (file records, file chunks
+    /// and dedup blocks together), after each batch; batches are tens of thousands
+    /// of records, not paced by time.
+    /// </param>
+    Task<int> ImportSetHistoryAsync(
+        int backupSetId, string sourceDatabasePath, CancellationToken ct = default,
+        IProgress<(long Done, long Total)>? rowsImported = null);
 
     // --- USN change-journal cursors ---
 

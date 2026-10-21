@@ -23,9 +23,12 @@
 //   5. the engine never overwrites an untracked _prev file: a history-less
 //      backup over an old destination files the old copy under a fresh number;
 //   6. a seed that finds both a plain copy and a .fileref of one file records one.
+//  10. export and import of a large history report rising progress through each
+//      step, and a cancel stops them part-way leaving nothing behind.
 
 using System.Security.Cryptography;
 using System.Text.Json;
+using LithicBackup.Core;
 using LithicBackup.Core.Interfaces;
 using LithicBackup.Core.Models;
 using LithicBackup.Infrastructure.Data;
@@ -607,9 +610,146 @@ else
         "and saves nothing: the stored path is left for a backup to update");
 }
 
+// ===================================================================
+// 10. Export and import say how far they have got, and stop when told.
+// ===================================================================
+Console.WriteLine();
+Console.WriteLine("=== 10. Progress and Cancel on a large history ===");
+// A history big enough to take a while: 600,000 records, written straight into
+// the set's database (backing up that many files would take far longer).
+var repoP = NewCatalog(Path.Combine(root, "P"));
+var setP = await repoP.CreateBackupSetAsync(new BackupSet
+{
+    Name = "large", SourceRoots = [source], CreatedUtc = DateTime.UtcNow,
+    DefaultMediaType = MediaType.Directory,
+    JobOptions = new JobOptions { TargetDirectory = target },
+});
+var discP = await repoP.CreateDiscAsync(new DiscRecord
+{
+    BackupSetId = setP.Id, Label = target, SequenceNumber = 1, MediaType = MediaType.Directory,
+    Status = BurnSessionStatus.Completed, CreatedUtc = DateTime.UtcNow, LastWrittenUtc = DateTime.UtcNow,
+});
+const int LargeRecords = 600_000;
+using (var raw = new Microsoft.Data.Sqlite.SqliteConnection(
+           $"Data Source={Path.Combine(repoP.DataDirectory, "sets", $"set-{setP.Id}.db")};Pooling=False"))
+{
+    raw.Open();
+    using var tx = raw.BeginTransaction();
+    using var ins = raw.CreateCommand();
+    ins.CommandText = """
+        INSERT INTO Files (DiscId, SourcePath, DiscPath, SizeBytes, Hash, Version, IsDeleted,
+                           SourceLastWriteUtc, BackedUpUtc)
+        VALUES ($disc, $path, $discPath, 1000, $hash, 1, 0, $when, $when)
+        """;
+    ins.Parameters.AddWithValue("$disc", discP.Id);
+    var pPath = ins.Parameters.Add("$path", Microsoft.Data.Sqlite.SqliteType.Text);
+    var pDisc = ins.Parameters.Add("$discPath", Microsoft.Data.Sqlite.SqliteType.Text);
+    var pHash = ins.Parameters.Add("$hash", Microsoft.Data.Sqlite.SqliteType.Text);
+    ins.Parameters.AddWithValue("$when", DateTime.UtcNow.ToString("O"));
+    for (int i = 0; i < LargeRecords; i++)
+    {
+        string rel = $@"music\modarchive\leftovers\folder_{i / 1000:D4}\module_{i:D7}_with_a_longish_name.mod";
+        pPath.Value = @"C:\" + rel;
+        pDisc.Value = @"C\" + rel;
+        pHash.Value = Convert.ToHexString(SHA256.HashData(BitConverter.GetBytes(i))).ToLowerInvariant();
+        ins.ExecuteNonQuery();
+    }
+    tx.Commit();
+}
+var setPStored = (await repoP.GetBackupSetAsync(setP.Id))!;
+Console.WriteLine($"  (history database: {repoP.GetSetHistorySizeBytes(setP.Id):N0} bytes)");
+
+// Every report, in order, and when it came.
+List<(long Ms, ProgressReport Report)> Recording(out IProgress<ProgressReport> progress, Action<ProgressReport>? also = null)
+{
+    var list = new List<(long, ProgressReport)>();
+    var clock = System.Diagnostics.Stopwatch.StartNew();
+    progress = new SyncProgress<ProgressReport>(r => { lock (list) list.Add((clock.ElapsedMilliseconds, r)); also?.Invoke(r); });
+    return list;
+}
+static bool Rising(IEnumerable<double?> percents)
+{
+    var p = percents.Select(x => x ?? -1).ToList();
+    return p.Count > 0 && p.Zip(p.Skip(1)).All(x => x.Second >= x.First);
+}
+
+string bigExport = Path.Combine(root, "large.lithic");
+var exportReports = Recording(out var exportProgress);
+var exportClock = System.Diagnostics.Stopwatch.StartNew();
+await BackupSetTransfer.ExportAsync(repoP, setPStored, bigExport, includeHistory: true, exportProgress);
+long fullExportMs = exportClock.ElapsedMilliseconds;
+var copySteps = exportReports.Where(r => r.Report.Text.StartsWith("Step 1 of 2: copying the backup history")).ToList();
+var zipSteps = exportReports.Where(r => r.Report.Text.StartsWith("Step 2 of 2: compressing")).ToList();
+Check(File.Exists(bigExport), $"the large export is written ({fullExportMs:N0} ms)");
+Check(copySteps.Count > 0 && copySteps[0].Report.Percent == 0 && Rising(copySteps.Select(r => r.Report.Percent)),
+    $"copying the history reports from 0%, rising ({string.Join(", ", copySteps.Select(r => $"{r.Report.Percent:F0}%"))})");
+Check(copySteps.Count > 1 && copySteps.Skip(1).All(r => r.Report.Text.Contains(" of about ")),
+    $"counting bytes as the copy grows (\"{copySteps.LastOrDefault().Report.Text}\")");
+Check(zipSteps.Count > 0 && Rising(zipSteps.Select(r => r.Report.Percent)),
+    $"then compressing reports, rising ({string.Join(", ", zipSteps.Select(r => $"{r.Report.Percent:F0}%"))})");
+var exportGaps = exportReports.Zip(exportReports.Skip(1)).Select(p => p.Second.Ms - p.First.Ms).ToList();
+Check(exportGaps.Count == 0 || exportGaps.Max() < 3 * ProgressCadence.IntervalMs,
+    $"with no long silence between reports (longest {exportGaps.DefaultIfEmpty().Max()} ms)");
+
+// Cancelled while the history is being copied: the copy - one SQLite statement
+// - is interrupted, not waited out.
+string cancelledExport = Path.Combine(root, "cancelled.lithic");
+using (var cts = new CancellationTokenSource())
+{
+    var cancelClock = System.Diagnostics.Stopwatch.StartNew();
+    long cancelledAtMs = -1;
+    Recording(out var cancelMidCopy, r =>
+    {
+        if (cancelledAtMs < 0 && r.Text.StartsWith("Step 1 of 2") && r.Percent > 0)
+        {
+            cancelledAtMs = cancelClock.ElapsedMilliseconds;
+            cts.Cancel();
+        }
+    });
+    bool cancelled = false;
+    try { await BackupSetTransfer.ExportAsync(repoP, setPStored, cancelledExport, true, cancelMidCopy, cts.Token); }
+    catch (OperationCanceledException) { cancelled = true; }
+    long stopMs = cancelClock.ElapsedMilliseconds - cancelledAtMs;
+    Check(cancelled && cancelledAtMs >= 0 && stopMs < 150,
+        $"cancelled mid-copy, the export stops at once ({stopMs:N0} ms after the cancel, "
+        + $"{cancelledAtMs:N0} ms into an export that takes {fullExportMs:N0})");
+    Check(!File.Exists(cancelledExport) && !File.Exists(cancelledExport + ".partial")
+          && !Directory.EnumerateFiles(root, "cancelled.lithic.*").Any(),
+        "and leaves nothing behind");
+}
+
+// Import: extracting counts bytes, importing counts records, to the total.
+var repoQ = NewCatalog(Path.Combine(root, "Q"));
+var importReports = Recording(out var importProgress);
+var importedP = await BackupSetTransfer.ImportAsync(repoQ, bigExport, importProgress);
+var extractSteps = importReports.Where(r => r.Report.Text.StartsWith("Step 1 of 2: extracting")).ToList();
+var recordSteps = importReports.Where(r => r.Report.Text.StartsWith("Step 2 of 2: importing")).ToList();
+Check(importedP.FileRecords == LargeRecords, $"the large history imports ({importedP.FileRecords:N0} records)");
+Check(extractSteps.Count > 0 && Rising(extractSteps.Select(r => r.Report.Percent)),
+    $"extracting reports, rising ({extractSteps.Count} report(s))");
+Check(recordSteps.Count > 0 && Rising(recordSteps.Select(r => r.Report.Percent))
+      && recordSteps[^1].Report.Percent == 100
+      && recordSteps[^1].Report.Text.Contains($"{LargeRecords:N0} of {LargeRecords:N0} records"),
+    $"importing counts the records up to all of them (\"{recordSteps.LastOrDefault().Report.Text}\")");
+
+// A cancel while the records go in adds no set, and stages nothing that stays.
+int setsInQ = (await repoQ.GetAllBackupSetsAsync()).Count;
+using (var cts = new CancellationTokenSource())
+{
+    Recording(out var cancelOnImport, r => { if (r.Text.StartsWith("Step 2 of 2")) cts.Cancel(); });
+    bool cancelled = false;
+    try { await BackupSetTransfer.ImportAsync(repoQ, bigExport, cancelOnImport, cts.Token); }
+    catch (OperationCanceledException) { cancelled = true; }
+    int setsAfter = (await repoQ.GetAllBackupSetsAsync()).Count;
+    Check(cancelled && setsAfter == setsInQ,
+        $"cancelled while importing, no backup set is added (cancelled: {cancelled}, sets {setsInQ} -> {setsAfter})");
+    Check(!Directory.EnumerateFiles(repoQ.DataDirectory, "lithic-import-*").Any(),
+        "and the extracted history is cleaned up");
+}
+
 Console.WriteLine();
 // Closed before the folder goes, or SQLite's open files keep it from going.
-foreach (var repo in new[] { repoA, repoB, repoA7, repoB7, repoA7b, repoB7b })
+foreach (var repo in new[] { repoA, repoB, repoA7, repoB7, repoA7b, repoB7b, repoP, repoQ })
     repo.Dispose();
 Microsoft.Data.Sqlite.SqliteConnection.ClearAllPools();
 try { Directory.Delete(root, recursive: true); } catch { /* temp; best effort */ }

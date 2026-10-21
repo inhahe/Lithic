@@ -1436,6 +1436,26 @@ import (see known-issues.md). Four defences, each sufficient for part of it:
   deletes the set it created: a set claiming a last-backup time with no records is
   the trap this exists to close. Settings-only exports stay the old plain JSON, so
   older versions can still read them; the two are told apart by the zip magic.
+* **Export and import show their progress, and stop when told.** Both run in a
+  `ProgressDialog` (modeless for export, which only reads; modal for import, which
+  adds a set) with the step, a bar and Cancel, and end in a message saying where
+  the file went (with an offer to show it in Explorer) or what was imported. An
+  export with history once ran for minutes with only a status-bar line, and the
+  file appears under its name only once complete, so a user could not tell a
+  running export from a failed one. The steps report at the `ProgressCadence`:
+  - **copying the history**: `VACUUM INTO` is one statement, but it writes its
+    file as it goes, to about the size of the database it copies (96% in a
+    measured run), so `BackupSetTransfer` polls the file's length against
+    `GetSetHistorySizeBytes`. A cancel calls `sqlite3_interrupt` on its
+    connection, so the statement stops part-way (18 ms after the cancel, against
+    600 ms waiting the copy out, in `history_transfer_test` §10);
+  - **compressing / extracting**: a counted stream copy instead of
+    `CreateEntryFromFile` / `ExtractToFile`;
+  - **importing the records**: the `INSERT ... SELECT` of files, chunks and dedup
+    blocks goes 50,000 source row ids at a time, inside the one transaction, so
+    the count moves and a cancel rolls the whole import back.
+
+  Each export and import is logged (start, end, size, duration, cancel).
 * **The catalog-empty check** (`DirectoryBackupService.FindUntrackedBackupAsync`):
   no file records at all (one `EXISTS` probe) **and** a file under the destination
   path of one of the set's own selected roots, current or `_prev`. Scoped to the

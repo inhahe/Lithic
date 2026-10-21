@@ -1,5 +1,6 @@
 using System.IO.Compression;
 using System.Text.Json;
+using LithicBackup.Core;
 using LithicBackup.Core.Interfaces;
 using LithicBackup.Core.Models;
 
@@ -47,9 +48,13 @@ public static class BackupSetTransfer
     /// history when <paramref name="includeHistory"/> is set. The file appears
     /// only once complete; a failure or cancel leaves nothing behind.
     /// </summary>
+    /// <param name="progress">
+    /// The step under way and how far through it, at the <see cref="ProgressCadence"/>:
+    /// copying the history, then compressing it, each counted in bytes.
+    /// </param>
     public static async Task ExportAsync(
         ICatalogRepository catalog, BackupSet set, string path, bool includeHistory,
-        IProgress<string>? status = null, CancellationToken ct = default)
+        IProgress<ProgressReport>? progress = null, CancellationToken ct = default)
     {
         var exported = ExportedBackupSet.FromBackupSet(set, includeHistory);
         string json = JsonSerializer.Serialize(exported, JsonOptions);
@@ -68,10 +73,24 @@ public static class BackupSetTransfer
                 // is gigabytes, and the system drive may not have room for it.
                 historyDb = Path.Combine(Path.GetDirectoryName(Path.GetFullPath(path))!,
                     $"{Path.GetFileName(path)}.{Guid.NewGuid():N}.history.partial");
-                status?.Report("Copying the backup history…");
-                await catalog.ExportSetHistoryAsync(set.Id, historyDb, ct);
 
-                status?.Report("Compressing…");
+                // The copy is one SQLite statement, but it writes its file as it
+                // goes, to about the size of the database it copies: its growth
+                // is the progress.
+                long expected = Math.Max(1, catalog.GetSetHistorySizeBytes(set.Id));
+                string historyFile = historyDb;
+                progress?.Report(new ProgressReport(
+                    $"Step 1 of 2: copying the backup history (0 of about {expected:N0} bytes)", 0));
+                var copying = catalog.ExportSetHistoryAsync(set.Id, historyDb, ct);
+                while (await Task.WhenAny(copying, Task.Delay(ProgressCadence.IntervalMs)) != copying)
+                {
+                    long written = SizeOf(historyFile);
+                    progress?.Report(new ProgressReport(
+                        $"Step 1 of 2: copying the backup history ({written:N0} of about {expected:N0} bytes)",
+                        Math.Min(99, written * 100.0 / expected)));
+                }
+                await copying;
+
                 await Task.Run(() =>
                 {
                     using var fs = new FileStream(partial, FileMode.Create, FileAccess.Write, FileShare.None);
@@ -81,7 +100,10 @@ public static class BackupSetTransfer
                         writer.Write(json);
                     // Fastest: a large history is gigabytes, and the default level
                     // roughly doubles the time for a few percent off the size.
-                    zip.CreateEntryFromFile(historyDb, HistoryEntryName, CompressionLevel.Fastest);
+                    var history = zip.CreateEntry(HistoryEntryName, CompressionLevel.Fastest);
+                    using var input = File.OpenRead(historyFile);
+                    using var output = history.Open();
+                    CopyCounting(input, output, input.Length, "Step 2 of 2: compressing", progress, ct);
                 }, ct);
             }
 
@@ -125,9 +147,13 @@ public static class BackupSetTransfer
     /// history cannot be imported, the set is removed again.
     /// </summary>
     /// <exception cref="InvalidDataException">The file is not a backup set export.</exception>
+    /// <param name="progress">
+    /// The step under way and how far through it, at the <see cref="ProgressCadence"/>:
+    /// extracting the history (bytes), then importing it (records).
+    /// </param>
     public static async Task<BackupSetImportResult> ImportAsync(
         ICatalogRepository catalog, string path,
-        IProgress<string>? status = null, CancellationToken ct = default)
+        IProgress<ProgressReport>? progress = null, CancellationToken ct = default)
     {
         string? historyDb = null;
         try
@@ -144,10 +170,15 @@ public static class BackupSetTransfer
 
                 if (zip.GetEntry(HistoryEntryName) is { } history)
                 {
-                    status?.Report("Extracting the backup history…");
                     // Beside the catalog, whose volume must hold the history anyway.
                     historyDb = Path.Combine(catalog.DataDirectory, $"lithic-import-{Guid.NewGuid():N}.db");
-                    await Task.Run(() => history.ExtractToFile(historyDb), ct);
+                    string target = historyDb;
+                    await Task.Run(() =>
+                    {
+                        using var input = history.Open();
+                        using var output = new FileStream(target, FileMode.CreateNew, FileAccess.Write, FileShare.None);
+                        CopyCounting(input, output, history.Length, "Step 1 of 2: extracting the backup history", progress, ct);
+                    }, ct);
                 }
             }
             else
@@ -162,10 +193,17 @@ public static class BackupSetTransfer
             int records = 0;
             if (withHistory)
             {
-                status?.Report("Importing the backup history…");
+                var cadence = new ProgressCadence();
+                var rows = new SyncProgress<(long Done, long Total)>(r =>
+                {
+                    if (progress is not null && (cadence.IsDue() || r.Done == r.Total))
+                        progress.Report(new ProgressReport(
+                            $"Step 2 of 2: importing the backup history ({r.Done:N0} of {r.Total:N0} records)",
+                            r.Total > 0 ? r.Done * 100.0 / r.Total : 100));
+                });
                 try
                 {
-                    records = await catalog.ImportSetHistoryAsync(newSet.Id, historyDb!, ct);
+                    records = await catalog.ImportSetHistoryAsync(newSet.Id, historyDb!, ct, rows);
                 }
                 catch
                 {
@@ -188,6 +226,48 @@ public static class BackupSetTransfer
                 TryDelete(historyDb + "-wal");
                 TryDelete(historyDb + "-shm");
             }
+        }
+    }
+
+    /// <summary>
+    /// Copy <paramref name="input"/> to <paramref name="output"/>, reporting
+    /// <paramref name="step"/> with the bytes copied of <paramref name="total"/>
+    /// at the <see cref="ProgressCadence"/>, and stopping for a cancel between
+    /// blocks.
+    /// </summary>
+    private static void CopyCounting(
+        Stream input, Stream output, long total, string step,
+        IProgress<ProgressReport>? progress, CancellationToken ct)
+    {
+        var buffer = new byte[1024 * 1024];
+        var cadence = new ProgressCadence();
+        long copied = 0;
+        int read;
+        do
+        {
+            ct.ThrowIfCancellationRequested();
+            if (progress is not null && cadence.IsDue())
+                progress.Report(new ProgressReport(
+                    $"{step} ({copied:N0} of {total:N0} bytes)",
+                    total > 0 ? copied * 100.0 / total : 0));
+            read = input.Read(buffer, 0, buffer.Length);
+            output.Write(buffer, 0, read);
+            copied += read;
+        }
+        while (read > 0);
+    }
+
+    /// <summary>The file's length now, or 0 while it does not exist yet.</summary>
+    private static long SizeOf(string path)
+    {
+        try
+        {
+            var info = new FileInfo(path);
+            return info.Exists ? info.Length : 0;
+        }
+        catch (IOException)
+        {
+            return 0;
         }
     }
 

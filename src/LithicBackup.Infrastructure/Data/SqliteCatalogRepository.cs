@@ -853,8 +853,20 @@ public class SqliteCatalogRepository : ICatalogRepository
                 using var cmd = conn.CreateCommand();
                 cmd.CommandText = "VACUUM INTO $path";
                 cmd.Parameters.AddWithValue("$path", destinationPath);
-                cmd.ExecuteNonQuery();
+                // One statement that can run for minutes: a cancel interrupts it
+                // (sqlite3_interrupt may be called from any thread) rather than
+                // waiting for the whole copy.
+                using var interrupt = ct.Register(() => SQLitePCL.raw.sqlite3_interrupt(conn.Handle));
+                try
+                {
+                    cmd.ExecuteNonQuery();
+                }
+                catch (SqliteException ex) when (ex.SqliteErrorCode == SQLitePCL.raw.SQLITE_INTERRUPT)
+                {
+                    throw new OperationCanceledException(ct);
+                }
             }
+            ct.ThrowIfCancellationRequested();
 
             // A self-contained file: no -wal/-shm companions to lose in transit.
             using (var conn = new SqliteConnection($"Data Source={destinationPath};Pooling=False"))
@@ -867,7 +879,9 @@ public class SqliteCatalogRepository : ICatalogRepository
         }, ct).ConfigureAwait(false);
     }
 
-    public async Task<int> ImportSetHistoryAsync(int backupSetId, string sourceDatabasePath, CancellationToken ct = default)
+    public async Task<int> ImportSetHistoryAsync(
+        int backupSetId, string sourceDatabasePath, CancellationToken ct = default,
+        IProgress<(long Done, long Total)>? rowsImported = null)
     {
         ct.ThrowIfCancellationRequested();
 
@@ -903,7 +917,7 @@ public class SqliteCatalogRepository : ICatalogRepository
             for (int i = 0; i < oldDiscIds.Count; i++)
                 map[oldDiscIds[i]] = newIds[i];
 
-            return await Task.Run(() => db.ImportHistoryFromAsync(sourceDatabasePath, map, ct), ct)
+            return await Task.Run(() => db.ImportHistoryFromAsync(sourceDatabasePath, map, ct, rowsImported), ct)
                 .ConfigureAwait(false);
         }
         catch

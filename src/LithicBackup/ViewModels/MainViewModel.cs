@@ -4823,15 +4823,48 @@ public class MainViewModel : ViewModelBase
 
         bool withHistory = hasHistory && options.IncludeHistory;
         string file = dialog.FileName;
+        CrashLogger.Log(null, $"GUI: exporting \"{set.Name}\" to {file} "
+            + (withHistory ? $"with its backup history (~{historyBytes:N0} bytes)." : "(settings only)."));
+        var clock = System.Diagnostics.Stopwatch.StartNew();
+        StatusText = $"Exporting \"{set.Name}\" to {file}…";
         try
         {
-            var status = new Progress<string>(s => StatusText = $"Exporting \"{set.Name}\": {s}");
-            // Off the UI thread: the catalog work in it is synchronous SQLite, and a
-            // history is gigabytes.
-            await Task.Run(() => BackupSetTransfer.ExportAsync(_catalog, set, file, withHistory, status));
+            // A window of its own, with the step, a bar and Cancel: a history is
+            // gigabytes and takes minutes, and the file appears only once complete.
+            // Modeless: it only reads the catalog, so the rest of the app stays usable.
+            var (completed, _) = await Views.ProgressDialog.RunAsync(
+                Application.Current.MainWindow,
+                $"Export \"{set.Name}\"",
+                $"Exporting \"{set.Name}\" to {file}",
+                cancellable: true,
+                (progress, ct) =>
+                {
+                    BackupSetTransfer.ExportAsync(_catalog, set, file, withHistory, progress, ct)
+                        .GetAwaiter().GetResult();
+                    return true;
+                },
+                modal: false);
+
+            if (!completed)
+            {
+                StatusText = $"Export of \"{set.Name}\" cancelled; no file was written.";
+                CrashLogger.Log(null, $"GUI: export of \"{set.Name}\" cancelled after {clock.Elapsed:hh\\:mm\\:ss}.");
+                return;
+            }
+
+            long size = new FileInfo(file).Length;
             StatusText = withHistory
-                ? $"Exported \"{set.Name}\" with its backup history to {file} ({FormatBytes(new FileInfo(file).Length)} bytes)."
+                ? $"Exported \"{set.Name}\" with its backup history to {file} ({FormatBytes(size)} bytes)."
                 : $"Exported \"{set.Name}\" (settings only) to {file}.";
+            CrashLogger.Log(null, $"GUI: exported \"{set.Name}\" to {file} ({size:N0} bytes) in {clock.Elapsed:hh\\:mm\\:ss}.");
+
+            var answer = MessageBox.Show(
+                $"Exported \"{set.Name}\" "
+                + (withHistory ? "with its backup history" : "(settings only)")
+                + $" to\n\n{file}\n\n{FormatBytes(size)} bytes. Show it in File Explorer?",
+                "Export Backup Set", MessageBoxButton.YesNo, MessageBoxImage.Information);
+            if (answer == MessageBoxResult.Yes)
+                System.Diagnostics.Process.Start("explorer.exe", $"/select,\"{file}\"");
         }
         catch (Exception ex)
         {
@@ -4950,10 +4983,27 @@ public class MainViewModel : ViewModelBase
     {
         try
         {
-            var status = new Progress<string>(s => StatusText = $"Importing: {s}");
-            // Off the UI thread: creating the set and allocating a disc id for each
-            // of a long-lived set's tens of thousands of runs is synchronous SQLite.
-            var result = await Task.Run(() => BackupSetTransfer.ImportAsync(_catalog, fileName, status));
+            CrashLogger.Log(null, $"GUI: importing {fileName}.");
+            var clock = System.Diagnostics.Stopwatch.StartNew();
+            StatusText = $"Importing {Path.GetFileName(fileName)}…";
+            // A window with the step, a bar and Cancel: a history holds millions
+            // of records. Modal, as it adds a set to the catalog. A cancel leaves
+            // no set behind (the import is all or nothing).
+            var (completed, result) = await Views.ProgressDialog.RunAsync(
+                PromptOwner(),
+                "Import Backup Set",
+                $"Importing {fileName}",
+                cancellable: true,
+                (progress, ct) => BackupSetTransfer.ImportAsync(_catalog, fileName, progress, ct)
+                    .GetAwaiter().GetResult());
+            if (!completed)
+            {
+                StatusText = $"Import of {Path.GetFileName(fileName)} cancelled; no backup set was added.";
+                CrashLogger.Log(null, $"GUI: import of {fileName} cancelled after {clock.Elapsed:hh\\:mm\\:ss}.");
+                return;
+            }
+            CrashLogger.Log(null, $"GUI: imported \"{result.Set.Name}\" from {fileName} "
+                + $"({result.FileRecords:N0} file records) in {clock.Elapsed:hh\\:mm\\:ss}.");
             var newSet = result.Set;
             await LoadBackupSetsAsync();
             SelectedBackupSet = BackupSets.FirstOrDefault(s => s.Id == newSet.Id)?.Model;
