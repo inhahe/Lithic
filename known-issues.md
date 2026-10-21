@@ -86,11 +86,16 @@ when the exception's message lacks it.
 
 **Seen again, likely the same cause (2026-10-21, evening):** once in a full
 run, `settings_split_test` check 6 failed: 50 pairs of
-`MachineSettings.Save` racing on one file in `%TEMP%`, and some pair had
-both saves fail ("saved False/False"). It passed in the three runs before and
-the three after. A save writes a temporary file, then replaces the settings
-file with it, retrying the replace for about a second. Both failing means the
-file stayed unreplaceable for longer than that. The test called `Save`, which
+`MachineSettings.Save` racing on one file in `%TEMP%`, and each side had at
+least one failed save among its 50 ("saved False/False" adds up all 50
+rounds, so not necessarily in the same round). The file still held one
+version whole and no temporary file was left, so the atomic replace held; only
+saves reported failure. It passed in the three runs before and the three
+after. A save writes a temporary file, then replaces the settings file with
+it, retrying the replace for about a second, so a failure means the file
+stayed unreplaceable for longer than that. In the app that is the Settings
+dialog's "Settings not saved" message: the dialog stays open, backups keep the
+previous settings, and Save can be tried again. The test called `Save`, which
 drops the reason; it now calls `TrySave` and prints the first failure's
 message, so the next occurrence names it.
 
