@@ -1134,6 +1134,29 @@ internal static class Program
         File.Move(other, renamed);
         var moved = await svc.MoveTargetedAsync(Job(), target, other, renamed, isDirectory: false, CancellationToken.None);
         Check(moved == TargetedMoveOutcome.Relocated, $"a rename to a new name still relocates (got {moved})");
+
+        // A folder renamed onto the name of one that was deleted, whose records
+        // are still there, falls back the same way.
+        string gone = Path.Combine(source, "B"), live = Path.Combine(source, "A");
+        Directory.CreateDirectory(gone);
+        Directory.CreateDirectory(live);
+        await File.WriteAllTextAsync(Path.Combine(gone, "x.txt"), "B's x");
+        await File.WriteAllTextAsync(Path.Combine(live, "x.txt"), "A's x");
+        await Backup();
+        Directory.Delete(gone, recursive: true);
+        await repo.MarkFilesDeletedBySourcePathsAsync(set.Id, [Path.Combine(gone, "x.txt")]);
+        // Cleanup has removed its copies; its records stay, deleted.
+        Directory.Delete(Path.Combine(target, gone[..1], gone[Path.GetPathRoot(gone)!.Length..]), recursive: true);
+        Directory.Move(live, gone);
+        var dirOutcome = await svc.MoveTargetedAsync(Job(), target, live, gone, isDirectory: true, CancellationToken.None);
+        Check(dirOutcome == TargetedMoveOutcome.FellBack, $"a folder renamed onto a deleted folder's name falls back (got {dirOutcome})");
+        string fresh = Path.Combine(source, "C");
+        Directory.Move(gone, fresh);
+        await svc.ExecuteTargetedAsync(Job(), target, [Path.Combine(fresh, "x.txt")], keepOne.Tiers, CancellationToken.None);
+        string fresh2 = Path.Combine(source, "D");
+        Directory.Move(fresh, fresh2);
+        var dirMoved = await svc.MoveTargetedAsync(Job(), target, fresh, fresh2, isDirectory: true, CancellationToken.None);
+        Check(dirMoved == TargetedMoveOutcome.Relocated, $"a folder renamed to a new name still relocates (got {dirMoved})");
         Microsoft.Data.Sqlite.SqliteConnection.ClearAllPools();
     }
 

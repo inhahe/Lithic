@@ -2400,25 +2400,21 @@ public class DirectoryBackupService
             return TargetedMoveOutcome.NothingToRelocate;
         }
 
-        // A rename OVER a file that is already backed up - the atomic-save
-        // pattern: git writes index.lock and renames it over index, editors do
-        // the same with temp files - is a new version of that file, not a move.
-        // Relocating carried the renamed file's copies onto the target's name and
-        // repointed its records there, beside the target's own chain: two
-        // histories with clashing version numbers under one path. When the copies
-        // collided (both plain) the move failed and fell back, harmlessly; when
-        // they did not - index.lock caught while still empty, so stored as a
-        // .fileref to empty content - index.fileref landed beside the plain
-        // index, and the next change filed the plain copy away and left the stale
-        // pointer at the current location. 23,190 of those were found on one
-        // destination. Fall back instead: the caller backs the target up as its
-        // next version and reconciles the vacated old path. (A case-only rename
-        // is the same file, and still relocates.)
-        if (!isDirectory
-            && !string.Equals(oldPath, newPath, StringComparison.OrdinalIgnoreCase)
-            && await _catalog.GetLastVersionAsync(setId, newPath, ct) is not null)
+        // A rename onto a path that has records, live or deleted, is a new
+        // version of what is there, not a move - the atomic-save pattern (git
+        // renames index.lock over index), or a folder renamed onto the name of
+        // one deleted earlier. Relocating would put the moved history beside the
+        // path's own: two chains with clashing version numbers under one path,
+        // which the engine's lookups by (path, version) cannot tell apart. Fall
+        // back: the caller backs the new path up as its next versions and
+        // reconciles the vacated old path. (A case-only rename is the same item,
+        // and still relocates.)
+        if (!string.Equals(oldPath, newPath, StringComparison.OrdinalIgnoreCase)
+            && (isDirectory
+                ? (await _catalog.GetFileRecordsUnderDirectoryAsync(setId, newPath, ct)).Count > 0
+                : await _catalog.GetLastVersionAsync(setId, newPath, ct) is not null))
         {
-            trace?.Invoke($"'{newPath}' already has a backup (a rename over an existing file) -> FellBack: " +
+            trace?.Invoke($"'{newPath}' already has a backup (a rename over an existing item) -> FellBack: " +
                           "back it up as its next version.");
             return TargetedMoveOutcome.FellBack;
         }
