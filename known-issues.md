@@ -1,5 +1,26 @@
 # LithicBackup — Known Issues & Tech Debt
 
+## FIXED: no backup set could be deleted in the session that created the catalog (2026-10-21)
+
+**Symptom.** `DeleteBackupSetAsync` threw "SQLite Error 1: no such table:
+FileChunks", so the set stayed. That included the set an import creates and
+must delete again when its history import fails or is cancelled, so a cancelled
+import left a set that claimed history it did not have.
+
+**Cause.** The delete first clears the set's rows from the master database's
+legacy per-file tables (`FileChunks`, `DeduplicationBlocks`, `Files`, `Discs`),
+which predate per-set databases. The first open of a catalog runs the one-time
+legacy migration, which drops those tables (`DropLegacyTables`). They come back
+as empty shells only when the next launch re-runs migration 001. Until then each
+of those DELETEs fails. A new install's first session is such a session. So is
+every harness that builds a fresh catalog, which is how
+`history_transfer_test` §10 found it, cancelling an import.
+
+**Fix.** The delete clears only the legacy tables that exist (one
+`sqlite_master` query). `history_transfer_test` §2 deletes a set in the session
+that created its catalog. With the old unconditional DELETEs back, that check
+fails with exactly the error above, and §10's cancelled import leaves its set.
+
 ## TECH DEBT: Cleanup's purge retires by source path, so it needs a "since the scan" baseline
 
 `OrphanedDirectoriesViewModel.PurgeSelected` retires a deleted-from-disk or

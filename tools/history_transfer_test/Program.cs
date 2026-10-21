@@ -253,6 +253,20 @@ catch (InvalidDataException) { rejected = true; }
 Check(rejected && (await repoB.GetAllBackupSetsAsync()).Count == setsBefore,
     "a file that is not an export is rejected and creates no set");
 
+// The first open of a catalog drops its legacy master tables; a set must still
+// be deletable in that same session (an import's clean-up after a cancel or
+// failure deletes the set it created).
+var throwaway = await repoB.CreateBackupSetAsync(new BackupSet
+{
+    Name = "throwaway", SourceRoots = [source], CreatedUtc = DateTime.UtcNow,
+    DefaultMediaType = MediaType.Directory,
+});
+string? deleteError = null;
+try { await repoB.DeleteBackupSetAsync(throwaway.Id); }
+catch (Exception ex) { deleteError = ex.Message; }
+Check(deleteError is null && await repoB.GetBackupSetAsync(throwaway.Id) is null,
+    $"a set can be deleted in the session that created its catalog{(deleteError is null ? "" : $" ({deleteError})")}");
+
 // ===================================================================
 // 3. The untracked-backup check.
 // ===================================================================

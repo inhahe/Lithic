@@ -986,26 +986,37 @@ public class SqliteCatalogRepository : ICatalogRepository
             // Order matters — children before parents, or the same FK bites:
             //   FileChunks/DeduplicationBlocks -> Files -> Discs -> BackupSets.
             // Harmless for sets with no legacy rows, which delete nothing here.
+            //
+            // Only the tables that exist: the one-time legacy migration drops them
+            // (DropLegacyTables), and they come back as empty shells only when the
+            // next launch re-runs 001. In between, an unconditional DELETE fails
+            // with "no such table" and no set can be deleted.
+            var legacy = new HashSet<string>(StringComparer.OrdinalIgnoreCase);
             cmd.CommandText = """
-                DELETE FROM FileChunks
-                WHERE DiscId IN (SELECT Id FROM Discs WHERE BackupSetId = $setId)
+                SELECT name FROM sqlite_master
+                WHERE type = 'table' AND name IN ('FileChunks', 'DeduplicationBlocks', 'Files', 'Discs')
                 """;
-            cmd.ExecuteNonQuery();
+            using (var r = cmd.ExecuteReader())
+                while (r.Read())
+                    legacy.Add(r.GetString(0));
 
-            cmd.CommandText = """
-                DELETE FROM DeduplicationBlocks
-                WHERE DiscId IN (SELECT Id FROM Discs WHERE BackupSetId = $setId)
-                """;
-            cmd.ExecuteNonQuery();
+            bool hasDiscs = legacy.Contains("Discs");
+            foreach (string table in new[] { "FileChunks", "DeduplicationBlocks", "Files" })
+            {
+                if (!hasDiscs || !legacy.Contains(table))
+                    continue;
+                cmd.CommandText = $"""
+                    DELETE FROM {table}
+                    WHERE DiscId IN (SELECT Id FROM Discs WHERE BackupSetId = $setId)
+                    """;
+                cmd.ExecuteNonQuery();
+            }
 
-            cmd.CommandText = """
-                DELETE FROM Files
-                WHERE DiscId IN (SELECT Id FROM Discs WHERE BackupSetId = $setId)
-                """;
-            cmd.ExecuteNonQuery();
-
-            cmd.CommandText = "DELETE FROM Discs WHERE BackupSetId = $setId";
-            cmd.ExecuteNonQuery();
+            if (hasDiscs)
+            {
+                cmd.CommandText = "DELETE FROM Discs WHERE BackupSetId = $setId";
+                cmd.ExecuteNonQuery();
+            }
 
             cmd.CommandText = "DELETE FROM DiscOwners WHERE SetId = $setId";
             cmd.ExecuteNonQuery();
