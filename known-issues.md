@@ -81,6 +81,16 @@ ERROR_ACCESS_DENIED and ERROR_SHARING_VIOLATION for destination writes and
 renames in `DirectoryBackupService`, and `DescribeFileError` adding the path
 when the exception's message lacks it.
 
+**Seen again, likely the same cause (2026-10-21, evening):** once in a full
+run, `settings_split_test` check 6 failed: 50 pairs of
+`MachineSettings.Save` racing on one file in `%TEMP%`, and some pair had
+both saves fail ("saved False/False"). It passed in the three runs before and
+the three after. A save writes a temporary file, then replaces the settings
+file with it, retrying the replace for about a second. Both failing means the
+file stayed unreplaceable for longer than that. The test called `Save`, which
+drops the reason; it now calls `TrySave` and prints the first failure's
+message, so the next occurrence names it.
+
 ## FIXED: no backup set could be deleted in the session that created the catalog (2026-10-21)
 
 **Symptom.** `DeleteBackupSetAsync` threw "SQLite Error 1: no such table:

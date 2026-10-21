@@ -169,17 +169,21 @@ try
     var second = new MachineSettings { DiscStagingMode = DiscStagingMode.InPlace };
     second.MemoryBudget.FixedGb = 2;
     bool okA = true, okB = true;
+    string? firstError = null;
     for (int i = 0; i < 50; i++)
     {
-        var a = Task.Run(() => first.Save(pairPath));
-        var b = Task.Run(() => second.Save(pairPath));
+        string? errorA = null, errorB = null;
+        var a = Task.Run(() => first.TrySave(out errorA, pairPath));
+        var b = Task.Run(() => second.TrySave(out errorB, pairPath));
         okA &= a.Result;
         okB &= b.Result;
+        firstError ??= errorA ?? errorB;
     }
     double finalGb = MachineSettings.Load(pairPath).MemoryBudget.FixedGb;
     bool leftovers = Directory.EnumerateFiles(Path.GetDirectoryName(pairPath)!, "*.tmp").Any();
     Check(okA && okB && (finalGb == 1 || finalGb == 2) && !leftovers,
-        $"6 two saves at once both land whole and leave no temporary file (saved {okA}/{okB}, file holds {finalGb})");
+        $"6 two saves at once both land whole and leave no temporary file (saved {okA}/{okB}, file holds {finalGb}"
+        + (firstError is null ? ")" : $"; first failure: {firstError})"));
 
     // 7 ---------------------------------------------------------------------
     string heldPath = Sub("held");
