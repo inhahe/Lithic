@@ -19,13 +19,15 @@ namespace LithicBackup.Services;
 /// </summary>
 public sealed class SlowFileCreationMonitor
 {
-    /// <summary>Files averaged over before deciding: one slow file proves nothing.</summary>
+    /// <summary>Files judged together before deciding: one slow file proves nothing.</summary>
     public const int Window = 32;
 
     /// <summary>
-    /// The average per file that counts as pathological. Creating and renaming a
+    /// The median per file that counts as pathological. Creating and renaming a
     /// file takes single-digit milliseconds on an SSD and tens on a busy hard
-    /// disk; a quarter of a second, sustained, is something wrong.
+    /// disk; a quarter of a second, for most files, is something wrong. The
+    /// median, not the mean: one stall of seconds (a drive waking, a scanner
+    /// holding one file) would lift a mean over the line by itself.
     /// </summary>
     public static readonly TimeSpan Threshold = TimeSpan.FromMilliseconds(250);
 
@@ -33,7 +35,6 @@ public sealed class SlowFileCreationMonitor
     private readonly Func<string, bool?> _shortNamesEnabled;
     private readonly Queue<(double Ms, string Directory)> _recent = new();
     private readonly object _lock = new();
-    private double _sumMs;
     private bool _raised;
 
     /// <param name="onSlow">Called once, with the message to show and log.</param>
@@ -61,20 +62,22 @@ public sealed class SlowFileCreationMonitor
     public void Record(string destPath, TimeSpan elapsed)
     {
         string? directory;
-        double average;
+        double median;
         lock (_lock)
         {
             if (_raised)
                 return;
             _recent.Enqueue((elapsed.TotalMilliseconds, Path.GetDirectoryName(destPath) ?? destPath));
-            _sumMs += elapsed.TotalMilliseconds;
             if (_recent.Count > Window)
-                _sumMs -= _recent.Dequeue().Ms;
-            if (_recent.Count < Window || _sumMs / Window < Threshold.TotalMilliseconds)
+                _recent.Dequeue();
+            if (_recent.Count < Window)
+                return;
+            var sorted = _recent.Select(r => r.Ms).Order().ToArray();
+            median = (sorted[Window / 2 - 1] + sorted[Window / 2]) / 2;
+            if (median < Threshold.TotalMilliseconds)
                 return;
 
             _raised = true;
-            average = _sumMs / Window;
             // Where the time went: the folder that cost the most in the window.
             directory = _recent.GroupBy(r => r.Directory, StringComparer.OrdinalIgnoreCase)
                 .OrderByDescending(g => g.Sum(r => r.Ms))
@@ -84,20 +87,29 @@ public sealed class SlowFileCreationMonitor
         bool? shortNames;
         try { shortNames = _shortNamesEnabled(directory); }
         catch { shortNames = null; }
-        _onSlow(Describe(directory, TimeSpan.FromMilliseconds(average), shortNames));
+        _onSlow(Describe(directory, TimeSpan.FromMilliseconds(median), shortNames,
+            shortNames == true && ShortNameSetting.IsSetForAllVolumes()));
     }
 
     /// <summary>The warning, for a folder where creating a file takes <paramref name="perFile"/>.</summary>
-    public static string Describe(string directory, TimeSpan perFile, bool? shortNamesEnabled)
+    /// <param name="shortNamesEnabled">Whether the folder's volume makes 8.3 short names; null if not known.</param>
+    /// <param name="setForAllVolumes">
+    /// Whether that is Windows' setting for every volume rather than this
+    /// volume's own (<see cref="ShortNameSetting.IsSetForAllVolumes"/>), which
+    /// takes another command to change.
+    /// </param>
+    public static string Describe(string directory, TimeSpan perFile, bool? shortNamesEnabled, bool setForAllVolumes = false)
     {
         string root = Path.GetPathRoot(directory) ?? directory;
         string drive = root.Length >= 2 && root[1] == ':' ? root[..2] : root.TrimEnd('\\');
         string head = $"Creating files on {drive} is taking about {perFile.TotalMilliseconds:N0} ms each "
                       + $"(most of that in \"{directory}\").";
+        string command = setForAllVolumes ? "fsutil 8dot3name set 1" : $"fsutil 8dot3name set {drive} 1";
+        string scope = setForAllVolumes ? " (that turns it off on every drive)" : "";
         return shortNamesEnabled == true
             ? head + $" Windows makes an 8.3 short name for every new file on {drive}, which gets very slow "
                    + "in a folder that holds a great many files. Turning that off can make this a hundred "
-                   + $"times faster: run \"fsutil 8dot3name set {drive} 1\" in an administrator terminal. "
+                   + $"times faster: run \"{command}\" in an administrator terminal{scope}. "
                    + "Files already there keep their short names; nothing else changes."
             : head + " The drive or its connection may be slow, or something on this computer (an antivirus "
                    + "scanner, say) may be checking every new file.";
@@ -120,6 +132,27 @@ public static class ShortNameSetting
     {
         if (!OperatingSystem.IsWindows())
             return null;
+        return Effective(SystemWideMode(), IsOnSystemVolume(path), () => VolumeFlagSaysEnabled(path));
+    }
+
+    /// <summary>
+    /// Whether short names are made, from Windows' setting for every volume
+    /// (<paramref name="systemWideMode"/>, <c>NtfsDisable8dot3NameCreation</c>),
+    /// which decides first, and the volume's own flag, which counts only when
+    /// that setting says "per volume" (2) or cannot be read.
+    /// </summary>
+    public static bool? Effective(int? systemWideMode, bool onSystemVolume, Func<bool?> volumeFlagSaysEnabled)
+        => systemWideMode switch
+        {
+            0 => true,
+            1 => false,
+            3 => onSystemVolume,
+            _ => volumeFlagSaysEnabled(),
+        };
+
+    /// <summary>The volume's own flag, asked through a handle to <paramref name="path"/>.</summary>
+    private static bool? VolumeFlagSaysEnabled(string path)
+    {
         try
         {
             using var handle = CreateFileW(path, 0, FileShareAll, IntPtr.Zero, OpenExisting,
@@ -137,6 +170,46 @@ public static class ShortNameSetting
         catch
         {
             return null;
+        }
+    }
+
+    /// <summary>
+    /// Whether short names are made or not by Windows' setting for every volume
+    /// (<c>NtfsDisable8dot3NameCreation</c> 0, 1 or 3) rather than by each
+    /// volume's own flag (2), so turning them off is <c>fsutil 8dot3name set 1</c>,
+    /// not the per-volume command.
+    /// </summary>
+    public static bool IsSetForAllVolumes() => SystemWideMode() is 0 or 1 or 3;
+
+    /// <summary>
+    /// <c>NtfsDisable8dot3NameCreation</c>: 0 makes short names on every volume,
+    /// 1 on none, 2 as each volume's flag says, 3 on the system volume only.
+    /// Null when it cannot be read; Windows then goes by the volume's flag.
+    /// </summary>
+    private static int? SystemWideMode()
+    {
+        try
+        {
+            using var key = Microsoft.Win32.Registry.LocalMachine.OpenSubKey(
+                @"SYSTEM\CurrentControlSet\Control\FileSystem");
+            return key?.GetValue("NtfsDisable8dot3NameCreation") is int mode ? mode : null;
+        }
+        catch
+        {
+            return null;
+        }
+    }
+
+    private static bool IsOnSystemVolume(string path)
+    {
+        try
+        {
+            return string.Equals(Path.GetPathRoot(Path.GetFullPath(path)),
+                Path.GetPathRoot(Environment.SystemDirectory), StringComparison.OrdinalIgnoreCase);
+        }
+        catch (Exception ex) when (ex is ArgumentException or NotSupportedException or PathTooLongException)
+        {
+            return false;
         }
     }
 

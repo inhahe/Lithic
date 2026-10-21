@@ -144,6 +144,29 @@ internal static class Program
             fast.Record($@"G:\b\f{i}", TimeSpan.FromMilliseconds(i % 50 == 0 ? 3000 : 5));
         Check(quiet.Count == 0, "the odd slow file among fast ones does not warn");
 
+        var stall = new List<string>();
+        var stalled = new SlowFileCreationMonitor(stall.Add, _ => true);
+        stalled.Record(@"G:\b\s0", TimeSpan.FromSeconds(8));
+        for (int i = 1; i < SlowFileCreationMonitor.Window; i++)
+            stalled.Record($@"G:\b\s{i}", TimeSpan.FromMilliseconds(7));
+        Check(stall.Count == 0, "nor does one stall of seconds in a window of fast ones (it lifts the mean over the line)");
+        var mostly = new List<string>();
+        var most = new SlowFileCreationMonitor(mostly.Add, _ => true);
+        for (int i = 0; i < SlowFileCreationMonitor.Window; i++)
+            most.Record($@"G:\b\m{i}", TimeSpan.FromMilliseconds(i < 15 ? 7 : 300));
+        Check(mostly.Count == 1 && mostly[0].Contains("300 ms"), "most of a window slow does, with their time");
+
+        Check(ShortNameSetting.Effective(0, false, () => false) == true
+              && ShortNameSetting.Effective(1, true, () => true) == false
+              && ShortNameSetting.Effective(3, true, () => false) == true
+              && ShortNameSetting.Effective(3, false, () => true) == false
+              && ShortNameSetting.Effective(2, false, () => true) == true
+              && ShortNameSetting.Effective(null, false, () => null) is null,
+            "Windows' setting for every volume decides before the volume's own flag");
+        Check(SlowFileCreationMonitor.Describe(@"G:\b", TimeSpan.FromMilliseconds(400), true, setForAllVolumes: true)
+                  .Contains("\"fsutil 8dot3name set 1\""),
+            "and when it is that setting, the advice is the command that changes it");
+
         var noShort = new List<string>();
         var off = new SlowFileCreationMonitor(noShort.Add, _ => false);
         for (int i = 0; i < SlowFileCreationMonitor.Window; i++)
