@@ -330,7 +330,122 @@ public class SourceSelectionNodeViewModel : ViewModelBase
                 // Propagate the notification up so they re-evaluate.
                 if ((_getShowSelectedOnly?.Invoke() ?? false) && Parent is not null)
                     Parent.InvalidateSelectedSize();
+                Parent?.TakeTotalsFromChildren();
             }
+        }
+    }
+
+    /// <summary>
+    /// A drive row. Its totals, filtered and unfiltered, are never walked for
+    /// on their own: a walk of every drive in the tree, the backup drive and
+    /// network shares included, would hold the size scheduler's one worker for
+    /// minutes at every open, ahead of the folders being looked at. They are
+    /// summed from its children once those are all sized
+    /// (<see cref="TakeTotalsFromChildren"/>), which describes exactly what the
+    /// tree lists, or walked when Calculate Size asks
+    /// (<see cref="WalkInsteadOfSummingChildren"/>).
+    /// </summary>
+    private bool _sizesFromChildren;
+
+    /// <summary>
+    /// The size is still the drive's used space (from <c>DriveInfo</c>,
+    /// available at once), with no count: no totals have landed yet.
+    /// </summary>
+    private bool _sizeIsDriveUsage;
+
+    /// <summary>Make this a drive row (<see cref="_sizesFromChildren"/>) showing
+    /// <paramref name="usedBytes"/>, the drive's used space, until its totals are known.</summary>
+    internal void SetDriveUsedSpace(long usedBytes)
+    {
+        _sizesFromChildren = true;
+        _sizeIsDriveUsage = true;
+        Size = usedBytes;
+        OnPropertyChanged(nameof(FormattedFileCount));
+    }
+
+    /// <summary>Whether the size is only a drive's used space (see <see cref="_sizeIsDriveUsage"/>).</summary>
+    internal bool SizeIsDriveUsage => _sizeIsDriveUsage;
+
+    /// <summary>
+    /// Have the size scheduler walk this drive rather than wait for its
+    /// children to be sized: Calculate Size on a fully selected drive that is
+    /// not expanded, which has no children to sum.
+    /// </summary>
+    internal void WalkInsteadOfSummingChildren()
+    {
+        _sizeIsDriveUsage = false;
+        Size = -1;
+        OnPropertyChanged(nameof(FormattedFileCount));
+    }
+
+    /// <summary>
+    /// The recursive size and file count still have to be computed by walking:
+    /// there is no size yet. Every "does this directory still need sizing" check
+    /// asks this. A drive row showing its used space does not: see
+    /// <see cref="_sizesFromChildren"/>.
+    /// </summary>
+    internal bool NeedsUnfilteredTotals => _size < 0;
+
+    /// <summary>
+    /// The filtered size still has to be computed by walking. Never on its own
+    /// for a drive row, which sums it from its children.
+    /// </summary>
+    private bool NeedsFilteredWalk(bool hasFilter) => hasFilter && _filteredSize < 0 && !_sizesFromChildren;
+
+    /// <summary>
+    /// For a drive row: take each of its totals still unknown, unfiltered and
+    /// (under the scheduler's filter) filtered, as its listed children's sums
+    /// once every child has that total. Run whenever a child's total lands, and
+    /// once the children are listed, since they can all arrive with cached sizes.
+    /// A total that is known is left alone, so a walk's result stands.
+    /// </summary>
+    private void TakeTotalsFromChildren()
+    {
+        if (!_sizesFromChildren || !_isLoaded)
+            return;
+
+        if (_fileCount < 0)
+        {
+            long size = 0;
+            int count = 0;
+            bool all = true;
+            foreach (var c in Children)
+            {
+                if (c._size < 0 || (c.IsDirectory && c._fileCount < 0)) { all = false; break; }
+                size += c._size;
+                count += c.IsDirectory ? c._fileCount : 1;
+            }
+            if (all)
+            {
+                Size = size;
+                FileCount = count;
+            }
+        }
+
+        var filter = _scheduler?.GlobalExcludeFilter;
+        if (filter is not null && _filteredSize < 0)
+        {
+            long size = 0;
+            int count = 0;
+            foreach (var c in Children)
+            {
+                if (IsExcludedByFilter(c, filter))
+                    continue;
+                if (c.IsDirectory)
+                {
+                    if (c._filteredSize < 0 || c._filteredFileCount < 0) return;
+                    size += c._filteredSize;
+                    count += c._filteredFileCount;
+                }
+                else
+                {
+                    if (c._size < 0) return;
+                    size += c._size;
+                    count++;
+                }
+            }
+            FilteredSize = size;
+            FilteredFileCount = count;
         }
     }
 
@@ -338,30 +453,6 @@ public class SourceSelectionNodeViewModel : ViewModelBase
     /// Total number of files. For files this is always 1; for directories it
     /// is the recursive count of all contained files. -1 means not yet computed.
     /// </summary>
-    /// <summary>
-    /// The size is a drive's used space (from <c>DriveInfo</c>, available at
-    /// once), standing in until the drive has been walked. Used space comes with
-    /// no file count, so the drive still needs its totals computed.
-    /// </summary>
-    private bool _sizeIsDriveUsage;
-
-    /// <summary>Show a drive's used space until its own totals are computed.</summary>
-    internal void SetDriveUsedSpace(long usedBytes)
-    {
-        _sizeIsDriveUsage = true;
-        Size = usedBytes;
-        OnPropertyChanged(nameof(FormattedFileCount));
-    }
-
-    /// <summary>
-    /// The recursive size and file count still have to be computed: there is no
-    /// size yet, or only a drive's used space, which has no count. Every "does
-    /// this directory still need sizing" check asks this; it used to ask
-    /// <c>Size &lt; 0</c>, so drive rows - sized from <c>DriveInfo</c> - were
-    /// never counted unless a filter made them walk for their filtered size.
-    /// </summary>
-    internal bool NeedsUnfilteredTotals => _size < 0 || (_sizeIsDriveUsage && _fileCount < 0);
-
     public int FileCount
     {
         get => _fileCount;
@@ -374,6 +465,7 @@ public class SourceSelectionNodeViewModel : ViewModelBase
                 OnPropertyChanged(nameof(FormattedFileCount));
                 if ((_getShowSelectedOnly?.Invoke() ?? false) && Parent is not null)
                     Parent.InvalidateSelectedFileCount();
+                Parent?.TakeTotalsFromChildren();
             }
         }
     }
@@ -392,6 +484,7 @@ public class SourceSelectionNodeViewModel : ViewModelBase
             OnPropertyChanged(nameof(FormattedSize));
             if ((_getShowSelectedOnly?.Invoke() ?? false) && Parent is not null)
                 Parent.InvalidateSelectedSize();
+            Parent?.TakeTotalsFromChildren();
         }
     }
 
@@ -406,6 +499,7 @@ public class SourceSelectionNodeViewModel : ViewModelBase
             OnPropertyChanged(nameof(FormattedFileCount));
             if ((_getShowSelectedOnly?.Invoke() ?? false) && Parent is not null)
                 Parent.InvalidateSelectedFileCount();
+            Parent?.TakeTotalsFromChildren();
         }
     }
 
@@ -431,8 +525,11 @@ public class SourceSelectionNodeViewModel : ViewModelBase
                     // Fully-selected directory with a filter — use the
                     // pre-computed filtered size (accounts for excluded
                     // subdirectories without requiring children to be loaded).
+                    // A drive row with no filtered total coming keeps showing its
+                    // used space, as it does without a filter.
                     if (IsSelected == true && filter is not null)
-                        return _filteredSize < 0 ? "Working..." : FormatBytes(_filteredSize);
+                        return _filteredSize >= 0 ? FormatBytes(_filteredSize)
+                             : FilteredTotalsAreComing ? "Working..." : FormatBytes(_size);
 
                     // Partially-selected directory — walk loaded children
                     // to sum only selected, non-excluded nodes.
@@ -453,11 +550,10 @@ public class SourceSelectionNodeViewModel : ViewModelBase
     /// individual files or when the count is not yet computed.
     /// In "selected only" mode, partially-selected directories show the
     /// count of selected children only.
-    /// Shows "Working..." while any contributing child's count is unknown.
-    /// A drive row starts with its used space as a provisional size and no
-    /// count, and shows "Working..." until its walk lands, like any other
-    /// directory. It used to show nothing at all: the count column read "size
-    /// known, count not" as "will never have a count".</summary>
+    /// Shows "Working..." while any contributing child's count is unknown. A
+    /// drive row showing its used space has no count until its children are
+    /// sized: "Working..." while they are (it is expanded), blank while it is
+    /// not.</summary>
     public string FormattedFileCount
     {
         get
@@ -471,23 +567,36 @@ public class SourceSelectionNodeViewModel : ViewModelBase
                 if (IsExcludedByFilter(this, filter)) return "";
 
                 if (IsSelected == true && filter is not null)
-                    return _filteredFileCount < 0 ? "Working..." : _filteredFileCount.ToString("N0");
+                    return _filteredFileCount >= 0 ? _filteredFileCount.ToString("N0")
+                         : FilteredTotalsAreComing ? "Working..." : "";
 
                 if (IsSelected == null && _isLoaded)
                 {
                     var total = ComputeSelectedChildrenFileCount();
                     return total.HasValue ? total.Value.ToString("N0") : "Working...";
                 }
-                // No count yet: "Working..." while one is coming (including a
-                // drive showing only its used space), blank when none will.
-                if (_fileCount < 0) return NeedsUnfilteredTotals ? "Working..." : "";
+                // No count yet: "Working..." while one is coming, blank when none will.
+                if (_fileCount < 0) return CountIsComing ? "Working..." : "";
                 return _fileCount.ToString("N0");
             }
             // Same check.
-            if (_fileCount < 0) return NeedsUnfilteredTotals ? "Working..." : "";
+            if (_fileCount < 0) return CountIsComing ? "Working..." : "";
             return _fileCount.ToString("N0");
         }
     }
+
+    /// <summary>
+    /// A count will arrive: the directory is being walked, or - a drive showing
+    /// its used space - its listed children are being sized.
+    /// </summary>
+    private bool CountIsComing => NeedsUnfilteredTotals || (_sizeIsDriveUsage && _isLoaded);
+
+    /// <summary>
+    /// A filtered total will arrive: always for a folder, which is walked for
+    /// it; for a drive row only while its children are being sized or it is
+    /// being walked.
+    /// </summary>
+    private bool FilteredTotalsAreComing => !_sizesFromChildren || _isLoaded || _size < 0;
 
     /// <summary>
     /// Recursively sum the sizes of selected children.
@@ -1483,6 +1592,15 @@ public class SourceSelectionNodeViewModel : ViewModelBase
             // now, and ComputePrioritySizesAsync re-sorts once sizes arrive.
             SortChildren();
 
+            // A drive's totals now come from its children, if they did not all
+            // bring theirs with them.
+            if (_sizesFromChildren)
+            {
+                TakeTotalsFromChildren();
+                OnPropertyChanged(nameof(FormattedSize));
+                OnPropertyChanged(nameof(FormattedFileCount));
+            }
+
             // If this directory's saved child selections were deferred (it was
             // collapsed during the initial restore), re-apply them now that the
             // children exist.  This runs the first time the user expands the node.
@@ -1767,7 +1885,7 @@ public class SourceSelectionNodeViewModel : ViewModelBase
 
         bool hasFilter = _scheduler.GlobalExcludeFilter is not null;
         var dirNodes = candidates.Where(c => c.IsDirectory
-            && (c.NeedsUnfilteredTotals || (hasFilter && c._filteredSize < 0))).ToList();
+            && (c.NeedsUnfilteredTotals || c.NeedsFilteredWalk(hasFilter))).ToList();
         if (dirNodes.Count > 0)
             _ = ComputePrioritySizesAsync(dirNodes);
     }
@@ -1902,7 +2020,7 @@ public class SourceSelectionNodeViewModel : ViewModelBase
         var gf = _scheduler.GlobalExcludeFilter;
         bool hasFilter = gf is not null;
         var dirNodes = Children.Where(c => c.IsDirectory
-            && (c.NeedsUnfilteredTotals || (hasFilter && c._filteredSize < 0))).ToList();
+            && (c.NeedsUnfilteredTotals || c.NeedsFilteredWalk(hasFilter))).ToList();
         if (dirNodes.Count > 0)
         {
             if (isVisible)
@@ -1951,7 +2069,7 @@ public class SourceSelectionNodeViewModel : ViewModelBase
                 // refinement — don't block the size report or recursion.
                 if (hasFilter)
                 {
-                    var needFiltered = dirNodes.Where(n => n._filteredSize < 0
+                    var needFiltered = dirNodes.Where(n => n.NeedsFilteredWalk(hasFilter)
                         && n._size >= 0).ToList();
                     if (needFiltered.Count > 0)
                     {
@@ -2032,11 +2150,14 @@ public class SourceSelectionNodeViewModel : ViewModelBase
     {
         long totalSize = 0;
         int totalCount = 0;
+        bool atRoot = IsVolumeRoot(dir);
 
         try
         {
             foreach (var file in dir.EnumerateFiles())
             {
+                if (atRoot && VolumeMetadataPaths.IsVolumeMetadata(file.FullName))
+                    continue;
                 try
                 {
                     if (!isExcluded(file.FullName))
@@ -2058,7 +2179,8 @@ public class SourceSelectionNodeViewModel : ViewModelBase
                 // displayed size matches what the backup engine actually copies.
                 // Check if the directory itself is excluded (e.g. */node_modules/*)
                 // by testing a synthetic child path.
-                if (isExcluded(System.IO.Path.Combine(subDir.FullName, "_")))
+                if ((atRoot && VolumeMetadataPaths.IsVolumeMetadata(subDir.FullName))
+                    || isExcluded(System.IO.Path.Combine(subDir.FullName, "_")))
                     continue;
 
                 var (subSize, subCount) = ComputeDirectorySizeFiltered(subDir, isExcluded);
@@ -2113,7 +2235,10 @@ public class SourceSelectionNodeViewModel : ViewModelBase
         // TryGetFilteredRecursive, against the column the filtered pass actually
         // writes — it used to be done here against DirLastWriteUtc, which this
         // pass never sets, so it could never succeed.
-        var cachedRec = cache.TryGetFilteredRecursive(
+        // Not for a volume root, whose few direct entries are re-read: a total
+        // stored by a walk that counted the volume's own items would stand.
+        bool atRoot = IsVolumeRoot(dir);
+        var cachedRec = atRoot ? null : cache.TryGetFilteredRecursive(
             dir.FullName, filterSignature, dirLastWrite);
         if (cachedRec is not null)
             return cachedRec.Value;
@@ -2125,6 +2250,8 @@ public class SourceSelectionNodeViewModel : ViewModelBase
         {
             foreach (var file in dir.EnumerateFiles())
             {
+                if (atRoot && VolumeMetadataPaths.IsVolumeMetadata(file.FullName))
+                    continue;
                 try
                 {
                     if (!isExcluded(file.FullName))
@@ -2144,7 +2271,8 @@ public class SourceSelectionNodeViewModel : ViewModelBase
             {
                 // Hidden/System directories are included in size totals so the
                 // displayed size matches what the backup engine actually copies.
-                if (isExcluded(System.IO.Path.Combine(subDir.FullName, "_")))
+                if ((atRoot && VolumeMetadataPaths.IsVolumeMetadata(subDir.FullName))
+                    || isExcluded(System.IO.Path.Combine(subDir.FullName, "_")))
                     continue;
 
                 var (subSize, subCount) = ComputeDirectorySizeFilteredCached(
@@ -2153,7 +2281,8 @@ public class SourceSelectionNodeViewModel : ViewModelBase
                 totalCount += subCount;
             }
         }
-        catch { }
+        // Not a cancellation: see ComputeDirectorySizeCached.
+        catch (Exception ex) when (ex is not OperationCanceledException) { }
 
         // Store the computed filtered total so future sessions / re-loads
         // can return it instantly via TryGetCachedFilteredRecursiveSize.
@@ -2240,7 +2369,10 @@ public class SourceSelectionNodeViewModel : ViewModelBase
         try { currentLastWrite = dir.LastWriteTimeUtc; }
         catch { return ComputeDirectorySizeFallback(dir); }
 
-        var cached = cache.TryGet(dir.FullName);
+        // A volume root's few direct files are re-read rather than taken from
+        // the cache, where a walk that counted the page file may have left them.
+        bool atRoot = IsVolumeRoot(dir);
+        var cached = atRoot ? null : cache.TryGet(dir.FullName);
         if (cached.HasValue && cached.Value.DirLastWriteUtc >= currentLastWrite)
         {
             // Direct contents unchanged — reuse cached values.
@@ -2256,6 +2388,8 @@ public class SourceSelectionNodeViewModel : ViewModelBase
             {
                 foreach (var file in dir.EnumerateFiles())
                 {
+                    if (atRoot && VolumeMetadataPaths.IsVolumeMetadata(file.FullName))
+                        continue;
                     try { directFileSize += file.Length; directFileCount++; }
                     catch { }
                 }
@@ -2274,12 +2408,16 @@ public class SourceSelectionNodeViewModel : ViewModelBase
             {
                 // Hidden/System directories are included in size totals so the
                 // displayed size matches what the backup engine actually copies.
+                if (atRoot && VolumeMetadataPaths.IsVolumeMetadata(subDir.FullName))
+                    continue;
                 var (subSize, subCount) = ComputeDirectorySizeCached(subDir, cache, ct);
                 subdirSizeTotal += subSize;
                 subdirFileTotal += subCount;
             }
         }
-        catch { }
+        // Not a cancellation: it leaves the sum partial, and cached as this
+        // folder's total, the next open would show it as one.
+        catch (Exception ex) when (ex is not OperationCanceledException) { }
 
         long totalSize = directFileSize + subdirSizeTotal;
         int totalCount = directFileCount + subdirFileTotal;
@@ -2299,16 +2437,31 @@ public class SourceSelectionNodeViewModel : ViewModelBase
     {
         long total = 0;
         int count = 0;
+        bool atRoot = IsVolumeRoot(dir);
         try
         {
             foreach (var file in dir.EnumerateFiles("*", SearchOption.AllDirectories))
             {
+                if (atRoot && VolumeMetadataPaths.IsVolumeMetadata(file.FullName))
+                    continue;
                 try { total += file.Length; count++; }
                 catch { }
             }
         }
         catch { }
         return (total, count);
+    }
+
+    /// <summary>
+    /// Whether <paramref name="dir"/> is a volume root. Its listing holds the
+    /// volume's own items (<see cref="VolumeMetadataPaths"/>: the recycle bin,
+    /// the page file), which the tree does not list and the backup never
+    /// copies, so no size counts them either.
+    /// </summary>
+    internal static bool IsVolumeRoot(DirectoryInfo dir)
+    {
+        var full = dir.FullName.AsSpan().TrimEnd(System.IO.Path.DirectorySeparatorChar);
+        return System.IO.Path.GetPathRoot(full).TrimEnd(System.IO.Path.DirectorySeparatorChar).Length == full.Length;
     }
 
     /// <summary>

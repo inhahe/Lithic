@@ -874,16 +874,29 @@ internal static class Program
         Check(!App.TrayBalloonText(LithicBackup.Services.ServiceState.Stopped).Text.Contains("monitoring continues"),
             "and none claims monitoring continues");
 
-        // --- 20. drive rows show Working... until counted ---
+        // --- 20. a drive row takes its totals from its children ---
         Console.WriteLine();
-        Console.WriteLine("=== 20. a drive row's file count ===");
-        var drive = new SourceSelectionNodeViewModel(@"Q:\", true, null);
+        Console.WriteLine("=== 20. a drive row's size and count come from its children ===");
+        string fakeDrive = Path.Combine(_root, "fake-drive");
+        Directory.CreateDirectory(Path.Combine(fakeDrive, "a"));
+        Directory.CreateDirectory(Path.Combine(fakeDrive, "b"));
+        File.WriteAllBytes(Path.Combine(fakeDrive, "f.bin"), new byte[3]);
+        var drive = new SourceSelectionNodeViewModel(fakeDrive, true, null);
         drive.SetDriveUsedSpace(123_456_789);
-        Check(drive.FormattedFileCount == "Working...", $"with only its used space: \"{drive.FormattedFileCount}\"");
-        Check(drive.NeedsUnfilteredTotals, "and it is still to be counted");
-        drive.Size = 120_000_000;
-        drive.FileCount = 4_321;
-        Check(drive.FormattedFileCount == "4,321" && !drive.NeedsUnfilteredTotals, $"counted: \"{drive.FormattedFileCount}\"");
+        Check(drive.FormattedFileCount == "" && !drive.NeedsUnfilteredTotals,
+            $"collapsed: no count, and not queued for a walk (\"{drive.FormattedFileCount}\")");
+        await drive.EnsureChildrenLoadedAsync();
+        Check(drive.FormattedFileCount == "Working..." && drive.Size == 123_456_789,
+            $"listed, folders unsized: Working..., used space kept (\"{drive.FormattedFileCount}\", {drive.Size})");
+        var childA = drive.Children.First(c => c.Name == "a");
+        var childB = drive.Children.First(c => c.Name == "b");
+        childA.Size = 10;
+        childA.FileCount = 2;
+        Check(drive.Size == 123_456_789 && drive.FileCount < 0, "one folder sized: still the used space");
+        childB.FileCount = 1;   // count first, then size: either order completes it
+        childB.Size = 5;
+        Check(drive.Size == 18 && drive.FileCount == 4 && drive.FormattedFileCount == "4" && !drive.SizeIsDriveUsage,
+            $"all sized: their sums (size {drive.Size}, count {drive.FileCount})");
         var folder = new SourceSelectionNodeViewModel(@"Q:\x", true, null);
         Check(folder.FormattedFileCount == "Working..." && folder.NeedsUnfilteredTotals, "an uncounted folder: Working..., as before");
 
@@ -894,6 +907,113 @@ internal static class Program
         LithicBackup.Services.OpenRequestQueue.DirectoryOverride = q;
         string export = Path.Combine(_root, "shared.lithic");
         await BackupSetTransfer.ExportAsync(_catalog, set, export, includeHistory: false);
+        // Under a filter, the filtered totals are the children's too.
+        using (var sched = new SizeComputeScheduler())
+        {
+            sched.GlobalExcludeFilter = p => p.EndsWith(".tmp", StringComparison.OrdinalIgnoreCase);
+            string fd2 = Path.Combine(_root, "fake-drive-2");
+            Directory.CreateDirectory(Path.Combine(fd2, "a"));
+            File.WriteAllBytes(Path.Combine(fd2, "keep.bin"), new byte[3]);
+            File.WriteAllBytes(Path.Combine(fd2, "skip.tmp"), new byte[7]);
+            var drive2 = new SourceSelectionNodeViewModel(fd2, true, null, scheduler: sched);
+            drive2.SetDriveUsedSpace(999);
+            await drive2.EnsureChildrenLoadedAsync();
+            var a2 = drive2.Children.First(c => c.Name == "a");
+            a2.Size = 4;
+            a2.FileCount = 1;
+            Check(drive2.Size == 14 && drive2.FileCount == 3 && drive2.FilteredSize < 0,
+                $"unfiltered sums first ({drive2.Size}, {drive2.FileCount}), filtered still to come");
+            a2.FilteredSize = 4;
+            a2.FilteredFileCount = 1;
+            Check(drive2.FilteredSize == 7 && drive2.FilteredFileCount == 2,
+                $"filtered: the excluded file left out ({drive2.FilteredSize}, {drive2.FilteredFileCount})");
+
+            // Opening the tree walks no drive, for either total: a walk of every
+            // drive would hold the scheduler's one worker for minutes.
+            string fd3 = Path.Combine(_root, "fake-drive-3");
+            Directory.CreateDirectory(Path.Combine(fd3, "a"));
+            File.WriteAllBytes(Path.Combine(fd3, "a", "x.bin"), new byte[5]);
+            var root3 = new SourceSelectionNodeViewModel("", true, null, scheduler: sched) { IsLoaded = true };
+            root3.Children.Clear();
+            var drive3 = new SourceSelectionNodeViewModel(fd3, true, root3);
+            drive3.SetDriveUsedSpace(999);
+            root3.Children.Add(drive3);
+            await root3.ComputeUnknownSizesAsync();
+            await Task.Delay(1500);
+            Check(drive3.Size == 999 && drive3.FileCount < 0 && drive3.FilteredSize < 0,
+                $"no drive walk on open (size {drive3.Size}, count {drive3.FileCount}, filtered {drive3.FilteredSize})");
+        }
+
+        // Calculate Size: a fully selected drive that is not expanded is walked;
+        // one that is expanded is summed from its children, which are sized.
+        var unexpanded = new SourceSelectionNodeViewModel(Path.Combine(_root, "fake-drive-3"), true, null);
+        unexpanded.SetDriveUsedSpace(999);
+        unexpanded.IsSelected = true;
+        var expanded = new SourceSelectionNodeViewModel(Path.Combine(_root, "fake-drive-3"), true, null);
+        expanded.SetDriveUsedSpace(999);
+        await expanded.EnsureChildrenLoadedAsync();
+        expanded.IsSelected = true;
+        var collected = new List<SourceSelectionNodeViewModel>();
+        SourceSelectionViewModel.CollectUncalculatedSelectedDirs([unexpanded, expanded], collected);
+        Check(collected.Contains(unexpanded) && !collected.Contains(expanded)
+              && collected.Any(n => n.Parent == expanded && n.Name == "a"),
+            $"collected: {string.Join(", ", collected.Select(n => n.Path))}");
+        unexpanded.WalkInsteadOfSummingChildren();
+        Check(unexpanded.NeedsUnfilteredTotals && unexpanded.FormattedSize == "Working...",
+            "the walked drive is queued, and says Working... meanwhile");
+        Check(SourceSelectionNodeViewModel.IsVolumeRoot(new DirectoryInfo(Path.GetPathRoot(_root)!))
+              && !SourceSelectionNodeViewModel.IsVolumeRoot(new DirectoryInfo(_root)),
+            "a volume root is told from a folder (its walk leaves out the recycle bin and page file)");
+
+        // A walk cancelled part-way stores nothing as a total, and does not
+        // return one. The canceller fires once the first folder's own files are
+        // in the cache, while the walk still has the rest ahead of it.
+        Console.WriteLine();
+        Console.WriteLine("=== 20b. a cancelled size walk is not a total ===");
+        foreach (bool filtered in new[] { false, true })
+        {
+            string kind = filtered ? "filtered" : "unfiltered";
+            const string sig = "editor-save-test";
+            bool sawCancel = false, sawPartial = false;
+            for (int attempt = 0; attempt < 5 && !sawCancel && !sawPartial; attempt++)
+            {
+                string tree = Path.Combine(_root, $"walk-{kind}-{attempt}");
+                for (int i = 0; i < 300; i++)
+                {
+                    string d = Path.Combine(tree, $"d{i:D3}");
+                    Directory.CreateDirectory(d);
+                    File.WriteAllBytes(Path.Combine(d, "x.bin"), new byte[1]);
+                }
+                string first = new DirectoryInfo(tree).EnumerateDirectories().First().FullName;
+                using var cache = new DirectorySizeCache();
+                using var cts = new CancellationTokenSource();
+                bool Landed(string path) => filtered
+                    ? cache.TryGetFilteredRecursive(path, sig, DateTime.MinValue) is not null
+                    : cache.TryGet(path) is not null;
+                var canceller = Task.Run(() =>
+                {
+                    var sw = System.Diagnostics.Stopwatch.StartNew();
+                    while (!Landed(first) && sw.ElapsedMilliseconds < 10_000) { }
+                    cts.Cancel();
+                });
+                try
+                {
+                    var (sz, n) = await Task.Run(() => filtered
+                        ? SourceSelectionNodeViewModel.ComputeDirectorySizeFilteredCached(
+                            new DirectoryInfo(tree), _ => false, cache, sig, cts.Token)
+                        : SourceSelectionNodeViewModel.ComputeDirectorySizeCached(new DirectoryInfo(tree), cache, cts.Token));
+                    if (n != 300) sawPartial = true;
+                }
+                catch (OperationCanceledException) { sawCancel = true; }
+                await canceller;
+                if (sawCancel)
+                    Check(filtered ? !Landed(tree) : cache.TryGetRecursive(tree) is null,
+                        $"{kind}: the cancelled walk cached no total for the folder");
+            }
+            Check(!sawPartial, $"{kind}: a cancelled walk never returns a partial sum as the total");
+            Check(sawCancel, $"{kind}: and the cancellation reached the caller");
+        }
+
         var fromArgs = LithicBackup.Services.OpenRequestQueue.FilesFromArguments(
             ["--test-mode", export, Path.Combine(_root, "missing.lithic"), Path.Combine(_root, "notes.txt")]);
         Check(fromArgs.Count == 1 && fromArgs[0] == export, "the command line yields just the existing export");

@@ -1975,6 +1975,9 @@ public class SourceSelectionViewModel : ViewModelBase, IDisposable
         // Find all selected directories that don't have computed sizes yet.
         var uncalculated = new List<SourceSelectionNodeViewModel>();
         CollectUncalculatedSelectedDirs(Roots, uncalculated);
+        foreach (var node in uncalculated)
+            if (node.SizeIsDriveUsage)
+                node.WalkInsteadOfSummingChildren();
 
         if (uncalculated.Count > 0)
         {
@@ -2304,7 +2307,7 @@ public class SourceSelectionViewModel : ViewModelBase, IDisposable
         }
     }
 
-    private static void CollectUncalculatedSelectedDirs(
+    internal static void CollectUncalculatedSelectedDirs(
         IEnumerable<SourceSelectionNodeViewModel> nodes,
         List<SourceSelectionNodeViewModel> result)
     {
@@ -2313,14 +2316,19 @@ public class SourceSelectionViewModel : ViewModelBase, IDisposable
             if (node.IsSelected == false || !node.IsDirectory)
                 continue;
 
-            if (node.NeedsUnfilteredTotals)
+            // A drive showing its used space has no totals of its own. Fully
+            // selected, the selected size needs them: they are its children's
+            // sums when it is expanded, and a walk of it when it is not. Partly
+            // selected, only its children count.
+            bool sumsChildren = node.SizeIsDriveUsage && node.IsLoaded;
+            if (node.NeedsUnfilteredTotals
+                || (node.IsSelected == true && node.SizeIsDriveUsage && !sumsChildren))
                 result.Add(node);
 
-            // Only recurse into partially selected directories.
-            // ComputeSelectedSize uses the aggregate Size/FileCount for
-            // fully-selected directories, so their children don't need
-            // individual sizes computed.
-            if (node.IsSelected != true && node.IsLoaded)
+            // Otherwise recurse only into partially selected directories:
+            // ComputeSelectedSize uses the aggregate Size/FileCount of
+            // fully-selected ones, so their children don't need sizes.
+            if ((node.IsSelected != true || sumsChildren) && node.IsLoaded)
                 CollectUncalculatedSelectedDirs(node.Children, result);
         }
     }

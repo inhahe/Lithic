@@ -1584,18 +1584,30 @@ than ten minutes are dropped unread, so one left behind by a crash does not pop 
 later. The GUI runs unelevated, so opening a file never prompts for elevation, and
 the queue is per user, as the single-instance names are per session.
 
-## A drive row's size is provisional until the drive is counted
+## A drive row's size is provisional until its children are sized
 
 Drive rows take their size from `DriveInfo` (used space) so the tree shows
-something at once. That figure comes with no file count, and every "does this
-directory still need sizing" check asked `Size < 0`, so a drive was never counted
-- unless a filter queued it for its filtered size - and its count column, reading
-"size known, count not" as "never", stayed blank while every folder row said
-"Working...". `NeedsUnfilteredTotals` (no size, or only used space) is now the one
-check, in the scheduler and the tree, so drives are walked like folders (the walk
-is cache-backed: only changed folders are re-enumerated) and show "Working..."
-until it lands. The computed total then replaces the used space, so a drive row
-describes the same files as its count and as every other row.
+something at once. That figure comes with no file count. A drive is **never
+walked on its own**, for its totals or for its filtered totals: the size
+scheduler has a single worker, and a whole-drive walk - every drive in the
+tree, the backup drive and network shares included - would hold it for minutes
+at every open, ahead of the folders the user is looking at and of the plan
+check. Instead, once every child the drive lists has a total, the drive takes
+their sums (`TakeTotalsFromChildren`, run as each child's total lands and once
+its children are listed), and the same for the filtered totals under the
+scheduler's filter. While that is under way (the drive is expanded) its count
+says "Working..."; while it is not, the count is blank and the size stays the
+used space, with or without a filter. The sums describe what the tree lists.
+
+**Calculate size** needs a fully selected drive's totals: an expanded one is
+summed from its children, which it sizes; one that is not is walked
+(`WalkInsteadOfSummingChildren`). A partly selected one is not needed itself,
+only its children. Every size walk leaves out a volume root's own items
+(`VolumeMetadataPaths`: the recycle bin, System Volume Information, the page,
+hibernation and swap files), which the tree does not list and the backup never
+copies, and re-reads a root's direct entries rather than trusting a cached
+total. A walk that is cancelled (the editor closed mid-walk) returns and stores
+nothing: a swallowed cancellation would leave partial sums cached as totals.
 
 ## Continuous backup and full scans interleave; they do not run concurrently
 
