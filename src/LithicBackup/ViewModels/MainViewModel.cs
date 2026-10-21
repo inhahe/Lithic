@@ -1952,6 +1952,42 @@ public class MainViewModel : ViewModelBase
             return;
         }
 
+        // Hold the set's row, as Cleanup's purge does: while it is working the
+        // Worker starts nothing on the set and stops what it is running, and this
+        // waits for that run to go, so no copy is written at a path this deletes.
+        // Not while something else works on the set; Cleanup can do it later.
+        var row = RowFor(backupSet.Id);
+        if (row is { IsWorking: true })
+        {
+            StatusText = $"\"{backupSet.Name}\" is {row.BusyActivity ?? "backing up"} right now, so the "
+                + "removed-source files were left on the destination. Remove them via Cleanup when that has finished.";
+            return;
+        }
+        BeginRowWork(row, RemovingDroppedSources, "Removing the backed-up files of the sources you dropped…", cancel: null);
+        try
+        {
+            await WaitForBackgroundRunAsync(row, backupSet.Id, "Removing the files of dropped sources");
+            await PurgeRemovedSourcesAsync(backupSet, removed, byPath, targetDir);
+        }
+        finally
+        {
+            EndRowWork(row, StatusText, isError: false);
+        }
+        await LoadBackupSetsAsync();
+    }
+
+    private const string RemovingDroppedSources = "removing the files of dropped sources";
+
+    /// <summary>
+    /// The removal itself, for <see cref="PromptAndPurgeRemovedAsync"/>, with the
+    /// set held: the records of <paramref name="removed"/> retired and their
+    /// stored files deleted, except what another file still needs. Its outcome
+    /// goes to <see cref="StatusText"/>.
+    /// </summary>
+    private async Task PurgeRemovedSourcesAsync(
+        BackupSet backupSet, List<FileRecord> removed,
+        List<(string SourcePath, long SizeBytes)> byPath, string? targetDir)
+    {
         var sourcePaths = byPath.Select(p => p.SourcePath).ToList();
         // Every version's destination file must be deleted, de-duplicated so a
         // shared disc path is never deleted (or counted) twice.
@@ -2025,6 +2061,12 @@ public class MainViewModel : ViewModelBase
                         kept = keptIds.Count;
                         foreach (long id in keptIds)
                             discPaths.Remove(candidates[id].Replace('/', '\\'));
+                        // A stored file a live record still points at is never
+                        // deleted (another set path's version filed there, say),
+                        // as in Cleanup's purge.
+                        if (discPaths.Count > 0)
+                            discPaths.ExceptWith(_catalog.FindDiscPathsInUseAsync(backupSet.Id, discPaths.ToList())
+                                .GetAwaiter().GetResult());
                         tx.Complete();
                     }
                     finally
@@ -2079,8 +2121,6 @@ public class MainViewModel : ViewModelBase
         StatusText = parts.Count > 0
             ? "Removed sources: " + string.Join(", ", parts) + "."
             : "No destination files needed removal.";
-
-        await LoadBackupSetsAsync();
     }
 
     /// <summary>
