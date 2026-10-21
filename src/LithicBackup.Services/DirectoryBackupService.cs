@@ -1085,7 +1085,9 @@ public class DirectoryBackupService
                 if (tierResolver is not null)
                 {
                     var fileTierSet = tierResolver(file.FullPath);
-                    keepVersions = fileTierSet.Tiers.Count > 0;
+                    // Excluded files never get here, so only an empty Default
+                    // keeps no history.
+                    keepVersions = !fileTierSet.KeepsNoHistory;
                 }
                 else
                 {

@@ -1017,6 +1017,13 @@
                         </TextBlock.Style>
                     </TextBlock>
 
+                    <!-- A set of the user's own with no tiers excludes its files -->
+                    <TextBlock Margin="20,0,0,4" FontSize="11"
+                               Foreground="{StaticResource WarningBrush}"
+                               TextWrapping="Wrap"
+                               Text="No tiers: the files this set matches are excluded from backup, and Cleanup offers their backups for deletion. Add a tier to back them up, with as many earlier versions as it keeps."
+                               Visibility="{Binding SelectedTierSet.ExcludesForLackOfTiers, Converter={StaticResource BoolToVis}, FallbackValue=Collapsed}" />
+
                     <!-- Retention tiers of the selected set -->
                     <StackPanel Margin="20,0,0,0">
                         <StackPanel.Style>

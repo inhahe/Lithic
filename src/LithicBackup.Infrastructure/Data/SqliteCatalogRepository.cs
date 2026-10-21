@@ -616,8 +616,6 @@ public class SqliteCatalogRepository : ICatalogRepository
     public Task<FileRecord?> GetActiveLatestRecordByPathAsync(int backupSetId, string sourcePath, CancellationToken ct = default)
         => GetSet(backupSetId).GetActiveLatestRecordByPathAsync(sourcePath, ct);
 
-    public Task<int> MarkFilesDeletedByDirectoryAsync(int backupSetId, string directoryPrefix, CancellationToken ct = default)
-        => GetSet(backupSetId).MarkFilesDeletedByDirectoryAsync(backupSetId, directoryPrefix, ct);
 
     public Task<int> MarkFilesDeletedBySourcePathsAsync(int backupSetId, IEnumerable<string> sourcePaths, CancellationToken ct = default)
         => GetSet(backupSetId).MarkFilesDeletedBySourcePathsAsync(backupSetId, sourcePaths, ct);

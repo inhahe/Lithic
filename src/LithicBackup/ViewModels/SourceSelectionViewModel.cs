@@ -232,12 +232,28 @@ public class SourceSelectionViewModel : ViewModelBase, IDisposable
         // view model, so they reach the unsaved-changes flag only through here.
         TierSets.CollectionChanged += (_, e) =>
         {
-            if (e.OldItems is not null)
-                foreach (TierSetViewModel ts in e.OldItems)
-                    ts.TiersEdited -= OnTierSetTiersEdited;
+            // A Clear carries no old items: let go of every set no longer here.
+            var gone = e.Action == System.Collections.Specialized.NotifyCollectionChangedAction.Reset
+                ? _watchedTierSets.Where(ts => !TierSets.Contains(ts)).ToList()
+                : e.OldItems?.Cast<TierSetViewModel>().ToList() ?? [];
+            foreach (var ts in gone)
+            {
+                ts.TiersEdited -= OnTierSetTiersEdited;
+                _watchedTierSets.Remove(ts);
+            }
             if (e.NewItems is not null)
                 foreach (TierSetViewModel ts in e.NewItems)
-                    ts.TiersEdited += OnTierSetTiersEdited;
+                    if (_watchedTierSets.Add(ts))
+                        ts.TiersEdited += OnTierSetTiersEdited;
+
+            // Adding or removing a set is an edit (selecting one is not); a set
+            // with patterns can change which files are excluded.
+            if (e.Action != System.Collections.Specialized.NotifyCollectionChangedAction.Move)
+            {
+                bool patterned = gone.Concat(e.NewItems?.Cast<TierSetViewModel>() ?? [])
+                    .Any(ts => !string.IsNullOrWhiteSpace(ts.FilePatternsText));
+                OnTierSetTiersEdited(patterned);
+            }
         };
         NextCommand = new RelayCommand(_ => OnNext(), _ => HasSelection && !IsEditMode);
         SaveCommand = new RelayCommand(_ => OnSave(), _ => _needsSave && IsEditMode && !_saving && !IsApplyingSelections);
@@ -288,7 +304,7 @@ public class SourceSelectionViewModel : ViewModelBase, IDisposable
                     or nameof(SortAscending) or nameof(IsApplyingSelections)
                     or nameof(ShowLargestFiles) or nameof(IsEditMode)
                     or nameof(IsAllAutoIncludeNew) or nameof(IsAllSelected)
-                    or nameof(CanEditSelectedTierSet)
+                    or nameof(CanEditSelectedTierSet) or nameof(SelectedTierSet)
                     or nameof(IsCalculatingSize) or nameof(SizeCalculationResult)
                     or nameof(IsSeeding) or nameof(SeedResult)
                     or nameof(DestinationSpaceText)
@@ -475,17 +491,19 @@ public class SourceSelectionViewModel : ViewModelBase, IDisposable
     }
 
     /// <summary>
-    /// A tier was added, removed or changed in one of the tier sets. Marks the
-    /// set unsaved, under the same init-time suspend as every other edit (the
-    /// restore adds every saved tier while it is off).
+    /// A tier was added, removed or changed in one of the tier sets, or a set
+    /// was added or removed. Marks the set unsaved, under the same init-time
+    /// suspend as every other edit (the restore adds every saved tier while it
+    /// is off).
     /// </summary>
-    /// <param name="countChanged">
-    /// The number of tiers changed. A set with patterns and no tiers excludes its
-    /// files from backup, so that can change which files the tree's sizes count:
-    /// the cached exclusion filter is rebuilt, and Apply is offered to refresh
-    /// the sizes, as for a pattern edit.
+    /// <param name="exclusionChanged">
+    /// Which files are excluded may have changed (a set started or stopped
+    /// excluding, a set with patterns came or went): the cached exclusion filter
+    /// is rebuilt, and Apply is offered to refresh the sizes, as for a pattern
+    /// edit. Otherwise the sizes cannot change, and Apply would only recompute
+    /// every one of them.
     /// </param>
-    private void OnTierSetTiersEdited(bool countChanged)
+    private void OnTierSetTiersEdited(bool exclusionChanged)
     {
         if (!_dirtyTrackingArmed)
             return;
@@ -495,13 +513,16 @@ public class SourceSelectionViewModel : ViewModelBase, IDisposable
         if (!_needsSave)
             _needsSave = true;
 
-        if (countChanged)
+        if (exclusionChanged)
         {
             _excludeFilterDirty = true;
             _filtersPendingApply = true;
         }
         CommandManager.InvalidateRequerySuggested();
     }
+
+    /// <summary>The tier sets whose tier edits this view model listens to.</summary>
+    private readonly HashSet<TierSetViewModel> _watchedTierSets = [];
 
     /// <summary>
     /// Whether the user has edited filter patterns since the last Apply.
@@ -587,13 +608,18 @@ public class SourceSelectionViewModel : ViewModelBase, IDisposable
     /// </summary>
     private static string ComputeExcludeFilterSignature(List<VersionTierSet> tierModels)
     {
-        var sb = new System.Text.StringBuilder();
+        // "v2": an empty Default stopped excluding (1.13), so the same inputs
+        // now give another filter; sizes cached under the old one must not
+        // match. Each set says whether it excludes, which is what the filter
+        // tests. Bump the version whenever the filter's meaning changes.
+        var sb = new System.Text.StringBuilder("v2\n");
         // Sort by name for determinism — TierSets order should not affect
         // the signature when the same sets are present.
         foreach (var ts in tierModels.OrderBy(t => t.Name, StringComparer.OrdinalIgnoreCase))
         {
             sb.Append("ts=").Append(ts.Name);
             sb.Append("|tiers=").Append(ts.Tiers.Count);
+            sb.Append("|excludes=").Append(ts.ExcludesFromBackup);
             sb.Append("|fp=");
             foreach (var p in ts.FilePatterns.OrderBy(s => s, StringComparer.OrdinalIgnoreCase))
                 sb.Append(p).Append(';');

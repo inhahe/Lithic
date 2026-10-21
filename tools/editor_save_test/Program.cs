@@ -261,11 +261,34 @@ internal static class Program
         await UnitTestsAsync();
         await LayoutAndSmallFixesAsync();
         await SeedHoldsTheRowAsync(dbPath);
+        NoTierWarning();
 #endif
         Check(_dialogs.Unexpected.Count == 0,
             "no unexpected message box appeared"
             + (_dialogs.Unexpected.Count > 0 ? ": " + string.Join(" | ", _dialogs.Unexpected) : ""));
     }
+
+#if !OLD_CODE
+    /// <summary>
+    /// 22: a set of the user's own with no tiers excludes its files, which the
+    /// editor showed only while Default was selected; the set says so itself now.
+    /// </summary>
+    static void NoTierWarning()
+    {
+        Console.WriteLine();
+        Console.WriteLine("=== 22. a custom set with no tiers says it excludes its files ===");
+        var photos = new TierSetViewModel("Photos", isBuiltIn: false);
+        Check(photos.ExcludesForLackOfTiers, "a custom set with no tiers warns that it excludes");
+        int raised = 0;
+        photos.PropertyChanged += (_, e) => { if (e.PropertyName == nameof(TierSetViewModel.ExcludesForLackOfTiers)) raised++; };
+        photos.Tiers.Add(RetentionTierViewModel.FromModel(new VersionRetentionTier { MaxVersions = 3 }));
+        Check(!photos.ExcludesForLackOfTiers && raised == 1, "and stops, and says so, once it has a tier");
+        Check(!new TierSetViewModel("Default", isBuiltIn: true).ExcludesForLackOfTiers,
+            "an empty Default never does (its files are backed up without history)");
+        Check(!new TierSetViewModel("None", isBuiltIn: true).ExcludesForLackOfTiers,
+            "nor \"None\", which says it excludes in its own words");
+    }
+#endif
 
     // ------------------------------------------------------------------ helpers
 
@@ -513,9 +536,11 @@ internal static class Program
         var def = DefaultOf(ed);
         Check(def is { Tiers.Count: > 0 }, $"Default starts with tiers ({def?.Tiers.Count})");
         Check(!ed.Vm.SaveCommand.CanExecute(null), "Save starts disabled");
+        ed.Vm.SelectedTierSet = ed.Vm.TierSets.First(t => t.Name == "None");
         ed.Vm.SelectedTierSet = def;
         await Task.Delay(300);
-        ed.Vm.MarkClean();   // selecting a tier set is not what this tests
+        Check(!ed.Vm.SaveCommand.CanExecute(null) && !ed.Vm.HasUnsavedChanges,
+            "selecting tier sets to look at them is not an edit (it enabled Save)");
         foreach (var tier in def!.Tiers.ToList())
             tier.RemoveCommand.Execute(null);
         Check(def.Tiers.Count == 0, "every tier is removed from Default");

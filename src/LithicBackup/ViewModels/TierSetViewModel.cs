@@ -26,23 +26,25 @@ public class TierSetViewModel : ViewModelBase
         _name = name;
         IsBuiltIn = isBuiltIn;
         Tiers = [];
+        _excludes = Excludes;
         Tiers.CollectionChanged += OnTiersChanged;
     }
 
     /// <summary>
     /// Raised when a tier is added or removed, or a tier's days or versions
-    /// change. Its argument says whether the NUMBER of tiers changed, which is
-    /// what decides if a set with patterns excludes its files (no tiers) or
-    /// versions them.
+    /// change: edits one level below this set's own properties, which the
+    /// editor's unsaved-changes flag would not otherwise see. Its argument says
+    /// whether the set started or stopped excluding its files
+    /// (<see cref="VersionTierSet.ExcludesFromBackup"/>), the one tier edit that
+    /// changes which files the tree's sizes count.
     /// </summary>
-    /// <remarks>
-    /// The editor's unsaved-changes flag listened only to this set's own
-    /// properties (name and patterns), and these edits live one level down, in
-    /// the tier collection and the tier rows. So removing Default's last tier,
-    /// adding one, or changing "keep 3" to "keep 1" left Save disabled - and the
-    /// close prompt silent, so the edit was simply lost on closing.
-    /// </remarks>
     public event Action<bool>? TiersEdited;
+
+    /// <summary>Whether the set excluded its files after the last tier edit.</summary>
+    private bool _excludes;
+
+    private bool Excludes => Tiers.Count == 0
+        && !string.Equals(_name, "Default", StringComparison.OrdinalIgnoreCase);
 
     private void OnTiersChanged(object? sender, NotifyCollectionChangedEventArgs e)
     {
@@ -52,8 +54,20 @@ public class TierSetViewModel : ViewModelBase
         if (e.NewItems is not null)
             foreach (RetentionTierViewModel t in e.NewItems)
                 t.PropertyChanged += OnTierPropertyChanged;
-        TiersEdited?.Invoke(true);
+        bool excludes = Excludes;
+        bool flipped = excludes != _excludes;
+        _excludes = excludes;
+        if (flipped)
+            OnPropertyChanged(nameof(ExcludesForLackOfTiers));
+        TiersEdited?.Invoke(flipped);
     }
+
+    /// <summary>
+    /// A set of the user's own with no tiers, which excludes its files from
+    /// backup: the editor says so where the tiers would be, since removing the
+    /// last tier is all it takes ("None" says so itself, and Default never does).
+    /// </summary>
+    public bool ExcludesForLackOfTiers => _excludes && !IsBuiltIn;
 
     private void OnTierPropertyChanged(object? sender, PropertyChangedEventArgs e)
     {
@@ -85,8 +99,8 @@ public class TierSetViewModel : ViewModelBase
     public bool IsBuiltIn { get; }
 
     /// <summary>
-    /// Retention tiers for this set. An empty collection means no version
-    /// history is kept (the "None" tier set).
+    /// Retention tiers for this set. Empty: Default backs its files up without
+    /// history, and any other set excludes its files from backup.
     /// </summary>
     public ObservableCollection<RetentionTierViewModel> Tiers { get; }
 

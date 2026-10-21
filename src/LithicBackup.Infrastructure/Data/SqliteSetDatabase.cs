@@ -1628,57 +1628,6 @@ internal sealed class SqliteSetDatabase : IDisposable
         return keep;
     }
 
-    public async Task<int> MarkFilesDeletedByDirectoryAsync(int backupSetId, string directoryPrefix, CancellationToken ct = default)
-    {
-        ct.ThrowIfCancellationRequested();
-        using var _ = await WriteLockAsync(ct).ConfigureAwait(false);
-
-        var prefix = directoryPrefix.TrimEnd('\\') + "\\";
-
-        // "Rows owned by this set" is spelled as a CORRELATED EXISTS, never as
-        // `DiscId IN (SELECT Id FROM Discs WHERE BackupSetId = $setId)`.  The
-        // IN-form reads as a cheap filter and is not one: SQLite materialises the
-        // subquery into a LIST SUBQUERY + bloom filter, which costs a full SCAN of
-        // Discs on EVERY execution of the statement.  On a real 66,470-disc set
-        // that is ~10 MB of 4 KB page reads per execution, and the two callers
-        // below run one execution PER SOURCE PATH inside a single transaction —
-        // a cleanup was measured sustaining 58 MB/s of reads against 0.2 MB/s of
-        // writes for two days without finishing.
-        //
-        // Worse, the IN-form gave the planner a DiscId equality to drive off, so
-        // this statement chose IX_Files_Active_Disc_Path (DiscId=?) and walked
-        // every disc's files applying the LIKE as a filter, instead of doing a
-        // SourcePath range scan.
-        //
-        // Discs.Id is INTEGER PRIMARY KEY (= the rowid), so the correlated form is
-        // one integer-key seek per candidate row and leaves the planner free to
-        // drive off SourcePath.  It is NOT equivalent to deleting the predicate:
-        // the ownership check is still enforced per row, so a stray foreign disc
-        // row could never widen the UPDATE.  See the "Cleanup purge scanned the
-        // Discs table once per path" entry in known-issues.md.
-        using var cmd = _connection.CreateCommand();
-        cmd.CommandText = """
-            UPDATE Files SET IsDeleted = 1
-            WHERE IsDeleted = 0
-              AND (SourcePath LIKE $prefix ESCAPE '\' OR SourcePath = $exact COLLATE NOCASE)
-              AND EXISTS (SELECT 1 FROM Discs d
-                          WHERE d.Id = Files.DiscId AND d.BackupSetId = $setId)
-            """;
-        cmd.Parameters.AddWithValue("$setId", backupSetId);
-        // Escape the escape character (backslash) FIRST — Windows source paths
-        // are full of separators, and under ESCAPE '\' every un-doubled '\'
-        // would swallow the following character, so an un-escaped prefix like
-        // "D:\some\dir\%" matches NOTHING.  Order matters: doubling backslashes
-        // after adding the "\[", "\%", "\_" escapes would corrupt those.
-        var escaped = prefix
-            .Replace("\\", "\\\\")
-            .Replace("[", "\\[")
-            .Replace("%", "\\%")
-            .Replace("_", "\\_");
-        cmd.Parameters.AddWithValue("$prefix", escaped + "%");
-        cmd.Parameters.AddWithValue("$exact", directoryPrefix);
-        return cmd.ExecuteNonQuery();
-    }
 
     public async Task<int> MarkFilesDeletedBySourcePathsAsync(
         int backupSetId, IEnumerable<string> sourcePaths, CancellationToken ct = default)

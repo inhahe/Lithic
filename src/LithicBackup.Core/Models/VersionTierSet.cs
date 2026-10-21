@@ -19,8 +19,9 @@ public class VersionTierSet
     public string Name { get; set; } = string.Empty;
 
     /// <summary>
-    /// Retention tiers applied to files assigned to this tier set.
-    /// An empty list means no version history is kept (files overwritten in place).
+    /// Retention tiers applied to files assigned to this tier set. Empty means
+    /// one of two opposite things, by set: see <see cref="ExcludesFromBackup"/>
+    /// and <see cref="KeepsNoHistory"/>, the only tests to make of it.
     /// </summary>
     public List<VersionRetentionTier> Tiers { get; set; } = [];
 
@@ -51,17 +52,9 @@ public class VersionTierSet
     /// Files this tier set resolves to are EXCLUDED from backup: it has no
     /// tiers and is not Default. A no-tier Default means the opposite - its
     /// files are backed up, with no history. The one definition every exclusion
-    /// check uses.
+    /// check uses; testing <c>Tiers.Count == 0</c> alone would exclude, under an
+    /// empty Default, every file no other set matches.
     /// </summary>
-    /// <remarks>
-    /// The per-file exclusion filters tested <c>Tiers.Count == 0</c> alone. With
-    /// an empty Default and any exclusion set present (a "None" set with
-    /// patterns is enough), that excluded every file no other tier set matched -
-    /// on a real set, everything outside a list of text and code extensions
-    /// would silently have stopped being backed up, and Cleanup would have
-    /// offered to delete their backups as "matches configured exclusion". Only
-    /// a Save button that never enabled kept the edit from reaching the catalog.
-    /// </remarks>
     public bool ExcludesFromBackup => Tiers.Count == 0 && !IsDefault;
 
     /// <summary>Files this tier set resolves to are backed up with no earlier versions kept.</summary>

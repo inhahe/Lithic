@@ -389,13 +389,6 @@ public interface ICatalogRepository : IDisposable
     // --- Orphaned directory cleanup ---
 
     /// <summary>
-    /// Mark all non-deleted files in a backup set whose SourcePath starts with
-    /// <paramref name="directoryPrefix"/> as deleted.  Returns the number of
-    /// file records affected.
-    /// </summary>
-    Task<int> MarkFilesDeletedByDirectoryAsync(int backupSetId, string directoryPrefix, CancellationToken ct = default);
-
-    /// <summary>
     /// Mark files as deleted by their exact source paths.  Used to clean up
     /// catalog records for files that are no longer in the source selection
     /// or are now excluded by glob patterns.

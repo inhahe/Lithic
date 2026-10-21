@@ -59,6 +59,7 @@ internal static class Program
 
         try { Microsoft.Data.Sqlite.SqliteConnection.ClearAllPools(); } catch { }
         try { Directory.Delete(root, recursive: true); } catch { }
+        Check(!Directory.Exists(root), "the harness leaves no temp folder behind");
         Console.WriteLine();
         Console.WriteLine(_failures == 0 ? "ALL PASS" : $"{_failures} CHECK(S) FAILED");
         return _failures == 0 ? 0 : 1;
@@ -71,7 +72,7 @@ internal static class Program
         Directory.CreateDirectory(source);
         Directory.CreateDirectory(target);
 
-        var repo = new SqliteCatalogRepository(Path.Combine(root, "catalog.db"));
+        using var repo = new SqliteCatalogRepository(Path.Combine(root, "catalog.db"));
         var svc = new DirectoryBackupService(repo, new FileScanner(repo), new VersionRetentionService(repo));
 
         List<SourceSelection> Selection() =>
@@ -752,7 +753,7 @@ internal static class Program
         Directory.CreateDirectory(source);
         Directory.CreateDirectory(target);
         Directory.CreateDirectory(Path.Combine(root, "cat13"));
-        var repo = new SqliteCatalogRepository(Path.Combine(root, "cat13", "catalog.db"));
+        using var repo = new SqliteCatalogRepository(Path.Combine(root, "cat13", "catalog.db"));
         var set = await repo.CreateBackupSetAsync(new BackupSet
         {
             Name = "reconcile-stale", SourceRoots = [source], CreatedUtc = DateTime.UtcNow,
@@ -842,7 +843,7 @@ internal static class Program
         Directory.CreateDirectory(Path.Combine(source, "sub"));
         Directory.CreateDirectory(target);
         Directory.CreateDirectory(catDir);
-        var repo = new SqliteCatalogRepository(Path.Combine(catDir, "catalog.db"));
+        using var repo = new SqliteCatalogRepository(Path.Combine(catDir, "catalog.db"));
         var svc = new DirectoryBackupService(repo, new FileScanner(repo), new VersionRetentionService(repo));
         var keepOne = new VersionTierSet { Name = "Default", Tiers = [new() { MaxAge = null, MaxVersions = 1 }] };
         List<SourceSelection> Sel() =>
@@ -1076,7 +1077,7 @@ internal static class Program
         Directory.CreateDirectory(source);
         Directory.CreateDirectory(target);
         Directory.CreateDirectory(Path.Combine(root, "cat11"));
-        var repo = new SqliteCatalogRepository(Path.Combine(root, "cat11", "catalog.db"));
+        using var repo = new SqliteCatalogRepository(Path.Combine(root, "cat11", "catalog.db"));
         var svc = new DirectoryBackupService(repo, new FileScanner(repo), new VersionRetentionService(repo));
         var keepOne = new VersionTierSet { Name = "Default", Tiers = [new() { MaxAge = null, MaxVersions = 1 }] };
         var set = await repo.CreateBackupSetAsync(new BackupSet
@@ -1149,7 +1150,7 @@ internal static class Program
         Directory.CreateDirectory(source);
         Directory.CreateDirectory(target);
         Directory.CreateDirectory(Path.Combine(root, "cat9"));
-        var repo = new SqliteCatalogRepository(Path.Combine(root, "cat9", "catalog.db"));
+        using var repo = new SqliteCatalogRepository(Path.Combine(root, "cat9", "catalog.db"));
         var svc = new DirectoryBackupService(repo, new FileScanner(repo), new VersionRetentionService(repo));
         List<SourceSelection> Sel() =>
             [new SourceSelection { Path = source, IsDirectory = true, IsSelected = true, AutoIncludeNewSubdirectories = true }];

@@ -1525,15 +1525,10 @@ public class OrphanedDirectoriesViewModel : ViewModelBase, IConfirmClose
             items.Where(i => ByPath(i.Reason) && i.MatchingSourcePaths is not null)
                  .SelectMany(i => i.MatchingSourcePaths!),
             StringComparer.OrdinalIgnoreCase);
-        var dirItems = items
-            .Where(i => ByPath(i.Reason) && i.MatchingSourcePaths is null && i.ExcessVersionRecords is null)
-            .Select(i => i.DirectoryPath)
-            .ToList();
-        var dirs = new DirectoryPrefixSet(dirItems);
-        if (_activeFiles is not null && (paths.Count > 0 || dirItems.Count > 0))
+        if (_activeFiles is not null && paths.Count > 0)
         {
             foreach (var f in _activeFiles)
-                if (paths.Contains(f.SourcePath) || (dirItems.Count > 0 && dirs.ContainsPathUnder(f.SourcePath)))
+                if (paths.Contains(f.SourcePath))
                     deleting.Add(f.Id);
         }
 
@@ -2543,7 +2538,7 @@ public class OrphanedDirectoriesViewModel : ViewModelBase, IConfirmClose
                     else if (w.MatchingSourcePaths is not null)
                         totalUnits += w.MatchingSourcePaths.Count;
                     else
-                        totalUnits += 1;   // recursive-prefix fallback: one statement
+                        totalUnits += 1;   // an item with no path list, which purges nothing
                 }
                 long doneUnits = 0;
 
@@ -2733,31 +2728,12 @@ public class OrphanedDirectoriesViewModel : ViewModelBase, IConfirmClose
                         }
                         else
                         {
-                            // FALLBACK ONLY, and a dangerous one: this marks
-                            // every row under the directory prefix, RECURSIVELY,
-                            // whether or not the item listed it. That was safe
-                            // only while "deleted from disk" could not mean
-                            // anything but "the whole directory is gone". It no
-                            // longer can, so nothing should be reaching this
-                            // branch; it is kept solely so an item that somehow
-                            // has no path list still purges something rather
-                            // than silently doing nothing. If you add a category,
-                            // give it MatchingSourcePaths.
-                            // Not at all if something under it was backed up
-                            // again since the scan: this marks by prefix and could
-                            // not leave that one path out.
-                            string prefix = wi.DirectoryPath.TrimEnd('\\') + "\\";
-                            if (backedUpAgain.Any(p => p.StartsWith(prefix, StringComparison.OrdinalIgnoreCase)))
-                            {
-                                leftAlone++;
-                                if (wi.DiscFilePaths is not null)
-                                    rewrittenDiscPaths.UnionWith(wi.DiscFilePaths);
-                            }
-                            else
-                            {
-                                catPurged += _catalog.MarkFilesDeletedByDirectoryAsync(
-                                    backupSetId, wi.DirectoryPath, ct).GetAwaiter().GetResult();
-                            }
+                            // A catalog-side item always lists its paths, and the
+                            // catalog is purged by exactly those; one without a
+                            // list purges nothing (it used to purge its directory
+                            // by prefix, everything under it, listed or not). A
+                            // new category must give its items MatchingSourcePaths.
+                            System.Diagnostics.Debug.Fail($"Cleanup item without a path list: {wi.Reason} {wi.DirectoryPath}");
                             doneUnits++;
                             ReportUnits(dirPath);
                         }
@@ -2879,13 +2855,6 @@ public class OrphanedDirectoriesViewModel : ViewModelBase, IConfirmClose
                                  .SelectMany(w => w.MatchingSourcePaths!)
                                  .Where(p => !backedUpAgain.Contains(p)),
                         StringComparer.OrdinalIgnoreCase);
-                    // Whole directories only for an item without a path list; a
-                    // listed item purged exactly its paths (purgedPaths), and its
-                    // directory can still hold files that are not gone.
-                    var purgedDirs = new DirectoryPrefixSet(workItems
-                        .Where(w => w.Reason is OrphanedReason.RemovedFromSources or OrphanedReason.DeletedFromDisk
-                                    && w.MatchingSourcePaths is null)
-                        .Select(w => w.DirectoryPath));
                     var purgedRecordIds = new HashSet<long>(
                         workItems.Where(w => w.ExcessVersionRecords is not null)
                                  .SelectMany(w => w.ExcessVersionRecords!)
@@ -2893,9 +2862,7 @@ public class OrphanedDirectoriesViewModel : ViewModelBase, IConfirmClose
                                  .Where(id => !keptIds.Contains(id)));
 
                     _activeFiles.RemoveAll(f => !keptIds.Contains(f.Id)
-                        && (purgedPaths.Contains(f.SourcePath)
-                            || purgedDirs.ContainsPathUnder(f.SourcePath)
-                            || purgedRecordIds.Contains(f.Id)));
+                        && (purgedPaths.Contains(f.SourcePath) || purgedRecordIds.Contains(f.Id)));
                 }
 
                 keptForReferences = keptIds.Count;

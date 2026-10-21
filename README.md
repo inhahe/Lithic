@@ -43,7 +43,7 @@ Lithic Backup keeps previous versions of files as they change over time. Retenti
 Two built-in tier sets are always available:
 
 - **Default** — the fallback: applies to every file no other tier set matches. Age-based tiered retention (configurable tiers, see below). Remove all of its tiers and those files are still backed up, but overwritten in place with no earlier versions kept.
-- **None** — files matching its patterns are **excluded from backup** altogether. The same goes for any custom tier set left with no tiers: only Default can mean "back up, but keep no history".
+- **None** — files matching its patterns are **excluded from backup** altogether. The same goes for any custom tier set left with no tiers: only Default can mean "back up, but keep no history". The editor says so, in warning colour, on any set of your own that has no tiers.
 
 You can create additional custom tier sets for different types of data. Each tier set contains any number of tiers:
 
