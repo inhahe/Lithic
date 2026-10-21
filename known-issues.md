@@ -1,5 +1,25 @@
 # LithicBackup — Known Issues & Tech Debt
 
+## TECH DEBT: Cleanup's purge retires by source path, so it needs a "since the scan" baseline
+
+`OrphanedDirectoriesViewModel.PurgeSelected` retires a deleted-from-disk or
+excluded item's records by source path (`MarkFilesDeletedBySourcePathsAsync`),
+which also reaches rows written after the scan. Keeping those safe takes
+time-based bookkeeping: the scans' start stamps, `GetRecordsWrittenSinceAsync`,
+and the `backedUpAgain` / `rewrittenDiscPaths` sets, plus a file-exists check for
+files that came back unchanged. The stamp is the fragile part: a failed rescan
+that advanced it (fixed in the review follow-ups of 7486fb6..79a9f31) silently
+narrowed the protection.
+
+Simpler, and safe by construction: retire the records the scan itself listed, by
+id, only where each row is still as the scan read it (DiscPath and BackedUpUtc
+unchanged; the `IfUnchanged` pattern reconcile already uses), and keep the
+in-use check before deleting stored files. Rows written since are then untouched
+without a baseline. Raised by the Opus review of that batch; not done there
+because it rewrites the most dangerous path in the app, which deserves its own
+change and review, with excess_versions_test §12-18 and
+purge_record_integrity_test as its oracle.
+
 ## FIXED: a link that pointed back into its own folder was followed forever (2026-10-20)
 
 The scan (`FileScanner`), the editor's size walks, and the Worker's walk of a

@@ -186,9 +186,9 @@ public sealed class CatalogReconcileService
             if (!File.Exists(strippedAbs)) { skipped++; continue; } // plain vanished — leave the row alone
 
             // Only if the row is still what Analyze read. Written whole from that
-            // snapshot, it un-retired a row Cleanup had retired since, and pointed
-            // a row a backup had since moved into the history back at the
-            // current copy - which by then held different content.
+            // snapshot, it would un-retire a row Cleanup has retired since, or
+            // point a row a backup has since moved into the history back at the
+            // current copy, which by then holds different content.
             if (!await _catalog.FlipFileRefToPlainIfUnchangedAsync(
                     backupSetId, f.Record.Id, f.OldDiscPath, f.NewDiscPath, ct))
             {

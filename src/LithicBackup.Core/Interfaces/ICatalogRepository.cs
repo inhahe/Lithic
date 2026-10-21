@@ -552,10 +552,8 @@ public interface ICatalogRepository : IDisposable
     /// is disposed. The Worker treats it as it does <see cref="HoldSetForCleanup"/>:
     /// it starts no run on the set, and stops one that is going. The app does not
     /// give the set's write lock up to the Worker during its own work, so a Worker
-    /// run that waited for it sat for the whole of it - and since the Worker runs
-    /// one backup at a time, so did every other set's. Measured: a quick update of
-    /// one set, made from inside another set's full backup, waited three hours
-    /// behind a backup in the app, holding the full backup with it.
+    /// run that waited for it would sit for the whole of it - and since the Worker
+    /// runs one backup at a time, so would every other set's.
     /// </summary>
     IDisposable HoldSetInApp(int backupSetId);
 

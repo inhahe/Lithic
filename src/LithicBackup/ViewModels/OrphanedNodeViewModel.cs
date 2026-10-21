@@ -140,10 +140,9 @@ public class OrphanedNodeViewModel : ViewModelBase
     /// gather what to delete.
     ///
     /// <para>An item's own selection is its file rows, not its node's box: that
-    /// box also rolls up the item's subdirectories. Yielding the item whenever
-    /// the box was not clear purged a directory whole when one of its file rows
-    /// was unticked, and purged it even when the user had unticked it and then
-    /// ticked only a subdirectory, which leaves it part-ticked too.</para>
+    /// box also rolls up the item's subdirectories, so it is part-ticked both
+    /// when one of the item's rows is unticked and when only a subdirectory is
+    /// ticked, and neither purges the item whole.</para>
     /// </summary>
     internal IEnumerable<(OrphanedDirectoryItem Item, IReadOnlyList<OrphanedFileInfo>? Unticked)> GetCheckedSelections()
     {
