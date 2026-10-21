@@ -749,15 +749,18 @@ using (var cts = new CancellationTokenSource())
 }
 
 // A cancel reaches a catalog read part-way, not only before it starts: the
-// read of a whole history (Cleanup, the post-edit scan) can take many seconds.
+// read of a whole history (the post-edit scan's fallback, a verify) can take
+// many seconds. The read reports every 5,000 records; cancelled at the first
+// report, it must report no more.
 using (var cts = new CancellationTokenSource())
 {
-    int readWhenCancelled = 0;
+    int readWhenCancelled = 0, lastReported = 0;
     bool cancelled = false;
     try
     {
         await repoP.GetAllFilesForBackupSetAsync(setP.Id, cts.Token, new SyncProgress<int>(read =>
         {
+            lastReported = read;
             if (readWhenCancelled == 0)
             {
                 readWhenCancelled = read;
@@ -766,8 +769,9 @@ using (var cts = new CancellationTokenSource())
         }));
     }
     catch (OperationCanceledException) { cancelled = true; }
-    Check(cancelled && readWhenCancelled < LargeRecords,
-        $"a catalog read cancelled part-way stops there (cancelled after {readWhenCancelled:N0} of {LargeRecords:N0} records; stopped: {cancelled})");
+    Check(cancelled && lastReported == readWhenCancelled,
+        $"a catalog read cancelled part-way stops there (cancelled at {readWhenCancelled:N0} of {LargeRecords:N0} records, "
+        + $"last reported {lastReported:N0}; stopped: {cancelled})");
 }
 
 // Import: extracting counts bytes, importing counts records, to the total.

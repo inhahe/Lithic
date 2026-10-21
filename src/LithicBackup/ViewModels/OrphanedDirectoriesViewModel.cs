@@ -85,22 +85,34 @@ public class OrphanedDirectoriesViewModel : ViewModelBase, IConfirmClose
     private DateTime? _destinationScanStartedUtc;
 
     /// <summary>
+    /// Cancelled when the window closes. A catalog scan stops with it: nobody will
+    /// see its result, and its read holds the set's gate for as long as it runs.
+    /// A purge has its own token and carries on (<see cref="ConfirmClose"/>).
+    /// </summary>
+    private readonly CancellationTokenSource _closed = new();
+
+    /// <summary>
     /// Closing mid-purge does not stop it, so say so first; it carries on, with
-    /// its progress and result on the set's row in the main window.
+    /// its progress and result on the set's row in the main window. A catalog
+    /// scan under way does stop.
     /// </summary>
     public bool ConfirmClose(bool canCancel)
     {
-        if (!IsPurging || !canCancel)
-            return true;
-        var answer = System.Windows.MessageBox.Show(
-            "The cleanup is still running.\n\n"
-            + "If you close this window it carries on in the background, with its progress and "
-            + "its result on the set's row in the main window. Close it anyway?",
-            "Cleanup",
-            System.Windows.MessageBoxButton.YesNo,
-            System.Windows.MessageBoxImage.Question,
-            System.Windows.MessageBoxResult.No);
-        return answer == System.Windows.MessageBoxResult.Yes;
+        if (IsPurging && canCancel)
+        {
+            var answer = System.Windows.MessageBox.Show(
+                "The cleanup is still running.\n\n"
+                + "If you close this window it carries on in the background, with its progress and "
+                + "its result on the set's row in the main window. Close it anyway?",
+                "Cleanup",
+                System.Windows.MessageBoxButton.YesNo,
+                System.Windows.MessageBoxImage.Question,
+                System.Windows.MessageBoxResult.No);
+            if (answer != System.Windows.MessageBoxResult.Yes)
+                return false;
+        }
+        _closed.Cancel();
+        return true;
     }
 
     public OrphanedDirectoriesViewModel(ICatalogRepository catalog, BackupSet backupSet)
@@ -579,7 +591,7 @@ public class OrphanedDirectoriesViewModel : ViewModelBase, IConfirmClose
                     // moment where both the full list and the active list are
                     // alive at once.
                     _activeFiles = (await _catalog.GetActiveFilesForClassificationAsync(
-                            _backupSet.Id, CancellationToken.None, rowProgress))
+                            _backupSet.Id, _closed.Token, rowProgress))
                         .ToList();
 
                     return await ClassifyAndBuildAsync(progress);
@@ -1397,7 +1409,7 @@ public class OrphanedDirectoriesViewModel : ViewModelBase, IConfirmClose
         if (excessRecords.Count > 0)
         {
             var needed = await _catalog.GetNeededContentCopiesAsync(
-                _backupSet.Id, excessRecords.Select(r => r.Id).ToList());
+                _backupSet.Id, excessRecords.Select(r => r.Id).ToList(), ct: _closed.Token);
             if (needed.Count > 0)
                 excessRecords.RemoveAll(r => needed.Contains(r.Id));
         }
@@ -2471,10 +2483,10 @@ public class OrphanedDirectoriesViewModel : ViewModelBase, IConfirmClose
             var since = new[] { _catalogScanStartedUtc, _destinationScanStartedUtc }
                 .Where(t => t is not null).Min();
 
-            // Run all DB work + disk deletion on a background thread — the
-            // catalog methods are synchronous (ExecuteNonQuery /
-            // Task.FromResult) and the filesystem walk for empty-dir
-            // cleanup can iterate thousands of directories.
+            // On a background thread, though it awaits: the catalog calls do their
+            // SQLite work synchronously before they return (statements, row
+            // loops), and the empty-directory sweep can walk thousands of
+            // directories. Awaited on the UI thread, both would freeze it.
             int keptForReferences = 0;
             int leftAloneSinceScan = 0;
             int keptInUse = 0;
@@ -2499,10 +2511,9 @@ public class OrphanedDirectoriesViewModel : ViewModelBase, IConfirmClose
                 int fAbsent = 0;
                 long bytes = 0;
 
-                // Shared throttle for both progress phases. Without one, large
-                // purges (tens or hundreds of thousands of work items) flood the
-                // UI thread with one Report() per iteration and visibly slow the
-                // work down - the user observed exactly this.
+                // The catalog phase's throttle (the disk phase, in
+                // DestinationFilePurger, has its own): a report per work item
+                // floods the UI thread on a purge of tens of thousands of them.
                 var cadence = new ProgressCadence();
 
                 // Count the thing the user is waiting on (design.md, "Long phases

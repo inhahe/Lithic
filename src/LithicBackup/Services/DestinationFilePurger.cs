@@ -1,4 +1,3 @@
-using System.Diagnostics;
 using System.IO;
 using LithicBackup.Core;
 
@@ -90,9 +89,7 @@ internal static class DestinationFilePurger
         int alreadyAbsent = 0;
         long bytesFreed = 0;
 
-        var sw = Stopwatch.StartNew();
-        // Negative initial value guarantees the first Report fires immediately.
-        long lastProgressMs = -ProgressCadence.IntervalMs;
+        var cadence = new ProgressCadence();
 
         int idx = 0;
         int total = discRelPaths.Count;
@@ -102,11 +99,9 @@ internal static class DestinationFilePurger
 
             idx++;
             string fullPath = Path.Combine(targetDir, discRel);
-            long nowMs = sw.ElapsedMilliseconds;
-            if (progress is not null
-                && (nowMs - lastProgressMs >= ProgressCadence.IntervalMs || idx == total))
+            // The last file always reports, so the count ends on N/N.
+            if (progress is not null && (cadence.IsDue() || idx == total))
             {
-                lastProgressMs = nowMs;
                 int pct = total == 0 ? 100 : (int)(idx * 100L / total);
                 progress.Report(new ProgressReport(
                     $"Deleting backed-up files {idx:N0}/{total:N0} ({pct}%): {fullPath}",
@@ -158,7 +153,7 @@ internal static class DestinationFilePurger
             progress?.Report("Cleaning up empty directories...");
             try
             {
-                var sweep = new SweepProgress(progress, sw);
+                var sweep = new SweepProgress(progress);
                 foreach (var subDir in new DirectoryInfo(targetDir).EnumerateDirectories())
                 {
                     if (ct.IsCancellationRequested) break;
@@ -220,27 +215,19 @@ internal static class DestinationFilePurger
     }
 
     /// <summary>
-    /// Throttled directory-scan counter for the empty-directory sweep.  Shares
-    /// the caller's stopwatch so the whole purge uses one monotonic clock, and
-    /// reports at the same <see cref="ProgressCadence.IntervalMs"/> cadence as the rest
-    /// of the operation.
+    /// The empty-directory sweep's count of directories scanned, reported at the
+    /// <see cref="ProgressCadence"/>.
     /// </summary>
-    private sealed class SweepProgress(IProgress<ProgressReport>? progress, Stopwatch sw)
+    private sealed class SweepProgress(IProgress<ProgressReport>? progress)
     {
+        private readonly ProgressCadence _cadence = new();
         private int _scanned;
-
-        // Null until the first report: a "minimum" start time would overflow the
-        // subtraction below and suppress every report.
-        private long? _lastMs;
 
         public void Tick()
         {
             _scanned++;
-            if (progress is null) return;
-            long nowMs = sw.ElapsedMilliseconds;
-            if (_lastMs is { } last && nowMs - last < ProgressCadence.IntervalMs) return;
-            _lastMs = nowMs;
-            progress.Report($"Cleaning empty directories: {_scanned:N0} scanned");
+            if (progress is not null && _cadence.IsDue())
+                progress.Report($"Cleaning empty directories: {_scanned:N0} scanned");
         }
     }
 }

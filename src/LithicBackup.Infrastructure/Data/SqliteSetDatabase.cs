@@ -496,8 +496,7 @@ internal sealed class SqliteSetDatabase : IDisposable
         cmd.Parameters.AddWithValue("$setId", backupSetId);
 
         var list = new List<DiscRecord>();
-        using var r = cmd.ExecuteReader();
-        while (r.Read())
+        foreach (var r in Rows(cmd, ct))
             list.Add(ReadDisc(r));
         return list;
     }
@@ -559,6 +558,21 @@ internal sealed class SqliteSetDatabase : IDisposable
         cmd.CommandText = "UPDATE Discs SET IsBad = 1 WHERE Id = $id";
         cmd.Parameters.AddWithValue("$id", discId);
         cmd.ExecuteNonQuery();
+    }
+
+    /// <summary>
+    /// The rows <paramref name="cmd"/> returns, with <paramref name="ct"/> checked
+    /// before each: reading a whole set can take many seconds, and a cancel must
+    /// not wait for the last row. The reader is disposed when the loop ends.
+    /// </summary>
+    private static IEnumerable<SqliteDataReader> Rows(SqliteCommand cmd, CancellationToken ct)
+    {
+        using var r = cmd.ExecuteReader();
+        while (r.Read())
+        {
+            ct.ThrowIfCancellationRequested();
+            yield return r;
+        }
     }
 
     private static DiscRecord ReadDisc(SqliteDataReader r) => new()
@@ -661,8 +675,7 @@ internal sealed class SqliteSetDatabase : IDisposable
         cmd.Parameters.AddWithValue("$discId", discId);
 
         var list = new List<FileRecord>();
-        using var r = cmd.ExecuteReader();
-        while (r.Read())
+        foreach (var r in Rows(cmd, ct))
             list.Add(ReadFile(r));
         return list;
     }
@@ -677,8 +690,7 @@ internal sealed class SqliteSetDatabase : IDisposable
         cmd.Parameters.AddWithValue("$discId", badDiscId);
 
         var list = new List<FileRecord>();
-        using var r = cmd.ExecuteReader();
-        while (r.Read())
+        foreach (var r in Rows(cmd, ct))
             list.Add(ReadFile(r));
         return list;
     }
@@ -698,10 +710,8 @@ internal sealed class SqliteSetDatabase : IDisposable
         cmd.Parameters.AddWithValue("$setId", backupSetId);
 
         var list = new List<FileRecord>();
-        using var r = cmd.ExecuteReader();
-        while (r.Read())
+        foreach (var r in Rows(cmd, ct))
         {
-            ct.ThrowIfCancellationRequested();
             list.Add(ReadFile(r));
             // Reporting every few thousand rows keeps a large-set load (which can
             // read hundreds of thousands of rows over many seconds) from looking
@@ -746,10 +756,8 @@ internal sealed class SqliteSetDatabase : IDisposable
         cmd.Parameters.AddWithValue("$setId", backupSetId);
 
         var list = new List<FileRecord>();
-        using var r = cmd.ExecuteReader();
-        while (r.Read())
+        foreach (var r in Rows(cmd, ct))
         {
-            ct.ThrowIfCancellationRequested();
             list.Add(new FileRecord
             {
                 Id = r.GetInt64(0),
@@ -792,10 +800,8 @@ internal sealed class SqliteSetDatabase : IDisposable
         cmd.Parameters.AddWithValue("$setId", backupSetId);
 
         long rows = 0;
-        using var r = cmd.ExecuteReader();
-        while (r.Read())
+        foreach (var r in Rows(cmd, ct))
         {
-            ct.ThrowIfCancellationRequested();
             onEntry(
                 r.GetString(0),
                 r.GetInt32(1) != 0,
@@ -842,8 +848,7 @@ internal sealed class SqliteSetDatabase : IDisposable
         cmd.Parameters.AddWithValue("$setId", backupSetId);
 
         var dict = new Dictionary<string, FileVersionInfo>(StringComparer.OrdinalIgnoreCase);
-        using var r = cmd.ExecuteReader();
-        while (r.Read())
+        foreach (var r in Rows(cmd, ct))
         {
             string path = r.GetString(0);
             dict[path] = new FileVersionInfo(
@@ -1012,8 +1017,7 @@ internal sealed class SqliteSetDatabase : IDisposable
         cmd.Parameters.AddWithValue("$path", sourcePath);
 
         var list = new List<FileRecord>();
-        using var r = cmd.ExecuteReader();
-        while (r.Read())
+        foreach (var r in Rows(cmd, ct))
             list.Add(ReadFile(r));
         return list;
     }
@@ -1048,12 +1052,8 @@ internal sealed class SqliteSetDatabase : IDisposable
         cmd.Parameters.AddWithValue("$exact", directoryPrefix);
 
         var list = new List<FileRecord>();
-        using var r = cmd.ExecuteReader();
-        while (r.Read())
-        {
-            ct.ThrowIfCancellationRequested();
+        foreach (var r in Rows(cmd, ct))
             list.Add(ReadFile(r));
-        }
         return list;
     }
 
@@ -1253,8 +1253,7 @@ internal sealed class SqliteSetDatabase : IDisposable
         cmd.Parameters.AddWithValue("$upper", upper);
 
         var list = new List<FileRecord>();
-        using var r = cmd.ExecuteReader();
-        while (r.Read())
+        foreach (var r in Rows(cmd, ct))
             list.Add(ReadFile(r));
         return list;
     }
@@ -1299,8 +1298,7 @@ internal sealed class SqliteSetDatabase : IDisposable
         cmd.Parameters.AddWithValue("$setId", backupSetId);
 
         var set = new HashSet<string>(StringComparer.OrdinalIgnoreCase);
-        using var r = cmd.ExecuteReader();
-        while (r.Read())
+        foreach (var r in Rows(cmd, ct))
             set.Add(r.GetString(0));
         return set;
     }
@@ -1326,8 +1324,7 @@ internal sealed class SqliteSetDatabase : IDisposable
         cmd.Parameters.AddWithValue("$setId", backupSetId);
 
         var map = new Dictionary<string, string>(StringComparer.OrdinalIgnoreCase);
-        using var r = cmd.ExecuteReader();
-        while (r.Read())
+        foreach (var r in Rows(cmd, ct))
             map[r.GetString(0)] = r.GetString(1);
         return map;
     }
@@ -1393,8 +1390,7 @@ internal sealed class SqliteSetDatabase : IDisposable
         cmd.Parameters.AddWithValue("$setId", backupSetId);
 
         var sizes = new HashSet<long>();
-        using var r = cmd.ExecuteReader();
-        while (r.Read())
+        foreach (var r in Rows(cmd, ct))
             sizes.Add(r.GetInt64(0));
         return sizes;
     }
@@ -1465,8 +1461,7 @@ internal sealed class SqliteSetDatabase : IDisposable
         cmd.Parameters.AddWithValue("$hash", hash);
 
         var list = new List<FileRecord>();
-        using var r = cmd.ExecuteReader();
-        while (r.Read())
+        foreach (var r in Rows(cmd, ct))
             list.Add(ReadFile(r));
         return list;
     }
@@ -1490,8 +1485,7 @@ internal sealed class SqliteSetDatabase : IDisposable
         if (among is not null)
             cmd.Parameters.AddWithValue("$ids", System.Text.Json.JsonSerializer.Serialize(among));
         var list = new List<(long, string)>();
-        using var r = cmd.ExecuteReader();
-        while (r.Read())
+        foreach (var r in Rows(cmd, ct))
             list.Add((r.GetInt64(0), r.GetString(1)));
         return list;
     }
@@ -1883,8 +1877,7 @@ internal sealed class SqliteSetDatabase : IDisposable
         cmd.Parameters.AddWithValue("$fileId", fileRecordId);
 
         var list = new List<FileChunk>();
-        using var r = cmd.ExecuteReader();
-        while (r.Read())
+        foreach (var r in Rows(cmd, ct))
         {
             list.Add(new FileChunk
             {
@@ -1965,8 +1958,7 @@ internal sealed class SqliteSetDatabase : IDisposable
         cmd.CommandText = "SELECT SourcePath, DiscPath FROM Files WHERE BackedUpUtc >= $since";
         cmd.Parameters.AddWithValue("$since", sinceUtc.ToUniversalTime().ToString("o"));
         var list = new List<(string, string)>();
-        using var r = cmd.ExecuteReader();
-        while (r.Read())
+        foreach (var r in Rows(cmd, ct))
             list.Add((r.GetString(0), r.GetString(1)));
         return list;
     }
@@ -1993,12 +1985,8 @@ internal sealed class SqliteSetDatabase : IDisposable
         using var cmd = _connection.CreateCommand();
         cmd.CommandText = "SELECT DiscPath FROM Files WHERE IsDeleted = 0";
         var found = new List<string>();
-        using var r = cmd.ExecuteReader();
-        long n = 0;
-        while (r.Read())
+        foreach (var r in Rows(cmd, ct))
         {
-            if ((++n & 0xFFFF) == 0)
-                ct.ThrowIfCancellationRequested();
             if (wanted.Remove(r.GetString(0).Replace('/', '\\'), out var given))
                 found.Add(given);
         }
@@ -2239,8 +2227,7 @@ internal sealed class SqliteSetDatabase : IDisposable
         using (var cmd = _connection.CreateCommand())
         {
             cmd.CommandText = "SELECT * FROM Discs ORDER BY Id";
-            using var r = cmd.ExecuteReader();
-            while (r.Read())
+            foreach (var r in Rows(cmd, ct))
                 discs.Add(ReadDisc(r));
         }
 
@@ -2248,8 +2235,7 @@ internal sealed class SqliteSetDatabase : IDisposable
         using (var cmd = _connection.CreateCommand())
         {
             cmd.CommandText = "SELECT * FROM Files ORDER BY Id";
-            using var r = cmd.ExecuteReader();
-            while (r.Read())
+            foreach (var r in Rows(cmd, ct))
                 files.Add(ReadFile(r));
         }
 
@@ -2257,8 +2243,7 @@ internal sealed class SqliteSetDatabase : IDisposable
         using (var cmd = _connection.CreateCommand())
         {
             cmd.CommandText = "SELECT * FROM FileChunks ORDER BY Id";
-            using var r = cmd.ExecuteReader();
-            while (r.Read())
+            foreach (var r in Rows(cmd, ct))
             {
                 chunks.Add(new FileChunk
                 {

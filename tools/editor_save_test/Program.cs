@@ -302,7 +302,11 @@ internal static class Program
         Console.WriteLine();
         Console.WriteLine("=== 23. after an edit, a dropped folder's copies go and an added one's files are offered ===");
 
-        // a and b backed up, for real, to an emptied destination.
+        // a and b backed up, for real, to a destination of its own (a new
+        // folder, not the earlier scenarios' emptied: a folder deleted and made
+        // again at once can be refused while a scanner still has it open).
+        string dst = Path.Combine(_root, "dst-reconcile");
+        Directory.CreateDirectory(dst);
         var set = await DbSetAsync();
         set.SourceSelections =
         [
@@ -310,23 +314,24 @@ internal static class Program
                 Dir(_a, true, auto: false),
                 Dir(_b, true, auto: false)),
         ];
+        set.JobOptions!.TargetDirectory = dst;
         await _observer.UpdateBackupSetAsync(set);
         await _observer.ClearBackupSetCatalogAsync(_setId);
-        Directory.Delete(_dst, recursive: true);
-        Directory.CreateDirectory(_dst);
         var backup = new DirectoryBackupService(
             _observer, new LithicBackup.Infrastructure.FileSystem.FileScanner(_observer),
             new VersionRetentionService(_observer));
         var ran = await backup.ExecuteAsync(new BackupJob
         {
             BackupSetId = _setId, Sources = set.SourceSelections, EnableFileDeduplication = true,
-            TargetDirectory = _dst, ZipMode = ZipMode.None,
-        }, _dst, null, null, CancellationToken.None);
-        string CopyOf(string source) => Path.Combine(_dst, source[..1], source[Path.GetPathRoot(source)!.Length..]);
-        if (!(ran.Success && File.Exists(CopyOf(_smallFile)) && File.Exists(CopyOf(_bigFile))))
+            TargetDirectory = dst, ZipMode = ZipMode.None,
+        }, dst, null, null, CancellationToken.None);
+        string CopyOf(string source) => Path.Combine(dst, source[..1], source[Path.GetPathRoot(source)!.Length..]);
+        bool smallCopied = File.Exists(CopyOf(_smallFile)), bigCopied = File.Exists(CopyOf(_bigFile));
+        if (!(ran.Success && smallCopied && bigCopied))
         {
-            Check(false, "set-up: a and b are backed up"
-                + string.Concat(ran.FailedFiles.Select(f => $"; {f.Path}: {f.Error}")));
+            Check(false, $"set-up: a and b are backed up (success: {ran.Success}; "
+                + $"{CopyOf(_smallFile)}: {smallCopied}; {CopyOf(_bigFile)}: {bigCopied}"
+                + string.Concat(ran.FailedFiles.Select(f => $"; {f.Path}: {f.Error}")) + ")");
             return;
         }
 
