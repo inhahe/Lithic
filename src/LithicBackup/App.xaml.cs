@@ -37,14 +37,18 @@ public partial class App : Application
     private MainViewModel? _mainViewModel;
 
     /// <summary>
-    /// Offer every queued export file as a backup set. Nothing until the main
-    /// window exists; startup calls this again once it does.
+    /// Offer <paramref name="ownFiles"/>, then every queued export file, as backup
+    /// sets. Nothing until the main window exists; startup calls this again once
+    /// it does.
     /// </summary>
-    private void OfferOpenedFiles()
+    /// <param name="ownFiles">Export files this launch's command line named (a
+    /// .lithic double-clicked in Explorer); none when a later launch woke us.</param>
+    private void OfferOpenedFiles(IEnumerable<string>? ownFiles = null)
     {
         if (_mainViewModel is null)
             return;
-        var files = OpenRequestQueue.TakeAll();
+        var files = ownFiles?.ToList() ?? [];
+        files.AddRange(OpenRequestQueue.TakeAll());
         if (files.Count > 0)
             _ = _mainViewModel.OfferOpenedFilesAsync(files);
     }
@@ -472,8 +476,7 @@ public partial class App : Application
         // in Explorer), and any a second launch handed over while this one was
         // still starting: offer each as a backup set.
         _mainViewModel = mainViewModel;
-        OpenRequestQueue.Enqueue(OpenRequestQueue.FilesFromArguments(_startupArgs));
-        OfferOpenedFiles();
+        OfferOpenedFiles(OpenRequestQueue.FilesFromArguments(_startupArgs));
 
         // Start background monitoring if there are existing backup sets.
         _ = StartBackgroundMonitoringAsync();

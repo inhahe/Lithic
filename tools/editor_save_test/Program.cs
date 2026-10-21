@@ -900,13 +900,6 @@ internal static class Program
         var folder = new SourceSelectionNodeViewModel(@"Q:\x", true, null);
         Check(folder.FormattedFileCount == "Working..." && folder.NeedsUnfilteredTotals, "an uncounted folder: Working..., as before");
 
-        // --- 21. opening a .lithic export ---
-        Console.WriteLine();
-        Console.WriteLine("=== 21. opening a .lithic export offers to add it ===");
-        string q = Path.Combine(_root, "open-requests");
-        LithicBackup.Services.OpenRequestQueue.DirectoryOverride = q;
-        string export = Path.Combine(_root, "shared.lithic");
-        await BackupSetTransfer.ExportAsync(_catalog, set, export, includeHistory: false);
         // Under a filter, the filtered totals are the children's too.
         using (var sched = new SizeComputeScheduler())
         {
@@ -1014,47 +1007,95 @@ internal static class Program
             Check(sawCancel, $"{kind}: and the cancellation reached the caller");
         }
 
-        var fromArgs = LithicBackup.Services.OpenRequestQueue.FilesFromArguments(
-            ["--test-mode", export, Path.Combine(_root, "missing.lithic"), Path.Combine(_root, "notes.txt")]);
-        Check(fromArgs.Count == 1 && fromArgs[0] == export, "the command line yields just the existing export");
-        string second = Path.Combine(_root, "second.lithic");
-        File.Copy(export, second);
-        LithicBackup.Services.OpenRequestQueue.Enqueue([export, second]);
-        var taken = LithicBackup.Services.OpenRequestQueue.TakeAll();
-        Check(taken.SequenceEqual([export, second]), "queued requests come back once, in order");
-        Check(LithicBackup.Services.OpenRequestQueue.TakeAll().Count == 0, "and are gone after");
-        LithicBackup.Services.OpenRequestQueue.Enqueue([export]);
-        foreach (var f in Directory.GetFiles(q, "*.txt"))
-            File.SetLastWriteTimeUtc(f, DateTime.UtcNow.AddHours(-1));
-        Check(LithicBackup.Services.OpenRequestQueue.TakeAll().Count == 0, "a request left behind an hour ago is dropped");
+        // --- 21. opening a .lithic export ---
+        Console.WriteLine();
+        Console.WriteLine("=== 21. opening a .lithic export offers to add it ===");
+        string q = Path.Combine(_root, "open-requests");
+        LithicBackup.Services.OpenRequestQueue.DirectoryOverride = q;
+        try
+        {
+            string export = Path.Combine(_root, "shared.lithic");
+            await BackupSetTransfer.ExportAsync(_catalog, set, export, includeHistory: false);
+            var fromArgs = LithicBackup.Services.OpenRequestQueue.FilesFromArguments(
+                ["--test-mode", export, Path.Combine(_root, "missing.lithic"), Path.Combine(_root, "notes.txt")]);
+            Check(fromArgs.Count == 1 && fromArgs[0] == export, "the command line yields just the existing export");
+            string second = Path.Combine(_root, "second.lithic");
+            File.Copy(export, second);
+            LithicBackup.Services.OpenRequestQueue.Enqueue([export, second]);
+            var taken = LithicBackup.Services.OpenRequestQueue.TakeAll();
+            Check(taken.SequenceEqual([export, second]), "queued requests come back once, in order");
+            Check(LithicBackup.Services.OpenRequestQueue.TakeAll().Count == 0, "and are gone after");
+            LithicBackup.Services.OpenRequestQueue.Enqueue([export]);
+            foreach (var f in Directory.GetFiles(q, "*.txt"))
+                File.SetLastWriteTimeUtc(f, DateTime.UtcNow.AddHours(-1));
+            Check(LithicBackup.Services.OpenRequestQueue.TakeAll().Count == 0, "a request left behind an hour ago is dropped");
+            string unfinished = Path.Combine(q, "00000000000000000001-x.partial");
+            string writing = Path.Combine(q, "00000000000000000002-y.partial");
+            File.WriteAllText(unfinished, export);
+            File.SetLastWriteTimeUtc(unfinished, DateTime.UtcNow.AddHours(-1));
+            File.WriteAllText(writing, export);
+            LithicBackup.Services.OpenRequestQueue.TakeAll();
+            Check(!File.Exists(unfinished) && File.Exists(writing),
+                "a request a crashed launch never finished writing is removed; one being written now is not");
+            File.Delete(writing);
 
-        int before = await SetCountAsync();
-        _dialogs.Expect("Open Backup Set", DialogWatcher.IDNO);
-        await _vm.OfferOpenedFilesAsync([export]);
-        Check(_dialogs.WasAnswered("Open Backup Set"), "it asks whether to add the set");
-        Check(await SetCountAsync() == before, "No adds nothing");
-        _dialogs.ClearExpectations();
+            int before = await SetCountAsync();
+            _dialogs.Expect("Open Backup Set", DialogWatcher.IDNO);
+            await _vm.OfferOpenedFilesAsync([export]);
+            Check(_dialogs.WasAnswered("Open Backup Set"), "it asks whether to add the set");
+            Check(await SetCountAsync() == before, "No adds nothing");
+            _dialogs.ClearExpectations();
 
-        _dialogs.Expect("Open Backup Set", DialogWatcher.IDYES);
-        _dialogs.Expect("Import Backup Set", DialogWatcher.IDOK);
-        await _vm.OfferOpenedFilesAsync([export]);
-        var sets = await _observer.GetAllBackupSetsAsync();
-        Check(sets.Count == before + 1, "Yes adds it");
-        var added = sets.Where(s => s.Id != _setId && s.Name == set.Name).OrderByDescending(s => s.Id).FirstOrDefault();
-        Check(added is { JobOptions.HoldAutomatedBackups: true } || added is { JobOptions: null },
-            "as an imported set, automated backups held");
-        _dialogs.ClearExpectations();
-        if (added is not null)
-            await _observer.DeleteBackupSetAsync(added.Id);
+            _dialogs.Expect("Open Backup Set", DialogWatcher.IDYES);
+            _dialogs.Expect("Import Backup Set", DialogWatcher.IDOK);
+            await _vm.OfferOpenedFilesAsync([export]);
+            var sets = await _observer.GetAllBackupSetsAsync();
+            Check(sets.Count == before + 1, "Yes adds it");
+            var added = sets.Where(s => s.Id != _setId && s.Name == set.Name).OrderByDescending(s => s.Id).FirstOrDefault();
+            Check(added is { JobOptions.HoldAutomatedBackups: true } || added is { JobOptions: null },
+                "as an imported set, automated backups held");
+            _dialogs.ClearExpectations();
+            if (added is not null)
+                await _observer.DeleteBackupSetAsync(added.Id);
 
-        string junk = Path.Combine(_root, "junk.lithic");
-        File.WriteAllText(junk, "not an export");
-        _dialogs.Expect("Open Backup Set", DialogWatcher.IDOK);
-        await _vm.OfferOpenedFilesAsync([junk]);
-        Check(_dialogs.WasAnswered("Open Backup Set") && await SetCountAsync() == before,
-            "a file that is not an export says so and adds nothing");
-        _dialogs.ClearExpectations();
-        LithicBackup.Services.OpenRequestQueue.DirectoryOverride = null;
+            string junk = Path.Combine(_root, "junk.lithic");
+            File.WriteAllText(junk, "not an export");
+            _dialogs.Expect("Open Backup Set", DialogWatcher.IDOK);
+            await _vm.OfferOpenedFilesAsync([junk]);
+            Check(_dialogs.WasAnswered("Open Backup Set") && await SetCountAsync() == before,
+                "a file that is not an export says so and adds nothing");
+            _dialogs.ClearExpectations();
+
+            string otherJson = Path.Combine(_root, "settings.lithic");
+            File.WriteAllText(otherJson, "{ \"Theme\": \"dark\", \"Recent\": [] }");
+            _dialogs.Expect("Open Backup Set", DialogWatcher.IDYES);   // were it offered, Yes would add it
+            await _vm.OfferOpenedFilesAsync([otherJson]);
+            Check(_dialogs.WasAnswered("Open Backup Set") && await SetCountAsync() == before,
+                "nor does another program's JSON");
+            _dialogs.ClearExpectations();
+
+            // An offer that arrives while a dialog is open belongs to that dialog: a
+            // box owned by the main window it disabled would enable it on closing.
+            var dlg = new Window
+            {
+                Width = 120, Height = 80, ShowInTaskbar = false, Content = new System.Windows.Controls.TextBlock(),
+                WindowStartupLocation = WindowStartupLocation.Manual, Left = -3000, Top = -3000,
+            };
+            Window? ownerWhileModal = null;
+            dlg.Loaded += (_, _) => dlg.Dispatcher.BeginInvoke(DispatcherPriority.ContextIdle, () =>
+            {
+                ownerWhileModal = MainViewModel.PromptOwner();
+                dlg.Close();
+            });
+            dlg.ShowDialog();
+            Check(ownerWhileModal == dlg, "a prompt that arrives under an open dialog is owned by the dialog");
+            Check(MainViewModel.PromptOwner() == Application.Current.MainWindow, "and by the main window otherwise");
+        }
+        finally
+        {
+            _dialogs.ClearExpectations();
+            LithicBackup.Services.OpenRequestQueue.DirectoryOverride = null;
+        }
     }
 #endif
 

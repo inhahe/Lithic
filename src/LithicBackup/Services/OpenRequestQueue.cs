@@ -17,6 +17,7 @@ namespace LithicBackup.Services;
 /// starting up), several files opened together queue in order, and a request
 /// can never be half-delivered. Requests older than <see cref="MaxAge"/> are
 /// discarded unread, so one left behind by a crash does not pop up days later.
+/// The app's own launch does not use the queue: it offers its own files directly.
 /// </remarks>
 internal static class OpenRequestQueue
 {
@@ -72,7 +73,11 @@ internal static class OpenRequestQueue
         }
     }
 
-    /// <summary>Remove and return every queued request, oldest first.</summary>
+    /// <summary>
+    /// Remove and return every queued request, oldest first. Also removes a
+    /// request a launch began writing and never finished (it crashed between
+    /// writing and renaming it), once it is older than <see cref="MaxAge"/>.
+    /// </summary>
     public static List<string> TakeAll()
     {
         var paths = new List<string>();
@@ -82,6 +87,15 @@ internal static class OpenRequestQueue
             if (!Directory.Exists(QueueDirectory))
                 return paths;
             entries = Directory.GetFiles(QueueDirectory, "*.txt");
+            foreach (string unfinished in Directory.GetFiles(QueueDirectory, "*.partial"))
+            {
+                try
+                {
+                    if (DateTime.UtcNow - File.GetLastWriteTimeUtc(unfinished) > MaxAge)
+                        File.Delete(unfinished);
+                }
+                catch (Exception ex) when (ex is IOException or UnauthorizedAccessException) { }
+            }
         }
         catch (Exception ex) when (ex is IOException or UnauthorizedAccessException)
         {

@@ -4844,9 +4844,28 @@ public class MainViewModel : ViewModelBase
         }
     }
 
+    /// <summary>
+    /// The window to own a prompt the user did not open from the window in front
+    /// of them, such as an opened file's offer: the main window, unless a dialog
+    /// open over it has disabled it, and then that dialog. A message box owned by
+    /// a disabled window enables it again on closing, under the still-open dialog.
+    /// </summary>
+    internal static Window? PromptOwner()
+    {
+        var main = Application.Current.MainWindow;
+        if (main is null || IsWindowEnabled(new System.Windows.Interop.WindowInteropHelper(main).Handle))
+            return main;
+        return Application.Current.Windows.OfType<Window>().LastOrDefault(w =>
+                   w.IsVisible && IsWindowEnabled(new System.Windows.Interop.WindowInteropHelper(w).Handle))
+               ?? main;
+    }
+
+    [System.Runtime.InteropServices.DllImport("user32.dll")]
+    private static extern bool IsWindowEnabled(IntPtr hWnd);
+
     private async Task OfferImportAsync(string path)
     {
-        var owner = Application.Current.MainWindow;
+        var owner = PromptOwner();
         ExportedBackupSet settings;
         bool hasHistory;
         try

@@ -197,7 +197,18 @@ public static class BackupSetTransfer
     {
         try
         {
-            return await JsonSerializer.DeserializeAsync<ExportedBackupSet>(s, JsonOptions, ct)
+            // Any JSON object deserializes - unknown members ignored, missing ones
+            // defaulted - so another program's settings file would pass as a
+            // nameless set with no sources. Every export writes these two.
+            using var doc = await JsonDocument.ParseAsync(s, cancellationToken: ct);
+            var top = doc.RootElement;
+            bool Has(string member) => top.EnumerateObject().Any(
+                p => string.Equals(p.Name, member, StringComparison.OrdinalIgnoreCase));
+            if (top.ValueKind != JsonValueKind.Object
+                || !Has(nameof(ExportedBackupSet.Name))
+                || !Has(nameof(ExportedBackupSet.SourceRoots)))
+                throw new InvalidDataException("The file is not a backup set configuration.");
+            return top.Deserialize<ExportedBackupSet>(JsonOptions)
                 ?? throw new InvalidDataException("The file is empty.");
         }
         catch (JsonException ex)
