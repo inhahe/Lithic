@@ -1054,6 +1054,41 @@ a healthy scan with nothing to report. `ScanProgress` now carries
 `DirectoriesScanned` and the UI shows it alongside. A progress indicator that can
 legitimately freeze is not a progress indicator.
 
+## A walk follows links, but never back into its own path
+
+Every walk of a source tree follows directory links (junctions, symbolic links,
+mounted folders): the scan (`FileScanner`), the editor's size walks
+(`SourceSelectionNodeViewModel.ComputeDirectorySize*`), the walk of folders just
+added to a selection (`MainViewModel.EnumerateFilesUnderRoots`) and the Worker's
+walk of a folder that appeared (`LinkLoopGuard.EnumerateFiles`). They must make
+the same choice, or the editor's sizes stop describing the backup.
+
+A walk is a depth-first search of a directed graph whose nodes are directories
+and whose edges are subdirectory entries, a link's edge going to its target.
+Without links it is a tree. A link to the folder holding it, or to any folder
+above that on the walk's path, is a back edge, and following it never ends:
+`C:\a\b\loop` -> `C:\a` gives `C:\a\b\loop\b\loop\...` until the path is too
+long for Windows, backing the same files up under each longer path (.NET's own
+recursive enumeration does exactly this). `LinkLoopGuard`, one per walk, refuses
+those links and only those. Every other link is followed, so its files are backed
+up under the link's path, including a link to a folder that is also selected
+(finite duplication, by choice: what is selected is backed up).
+
+Directories are compared by final path (`GetFinalPathNameByHandle`), so `subst`
+drives, mounted folders and links reached through links are seen for what they
+are. The walk's path is split by the links it went through; within each stretch
+the folders are one chain of real directories, so a target above any of them is
+above the deepest, and the guard keeps only that one's final path per followed
+link (the holding folder's) plus the current folder's. Plain folders cost
+nothing; a link costs two handle opens. The guard works from the paths the walk
+reached things by, not from visiting order, so it serves recursive walks and
+.NET's queue-based enumeration alike, and `Seed` records the links among a
+walk's start and its ancestors, so a selected folder inside a junction is
+treated the same as when reached from above. A listed selection entry is walked
+whatever it is (the selection says so), so a loop link ticked on its own backs
+its target up once under its path, and nothing again through it.
+`tools\link_loop_test` and editor_save_test 20c pin all of this.
+
 ## Build the answer, not a copy of the question
 
 The destination scan needs, per disc path, one bit — is any record still active,

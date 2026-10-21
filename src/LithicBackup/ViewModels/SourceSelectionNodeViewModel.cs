@@ -2145,12 +2145,14 @@ public class SourceSelectionNodeViewModel : ViewModelBase
     /// filtered sizes depend on patterns that can change independently of
     /// the directory's last-write timestamp.
     /// </summary>
+    /// <param name="links">The walk's loop guard; null at the walk's start, which makes one.</param>
     internal static (long Size, int FileCount) ComputeDirectorySizeFiltered(
-        DirectoryInfo dir, Func<string, bool> isExcluded)
+        DirectoryInfo dir, Func<string, bool> isExcluded, LinkLoopGuard? links = null)
     {
         long totalSize = 0;
         int totalCount = 0;
         bool atRoot = IsVolumeRoot(dir);
+        links ??= GuardFor(dir);
 
         try
         {
@@ -2180,10 +2182,11 @@ public class SourceSelectionNodeViewModel : ViewModelBase
                 // Check if the directory itself is excluded (e.g. */node_modules/*)
                 // by testing a synthetic child path.
                 if ((atRoot && VolumeMetadataPaths.IsVolumeMetadata(subDir.FullName))
-                    || isExcluded(System.IO.Path.Combine(subDir.FullName, "_")))
+                    || isExcluded(System.IO.Path.Combine(subDir.FullName, "_"))
+                    || !links.MayEnter(subDir.FullName, subDir.Attributes))
                     continue;
 
-                var (subSize, subCount) = ComputeDirectorySizeFiltered(subDir, isExcluded);
+                var (subSize, subCount) = ComputeDirectorySizeFiltered(subDir, isExcluded, links);
                 totalSize += subSize;
                 totalCount += subCount;
             }
@@ -2210,12 +2213,14 @@ public class SourceSelectionNodeViewModel : ViewModelBase
     /// only took effect between queue items, so a single walk of a large volume
     /// carried on for hours after the window that wanted it had closed.
     /// </param>
+    /// <param name="links">The walk's loop guard; null at the walk's start, which makes one.</param>
     internal static (long Size, int FileCount) ComputeDirectorySizeFilteredCached(
         DirectoryInfo dir, Func<string, bool> isExcluded,
         DirectorySizeCache cache, string filterSignature,
-        CancellationToken ct = default)
+        CancellationToken ct = default, LinkLoopGuard? links = null)
     {
         ct.ThrowIfCancellationRequested();
+        links ??= GuardFor(dir);
 
         // Read the directory's mtime ONCE, up front, and use it both to validate
         // any cached value and — if we recompute — to stamp the new one.
@@ -2272,11 +2277,12 @@ public class SourceSelectionNodeViewModel : ViewModelBase
                 // Hidden/System directories are included in size totals so the
                 // displayed size matches what the backup engine actually copies.
                 if ((atRoot && VolumeMetadataPaths.IsVolumeMetadata(subDir.FullName))
-                    || isExcluded(System.IO.Path.Combine(subDir.FullName, "_")))
+                    || isExcluded(System.IO.Path.Combine(subDir.FullName, "_"))
+                    || !links.MayEnter(subDir.FullName, subDir.Attributes))
                     continue;
 
                 var (subSize, subCount) = ComputeDirectorySizeFilteredCached(
-                    subDir, isExcluded, cache, filterSignature, ct);
+                    subDir, isExcluded, cache, filterSignature, ct, links);
                 totalSize += subSize;
                 totalCount += subCount;
             }
@@ -2357,17 +2363,20 @@ public class SourceSelectionNodeViewModel : ViewModelBase
     /// in the cache so future calls to <see cref="TryGetCachedRecursiveSize"/>
     /// can return it instantly.
     /// </summary>
+    /// <param name="links">The walk's loop guard; null at the walk's start, which makes one.</param>
     internal static (long Size, int FileCount) ComputeDirectorySizeCached(
-        DirectoryInfo dir, DirectorySizeCache cache, CancellationToken ct = default)
+        DirectoryInfo dir, DirectorySizeCache cache, CancellationToken ct = default,
+        LinkLoopGuard? links = null)
     {
         ct.ThrowIfCancellationRequested();
+        links ??= GuardFor(dir);
 
         long directFileSize;
         int directFileCount;
 
         DateTime currentLastWrite;
         try { currentLastWrite = dir.LastWriteTimeUtc; }
-        catch { return ComputeDirectorySizeFallback(dir); }
+        catch { return ComputeDirectorySizeFallback(dir, links); }
 
         // A volume root's few direct files are re-read rather than taken from
         // the cache, where a walk that counted the page file may have left them.
@@ -2408,9 +2417,10 @@ public class SourceSelectionNodeViewModel : ViewModelBase
             {
                 // Hidden/System directories are included in size totals so the
                 // displayed size matches what the backup engine actually copies.
-                if (atRoot && VolumeMetadataPaths.IsVolumeMetadata(subDir.FullName))
+                if ((atRoot && VolumeMetadataPaths.IsVolumeMetadata(subDir.FullName))
+                    || !links.MayEnter(subDir.FullName, subDir.Attributes))
                     continue;
-                var (subSize, subCount) = ComputeDirectorySizeCached(subDir, cache, ct);
+                var (subSize, subCount) = ComputeDirectorySizeCached(subDir, cache, ct, links);
                 subdirSizeTotal += subSize;
                 subdirFileTotal += subCount;
             }
@@ -2433,23 +2443,42 @@ public class SourceSelectionNodeViewModel : ViewModelBase
     /// Fallback: flat recursive file enumeration (no cache). Used when the
     /// directory's timestamp cannot be read.
     /// </summary>
-    private static (long Size, int FileCount) ComputeDirectorySizeFallback(DirectoryInfo dir)
+    private static (long Size, int FileCount) ComputeDirectorySizeFallback(DirectoryInfo dir, LinkLoopGuard links)
     {
         long total = 0;
         int count = 0;
         bool atRoot = IsVolumeRoot(dir);
         try
         {
-            foreach (var file in dir.EnumerateFiles("*", SearchOption.AllDirectories))
+            var files = new System.IO.Enumeration.FileSystemEnumerable<long>(
+                dir.FullName, (ref System.IO.Enumeration.FileSystemEntry entry) => entry.Length,
+                new EnumerationOptions { RecurseSubdirectories = true, IgnoreInaccessible = true, AttributesToSkip = 0 })
             {
-                if (atRoot && VolumeMetadataPaths.IsVolumeMetadata(file.FullName))
-                    continue;
-                try { total += file.Length; count++; }
-                catch { }
+                ShouldIncludePredicate = (ref System.IO.Enumeration.FileSystemEntry entry) =>
+                    !entry.IsDirectory && !(atRoot && VolumeMetadataPaths.IsVolumeMetadata(entry.ToFullPath())),
+                ShouldRecursePredicate = (ref System.IO.Enumeration.FileSystemEntry entry) =>
+                {
+                    string path = entry.ToFullPath();
+                    return !(atRoot && VolumeMetadataPaths.IsVolumeMetadata(path))
+                        && links.MayEnter(path, entry.Attributes);
+                },
+            };
+            foreach (long length in files)
+            {
+                total += length;
+                count++;
             }
         }
         catch { }
         return (total, count);
+    }
+
+    /// <summary>A loop guard for a size walk that starts at <paramref name="dir"/>.</summary>
+    private static LinkLoopGuard GuardFor(DirectoryInfo dir)
+    {
+        var links = new LinkLoopGuard();
+        links.Seed(dir.FullName);
+        return links;
     }
 
     /// <summary>

@@ -2232,14 +2232,16 @@ public class MainViewModel : ViewModelBase
 
     /// <summary>
     /// Recursively enumerate the files (with sizes) under a set of directory
-    /// roots, skipping reparse points to avoid symlink loops and swallowing
-    /// per-directory access errors so one unreadable folder can't abort the walk.
+    /// roots, following links as the scan does - but not into themselves - and
+    /// swallowing per-directory access errors so one unreadable folder can't
+    /// abort the walk.
     /// </summary>
-    private static IEnumerable<(string Path, long Size)> EnumerateFilesUnderRoots(
+    internal static IEnumerable<(string Path, long Size)> EnumerateFilesUnderRoots(
         IEnumerable<string> roots)
     {
         var visited = new HashSet<string>(StringComparer.OrdinalIgnoreCase);
         var stack = new Stack<string>();
+        var links = new LinkLoopGuard();
         foreach (var r in roots)
         {
             // An entry may be a file: CollectCoveredEntries returns a selected
@@ -2252,6 +2254,7 @@ public class MainViewModel : ViewModelBase
             }
             else if (visited.Add(r))
             {
+                links.Seed(r);
                 stack.Push(r);
             }
         }
@@ -2260,19 +2263,13 @@ public class MainViewModel : ViewModelBase
         {
             var dir = stack.Pop();
 
-            IEnumerable<string> subdirs = Array.Empty<string>();
-            try { subdirs = Directory.EnumerateDirectories(dir); }
+            var subdirs = new List<DirectoryInfo>();
+            try { subdirs.AddRange(new DirectoryInfo(dir).EnumerateDirectories()); }
             catch { /* unreadable — skip */ }
             foreach (var sd in subdirs)
             {
-                try
-                {
-                    if ((File.GetAttributes(sd) & FileAttributes.ReparsePoint) != 0)
-                        continue; // don't follow junctions/symlinks
-                }
-                catch { continue; }
-                if (visited.Add(sd))
-                    stack.Push(sd);
+                if (links.MayEnter(sd.FullName, sd.Attributes) && visited.Add(sd.FullName))
+                    stack.Push(sd.FullName);
             }
 
             IEnumerable<string> files = Array.Empty<string>();

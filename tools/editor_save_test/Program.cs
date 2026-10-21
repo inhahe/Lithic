@@ -1013,6 +1013,60 @@ internal static class Program
             Check(sawCancel, $"{kind}: and the cancellation reached the caller");
         }
 
+        // --- 20c. size walks over links that loop ---
+        Console.WriteLine();
+        Console.WriteLine("=== 20c. size walks follow links, but not into themselves ===");
+        {
+            // a\b\f.txt and a\c.txt; a\b\loop -> a, a\ext -> outside\g.txt. (Loops above
+            // the start, and through two links, are link_loop_test's.)
+            string lt = Path.Combine(_root, "linkloop");
+            string la = Path.Combine(lt, "a"), lb = Path.Combine(la, "b"), lo = Path.Combine(lt, "outside");
+            Directory.CreateDirectory(lb);
+            Directory.CreateDirectory(lo);
+            File.WriteAllBytes(Path.Combine(lb, "f.txt"), new byte[2]);
+            File.WriteAllBytes(Path.Combine(la, "c.txt"), new byte[3]);
+            File.WriteAllBytes(Path.Combine(lo, "g.txt"), new byte[5]);
+            void Junction(string link, string target)
+            {
+                var pj = System.Diagnostics.Process.Start(new System.Diagnostics.ProcessStartInfo(
+                    "cmd.exe", $"/c mklink /J \"{link}\" \"{target}\"")
+                    { UseShellExecute = false, CreateNoWindow = true, RedirectStandardOutput = true })!;
+                pj.WaitForExit();
+            }
+            Junction(Path.Combine(lb, "loop"), la);
+            Junction(Path.Combine(la, "ext"), lo);
+
+            // Each walk gets a deadline, and a thread with room for a walk that
+            // follows the loop until the path is too long, which then ends.
+            async Task<T?> Within<T>(Func<T> walk) where T : struct
+            {
+                var done = new TaskCompletionSource<T?>(TaskCreationOptions.RunContinuationsAsynchronously);
+                new Thread(() =>
+                {
+                    try { done.TrySetResult(walk()); }
+                    catch { done.TrySetResult(null); }
+                }, 256 * 1024 * 1024) { IsBackground = true }.Start();
+                return await Task.WhenAny(done.Task, Task.Delay(20_000)) == done.Task ? done.Task.Result : null;
+            }
+            var dirA = new DirectoryInfo(la);
+            using (var lcache = new DirectorySizeCache())
+            using (var deadline = new CancellationTokenSource(TimeSpan.FromSeconds(20)))
+            {
+                var cached = await Within(() => SourceSelectionNodeViewModel.ComputeDirectorySizeCached(dirA, lcache, deadline.Token));
+                Check(cached is (10, 3), $"the cached walk: 3 files, 10 bytes (got {cached})");
+                var filteredCached = await Within(() => SourceSelectionNodeViewModel.ComputeDirectorySizeFilteredCached(
+                    dirA, p => p.EndsWith("c.txt", StringComparison.OrdinalIgnoreCase), lcache, "linkloop-sig", deadline.Token));
+                Check(filteredCached is (7, 2), $"the filtered cached walk: 2 files, 7 bytes (got {filteredCached})");
+            }
+            var filtered = await Within(() => SourceSelectionNodeViewModel.ComputeDirectorySizeFiltered(dirA, _ => false));
+            Check(filtered is (10, 3), $"the filtered walk: 3 files, 10 bytes (got {filtered})");
+            var added = await Within(() => MainViewModel.EnumerateFilesUnderRoots([la]).Take(1000).Select(f => f.Path).ToList().Count);
+            Check(added == 3, $"the walk of an added folder: 3 files (got {added})");
+
+            foreach (var j in new[] { Path.Combine(lb, "loop"), Path.Combine(la, "ext") })
+                try { Directory.Delete(j); } catch { }
+        }
+
         // --- 21. opening a .lithic export ---
         Console.WriteLine();
         Console.WriteLine("=== 21. opening a .lithic export offers to add it ===");

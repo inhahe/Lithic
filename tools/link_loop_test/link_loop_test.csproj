@@ -1,0 +1,16 @@
+<Project Sdk="Microsoft.NET.Sdk">
+
+  <PropertyGroup>
+    <OutputType>Exe</OutputType>
+    <TargetFramework>net8.0-windows</TargetFramework>
+    <ImplicitUsings>enable</ImplicitUsings>
+    <Nullable>enable</Nullable>
+    <AssemblyName>link_loop_test</AssemblyName>
+  </PropertyGroup>
+
+  <ItemGroup>
+    <ProjectReference Include="..\..\src\LithicBackup.Core\LithicBackup.Core.csproj" />
+    <ProjectReference Include="..\..\src\LithicBackup.Infrastructure\LithicBackup.Infrastructure.csproj" />
+  </ItemGroup>
+
+</Project>

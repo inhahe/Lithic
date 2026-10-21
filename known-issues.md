@@ -1,27 +1,24 @@
 # LithicBackup — Known Issues & Tech Debt
 
-## OPEN: the scan and the editor's size walks follow junctions and directory symlinks (2026-10-20)
+## FIXED: a link that pointed back into its own folder was followed forever (2026-10-20)
 
-Neither `FileScanner.ScanDirectoryRecursive` / `ScanUnlistedEntries` nor the
-editor's size walks (`SourceSelectionNodeViewModel.ComputeDirectorySizeCached`,
-`ComputeDirectorySizeFiltered[Cached]`) check `FileAttributes.ReparsePoint` before
-recursing; only the "you added a folder" walk in `MainViewModel` does. So:
+The scan (`FileScanner`), the editor's size walks, and the Worker's walk of a
+folder that appeared (a .NET recursive enumeration) all followed junctions and
+directory symlinks, so a link to one of its own ancestors (`mklink /J C:\x\loop
+C:\x`) recursed until the path was too long for Windows, backing the same files
+up under `loop\loop\loop\...` on the way. Windows' own legacy junctions
+(`Documents and Settings`, `Application Data`) deny listing, so they were never
+followed; a user-made one was. The "you added a folder" walk went the other
+way and skipped every link, so its targeted backup missed what the next full
+scan then found.
 
-- A junction or symlink to a folder that is also selected backs its files up
-  twice, under two source paths.
-- A link that points at one of its own ancestors (`mklink /J C:\x\loop C:\x`)
-  recurses until the path is too long for Windows, backing the same files up
-  under `loop\loop\loop\...` paths on the way. Windows' own legacy junctions
-  (`Documents and Settings`, `Application Data`) deny listing, so they are not
-  followed; a user-made one is.
-
-Found while answering a review remark about drive-root walks (Fable, batch
-7486fb6's follow-up). The fix needs a decision, which is why it is not made
-here: skip every reparse point (what most backup tools do; a link's target is
-backed up only where it is selected), or follow links but remember each
-directory's file ID and never enter one twice. Either way the scan and the size
-walks must make the same choice, or the editor's sizes stop describing the
-backup.
+Decided with the user: follow links, but never into the walk's own path. Every
+walk now asks `LinkLoopGuard`, which compares final paths and refuses only a
+link to the folder holding it or above (see design.md: "A walk follows links,
+but never back into its own path"). A link to a folder that is also selected
+still backs its files up a second time, under the link's path; that is finite,
+and what the selection says. Pinned by `tools\link_loop_test` and
+editor_save_test 20c, which fail without it.
 
 ## FIXED: a backup crawled at 0.8 s a file with nothing to say why, showed "~1492:01:56" left, and held the Worker for hours (2026-10-20, 1.15.0)
 

@@ -1,5 +1,4 @@
 using System.Collections.Concurrent;
-using System.IO.Enumeration;
 using LithicBackup.Core;
 using LithicBackup.Core.Interfaces;
 using LithicBackup.Core.Models;
@@ -2264,16 +2263,10 @@ public sealed class BackupWorker : BackgroundService
             return;
         }
 
-        // Wholly excluded subtrees are not entered, as in the scanner, and an
-        // unreadable folder part-way is skipped instead of ending the walk.
-        var prunes = state.PrunesDirectory;
-        var files = new FileSystemEnumerable<string>(
-            path, (ref FileSystemEntry entry) => entry.ToFullPath(),
-            new EnumerationOptions { RecurseSubdirectories = true, IgnoreInaccessible = true, AttributesToSkip = 0 })
-        {
-            ShouldIncludePredicate = (ref FileSystemEntry entry) => !entry.IsDirectory,
-            ShouldRecursePredicate = (ref FileSystemEntry entry) => !prunes(entry.ToFullPath()),
-        };
+        // Wholly excluded subtrees are not entered, as in the scanner, an
+        // unreadable folder part-way is skipped instead of ending the walk, and
+        // links are followed but not into themselves.
+        var files = LinkLoopGuard.EnumerateFiles(path, state.PrunesDirectory);
 
         try
         {

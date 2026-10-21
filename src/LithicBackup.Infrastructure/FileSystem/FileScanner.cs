@@ -1,3 +1,4 @@
+using LithicBackup.Core;
 using LithicBackup.Core.Interfaces;
 using LithicBackup.Core.Models;
 
@@ -27,12 +28,14 @@ public class FileScanner : IFileScanner
         int filesFound = 0;
         int dirsScanned = 0;
         long totalBytes = 0;
+        // Links are followed, but not into themselves (see LinkLoopGuard).
+        var links = new LinkLoopGuard();
 
         foreach (var source in sources)
         {
             if (ct.IsCancellationRequested) break;
             ScanNode(source, results, ref filesFound, ref dirsScanned, ref totalBytes,
-                     progress, ct, isExcluded, isDirectoryExcluded);
+                     progress, ct, links, isExcluded, isDirectoryExcluded);
         }
 
         return Task.FromResult<IReadOnlyList<ScannedFile>>(results);
@@ -46,6 +49,7 @@ public class FileScanner : IFileScanner
         ref long totalBytes,
         IProgress<ScanProgress>? progress,
         CancellationToken ct,
+        LinkLoopGuard links,
         Func<string, bool>? isExcluded = null,
         Func<string, bool>? isDirectoryExcluded = null)
     {
@@ -62,6 +66,11 @@ public class FileScanner : IFileScanner
             if (isDirectoryExcluded is not null && isDirectoryExcluded(node.Path))
                 return;
 
+            // A listed folder is walked whatever it is, as the selection says; a
+            // link among it and its ancestors is recorded, so a loop back from
+            // inside it is seen.
+            links.Seed(node.Path);
+
             dirsScanned++;
             progress?.Report(new ScanProgress
             {
@@ -77,7 +86,7 @@ public class FileScanner : IFileScanner
                 // Has explicit child selections — follow those.
                 foreach (var child in node.Children)
                     ScanNode(child, results, ref filesFound, ref dirsScanned, ref totalBytes,
-                             progress, ct, isExcluded, isDirectoryExcluded);
+                             progress, ct, links, isExcluded, isDirectoryExcluded);
 
                 // Pick up any children on disk that aren't in the selection tree
                 // when this directory auto-includes new entries — for a fully- or
@@ -90,7 +99,7 @@ public class FileScanner : IFileScanner
 
                     ScanUnlistedEntries(node.Path, knownChildren, results,
                         ref filesFound, ref dirsScanned, ref totalBytes,
-                        progress, ct, isExcluded, isDirectoryExcluded);
+                        progress, ct, links, isExcluded, isDirectoryExcluded);
                 }
             }
             else if (node.IsSelected == true)
@@ -98,7 +107,7 @@ public class FileScanner : IFileScanner
                 // Fully selected directory with no child overrides — include everything.
                 ScanDirectoryRecursive(node.Path, results,
                     ref filesFound, ref dirsScanned, ref totalBytes,
-                    progress, ct, isExcluded, isDirectoryExcluded);
+                    progress, ct, links, isExcluded, isDirectoryExcluded);
             }
         }
         else
@@ -120,6 +129,7 @@ public class FileScanner : IFileScanner
         ref long totalBytes,
         IProgress<ScanProgress>? progress,
         CancellationToken ct,
+        LinkLoopGuard links,
         Func<string, bool>? isExcluded = null,
         Func<string, bool>? isDirectoryExcluded = null)
     {
@@ -154,18 +164,20 @@ public class FileScanner : IFileScanner
                 }
             }
 
-            foreach (var subDir in Directory.EnumerateDirectories(directoryPath))
+            foreach (var subDir in new DirectoryInfo(directoryPath).EnumerateDirectories())
             {
                 // Skip a subtree that cannot contribute a file. This is the
                 // difference between a scan that walks hundreds of thousands of
                 // build/ and debug/ directories rejecting every file one at a
                 // time, and one that never opens them.
-                if (isDirectoryExcluded is not null && isDirectoryExcluded(subDir))
+                if (isDirectoryExcluded is not null && isDirectoryExcluded(subDir.FullName))
+                    continue;
+                if (!links.MayEnter(subDir.FullName, subDir.Attributes))
                     continue;
 
-                ScanDirectoryRecursive(subDir, results,
+                ScanDirectoryRecursive(subDir.FullName, results,
                     ref filesFound, ref dirsScanned, ref totalBytes,
-                    progress, ct, isExcluded, isDirectoryExcluded);
+                    progress, ct, links, isExcluded, isDirectoryExcluded);
             }
         }
         catch (UnauthorizedAccessException)
@@ -191,6 +203,7 @@ public class FileScanner : IFileScanner
         ref long totalBytes,
         IProgress<ScanProgress>? progress,
         CancellationToken ct,
+        LinkLoopGuard links,
         Func<string, bool>? isExcluded = null,
         Func<string, bool>? isDirectoryExcluded = null)
     {
@@ -203,17 +216,19 @@ public class FileScanner : IFileScanner
                     AddFile(filePath, results, ref filesFound, ref totalBytes, isExcluded);
             }
 
-            foreach (var subDir in Directory.EnumerateDirectories(directoryPath))
+            foreach (var subDir in new DirectoryInfo(directoryPath).EnumerateDirectories())
             {
                 if (ct.IsCancellationRequested) return;
-                if (!knownChildren.Contains(subDir))
+                if (!knownChildren.Contains(subDir.FullName))
                 {
-                    if (isDirectoryExcluded is not null && isDirectoryExcluded(subDir))
+                    if (isDirectoryExcluded is not null && isDirectoryExcluded(subDir.FullName))
+                        continue;
+                    if (!links.MayEnter(subDir.FullName, subDir.Attributes))
                         continue;
 
-                    ScanDirectoryRecursive(subDir, results,
+                    ScanDirectoryRecursive(subDir.FullName, results,
                         ref filesFound, ref dirsScanned, ref totalBytes,
-                        progress, ct, isExcluded, isDirectoryExcluded);
+                        progress, ct, links, isExcluded, isDirectoryExcluded);
                 }
             }
         }
