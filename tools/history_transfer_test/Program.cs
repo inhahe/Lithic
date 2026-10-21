@@ -57,22 +57,23 @@ static SqliteCatalogRepository NewCatalog(string dir)
 static DirectoryBackupService NewService(ICatalogRepository repo) =>
     new(repo, new FileScanner(repo), new VersionRetentionService(repo));
 
-List<SourceSelection> Selection() =>
-    [new SourceSelection { Path = source, IsDirectory = true, IsSelected = true }];
+// "from": the folder a set backs up, the harness's main source when null.
+List<SourceSelection> Selection(string? from = null) =>
+    [new SourceSelection { Path = from ?? source, IsDirectory = true, IsSelected = true }];
 
-BackupJob Job(int setId, string dest) => new()
+BackupJob Job(int setId, string dest, string? from = null) => new()
 {
     BackupSetId = setId,
-    Sources = Selection(),
+    Sources = Selection(from),
     EnableFileDeduplication = true,
     EnableDeduplication = false,
     TargetDirectory = dest,
     ZipMode = ZipMode.None,
 };
 
-async Task Backup(DirectoryBackupService svc, int setId, string dest)
+async Task Backup(DirectoryBackupService svc, int setId, string dest, string? from = null)
 {
-    var r = await svc.ExecuteAsync(Job(setId, dest), dest, null, null, CancellationToken.None);
+    var r = await svc.ExecuteAsync(Job(setId, dest, from), dest, null, null, CancellationToken.None);
     if (!r.Success)
         throw new Exception("backup failed: " + string.Join("; ", r.FailedFiles.Select(f => $"{f.Path}: {f.Error}")));
 }
@@ -437,36 +438,24 @@ string target7 = Path.Combine(root, "dst7");
 Directory.CreateDirectory(source7);
 Directory.CreateDirectory(target7);
 string fPath = Path.Combine(source7, "f.txt");
-List<SourceSelection> Sel7() => [new SourceSelection { Path = source7, IsDirectory = true, IsSelected = true }];
-async Task Backup7(DirectoryBackupService svc, int setId, string dest)
-{
-    var job = new BackupJob
-    {
-        BackupSetId = setId, Sources = Sel7(), EnableFileDeduplication = true,
-        TargetDirectory = dest, ZipMode = ZipMode.None,
-    };
-    var r = await svc.ExecuteAsync(job, dest, null, null, CancellationToken.None);
-    if (!r.Success)
-        throw new Exception("backup failed: " + string.Join("; ", r.FailedFiles.Select(f => $"{f.Path}: {f.Error}")));
-}
 static string Sha(string p) => Convert.ToHexString(SHA256.HashData(File.ReadAllBytes(p)));
 
 var repoA7 = NewCatalog(Path.Combine(root, "A7"));
 var svcA7 = NewService(repoA7);
 var setA7 = await repoA7.CreateBackupSetAsync(new BackupSet
 {
-    Name = "behind", SourceRoots = [source7], SourceSelections = Sel7(),
+    Name = "behind", SourceRoots = [source7], SourceSelections = Selection(source7),
     CreatedUtc = DateTime.UtcNow, DefaultMediaType = MediaType.Directory,
     JobOptions = new JobOptions { TargetDirectory = target7 },
 });
 await File.WriteAllTextAsync(fPath, "f one");
-await Backup7(svcA7, setA7.Id, target7);
+await Backup(svcA7, setA7.Id, target7, source7);
 await File.WriteAllTextAsync(fPath, "f two, longer");
-await Backup7(svcA7, setA7.Id, target7);
+await Backup(svcA7, setA7.Id, target7, source7);
 string export7 = Path.Combine(root, "behind.lithic");
 await BackupSetTransfer.ExportAsync(repoA7, (await repoA7.GetBackupSetAsync(setA7.Id))!, export7, includeHistory: true);
 await File.WriteAllTextAsync(fPath, "f three, longer still");     // after the export
-await Backup7(svcA7, setA7.Id, target7);
+await Backup(svcA7, setA7.Id, target7, source7);
 
 var repoB7 = NewCatalog(Path.Combine(root, "B7"));
 var svcB7 = NewService(repoB7);
@@ -475,7 +464,7 @@ Check((await repoB7.GetLatestVersionInfoAsync(setB7.Id))[fPath].MaxVersion == 2,
     "the imported history ends at v2, while the drive has moved on to v3");
 
 await File.WriteAllTextAsync(fPath, "f four, on the new computer");
-await Backup7(svcB7, setB7.Id, target7);
+await Backup(svcB7, setB7.Id, target7, source7);
 var fRecords = (await repoB7.GetFileRecordsByPathAsync(setB7.Id, fPath)).OrderBy(r => r.Version).ToList();
 Check(fRecords.Select(r => r.Version).SequenceEqual([1, 2, 3, 4]),
     $"versions 1 to 4 (got {string.Join(",", fRecords.Select(r => r.Version))})");
@@ -504,18 +493,6 @@ string source7b = Path.Combine(root, "src7b"), target7b = Path.Combine(root, "ds
 Directory.CreateDirectory(source7b);
 Directory.CreateDirectory(target7b);
 string gPath = Path.Combine(source7b, "g.txt");
-async Task Backup7b(DirectoryBackupService svc, int setId)
-{
-    var job = new BackupJob
-    {
-        BackupSetId = setId,
-        Sources = [new SourceSelection { Path = source7b, IsDirectory = true, IsSelected = true }],
-        EnableFileDeduplication = true, TargetDirectory = target7b, ZipMode = ZipMode.None,
-    };
-    var r = await svc.ExecuteAsync(job, target7b, null, null, CancellationToken.None);
-    if (!r.Success)
-        throw new Exception("backup failed: " + string.Join("; ", r.FailedFiles.Select(f => $"{f.Path}: {f.Error}")));
-}
 var repoA7b = NewCatalog(Path.Combine(root, "A7b"));
 var svcA7b = NewService(repoA7b);
 var setA7b = await repoA7b.CreateBackupSetAsync(new BackupSet
@@ -525,21 +502,21 @@ var setA7b = await repoA7b.CreateBackupSetAsync(new BackupSet
 });
 string[] gContents = ["g one", "g two, longer", "g three, longer still", "g four, the old computer's last", "g five, on the new computer"];
 await File.WriteAllTextAsync(gPath, gContents[0]);
-await Backup7b(svcA7b, setA7b.Id);
+await Backup(svcA7b, setA7b.Id, target7b, source7b);
 await File.WriteAllTextAsync(gPath, gContents[1]);
-await Backup7b(svcA7b, setA7b.Id);
+await Backup(svcA7b, setA7b.Id, target7b, source7b);
 string export7b = Path.Combine(root, "behind twice.lithic");
 await BackupSetTransfer.ExportAsync(repoA7b, (await repoA7b.GetBackupSetAsync(setA7b.Id))!, export7b, includeHistory: true);
 await File.WriteAllTextAsync(gPath, gContents[2]);     // after the export, twice
-await Backup7b(svcA7b, setA7b.Id);
+await Backup(svcA7b, setA7b.Id, target7b, source7b);
 await File.WriteAllTextAsync(gPath, gContents[3]);
-await Backup7b(svcA7b, setA7b.Id);
+await Backup(svcA7b, setA7b.Id, target7b, source7b);
 
 var repoB7b = NewCatalog(Path.Combine(root, "B7b"));
 var svcB7b = NewService(repoB7b);
 var setB7b = (await BackupSetTransfer.ImportAsync(repoB7b, export7b)).Set;
 await File.WriteAllTextAsync(gPath, gContents[4]);
-await Backup7b(svcB7b, setB7b.Id);
+await Backup(svcB7b, setB7b.Id, target7b, source7b);
 var gRecords = (await repoB7b.GetFileRecordsByPathAsync(setB7b.Id, gPath)).Where(r => !r.IsDeleted).OrderBy(r => r.Version).ToList();
 Check(gRecords.Select(r => r.Version).SequenceEqual([1, 2, 3, 4, 5]),
     $"versions 1 to 5, the old computer's v3 among them (got {string.Join(",", gRecords.Select(r => r.Version))})");
