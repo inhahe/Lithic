@@ -102,9 +102,17 @@ public class OrphanedNodeViewModel : ViewModelBase
             OnPropertyChanged();
 
             // Keep the wrapped item's IsSelected in sync so existing purge
-            // code (which iterates items) sees the user's selection.
+            // code (which iterates items) sees the user's selection, and a file
+            // row's in its item, which outlives the tree.
             if (Item is not null && value.HasValue)
                 Item.IsSelected = value.Value;
+            if (File is not null && Parent?.Item is { } owner && value.HasValue)
+            {
+                if (value.Value)
+                    owner.UntickedFiles.Remove(File);
+                else
+                    owner.UntickedFiles.Add(File);
+            }
 
             if (!_updatingFromChild)
                 PropagateToChildren(value);
@@ -175,17 +183,18 @@ public class OrphanedNodeViewModel : ViewModelBase
 
     /// <summary>
     /// Make a freshly built tree's boxes agree with its items: an item's file
-    /// rows take the item's state, and every node with children shows their
-    /// roll-up. Interior nodes and file rows default to ticked, so after a purge
-    /// left an unticked item behind, its rebuilt tree showed it ticked while the
-    /// purge read it as not, and Clean Selected did nothing at all.
+    /// rows take the item's state and their own unticks
+    /// (<see cref="OrphanedDirectoryItem.UntickedFiles"/>), and every node with
+    /// children shows their roll-up. Interior nodes and file rows default to
+    /// ticked, which would otherwise show an unticked item, or row, ticked while
+    /// the purge reads it as not.
     /// </summary>
     internal void SettleCheckState()
     {
         foreach (var child in Children)
         {
             if (child.File is not null && Item is not null)
-                child._isChecked = Item.IsSelected;
+                child._isChecked = Item.IsSelected && !Item.UntickedFiles.Contains(child.File);
             child.SettleCheckState();
         }
 

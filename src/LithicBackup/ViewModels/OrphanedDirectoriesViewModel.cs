@@ -537,8 +537,11 @@ public class OrphanedDirectoriesViewModel : ViewModelBase, IConfirmClose
     private async Task LoadAsync()
     {
         IsLoading = true;
-        // Before the catalog is read: a purge leaves alone anything written since.
-        _catalogScanStartedUtc = DateTime.UtcNow;
+        // Taken before the catalog is read - a purge leaves alone anything written
+        // since - and kept, with the files read, only once this scan's results
+        // replace the listed ones: the purge acts on what is listed.
+        var startedUtc = DateTime.UtcNow;
+        var listedFiles = _activeFiles;
         SummaryText = "Loading catalogue...";
 
         // A DispatcherTimer polls a thread-safe progress counter at the shared
@@ -608,10 +611,12 @@ public class OrphanedDirectoriesViewModel : ViewModelBase, IConfirmClose
                 Categories.Add(cat);
             }
 
+            _catalogScanStartedUtc = startedUtc;
             UpdateSummaryText();
         }
         catch (Exception ex)
         {
+            _activeFiles = listedFiles;
             SummaryText = $"Error: {ex.Message}";
         }
         finally
@@ -2484,8 +2489,9 @@ public class OrphanedDirectoriesViewModel : ViewModelBase, IConfirmClose
                 // Excess-version records held back because a .fileref still needs
                 // their bytes (RecheckNeededCopies, inside the transaction).
                 HashSet<long> keptIds = [];
-                // Source paths backed up again since the scan, and stored paths
-                // belonging to them or written since: left alone (see the re-check).
+                // Source paths backed up again since the scan or back on disk, and
+                // stored paths belonging to them or written since: left alone (see
+                // the re-check).
                 var backedUpAgain = new HashSet<string>(StringComparer.OrdinalIgnoreCase);
                 var rewrittenDiscPaths = new HashSet<string>(StringComparer.OrdinalIgnoreCase);
                 int leftAlone = 0;
@@ -2604,13 +2610,21 @@ public class OrphanedDirectoriesViewModel : ViewModelBase, IConfirmClose
                             backedUpAgain.Add(src);
                             rewrittenDiscPaths.Add(disc.Replace('/', '\\'));
                         }
-                        // The stored copies those paths had when scanned are the
-                        // ones the items list; keep them too.
-                        if (backedUpAgain.Count > 0 && _activeFiles is not null)
-                            foreach (var f in _activeFiles)
-                                if (backedUpAgain.Contains(f.SourcePath))
-                                    rewrittenDiscPaths.Add(f.DiscPath.Replace('/', '\\'));
                     }
+                    // A file listed as deleted from disk that is back, unchanged
+                    // (restored from the recycle bin, say), writes no record, so
+                    // the check above cannot see it: it is looked for.
+                    foreach (var w in workItems)
+                        if (w.Reason == OrphanedReason.DeletedFromDisk && w.MatchingSourcePaths is not null)
+                            foreach (var p in w.MatchingSourcePaths)
+                                if (File.Exists(p))
+                                    backedUpAgain.Add(p);
+                    // The stored copies those paths had when scanned are the ones
+                    // the items list; keep them too.
+                    if (backedUpAgain.Count > 0 && _activeFiles is not null)
+                        foreach (var f in _activeFiles)
+                            if (backedUpAgain.Contains(f.SourcePath))
+                                rewrittenDiscPaths.Add(f.DiscPath.Replace('/', '\\'));
 
                     ((IProgress<Services.ProgressReport>)progress).Report(
                         "Cleaning up: checking which older copies duplicate-file references still need...");
@@ -2894,7 +2908,7 @@ public class OrphanedDirectoriesViewModel : ViewModelBase, IConfirmClose
                     + "that duplicate-file references still need");
             if (leftAloneSinceScan > 0)
                 summary.Add($"left {leftAloneSinceScan:N0} file{(leftAloneSinceScan == 1 ? "" : "s")} alone "
-                    + "that had been backed up again since the scan");
+                    + "that are back on disk or were backed up again since the scan");
             if (keptInUse > 0)
                 summary.Add($"kept {keptInUse:N0} stored file{(keptInUse == 1 ? "" : "s")} that the catalog "
                     + "uses again (adopted by a seed, or backed up, since the scan)");
@@ -3509,6 +3523,13 @@ public class OrphanedDirectoryItem : ViewModelBase
         get => _isSelected;
         set => SetProperty(ref _isSelected, value);
     }
+
+    /// <summary>
+    /// The rows of <see cref="Files"/> the user has unticked. Kept here, with
+    /// <see cref="IsSelected"/>, rather than in the tree's nodes: the tree is
+    /// rebuilt whenever a scan adds or removes items, and its nodes go with it.
+    /// </summary>
+    public HashSet<OrphanedFileInfo> UntickedFiles { get; } = [];
 
     public string ReasonText => Reason switch
     {

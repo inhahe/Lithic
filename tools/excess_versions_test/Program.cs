@@ -864,13 +864,16 @@ internal static class Program
         string gone = Path.Combine(source, "gone.txt");
         string keepMe = Path.Combine(source, "keep-me.txt");
         string gone2 = Path.Combine(source, "sub", "gone-later.txt");
+        string restored = Path.Combine(source, "restored.txt");
         await File.WriteAllTextAsync(back, "comes back, first content");
         await File.WriteAllTextAsync(gone, "gone for good");
         await File.WriteAllTextAsync(keepMe, "deleted, but unticked in Cleanup");
         await File.WriteAllTextAsync(gone2, "purged in the second cleanup");
+        await File.WriteAllTextAsync(restored, "deleted, then restored unchanged");
         var r0 = await svc.ExecuteAsync(Job(), target, keepOne.Tiers, null, CancellationToken.None);
         Check(r0.Success, "the set is backed up");
-        foreach (var f in new[] { back, gone, keepMe, gone2 })
+        var restoredWritten = File.GetLastWriteTimeUtc(restored);
+        foreach (var f in new[] { back, gone, keepMe, gone2, restored })
             File.Delete(f);
 
         // Stray copies where files would be stored, with no record: untracked.
@@ -917,12 +920,26 @@ internal static class Program
         await WaitFor(() => !vm.IsScanningDestination, 60000);
         var listedDeleted = vm.Items.Where(i => i.Reason == OrphanedReason.DeletedFromDisk)
             .SelectMany(i => i.MatchingSourcePaths ?? []).ToHashSet(StringComparer.OrdinalIgnoreCase);
-        Check(listedDeleted.SetEquals([back, gone, keepMe, gone2]),
-            $"the scan lists the four deleted files (got {string.Join(", ", listedDeleted.Select(Path.GetFileName))})");
+        Check(listedDeleted.SetEquals([back, gone, keepMe, gone2, restored]),
+            $"the scan lists the five deleted files (got {string.Join(", ", listedDeleted.Select(Path.GetFileName))})");
         var listedStrays = vm.Items.Where(i => i.Reason == OrphanedReason.UntrackedFile)
             .SelectMany(i => i.DiscFilePaths ?? []).Select(Path.GetFileName).ToHashSet(StringComparer.OrdinalIgnoreCase);
         Check(listedStrays.SetEquals(["adopted-now.txt", "adopted-old.txt", "stray-keep.txt", "stray-gone.txt"]),
             $"and the four stray copies as untracked (got {string.Join(", ", listedStrays)})");
+
+        // A rescan of the destination rebuilds every category's tree, the
+        // catalog's too; a file row unticked before it stays unticked.
+        Row(OrphanedReason.DeletedFromDisk, "keep-me.txt").IsChecked = false;
+        vm.ScanDestinationCommand.Execute(null);
+        await Task.Delay(100);
+        await WaitFor(() => !vm.IsScanningDestination, 60000);
+        Check(Row(OrphanedReason.DeletedFromDisk, "keep-me.txt").IsChecked == false,
+            "a file row unticked before a rescan is still unticked after it");
+
+        // restored.txt comes back unchanged (from the recycle bin, say): no
+        // backup has anything to write for it.
+        await File.WriteAllTextAsync(restored, "deleted, then restored unchanged");
+        File.SetLastWriteTimeUtc(restored, restoredWritten);
 
         // Since the scan: comes-back.txt returns and is backed up again (as the
         // background service would, one path), and two strays are adopted - one
@@ -962,8 +979,8 @@ internal static class Program
         await WaitFor(() => vm.IsPurging, 3000);
         await WaitFor(() => !vm.IsPurging, 60000);
         Check(!vm.IsPurging, $"the purge finished (\"{vm.SummaryText}\")");
-        Check(vm.SummaryText.Contains("left 1 file alone", StringComparison.Ordinal),
-            "and says it left one file alone that was backed up again since the scan");
+        Check(vm.SummaryText.Contains("left 2 files alone", StringComparison.Ordinal),
+            "and says it left two files alone: one backed up again since the scan, one back on disk");
         Check(vm.SummaryText.Contains("kept 1 stored file", StringComparison.Ordinal),
             "and that it kept one stored file the catalog uses again");
         Check(vm.SummaryText.Contains("deleted 2 files", StringComparison.Ordinal),
@@ -975,6 +992,8 @@ internal static class Program
             "comes-back.txt keeps its live record and its new stored copy");
         Check((await repo.GetFileRecordsByPathAsync(set.Id, gone)).All(r => r.IsDeleted) && !File.Exists(Stored(gone)),
             "gone.txt was purged: records retired, stored copy deleted");
+        Check(await repo.GetActiveLatestRecordByPathAsync(set.Id, restored) is not null && File.Exists(Stored(restored)),
+            "restored.txt, back on disk unchanged, keeps its record and its copy");
         Check(await repo.GetActiveLatestRecordByPathAsync(set.Id, keepMe) is not null && File.Exists(Stored(keepMe)),
             "keep-me.txt, its row unticked, keeps its record and its copy");
         Check(await repo.GetActiveLatestRecordByPathAsync(set.Id, gone2) is not null && File.Exists(Stored(gone2)),

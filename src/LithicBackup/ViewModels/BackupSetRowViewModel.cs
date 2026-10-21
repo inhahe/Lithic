@@ -62,6 +62,15 @@ public class BackupSetRowViewModel : ViewModelBase
         set { if (SetProperty(ref _isRunning, value)) CommandManager.InvalidateRequerySuggested(); }
     }
 
+    /// <summary>
+    /// Work is under way on the set: <see cref="IsRunning"/>, unless all that is
+    /// left is a finished run's panel, which stays up until it is dismissed.
+    /// Whatever refuses other work on the set asks this, and so does the hold
+    /// against the Worker (<c>MainViewModel.SyncAppHold</c>), which also lets a
+    /// paused backup go.
+    /// </summary>
+    public bool IsWorking => IsRunning && Progress is not { IsComplete: true };
+
     private string? _busyActivity;
     /// <summary>
     /// What is holding this row in <see cref="IsRunning"/> when it is not a backup:

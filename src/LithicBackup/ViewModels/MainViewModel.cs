@@ -4528,7 +4528,7 @@ public class MainViewModel : ViewModelBase
             {
                 RowWork = new RowWorkHooks
                 {
-                    DescribeBusy = () => RowFor(setId) is { IsRunning: true } r
+                    DescribeBusy = () => RowFor(setId) is { IsWorking: true } r
                         ? r.BusyActivity ?? "backing up"
                         : null,
                     Begin = cts =>
