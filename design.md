@@ -1940,15 +1940,40 @@ disk first:
   its progress. If the flush fails, the commit does not happen, the way-out one
   included (that is the case of the drive that has just gone), and what was noted
   stays noted, so a later attempt flushes it again. The next run copies the batch
-  again. (The disk is then ahead of the catalog, a `_prev` move or two recorded
-  nowhere. The `_prev` move already handles that case — "the catalog is behind
-  the drive" — as it does after a crash.)
+  again.
+* **A batch that rolls back leaves the disk ahead of the catalog,** and the next
+  run must not be misled by what it left:
+  * *Its moves into `_prev`.* The `_prev` move's "catalog is behind the drive"
+    case files the record under its `.vN` when the current path holds another
+    copy, as after a crash. When the current path holds nothing
+    (`FollowMissingCurrentCopyAsync`), the record follows its copy to its `.vN`,
+    or goes there all the same, so it never shares the current path with the new
+    copy. (When another file has that `.vN` name, the record is retired.)
+  * *Its new copies and blocks,* whose names may have survived without their
+    data. The way-out path records the span of time in which they were written
+    (`SuspectWrites`, beside the catalog, per destination). A copy at a current
+    path written in such a span is not recorded as a version of its own: it is
+    deleted, and the source copied afresh. A block written in one is written
+    again when next needed, rather than taken as stored. Write times tell them
+    apart, since a copy or block is written once and a rename keeps its time:
+    the durable old copies such a batch moved into the history are not
+    suspected.
+  * *A reference given new bytes.* When a file that keeps no history is
+    overwritten in place, a `.fileref` resolving to its old bytes is made a
+    plain copy first. That change is committed before the overwrite, and only
+    then is the reference's manifest deleted. A batch rolled back later cannot
+    make it a reference again with nothing to resolve to.
 * **Some writes are made durable at once, not at the commit:** a write that
-  something irreversible follows. Retention giving a `.fileref` the bytes of the
-  last plain copy of its content, before deleting that copy
-  (`TryPromoteFileRefToPlainAsync`), flushes the new copy first
-  (`DestinationWrites.MakeDurableNowAsync`), and keeps the old one if it cannot.
-  A new path that copies bytes and then deletes their source must do the same.
+  something irreversible follows. A `.fileref` given the bytes of the last
+  plain copy of its content, before that copy is deleted or overwritten
+  (`TryPromoteFileRefToPlainAsync`), has the new copy flushed first
+  (`DestinationWrites.MakeDurableNowAsync`). If that fails, the old bytes are
+  kept and the new copy is taken back. A new path that copies bytes and then
+  deletes their source must do the same.
+* **The seed and the moves flush before they take the set's write lock:** what
+  they record was renamed before the transaction, so the lock is held for the
+  inserts only. A run's batches flush under the lock, which they hold
+  throughout anyway.
 * **The flush** (`DestinationFlush`). The volume each written path is on is found
   from the folder it was written in, by handle (`DurableFlush.VolumeOf`,
   `GetFinalPathNameByHandle`, as `\\?\Volume{GUID}\`). A drive letter would
@@ -1960,16 +1985,25 @@ disk first:
   request (`VolumeFlushPipe`, `\\.\pipe\LithicBackup.FlushVolume`, served by
   `VolumeFlushServer`). The request is the volume's name, never a path: the
   service's logon session does not see the user's subst and network drives, and
-  the server refuses anything that is not a volume name. What no volume flush
-  covers (a network share, a file system without volume names, no service
-  answering, which is then not asked again for a minute) is flushed file by file,
-  one device flush each, after a check that the destination is still there.
+  the server refuses anything that is not a volume name. Its flushes run one at
+  a time and are shared: requests that arrive while a volume is being flushed
+  wait for the next flush, which covers them all. So a crowd of connections
+  costs at most two flushes of a volume, and one thread. What no volume flush
+  covers is flushed file by file, one device flush each: a network share, a
+  file system without volume names, or no service answering (which is then not
+  asked again for a minute). This is done after checking that the destination
+  is still there, and a copy that is gone with its folder fails the flush. A
+  folder that will not flush (a renamed one, on a file system that refuses)
+  fails it too.
 * **A drive that comes back.** A USB drive that drops off and comes back under
   the same letter has lost what was in the cache, yet its paths work again, and a
-  flush then succeeds, flushing none of what was lost. So a run holds its
-  destination folder open (`VolumeWatch`) from `Begin` on, and a commit after a
-  flush first checks that the handle still works. A handle from before the drop
-  never works again. Untested: it takes pulling the drive.
+  flush then succeeds, flushing none of what was lost. So a run holds a folder
+  on every volume it writes to (`VolumeWatch`): the destination from `Begin` on,
+  and another volume reached through a junction from the run's first write
+  there. A commit, after its flush, first checks that each handle still works:
+  a handle from before the drop never works again. A watch whose volume went
+  is renewed at the first write after a durable point, when the loss cost
+  nothing. Untested: it takes pulling the drive.
 * **Batches are larger, because each commit costs a flush:** 500 files, a file of
   100 MB or more, or 30 s (they were 50, 10 MB and 30 s). The flush writes out
   synchronously whatever the lazy writer has not yet written. Over a longer batch
@@ -1978,9 +2012,16 @@ disk first:
   the Worker now lets a waiting writer in between files (see "Writes to a set take
   turns, and the Worker gives way").
 
-`durability_test` covers the pieces and the runs: subst drives, junctions,
-read-only files, the pipe against a server in its own process, and a run, a seed
-and a folder move with a flush that records what it is given or fails.
+`durability_test` covers the pieces and the runs:
+- subst drives, junctions and read-only files;
+- the pipe against a server in its own process, and its shared flushes;
+- a run, a seed, a folder move, retention's promotions and a no-history
+  overwrite, each with a flush that records what it is given or fails;
+- what the next run makes of a batch that rolled back: a missing current copy,
+  a copy and blocks left behind.
+
+`DirectoryBackupService.CommitBatchSize` is public so harnesses can reach a
+commit boundary.
 
 ## Threading rules that bite
 

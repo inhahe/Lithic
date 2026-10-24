@@ -304,9 +304,8 @@ internal static class Program
 
     /// <summary>
     /// 24: Verify Integrity verifies when its window opens, and says so as it
-    /// goes. Its view model refused the run its constructor started (its loading
-    /// flag began true), so the window sat on "Preparing verification..." for
-    /// ever, with Verify unavailable.
+    /// goes: the run it starts on opening finishes, and Verify is available
+    /// again after it.
     /// </summary>
     static async Task VerifyStartsAsync()
     {

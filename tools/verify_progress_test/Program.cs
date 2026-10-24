@@ -1,11 +1,5 @@
 // Verify Integrity says what it is doing, how far it is, and for how long.
 //
-// The window sat on "Preparing verification..." with nothing to say whether it
-// was doing anything: the view model refused its own first run (its loading
-// flag started true), and the service, once running, said "Loading catalog..."
-// and "Scanning source files..." with no count, through a read sorted before
-// its first row and a scan with no progress at all.
-//
 // This drives the real VerifyService against a throwaway catalog of 200,000
 // records and checks that every step reports, at the ProgressCadence, its step
 // number, a count (and a percentage where the total is known) and its elapsed
@@ -147,6 +141,41 @@ Check(whileHeld.Count >= HoldMs / ProgressCadence.IntervalMs - 1
     $"while the catalog is held, the load keeps reporting ({whileHeld.Count} reports in {HoldMs:N0} ms)");
 Check(clocks.Count >= 2,
     $"and its time moves on meanwhile ({string.Join(",", clocks.Select(c => c.Trim(' ', '-')))})");
+
+Console.WriteLine();
+Console.WriteLine("=== 3. The records are read in no order, but their issues are listed by path ===");
+// Records whose stored copies are missing, added last-path-first, so the order
+// they are stored in is the reverse of their paths'.
+const int Missing = 50;
+using (var raw = new SqliteConnection(
+           $"Data Source={Path.Combine(repo.DataDirectory, "sets", $"set-{set.Id}.db")};Pooling=False"))
+{
+    raw.Open();
+    using var tx = raw.BeginTransaction();
+    using var ins = raw.CreateCommand();
+    ins.CommandText = """
+        INSERT INTO Files (DiscId, SourcePath, DiscPath, SizeBytes, Hash, Version, IsDeleted,
+                           SourceLastWriteUtc, BackedUpUtc)
+        VALUES ($disc, $path, $stored, 100, 'h', 1, 0, $when, $when)
+        """;
+    ins.Parameters.AddWithValue("$disc", disc.Id);
+    var pPath = ins.Parameters.Add("$path", SqliteType.Text);
+    var pStored = ins.Parameters.Add("$stored", SqliteType.Text);
+    ins.Parameters.AddWithValue("$when", DateTime.UtcNow.ToString("O"));
+    for (int i = Missing - 1; i >= 0; i--)
+    {
+        pPath.Value = $@"C:\gone\file_{i:D3}.dat";
+        pStored.Value = $"gone_{i:D3}.bin";
+        ins.ExecuteNonQuery();
+    }
+    tx.Commit();
+}
+var sorted = await Task.Run(() => service.VerifyAsync(job, dst, verifyContents: false, null));
+var goneIssues = sorted.Issues.Where(i => i.Path.StartsWith(@"C:\gone\", StringComparison.Ordinal))
+    .Select(i => i.Path).ToList();
+Check(goneIssues.Count == Missing
+      && goneIssues.SequenceEqual(goneIssues.Order(StringComparer.OrdinalIgnoreCase)),
+    $"{goneIssues.Count} missing copies, listed in path order (first {goneIssues.FirstOrDefault()})");
 
 Console.WriteLine();
 repo.Dispose();

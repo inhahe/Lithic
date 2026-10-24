@@ -69,6 +69,13 @@ design.md, "A copy is recorded only once it is on the disk". In short:
 - Batches grew from 50 files / 10 MB / 30 s to 500 / 100 MB / 30 s, since each
   commit now costs a flush. So that the larger batch does not keep the app
   waiting, the Worker now lets a waiting app in between files.
+- A batch that rolls back leaves the disk ahead of the catalog. The next run
+  copes with each kind of leftover:
+  - a record whose current copy was moved away follows it to its `.vN`;
+  - a copy or a block written in the span the failed batch could not make
+    durable is not trusted (`SuspectWrites`);
+  - a reference promoted in the batch was committed before the overwrite that
+    made it necessary.
 
 **The re-check proposed above was not needed.** It was to catch the drive that
 drops off and comes back, when a flush succeeds on the returned drive while
@@ -108,6 +115,25 @@ for a file renamed in that batch that another process is reading.
 **Verify integrity** on the set with **Verify file contents** on: it re-hashes
 everything stored on H: against the catalog and finds whatever these drops
 lost.
+
+## TECH DEBT: retention flushes the destination once for every reference it promotes (2026-10-24)
+
+When retention deletes the last plain copy of some content that a `.fileref`
+still resolves to, it first copies the bytes into that reference
+(`TryPromoteFileRefToPlainAsync`). It makes the copy durable before deleting
+the old one (`DestinationWrites.MakeDurableNowAsync`), and it does that once
+per promotion: a volume flush each, a pipe round trip plus a flush of the
+device's cache, tens of milliseconds on a USB disk. A pass with a few
+promotions doesn't notice. A pass that prunes a thousand last copies of
+referenced content would spend a minute or more just flushing.
+
+**Proper fix:** two passes over the expired versions. First make every
+promotion's copy, then flush once. Then flip the promoted records, delete their
+manifests, delete the expired copies and retire their records. The first pass
+has to remember which references it is promoting, so that a later version with
+the same hash, finding the content in a pending promotion, does not promote
+another one. On a flush failure the pass deletes the copies it made and keeps
+every expired copy. `durability_test` §13 is the test to extend.
 
 ## FIXED: "files under this folder" read every file of the set, and missed names starting with an emoji (2026-10-21)
 
@@ -207,6 +233,18 @@ dialog's "Settings not saved" message: the dialog stays open, backups keep the
 previous settings, and Save can be tried again. The test called `Save`, which
 drops the reason; it now calls `TrySave` and prints the first failure's
 message, so the next occurrence names it.
+
+**Seen again, with its reason (2026-10-24):** check 6 failed in a full run,
+"saved False/False", and the first failure was "settings.json stayed in use
+for a second, or cannot be replaced: Access is denied." So it is the replace
+itself (`File.Replace`/`MoveFileEx` onto a file that is there) failing with
+ERROR_ACCESS_DENIED for over a second, not a sharing violation. What denies
+it is not known yet. The likely candidates are the other save's replace in
+flight (a target with a delete pending refuses access until its last handle
+closes) and an antivirus scan holding the freshly written file. The next step
+is to log the Win32 error and the attempt count of each retry, and to see
+whether lengthening the retry, or retrying on ERROR_ACCESS_DENIED only while
+the target is delete-pending, makes it go away.
 
 ## FIXED: no backup set could be deleted in the session that created the catalog (2026-10-21)
 

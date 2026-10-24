@@ -1,3 +1,4 @@
+using System.Diagnostics;
 using System.IO.Pipes;
 using System.Security.AccessControl;
 using System.Security.Principal;
@@ -94,12 +95,19 @@ public static class VolumeFlushPipe
 
     /// <summary>
     /// Serve flush requests until <paramref name="ct"/> is cancelled. Each
-    /// connection is answered on its own task while the next one is awaited.
+    /// connection is answered on its own task while the next one is awaited; the
+    /// flushes themselves run one at a time, shared (<see cref="Flushes"/>).
     /// </summary>
     /// <param name="onError">Told of a server that could not be set up, or a request that failed.</param>
     /// <param name="pipeName">The pipe; another than <see cref="Name"/> only in tests.</param>
-    public static async Task ServeAsync(CancellationToken ct, Action<Exception>? onError = null, string pipeName = Name)
+    /// <param name="flushVolume">
+    /// What flushes a volume: <see cref="DurableFlush.TryFlushVolume"/>, or in a
+    /// test something that counts.
+    /// </param>
+    public static async Task ServeAsync(CancellationToken ct, Action<Exception>? onError = null, string pipeName = Name,
+        Func<string, (DurableFlush.Outcome Outcome, string? Error)>? flushVolume = null)
     {
+        var flushes = new Flushes(flushVolume ?? (volume => (DurableFlush.TryFlushVolume(volume, out var why), why)));
         while (!ct.IsCancellationRequested)
         {
             NamedPipeServerStream server;
@@ -134,12 +142,57 @@ public static class VolumeFlushPipe
                     return;
                 continue;
             }
-            _ = Task.Run(() => AnswerAsync(server, onError, ct), CancellationToken.None);
+            _ = Task.Run(() => AnswerAsync(server, flushes, onError, ct), CancellationToken.None);
+        }
+    }
+
+    /// <summary>
+    /// The server's flushes: one at a time, and shared. A request that arrives
+    /// while a flush of its volume is running waits for the next one, which covers
+    /// its writes, as it does those of every request that arrived meanwhile. So
+    /// however many connections ask at once, a volume is flushed at most twice
+    /// for them, and a flush holds one thread.
+    /// </summary>
+    private sealed class Flushes(Func<string, (DurableFlush.Outcome Outcome, string? Error)> flushVolume)
+    {
+        private readonly SemaphoreSlim _one = new(1, 1);
+
+        /// <summary>
+        /// Each volume's last flush: when it started, in <see cref="Stopwatch"/>
+        /// ticks, and how it went. Only volumes that could be opened are kept, so
+        /// requests naming volumes that do not exist add nothing.
+        /// </summary>
+        private readonly Dictionary<string, (long Started, DurableFlush.Outcome Outcome, string? Error)> _last =
+            new(StringComparer.OrdinalIgnoreCase);
+
+        public async Task<(DurableFlush.Outcome Outcome, string? Error)> FlushAsync(string volume, CancellationToken ct)
+        {
+            if (!DurableFlush.IsVolumeName(volume))
+                return (DurableFlush.Outcome.Failed, $"\"{volume}\" is not a volume name");
+            long arrived = Stopwatch.GetTimestamp();
+            await _one.WaitAsync(ct).ConfigureAwait(false);
+            try
+            {
+                // A flush that started after this request arrived covers the
+                // writes it was sent for.
+                if (_last.TryGetValue(volume, out var last) && last.Started > arrived)
+                    return (last.Outcome, last.Error);
+                long started = Stopwatch.GetTimestamp();
+                var (outcome, error) = flushVolume(volume);
+                if (outcome != DurableFlush.Outcome.Failed)
+                    _last[volume] = (started, outcome, error);
+                return (outcome, error);
+            }
+            finally
+            {
+                _one.Release();
+            }
         }
     }
 
     /// <summary>Read one request, flush, answer, hang up.</summary>
-    private static async Task AnswerAsync(NamedPipeServerStream server, Action<Exception>? onError, CancellationToken ct)
+    private static async Task AnswerAsync(
+        NamedPipeServerStream server, Flushes flushes, Action<Exception>? onError, CancellationToken ct)
     {
         await using (server)
         {
@@ -155,8 +208,7 @@ public static class VolumeFlushPipe
                 requestTime.CancelAfter(TimeSpan.FromSeconds(10));
                 string? volume = await reader.ReadLineAsync(requestTime.Token).ConfigureAwait(false);
 
-                // TryFlushVolume refuses anything but a volume's name.
-                var outcome = DurableFlush.TryFlushVolume(volume ?? "", out string? error);
+                var (outcome, error) = await flushes.FlushAsync(volume ?? "", ct).ConfigureAwait(false);
                 string reply = outcome == DurableFlush.Outcome.Flushed
                     ? "OK"
                     : $"{outcome.ToString().ToUpperInvariant()} {OneLine(error)}";

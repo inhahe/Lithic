@@ -312,9 +312,14 @@ public class VerifyService : IVerifyService
             return processed;
         }
         live.Done = 0;
+        int firstRecordIssue = issues.Count;
         await ReportingAsync(Task.Run(CheckRecordsAsync, ct),
             elapsed => Step(checking, live.Done, total, "records", elapsed, live.Current),
             progress).ConfigureAwait(false);
+        // The records were read in no order, and the window lists the first few
+        // thousand issues: by path, so a folder's issues stay together.
+        issues.Sort(firstRecordIssue, issues.Count - firstRecordIssue,
+            Comparer<VerifyIssue>.Create((a, b) => StringComparer.OrdinalIgnoreCase.Compare(a.Path, b.Path)));
 
         progress?.Report(new VerifyProgress
         {
@@ -388,7 +393,10 @@ public class VerifyService : IVerifyService
         progress.Report(snapshot(clock.Elapsed));
         while (await Task.WhenAny(work, Task.Delay(ProgressCadence.IntervalMs)).ConfigureAwait(false) != work)
             progress.Report(snapshot(clock.Elapsed));
-        return await work.ConfigureAwait(false);
+        var result = await work.ConfigureAwait(false);
+        // Where it ended, also when that came before the first tick.
+        progress.Report(snapshot(clock.Elapsed));
+        return result;
     }
 
     /// <summary>

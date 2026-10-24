@@ -121,10 +121,10 @@ public static class DurableFlush
     }
 
     /// <summary>
-    /// Flush one file's data, and the file system's records of it, onto the disk.
-    /// A folder is flushed the same way where the file system allows it (NTFS
-    /// does); where it does not, that is not counted as a failure, the folder's
-    /// own records going out with the next file flushed on its volume.
+    /// Flush one file's data, or one folder's entries, and the file system's
+    /// records of it, onto the disk. NTFS and FAT flush a folder; a file system
+    /// that will not leaves its rename undurable, which is a failure like any
+    /// other.
     /// </summary>
     /// <param name="path">A file or folder the caller wrote or renamed.</param>
     /// <param name="error">Why it was not flushed; null when it was.</param>
@@ -158,8 +158,6 @@ public static class DurableFlush
                 IntPtr.Zero, OPEN_EXISTING, isFolder ? FILE_FLAG_BACKUP_SEMANTICS : 0, IntPtr.Zero);
             if (handle.IsInvalid || !FlushFileBuffers(handle))
             {
-                if (isFolder)
-                    return true;
                 error = $"{path}: {LastError()}";
                 return false;
             }
@@ -239,6 +237,9 @@ public sealed class VolumeWatch : IDisposable
         _handle = handle;
         _folder = folder;
     }
+
+    /// <summary>The folder held.</summary>
+    public string Folder => _folder;
 
     /// <summary>
     /// Start watching <paramref name="folder"/>'s volume; null when the folder

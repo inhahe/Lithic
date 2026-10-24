@@ -81,6 +81,15 @@ public class DirectoryBackupService
     private readonly IDestinationFlush _destinationFlush;
 
     /// <summary>
+    /// The most files a run copies between two commits of its catalog records (a
+    /// file of 100 MB or more, and 30 s, also end a batch). Each commit flushes the
+    /// destination first, so a batch is a few hundred files; a cancel or a crash
+    /// copies at most that many again. Public for harnesses that need a run to
+    /// reach a commit.
+    /// </summary>
+    public const int CommitBatchSize = 500;
+
+    /// <summary>
     /// TESTING ONLY — when <c>true</c>, plain (non-deduplicated) file copies are
     /// written as tiny hash+size stubs instead of real content, so a dedup test
     /// run doesn't fill the destination drive. The block store (<c>_blocks</c>)
@@ -578,10 +587,8 @@ public class DirectoryBackupService
         //   - immediately after any large file (>= CommitLargeFileThreshold),
         //   - before starting a large file (to flush pending small files),
         //   - at least every CommitIntervalSeconds regardless of file size.
-        // Each commit first flushes the destination (MakeDurableAsync), one flush
-        // of the drive's cache, so the batches are a few hundred files: a cancel
-        // or a crash copies at most that many again.
-        const int CommitBatchSize = 500;
+        // Each commit first flushes the destination (MakeDurableAsync): see
+        // CommitBatchSize.
         const long CommitLargeFileThreshold = 100L * 1024 * 1024; // 100 MB
         const double CommitIntervalSeconds = 30;
 
@@ -592,6 +599,9 @@ public class DirectoryBackupService
         using var writes = DestinationWrites.Begin(targetDirectory);
         Task MakeDurableAsync(CancellationToken token) =>
             writes.MakeDurableAsync(_destinationFlush, token);
+        // When earlier runs here wrote what they could not make durable: a copy
+        // or block written then is not to be trusted (SuspectWrites).
+        var suspect = SuspectWrites.Load(_catalog.DataDirectory, targetDirectory);
         int batchCount = 0;
         var commitTimer = System.Diagnostics.Stopwatch.StartNew();
 
@@ -1176,13 +1186,33 @@ public class DirectoryBackupService
                     }
                     if (replacedRecord is { IsFileRef: false, IsDeduped: false }
                         && !string.IsNullOrEmpty(replacedRecord.Hash)
-                        && File.Exists(Path.Combine(targetDirectory, replacedRecord.DiscPath))
-                        && !await EnsureContentReachableAsync(
-                            backupSetId, replacedRecord, targetDirectory, replacedIds.ToHashSet(), ct))
+                        && File.Exists(Path.Combine(targetDirectory, replacedRecord.DiscPath)))
                     {
-                        keepVersions = true;
-                        replacedRecord = null;
-                        replacedIds = [];
+                        var (reachable, promotedManifest) = await EnsureContentReachableAsync(
+                            backupSetId, replacedRecord, targetDirectory, replacedIds.ToHashSet(), ct);
+                        if (!reachable)
+                        {
+                            keepVersions = true;
+                            replacedRecord = null;
+                            replacedIds = [];
+                        }
+                        else if (promotedManifest is not null)
+                        {
+                            // A reference was given these bytes, and its record
+                            // changed in this batch. Commit it before they are
+                            // overwritten: a batch rolled back later (its flush
+                            // failing) would otherwise leave the record calling it a
+                            // reference again, resolving to bytes no longer there.
+                            // Only then can its manifest go. Letting the lock go
+                            // means checking this file's number again, as a pause
+                            // does.
+                            await CommitAndReleaseAsync();
+                            await ReacquireLockAsync();
+                            TryDeleteFile(promotedManifest);
+                            var now = await _catalog.GetLastVersionAsync(backupSetId, file.FullPath, ct);
+                            if ((now?.HighestVersion ?? 0) != version - 1)
+                                throw new VersionTakenException();
+                        }
                     }
                     if (replacedRecord is not null && !string.IsNullOrEmpty(replacedRecord.Hash))
                         contentPathCache.Remove(replacedRecord.Hash);
@@ -1201,7 +1231,14 @@ public class DirectoryBackupService
                         targetDirectory, file.FullPath,
                         oldDeduped, oldFileRef);
 
-                    if (File.Exists(oldCurrentPath))
+                    if (!File.Exists(oldCurrentPath))
+                    {
+                        await FollowMissingCurrentCopyAsync(
+                            backupSetId, targetDirectory, file.FullPath, existingInfo, ct);
+                        if (!string.IsNullOrEmpty(existingInfo.Hash))
+                            contentPathCache.Remove(existingInfo.Hash);
+                    }
+                    else
                     {
                         int oldVersion = existingInfo.MaxVersion;
 
@@ -1234,6 +1271,8 @@ public class DirectoryBackupService
                         int prevVersion = oldVersion;
                         // Which case: the record's own .vN holds its content.
                         bool catalogBehind = false;
+                        // The copy at the current path is not to be kept (see below).
+                        bool discardCurrent = false;
                         // The newer copy at the current path, when the catalog is
                         // behind and it can be read; it gets a record of its own.
                         StoredFileInfo? unrecordedCopy = null;
@@ -1256,7 +1295,16 @@ public class DirectoryBackupService
                                         await DescribeStoredCopyAsync(
                                             recordedPrev, oldDeduped, oldFileRef, hashPlain, ct),
                                         existingInfo);
-                                if (catalogBehind && atCurrent is not null)
+                                if (catalogBehind && atCurrent is not null && !suspect.IsEmpty
+                                    && suspect.Covers(File.GetLastWriteTimeUtc(oldCurrentPath)))
+                                {
+                                    // Written by a batch whose drive went before it
+                                    // could be made durable: its name survived, its
+                                    // data perhaps not. Not recorded; deleted below,
+                                    // and the source copied afresh.
+                                    discardCurrent = true;
+                                }
+                                else if (catalogBehind && atCurrent is not null)
                                 {
                                     // Hash the newer copy for its own record (the
                                     // match check may have stopped at its size).
@@ -1275,15 +1323,24 @@ public class DirectoryBackupService
                             targetDirectory, file.FullPath, prevVersion,
                             oldDeduped, oldFileRef);
 
-                        string? prevDir = Path.GetDirectoryName(prevPath);
-                        if (prevDir is not null)
-                            Directory.CreateDirectory(prevDir);
+                        if (discardCurrent)
+                        {
+                            // Nothing takes the fresh number, so the new copy does.
+                            ForceDeleteFile(oldCurrentPath);
+                            version = prevVersion;
+                        }
+                        else
+                        {
+                            string? prevDir = Path.GetDirectoryName(prevPath);
+                            if (prevDir is not null)
+                                Directory.CreateDirectory(prevDir);
 
-                        // Never replaces a file: if one appeared since the check,
-                        // this throws and the file fails (and is retried next run)
-                        // rather than destroy a version.
-                        File.Move(oldCurrentPath, prevPath, overwrite: false);
-                        DestinationWrites.Note(prevPath);
+                            // Never replaces a file: if one appeared since the check,
+                            // this throws and the file fails (and is retried next run)
+                            // rather than destroy a version.
+                            File.Move(oldCurrentPath, prevPath, overwrite: false);
+                            DestinationWrites.Note(prevPath);
+                        }
 
                         string prevDiscPath = GetPrevDiscPath(
                             file.FullPath, prevVersion, oldDeduped, oldFileRef);
@@ -1407,10 +1464,10 @@ public class DirectoryBackupService
                     // by streaming the file from disk.
                     if (contentBuffer is not null)
                         await WriteNewBlocksFromBufferAsync(contentBuffer, recipe,
-                            job.DeduplicationBlockSize, blockStoreDir, ct);
+                            job.DeduplicationBlockSize, blockStoreDir, suspect, ct);
                     else
                         await WriteNewBlocksAsync(file.FullPath, recipe,
-                            job.DeduplicationBlockSize, blockStoreDir, ct);
+                            job.DeduplicationBlockSize, blockStoreDir, suspect, ct);
 
                     // Write the .dedup manifest (JSON recipe).
                     var manifest = new DedupManifest
@@ -1761,12 +1818,18 @@ public class DirectoryBackupService
             // has just gone, taking those copies with it; then the batch rolls
             // back, and the next backup copies them again. Not cancellable: a
             // cancel is what saves its progress here.
+            bool durable = false;
             try
             {
                 await MakeDurableAsync(CancellationToken.None);
+                durable = true;
                 tx.Complete();
             }
             catch { /* not durable, or not committable: rolled back */ }
+            // What it wrote may still be on the disk, its names without their
+            // data: the next run must not take it for copies of its own.
+            if (!durable)
+                suspect.Add(targetDirectory, writes.PendingSinceUtc);
             throw;
         }
         finally
@@ -2025,11 +2088,16 @@ public class DirectoryBackupService
                     // bytes, before deleting.
                     if (!fileRecord.IsFileRef && !fileRecord.IsDeduped
                         && !string.IsNullOrEmpty(fileRecord.Hash)
-                        && File.Exists(prevPath)
-                        && !await EnsureContentReachableAsync(
-                            backupSetId, fileRecord, targetDirectory, toDeleteIds, ct))
+                        && File.Exists(prevPath))
                     {
-                        continue; // a reference needs these bytes: leave file and record
+                        var (reachable, promotedManifest) = await EnsureContentReachableAsync(
+                            backupSetId, fileRecord, targetDirectory, toDeleteIds, ct);
+                        if (!reachable)
+                            continue; // a reference needs these bytes: leave file and record
+                        // Its record is a plain copy's now, committed (no batch is
+                        // open here): its manifest can go.
+                        if (promotedManifest is not null)
+                            TryDeleteFile(promotedManifest);
                     }
 
                     // Remove the physical file, then flip the catalog bit ONLY
@@ -2590,6 +2658,10 @@ public class DirectoryBackupService
                 return TargetedMoveOutcome.FellBack;
             }
 
+            // The renames on the disk before the records say so, and before the
+            // transaction holds the set's write lock; when they cannot be made
+            // durable, the catch below puts the trees back.
+            await writes.MakeDurableAsync(_destinationFlush, ct);
             using var tx = await _catalog.BeginTransactionAsync(setId, ct);
             foreach (var rec in records)
             {
@@ -2599,9 +2671,6 @@ public class DirectoryBackupService
                 rec.SourcePath = newSource;
                 await _catalog.UpdateFileRecordAsync(rec, ct);
             }
-            // The renames on the disk before the records say so; when they cannot
-            // be made durable, the catch below puts the trees back.
-            await writes.MakeDurableAsync(_destinationFlush, ct);
             tx.Complete();
             trace?.Invoke($"updated {records.Count} catalog record(s) to the new path -> Relocated.");
             return TargetedMoveOutcome.Relocated;
@@ -2655,6 +2724,10 @@ public class DirectoryBackupService
                 return TargetedMoveOutcome.FellBack;
             }
 
+            // The renames on the disk before the records say so, and before the
+            // transaction holds the set's write lock; when they cannot be made
+            // durable, the catch below puts the files back.
+            await writes.MakeDurableAsync(_destinationFlush, ct);
             using var tx = await _catalog.BeginTransactionAsync(setId, ct);
             foreach (var rec in records)
             {
@@ -2663,9 +2736,6 @@ public class DirectoryBackupService
                 rec.SourcePath = newPath;
                 await _catalog.UpdateFileRecordAsync(rec, ct);
             }
-            // The renames on the disk before the records say so; when they cannot
-            // be made durable, the catch below puts the files back.
-            await writes.MakeDurableAsync(_destinationFlush, ct);
             tx.Complete();
             trace?.Invoke($"updated {records.Count} catalog record(s) -> Relocated.");
             return TargetedMoveOutcome.Relocated;
@@ -3206,6 +3276,19 @@ public class DirectoryBackupService
     // -------------------------------------------------------------------
 
     /// <summary>
+    /// Whether a block goes into the store: it is not there, or it is there from
+    /// a batch that was never made durable, its data perhaps lost
+    /// (<see cref="SuspectWrites"/>). Rewritten, it is a write of this run's.
+    /// </summary>
+    /// <param name="known">Whether the dedup analysis found the block in the store.</param>
+    private static bool BlockNeedsWriting(bool known, string blockPath, SuspectWrites suspect)
+    {
+        if (suspect.IsEmpty)
+            return !known && !File.Exists(blockPath);
+        return !File.Exists(blockPath) || suspect.Covers(File.GetLastWriteTimeUtc(blockPath));
+    }
+
+    /// <summary>
     /// Write blocks that are new (not already in the store) to _blocks/{hash}.blk.
     /// </summary>
     private static async Task WriteNewBlocksAsync(
@@ -3213,6 +3296,7 @@ public class DirectoryBackupService
         DeduplicationRecipe recipe,
         int blockSize,
         string blockStoreDir,
+        SuspectWrites suspect,
         CancellationToken ct)
     {
         await using var src = new FileStream(
@@ -3228,18 +3312,14 @@ public class DirectoryBackupService
             int bytesRead = await ReadFullBlockAsync(src, buffer, ct);
             if (bytesRead == 0) break;
 
-            if (!block.IsExisting)
+            string blockPath = Path.Combine(blockStoreDir, block.Hash + ".blk");
+            if (BlockNeedsWriting(block.IsExisting, blockPath, suspect))
             {
-                // New block — write it to the store.
-                string blockPath = Path.Combine(blockStoreDir, block.Hash + ".blk");
-                if (!File.Exists(blockPath))
-                {
-                    await using var dst = new FileStream(
-                        blockPath, FileMode.Create, FileAccess.Write,
-                        FileShare.None, bufferSize: 81920, useAsync: true);
-                    await dst.WriteAsync(buffer.AsMemory(0, bytesRead), ct);
-                    DestinationWrites.Note(blockPath);
-                }
+                await using var dst = new FileStream(
+                    blockPath, FileMode.Create, FileAccess.Write,
+                    FileShare.None, bufferSize: 81920, useAsync: true);
+                await dst.WriteAsync(buffer.AsMemory(0, bytesRead), ct);
+                DestinationWrites.Note(blockPath);
             }
         }
     }
@@ -3254,6 +3334,7 @@ public class DirectoryBackupService
         DeduplicationRecipe recipe,
         int blockSize,
         string blockStoreDir,
+        SuspectWrites suspect,
         CancellationToken ct)
     {
         int offset = 0;
@@ -3262,17 +3343,14 @@ public class DirectoryBackupService
             int len = Math.Min(blockSize, content.Length - offset);
             if (len <= 0) break;
 
-            if (!block.IsExisting)
+            string blockPath = Path.Combine(blockStoreDir, block.Hash + ".blk");
+            if (BlockNeedsWriting(block.IsExisting, blockPath, suspect))
             {
-                string blockPath = Path.Combine(blockStoreDir, block.Hash + ".blk");
-                if (!File.Exists(blockPath))
-                {
-                    await using var dst = new FileStream(
-                        blockPath, FileMode.Create, FileAccess.Write,
-                        FileShare.None, bufferSize: 81920, useAsync: true);
-                    await dst.WriteAsync(content.AsMemory(offset, len), ct);
-                    DestinationWrites.Note(blockPath);
-                }
+                await using var dst = new FileStream(
+                    blockPath, FileMode.Create, FileAccess.Write,
+                    FileShare.None, bufferSize: 81920, useAsync: true);
+                await dst.WriteAsync(content.AsMemory(offset, len), ct);
+                DestinationWrites.Note(blockPath);
             }
 
             offset += len;
@@ -3377,6 +3455,44 @@ public class DirectoryBackupService
         => File.Exists(GetPrevPath(targetDir, fullPath, version, false, false))
         || File.Exists(GetPrevPath(targetDir, fullPath, version, true, false))
         || File.Exists(GetPrevPath(targetDir, fullPath, version, false, true));
+
+    /// <summary>
+    /// The live record's copy is not at the current path, where the new copy is
+    /// about to be written and recorded. A batch moved it into the history and
+    /// was then not recorded (its drive went before it could be made durable), or
+    /// it was removed by hand. The record must not stay pointing there: it and the
+    /// new copy would share a path, and restoring it would give the new copy's
+    /// bytes. It follows its copy to its own <c>.vN</c> when that holds its
+    /// content. When nothing is there, it goes there all the same, so Verify finds
+    /// it missing rather than finding the new copy in its place. When another
+    /// file has the name, the record is retired.
+    /// </summary>
+    /// <param name="existingInfo">The path's live head, as the run read it.</param>
+    private async Task FollowMissingCurrentCopyAsync(
+        int backupSetId, string targetDirectory, string sourcePath, FileVersionInfo existingInfo, CancellationToken ct)
+    {
+        var record = await _catalog.GetFileRecordByPathAndVersionAsync(
+            backupSetId, sourcePath, existingInfo.MaxVersion, ct);
+        if (record is null || IsPrevDiscPath(record.DiscPath))
+            return;
+        string prevDiscPath = GetPrevDiscPath(sourcePath, record.Version, record.IsDeduped, record.IsFileRef);
+        string prevAbs = Path.Combine(targetDirectory, prevDiscPath);
+        if (File.Exists(prevAbs) && !StoredCopyMatches(
+                await DescribeStoredCopyAsync(prevAbs, record.IsDeduped, record.IsFileRef,
+                    hashPlain: !string.IsNullOrEmpty(record.Hash), ct),
+                existingInfo))
+        {
+            record.IsDeleted = true;
+            await _catalog.UpdateFileRecordAsync(record, ct);
+            return;
+        }
+        string currentDiscPath = record.DiscPath;
+        record.DiscPath = prevDiscPath;
+        await _catalog.UpdateFileRecordAsync(record, ct);
+        if (!record.IsDeduped && !record.IsFileRef && !string.IsNullOrEmpty(record.Hash))
+            await UpdateFileRefContentPathsAsync(
+                backupSetId, record.Hash, prevDiscPath, targetDirectory, ct, onlyIfHintIs: currentDiscPath);
+    }
 
     /// <summary>
     /// Size and content hash of a stored copy. A manifest's figures come from the
@@ -3581,15 +3697,21 @@ public class DirectoryBackupService
     /// sure no surviving <c>.fileref</c> is left resolving to its content with
     /// nowhere to find it: if another plain copy survives, repoint the references
     /// whose hint named this one; otherwise promote one reference into a real
-    /// plain file using these bytes. Returns <c>false</c> when a reference needs
-    /// the bytes and could not be given them; the caller keeps them.
+    /// plain file using these bytes.
     /// </summary>
     /// <param name="alsoGoing">Records going in the same pass, which survive no more than this one.</param>
+    /// <returns>
+    /// Reachable: false when a reference needs the bytes and could not be given
+    /// them; the caller keeps them. PromotedManifest: when a reference was made a
+    /// plain copy, its <c>.fileref</c> manifest, which the caller deletes once
+    /// the reference's changed record is committed - until then the record may
+    /// yet roll back to it.
+    /// </returns>
     /// <remarks>
     /// A row at the same stored path is not another copy: it is this file, and
     /// goes with it (a catalog duplicate, a seed run twice).
     /// </remarks>
-    private async Task<bool> EnsureContentReachableAsync(
+    private async Task<(bool Reachable, string? PromotedManifest)> EnsureContentReachableAsync(
         int backupSetId, FileRecord going, string targetDirectory,
         IReadOnlySet<long>? alsoGoing, CancellationToken ct)
     {
@@ -3612,22 +3734,23 @@ public class DirectoryBackupService
         {
             await UpdateFileRefContentPathsAsync(
                 backupSetId, going.Hash, survivingPlain.DiscPath, targetDirectory, ct, onlyIfHintIs: going.DiscPath);
-            return true;
+            return (true, null);
         }
 
         var survivingRef = others.FirstOrDefault(r => r.IsFileRef);
         if (survivingRef is null)
-            return true; // nothing refers to this content
+            return (true, null); // nothing refers to this content
 
+        string manifest = Path.Combine(targetDirectory, survivingRef.DiscPath);
         if (!await TryPromoteFileRefToPlainAsync(
                 targetDirectory, Path.Combine(targetDirectory, going.DiscPath), survivingRef, ct))
-            return false;
+            return (false, null);
 
         // The promoted reference holds the bytes now, at its suffix-less path;
         // every other reference's hint goes there.
         await UpdateFileRefContentPathsAsync(
             backupSetId, going.Hash, survivingRef.DiscPath, targetDirectory, ct);
-        return true;
+        return (true, manifest);
     }
 
     /// <summary>
@@ -3647,21 +3770,21 @@ public class DirectoryBackupService
     /// <summary>
     /// Materialise a <c>.fileref</c> record into a real plain file using bytes
     /// from <paramref name="sourceBytesPath"/> — an existing plain copy of the
-    /// same content that is about to be deleted by retention. Replaces the
-    /// reference's on-disk <c>.fileref</c> manifest with the actual content and
-    /// flips its catalog record to a plain copy at the new (suffix-less) path.
-    /// Returns <c>false</c> (leaving everything untouched) on any failure, so the
+    /// same content that is about to be deleted or overwritten. Writes the content
+    /// beside the reference's <c>.fileref</c> manifest, at its suffix-less path,
+    /// makes it durable, and flips the catalog record to a plain copy there. The
+    /// manifest stays: it is the caller's to delete once the record's change is
+    /// committed. Returns <c>false</c> on any failure, the copy taken back, so the
     /// caller can keep the source bytes rather than orphan the reference.
     /// </summary>
     private async Task<bool> TryPromoteFileRefToPlainAsync(
         string targetDirectory, string sourceBytesPath, FileRecord fileRef, CancellationToken ct)
     {
+        string plainDiscPath = StripFileRefSuffix(fileRef.DiscPath);
+        string plainAbsPath = Path.Combine(targetDirectory, plainDiscPath);
+        bool copied = false;
         try
         {
-            string refAbsPath = Path.Combine(targetDirectory, fileRef.DiscPath);
-            string plainDiscPath = StripFileRefSuffix(fileRef.DiscPath);
-            string plainAbsPath = Path.Combine(targetDirectory, plainDiscPath);
-
             string? dir = Path.GetDirectoryName(plainAbsPath);
             if (dir is not null)
                 Directory.CreateDirectory(dir);
@@ -3672,20 +3795,13 @@ public class DirectoryBackupService
             // leaves a read-only file on the destination that later resists
             // retention/cleanup deletion.
             File.Copy(sourceBytesPath, plainAbsPath, overwrite: true);
+            copied = true;
             DestinationWrites.Note(plainAbsPath);
             ClearReadOnly(plainAbsPath);
             // On the disk before anything is deleted: the caller deletes or
             // overwrites the bytes this was copied from next, and then it is the
             // only copy. When it cannot be made durable, they stay (false).
-            await DestinationWrites.MakeDurableNowAsync(_destinationFlush, targetDirectory, plainAbsPath, ct);
-
-            // Remove the now-redundant .fileref manifest (it differs from the
-            // plain path only by the ".fileref" suffix).
-            if (!string.Equals(refAbsPath, plainAbsPath, StringComparison.OrdinalIgnoreCase)
-                && File.Exists(refAbsPath))
-            {
-                ForceDeleteFile(refAbsPath);
-            }
+            await DestinationWrites.MakeDurableNowAsync(_destinationFlush, ct);
 
             // Flip the catalog record to a plain copy at its new path.
             fileRef.IsFileRef = false;
@@ -3695,7 +3811,22 @@ public class DirectoryBackupService
         }
         catch
         {
+            // The record is still the reference's: nothing may sit beside it.
+            if (copied)
+                TryDeleteFile(plainAbsPath);
             return false;
+        }
+    }
+
+    /// <summary>Delete a file we own on the destination if we can; a stray file is Cleanup's to find.</summary>
+    private static void TryDeleteFile(string path)
+    {
+        try
+        {
+            ForceDeleteFile(path);
+        }
+        catch (Exception ex) when (ex is IOException or UnauthorizedAccessException)
+        {
         }
     }
 
@@ -4195,13 +4326,16 @@ public class DirectoryBackupService
         {
             if (pending.Count == 0)
                 return;
+            // What the batch moved into the history is on the disk before its
+            // records say so: before the transaction, so that holds the set's
+            // write lock for the inserts only.
+            await writes.MakeDurableAsync(_destinationFlush, CancellationToken.None);
             // Not cancellable: a batch is committed whole or not at all.
             var tx = await _catalog.BeginTransactionAsync(backupSetId, CancellationToken.None);
             try
             {
                 foreach (var rec in pending)
                     await _catalog.CreateFileRecordAsync(rec, CancellationToken.None);
-                await writes.MakeDurableAsync(_destinationFlush, CancellationToken.None);
                 tx.Complete();
             }
             finally

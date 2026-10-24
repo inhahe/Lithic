@@ -69,8 +69,8 @@ BackupJob MakeJob() => new()
 // ===================================================================
 Console.WriteLine("=== B: commit-boundary hook during a full scan ===");
 
-// CommitBatchSize is 50, so 130 files guarantees several boundaries.
-const int FileCount = 130;
+// Two batches and some: several boundaries.
+const int FileCount = 2 * DirectoryBackupService.CommitBatchSize + 30;
 for (int i = 0; i < FileCount; i++)
     await File.WriteAllTextAsync(Path.Combine(source, $"f{i:D3}.txt"), $"contents of file {i}");
 

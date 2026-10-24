@@ -643,7 +643,7 @@ internal static class Program
         string boundary = Path.Combine(raceDir, "fourteen_boundary.txt");
         File.WriteAllText(boundary, "one");
         await svc.ExecuteTargetedAsync(job, dest, [boundary], tiers, CancellationToken.None);
-        var fillers = MakeBatch(src, "fourteen_fill", 50, 512);   // one commit batch ahead of it
+        var fillers = MakeBatch(src, "fourteen_fill", DirectoryBackupService.CommitBatchSize, 512);   // one commit batch ahead of it
         File.WriteAllText(boundary, "two, edited");
         static ScannedFile Scan(string p) => new()
         {

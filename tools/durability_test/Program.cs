@@ -17,6 +17,13 @@
 //  13.  Retention making a reference a plain copy, from the bytes of the last
 //       plain copy it is about to delete: that copy is flushed first, and when
 //       it cannot be, the bytes stay.
+//  14-16. What the next run makes of a batch that rolled back: a record whose
+//       current copy is gone follows it; a copy or block written in the span
+//       that was never made durable is not trusted.
+//  17.  File by file, a copy gone with its folder fails the flush.
+//  18.  The service shares one flush among requests that arrive together.
+//  19.  No history: a reference made a plain copy is committed before the
+//       overwrite that needed it, whatever the batch does after.
 //
 // Not covered: a USB drive that drops off and comes back (VolumeWatch.WasLost
 // true), which takes the hardware.
@@ -171,7 +178,9 @@ try
     var (nobody, nobodyWhy) = await VolumeFlushPipe.RequestAsync(tempVolume ?? "", CancellationToken.None, testPipe);
     sw.Stop();
     Check(nobody is null && nobodyWhy is not null, $"with no service, no outcome ({nobodyWhy})");
-    Check(sw.Elapsed < TimeSpan.FromSeconds(3), $"and it is known in {sw.ElapsedMilliseconds} ms");
+    // A 1 s connect timeout, which a loaded machine stretches: the check is that
+    // nobody waits for the reply timeout (minutes) instead.
+    Check(sw.Elapsed < TimeSpan.FromSeconds(10), $"and it is known in {sw.ElapsedMilliseconds} ms");
 
     var serverErrors = new List<Exception>();
     using var stopServer = new CancellationTokenSource();
@@ -238,6 +247,7 @@ try
     string catalogDir = Path.Combine(root, "catalog");
     Directory.CreateDirectory(catalogDir);
     repo = new SqliteCatalogRepository(Path.Combine(catalogDir, "catalog.db"));
+    string LockFile(int setId) => Path.Combine(catalogDir, "sets", $"set-{setId}.db.writelock");
 
     async Task<(BackupSet Set, string Source, string Target)> NewSet(string name, int files)
     {
@@ -403,11 +413,14 @@ try
               && (await repo.GetFileRecordsUnderDirectoryAsync(set.Id, newDir)).Count == 0,
             "and its records still say the old place");
 
-        ok.Calls.Clear();
-        outcome = await svc.MoveTargetedAsync(Job(set, src, dst), dst, oldDir, newDir, isDirectory: true, CancellationToken.None);
+        bool? lockHeldAtMoveFlush = null;
+        var moving = new RecordingFlush { OnFlush = _ => lockHeldAtMoveFlush = IsHeld(LockFile(set.Id)) };
+        outcome = await Service(moving).MoveTargetedAsync(Job(set, src, dst), dst, oldDir, newDir, isDirectory: true,
+            CancellationToken.None);
         Check(outcome == TargetedMoveOutcome.Relocated, $"with a working flush it relocates ({outcome})");
-        Check(ok.Calls.Count == 1 && ok.Calls[0].Written.Contains(newCopy, StringComparer.OrdinalIgnoreCase),
+        Check(moving.Calls.Count == 1 && moving.Calls[0].Written.Contains(newCopy, StringComparer.OrdinalIgnoreCase),
             "after flushing the copy's new name");
+        Check(lockHeldAtMoveFlush == false, "and before taking the set's write lock, not while holding it");
 
         // A seed moves an older stored form at a file's current location into the
         // history: an empty-content .fileref older than the plain copy beside it.
@@ -431,13 +444,19 @@ try
         var seedGone = new RecordingFlush { Fails = _ => true };
         var seedError = await Try(() => Service(seedGone).SeedFromExistingDirectoryAsync(seedSetA.Id, seedFailing));
         Check(seedError is IOException, $"a seed whose flush fails fails ({seedError?.GetType().Name})");
-        Check((await repo.GetAllFilesForBackupSetAsync(seedSetA.Id)).Count == 0, "and records nothing");
+        // Paths seeded before the move may be committed (the seed commits every
+        // 2 s, and they needed no flush); the moved one's batch may not.
+        string movedSource = Path.Combine(newDir, Path.GetFileName(anyCopy));
+        Check(!(await repo.GetAllFilesForBackupSetAsync(seedSetA.Id))
+                  .Any(r => string.Equals(r.SourcePath, movedSource, StringComparison.OrdinalIgnoreCase)),
+            "and records nothing of the file whose older copy it moved");
 
         var seedSetB = await repo.CreateBackupSetAsync(new BackupSet
         {
             Name = "seed working", SourceRoots = [src], CreatedUtc = DateTime.UtcNow, DefaultMediaType = MediaType.Directory,
         });
-        var seedOk = new RecordingFlush();
+        bool? lockHeldAtSeedFlush = null;
+        var seedOk = new RecordingFlush { OnFlush = _ => lockHeldAtSeedFlush = IsHeld(LockFile(seedSetB.Id)) };
         var seeded = await Service(seedOk).SeedFromExistingDirectoryAsync(seedSetB.Id, seedWorking);
         Check(seeded.MovedToHistory == 1, $"a seed moves the older form into the history ({seeded.MovedToHistory})");
         var movedRecord = (await repo.GetAllFilesForBackupSetAsync(seedSetB.Id))
@@ -445,6 +464,7 @@ try
         string? movedTo = movedRecord is null ? null : Path.GetFullPath(Path.Combine(seedWorking, movedRecord.DiscPath));
         Check(movedTo is not null && seedOk.Flushed().Contains(movedTo),
             $"and flushes it at its new place before recording it there ({movedTo})");
+        Check(lockHeldAtSeedFlush == false, "before taking the set's write lock, which it holds for the inserts only");
     }
 
     // ===================================================================
@@ -515,13 +535,221 @@ try
                   && File.ReadAllText(Path.Combine(dst, bAfter.DiscPath)) == "one content, two files",
                 "b.txt is a plain copy now, holding the content");
             Check(aOld is not null && aOld.IsDeleted && !File.Exists(aV1), "and a.txt's old version is gone");
+            Check(!File.Exists(bPlain + ".fileref"), "and so is b.txt's manifest");
         }
         else
         {
-            Check(bAfter.IsFileRef, "when that flush fails, b.txt stays a reference");
+            Check(bAfter.IsFileRef && File.Exists(bPlain + ".fileref"), "when that flush fails, b.txt stays a reference");
+            Check(!File.Exists(bPlain), "with nothing left beside it");
             Check(aOld is not null && !aOld.IsDeleted && File.Exists(aV1),
                 "and a.txt's old version, the bytes it resolves to, is kept");
         }
+    }
+
+    // Where a source file's copies are in a destination.
+    static string CurrentIn(string dst, string s) => Path.Combine(dst, s[..1], s[Path.GetPathRoot(s)!.Length..]);
+    static string PrevIn(string dst, string s, int v) =>
+        Path.Combine(dst, s[..1] + "_prev", s[Path.GetPathRoot(s)!.Length..] + $".v{v}");
+
+    // ===================================================================
+    Console.WriteLine();
+    Console.WriteLine("=== 14. A current copy that is not there: its record does not stay where the new one goes ===");
+    // ===================================================================
+    {
+        var (set, src, dst) = await NewSet("missing-current", 0);
+        Directory.CreateDirectory(src);
+        string a = Path.Combine(src, "a.txt");   // moved into the history by a batch then not recorded
+        string b = Path.Combine(src, "b.txt");   // deleted from the destination by hand
+        File.WriteAllText(a, "a one");
+        File.WriteAllText(b, "b one");
+        var svc = Service(new RecordingFlush());
+        Check((await svc.ExecuteAsync(Job(set, src, dst), dst, null, null, CancellationToken.None)).Success, "backed up");
+        Directory.CreateDirectory(Path.GetDirectoryName(PrevIn(dst, a, 1))!);
+        File.Move(CurrentIn(dst, a), PrevIn(dst, a, 1));
+        File.Delete(CurrentIn(dst, b));
+        File.WriteAllText(a, "a two");
+        File.WriteAllText(b, "b two");
+        Check((await svc.ExecuteAsync(Job(set, src, dst), dst, null, null, CancellationToken.None)).Success,
+            "backed up after both changed");
+        foreach (var (path, old, kept) in new[] { (a, "a one", true), (b, "b one", false) })
+        {
+            string name = Path.GetFileName(path);
+            var recs = (await repo.GetFileRecordsByPathAsync(set.Id, path)).OrderBy(r => r.Version).ToList();
+            Check(recs.Count == 2 && recs.Select(r => r.DiscPath).Distinct(StringComparer.OrdinalIgnoreCase).Count() == 2,
+                $"{name}: two versions, at two places ({string.Join(", ", recs.Select(r => $"v{r.Version} at {r.DiscPath[^12..]}"))})");
+            if (recs.Count != 2)
+                continue;
+            Check(string.Equals(Path.GetFullPath(Path.Combine(dst, recs[0].DiscPath)), PrevIn(dst, path, 1),
+                    StringComparison.OrdinalIgnoreCase),
+                $"{name}: version 1 is recorded at its .v1");
+            Check(kept ? File.Exists(PrevIn(dst, path, 1)) && File.ReadAllText(PrevIn(dst, path, 1)) == old
+                       : !File.Exists(PrevIn(dst, path, 1)),
+                kept ? $"{name}: which holds it" : $"{name}: where it is not, which Verify will report");
+            Check(File.ReadAllText(Path.Combine(dst, recs[1].DiscPath)) == File.ReadAllText(path),
+                $"{name}: version 2 is the new copy, at the current path");
+        }
+    }
+
+    // ===================================================================
+    Console.WriteLine();
+    Console.WriteLine("=== 15. A batch never made durable: what it left is not taken for a version ===");
+    // ===================================================================
+    {
+        var (set, src, dst) = await NewSet("never-durable", 0);
+        Directory.CreateDirectory(src);
+        string c = Path.Combine(src, "c.txt");
+        File.WriteAllText(c, "c one");
+        var svc = Service(new RecordingFlush());
+        Check((await svc.ExecuteAsync(Job(set, src, dst), dst, null, null, CancellationToken.None)).Success, "backed up");
+        File.WriteAllText(c, "c two");
+        var error = await Try(() => Service(new RecordingFlush { Fails = _ => true })
+            .ExecuteAsync(Job(set, src, dst), dst, null, null, CancellationToken.None));
+        Check(error is IOException, $"a run whose drive goes fails ({error?.GetType().Name})");
+        Check(File.Exists(PrevIn(dst, c, 1)) && File.Exists(CurrentIn(dst, c))
+              && (await repo.GetFileRecordsByPathAsync(set.Id, c)).Count == 1,
+            "leaving its move into the history and its new copy on the disk, and neither recorded");
+        string ledgers = Path.Combine(catalogDir, "unflushed");
+        Check(Directory.Exists(ledgers) && Directory.EnumerateFiles(ledgers)
+                  .Any(f => File.ReadLines(f).First().Contains(dst, StringComparison.OrdinalIgnoreCase)),
+            "and noting, beside the catalog, that writes there were never made durable");
+
+        Check((await svc.ExecuteAsync(Job(set, src, dst), dst, null, null, CancellationToken.None)).Success,
+            "the next run succeeds");
+        var recs = (await repo.GetFileRecordsByPathAsync(set.Id, c)).OrderBy(r => r.Version).ToList();
+        Check(recs.Count == 2,
+            $"c.txt has its two versions, the failed batch's copy not recorded as a third ({recs.Count}: "
+            + $"{string.Join(", ", recs.Select(r => $"v{r.Version} at {r.DiscPath[^12..]}"))})");
+        Check(recs.Count == 2 && File.ReadAllText(Path.Combine(dst, recs[0].DiscPath)) == "c one"
+              && File.ReadAllText(Path.Combine(dst, recs[1].DiscPath)) == "c two",
+            "version 1 at its .v1, version 2 the new copy");
+    }
+
+    // ===================================================================
+    Console.WriteLine();
+    Console.WriteLine("=== 16. A block from a batch never made durable is written again, not trusted ===");
+    // ===================================================================
+    {
+        var (set, src, dst) = await NewSet("blocks", 0);
+        Directory.CreateDirectory(src);
+        const int Block = 64 * 1024;
+        byte[] Blocks(params byte[][] parts) => parts.SelectMany(p => p).ToArray();
+        byte[] p1 = RandomNumberGenerator.GetBytes(Block), p2 = RandomNumberGenerator.GetBytes(Block);
+        byte[] q1 = RandomNumberGenerator.GetBytes(Block), q2 = RandomNumberGenerator.GetBytes(Block);
+        // A block repeated within a file is a duplicate: such a file is stored as blocks.
+        File.WriteAllBytes(Path.Combine(src, "x.bin"), Blocks(p1, p1, p2));
+        DirectoryBackupService BlockService(IDestinationFlush f) => new(repo, new FileScanner(repo),
+            new VersionRetentionService(repo), dedup: new LithicBackup.Infrastructure.Deduplication.BlockDeduplicationEngine(),
+            destinationFlush: f);
+        BackupJob BlockJob()
+        {
+            var job = Job(set, src, dst);
+            job.EnableDeduplication = true;
+            job.EnableFileDeduplication = false;
+            return job;
+        }
+        string store = Path.Combine(dst, "_blocks");
+        Check((await BlockService(new RecordingFlush()).ExecuteAsync(BlockJob(), dst, null, null, CancellationToken.None)).Success,
+            "backed up with block dedup");
+        var before = Directory.Exists(store) ? Directory.GetFiles(store).ToHashSet(StringComparer.OrdinalIgnoreCase) : [];
+        Check(before.Count == 2, $"a file of a repeated block stored as its 2 blocks ({before.Count})");
+
+        File.WriteAllBytes(Path.Combine(src, "z.bin"), Blocks(q1, q1, q2));
+        var error = await Try(() => BlockService(new RecordingFlush { Fails = _ => true })
+            .ExecuteAsync(BlockJob(), dst, null, null, CancellationToken.None));
+        Check(error is IOException, $"a run whose drive goes fails ({error?.GetType().Name})");
+        var left = Directory.GetFiles(store).Where(f => !before.Contains(f)).ToList();
+        Check(left.Count == 2, $"leaving the 2 blocks it wrote in the store ({left.Count})");
+        // As a drive that drops off leaves them: the names, not the data.
+        foreach (string blk in left)
+        {
+            var written = File.GetLastWriteTimeUtc(blk);
+            File.WriteAllBytes(blk, new byte[Block]);
+            File.SetLastWriteTimeUtc(blk, written);
+        }
+
+        Check((await BlockService(new RecordingFlush()).ExecuteAsync(BlockJob(), dst, null, null, CancellationToken.None)).Success,
+            "the next run succeeds");
+        static string Sha(string file) => Convert.ToHexString(SHA256.HashData(File.ReadAllBytes(file))).ToLowerInvariant();
+        var bad = Directory.GetFiles(store)
+            .Where(f => !string.Equals(Sha(f), Path.GetFileNameWithoutExtension(f), StringComparison.OrdinalIgnoreCase))
+            .ToList();
+        Check(bad.Count == 0, $"and every block in the store holds what its name says ({bad.Count} do not)");
+    }
+
+    // ===================================================================
+    Console.WriteLine();
+    Console.WriteLine("=== 17. File by file: a copy gone with its folder fails the flush ===");
+    // ===================================================================
+    {
+        string dest17 = Path.Combine(root, "dest17");
+        Directory.CreateDirectory(dest17);
+        var error = await Try(() => new DestinationFlush(testPipe)
+            .FlushAsync(dest17, [Path.Combine(dest17, "folder-gone", "x.bin")], CancellationToken.None));
+        Check(error is IOException,
+            $"the destination is there, but a copy's folder is not: its drive went ({error?.Message ?? "no error"})");
+    }
+
+    // ===================================================================
+    Console.WriteLine();
+    Console.WriteLine("=== 18. The service flushes a volume once for many requests at once ===");
+    // ===================================================================
+    if (tempVolume is not null)
+    {
+        string pipe18 = VolumeFlushPipe.Name + ".test-" + Guid.NewGuid().ToString("N");
+        int flushes18 = 0;
+        using var stop18 = new CancellationTokenSource();
+        var server18 = VolumeFlushPipe.ServeAsync(stop18.Token, null, pipe18, _ =>
+        {
+            Interlocked.Increment(ref flushes18);
+            Thread.Sleep(300);
+            return (DurableFlush.Outcome.Flushed, null);
+        });
+        var answers = await Task.WhenAll(Enumerable.Range(0, 20).Select(_ =>
+            VolumeFlushPipe.RequestAsync(tempVolume, CancellationToken.None, pipe18)));
+        Check(answers.All(r => r.Outcome == DurableFlush.Outcome.Flushed),
+            $"20 requests at once are all told it is flushed ({answers.Count(r => r.Outcome == DurableFlush.Outcome.Flushed)})");
+        Check(flushes18 <= 3, $"by {flushes18} flushes, each covering the requests that came before it started");
+        stop18.Cancel();
+        await Task.WhenAny(server18, Task.Delay(5000));
+    }
+
+    // ===================================================================
+    Console.WriteLine();
+    Console.WriteLine("=== 19. No history: a reference given the replaced copy's bytes stays so, whatever the batch does after ===");
+    // ===================================================================
+    {
+        var (set, src, dst) = await NewSet("no-history", 0);
+        Directory.CreateDirectory(src);
+        string a = Path.Combine(src, "a.txt");
+        string b = Path.Combine(src, "b.txt");
+        File.WriteAllText(a, "shared content");
+        File.WriteAllText(b, "shared content");
+        BackupJob NoHistory()
+        {
+            var job = Job(set, src, dst);
+            job.TierSets = [new VersionTierSet { Name = "Default" }];   // no tiers: no history
+            return job;
+        }
+        Check((await Service(new RecordingFlush()).ExecuteAsync(NoHistory(), dst, null, null, CancellationToken.None)).Success,
+            "backed up, keeping no history");
+        var bBefore = (await repo.GetFileRecordsByPathAsync(set.Id, b)).Single();
+        Check(bBefore.IsFileRef, "b.txt is a reference to a.txt's copy");
+
+        // a.txt changes. Its copy is overwritten in place, so b.txt is given its
+        // bytes first; then the batch's own flush fails, its drive gone.
+        File.WriteAllText(a, "a changed");
+        string aCopy = CurrentIn(dst, a);
+        var recording = new RecordingFlush
+        {
+            FailsFor = written => written.Contains(aCopy, StringComparer.OrdinalIgnoreCase),
+        };
+        var error = await Try(() => Service(recording).ExecuteAsync(NoHistory(), dst, null, null, CancellationToken.None));
+        Check(error is IOException, $"the run fails ({error?.GetType().Name})");
+        var bAfter = (await repo.GetFileRecordsByPathAsync(set.Id, b)).Single();
+        string bPlain = CurrentIn(dst, b);
+        Check(!bAfter.IsFileRef && File.Exists(bPlain) && File.ReadAllText(bPlain) == "shared content",
+            "b.txt is recorded as the plain copy it now is, holding its content");
+        Check(!File.Exists(bPlain + ".fileref"), "its manifest gone");
     }
 }
 finally
@@ -553,6 +781,24 @@ static async Task<Exception?> Try(Func<Task> action)
     catch (Exception ex)
     {
         return ex;
+    }
+}
+
+/// <summary>Whether another holder (this process's catalog included) has <paramref name="lockFile"/> open.</summary>
+static bool IsHeld(string lockFile)
+{
+    try
+    {
+        using var _ = new FileStream(lockFile, FileMode.Open, FileAccess.ReadWrite, FileShare.None);
+        return false;
+    }
+    catch (Exception ex) when (ex is FileNotFoundException or DirectoryNotFoundException)
+    {
+        return false;
+    }
+    catch (IOException)
+    {
+        return true;
     }
 }
 
