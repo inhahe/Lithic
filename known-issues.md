@@ -158,8 +158,11 @@ copies take, until what they came from goes, to a gigabyte. Holding
 promotions open opens windows that finishing each at once did not. So the
 records change in one transaction under the set's write lock, each reference
 checked again there. A batch is finished before a pause is waited out. A copy
-is taken back only while it is still as the run made it. Deletions that have
-happened are recorded even when a stop arrives.
+never replaces a file at its path, and is taken back only while it is still
+the file the run made (file index, length, write time). Retention's deletions
+run under the set's write lock with each guard checked again, so two passes,
+the app's and the Worker's, cannot each count the other's copy as the
+survivor.
 
 **Tests.** `durability_test` §20: five promotions in one pass take one flush,
 made while every source was still there. When that flush fails, every
@@ -173,6 +176,14 @@ promoted, and its source stays. Each fails with its fix taken out:
 - not waiting fails §21 (an expired copy is left);
 - record changes that cannot be stopped fail §22;
 - no second check fails §23 (the source is deleted).
+
+§24 checks that 257 promotions take two flushes. §25 checks that an expired
+copy whose surviving copy goes meanwhile is kept. §26 checks that a stray
+file where a reference's copy would go is left alone. Each fails with its fix
+taken out:
+- the boundary off by one fails §24;
+- no re-check before deleting fails §25;
+- overwriting the stray fails §26.
 
 ## FIXED: "files under this folder" read every file of the set, and missed names starting with an emoji (2026-10-21)
 

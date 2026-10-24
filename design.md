@@ -1982,10 +1982,19 @@ disk first:
   Each reference is checked again under that lock, because another writer may
   have backed the file up since the promotion was planned. When it has, that
   promotion is abandoned and its source kept. The batch is also finished before
-  a pause is waited out, when other writers may come in. A copy is taken back
-  only if it is still as the run made it (its creation time and length), since
-  another writer may have put its own at the same path. A no-history overwrite
-  does its one promotion at once, inside the run's own batch.
+  a pause is waited out, when other writers may come in. A copy is made through
+  a temporary file of its own and never replaces a file already at its path.
+  It is taken back only while it is still the file the run made: same file
+  index, length and write time, not creation time, which NTFS hands to a file
+  reusing a just-freed name. A no-history overwrite does its one promotion at
+  once, inside the run's own batch.
+
+  Retention's deletions run under the set's write lock, 256 at a time, with
+  each plain copy's guard checked again there. Without that, two passes (the
+  app's and the Worker's) could each count the other's copy as the survivor
+  and delete both. A copy whose content would be left only in references then
+  stays, for the next pass to promote. A copy the catalog lists but the disk
+  has lost is no survivor.
 * **The seed and the moves flush before they take the set's write lock:** what
   they record was renamed before the transaction, so the lock is held for the
   inserts only. A run's batches flush under the lock, which they hold

@@ -27,6 +27,8 @@
 //  20-23. Retention's promotions finished a batch at a time: one flush for
 //       many, the sources kept when it fails, one promotion per content; a
 //       stop meanwhile, and a reference another writer changes meanwhile.
+//  24-26. The flush per 256; an expired copy whose surviving copy goes
+//       meanwhile is kept; a stray where a copy would go is left alone.
 //
 // Not covered: a USB drive that drops off and comes back (VolumeWatch.WasLost
 // true), which takes the hardware.
@@ -983,6 +985,115 @@ try
         Check(othersDone, "while the other four were promoted, and their expired copies went");
         var orphans = await LiveRecordsWithoutFiles(set, dst);
         Check(orphans.Count == 0, $"no record claims a file that is gone ({string.Join(", ", orphans)})");
+    }
+
+    // ===================================================================
+    Console.WriteLine();
+    Console.WriteLine("=== 24. Retention: 257 promotions, two flushes ===");
+    // ===================================================================
+    {
+        var (set, src, dst) = await NewSet("promote-257", 0);
+        Directory.CreateDirectory(src);
+        const int Pairs = 257;
+        var a = Enumerable.Range(0, Pairs).Select(i => Path.Combine(src, $"a{i:D3}.txt")).ToList();
+        var b = Enumerable.Range(0, Pairs).Select(i => Path.Combine(src, $"b{i:D3}.txt")).ToList();
+        for (int i = 0; i < Pairs; i++)
+        {
+            File.WriteAllText(a[i], $"content {i}, two files");
+            File.WriteAllText(b[i], $"content {i}, two files");
+        }
+        var svc = Service(new RecordingFlush());
+        await svc.ExecuteAsync(Job(set, src, dst), dst, null, null, CancellationToken.None);
+        foreach (string edit in new[] { "changed", "changed again" })
+        {
+            foreach (var f in a)
+                File.WriteAllText(f, $"{Path.GetFileName(f)} {edit}");
+            if (edit == "changed")
+                await svc.ExecuteAsync(Job(set, src, dst), dst, null, null, CancellationToken.None);
+        }
+        var bPlain = b.Select(f => CurrentIn(dst, f)).ToHashSet(StringComparer.OrdinalIgnoreCase);
+        var sizes = new List<int>();
+        var recording = new RecordingFlush
+        {
+            OnFlush = written =>
+            {
+                int promoted = written.Count(bPlain.Contains);
+                if (promoted > 0)
+                    sizes.Add(promoted);
+            },
+        };
+        Check((await Service(recording).ExecuteAsync(Job(set, src, dst), dst,
+                [new VersionRetentionTier { MaxVersions = 1 }], null, CancellationToken.None)).Success,
+            "the run keeping one earlier version succeeds");
+        Check(sizes.SequenceEqual([256, 1]), $"its promotions took a flush per 256 ({string.Join(" + ", sizes)})");
+        Check(a.All(f => !File.Exists(PrevIn(dst, f, 1))), "and every expired copy went");
+    }
+
+    // ===================================================================
+    Console.WriteLine();
+    Console.WriteLine("=== 25. Retention: an expired copy whose surviving copy goes meanwhile is kept ===");
+    // ===================================================================
+    {
+        var (set, src, dst) = await NewSet("survivor-goes", 0);
+        Directory.CreateDirectory(src);
+        string s = Path.Combine(src, "s.txt"), t = Path.Combine(src, "t.txt"), r = Path.Combine(src, "r.txt");
+        string p0 = Path.Combine(src, "p.txt"), q0 = Path.Combine(src, "q.txt");
+        File.WriteAllText(s, "kept by s, t and r");
+        File.WriteAllText(t, "kept by s, t and r");
+        var plainJob = Job(set, src, dst);
+        plainJob.EnableFileDeduplication = false;
+        var svc = Service(new RecordingFlush());
+        await svc.ExecuteAsync(plainJob, dst, null, null, CancellationToken.None);   // s and t both plain
+        File.WriteAllText(r, "kept by s, t and r");                                   // r a reference
+        File.WriteAllText(p0, "p and q");
+        File.WriteAllText(q0, "p and q");                                             // q a reference to p
+        await svc.ExecuteAsync(Job(set, src, dst), dst, null, null, CancellationToken.None);
+        foreach (string edit in new[] { "changed", "changed again" })
+        {
+            File.WriteAllText(t, $"t {edit}");
+            File.WriteAllText(p0, $"p {edit}");
+            if (edit == "changed")
+                await svc.ExecuteAsync(Job(set, src, dst), dst, null, null, CancellationToken.None);
+        }
+        Check((await repo.GetFileRecordsByPathAsync(set.Id, r)).Single().IsFileRef, "r.txt is a reference");
+        // t's expired copy can go, s holding its content - until, while the pass
+        // makes p's promotion durable, another writer takes s away.
+        string sCopy = CurrentIn(dst, s);
+        bool taken = false;
+        var recording = new RecordingFlush
+        {
+            OnFlush = written =>
+            {
+                if (taken || !written.Contains(CurrentIn(dst, q0), StringComparer.OrdinalIgnoreCase))
+                    return;
+                taken = true;
+                var sRec = repo.GetFileRecordsByPathAsync(set.Id, s).GetAwaiter().GetResult().Single();
+                File.Delete(sCopy);
+                repo.MarkFileRecordsDeletedByIdsAsync(set.Id, [sRec.Id]).GetAwaiter().GetResult();
+            },
+        };
+        Check((await Service(recording).ExecuteAsync(Job(set, src, dst), dst,
+                [new VersionRetentionTier { MaxVersions = 1 }], null, CancellationToken.None)).Success && taken,
+            "the run keeping one earlier version succeeds, s taken away meanwhile");
+        Check(File.Exists(PrevIn(dst, t, 1)) && !(await repo.GetFileRecordByPathAndVersionAsync(set.Id, t, 1))!.IsDeleted,
+            "t's expired copy stays: r's content is in nothing else now");
+    }
+
+    // ===================================================================
+    Console.WriteLine();
+    Console.WriteLine("=== 26. Retention: a stray file where a reference's copy would go is not overwritten ===");
+    // ===================================================================
+    {
+        var (set, src, dst, a, b) = await FivePromotionsDue("promote-stray");
+        string stray = CurrentIn(dst, b[0]);
+        File.WriteAllText(stray, "a stray, not this run's");
+        Check((await Service(new RecordingFlush()).ExecuteAsync(Job(set, src, dst), dst,
+                [new VersionRetentionTier { MaxVersions = 1 }], null, CancellationToken.None)).Success,
+            "the run keeping one earlier version succeeds");
+        Check(File.ReadAllText(stray) == "a stray, not this run's", "the stray is left as it was");
+        Check((await repo.GetFileRecordsByPathAsync(set.Id, b[0])).Single().IsFileRef && File.Exists(PrevIn(dst, a[0], 1)),
+            "b0 stays a reference, and a0's expired copy, which it resolves to, is kept");
+        Check(Enumerable.Range(1, 4).All(i => !File.Exists(PrevIn(dst, a[i], 1))), "while the other four went");
     }
 }
 finally

@@ -1189,7 +1189,7 @@ public class DirectoryBackupService
                         && !string.IsNullOrEmpty(replacedRecord.Hash)
                         && File.Exists(Path.Combine(targetDirectory, replacedRecord.DiscPath)))
                     {
-                        var (reachable, promotedManifest) = await EnsureContentReachableAsync(
+                        var (reachable, promoted) = await EnsureContentReachableAsync(
                             backupSetId, replacedRecord, targetDirectory, replacedIds.ToHashSet(), ct);
                         if (!reachable)
                         {
@@ -1197,7 +1197,7 @@ public class DirectoryBackupService
                             replacedRecord = null;
                             replacedIds = [];
                         }
-                        else if (promotedManifest is not null)
+                        else if (promoted is not null)
                         {
                             // A reference was given these bytes, and its record
                             // changed in this batch. Commit it before they are
@@ -1209,7 +1209,9 @@ public class DirectoryBackupService
                             // does.
                             await CommitAndReleaseAsync();
                             await ReacquireLockAsync();
-                            TryDeleteFile(promotedManifest);
+                            // Another writer may have backed the reference's file up
+                            // while the lock was let go, a new manifest in its place.
+                            TryDeleteManifest(promoted);
                             var now = await _catalog.GetLastVersionAsync(backupSetId, file.FullPath, ct);
                             if ((now?.HighestVersion ?? 0) != version - 1)
                                 throw new VersionTakenException();
@@ -2069,70 +2071,61 @@ public class DirectoryBackupService
                 var promotions = new Dictionary<string, (Promotion Promotion, List<(FileRecord Record, string Path)> Waiting)>(
                     StringComparer.OrdinalIgnoreCase);
                 long promotedBytes = 0;
+                // Expired copies to delete, a transaction's worth at a time.
+                var deletions = new List<(FileRecord Record, string Path)>();
                 // The record the pass has reached, for the progress line.
                 int removingAt = 0;
 
-                // Remove the physical files, then flip the catalog bit ONLY once the
-                // bytes are confirmed gone. If a delete fails (file locked, ACL,
-                // transient IO), leave the record intact so the catalog never claims
-                // a deletion that didn't happen — a later retention pass retries.
-                // This is the invariant that prevents "catalog-deleted (still on
-                // disk)" records; and a deletion that has happened is recorded
-                // whatever stop comes, or the record would claim a file that is
-                // gone. By id: the records were read before the copy loop, and
-                // written back whole they would undo anything a writer changed
-                // since.
-                async Task DeleteExpiredAsync(IReadOnlyList<(FileRecord Record, string Path)> expired)
+                // Delete the queued expired copies under the set's write lock, so
+                // that no other writer's retention deletes what this one counts on
+                // meanwhile. Each plain copy's guard is checked again there: another
+                // pass may have deleted the copy its content was to be found in, and
+                // one that would now leave a reference without its content stays for
+                // the next pass to promote. Remove the physical file, then flip the
+                // catalog bit ONLY once the bytes are confirmed gone. If the delete
+                // fails (file locked, ACL, transient IO), leave the record intact so
+                // the catalog never claims a deletion that didn't happen — a later
+                // retention pass retries. This is the invariant that prevents
+                // "catalog-deleted (still on disk)" records. By id: the records were
+                // read before the copy loop, and written back whole they would undo
+                // anything a writer changed since.
+                async Task DeleteQueuedAsync()
                 {
-                    var gone = new List<long>(expired.Count);
-                    try
+                    if (deletions.Count == 0)
+                        return;
+                    var batch = deletions.ToList();
+                    deletions.Clear();
+                    var gone = new List<long>(batch.Count);
+                    using var tx = await _catalog.BeginTransactionAsync(backupSetId, ct, ReportWaitingForLock);
+                    // Not cancellable from here, so a deletion made is recorded.
+                    foreach (var (record, storedPath) in batch)
                     {
-                        foreach (var (record, storedPath) in expired)
+                        removing.Advance(removingAt, storedPath);
+                        if (!record.IsFileRef && !record.IsDeduped && !string.IsNullOrEmpty(record.Hash)
+                            && File.Exists(storedPath))
                         {
-                            removing.Advance(removingAt, storedPath);
-                            if (gone.Count > 0 && pauseEvent is { IsSet: false })
-                            {
-                                // Recorded before the pause is waited out: no
-                                // deleted file keeps a live record meanwhile.
-                                await _catalog.MarkFileRecordsDeletedByIdsAsync(backupSetId, gone, ct);
-                                gone.Clear();
-                            }
-                            pauseEvent?.Wait(ct);
-                            ct.ThrowIfCancellationRequested();
-                            try
-                            {
-                                ForceDeleteFile(storedPath);
-                            }
-                            catch (Exception ex) when (ex is IOException or UnauthorizedAccessException)
-                            {
-                                continue; // leave file + record consistent; retry next run
-                            }
-                            if (!File.Exists(storedPath))
-                            {
-                                record.IsDeleted = true;
-                                gone.Add(record.Id);
-                            }
+                            var (reachable, needed) = await PlanContentReachabilityAsync(
+                                backupSetId, record, targetDirectory, toDeleteIds, CancellationToken.None);
+                            if (!reachable || needed is not null)
+                                continue;
+                        }
+                        try
+                        {
+                            ForceDeleteFile(storedPath);
+                        }
+                        catch (Exception ex) when (ex is IOException or UnauthorizedAccessException)
+                        {
+                            continue; // leave file + record consistent; retry next run
+                        }
+                        if (!File.Exists(storedPath))
+                        {
+                            record.IsDeleted = true;
+                            gone.Add(record.Id);
                         }
                     }
-                    finally
-                    {
-                        // What was deleted is recorded, a stop or not, waiting a while
-                        // for another writer's lock: not for ever, which a stop could
-                        // not end. Unrecorded, such a record claims a file that is
-                        // gone until the next pass, which finds it expired still and
-                        // retires it.
-                        if (gone.Count > 0)
-                        {
-                            using var bounded = new CancellationTokenSource(TimeSpan.FromSeconds(10));
-                            try
-                            {
-                                await _catalog.MarkFileRecordsDeletedByIdsAsync(backupSetId, gone, bounded.Token);
-                            }
-                            catch (OperationCanceledException)
-                            {
-                            }
-                        }
-                    }
+                    if (gone.Count > 0)
+                        await _catalog.MarkFileRecordsDeletedByIdsAsync(backupSetId, gone, CancellationToken.None);
+                    tx.Complete();
                 }
 
                 async Task FinishPendingPromotionsAsync()
@@ -2143,21 +2136,28 @@ public class DirectoryBackupService
                     promotions.Clear();
                     promotedBytes = 0;
                     var finished = (await FinishPromotionsAsync(
-                        backupSetId, targetDirectory, [.. batch.Select(b => b.Promotion)], ownTransaction: true, ct))
-                        .ToHashSet();
-                    var expired = new List<(FileRecord Record, string Path)>();
+                        backupSetId, targetDirectory, [.. batch.Select(b => b.Promotion)], ownTransaction: true,
+                        ReportWaitingForLock, ct)).ToHashSet();
                     foreach (var (promotion, waiting) in batch)
                     {
                         // Not finished: a reference needs these bytes, and they stay.
                         if (!finished.Contains(promotion))
                             continue;
-                        // Its record is a plain copy's now, committed (no batch is
-                        // open here): its manifest can go.
+                        // Its record is a plain copy's now, committed: its manifest
+                        // can go.
                         TryDeleteManifest(promotion);
-                        expired.AddRange(waiting);
+                        deletions.AddRange(waiting);
                     }
-                    if (expired.Count > 0)
-                        await DeleteExpiredAsync(expired);
+                    await DeleteQueuedAsync();
+                }
+
+                // Everything pending finished: before a pause is waited out (paused,
+                // this run lets other writers at the set, and they may change the
+                // references meanwhile), when a copy runs out of space, and at the end.
+                async Task SettleAsync()
+                {
+                    await FinishPendingPromotionsAsync();
+                    await DeleteQueuedAsync();
                 }
 
                 try
@@ -2166,11 +2166,8 @@ public class DirectoryBackupService
                 {
                     var fileRecord = toDelete[i];
                     removingAt = i;
-                    // Promotions made are finished before a pause is waited out:
-                    // paused, this run lets other writers at the set, and they may
-                    // change the references meanwhile.
                     if (pauseEvent is { IsSet: false })
-                        await FinishPendingPromotionsAsync();
+                        await SettleAsync();
                     pauseEvent?.Wait(ct);
                     ct.ThrowIfCancellationRequested();
 
@@ -2214,11 +2211,11 @@ public class DirectoryBackupService
                             // Short of space, the copies held for the batch are what
                             // fills it: finish them, which frees what they came from,
                             // and try once more.
-                            bool copied = TryCopyForPromotion(promotion, prevPath);
-                            if (!copied && promotions.Count > 0)
+                            bool copied = TryCopyForPromotion(promotion, prevPath, out bool diskFull);
+                            if (!copied && diskFull && promotions.Count > 0)
                             {
-                                await FinishPendingPromotionsAsync();
-                                copied = TryCopyForPromotion(promotion, prevPath);
+                                await SettleAsync();
+                                copied = TryCopyForPromotion(promotion, prevPath, out _);
                             }
                             if (!copied)
                                 continue; // a reference needs these bytes: leave file and record
@@ -2230,9 +2227,11 @@ public class DirectoryBackupService
                         }
                     }
 
-                    await DeleteExpiredAsync([(fileRecord, prevPath)]);
+                    deletions.Add((fileRecord, prevPath));
+                    if (deletions.Count >= DeletionsPerTransaction)
+                        await DeleteQueuedAsync();
                 }
-                await FinishPendingPromotionsAsync();
+                await SettleAsync();
                 } // try (promotions pending)
                 finally
                 {
@@ -3829,12 +3828,12 @@ public class DirectoryBackupService
     /// <param name="alsoGoing">Records going in the same pass, which survive no more than this one.</param>
     /// <returns>
     /// Reachable: false when a reference needs the bytes and could not be given
-    /// them; the caller keeps them. PromotedManifest: when a reference was made a
-    /// plain copy, its <c>.fileref</c> manifest, which the caller deletes once
-    /// the reference's changed record is committed - until then the record may
-    /// yet roll back to it.
+    /// them; the caller keeps them. Promoted: when a reference was made a plain
+    /// copy, that promotion; its manifest is the caller's to delete
+    /// (<see cref="TryDeleteManifest"/>) once the reference's changed record is
+    /// committed - until then the record may yet roll back to it.
     /// </returns>
-    private async Task<(bool Reachable, string? PromotedManifest)> EnsureContentReachableAsync(
+    private async Task<(bool Reachable, Promotion? Promoted)> EnsureContentReachableAsync(
         int backupSetId, FileRecord going, string targetDirectory,
         IReadOnlySet<long>? alsoGoing, CancellationToken ct)
     {
@@ -3843,13 +3842,14 @@ public class DirectoryBackupService
             return (false, null);
         if (promotion is null)
             return (true, null);
-        if (!TryCopyForPromotion(promotion, Path.Combine(targetDirectory, going.DiscPath)))
+        if (!TryCopyForPromotion(promotion, Path.Combine(targetDirectory, going.DiscPath), out _))
             return (false, null);
         // Inside the run's batch, whose lock keeps other writers out: the record
         // changes in it, and the caller commits it.
-        return (await FinishPromotionsAsync(backupSetId, targetDirectory, [promotion], ownTransaction: false, ct))
+        return (await FinishPromotionsAsync(
+                backupSetId, targetDirectory, [promotion], ownTransaction: false, onWaitingForLock: null, ct))
             .Count == 1
-            ? (true, promotion.ManifestPath)
+            ? (true, promotion)
             : (false, null);
     }
 
@@ -3885,7 +3885,9 @@ public class DirectoryBackupService
         FileRecord? survivingPlain = null;
         foreach (var r in others.Where(r => !r.IsFileRef && !r.IsDeduped))
         {
-            if (await IsCurrentRowAtItsPathAsync(backupSetId, r, ct))
+            // A plain copy the catalog lists but the disk has lost holds nothing.
+            if (await IsCurrentRowAtItsPathAsync(backupSetId, r, ct)
+                && File.Exists(Path.Combine(targetDirectory, r.DiscPath)))
             {
                 survivingPlain = r;
                 break;
@@ -3903,17 +3905,17 @@ public class DirectoryBackupService
             return (true, null); // nothing refers to this content
         foreach (var candidate in refs)
         {
+            var pathRows = await _catalog.GetFileRecordsByPathAsync(backupSetId, candidate.SourcePath, ct);
             // Not a stale row whose manifest a newer one overwrote in place: it
             // would be given the content and the newer one's manifest deleted.
-            if (!await IsCurrentRowAtItsPathAsync(backupSetId, candidate, ct))
+            if (!IsCurrentRowAtItsPath(candidate, pathRows))
                 continue;
             // Its plain path must be free: not the going copy itself, which is
             // about to be deleted, and not a recorded file's.
             string plainDiscPath = StripFileRefSuffix(candidate.DiscPath).Replace('/', '\\');
             if (string.Equals(plainDiscPath, goingPath, StringComparison.OrdinalIgnoreCase)
-                || (await _catalog.GetFileRecordsByPathAsync(backupSetId, candidate.SourcePath, ct)).Any(r =>
-                    !r.IsDeleted && string.Equals(
-                        r.DiscPath.Replace('/', '\\'), plainDiscPath, StringComparison.OrdinalIgnoreCase)))
+                || pathRows.Any(r => !r.IsDeleted && string.Equals(
+                    r.DiscPath.Replace('/', '\\'), plainDiscPath, StringComparison.OrdinalIgnoreCase)))
                 continue;
             return (true, new Promotion(candidate, targetDirectory));
         }
@@ -3926,10 +3928,15 @@ public class DirectoryBackupService
     /// copies that keep no history were, before their replaced rows were retired),
     /// so it is no copy of the content it names.
     /// </summary>
-    private async Task<bool> IsCurrentRowAtItsPathAsync(int backupSetId, FileRecord row, CancellationToken ct)
+    private async Task<bool> IsCurrentRowAtItsPathAsync(int backupSetId, FileRecord row, CancellationToken ct) =>
+        IsCurrentRowAtItsPath(row, await _catalog.GetFileRecordsByPathAsync(backupSetId, row.SourcePath, ct));
+
+    /// <inheritdoc cref="IsCurrentRowAtItsPathAsync"/>
+    /// <param name="pathRows">Every row of <paramref name="row"/>'s source path.</param>
+    private static bool IsCurrentRowAtItsPath(FileRecord row, IEnumerable<FileRecord> pathRows)
     {
         string path = row.DiscPath.Replace('/', '\\');
-        return !(await _catalog.GetFileRecordsByPathAsync(backupSetId, row.SourcePath, ct)).Any(n =>
+        return !pathRows.Any(n =>
             !n.IsDeleted && n.Id > row.Id
             && string.Equals(n.DiscPath.Replace('/', '\\'), path, StringComparison.OrdinalIgnoreCase));
     }
@@ -3944,27 +3951,26 @@ public class DirectoryBackupService
     /// </summary>
     private sealed class Promotion(FileRecord reference, string targetDirectory)
     {
+        /// <summary>The reference's record as planned; not changed here.</summary>
         public FileRecord Reference { get; } = reference;
         public string Hash => Reference.Hash;
-        public string ManifestDiscPath { get; } = reference.DiscPath;
         public string PlainDiscPath { get; } = StripFileRefSuffix(reference.DiscPath);
         public string PlainPath => Path.Combine(targetDirectory, PlainDiscPath);
         public string ManifestPath { get; } = Path.Combine(targetDirectory, reference.DiscPath);
 
         /// <summary>
-        /// The copy made, by its creation time and length: until the reference's
-        /// record says it is there, another writer backing the file up may put a
-        /// copy of its own at the same path.
+        /// The copy made (<see cref="DurableFlush.IdentityOf"/>): until the
+        /// reference's record says it is there, another writer backing the file up
+        /// may put a copy of its own at the same path.
         /// </summary>
-        public (DateTime Created, long Length)? Copy { get; set; }
+        public (uint Volume, ulong Index, long Length, long Written)? Copy { get; set; }
 
         /// <summary>Delete the copy made, if what is at its path is still that.</summary>
         public void TakeBack()
         {
             try
             {
-                var file = new FileInfo(PlainPath);
-                if (Copy is { } made && file.Exists && file.CreationTimeUtc == made.Created && file.Length == made.Length)
+                if (Copy is { } made && DurableFlush.IdentityOf(PlainPath) == made)
                     ForceDeleteFile(PlainPath);
             }
             catch (Exception ex) when (ex is IOException or UnauthorizedAccessException)
@@ -3977,13 +3983,19 @@ public class DirectoryBackupService
     /// <summary>
     /// Write <paramref name="promotion"/>'s copy from
     /// <paramref name="sourceBytesPath"/>, noted for the run's next flush. False,
-    /// with nothing left beside the reference, when it cannot be.
+    /// with nothing left beside the reference, when it cannot be - and when
+    /// something is at its path already: nothing recorded is there (the planning
+    /// saw to that), so it is a stray or another writer's copy on its way to
+    /// being recorded, and not this run's to replace.
     /// </summary>
-    private static bool TryCopyForPromotion(Promotion promotion, string sourceBytesPath)
+    /// <param name="diskFull">Whether it failed for want of space.</param>
+    private static bool TryCopyForPromotion(Promotion promotion, string sourceBytesPath, out bool diskFull)
     {
+        diskFull = false;
         string plainPath = promotion.PlainPath;
-        // Through a temporary file, so a failed copy takes back only what it wrote.
-        string tempPath = plainPath + ".lbtmp";
+        // Through a temporary file of its own, so a failed copy takes back only
+        // what it wrote, and shares no name with another writer's.
+        string tempPath = $"{plainPath}.{Guid.NewGuid():N}.lbtmp";
         try
         {
             string? dir = Path.GetDirectoryName(plainPath);
@@ -3993,17 +4005,17 @@ public class DirectoryBackupService
             // afterwards — otherwise read-only source content (git objects, etc.)
             // leaves a read-only file on the destination that later resists
             // retention/cleanup deletion.
-            File.Copy(sourceBytesPath, tempPath, overwrite: true);
+            File.Copy(sourceBytesPath, tempPath, overwrite: false);
             ClearReadOnly(tempPath);
-            File.Move(tempPath, plainPath, overwrite: true);
+            File.Move(tempPath, plainPath, overwrite: false);
             DestinationWrites.Note(plainPath);
-            var copy = new FileInfo(plainPath);
-            promotion.Copy = (copy.CreationTimeUtc, copy.Length);
+            promotion.Copy = DurableFlush.IdentityOf(plainPath);
             return true;
         }
         catch (Exception ex) when (ex is IOException or UnauthorizedAccessException)
         {
             TryDeleteFile(tempPath);
+            diskFull = BackupErrorClassifier.Classify(ex) == BackupErrorCategory.DiskFull;
             return false;
         }
     }
@@ -4040,15 +4052,15 @@ public class DirectoryBackupService
     /// write lock while it checks and changes them (retention). False inside a
     /// transaction the caller holds, and commits (the copy loop's batch).
     /// </param>
+    /// <param name="onWaitingForLock">Told once if the transaction has to wait for another writer.</param>
     /// <returns>
     /// Those finished, their bytes on the disk where their records say. The bytes
-    /// any other promotion came from must stay. Its copy is taken back, unless
-    /// another writer changed its reference: the copy may then be that writer's.
-    /// (Taking back deletes only a copy still as this run made it.)
+    /// any other promotion came from must stay, and its copy is taken back - if it
+    /// is still the copy this run made, and not another writer's put in its place.
     /// </returns>
     private async Task<List<Promotion>> FinishPromotionsAsync(
         int backupSetId, string targetDirectory, IReadOnlyList<Promotion> promotions,
-        bool ownTransaction, CancellationToken ct)
+        bool ownTransaction, Action? onWaitingForLock, CancellationToken ct)
     {
         static void TakeBack(IEnumerable<Promotion> those)
         {
@@ -4075,7 +4087,9 @@ public class DirectoryBackupService
         var changedElsewhere = new List<Promotion>();
         try
         {
-            using var tx = ownTransaction ? await _catalog.BeginTransactionAsync(backupSetId, ct) : null;
+            using var tx = ownTransaction
+                ? await _catalog.BeginTransactionAsync(backupSetId, ct, onWaitingForLock)
+                : null;
             foreach (var promotion in promotions)
             {
                 // Under the set's write lock from here: what is read is what is
@@ -4085,7 +4099,7 @@ public class DirectoryBackupService
                         backupSetId, promotion.Reference.SourcePath, CancellationToken.None))
                     .FirstOrDefault(r => r.Id == promotion.Reference.Id);
                 if (now is not { IsFileRef: true, IsDeleted: false }
-                    || !string.Equals(now.DiscPath.Replace('/', '\\'), promotion.ManifestDiscPath.Replace('/', '\\'),
+                    || !string.Equals(now.DiscPath.Replace('/', '\\'), promotion.Reference.DiscPath.Replace('/', '\\'),
                         StringComparison.OrdinalIgnoreCase))
                 {
                     changedElsewhere.Add(promotion);
@@ -4102,11 +4116,12 @@ public class DirectoryBackupService
         {
             // Not committed (or, without a transaction of its own, the caller's
             // batch is failing): none of them is finished.
-            TakeBack(promotions.Except(changedElsewhere));
+            TakeBack(promotions);
             if (ex is OperationCanceledException)
                 throw;
             return [];
         }
+        TakeBack(changedElsewhere);
 
         // The promoted references hold the bytes now; every other reference's
         // hint goes there. Best effort, as hints are.
@@ -4123,6 +4138,12 @@ public class DirectoryBackupService
     /// </summary>
     private const int PromotionsPerFlush = 256;
     private const long PromotionBytesPerFlush = 1L << 30;
+
+    /// <summary>
+    /// The most expired copies retention deletes under one hold of the set's
+    /// write lock, which other writers wait out.
+    /// </summary>
+    private const int DeletionsPerTransaction = 256;
 
     /// <summary>Delete a file we own on the destination if we can; a stray file is Cleanup's to find.</summary>
     private static void TryDeleteFile(string path)

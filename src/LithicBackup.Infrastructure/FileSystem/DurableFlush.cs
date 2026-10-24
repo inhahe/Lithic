@@ -206,6 +206,23 @@ public static class DurableFlush
     private const int SharedOpenRetryMs = 200;
 
     /// <summary>
+    /// The file at <paramref name="path"/>, told apart from any other that takes
+    /// its name later: its volume's serial number and its file index, with its
+    /// length and write time (FAT makes the index up from where the entry sits, so
+    /// a file put in its place can share it). A creation time will not do: NTFS
+    /// gives a file created under a name freed moments before the freed one's.
+    /// Null when it cannot be read.
+    /// </summary>
+    public static (uint Volume, ulong Index, long Length, long Written)? IdentityOf(string path)
+    {
+        using var handle = OpenForAttributes(path);
+        if (handle.IsInvalid || !GetFileInformationByHandle(handle, out var info))
+            return null;
+        return (info.VolumeSerialNumber, ((ulong)info.FileIndexHigh << 32) | info.FileIndexLow,
+            ((long)info.FileSizeHigh << 32) | info.FileSizeLow, info.LastWriteTime);
+    }
+
+    /// <summary>
     /// <paramref name="path"/> opened to read its attributes only, sharing
     /// everything: a folder as readily as a file. Invalid when it cannot be.
     /// </summary>
@@ -255,6 +272,26 @@ public static class DurableFlush
     [DllImport("kernel32.dll", SetLastError = true, CharSet = CharSet.Unicode)]
     private static extern uint GetFinalPathNameByHandleW(
         SafeFileHandle hFile, [Out] char[] lpszFilePath, uint cchFilePath, uint dwFlags);
+
+    // FILETIMEs are pairs of DWORDs, aligned on 4.
+    [StructLayout(LayoutKind.Sequential, Pack = 4)]
+    internal struct ByHandleFileInformation
+    {
+        public uint FileAttributes;
+        public long CreationTime;
+        public long LastAccessTime;
+        public long LastWriteTime;
+        public uint VolumeSerialNumber;
+        public uint FileSizeHigh;
+        public uint FileSizeLow;
+        public uint NumberOfLinks;
+        public uint FileIndexHigh;
+        public uint FileIndexLow;
+    }
+
+    [DllImport("kernel32.dll", SetLastError = true)]
+    [return: MarshalAs(UnmanagedType.Bool)]
+    internal static extern bool GetFileInformationByHandle(SafeFileHandle hFile, out ByHandleFileInformation info);
 }
 
 /// <summary>
@@ -285,7 +322,7 @@ public sealed class VolumeWatch : IDisposable
     public static VolumeWatch? Open(string folder)
     {
         var handle = DurableFlush.OpenForAttributes(folder);
-        if (handle.IsInvalid || !GetFileInformationByHandle(handle, out _))
+        if (handle.IsInvalid || !DurableFlush.GetFileInformationByHandle(handle, out _))
         {
             handle.Dispose();
             return null;
@@ -301,7 +338,7 @@ public sealed class VolumeWatch : IDisposable
     /// <param name="error">What the file system said; null when not lost.</param>
     public bool WasLost(out string? error)
     {
-        if (GetFileInformationByHandle(_handle, out _))
+        if (DurableFlush.GetFileInformationByHandle(_handle, out _))
         {
             error = null;
             return false;
@@ -312,23 +349,4 @@ public sealed class VolumeWatch : IDisposable
 
     public void Dispose() => _handle.Dispose();
 
-    // FILETIMEs are pairs of DWORDs, aligned on 4.
-    [StructLayout(LayoutKind.Sequential, Pack = 4)]
-    private struct ByHandleFileInformation
-    {
-        public uint FileAttributes;
-        public long CreationTime;
-        public long LastAccessTime;
-        public long LastWriteTime;
-        public uint VolumeSerialNumber;
-        public uint FileSizeHigh;
-        public uint FileSizeLow;
-        public uint NumberOfLinks;
-        public uint FileIndexHigh;
-        public uint FileIndexLow;
-    }
-
-    [DllImport("kernel32.dll", SetLastError = true)]
-    [return: MarshalAs(UnmanagedType.Bool)]
-    private static extern bool GetFileInformationByHandle(SafeFileHandle hFile, out ByHandleFileInformation info);
 }
