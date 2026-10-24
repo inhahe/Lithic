@@ -1968,10 +1968,15 @@ disk first:
 * **Some writes are made durable at once, not at the commit:** a write that
   something irreversible follows. A `.fileref` given the bytes of the last
   plain copy of its content, before that copy is deleted or overwritten
-  (`TryPromoteFileRefToPlainAsync`), has the new copy flushed first
-  (`DestinationWrites.MakeDurableNowAsync`). If that fails, the old bytes are
-  kept and the new copy is taken back. A new path that copies bytes and then
-  deletes their source must do the same.
+  (`Promotion`), has its new copy flushed first
+  (`DestinationWrites.MakeDurableNowAsync`, in `FinishPromotionsAsync`). If
+  that fails, the old bytes are kept and the new copy is taken back. A new path
+  that copies bytes and then deletes their source must do the same. Retention
+  makes its promotions' copies as it goes, and holds back the expired copies
+  they come from, along with any other expired copy of the same content. It
+  finishes them in batches of up to 256, or 1 GB of copies: one flush, then
+  the records, then the deletions. A no-history overwrite does its one
+  promotion at once.
 * **The seed and the moves flush before they take the set's write lock:** what
   they record was renamed before the transaction, so the lock is held for the
   inserts only. A run's batches flush under the lock, which they hold

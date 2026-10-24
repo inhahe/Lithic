@@ -24,6 +24,8 @@
 //  18.  The service shares one flush among requests that arrive together.
 //  19.  No history: a reference made a plain copy is committed before the
 //       overwrite that needed it, whatever the batch does after.
+//  20-21. Retention's promotions finished a batch at a time: one flush for
+//       many, the sources kept when it fails, one promotion per content.
 //
 // Not covered: a USB drive that drops off and comes back (VolumeWatch.WasLost
 // true), which takes the hardware.
@@ -767,6 +769,121 @@ try
         Check(!bAfter.IsFileRef && File.Exists(bPlain) && File.ReadAllText(bPlain) == "shared content",
             "b.txt is recorded as the plain copy it now is, holding its content");
         Check(!File.Exists(bPlain + ".fileref"), "its manifest gone");
+    }
+
+    // ===================================================================
+    Console.WriteLine();
+    Console.WriteLine("=== 20. Retention: many references given expired copies' bytes, one flush ===");
+    // ===================================================================
+    foreach (bool flushWorks in new[] { true, false })
+    {
+        var (set, src, dst) = await NewSet(flushWorks ? "promote-many" : "promote-many-fails", 0);
+        Directory.CreateDirectory(src);
+        const int Pairs = 5;
+        var a = Enumerable.Range(0, Pairs).Select(i => Path.Combine(src, $"a{i}.txt")).ToList();
+        var b = Enumerable.Range(0, Pairs).Select(i => Path.Combine(src, $"b{i}.txt")).ToList();
+        string c = Path.Combine(src, "c.txt");   // referred to by nothing: needs no promotion
+        for (int i = 0; i < Pairs; i++)
+        {
+            File.WriteAllText(a[i], $"content {i}, two files");
+            File.WriteAllText(b[i], $"content {i}, two files");
+        }
+        File.WriteAllText(c, "c alone");
+        var svc = Service(new RecordingFlush());
+        Check((await svc.ExecuteAsync(Job(set, src, dst), dst, null, null, CancellationToken.None)).Success,
+            $"{set.Name}: {Pairs} pairs backed up, each a plain copy and a reference to it");
+        foreach (string edit in new[] { "changed", "changed again" })
+        {
+            foreach (string f in a.Append(c))
+                File.WriteAllText(f, $"{Path.GetFileName(f)} {edit}");
+            if (edit == "changed")
+                Check((await svc.ExecuteAsync(Job(set, src, dst), dst, null, null, CancellationToken.None)).Success,
+                    "every a and c changed: backed up again");
+        }
+
+        var bPlain = b.Select(f => CurrentIn(dst, f)).ToList();
+        var aV1 = a.Select(f => PrevIn(dst, f, 1)).ToList();
+        var promotionFlushes = new List<(int Promoted, int SourcesThere)>();
+        var recording = new RecordingFlush
+        {
+            FailsFor = written => !flushWorks && written.Intersect(bPlain, StringComparer.OrdinalIgnoreCase).Any(),
+            OnFlush = written =>
+            {
+                int promoted = written.Intersect(bPlain, StringComparer.OrdinalIgnoreCase).Count();
+                if (promoted > 0)
+                    promotionFlushes.Add((promoted, aV1.Count(File.Exists)));
+            },
+        };
+        Check((await Service(recording).ExecuteAsync(Job(set, src, dst), dst,
+                [new VersionRetentionTier { MaxVersions = 1 }], null, CancellationToken.None)).Success,
+            "changed again: the run keeping one earlier version succeeds");
+        Check(promotionFlushes.Count == 1 && promotionFlushes[0].Promoted == Pairs,
+            $"its {Pairs} promotions were made durable in one flush "
+            + $"({string.Join(", ", promotionFlushes.Select(f => $"{f.Promoted} promoted"))})");
+        Check(promotionFlushes.Count == 1 && promotionFlushes[0].SourcesThere == Pairs,
+            "while every copy they came from was still there");
+
+        var bAfter = new List<FileRecord>();
+        foreach (string f in b)
+            bAfter.Add((await repo.GetFileRecordsByPathAsync(set.Id, f)).Single());
+        var cOld = await repo.GetFileRecordByPathAndVersionAsync(set.Id, c, 1);
+        Check(cOld is not null && cOld.IsDeleted && !File.Exists(PrevIn(dst, c, 1)),
+            "c.txt's expired copy, which nothing refers to, is gone either way");
+        if (flushWorks)
+        {
+            Check(bAfter.All(r => !r.IsFileRef) && bPlain.All(File.Exists)
+                  && Enumerable.Range(0, Pairs).All(i => File.ReadAllText(bPlain[i]) == $"content {i}, two files")
+                  && bPlain.All(p => !File.Exists(p + ".fileref")),
+                "every b is a plain copy now, holding its content, its manifest gone");
+            Check(aV1.All(p => !File.Exists(p)), "and every a's expired copy is gone");
+        }
+        else
+        {
+            Check(bAfter.All(r => r.IsFileRef) && bPlain.All(p => File.Exists(p + ".fileref") && !File.Exists(p)),
+                "when that flush fails, every b stays a reference, with nothing beside it");
+            Check(aV1.All(File.Exists), "and every a's expired copy, which they resolve to, is kept");
+        }
+    }
+
+    // ===================================================================
+    Console.WriteLine();
+    Console.WriteLine("=== 21. Retention: two expired copies of one content, one promotion ===");
+    // ===================================================================
+    {
+        var (set, src, dst) = await NewSet("promote-same", 0);
+        Directory.CreateDirectory(src);
+        string x = Path.Combine(src, "x.txt"), y = Path.Combine(src, "y.txt"), z = Path.Combine(src, "z.txt");
+        File.WriteAllText(x, "shared by three");
+        File.WriteAllText(z, "shared by three");
+        var plainJob = Job(set, src, dst);
+        plainJob.EnableFileDeduplication = false;   // both stored plain
+        var svc = Service(new RecordingFlush());
+        Check((await svc.ExecuteAsync(plainJob, dst, null, null, CancellationToken.None)).Success,
+            "x.txt and z.txt backed up without dedup, both plain");
+        File.WriteAllText(y, "shared by three");
+        Check((await svc.ExecuteAsync(Job(set, src, dst), dst, null, null, CancellationToken.None)).Success
+              && (await repo.GetFileRecordsByPathAsync(set.Id, y)).Single().IsFileRef,
+            "y.txt, the same content, backed up as a reference");
+        File.WriteAllText(x, "x changed");
+        File.WriteAllText(z, "z changed");
+        Check((await svc.ExecuteAsync(Job(set, src, dst), dst, null, null, CancellationToken.None)).Success,
+            "x and z changed: backed up again");
+        File.WriteAllText(x, "x changed again");
+        File.WriteAllText(z, "z changed again");
+        string yPlain = CurrentIn(dst, y);
+        int yFlushes = 0;
+        var recording = new RecordingFlush
+        {
+            OnFlush = written => yFlushes += written.Contains(yPlain, StringComparer.OrdinalIgnoreCase) ? 1 : 0,
+        };
+        Check((await Service(recording).ExecuteAsync(Job(set, src, dst), dst,
+                [new VersionRetentionTier { MaxVersions = 1 }], null, CancellationToken.None)).Success,
+            "changed again: the run keeping one earlier version succeeds");
+        var yAfter = (await repo.GetFileRecordsByPathAsync(set.Id, y)).Single();
+        Check(!yAfter.IsFileRef && File.ReadAllText(yPlain) == "shared by three" && yFlushes == 1,
+            $"y.txt is given the content once ({yFlushes} flush of it)");
+        Check(!File.Exists(PrevIn(dst, x, 1)) && !File.Exists(PrevIn(dst, z, 1)),
+            "and both expired copies of it are gone");
     }
 }
 finally

@@ -138,24 +138,31 @@ opened, call `SqliteConnection.ClearAllPools()`, then delete the folder in a
 `finally`, and say so if it cannot. `cache_maint_test` should delete its copy
 when it ends.
 
-## TECH DEBT: retention flushes the destination once for every reference it promotes (2026-10-24)
+## FIXED: retention flushed the destination once for every reference it promoted (2026-10-24)
 
 When retention deletes the last plain copy of some content that a `.fileref`
-still resolves to, it first copies the bytes into that reference
-(`TryPromoteFileRefToPlainAsync`). It makes the copy durable before deleting
-the old one (`DestinationWrites.MakeDurableNowAsync`), and it does that once
-per promotion: a volume flush each, a pipe round trip plus a flush of the
-device's cache, tens of milliseconds on a USB disk. A pass with a few
-promotions doesn't notice. A pass that prunes a thousand last copies of
-referenced content would spend a minute or more just flushing.
+still resolves to, it first copies the bytes into that reference, and makes
+the copy durable before deleting the old one. It flushed once per promotion:
+a volume flush each, a pipe round trip plus a flush of the device's cache,
+tens of milliseconds on a USB disk. A pass that pruned a thousand last copies
+of referenced content spent a minute or more just flushing.
 
-**Proper fix:** two passes over the expired versions. First make every
-promotion's copy, then flush once. Then flip the promoted records, delete their
-manifests, delete the expired copies and retire their records. The first pass
-has to remember which references it is promoting, so that a later version with
-the same hash, finding the content in a pending promotion, does not promote
-another one. On a flush failure the pass deletes the copies it made and keeps
-every expired copy. `durability_test` §13 is the test to extend.
+**Fix.** Retention makes the promotions' copies as it goes (`Promotion`,
+`TryCopyForPromotion`). It holds back the expired copies they come from, along
+with any other expired copy of the same content. Every 256 promotions, or 1 GB
+of copies, it finishes them (`FinishPromotionsAsync`): one flush, then the
+records, then the manifests and the expired copies go. When the flush fails,
+every copy is taken back and every held-back copy is kept. A copy stopped
+before it is finished is taken back too. The bound keeps the extra space the
+copies take, until what they came from goes, to a gigabyte.
+
+**Tests.** `durability_test` §20: five promotions in one pass take one flush,
+made while every source was still there. When that flush fails, every
+reference stays as it was, with nothing beside it, and every source is kept,
+while an expired copy that needed no promotion still goes. §21: two expired
+copies of one content wait on one promotion. Finishing each promotion at once,
+as before, fails §20 (five flushes); not waiting fails §21 (an expired copy is
+left).
 
 ## FIXED: "files under this folder" read every file of the set, and missed names starting with an emoji (2026-10-21)
 
