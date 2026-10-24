@@ -144,17 +144,21 @@ public sealed class DestinationFlush : IDestinationFlush
 /// and the many places that write need no parameter for it.
 /// </summary>
 /// <remarks>
-/// It also watches every volume the run writes to (<see cref="VolumeWatch"/>): the
-/// destination's from <see cref="Begin"/>, another's (a junction inside the
-/// destination) from the first write in a folder on it. A watch that has seen
-/// its volume go is renewed at the first write after a durable point, when
-/// nothing the run wrote was at risk.
+/// It also watches every volume the run writes to (<see cref="VolumeWatch"/>, held
+/// on the volume's root, which no one can delete, or on the folder written in when
+/// the root may not be opened): the destination's from <see cref="Begin"/>,
+/// another's (through a junction inside the destination) from the first write on
+/// it. A watch that has seen its volume go is renewed at the
+/// first write after a durable point, when nothing the run wrote was at risk; one
+/// that cannot be held then fails the commit, which cannot tell what the volume
+/// lost.
 /// </remarks>
 internal sealed class DestinationWrites : IDisposable
 {
     private static readonly AsyncLocal<DestinationWrites?> Current = new();
 
     private readonly string _destination;
+    private readonly SuspectWrites? _suspect;
     private readonly object _gate = new();
 
     /// <summary>What was noted since the last durable point.</summary>
@@ -163,37 +167,44 @@ internal sealed class DestinationWrites : IDisposable
     /// <summary>
     /// The watch of each volume written to, by volume name - or, for the
     /// destination on a file system without volume names (a share), by its
-    /// path. Null while it could not be held (the volume was gone).
+    /// path - with the root and the folder it may hold. Null while neither could
+    /// be held.
     /// </summary>
-    private readonly Dictionary<string, (string Folder, VolumeWatch? Watch)> _watches =
+    private readonly Dictionary<string, (string Root, string Folder, VolumeWatch? Watch)> _watches =
         new(StringComparer.OrdinalIgnoreCase);
 
-    /// <summary>Folders written in whose volume has been looked up, once each.</summary>
+    /// <summary>
+    /// Folders written in since the last durable point whose volume has been
+    /// looked up, so each is looked up once a batch.
+    /// </summary>
     private readonly HashSet<string> _placedFolders = new(StringComparer.OrdinalIgnoreCase);
 
-    private DestinationWrites(string destination)
+    private DestinationWrites(string destination, SuspectWrites? suspect)
     {
         _destination = destination;
-        PendingSinceUtc = DateTime.UtcNow;
-        string key = DurableFlush.VolumeOf(destination, out _) ?? destination;
-        _watches[key] = (destination, VolumeWatch.Open(destination));
-        _placedFolders.Add(destination);
+        _suspect = suspect;
+        string root = DurableFlush.VolumeOf(destination, out _) ?? destination;
+        _watches[root] = (root, destination, Hold(root, destination));
     }
 
     /// <summary>
-    /// When the writes now pending began: the run's start, or the last durable
-    /// point. What was written since may be lost if they cannot be made durable.
+    /// A watch on <paramref name="root"/>, or on <paramref name="folder"/> when
+    /// the root may not be opened (an ACL that admits users to a folder only).
     /// </summary>
-    public DateTime PendingSinceUtc { get; private set; }
+    private static VolumeWatch? Hold(string root, string folder) => VolumeWatch.Open(root) ?? VolumeWatch.Open(folder);
 
     /// <summary>
     /// Start noting for a run writing under <paramref name="destination"/> (an
     /// existing folder), in the calling flow and everything it calls or starts.
     /// Not async on purpose: the value is set in the caller's flow.
     /// </summary>
-    public static DestinationWrites Begin(string destination)
+    /// <param name="suspect">
+    /// The destination's writes that earlier runs never made durable: what this
+    /// run makes durable is no longer among them.
+    /// </param>
+    public static DestinationWrites Begin(string destination, SuspectWrites? suspect = null)
     {
-        var writes = new DestinationWrites(destination);
+        var writes = new DestinationWrites(destination, suspect);
         Current.Value = writes;
         return writes;
     }
@@ -215,15 +226,22 @@ internal sealed class DestinationWrites : IDisposable
         (Current.Value ?? throw new InvalidOperationException("A write to a destination outside a run: nothing noted it."))
             .MakeDurableAsync(flush, ct);
 
+    /// <summary>What is noted and not yet durable.</summary>
+    public List<string> Pending
+    {
+        get
+        {
+            lock (_gate)
+                return [.. _pending];
+        }
+    }
+
     private void Add(string path)
     {
         lock (_gate)
         {
             if (_pending.Count == 0)
-            {
-                PendingSinceUtc = DateTime.UtcNow;
                 RenewLostWatches();
-            }
             _pending.Add(path);
             string? folder = Path.GetDirectoryName(path);
             if (folder is not null && _placedFolders.Add(folder))
@@ -231,19 +249,12 @@ internal sealed class DestinationWrites : IDisposable
         }
     }
 
-    /// <summary>
-    /// Watch the volume <paramref name="folder"/> is on, if no watch has it yet
-    /// and it has a name (the destination's own is watched from the start).
-    /// </summary>
+    /// <summary>Watch the volume <paramref name="folder"/> is on, when it has a name and no watch yet.</summary>
     private void WatchVolumeOf(string folder)
     {
         string? volume = DurableFlush.VolumeOf(folder, out _);
-        if (volume is null)
-            return;
-        if (!_watches.TryGetValue(volume, out var held))
-            _watches[volume] = (folder, VolumeWatch.Open(folder));
-        else if (held.Watch is null)
-            _watches[volume] = (held.Folder, VolumeWatch.Open(held.Folder));
+        if (volume is not null && !_watches.ContainsKey(volume))
+            _watches[volume] = (volume, folder, Hold(volume, folder));
     }
 
     /// <summary>
@@ -252,12 +263,12 @@ internal sealed class DestinationWrites : IDisposable
     /// </summary>
     private void RenewLostWatches()
     {
-        foreach (var (key, (folder, watch)) in _watches.ToList())
+        foreach (var (key, (root, folder, watch)) in _watches.ToList())
         {
             if (watch is not null && !watch.WasLost(out _))
                 continue;
             watch?.Dispose();
-            _watches[key] = (folder, VolumeWatch.Open(folder));
+            _watches[key] = (root, folder, Hold(root, folder));
         }
     }
 
@@ -268,8 +279,8 @@ internal sealed class DestinationWrites : IDisposable
     /// <exception cref="IOException">
     /// It could not be; or a volume written to went away at some point since it
     /// was first watched, taking with it whatever was in the cache then, though it
-    /// may be back. Either way the commit must not happen. What was noted stays
-    /// noted, for the next attempt.
+    /// may be back; or one could not be watched. Either way the commit must not
+    /// happen. What was noted stays noted, for the next attempt.
     /// </exception>
     public async Task MakeDurableAsync(IDestinationFlush flush, CancellationToken ct)
     {
@@ -281,25 +292,27 @@ internal sealed class DestinationWrites : IDisposable
         await flush.FlushAsync(_destination, written, ct).ConfigureAwait(false);
         lock (_gate)
         {
-            foreach (var (folder, watch) in _watches.Values)
+            foreach (var (_, folder, watch) in _watches.Values)
             {
-                if (watch is not null && watch.WasLost(out string? why))
+                string? why = null;
+                if (watch is null || watch.WasLost(out why))
                     throw new IOException(
-                        $"The drive holding {folder} went away during the backup ({why}). What was written to it "
-                        + "since the last save of the catalog may be lost, so it is not recorded.");
+                        $"The drive holding {folder} went away during the backup ({why ?? "it could not be held"}). "
+                        + "What was written to it since the last save of the catalog may be lost, so it is not recorded.");
             }
             // Only Add adds, at the end: the first ones are these.
             _pending.RemoveRange(0, written.Length);
             if (_pending.Count == 0)
-                PendingSinceUtc = DateTime.UtcNow;
+                _placedFolders.Clear();
         }
+        _suspect?.Durable(written);
     }
 
     public void Dispose()
     {
         lock (_gate)
         {
-            foreach (var (_, watch) in _watches.Values)
+            foreach (var (_, _, watch) in _watches.Values)
                 watch?.Dispose();
             _watches.Clear();
         }
@@ -309,42 +322,42 @@ internal sealed class DestinationWrites : IDisposable
 }
 
 /// <summary>
-/// The spans of time in which a run's writes to a destination were never made
-/// durable: its last batch could not be flushed (the drive had gone), so the
-/// batch was not recorded, but what it wrote may still be there - its names on
-/// the disk, its data perhaps not. A later run must neither record such a copy
-/// as a version of its own (the "catalog behind the drive" case of the move into
-/// <c>_prev</c>) nor take such a block as stored. They are told by their write
-/// time: a copy or a block is written once, and a rename keeps the time, so the
-/// old copies such a batch moved into the history, which were durable, are not
-/// taken for its new ones.
+/// The writes to a destination that a run never made durable: its last batch
+/// could not be flushed (the drive had gone), so the batch was not recorded,
+/// but what it wrote may still be there - its names on the disk, its data
+/// perhaps not. A later run must neither record such a copy as a version of its
+/// own (the "catalog behind the drive" case of the move into <c>_prev</c>) nor
+/// take such a block as stored. A path stops being suspect once a run has
+/// written it again and made that durable.
 /// </summary>
 /// <remarks>
 /// Kept per destination folder, in the catalog's folder (on a drive that did not
-/// go), one line per span, its start and end in UTC ticks; shared by every set
-/// backing up there, as the block store is. A span stays: a copy written in one
-/// can sit unrecorded until its source next changes. The newest
-/// <see cref="MaxSpans"/> are kept.
+/// go), one full path a line; shared by every set backing up there, as the block
+/// store is. A run reads it when it starts and writes back what it changed when
+/// it ends, merged under an exclusive open with what other runs wrote meanwhile.
+/// The newest <see cref="MaxPaths"/> are kept.
 /// </remarks>
 internal sealed class SuspectWrites
 {
-    /// <summary>Either side of a span: file times have a resolution of their own (2 s on FAT).</summary>
-    private static readonly TimeSpan Margin = TimeSpan.FromSeconds(2);
-
-    private const int MaxSpans = 1000;
+    private const int MaxPaths = 100_000;
 
     private readonly string _file;
-    private readonly List<(long Start, long End)> _spans;
+    private readonly string _destination;
+    private readonly object _gate = new();
+    private readonly HashSet<string> _paths;
+    private readonly HashSet<string> _added = new(StringComparer.OrdinalIgnoreCase);
+    private readonly HashSet<string> _cleared = new(StringComparer.OrdinalIgnoreCase);
 
-    private SuspectWrites(string file, List<(long Start, long End)> spans)
+    private SuspectWrites(string file, string destination, HashSet<string> paths)
     {
         _file = file;
-        _spans = spans;
+        _destination = destination;
+        _paths = paths;
     }
 
     /// <summary>
-    /// The spans recorded for <paramref name="destination"/>; none when there are
-    /// none, or they cannot be read.
+    /// The suspect writes recorded for <paramref name="destination"/>; none when
+    /// there are none, or they cannot be read.
     /// </summary>
     /// <param name="catalogFolder">The catalog's folder (<c>ICatalogRepository.DataDirectory</c>).</param>
     public static SuspectWrites Load(string catalogFolder, string destination)
@@ -352,70 +365,131 @@ internal sealed class SuspectWrites
         string key = Path.GetFullPath(destination).TrimEnd('\\').ToUpperInvariant();
         string name = Convert.ToHexString(SHA256.HashData(Encoding.UTF8.GetBytes(key)))[..16] + ".txt";
         string file = Path.Combine(catalogFolder, "unflushed", name);
-        var spans = new List<(long, long)>();
-        try
+        var paths = new HashSet<string>(StringComparer.OrdinalIgnoreCase);
+        // Another run may be writing it back; it holds it a moment.
+        WithRetry(() =>
         {
-            using var stream = new FileStream(file, FileMode.Open, FileAccess.Read, FileShare.ReadWrite);
-            using var reader = new StreamReader(stream, Encoding.UTF8);
-            while (reader.ReadLine() is { } line)
-            {
-                var parts = line.Split(' ');
-                if (parts.Length == 2 && long.TryParse(parts[0], out long start) && long.TryParse(parts[1], out long end))
-                    spans.Add((start, end));
-            }
-        }
-        catch (Exception ex) when (ex is IOException or UnauthorizedAccessException)
-        {
-            // None recorded, or none readable: as before there were any.
-        }
-        return new SuspectWrites(file, spans);
+            using var stream = new FileStream(file, FileMode.Open, FileAccess.Read, FileShare.Read);
+            paths.UnionWith(ReadPaths(stream));
+        });
+        return new SuspectWrites(file, destination, paths);
     }
 
-    public bool IsEmpty => _spans.Count == 0;
-
-    /// <summary>Whether a file last written at <paramref name="writtenUtc"/> may be one such write.</summary>
-    public bool Covers(DateTime writtenUtc)
+    public bool IsEmpty
     {
-        long t = writtenUtc.Ticks;
-        foreach (var (start, end) in _spans)
-            if (t >= start && t <= end)
-                return true;
-        return false;
+        get
+        {
+            lock (_gate)
+                return _paths.Count == 0;
+        }
+    }
+
+    /// <summary>Whether <paramref name="path"/> was written by a batch never made durable.</summary>
+    public bool Contains(string path)
+    {
+        lock (_gate)
+            return _paths.Count > 0 && _paths.Contains(Path.GetFullPath(path));
+    }
+
+    /// <summary>These were not made durable: suspect from now on.</summary>
+    public void Add(IEnumerable<string> paths)
+    {
+        lock (_gate)
+        {
+            foreach (string path in paths.Select(Path.GetFullPath))
+            {
+                _paths.Add(path);
+                _added.Add(path);
+                _cleared.Remove(path);
+            }
+        }
+    }
+
+    /// <summary>These were written again and made durable: no longer suspect.</summary>
+    public void Durable(IEnumerable<string> paths)
+    {
+        lock (_gate)
+        {
+            if (_paths.Count == 0)
+                return;
+            foreach (string path in paths.Select(Path.GetFullPath))
+            {
+                if (_paths.Remove(path))
+                    _cleared.Add(path);
+                _added.Remove(path);
+            }
+        }
     }
 
     /// <summary>
-    /// Record that what <paramref name="destination"/>'s run wrote from
-    /// <paramref name="fromUtc"/> to now was not made durable. Best effort: a span
-    /// that cannot be recorded leaves its writes to be taken as they are, as
-    /// before.
+    /// Write back what this run changed, merged with what is there now. Best
+    /// effort: an addition that cannot be recorded leaves its writes to be taken
+    /// as they are, as before there was a record.
     /// </summary>
-    public void Add(string destination, DateTime fromUtc)
+    public void Save()
     {
-        var span = ((fromUtc - Margin).Ticks, (DateTime.UtcNow + Margin).Ticks);
-        _spans.Add(span);
+        string[] added, cleared;
+        lock (_gate)
+        {
+            if (_added.Count == 0 && _cleared.Count == 0)
+                return;
+            added = [.. _added];
+            cleared = [.. _cleared];
+        }
+        bool saved = WithRetry(() =>
+        {
+            Directory.CreateDirectory(Path.GetDirectoryName(_file)!);
+            using var stream = new FileStream(_file, FileMode.OpenOrCreate, FileAccess.ReadWrite, FileShare.None);
+            var paths = ReadPaths(stream).ToList();
+            var gone = new HashSet<string>(cleared, StringComparer.OrdinalIgnoreCase);
+            var have = new HashSet<string>(StringComparer.OrdinalIgnoreCase);
+            var kept = paths.Where(p => !gone.Contains(p) && have.Add(p)).ToList();
+            kept.AddRange(added.Where(have.Add));
+            stream.Position = 0;
+            stream.SetLength(0);
+            using (var writer = new StreamWriter(stream, new UTF8Encoding(false), 65536, leaveOpen: true))
+            {
+                writer.WriteLine($"# Writes to {_destination} that were never made durable.");
+                foreach (string path in kept.Skip(Math.Max(0, kept.Count - MaxPaths)))
+                    writer.WriteLine(path);
+            }
+            stream.Flush(flushToDisk: true);
+        });
+        if (saved)
+        {
+            lock (_gate)
+            {
+                _added.ExceptWith(added);
+                _cleared.ExceptWith(cleared);
+            }
+        }
+    }
+
+    private static IEnumerable<string> ReadPaths(Stream stream)
+    {
+        using var reader = new StreamReader(stream, Encoding.UTF8, false, 65536, leaveOpen: true);
+        while (reader.ReadLine() is { } line)
+            if (line.Length > 0 && !line.StartsWith('#'))
+                yield return line;
+    }
+
+    /// <summary>
+    /// Do <paramref name="action"/> on the file, waiting out another run that holds
+    /// it (for a second at most); false when it could not be done. A file that is
+    /// not there is nothing to read, and not a failure.
+    /// </summary>
+    private static bool WithRetry(Action action)
+    {
         for (int attempt = 0; ; attempt++)
         {
             try
             {
-                Directory.CreateDirectory(Path.GetDirectoryName(_file)!);
-                // Rewritten whole, under an exclusive open: another process
-                // recording a span of its own waits for it.
-                using var stream = new FileStream(_file, FileMode.OpenOrCreate, FileAccess.ReadWrite, FileShare.None);
-                var lines = new List<string>();
-                using (var reader = new StreamReader(stream, Encoding.UTF8, false, 4096, leaveOpen: true))
-                    while (reader.ReadLine() is { } line)
-                        if (!line.StartsWith('#'))
-                            lines.Add(line);
-                lines.Add($"{span.Item1} {span.Item2}");
-                stream.SetLength(0);
-                using (var writer = new StreamWriter(stream, new UTF8Encoding(false), 4096, leaveOpen: true))
-                {
-                    writer.WriteLine($"# Writes to {destination} that were never made durable: UTC ticks, from and to.");
-                    foreach (string line in lines.Skip(Math.Max(0, lines.Count - MaxSpans)))
-                        writer.WriteLine(line);
-                }
-                stream.Flush(flushToDisk: true);
-                return;
+                action();
+                return true;
+            }
+            catch (Exception ex) when (ex is FileNotFoundException or DirectoryNotFoundException)
+            {
+                return true;
             }
             catch (IOException) when (attempt < 20)
             {
@@ -423,7 +497,7 @@ internal sealed class SuspectWrites
             }
             catch (Exception ex) when (ex is IOException or UnauthorizedAccessException)
             {
-                return;
+                return false;
             }
         }
     }

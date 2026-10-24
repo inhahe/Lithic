@@ -72,8 +72,8 @@ design.md, "A copy is recorded only once it is on the disk". In short:
 - A batch that rolls back leaves the disk ahead of the catalog. The next run
   copes with each kind of leftover:
   - a record whose current copy was moved away follows it to its `.vN`;
-  - a copy or a block written in the span the failed batch could not make
-    durable is not trusted (`SuspectWrites`);
+  - a copy or a block that the failed batch wrote and could not make durable
+    is not trusted (`SuspectWrites`, a list of those paths);
   - a reference promoted in the batch was committed before the overwrite that
     made it necessary.
 
@@ -106,15 +106,37 @@ was specified". That they stay dead once it is back follows from how mounting
 works, not from anything observed here: a returning drive is mounted anew, and
 old handles belong to the mount that went.
 
-**Limit.** When files are flushed one by one, a file another process has open
-without sharing writes cannot be flushed, and that batch is not committed. The
-next run copies it again. This happens only in the per-file fallback, and only
-for a file renamed in that batch that another process is reading.
+**Limit.** Files are flushed one by one on a share, or when no service
+answers. In that mode, a file that another process keeps open without
+sharing writes (a preview handler, a virus scanner) cannot be opened to be
+flushed. It is retried for most of a second. If it is still held, the
+commit fails, and so does the run. That batch's writes are recorded as
+suspect, so the next run copies them again.
 
 **Repairing the H: backup now.** Once `chkdsk` has checked the volume, run
 **Verify integrity** on the set with **Verify file contents** on: it re-hashes
 everything stored on H: against the catalog and finds whatever these drops
 lost.
+
+## TECH DEBT: ten harnesses leave their temp folders behind (2026-10-24)
+
+On every run, ten harnesses leave their `%TEMP%\lithic_<name>_<guid>` folder
+behind:
+- `case_rename_test`, `dest_space_test`, `dir_dedup_test`;
+- `dedup_estimate_test`, which leaves two;
+- `continuous_interleave_test`, `missing_source_test`,
+  `purge_record_integrity_test`;
+- `targeted_progress_test`, `selection_widening_test`, `resurrection_test`.
+
+Most delete it while their catalog is still open, which fails quietly.
+`resurrection_test` never tries. Three full suite runs left 53 of them, 62 MB.
+`cache_maint_test` keeps a fixed-name copy of the real size cache
+(`%TEMP%\lithic_cache_maint_test`, 350 MB here) between runs.
+
+**Fix:** what `write_lock_fairness_test` now does: dispose every catalog it
+opened, call `SqliteConnection.ClearAllPools()`, then delete the folder in a
+`finally`, and say so if it cannot. `cache_maint_test` should delete its copy
+when it ends.
 
 ## TECH DEBT: retention flushes the destination once for every reference it promotes (2026-10-24)
 

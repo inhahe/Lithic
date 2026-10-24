@@ -18,8 +18,8 @@
 //       plain copy it is about to delete: that copy is flushed first, and when
 //       it cannot be, the bytes stay.
 //  14-16. What the next run makes of a batch that rolled back: a record whose
-//       current copy is gone follows it; a copy or block written in the span
-//       that was never made durable is not trusted.
+//       current copy is gone follows it; a copy or a block that batch wrote,
+//       never made durable, is not trusted, and nothing else is suspected.
 //  17.  File by file, a copy gone with its folder fails the flush.
 //  18.  The service shares one flush among requests that arrive together.
 //  19.  No history: a reference made a plain copy is committed before the
@@ -157,6 +157,17 @@ try
     Check(DurableFlush.TryFlushPath(root, out _), "a folder");
     Check(!DurableFlush.TryFlushPath(Path.Combine(root, "gone.bin"), out string? goneWhy),
         $"a file that is not there is not flushed ({goneWhy})");
+
+    // Held by another process that shares reading only (a preview handler, a
+    // scanner): flushed once it lets go, if that is soon.
+    string held = Path.Combine(root, "held.bin");
+    File.WriteAllBytes(held, RandomNumberGenerator.GetBytes(10_000));
+    var holder = new FileStream(held, FileMode.Open, FileAccess.Read, FileShare.Read);
+    var letGo = Task.Delay(300).ContinueWith(_ => holder.Dispose());
+    Check(DurableFlush.TryFlushPath(held, out string? heldWhy), $"a file held for a moment by another reader ({heldWhy ?? "flushed"})");
+    await letGo;
+    using (new FileStream(held, FileMode.Open, FileAccess.Read, FileShare.Read))
+        Check(!DurableFlush.TryFlushPath(held, out heldWhy), $"but not one held for good ({heldWhy})");
 
     // ===================================================================
     Console.WriteLine();
@@ -651,6 +662,7 @@ try
         Check((await BlockService(new RecordingFlush()).ExecuteAsync(BlockJob(), dst, null, null, CancellationToken.None)).Success,
             "backed up with block dedup");
         var before = Directory.Exists(store) ? Directory.GetFiles(store).ToHashSet(StringComparer.OrdinalIgnoreCase) : [];
+        var beforeWritten = before.ToDictionary(f => f, File.GetLastWriteTimeUtc, StringComparer.OrdinalIgnoreCase);
         Check(before.Count == 2, $"a file of a repeated block stored as its 2 blocks ({before.Count})");
 
         File.WriteAllBytes(Path.Combine(src, "z.bin"), Blocks(q1, q1, q2));
@@ -674,6 +686,11 @@ try
             .Where(f => !string.Equals(Sha(f), Path.GetFileNameWithoutExtension(f), StringComparison.OrdinalIgnoreCase))
             .ToList();
         Check(bad.Count == 0, $"and every block in the store holds what its name says ({bad.Count} do not)");
+        Check(!Directory.EnumerateFiles(store, "*.lbtmp").Any(), "with no rewrite left half-done");
+        // The blocks the run before the failed one made durable were not suspected,
+        // however close in time.
+        Check(beforeWritten.All(b => File.GetLastWriteTimeUtc(b.Key) == b.Value),
+            "and the blocks of the batch before it, durable, were left as they were");
     }
 
     // ===================================================================

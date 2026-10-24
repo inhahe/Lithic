@@ -94,11 +94,12 @@ public class VerifyService : IVerifyService
             Task.Run(() => _scanner.ScanAsync(
                 job.Sources, scanProgress, ct, isExcluded,
                 DirectoryBackupService.BuildDirectoryPruneFilter(job)), ct),
-            elapsed => live.Scan is { } p
-                ? Step("Step 2 of 3: scanning the sources", p.FilesFound, backedUpSourcePaths.Count,
-                    "files", elapsed, p.CurrentDirectory, estimated: true)
-                : Step("Step 2 of 3: scanning the sources", 0, backedUpSourcePaths.Count,
-                    "files", elapsed, estimated: true),
+            elapsed =>
+            {
+                var p = live.Scan;
+                return Step("Step 2 of 3: scanning the sources", p?.FilesFound ?? 0, backedUpSourcePaths.Count,
+                    "files", elapsed, p?.CurrentDirectory, estimated: true);
+            },
             progress).ConfigureAwait(false);
 
         int sourceChecked = 0;

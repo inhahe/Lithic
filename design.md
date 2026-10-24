@@ -1950,14 +1950,16 @@ disk first:
     or goes there all the same, so it never shares the current path with the new
     copy. (When another file has that `.vN` name, the record is retired.)
   * *Its new copies and blocks,* whose names may have survived without their
-    data. The way-out path records the span of time in which they were written
-    (`SuspectWrites`, beside the catalog, per destination). A copy at a current
-    path written in such a span is not recorded as a version of its own: it is
-    deleted, and the source copied afresh. A block written in one is written
-    again when next needed, rather than taken as stored. Write times tell them
-    apart, since a copy or block is written once and a rename keeps its time:
-    the durable old copies such a batch moved into the history are not
-    suspected.
+    data. The way-out path records exactly what it could not make durable, the
+    journal's pending paths (`SuspectWrites`, beside the catalog, one file per
+    destination, shared by the sets that back up there). A copy at a current
+    path on that list is not recorded as a version of its own: it is deleted,
+    and the source copied afresh. A block on it is written again when next
+    needed, rather than taken as stored. Rewriting goes to a temporary file,
+    flushed, then renamed over the block, since committed manifests may already
+    resolve to it. A path leaves the list once a run has written it again and
+    made that durable. Runs read the list when they start and write back their
+    changes when they end, merged under an exclusive open.
   * *A reference given new bytes.* When a file that keeps no history is
     overwritten in place, a `.fileref` resolving to its old bytes is made a
     plain copy first. That change is committed before the overwrite, and only
@@ -1994,16 +1996,21 @@ disk first:
   asked again for a minute). This is done after checking that the destination
   is still there, and a copy that is gone with its folder fails the flush. A
   folder that will not flush (a renamed one, on a file system that refuses)
-  fails it too.
+  fails it too. So does a file that another process keeps open without sharing
+  writes, such as a preview handler or a scanner. It is retried for most of a
+  second first: until it is let go, it cannot be opened to be flushed.
 * **A drive that comes back.** A USB drive that drops off and comes back under
   the same letter has lost what was in the cache, yet its paths work again, and a
-  flush then succeeds, flushing none of what was lost. So a run holds a folder
-  on every volume it writes to (`VolumeWatch`): the destination from `Begin` on,
-  and another volume reached through a junction from the run's first write
-  there. A commit, after its flush, first checks that each handle still works:
-  a handle from before the drop never works again. A watch whose volume went
-  is renewed at the first write after a durable point, when the loss cost
-  nothing. Untested: it takes pulling the drive.
+  flush then succeeds, flushing none of what was lost. So a run holds the root
+  of every volume it writes to (`VolumeWatch`; a root cannot be deleted): the
+  destination's from `Begin` on, and another reached through a junction from
+  the run's first write there. When the root may not be opened (an ACL that
+  admits users to a folder only), the folder written in is held instead. So it
+  is for a destination on a share, which has no volume name. A commit, after its flush, first checks that
+  each handle still works: a handle from before the drop never works again. A
+  watch whose volume went is renewed at the first write after a durable point,
+  when the loss cost nothing. One that cannot be held then fails the commit,
+  which cannot tell what the volume lost. Untested: it takes pulling the drive.
 * **Batches are larger, because each commit costs a flush:** 500 files, a file of
   100 MB or more, or 30 s (they were 50, 10 MB and 30 s). The flush writes out
   synchronously whatever the lazy writer has not yet written. Over a longer batch

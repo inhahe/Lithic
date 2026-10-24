@@ -5,6 +5,7 @@ using LithicBackup.Core;
 using LithicBackup.Core.Interfaces;
 using LithicBackup.Core.Models;
 using LithicBackup.Infrastructure.Data;
+using LithicBackup.Infrastructure.FileSystem;
 
 namespace LithicBackup.Services;
 
@@ -596,12 +597,12 @@ public class DirectoryBackupService
         // durable before each commit records it: a copy is done once its bytes
         // are in the cache, and a drive that drops off before they reach the disk
         // would leave the catalog listing files that are not there.
-        using var writes = DestinationWrites.Begin(targetDirectory);
+        // What earlier runs here wrote and could not make durable: such a copy or
+        // block is not to be trusted (SuspectWrites).
+        var suspect = SuspectWrites.Load(_catalog.DataDirectory, targetDirectory);
+        using var writes = DestinationWrites.Begin(targetDirectory, suspect);
         Task MakeDurableAsync(CancellationToken token) =>
             writes.MakeDurableAsync(_destinationFlush, token);
-        // When earlier runs here wrote what they could not make durable: a copy
-        // or block written then is not to be trusted (SuspectWrites).
-        var suspect = SuspectWrites.Load(_catalog.DataDirectory, targetDirectory);
         int batchCount = 0;
         var commitTimer = System.Diagnostics.Stopwatch.StartNew();
 
@@ -1295,8 +1296,7 @@ public class DirectoryBackupService
                                         await DescribeStoredCopyAsync(
                                             recordedPrev, oldDeduped, oldFileRef, hashPlain, ct),
                                         existingInfo);
-                                if (catalogBehind && atCurrent is not null && !suspect.IsEmpty
-                                    && suspect.Covers(File.GetLastWriteTimeUtc(oldCurrentPath)))
+                                if (catalogBehind && atCurrent is not null && suspect.Contains(oldCurrentPath))
                                 {
                                     // Written by a batch whose drive went before it
                                     // could be made durable: its name survived, its
@@ -1829,12 +1829,13 @@ public class DirectoryBackupService
             // What it wrote may still be on the disk, its names without their
             // data: the next run must not take it for copies of its own.
             if (!durable)
-                suspect.Add(targetDirectory, writes.PendingSinceUtc);
+                suspect.Add(writes.Pending);
             throw;
         }
         finally
         {
             tx.Dispose();
+            suspect.Save();
         }
 
         // Every planned file copied and committed - unless the disk filled first.
@@ -3278,14 +3279,36 @@ public class DirectoryBackupService
     /// <summary>
     /// Whether a block goes into the store: it is not there, or it is there from
     /// a batch that was never made durable, its data perhaps lost
-    /// (<see cref="SuspectWrites"/>). Rewritten, it is a write of this run's.
+    /// (<see cref="SuspectWrites"/>).
     /// </summary>
     /// <param name="known">Whether the dedup analysis found the block in the store.</param>
-    private static bool BlockNeedsWriting(bool known, string blockPath, SuspectWrites suspect)
+    private static bool BlockNeedsWriting(bool known, string blockPath, SuspectWrites suspect) =>
+        suspect.Contains(blockPath) || (!known && !File.Exists(blockPath));
+
+    /// <summary>
+    /// Put a block into the store. One already there (a suspect one) is replaced
+    /// only once its replacement is on the disk: manifests recorded since may
+    /// resolve to it, and a drive lost during a rewrite in place would leave them
+    /// nothing.
+    /// </summary>
+    private static async Task StoreBlockAsync(string blockPath, ReadOnlyMemory<byte> data, CancellationToken ct)
     {
-        if (suspect.IsEmpty)
-            return !known && !File.Exists(blockPath);
-        return !File.Exists(blockPath) || suspect.Covers(File.GetLastWriteTimeUtc(blockPath));
+        bool replacing = File.Exists(blockPath);
+        string target = replacing ? blockPath + ".lbtmp" : blockPath;
+        await using (var dst = new FileStream(
+                         target, FileMode.Create, FileAccess.Write,
+                         FileShare.None, bufferSize: 81920, useAsync: true))
+            await dst.WriteAsync(data, ct);
+        if (replacing)
+        {
+            if (!DurableFlush.TryFlushPath(target, out string? why))
+            {
+                TryDeleteFile(target);
+                throw new IOException($"The block {blockPath} could not be written again: {why}");
+            }
+            File.Move(target, blockPath, overwrite: true);
+        }
+        DestinationWrites.Note(blockPath);
     }
 
     /// <summary>
@@ -3314,13 +3337,7 @@ public class DirectoryBackupService
 
             string blockPath = Path.Combine(blockStoreDir, block.Hash + ".blk");
             if (BlockNeedsWriting(block.IsExisting, blockPath, suspect))
-            {
-                await using var dst = new FileStream(
-                    blockPath, FileMode.Create, FileAccess.Write,
-                    FileShare.None, bufferSize: 81920, useAsync: true);
-                await dst.WriteAsync(buffer.AsMemory(0, bytesRead), ct);
-                DestinationWrites.Note(blockPath);
-            }
+                await StoreBlockAsync(blockPath, buffer.AsMemory(0, bytesRead), ct);
         }
     }
 
@@ -3345,13 +3362,7 @@ public class DirectoryBackupService
 
             string blockPath = Path.Combine(blockStoreDir, block.Hash + ".blk");
             if (BlockNeedsWriting(block.IsExisting, blockPath, suspect))
-            {
-                await using var dst = new FileStream(
-                    blockPath, FileMode.Create, FileAccess.Write,
-                    FileShare.None, bufferSize: 81920, useAsync: true);
-                await dst.WriteAsync(content.AsMemory(offset, len), ct);
-                DestinationWrites.Note(blockPath);
-            }
+                await StoreBlockAsync(blockPath, content.AsMemory(offset, len), ct);
 
             offset += len;
         }

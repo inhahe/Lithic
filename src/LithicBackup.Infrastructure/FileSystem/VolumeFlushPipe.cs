@@ -108,6 +108,7 @@ public static class VolumeFlushPipe
         Func<string, (DurableFlush.Outcome Outcome, string? Error)>? flushVolume = null)
     {
         var flushes = new Flushes(flushVolume ?? (volume => (DurableFlush.TryFlushVolume(volume, out var why), why)));
+        int acceptFailures = 0;
         while (!ct.IsCancellationRequested)
         {
             NamedPipeServerStream server;
@@ -120,14 +121,8 @@ public static class VolumeFlushPipe
             catch (Exception ex) when (ex is IOException or UnauthorizedAccessException)
             {
                 onError?.Invoke(ex);
-                try
-                {
-                    await Task.Delay(TimeSpan.FromSeconds(5), ct).ConfigureAwait(false);
-                }
-                catch (OperationCanceledException)
-                {
+                if (!await BackOffAsync(TimeSpan.FromSeconds(5), ct).ConfigureAwait(false))
                     return;
-                }
                 continue;
             }
 
@@ -135,14 +130,40 @@ public static class VolumeFlushPipe
             {
                 await server.WaitForConnectionAsync(ct).ConfigureAwait(false);
             }
-            catch
+            catch (Exception ex)
             {
                 await server.DisposeAsync().ConfigureAwait(false);
                 if (ct.IsCancellationRequested)
                     return;
+                // A client that hung up before it was answered fails this too, so
+                // only a run of failures is the pipe itself failing, which would
+                // fail again at once: say so, and wait.
+                if (++acceptFailures < AcceptFailuresBeforeBackOff)
+                    continue;
+                acceptFailures = 0;
+                onError?.Invoke(ex);
+                if (!await BackOffAsync(TimeSpan.FromSeconds(1), ct).ConfigureAwait(false))
+                    return;
                 continue;
             }
+            acceptFailures = 0;
             _ = Task.Run(() => AnswerAsync(server, flushes, onError, ct), CancellationToken.None);
+        }
+    }
+
+    private const int AcceptFailuresBeforeBackOff = 10;
+
+    /// <summary>Wait before trying a failing pipe again; false when told to stop meanwhile.</summary>
+    private static async Task<bool> BackOffAsync(TimeSpan delay, CancellationToken ct)
+    {
+        try
+        {
+            await Task.Delay(delay, ct).ConfigureAwait(false);
+            return true;
+        }
+        catch (OperationCanceledException)
+        {
+            return false;
         }
     }
 

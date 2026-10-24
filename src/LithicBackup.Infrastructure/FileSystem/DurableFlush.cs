@@ -131,44 +131,79 @@ public static class DurableFlush
     /// <returns>False when <paramref name="path"/> is gone or could not be flushed.</returns>
     public static bool TryFlushPath(string path, out string? error)
     {
-        error = null;
-        bool isFolder = Directory.Exists(path);
-        if (!isFolder && !File.Exists(path))
-        {
-            error = $"{path}: it is no longer there";
-            return false;
-        }
-
-        // A read-only file cannot be opened for writing, and flushing needs that:
-        // its read-only flag is lifted for the flush and put back.
         bool readOnly = false;
-        if (!isFolder)
-        {
-            var attributes = File.GetAttributes(path);
-            if ((attributes & FileAttributes.ReadOnly) != 0)
-            {
-                readOnly = true;
-                File.SetAttributes(path, attributes & ~FileAttributes.ReadOnly);
-            }
-        }
         try
         {
-            using var handle = CreateFileW(LongPath(Path.GetFullPath(path)),
-                GENERIC_WRITE, FILE_SHARE_READ | FILE_SHARE_WRITE | FILE_SHARE_DELETE,
-                IntPtr.Zero, OPEN_EXISTING, isFolder ? FILE_FLAG_BACKUP_SEMANTICS : 0, IntPtr.Zero);
-            if (handle.IsInvalid || !FlushFileBuffers(handle))
+            bool isFolder = Directory.Exists(path);
+            if (!isFolder && !File.Exists(path))
             {
-                error = $"{path}: {LastError()}";
+                error = $"{path}: it is no longer there";
                 return false;
             }
-            return true;
+
+            // A read-only file cannot be opened for writing, and flushing needs
+            // that: its read-only flag is lifted for the flush and put back.
+            if (!isFolder)
+            {
+                var attributes = File.GetAttributes(path);
+                if ((attributes & FileAttributes.ReadOnly) != 0)
+                {
+                    File.SetAttributes(path, attributes & ~FileAttributes.ReadOnly);
+                    readOnly = true;
+                }
+            }
+
+            for (int attempt = 1; ; attempt++)
+            {
+                using var handle = CreateFileW(LongPath(Path.GetFullPath(path)),
+                    GENERIC_WRITE, FILE_SHARE_READ | FILE_SHARE_WRITE | FILE_SHARE_DELETE,
+                    IntPtr.Zero, OPEN_EXISTING, isFolder ? FILE_FLAG_BACKUP_SEMANTICS : 0, IntPtr.Zero);
+                if (!handle.IsInvalid)
+                {
+                    if (FlushFileBuffers(handle))
+                    {
+                        error = null;
+                        return true;
+                    }
+                    error = $"{path}: {LastError()}";
+                    return false;
+                }
+                int code = Marshal.GetLastWin32Error();
+                // Another process holding it without sharing writes (a preview
+                // handler, a virus scanner) mostly lets go within a moment.
+                if ((code is ERROR_SHARING_VIOLATION or ERROR_LOCK_VIOLATION) && attempt < SharedOpenAttempts)
+                {
+                    Thread.Sleep(SharedOpenRetryMs);
+                    continue;
+                }
+                error = $"{path}: {new Win32Exception(code).Message}";
+                return false;
+            }
+        }
+        catch (Exception ex) when (ex is IOException or UnauthorizedAccessException)
+        {
+            error = $"{path}: {ex.Message}";
+            return false;
         }
         finally
         {
             if (readOnly)
-                File.SetAttributes(path, File.GetAttributes(path) | FileAttributes.ReadOnly);
+            {
+                try
+                {
+                    File.SetAttributes(path, File.GetAttributes(path) | FileAttributes.ReadOnly);
+                }
+                catch (Exception ex) when (ex is IOException or UnauthorizedAccessException)
+                {
+                    // Gone, or no longer ours to change: the flush's result stands.
+                }
+            }
         }
     }
+
+    /// <summary>How often <see cref="TryFlushPath"/> tries a file another process holds, and how far apart.</summary>
+    private const int SharedOpenAttempts = 5;
+    private const int SharedOpenRetryMs = 200;
 
     /// <summary>
     /// <paramref name="path"/> opened to read its attributes only, sharing
@@ -204,6 +239,8 @@ public static class DurableFlush
     private const uint FILE_FLAG_BACKUP_SEMANTICS = 0x02000000;
     private const uint VOLUME_NAME_GUID = 0x1;
     private const int ERROR_ACCESS_DENIED = 5;
+    private const int ERROR_SHARING_VIOLATION = 32;
+    private const int ERROR_LOCK_VIOLATION = 33;
 
     [DllImport("kernel32.dll", SetLastError = true, CharSet = CharSet.Unicode)]
     private static extern SafeFileHandle CreateFileW(

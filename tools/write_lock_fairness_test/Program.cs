@@ -47,10 +47,11 @@ internal static class Program
 
         string root = Path.Combine(Path.GetTempPath(), "lithic_lockfair_" + Guid.NewGuid().ToString("N"));
         Directory.CreateDirectory(root);
+        SqliteCatalogRepository? repo = null;
         try
         {
             string catalog = Path.Combine(root, "catalog.db");
-            var repo = new SqliteCatalogRepository(catalog);
+            repo = new SqliteCatalogRepository(catalog);
             var set = await repo.CreateBackupSetAsync(new BackupSet
             {
                 Name = "lock-fairness",
@@ -71,7 +72,7 @@ internal static class Program
                 using var holder = StartHolder(catalog, set.Id, seconds: 8, yield: true);
                 await holder.Holding;
                 var watch = Stopwatch.StartNew();
-                var fresh = new SqliteCatalogRepository(catalog);     // a process opening the set anew
+                using var fresh = new SqliteCatalogRepository(catalog);     // a process opening the set anew
                 await fresh.GetLatestVersionInfoForPathsAsync(set.Id, [Path.Combine(root, "x")]);
                 Check(watch.Elapsed < TimeSpan.FromSeconds(1),
                     $"it opens at once, without waiting for the writer's run: {watch.Elapsed.TotalMilliseconds:N0} ms of an 8 s run");
@@ -217,6 +218,9 @@ internal static class Program
         }
         finally
         {
+            // Its catalog closed first: an open one keeps the folder from going.
+            repo?.Dispose();
+            Microsoft.Data.Sqlite.SqliteConnection.ClearAllPools();
             try { Directory.Delete(root, recursive: true); } catch { }
         }
 
