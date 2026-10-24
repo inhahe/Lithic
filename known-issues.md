@@ -1,5 +1,49 @@
 # LithicBackup — Known Issues & Tech Debt
 
+## OPEN: a copy is recorded as backed up before its data reaches the destination disk, so a drive that drops off USB loses files the catalog says it has (seen 2026-10-22/23)
+
+**Seen.** The WD 6 TB USB drive (H:, set "backup to i: (wd 6tb usb3 hdd)") fell
+off the USB bus 11 times between 2026-10-22 06:54 and 10-24 00:24, each time in
+the middle of the Worker's continuous backup (a hardware fault, investigated
+separately). Each drop logged, in the System log, `Ntfs` 50 "Delayed Write
+Failed ... The data has been lost" and/or `Microsoft-Windows-Ntfs` 140 "failed
+to flush data to the transaction log", naming backed-up folders such as
+`H:\lithicbackup\D\youtube\philosophy\essays\free will` and
+`H:\lithicbackup\D\visual studio projects\forward raytracer\scraps\lens`, as
+well as `$Mft` and `$BitMap`. The Worker logged only the files whose copy was
+still in flight ("A device which does not exist was specified"), which the
+next run retries.
+
+**Cause.** `CopyFileAsync`, `CopyFileWithHashAsync` and the other copy helpers
+in `DirectoryBackupService` write through the Windows file cache and never
+flush (`Flush(flushToDisk: true)` or `FlushFileBuffers`) before `Promote` and
+the catalog commit. A copy has "succeeded" once its bytes are in the cache, and
+the lazy writer puts them on the disk seconds later, longer under heavy
+writing. A drive lost in between takes the data of the files completed in
+those last seconds, and the rename that promoted them. The catalog still lists
+them as backed up, and unless a check of the destination (the catalog
+reconcile, Verify integrity) finds them, nothing re-copies them until the
+source changes again. A file whose data was lost but whose name survived
+(zeros or stale content where the bytes should be) only a content check finds.
+The temp-file-and-rename scheme protects against a torn file, but not against
+this.
+
+**Fix.** Make a copy durable before the catalog records it. Per-file
+`Flush(true)` is correct but costs a device cache flush per file, which is
+slow for many small files on a USB disk. It is cheaper to flush the volume
+once before each catalog commit batch: `FlushFileBuffers` on a handle to
+`\\.\H:` writes out all dirty data and metadata for the volume. That needs
+write access to the volume, which the Worker has as LocalSystem; the app, when
+not elevated, would fall back to per-file flushes. Then, when a run sees the
+device vanish, re-check the files committed in the minute or so before it
+(existence and size at least) and drop the ones that did not survive from the
+catalog so the next run copies them again.
+
+**Repairing the H: backup now.** Once `chkdsk` has checked the volume, run
+**Verify integrity** on the set with **Verify file contents** on: it re-hashes
+everything stored on H: against the catalog and finds whatever these drops
+lost.
+
 ## FIXED: "files under this folder" read every file of the set, and missed names starting with an emoji (2026-10-21)
 
 **Slow.** `GetFileRecordsUnderDirectoryAsync` serves the post-edit scan's
