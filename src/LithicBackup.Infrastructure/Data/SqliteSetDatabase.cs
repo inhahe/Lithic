@@ -768,7 +768,26 @@ internal sealed class SqliteSetDatabase : IDisposable
         return list;
     }
 
-    public async Task<IReadOnlyList<FileRecord>> GetAllFilesForBackupSetAsync(int backupSetId, CancellationToken ct = default, IProgress<int>? rowProgress = null)
+    /// <summary>The records <see cref="GetAllFilesForBackupSetAsync"/> reads, counted.</summary>
+    public async Task<long> GetFileRecordCountAsync(int backupSetId, CancellationToken ct = default)
+    {
+        ct.ThrowIfCancellationRequested();
+        using var _ = await LockAsync(ct).ConfigureAwait(false);
+
+        using var cmd = _connection.CreateCommand();
+        cmd.CommandText = """
+            SELECT COUNT(*) FROM Files f
+            INNER JOIN Discs d ON f.DiscId = d.Id
+            WHERE d.BackupSetId = $setId
+            """;
+        cmd.Parameters.AddWithValue("$setId", backupSetId);
+        using (SqliteCancellation.Watch(_connection, ct))
+            return Convert.ToInt64(SqliteCancellation.Interruptible(cmd.ExecuteScalar, ct));
+    }
+
+    public async Task<IReadOnlyList<FileRecord>> GetAllFilesForBackupSetAsync(
+        int backupSetId, CancellationToken ct = default, IProgress<int>? rowProgress = null,
+        bool inPathOrder = true)
     {
         ct.ThrowIfCancellationRequested();
         using var _ = await LockAsync(ct).ConfigureAwait(false);
@@ -778,8 +797,7 @@ internal sealed class SqliteSetDatabase : IDisposable
             SELECT f.* FROM Files f
             INNER JOIN Discs d ON f.DiscId = d.Id
             WHERE d.BackupSetId = $setId
-            ORDER BY f.SourcePath, f.Version DESC
-            """;
+            """ + (inPathOrder ? "\nORDER BY f.SourcePath, f.Version DESC" : "");
         cmd.Parameters.AddWithValue("$setId", backupSetId);
 
         var list = new List<FileRecord>();

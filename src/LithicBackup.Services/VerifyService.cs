@@ -1,5 +1,7 @@
+using System.Diagnostics;
 using System.Security.Cryptography;
 using System.Text.Json;
+using LithicBackup.Core;
 using LithicBackup.Core.Interfaces;
 using LithicBackup.Core.Models;
 
@@ -58,9 +60,24 @@ public class VerifyService : IVerifyService
         var issues = new List<VerifyIssue>();
         string blockStoreDir = Path.Combine(targetDirectory, "_blocks");
 
-        // --- Load the full catalog for this set (all versions, current + _prev). ---
-        progress?.Report(new VerifyProgress { StatusMessage = "Loading catalog..." });
-        var allRecords = await _catalog.GetAllFilesForBackupSetAsync(backupSetId, ct);
+        // What each step has done so far, read by the reports while it works.
+        var live = new LiveCounts();
+
+        // --- Step 1: the full catalog for this set (all versions, current + _prev),
+        // in no particular order: sorting it first is most of the read. Counted
+        // first for the percentage, inside the step, as the count waits for the
+        // set's catalog like the read. ---
+        var rowsRead = new SyncProgress<int>(read => live.Done = read);
+        var allRecords = await ReportingAsync(
+            Task.Run(async () =>
+            {
+                live.Total = (int)Math.Min(int.MaxValue,
+                    await _catalog.GetFileRecordCountAsync(backupSetId, ct).ConfigureAwait(false));
+                return await _catalog.GetAllFilesForBackupSetAsync(
+                    backupSetId, ct, rowsRead, inPathOrder: false).ConfigureAwait(false);
+            }, ct),
+            elapsed => Step("Step 1 of 3: loading the catalog", live.Done, live.Total, "records", elapsed),
+            progress).ConfigureAwait(false);
         var activeRecords = allRecords.Where(r => !r.IsDeleted).ToList();
 
         // Source paths that have at least one active (non-deleted) record.
@@ -68,12 +85,21 @@ public class VerifyService : IVerifyService
             activeRecords.Select(r => r.SourcePath),
             StringComparer.OrdinalIgnoreCase);
 
-        // --- Check 1: every current source file is represented in the backup. ---
-        progress?.Report(new VerifyProgress { StatusMessage = "Scanning source files..." });
+        // --- Step 2, check 1: every current source file is represented in the
+        // backup. How many there are is known only once the scan ends; the
+        // catalog's count of live paths stands in until then. ---
         var isExcluded = DirectoryBackupService.BuildExclusionFilter(job);
-        var scanned = await _scanner.ScanAsync(
-            job.Sources, progress: null, ct, isExcluded,
-            DirectoryBackupService.BuildDirectoryPruneFilter(job));
+        var scanProgress = new SyncProgress<ScanProgress>(p => live.Scan = p);
+        var scanned = await ReportingAsync(
+            Task.Run(() => _scanner.ScanAsync(
+                job.Sources, scanProgress, ct, isExcluded,
+                DirectoryBackupService.BuildDirectoryPruneFilter(job)), ct),
+            elapsed => live.Scan is { } p
+                ? Step("Step 2 of 3: scanning the sources", p.FilesFound, backedUpSourcePaths.Count,
+                    "files", elapsed, p.CurrentDirectory, estimated: true)
+                : Step("Step 2 of 3: scanning the sources", 0, backedUpSourcePaths.Count,
+                    "files", elapsed, estimated: true),
+            progress).ConfigureAwait(false);
 
         int sourceChecked = 0;
         foreach (var file in scanned)
@@ -104,190 +130,191 @@ public class VerifyService : IVerifyService
         int itemsHashed = 0;
         int total = activeRecords.Count;
         int processed = 0;
+        string checking = verifyContents
+            ? "Step 3 of 3: reading and hashing the backed-up files"
+            : "Step 3 of 3: checking the backed-up files";
 
-        foreach (var record in activeRecords)
+        // On a task of its own, so the reports keep coming while one record takes
+        // long: a large file being hashed, a slow destination.
+        async Task<int> CheckRecordsAsync()
         {
-            ct.ThrowIfCancellationRequested();
-            processed++;
-            recordsChecked++;
-
-            if (processed % 64 == 0 || processed == total)
+            foreach (var record in activeRecords)
             {
-                progress?.Report(new VerifyProgress
-                {
-                    StatusMessage = verifyContents
-                        ? "Verifying backup contents (reading & hashing)..."
-                        : "Verifying backup files...",
-                    CurrentFile = record.SourcePath,
-                    ItemsChecked = processed,
-                    TotalItems = total,
-                    Percentage = total > 0 ? (double)processed / total * 100 : 100,
-                });
-            }
+                ct.ThrowIfCancellationRequested();
+                processed++;
+                recordsChecked++;
+                live.Done = processed;
+                live.Current = record.SourcePath;
 
-            if (record.IsFileRef)
-            {
-                fileRefsChecked++;
+                if (record.IsFileRef)
+                {
+                    fileRefsChecked++;
 
-                // The .fileref manifest itself should exist on disk.
-                string refPath = Path.Combine(targetDirectory, record.DiscPath);
-                if (!File.Exists(refPath))
-                {
-                    issues.Add(new VerifyIssue
-                    {
-                        Path = record.SourcePath,
-                        Detail = $"File reference manifest is missing: {record.DiscPath}",
-                        Kind = VerifyIssueKind.BackingFileMissing,
-                    });
-                    continue;
-                }
-
-                // The referenced content must resolve to an existing plain copy.
-                if (!resolvedPlain.TryGetValue(record.Hash, out string? plainPath))
-                {
-                    plainPath = await ResolvePlainContentPathAsync(
-                        backupSetId, record.Hash, targetDirectory, ct);
-                    resolvedPlain[record.Hash] = plainPath;
-                }
-
-                if (plainPath is null || !File.Exists(plainPath))
-                {
-                    issues.Add(new VerifyIssue
-                    {
-                        Path = record.SourcePath,
-                        Detail = "File reference does not resolve to an existing plain copy "
-                            + $"of its content (hash {Shorten(record.Hash)}).",
-                        Kind = VerifyIssueKind.FileRefUnresolved,
-                    });
-                }
-                else if (verifyContents && hashedPaths.Add(plainPath))
-                {
-                    // Re-hash the shared plain copy once and compare to the catalog.
-                    itemsHashed++;
-                    string? actual = await ComputeFileHashAsync(plainPath, ct);
-                    if (actual is not null && !HashEquals(actual, record.Hash))
+                    // The .fileref manifest itself should exist on disk.
+                    string refPath = Path.Combine(targetDirectory, record.DiscPath);
+                    if (!File.Exists(refPath))
                     {
                         issues.Add(new VerifyIssue
                         {
                             Path = record.SourcePath,
-                            Detail = "Resolved content hash does not match the catalog "
-                                + $"(expected {Shorten(record.Hash)}, got {Shorten(actual)}): "
-                                + plainPath,
-                            Kind = VerifyIssueKind.ContentMismatch,
-                        });
-                    }
-                }
-            }
-            else if (record.IsDeduped)
-            {
-                string manifestPath = Path.Combine(targetDirectory, record.DiscPath);
-                if (!File.Exists(manifestPath))
-                {
-                    issues.Add(new VerifyIssue
-                    {
-                        Path = record.SourcePath,
-                        Detail = $"Dedup manifest is missing: {record.DiscPath}",
-                        Kind = VerifyIssueKind.BackingFileMissing,
-                    });
-                    continue;
-                }
-
-                // Each block the manifest references must exist in the block store.
-                try
-                {
-                    string json = await File.ReadAllTextAsync(manifestPath, ct);
-                    var manifest = JsonSerializer.Deserialize<DedupManifest>(json, _jsonOptions);
-                    if (manifest is null)
-                    {
-                        issues.Add(new VerifyIssue
-                        {
-                            Path = record.SourcePath,
-                            Detail = $"Dedup manifest is corrupt: {record.DiscPath}",
+                            Detail = $"File reference manifest is missing: {record.DiscPath}",
                             Kind = VerifyIssueKind.BackingFileMissing,
                         });
                         continue;
                     }
 
-                    foreach (string blockHash in manifest.BlockHashes)
+                    // The referenced content must resolve to an existing plain copy.
+                    if (!resolvedPlain.TryGetValue(record.Hash, out string? plainPath))
                     {
-                        ct.ThrowIfCancellationRequested();
-                        string blockPath = Path.Combine(blockStoreDir, blockHash + ".blk");
-                        if (!File.Exists(blockPath))
-                        {
-                            issues.Add(new VerifyIssue
-                            {
-                                Path = record.SourcePath,
-                                Detail = $"Missing block in store: {blockHash}.blk",
-                                Kind = VerifyIssueKind.BlockMissing,
-                            });
-                        }
-                        else if (verifyContents && hashedBlocks.Add(blockHash))
-                        {
-                            // Each block is content-addressed: its file name IS its
-                            // SHA-256, so re-hash it and compare against the name.
-                            itemsHashed++;
-                            string? actual = await ComputeFileHashAsync(blockPath, ct);
-                            if (actual is not null && !HashEquals(actual, blockHash))
-                            {
-                                issues.Add(new VerifyIssue
-                                {
-                                    Path = record.SourcePath,
-                                    Detail = "Block content does not match its hash "
-                                        + $"(expected {Shorten(blockHash)}, got {Shorten(actual)}): "
-                                        + $"{blockHash}.blk",
-                                    Kind = VerifyIssueKind.ContentMismatch,
-                                });
-                            }
-                        }
+                        plainPath = await ResolvePlainContentPathAsync(
+                            backupSetId, record.Hash, targetDirectory, ct);
+                        resolvedPlain[record.Hash] = plainPath;
                     }
-                }
-                catch (Exception ex) when (ex is not OperationCanceledException)
-                {
-                    issues.Add(new VerifyIssue
-                    {
-                        Path = record.SourcePath,
-                        Detail = $"Could not read dedup manifest: {ex.Message}",
-                        Kind = VerifyIssueKind.BackingFileMissing,
-                    });
-                }
-            }
-            else
-            {
-                // Plain copy (or zipped/split — DiscPath points at the stored file).
-                string filePath = Path.Combine(targetDirectory, record.DiscPath);
-                if (!File.Exists(filePath))
-                {
-                    issues.Add(new VerifyIssue
-                    {
-                        Path = record.SourcePath,
-                        Detail = $"Backing file is missing: {record.DiscPath}",
-                        Kind = VerifyIssueKind.BackingFileMissing,
-                    });
-                }
-                else if (verifyContents
-                    && !record.IsZipped && !record.IsSplit
-                    && !string.IsNullOrEmpty(record.Hash)
-                    && hashedPaths.Add(filePath))
-                {
-                    // Re-hash the stored plain copy and compare against the catalog.
-                    // Zipped/split stores don't hold the raw content directly,
-                    // so a name-vs-hash comparison wouldn't be meaningful for them.
-                    itemsHashed++;
-                    string? actual = await ComputeFileHashAsync(filePath, ct);
-                    if (actual is not null && !HashEquals(actual, record.Hash))
+
+                    if (plainPath is null || !File.Exists(plainPath))
                     {
                         issues.Add(new VerifyIssue
                         {
                             Path = record.SourcePath,
-                            Detail = "Stored content hash does not match the catalog "
-                                + $"(expected {Shorten(record.Hash)}, got {Shorten(actual)}): "
-                                + record.DiscPath,
-                            Kind = VerifyIssueKind.ContentMismatch,
+                            Detail = "File reference does not resolve to an existing plain copy "
+                                + $"of its content (hash {Shorten(record.Hash)}).",
+                            Kind = VerifyIssueKind.FileRefUnresolved,
+                        });
+                    }
+                    else if (verifyContents && hashedPaths.Add(plainPath))
+                    {
+                        // Re-hash the shared plain copy once and compare to the catalog.
+                        itemsHashed++;
+                        string? actual = await ComputeFileHashAsync(plainPath, ct);
+                        if (actual is not null && !HashEquals(actual, record.Hash))
+                        {
+                            issues.Add(new VerifyIssue
+                            {
+                                Path = record.SourcePath,
+                                Detail = "Resolved content hash does not match the catalog "
+                                    + $"(expected {Shorten(record.Hash)}, got {Shorten(actual)}): "
+                                    + plainPath,
+                                Kind = VerifyIssueKind.ContentMismatch,
+                            });
+                        }
+                    }
+                }
+                else if (record.IsDeduped)
+                {
+                    string manifestPath = Path.Combine(targetDirectory, record.DiscPath);
+                    if (!File.Exists(manifestPath))
+                    {
+                        issues.Add(new VerifyIssue
+                        {
+                            Path = record.SourcePath,
+                            Detail = $"Dedup manifest is missing: {record.DiscPath}",
+                            Kind = VerifyIssueKind.BackingFileMissing,
+                        });
+                        continue;
+                    }
+
+                    // Each block the manifest references must exist in the block store.
+                    try
+                    {
+                        string json = await File.ReadAllTextAsync(manifestPath, ct);
+                        var manifest = JsonSerializer.Deserialize<DedupManifest>(json, _jsonOptions);
+                        if (manifest is null)
+                        {
+                            issues.Add(new VerifyIssue
+                            {
+                                Path = record.SourcePath,
+                                Detail = $"Dedup manifest is corrupt: {record.DiscPath}",
+                                Kind = VerifyIssueKind.BackingFileMissing,
+                            });
+                            continue;
+                        }
+
+                        foreach (string blockHash in manifest.BlockHashes)
+                        {
+                            ct.ThrowIfCancellationRequested();
+                            string blockPath = Path.Combine(blockStoreDir, blockHash + ".blk");
+                            if (!File.Exists(blockPath))
+                            {
+                                issues.Add(new VerifyIssue
+                                {
+                                    Path = record.SourcePath,
+                                    Detail = $"Missing block in store: {blockHash}.blk",
+                                    Kind = VerifyIssueKind.BlockMissing,
+                                });
+                            }
+                            else if (verifyContents && hashedBlocks.Add(blockHash))
+                            {
+                                // Each block is content-addressed: its file name IS its
+                                // SHA-256, so re-hash it and compare against the name.
+                                itemsHashed++;
+                                string? actual = await ComputeFileHashAsync(blockPath, ct);
+                                if (actual is not null && !HashEquals(actual, blockHash))
+                                {
+                                    issues.Add(new VerifyIssue
+                                    {
+                                        Path = record.SourcePath,
+                                        Detail = "Block content does not match its hash "
+                                            + $"(expected {Shorten(blockHash)}, got {Shorten(actual)}): "
+                                            + $"{blockHash}.blk",
+                                        Kind = VerifyIssueKind.ContentMismatch,
+                                    });
+                                }
+                            }
+                        }
+                    }
+                    catch (Exception ex) when (ex is not OperationCanceledException)
+                    {
+                        issues.Add(new VerifyIssue
+                        {
+                            Path = record.SourcePath,
+                            Detail = $"Could not read dedup manifest: {ex.Message}",
+                            Kind = VerifyIssueKind.BackingFileMissing,
                         });
                     }
                 }
+                else
+                {
+                    // Plain copy (or zipped/split — DiscPath points at the stored file).
+                    string filePath = Path.Combine(targetDirectory, record.DiscPath);
+                    if (!File.Exists(filePath))
+                    {
+                        issues.Add(new VerifyIssue
+                        {
+                            Path = record.SourcePath,
+                            Detail = $"Backing file is missing: {record.DiscPath}",
+                            Kind = VerifyIssueKind.BackingFileMissing,
+                        });
+                    }
+                    else if (verifyContents
+                        && !record.IsZipped && !record.IsSplit
+                        && !string.IsNullOrEmpty(record.Hash)
+                        && hashedPaths.Add(filePath))
+                    {
+                        // Re-hash the stored plain copy and compare against the catalog.
+                        // Zipped/split stores don't hold the raw content directly,
+                        // so a name-vs-hash comparison wouldn't be meaningful for them.
+                        itemsHashed++;
+                        string? actual = await ComputeFileHashAsync(filePath, ct);
+                        if (actual is not null && !HashEquals(actual, record.Hash))
+                        {
+                            issues.Add(new VerifyIssue
+                            {
+                                Path = record.SourcePath,
+                                Detail = "Stored content hash does not match the catalog "
+                                    + $"(expected {Shorten(record.Hash)}, got {Shorten(actual)}): "
+                                    + record.DiscPath,
+                                Kind = VerifyIssueKind.ContentMismatch,
+                            });
+                        }
+                    }
+                }
             }
+            return processed;
         }
+        live.Done = 0;
+        await ReportingAsync(Task.Run(CheckRecordsAsync, ct),
+            elapsed => Step(checking, live.Done, total, "records", elapsed, live.Current),
+            progress).ConfigureAwait(false);
 
         progress?.Report(new VerifyProgress
         {
@@ -332,6 +359,72 @@ public class VerifyService : IVerifyService
 
     private static bool HashEquals(string a, string b)
         => string.Equals(a, b, StringComparison.OrdinalIgnoreCase);
+
+    /// <summary>
+    /// What the step under way has done, written by the step and read by its
+    /// reports from another thread.
+    /// </summary>
+    private sealed class LiveCounts
+    {
+        public volatile int Done;
+        public volatile int Total;
+        public volatile string? Current;
+        public volatile ScanProgress? Scan;
+    }
+
+    /// <summary>
+    /// Await <paramref name="work"/>, reporting <paramref name="snapshot"/> of it as
+    /// it starts and then at the <see cref="ProgressCadence"/> until it ends - also
+    /// through stretches with nothing new to count (a wait for the catalog, one
+    /// large file being hashed), so the display shows the work going on.
+    /// </summary>
+    /// <param name="snapshot">The report for the step so far, given how long it has run.</param>
+    private static async Task<T> ReportingAsync<T>(
+        Task<T> work, Func<TimeSpan, VerifyProgress> snapshot, IProgress<VerifyProgress>? progress)
+    {
+        if (progress is null)
+            return await work.ConfigureAwait(false);
+        var clock = Stopwatch.StartNew();
+        progress.Report(snapshot(clock.Elapsed));
+        while (await Task.WhenAny(work, Task.Delay(ProgressCadence.IntervalMs)).ConfigureAwait(false) != work)
+            progress.Report(snapshot(clock.Elapsed));
+        return await work.ConfigureAwait(false);
+    }
+
+    /// <summary>
+    /// A step's report: what it does, how much of it is done, and for how long it
+    /// has run.
+    /// </summary>
+    /// <param name="done">Items done so far.</param>
+    /// <param name="total">Items in all, or 0 when not known.</param>
+    /// <param name="unit">What an item is, for the text ("records").</param>
+    /// <param name="current">The item or folder being worked on, if any.</param>
+    /// <param name="estimated">
+    /// Whether <paramref name="total"/> is a guess: shown as "about", and the
+    /// percentage held below 100 until the step ends.
+    /// </param>
+    private static VerifyProgress Step(
+        string step, long done, long total, string unit, TimeSpan elapsed,
+        string? current = null, bool estimated = false)
+    {
+        double percent = total > 0 ? Math.Min(estimated ? 99 : 100, done * 100.0 / total) : 0;
+        string counted = total > 0
+            ? $"{done:N0} of {(estimated ? "about " : "")}{total:N0} {unit}, {percent:F0}%"
+            : $"{done:N0} {unit}";
+        return new VerifyProgress
+        {
+            StatusMessage = $"{step}: {counted} - {Clock(elapsed)}",
+            CurrentFile = current ?? "",
+            ItemsChecked = (int)Math.Min(done, int.MaxValue),
+            TotalItems = (int)Math.Min(total, int.MaxValue),
+            Percentage = percent,
+        };
+    }
+
+    /// <summary>Elapsed time as m:ss, or h:mm:ss from an hour on.</summary>
+    private static string Clock(TimeSpan t) => t.TotalHours >= 1
+        ? $"{(int)t.TotalHours}:{t.Minutes:D2}:{t.Seconds:D2}"
+        : $"{t.Minutes}:{t.Seconds:D2}";
 
     /// <summary>
     /// Resolve a content hash to the absolute path of an active plain copy of

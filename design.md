@@ -639,6 +639,18 @@ count that — the unit of iteration usually is not it.
 backup makes before copying its first file. See "A targeted run shows the same
 progress as any other backup" below.
 
+**A step with nothing to count still shows it is going.** Verify Integrity
+(`VerifyService`) runs each step on a task of its own: loading the catalog,
+scanning the sources, checking each record. `ReportingAsync` reports a snapshot
+of the step as it starts and then at the `ProgressCadence` until it ends:
+"Step n of 3", a count, a percentage where the total is known (the load counts
+`GetFileRecordCountAsync` records, the scan against the catalog's live paths as
+"about"), and the step's elapsed time. So the line moves even while the step
+waits for the catalog, or hashes one large file. The load reads unsorted
+(`inPathOrder: false`), since sorting every record before the first is most of
+the read and Verify needs no order. Test: `tools\verify_progress_test`; the
+window's own start, `tools\editor_save_test` §24.
+
 ### When creating a name is the whole cost, say so
 
 A backup into the j: set copied 1.8 GB in nine hours. Its process ran one core

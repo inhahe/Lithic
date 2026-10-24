@@ -1,5 +1,27 @@
 # LithicBackup — Known Issues & Tech Debt
 
+## FIXED: Verify Integrity never verified; it sat on "Preparing verification..." (2026-10-24)
+
+**Cause.** `VerifyIntegrityViewModel` started its run from its constructor,
+through the method the Verify button also uses. That method refuses to start
+while a run is loading, and the loading flag began `true`. So the first run
+was refused, the window showed its initial "Preparing verification..." over a
+spinning bar for ever, and Verify stayed unavailable, as it needs loading
+false. It was so from the window's first version (d5aad45, 2026-07-11).
+
+**Also:** once running, verification said "Loading catalog..." and
+"Scanning source files..." with no count or time. The load sorted every record
+before its first; the scan had no progress at all. Now each of its three steps
+reports at the `ProgressCadence`: its number, its count, a percentage where the
+total is known, the file or folder at hand, and its elapsed time. It does so
+also while a step has nothing to count. The load reads unsorted.
+
+**Tests.** `editor_save_test` §24 opens Verify Integrity from the main window
+and requires it to finish. `tools/verify_progress_test` checks the steps'
+reports, and that they keep coming while the set's catalog is held. Against
+the old code, both fail: §24 still shows "Preparing verification...", and the
+held catalog gets 1 report in 2 s.
+
 ## OPEN: a copy is recorded as backed up before its data reaches the destination disk, so a drive that drops off USB loses files the catalog says it has (seen 2026-10-22/23)
 
 **Seen.** The WD 6 TB USB drive (H:, set "backup to i: (wd 6tb usb3 hdd)") fell

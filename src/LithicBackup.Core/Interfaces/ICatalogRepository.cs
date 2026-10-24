@@ -104,6 +104,12 @@ public interface ICatalogRepository : IDisposable
     Task<IReadOnlyList<FileRecord>> GetFilesOnDiscAsync(int discId, CancellationToken ct = default);
 
     /// <summary>
+    /// How many records <see cref="GetAllFilesForBackupSetAsync"/> would return -
+    /// every version, deleted ones included - for a progress bar over that read.
+    /// </summary>
+    Task<long> GetFileRecordCountAsync(int backupSetId, CancellationToken ct = default);
+
+    /// <summary>
     /// Get all files across all discs in a backup set.
     /// Caution: for large backup sets this can load hundreds of thousands of
     /// FileRecord objects into memory. Prefer <see cref="GetLatestVersionInfoAsync"/>
@@ -112,8 +118,15 @@ public interface ICatalogRepository : IDisposable
     /// the running count of records read so a caller can show live progress on a
     /// large set (the read itself is synchronous and can take many seconds).
     /// </summary>
+    /// <param name="inPathOrder">
+    /// Whether the records come ordered by source path (then version, newest
+    /// first). False for a caller that needs no order: SQLite sorts every record
+    /// before returning the first, which on a large set is most of the read, with
+    /// nothing to report meanwhile.
+    /// </param>
     Task<IReadOnlyList<FileRecord>> GetAllFilesForBackupSetAsync(
-        int backupSetId, CancellationToken ct = default, IProgress<int>? rowProgress = null);
+        int backupSetId, CancellationToken ct = default, IProgress<int>? rowProgress = null,
+        bool inPathOrder = true);
 
     /// <summary>
     /// Lightweight query for the destination filesystem scan: every file row's

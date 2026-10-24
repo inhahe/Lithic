@@ -274,6 +274,7 @@ internal static class Program
         await SeedHoldsTheRowAsync(dbPath);
         NoTierWarning();
         await ReconcileAfterEditAsync();
+        await VerifyStartsAsync();
 #endif
         Check(_dialogs.Unexpected.Count == 0,
             "no unexpected message box appeared"
@@ -299,6 +300,34 @@ internal static class Program
             "an empty Default never does (its files are backed up without history)");
         Check(!new TierSetViewModel("None", isBuiltIn: true).ExcludesForLackOfTiers,
             "nor \"None\", which says it excludes in its own words");
+    }
+
+    /// <summary>
+    /// 24: Verify Integrity verifies when its window opens, and says so as it
+    /// goes. Its view model refused the run its constructor started (its loading
+    /// flag began true), so the window sat on "Preparing verification..." for
+    /// ever, with Verify unavailable.
+    /// </summary>
+    static async Task VerifyStartsAsync()
+    {
+        Console.WriteLine();
+        Console.WriteLine("=== 24. Verify Integrity verifies when its window opens ===");
+        var row = _vm.BackupSets.First(r => r.Id == _setId);
+        _vm.SetVerifyIntegrityCommand.Execute(row);
+        TaskWindow? win = null;
+        Check(await WaitFor(() => (win = Application.Current.Windows.OfType<TaskWindow>()
+                                      .FirstOrDefault(w => w.Flow is VerifyIntegrityViewModel)) is not null, 10000),
+            "the Verify Integrity window opened");
+        if (win is null) return;
+        MoveOffscreen(win);
+        // Its steps' reports are verify_progress_test's to check; this small set
+        // can finish before anything here could watch them.
+        var verify = (VerifyIntegrityViewModel)win.Flow!;
+        bool finished = await WaitFor(() => !verify.IsLoading && verify.SummaryText.Length > 0, 30000);
+        Check(finished, $"it verified, and finished (\"{verify.SummaryText}\"; showing \"{verify.ProgressText}\")");
+        Check(verify.CanVerify, "and Verify is available again");
+        win.Close();
+        await WaitFor(() => !IsOpen(win), 5000);
     }
 
     /// <summary>

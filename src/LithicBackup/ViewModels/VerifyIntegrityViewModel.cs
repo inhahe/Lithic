@@ -21,7 +21,9 @@ public class VerifyIntegrityViewModel : ViewModelBase, IDisposable
     private readonly IFileScanner _scanner;
     private readonly BackupSet _backupSet;
 
-    private bool _isLoading = true;
+    // False until a run starts: the constructor's start is refused while a run
+    // is loading, and so is the Verify button.
+    private bool _isLoading;
     private bool _isProgressIndeterminate = true;
     private double _progressPercent;
     private string _progressText = "Preparing verification...";
@@ -316,17 +318,18 @@ public class VerifyIntegrityViewModel : ViewModelBase, IDisposable
 
             var verifyService = new VerifyService(_catalog, _scanner);
 
+            // Each step reports what it does, how far it is (when that can be
+            // counted) and how long it has run, at the ProgressCadence; the file
+            // or folder it is on goes on a line of its own.
             var progress = new Progress<VerifyProgress>(p =>
             {
                 if (!string.IsNullOrEmpty(p.StatusMessage))
                     ProgressText = string.IsNullOrEmpty(p.CurrentFile)
                         ? p.StatusMessage!
-                        : $"{p.StatusMessage} {p.CurrentFile}";
+                        : $"{p.StatusMessage}\n{p.CurrentFile}";
+                IsProgressIndeterminate = p.TotalItems <= 0;
                 if (p.TotalItems > 0)
-                {
-                    IsProgressIndeterminate = false;
                     ProgressPercent = p.Percentage;
-                }
             });
 
             VerifyResult result = await Task.Run(
