@@ -1597,9 +1597,9 @@ live, claiming the old content at a path that then held the new bytes: a
 `.fileref` to the old content restored the new bytes (restore does not re-hash),
 a later file with the old content became a reference to nothing, and the stale row
 counted as a surviving copy in Cleanup's guard. Before the overwrite,
-`KeepContentReachableAsync` gives the bytes to a reference that needs them
-(promotes it, as retention does); if that fails the old copy is kept as an earlier
-version rather than overwritten. A stored file left under another name when the
+`EnsureContentReachableAsync` gives the bytes to a reference that needs them
+(promotes it at once; retention does the same a batch at a time). If that fails,
+the old copy is kept as an earlier version rather than overwritten. A stored file left under another name when the
 storage form changes (plain to `.fileref`, say) is deleted. This path used to run
 only for an empty Default with no exclusion set, which is why nobody hit it.
 
@@ -1974,9 +1974,18 @@ disk first:
   that copies bytes and then deletes their source must do the same. Retention
   makes its promotions' copies as it goes, and holds back the expired copies
   they come from, along with any other expired copy of the same content. It
-  finishes them in batches of up to 256, or 1 GB of copies: one flush, then
-  the records, then the deletions. A no-history overwrite does its one
-  promotion at once.
+  finishes them in batches of up to 256, or 1 GB of copies:
+  - one flush;
+  - then the records, in one transaction holding the set's write lock;
+  - then the manifests and the expired copies.
+
+  Each reference is checked again under that lock, because another writer may
+  have backed the file up since the promotion was planned. When it has, that
+  promotion is abandoned and its source kept. The batch is also finished before
+  a pause is waited out, when other writers may come in. A copy is taken back
+  only if it is still as the run made it (its creation time and length), since
+  another writer may have put its own at the same path. A no-history overwrite
+  does its one promotion at once, inside the run's own batch.
 * **The seed and the moves flush before they take the set's write lock:** what
   they record was renamed before the transaction, so the lock is held for the
   inserts only. A run's batches flush under the lock, which they hold

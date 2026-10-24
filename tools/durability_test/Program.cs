@@ -24,8 +24,9 @@
 //  18.  The service shares one flush among requests that arrive together.
 //  19.  No history: a reference made a plain copy is committed before the
 //       overwrite that needed it, whatever the batch does after.
-//  20-21. Retention's promotions finished a batch at a time: one flush for
-//       many, the sources kept when it fails, one promotion per content.
+//  20-23. Retention's promotions finished a batch at a time: one flush for
+//       many, the sources kept when it fails, one promotion per content; a
+//       stop meanwhile, and a reference another writer changes meanwhile.
 //
 // Not covered: a USB drive that drops off and comes back (VolumeWatch.WasLost
 // true), which takes the hardware.
@@ -884,6 +885,104 @@ try
             $"y.txt is given the content once ({yFlushes} flush of it)");
         Check(!File.Exists(PrevIn(dst, x, 1)) && !File.Exists(PrevIn(dst, z, 1)),
             "and both expired copies of it are gone");
+    }
+
+    // Five pairs, each a plain copy and a reference to it, whose plain copies
+    // have each changed twice: the next run keeping one earlier version
+    // promotes all five references.
+    async Task<(BackupSet Set, string Src, string Dst, List<string> A, List<string> B)> FivePromotionsDue(string name)
+    {
+        var (set, src, dst) = await NewSet(name, 0);
+        Directory.CreateDirectory(src);
+        var a = Enumerable.Range(0, 5).Select(i => Path.Combine(src, $"a{i}.txt")).ToList();
+        var b = Enumerable.Range(0, 5).Select(i => Path.Combine(src, $"b{i}.txt")).ToList();
+        for (int i = 0; i < 5; i++)
+        {
+            File.WriteAllText(a[i], $"content {i}, two files");
+            File.WriteAllText(b[i], $"content {i}, two files");
+        }
+        var svc = Service(new RecordingFlush());
+        await svc.ExecuteAsync(Job(set, src, dst), dst, null, null, CancellationToken.None);
+        foreach (var f in a)
+            File.WriteAllText(f, $"{Path.GetFileName(f)} changed");
+        await svc.ExecuteAsync(Job(set, src, dst), dst, null, null, CancellationToken.None);
+        foreach (var f in a)
+            File.WriteAllText(f, $"{Path.GetFileName(f)} changed again");
+        return (set, src, dst, a, b);
+    }
+
+    async Task<List<string>> LiveRecordsWithoutFiles(BackupSet set, string dst) =>
+        (await repo.GetAllFilesForBackupSetAsync(set.Id))
+            .Where(r => !r.IsDeleted && !File.Exists(Path.Combine(dst, r.DiscPath)))
+            .Select(r => r.DiscPath).ToList();
+
+    // ===================================================================
+    Console.WriteLine();
+    Console.WriteLine("=== 22. Retention stopped while its promotions are being made durable ===");
+    // ===================================================================
+    {
+        var (set, src, dst, a, b) = await FivePromotionsDue("promote-stopped");
+        var bPlain = b.Select(f => CurrentIn(dst, f)).ToList();
+        using var stop = new CancellationTokenSource();
+        var recording = new RecordingFlush
+        {
+            OnFlush = written =>
+            {
+                if (written.Intersect(bPlain, StringComparer.OrdinalIgnoreCase).Any())
+                    stop.Cancel();
+            },
+        };
+        var error = await Try(() => Service(recording).ExecuteAsync(Job(set, src, dst), dst,
+            [new VersionRetentionTier { MaxVersions = 1 }], null, stop.Token));
+        Check(error is OperationCanceledException, $"the run stops ({error?.GetType().Name})");
+        bool allRefs = true;
+        foreach (string f in b)
+            allRefs &= (await repo.GetFileRecordsByPathAsync(set.Id, f)).Single().IsFileRef;
+        Check(allRefs && bPlain.All(p => File.Exists(p + ".fileref") && !File.Exists(p)),
+            "every b is still a reference, with nothing beside it");
+        Check(a.All(f => File.Exists(PrevIn(dst, f, 1))), "every a's expired copy, which they resolve to, is kept");
+        var orphans = await LiveRecordsWithoutFiles(set, dst);
+        Check(orphans.Count == 0, $"and no record claims a file that is gone ({orphans.Count})");
+    }
+
+    // ===================================================================
+    Console.WriteLine();
+    Console.WriteLine("=== 23. A reference another writer changes meanwhile is not promoted ===");
+    // ===================================================================
+    {
+        var (set, src, dst, a, b) = await FivePromotionsDue("promote-changed");
+        var bPlain = b.Select(f => CurrentIn(dst, f)).ToList();
+        string movedTo = "";
+        var recording = new RecordingFlush
+        {
+            OnFlush = written =>
+            {
+                if (movedTo.Length > 0 || !written.Intersect(bPlain, StringComparer.OrdinalIgnoreCase).Any())
+                    return;
+                // As the Worker does when it backs b0 up while this run waits:
+                // the reference moved into the history.
+                var rec = repo.GetFileRecordsByPathAsync(set.Id, b[0]).GetAwaiter().GetResult().Single();
+                movedTo = PrevIn(dst, b[0], 1) + ".fileref";
+                Directory.CreateDirectory(Path.GetDirectoryName(movedTo)!);
+                File.Move(Path.Combine(dst, rec.DiscPath), movedTo);
+                rec.DiscPath = Path.GetRelativePath(dst, movedTo);
+                repo.UpdateFileRecordAsync(rec).GetAwaiter().GetResult();
+            },
+        };
+        Check((await Service(recording).ExecuteAsync(Job(set, src, dst), dst,
+                [new VersionRetentionTier { MaxVersions = 1 }], null, CancellationToken.None)).Success,
+            "the run succeeds");
+        var b0 = (await repo.GetFileRecordsByPathAsync(set.Id, b[0])).Single();
+        Check(b0.IsFileRef && string.Equals(Path.Combine(dst, b0.DiscPath), movedTo, StringComparison.OrdinalIgnoreCase),
+            "b0's record is as the other writer left it");
+        Check(File.Exists(PrevIn(dst, a[0], 1)), "and a0's expired copy, which it resolves to, is kept");
+        bool othersDone = true;
+        for (int i = 1; i < 5; i++)
+            othersDone &= !(await repo.GetFileRecordsByPathAsync(set.Id, b[i])).Single().IsFileRef
+                          && !File.Exists(PrevIn(dst, a[i], 1));
+        Check(othersDone, "while the other four were promoted, and their expired copies went");
+        var orphans = await LiveRecordsWithoutFiles(set, dst);
+        Check(orphans.Count == 0, $"no record claims a file that is gone ({string.Join(", ", orphans)})");
     }
 }
 finally

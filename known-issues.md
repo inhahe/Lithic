@@ -154,15 +154,25 @@ of copies, it finishes them (`FinishPromotionsAsync`): one flush, then the
 records, then the manifests and the expired copies go. When the flush fails,
 every copy is taken back and every held-back copy is kept. A copy stopped
 before it is finished is taken back too. The bound keeps the extra space the
-copies take, until what they came from goes, to a gigabyte.
+copies take, until what they came from goes, to a gigabyte. Holding
+promotions open opens windows that finishing each at once did not. So the
+records change in one transaction under the set's write lock, each reference
+checked again there. A batch is finished before a pause is waited out. A copy
+is taken back only while it is still as the run made it. Deletions that have
+happened are recorded even when a stop arrives.
 
 **Tests.** `durability_test` §20: five promotions in one pass take one flush,
 made while every source was still there. When that flush fails, every
 reference stays as it was, with nothing beside it, and every source is kept,
 while an expired copy that needed no promotion still goes. §21: two expired
-copies of one content wait on one promotion. Finishing each promotion at once,
-as before, fails §20 (five flushes); not waiting fails §21 (an expired copy is
-left).
+copies of one content wait on one promotion. §22: a stop during the flush
+leaves every reference as it was and every source kept, and no record claims
+a file that is gone. §23: a reference another writer moves meanwhile is not
+promoted, and its source stays. Each fails with its fix taken out:
+- finishing each promotion at once, as before, fails §20 (five flushes);
+- not waiting fails §21 (an expired copy is left);
+- record changes that cannot be stopped fail §22;
+- no second check fails §23 (the source is deleted).
 
 ## FIXED: "files under this folder" read every file of the set, and missed names starting with an emoji (2026-10-21)
 
