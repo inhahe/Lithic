@@ -14,6 +14,7 @@
   <ItemGroup>
     <ProjectReference Include="..\..\src\LithicBackup.Core\LithicBackup.Core.csproj" />
     <ProjectReference Include="..\..\src\LithicBackup.Infrastructure\LithicBackup.Infrastructure.csproj" />
+    <ProjectReference Include="..\..\src\LithicBackup.Services\LithicBackup.Services.csproj" />
   </ItemGroup>
 
 </Project>

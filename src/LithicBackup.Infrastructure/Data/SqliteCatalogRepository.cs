@@ -1231,6 +1231,8 @@ public class SqliteCatalogRepository : ICatalogRepository
         int backupSetId, CancellationToken ct = default, Action? onWaitingForOtherProcess = null)
         => GetSet(backupSetId).BeginTransactionAsync(ct, onWaitingForOtherProcess);
 
+    public bool ShouldGiveWayToWaitingWriter(int backupSetId) => GetSet(backupSetId).ShouldGiveWayToWaitingWriter;
+
     /// <summary>
     /// Make this process's writes step aside for a writer in another process that
     /// is waiting for the same set (see <c>SqliteSetDatabase.YieldToWaitingWriters</c>).

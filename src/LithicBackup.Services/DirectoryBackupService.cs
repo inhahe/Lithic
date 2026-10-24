@@ -78,6 +78,7 @@ public class DirectoryBackupService
     private readonly VersionRetentionService _retention;
     private readonly IDeduplicationEngine? _dedup;
     private readonly IFileHashLookup? _hashCache;
+    private readonly IDestinationFlush _destinationFlush;
 
     /// <summary>
     /// TESTING ONLY — when <c>true</c>, plain (non-deduplicated) file copies are
@@ -97,13 +98,15 @@ public class DirectoryBackupService
         IFileScanner scanner,
         VersionRetentionService retention,
         IDeduplicationEngine? dedup = null,
-        IFileHashLookup? hashCache = null)
+        IFileHashLookup? hashCache = null,
+        IDestinationFlush? destinationFlush = null)
     {
         _catalog = catalog;
         _scanner = scanner;
         _retention = retention;
         _dedup = dedup;
         _hashCache = hashCache;
+        _destinationFlush = destinationFlush ?? new DestinationFlush();
     }
 
     /// <summary>
@@ -572,12 +575,23 @@ public class DirectoryBackupService
         // Commit catalog records periodically so that cancellation preserves
         // progress for files already copied.  Commits happen:
         //   - every CommitBatchSize small files,
-        //   - immediately after any large file (>= 10 MB),
+        //   - immediately after any large file (>= CommitLargeFileThreshold),
         //   - before starting a large file (to flush pending small files),
         //   - at least every CommitIntervalSeconds regardless of file size.
-        const int CommitBatchSize = 50;
-        const long CommitLargeFileThreshold = 10 * 1024 * 1024; // 10 MB
+        // Each commit first flushes the destination (MakeDurableAsync), one flush
+        // of the drive's cache, so the batches are a few hundred files: a cancel
+        // or a crash copies at most that many again.
+        const int CommitBatchSize = 500;
+        const long CommitLargeFileThreshold = 100L * 1024 * 1024; // 100 MB
         const double CommitIntervalSeconds = 30;
+
+        // What this run writes on the destination is noted as it goes, and made
+        // durable before each commit records it: a copy is done once its bytes
+        // are in the cache, and a drive that drops off before they reach the disk
+        // would leave the catalog listing files that are not there.
+        using var writes = DestinationWrites.Begin(targetDirectory);
+        Task MakeDurableAsync(CancellationToken token) =>
+            writes.MakeDurableAsync(_destinationFlush, token);
         int batchCount = 0;
         var commitTimer = System.Diagnostics.Stopwatch.StartNew();
 
@@ -609,9 +623,11 @@ public class DirectoryBackupService
             LastWrittenUtc = DateTime.UtcNow,
         }, ct);
 
-        // Commit what this run has written and let the set's write lock go.
+        // Commit what this run has written - on the disk first - and let the
+        // set's write lock go.
         async Task CommitAndReleaseAsync()
         {
+            await MakeDurableAsync(ct);
             discRecord.BytesUsed = bytesWritten;
             discRecord.LastWrittenUtc = DateTime.UtcNow;
             await _catalog.UpdateDiscAsync(discRecord, ct);
@@ -641,6 +657,22 @@ public class DirectoryBackupService
             await ReacquireLockAsync();
         }
 
+        // A writer in another process waiting for the set - the app, when this is
+        // the Worker - is let in between files, not at the end of the batch, which
+        // can be CommitIntervalSeconds away. Asked at most every quarter second:
+        // asking lists the catalog's folder.
+        var giveWayCheck = System.Diagnostics.Stopwatch.StartNew();
+        async Task GiveWayIfWaitedForAsync()
+        {
+            if (giveWayCheck.ElapsedMilliseconds < 250)
+                return;
+            giveWayCheck.Restart();
+            if (!_catalog.ShouldGiveWayToWaitingWriter(backupSetId))
+                return;
+            await CommitAndReleaseAsync();
+            await ReacquireLockAsync();
+        }
+
         // Per-file progress: only report intermediate progress for files >= 1 MB,
         // and throttle reports to every ~1 MB to avoid flooding the UI thread.
         const long PerFileProgressThreshold = 1024 * 1024;      // 1 MB
@@ -656,6 +688,7 @@ public class DirectoryBackupService
         {
             await WaitOutPauseAsync();
             ct.ThrowIfCancellationRequested();
+            await GiveWayIfWaitedForAsync();
 
             var file = filesToBackup[i];
 
@@ -1250,6 +1283,7 @@ public class DirectoryBackupService
                         // this throws and the file fails (and is retried next run)
                         // rather than destroy a version.
                         File.Move(oldCurrentPath, prevPath, overwrite: false);
+                        DestinationWrites.Note(prevPath);
 
                         string prevDiscPath = GetPrevDiscPath(
                             file.FullPath, prevVersion, oldDeduped, oldFileRef);
@@ -1364,6 +1398,7 @@ public class DirectoryBackupService
                     };
                     string json = JsonSerializer.Serialize(manifest, _jsonOptions);
                     await File.WriteAllTextAsync(currentPath, json, ct);
+                    DestinationWrites.Note(currentPath);
                 }
                 else if (isDeduped && recipe is not null)
                 {
@@ -1388,6 +1423,7 @@ public class DirectoryBackupService
                     };
                     string json = JsonSerializer.Serialize(manifest, _jsonOptions);
                     await File.WriteAllTextAsync(currentPath, json, ct);
+                    DestinationWrites.Note(currentPath);
                 }
                 else if (StubPlainContentForTesting)
                 {
@@ -1708,6 +1744,7 @@ public class DirectoryBackupService
         });
 
         // Final batch: update disc record and commit remaining records.
+        await MakeDurableAsync(ct);
         discRecord.BytesUsed = bytesWritten;
         discRecord.Status = BurnSessionStatus.Completed;
         discRecord.LastWrittenUtc = DateTime.UtcNow;
@@ -1718,9 +1755,18 @@ public class DirectoryBackupService
         } // try (batch transaction)
         catch
         {
-            // Save partial progress: commit whatever file records are in
-            // the current transaction so the next backup doesn't redo them.
-            try { tx.Complete(); } catch { /* best-effort */ }
+            // Save partial progress: commit whatever file records are in the
+            // current transaction so the next backup doesn't redo them - if what
+            // they record is on the disk. The run may be failing because the drive
+            // has just gone, taking those copies with it; then the batch rolls
+            // back, and the next backup copies them again. Not cancellable: a
+            // cancel is what saves its progress here.
+            try
+            {
+                await MakeDurableAsync(CancellationToken.None);
+                tx.Complete();
+            }
+            catch { /* not durable, or not committable: rolled back */ }
             throw;
         }
         finally
@@ -2512,6 +2558,7 @@ public class DirectoryBackupService
         trace?.Invoke($"RelocateDirectoryAsync: history tree '{oldPrev}' -> '{newPrev}'");
 
         bool curMoved = false, prevMoved = false;
+        using var writes = DestinationWrites.Begin(targetDirectory);
         try
         {
             if (Directory.Exists(oldCur))
@@ -2519,6 +2566,7 @@ public class DirectoryBackupService
                 EnsureParentDirectory(newCur);
                 Directory.Move(oldCur, newCur);
                 curMoved = true;
+                DestinationWrites.Note(newCur);
                 trace?.Invoke("renamed current-version tree on disk.");
             }
             else
@@ -2530,6 +2578,7 @@ public class DirectoryBackupService
                 EnsureParentDirectory(newPrev);
                 Directory.Move(oldPrev, newPrev);
                 prevMoved = true;
+                DestinationWrites.Note(newPrev);
                 trace?.Invoke("renamed history (_prev) tree on disk.");
             }
 
@@ -2550,6 +2599,9 @@ public class DirectoryBackupService
                 rec.SourcePath = newSource;
                 await _catalog.UpdateFileRecordAsync(rec, ct);
             }
+            // The renames on the disk before the records say so; when they cannot
+            // be made durable, the catch below puts the trees back.
+            await writes.MakeDurableAsync(_destinationFlush, ct);
             tx.Complete();
             trace?.Invoke($"updated {records.Count} catalog record(s) to the new path -> Relocated.");
             return TargetedMoveOutcome.Relocated;
@@ -2579,6 +2631,7 @@ public class DirectoryBackupService
     {
         // (newAbs -> oldAbs) pairs we can undo on failure.
         var undo = new List<(string From, string To)>();
+        using var writes = DestinationWrites.Begin(targetDirectory);
         try
         {
             foreach (var rec in records)
@@ -2591,6 +2644,7 @@ public class DirectoryBackupService
                 EnsureParentDirectory(newAbs);
                 File.Move(oldAbs, newAbs, overwrite: false);
                 undo.Add((newAbs, oldAbs));
+                DestinationWrites.Note(newAbs);
                 trace?.Invoke($"RelocateFileAsync: renamed '{oldAbs}' -> '{newAbs}'");
             }
 
@@ -2609,6 +2663,9 @@ public class DirectoryBackupService
                 rec.SourcePath = newPath;
                 await _catalog.UpdateFileRecordAsync(rec, ct);
             }
+            // The renames on the disk before the records say so; when they cannot
+            // be made durable, the catch below puts the files back.
+            await writes.MakeDurableAsync(_destinationFlush, ct);
             tx.Complete();
             trace?.Invoke($"updated {records.Count} catalog record(s) -> Relocated.");
             return TargetedMoveOutcome.Relocated;
@@ -3052,6 +3109,7 @@ public class DirectoryBackupService
         File.Move(tempPath, destPath, overwrite: true);
         created += System.Diagnostics.Stopwatch.GetElapsedTime(started);
         creations?.Record(destPath, created);
+        DestinationWrites.Note(destPath);
     }
 
     /// <summary>Lowercase-hex SHA-256 of an in-memory buffer.</summary>
@@ -3140,6 +3198,7 @@ public class DirectoryBackupService
             $"[LithicBackup TEST STUB \u2014 not real content, not restorable]\n" +
             $"sha256: {hash}\nsize: {size}\n",
             ct);
+        DestinationWrites.Note(destPath);
     }
 
     // -------------------------------------------------------------------
@@ -3179,6 +3238,7 @@ public class DirectoryBackupService
                         blockPath, FileMode.Create, FileAccess.Write,
                         FileShare.None, bufferSize: 81920, useAsync: true);
                     await dst.WriteAsync(buffer.AsMemory(0, bytesRead), ct);
+                    DestinationWrites.Note(blockPath);
                 }
             }
         }
@@ -3211,6 +3271,7 @@ public class DirectoryBackupService
                         blockPath, FileMode.Create, FileAccess.Write,
                         FileShare.None, bufferSize: 81920, useAsync: true);
                     await dst.WriteAsync(content.AsMemory(offset, len), ct);
+                    DestinationWrites.Note(blockPath);
                 }
             }
 
@@ -3611,7 +3672,12 @@ public class DirectoryBackupService
             // leaves a read-only file on the destination that later resists
             // retention/cleanup deletion.
             File.Copy(sourceBytesPath, plainAbsPath, overwrite: true);
+            DestinationWrites.Note(plainAbsPath);
             ClearReadOnly(plainAbsPath);
+            // On the disk before anything is deleted: the caller deletes or
+            // overwrites the bytes this was copied from next, and then it is the
+            // only copy. When it cannot be made durable, they stay (false).
+            await DestinationWrites.MakeDurableNowAsync(_destinationFlush, targetDirectory, plainAbsPath, ct);
 
             // Remove the now-redundant .fileref manifest (it differs from the
             // plain path only by the ".fileref" suffix).
@@ -3755,6 +3821,7 @@ public class DirectoryBackupService
                 m.ContentPath = newContentDiscPath;
                 await File.WriteAllTextAsync(
                     refAbs, JsonSerializer.Serialize(m, _jsonOptions), ct);
+                DestinationWrites.Note(refAbs);
             }
             catch
             {
@@ -4120,6 +4187,9 @@ public class DirectoryBackupService
         // only ever held for the inserts.
         var pending = new List<FileRecord>();
         var flushSw = System.Diagnostics.Stopwatch.StartNew();
+        // Files moved into the history are noted, and on the disk before a
+        // batch's records say where they are (see DestinationWrites).
+        using var writes = DestinationWrites.Begin(targetDir);
 
         async Task FlushAsync()
         {
@@ -4131,6 +4201,7 @@ public class DirectoryBackupService
             {
                 foreach (var rec in pending)
                     await _catalog.CreateFileRecordAsync(rec, CancellationToken.None);
+                await writes.MakeDurableAsync(_destinationFlush, CancellationToken.None);
                 tx.Complete();
             }
             finally
@@ -4338,6 +4409,7 @@ public class DirectoryBackupService
                             {
                                 Directory.CreateDirectory(Path.GetDirectoryName(prevAbs)!);
                                 File.Move(d.File.FullName, prevAbs, overwrite: false);
+                                DestinationWrites.Note(prevAbs);
                             }
                             catch (Exception ex) when (ex is IOException or UnauthorizedAccessException)
                             {

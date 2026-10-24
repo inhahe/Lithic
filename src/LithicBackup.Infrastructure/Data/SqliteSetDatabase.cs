@@ -311,12 +311,14 @@ internal sealed class SqliteSetDatabase : IDisposable
     /// When true, this process steps aside for a writer in another process that is
     /// waiting for the same set: before taking the set's write lock it waits until
     /// that writer has had its turn. The Worker service sets it. Its continuous
-    /// backup commits every 50 files or 30 s and takes the lock back within
+    /// backup commits every 500 files or 30 s and takes the lock back within
     /// microseconds of letting it go, while a waiter polls every 25 ms, so without
     /// this a backup the user started could not get in until the Worker's whole
     /// run was over - which on a large run is hours ("Checking 23,780 file(s)
-    /// against the catalog..." until then). The GUI does not step aside: the work
-    /// the user is watching goes first, and the Worker carries on after it.
+    /// against the catalog..." until then). Nor does it wait for the end of a
+    /// batch: a run asks <see cref="ShouldGiveWayToWaitingWriter"/> between files.
+    /// The GUI does not step aside: the work the user is watching goes first, and
+    /// the Worker carries on after it.
     /// </summary>
     internal static bool YieldToWaitingWriters { get; set; }
 
@@ -337,6 +339,13 @@ internal sealed class SqliteSetDatabase : IDisposable
     private static readonly TimeSpan MaxYield = TimeSpan.FromMinutes(2);
 
     private string WaitMarkerPath(int processId) => $"{_writeLockPath}.wait-{processId}";
+
+    /// <summary>
+    /// Whether this process steps aside for writers in others and one is waiting
+    /// for this set now (<see cref="YieldToWaitingWriters"/>). Lists the catalog's
+    /// folder, so not for every row.
+    /// </summary>
+    internal bool ShouldGiveWayToWaitingWriter => YieldToWaitingWriters && AnotherProcessIsWaiting();
 
     /// <summary>
     /// For a background writer (<see cref="YieldToWaitingWriters"/>): wait while a

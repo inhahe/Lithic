@@ -69,6 +69,10 @@ var builder = Host.CreateDefaultBuilder(args)
         // and its StopAsync is a no-op.
         services.AddHostedService<ShutdownSignalListener>();
 
+        // Flushes a destination volume for a backup run in the app, which may not
+        // (see VolumeFlushServer). Returns at once, like the listener above.
+        services.AddHostedService<VolumeFlushServer>();
+
         services.AddHostedService<BackupWorker>();
     });
 

@@ -108,17 +108,27 @@ when the other process is running.
 * **Writes to a set take turns, and the Worker gives way.** Every write to a set's
   database first takes a cross-process lock file (`set-<id>.db.writelock`,
   `SqliteSetDatabase.AcquireCrossProcessWriteAsync`). A waiter polls every 25 ms.
-  A backup holds the lock for a whole commit batch (50 files, a large file, or
-  30 s) and takes it back within microseconds of releasing it. So the Worker's
+  A backup holds the lock for a whole commit batch (500 files, a file of 100 MB
+  or more, or 30 s: see "A copy is recorded only once it is on the disk") and
+  takes it back within microseconds of releasing it. So the Worker's
   continuous run used to shut the GUI out for as long as it lasted: hours on a
   large one, with the GUI's backup showing its previous status throughout. A
   waiter now leaves `set-<id>.db.writelock.wait-<pid>`, refreshed each second. The
   Worker (`SqliteCatalogRepository.YieldWritesToWaitingProcesses`, set in its
   `Program.cs`) steps aside at its next acquisition while a fresh marker from
   another process exists. It ignores markers more than 5 s old and gives way for
-  at most 2 minutes at a time. The GUI never gives way, so the backup the user is
-  watching goes first. `BeginTransactionAsync`'s `onWaitingForOtherProcess`
+  at most 2 minutes at a time. Nor does it make the waiter sit out the rest of
+  its batch: a run asks `ShouldGiveWayToWaitingWriter` between files, at most
+  every quarter second, and commits and steps aside when it is told to
+  (`GiveWayIfWaitedForAsync`). A waiter gets in after the file being copied
+  (`write_lock_fairness_test` §4). The GUI never gives way, so the backup the
+  user is watching goes first. `BeginTransactionAsync`'s `onWaitingForOtherProcess`
   lets a backup say that it is waiting.
+* **The Worker flushes volumes for the app.** Making a backup's copies durable
+  before a commit takes flushing the destination's volume, which only an elevated
+  process may do; the app asks the Worker over `\\.\pipe\LithicBackup.FlushVolume`,
+  and falls back to flushing file by file when nobody answers. See "A copy is
+  recorded only once it is on the disk".
 * **Opening a set must not need the write lock.** Every process runs
   `SetSchema.sql` when it first opens a set, while the other may be mid-run. So
   the script is `CREATE ... IF NOT EXISTS` only, which is a no-op on an existing
@@ -964,8 +974,9 @@ and the copy, and at a commit boundary, and checks every version's number and
 content.
 
 **Anything learned under the write lock is good only until the run lets it go.**
-A run lets go at every commit (every 50 files or 30 s), and the Worker can write
-between two of them. So: version numbers are read per file under the lock (above).
+A run lets go at every commit (every 500 files or 30 s, and in the Worker whenever
+another process waits for the set), and another writer can write between two of
+them. So: version numbers are read per file under the lock (above).
 The file-level dedup memo of "hash -> a plain copy holding it" is emptied whenever
 the lock is taken back (`ReacquireLockAsync`), because the copy it names may have
 been pruned. Pause commits and lets the lock go before waiting
@@ -1902,6 +1913,74 @@ editor are choices, and stay. Checked on
 thing lost is what pinning exists for: if the parent's auto-include is turned off
 later, those folders drop out with it, which costs nothing for folders whose files
 are excluded anyway.
+
+## A copy is recorded only once it is on the disk
+
+A write is done once its bytes are in the Windows cache; the lazy writer puts them
+on the disk seconds later. A drive lost in between takes them, and the rename that
+promoted them, and a catalog that has recorded them says they are backed up when
+they are not. Nothing re-copies them until the source changes. (The WD 6 TB USB
+drive dropped off its bus 11 times in two days, each time mid-run; see
+known-issues.md.) So whatever a commit records about a destination, it is on the
+disk first:
+
+* **The journal.** Each place that writes or renames something on a destination
+  calls `DestinationWrites.Note(path)`: the promote of a copy, the move of the
+  current copy into `_prev`, `.fileref`/`.dedup` manifests, dedup blocks, a
+  materialised copy, the seed's moves into the history, a relocation's renames.
+  The journal is an `AsyncLocal` that `DestinationWrites.Begin(destination)` sets
+  for a run, a seed and a relocation, so concurrent runs keep their own and the
+  write sites need no parameter. **A new place that writes to a destination must
+  note it:** an unnoted write is committed without being flushed, and nothing
+  says so. `durability_test` §7 checks that every record a run commits is of a
+  file flushed before the commit.
+* **Every commit makes the journal durable first** (`MakeDurableAsync`): the batch
+  commits, the commit before a large file, the commit a pause makes, the final
+  commit, and the commit a failing or cancelled run makes on its way out to save
+  its progress. If the flush fails, the commit does not happen, the way-out one
+  included (that is the case of the drive that has just gone), and what was noted
+  stays noted, so a later attempt flushes it again. The next run copies the batch
+  again. (The disk is then ahead of the catalog, a `_prev` move or two recorded
+  nowhere. The `_prev` move already handles that case — "the catalog is behind
+  the drive" — as it does after a crash.)
+* **Some writes are made durable at once, not at the commit:** a write that
+  something irreversible follows. Retention giving a `.fileref` the bytes of the
+  last plain copy of its content, before deleting that copy
+  (`TryPromoteFileRefToPlainAsync`), flushes the new copy first
+  (`DestinationWrites.MakeDurableNowAsync`), and keeps the old one if it cannot.
+  A new path that copies bytes and then deletes their source must do the same.
+* **The flush** (`DestinationFlush`). The volume each written path is on is found
+  from the folder it was written in, by handle (`DurableFlush.VolumeOf`,
+  `GetFinalPathNameByHandle`, as `\\?\Volume{GUID}\`). A drive letter would
+  mislead: it says nothing through a junction or a mount point, and Windows will
+  not resolve a subst drive's at all. Each volume is flushed whole with one
+  `FlushFileBuffers` on the volume, one flush of the device's cache, whatever the
+  batch held. That needs an elevated process. The Worker is one (LocalSystem) and
+  flushes for itself. For the app, which usually is not, the Worker flushes on
+  request (`VolumeFlushPipe`, `\\.\pipe\LithicBackup.FlushVolume`, served by
+  `VolumeFlushServer`). The request is the volume's name, never a path: the
+  service's logon session does not see the user's subst and network drives, and
+  the server refuses anything that is not a volume name. What no volume flush
+  covers (a network share, a file system without volume names, no service
+  answering, which is then not asked again for a minute) is flushed file by file,
+  one device flush each, after a check that the destination is still there.
+* **A drive that comes back.** A USB drive that drops off and comes back under
+  the same letter has lost what was in the cache, yet its paths work again, and a
+  flush then succeeds, flushing none of what was lost. So a run holds its
+  destination folder open (`VolumeWatch`) from `Begin` on, and a commit after a
+  flush first checks that the handle still works. A handle from before the drop
+  never works again. Untested: it takes pulling the drive.
+* **Batches are larger, because each commit costs a flush:** 500 files, a file of
+  100 MB or more, or 30 s (they were 50, 10 MB and 30 s). The flush writes out
+  synchronously whatever the lazy writer has not yet written. Over a longer batch
+  the lazy writer has written most of it in the background, so the flush is a
+  smaller share of the run. A longer batch holds the set's write lock longer, so
+  the Worker now lets a waiting writer in between files (see "Writes to a set take
+  turns, and the Worker gives way").
+
+`durability_test` covers the pieces and the runs: subst drives, junctions,
+read-only files, the pipe against a server in its own process, and a run, a seed
+and a folder move with a flush that records what it is given or fails.
 
 ## Threading rules that bite
 

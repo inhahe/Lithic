@@ -659,4 +659,12 @@ public interface ICatalogRepository : IDisposable
     /// </param>
     Task<ICatalogTransaction> BeginTransactionAsync(
         int backupSetId, CancellationToken ct = default, Action? onWaitingForOtherProcess = null);
+
+    /// <summary>
+    /// Whether this process should let a writer of the set in another process in
+    /// now: it gives way to such writers (the Worker does), and one is waiting. A
+    /// long run asks between files, and commits and lets the lock go rather than
+    /// hold it to the end of its batch.
+    /// </summary>
+    bool ShouldGiveWayToWaitingWriter(int backupSetId) => false;
 }

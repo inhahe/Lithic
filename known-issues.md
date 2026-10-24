@@ -22,7 +22,7 @@ reports, and that they keep coming while the set's catalog is held. Against
 the old code, both fail: §24 still shows "Preparing verification...", and the
 held catalog gets 1 report in 2 s.
 
-## OPEN: a copy is recorded as backed up before its data reaches the destination disk, so a drive that drops off USB loses files the catalog says it has (seen 2026-10-22/23)
+## FIXED: a copy was recorded as backed up before its data reached the destination disk, so a drive that dropped off USB lost files the catalog said it had (seen 2026-10-22/23, fixed 2026-10-24)
 
 **Seen.** The WD 6 TB USB drive (H:, set "backup to i: (wd 6tb usb3 hdd)") fell
 off the USB bus 11 times between 2026-10-22 06:54 and 10-24 00:24, each time in
@@ -50,16 +50,59 @@ source changes again. A file whose data was lost but whose name survived
 The temp-file-and-rename scheme protects against a torn file, but not against
 this.
 
-**Fix.** Make a copy durable before the catalog records it. Per-file
-`Flush(true)` is correct but costs a device cache flush per file, which is
-slow for many small files on a USB disk. It is cheaper to flush the volume
-once before each catalog commit batch: `FlushFileBuffers` on a handle to
-`\\.\H:` writes out all dirty data and metadata for the volume. That needs
-write access to the volume, which the Worker has as LocalSystem; the app, when
-not elevated, would fall back to per-file flushes. Then, when a run sees the
-device vanish, re-check the files committed in the minute or so before it
-(existence and size at least) and drop the ones that did not survive from the
-catalog so the next run copies them again.
+**Fix.** Every commit that records something written to a destination makes
+it durable first, and does not happen when it cannot. The design is in
+design.md, "A copy is recorded only once it is on the disk". In short:
+
+- Each place that writes or renames on the destination notes the path in the
+  run's journal (`DestinationWrites`). The run flushes what is noted before
+  each commit, including the commit a failing or cancelled run makes on its way
+  out. A failed flush leaves the journal as it was, for the next attempt.
+- The flush covers the whole volume in one go (`FlushFileBuffers` on
+  `\\?\Volume{GUID}`). The Worker does it itself. For the app, which is usually
+  not elevated, the Worker does it on request over a named pipe. Where neither
+  can (a network share; no service answering), each file is flushed.
+- The volume is found by handle, not by drive letter. The probe that settled
+  the design showed why: a subst drive's letter resolves to no volume at all,
+  the service's logon session sees neither the user's subst drives nor their
+  network drives, and a junction leads to another volume than its letter's.
+- Batches grew from 50 files / 10 MB / 30 s to 500 / 100 MB / 30 s, since each
+  commit now costs a flush. So that the larger batch does not keep the app
+  waiting, the Worker now lets a waiting app in between files.
+
+**The re-check proposed above was not needed.** It was to catch the drive that
+drops off and comes back, when a flush succeeds on the returned drive while
+what was lost stays lost. Instead a run holds its destination folder open from
+its start (`VolumeWatch`), and a commit checks that the handle still works. A
+handle opened before the drop never works again, whereas a check of existence
+and size would pass a file whose name survived and whose data did not.
+
+**Tests.** `tools/durability_test` covers the pieces (subst drives, junctions,
+read-only files, the pipe against a server in its own process). It also covers
+a run, a seed and a folder move, with a flush that records what it is given or
+fails. In each, every record a commit writes is of a file flushed before it,
+and a failing flush stops the commit. Against the code with the bug put back,
+three ways, it fails 7 to 12 checks:
+
+- no flush before commits;
+- the way-out commit not flushing;
+- the journal emptied before its flush succeeded.
+
+`write_lock_fairness_test` §4 checks that the app gets in mid-batch.
+
+**Not tested: the drive that is pulled and comes back.** Testing it takes the
+hardware; nothing here can make a volume go away without admin rights. The
+handle check rests on file systems failing every request on a handle to a
+dismounted volume. The Worker's log shows its open handles failing while the
+drive was gone: its in-flight copies failed with "A device which does not exist
+was specified". That they stay dead once it is back follows from how mounting
+works, not from anything observed here: a returning drive is mounted anew, and
+old handles belong to the mount that went.
+
+**Limit.** When files are flushed one by one, a file another process has open
+without sharing writes cannot be flushed, and that batch is not committed. The
+next run copies it again. This happens only in the per-file fallback, and only
+for a file renamed in that batch that another process is reading.
 
 **Repairing the H: backup now.** Once `chkdsk` has checked the volume, run
 **Verify integrity** on the set with **Verify file contents** on: it re-hashes

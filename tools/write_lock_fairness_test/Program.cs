@@ -13,11 +13,18 @@
 //
 // The lock is between PROCESSES, so this harness runs a second copy of itself as
 // the "Worker": it holds the set's lock in 150 ms batches, re-taking it at once
-// each time, exactly as a continuous backup's commit loop does.
+// each time, exactly as a continuous backup's commit loop does. Section 4 has it
+// run a real backup instead, whose batches (500 files, or 30 s) are long enough
+// that waiting for the end of one would be the old shut-out again: the run lets
+// a waiting writer in between files.
 
 using System.Diagnostics;
+using LithicBackup.Core;
+using LithicBackup.Core.Interfaces;
 using LithicBackup.Core.Models;
 using LithicBackup.Infrastructure.Data;
+using LithicBackup.Infrastructure.FileSystem;
+using LithicBackup.Services;
 
 namespace WriteLockFairnessTest;
 
@@ -35,6 +42,8 @@ internal static class Program
     {
         if (args.Length > 0 && args[0] == "holder")
             return await HolderAsync(args[1], int.Parse(args[2]), double.Parse(args[3]), args[4] == "yield");
+        if (args.Length > 0 && args[0] == "backup")
+            return await BackupHolderAsync(args[1], int.Parse(args[2]), args[3], args[4]);
 
         string root = Path.Combine(Path.GetTempPath(), "lithic_lockfair_" + Guid.NewGuid().ToString("N"));
         Directory.CreateDirectory(root);
@@ -160,6 +169,46 @@ internal static class Program
                     SqliteCatalogRepository.YieldWritesToWaitingProcesses = false;
                 }
             }
+
+            Console.WriteLine();
+            Console.WriteLine("=== 4. the Worker's backup lets a waiting writer in between files ===");
+            {
+                string source = Path.Combine(root, "src4");
+                string dest = Path.Combine(root, "dst4");
+                Directory.CreateDirectory(dest);
+                for (int i = 0; i < BackupFiles; i++)
+                {
+                    string f = Path.Combine(source, $"d{i % 10}", $"f{i:D5}.txt");
+                    Directory.CreateDirectory(Path.GetDirectoryName(f)!);
+                    File.WriteAllText(f, $"file {i}");
+                }
+                var set4 = await repo.CreateBackupSetAsync(new BackupSet
+                {
+                    Name = "worker backup",
+                    SourceRoots = [source],
+                    CreatedUtc = DateTime.UtcNow,
+                    DefaultMediaType = MediaType.Directory,
+                    SourceSelections = [new SourceSelection { Path = source, IsDirectory = true, IsSelected = true }],
+                    JobOptions = new JobOptions { TargetDirectory = dest },
+                });
+                using var holder = StartProcess("backup", catalog, set4.Id.ToString(), source, dest);
+                await holder.Holding;
+                string lockFile = Path.Combine(setsDir, $"set-{set4.Id}.db.writelock");
+                Check(IsHeld(lockFile), "the run holds the set's lock while it copies");
+                // Well into its first batch, which lasts 500 files.
+                await Task.Delay(1000);
+                var watch = Stopwatch.StartNew();
+                var tx = await repo.BeginTransactionAsync(set4.Id);
+                var waited = watch.Elapsed;
+                tx.Dispose();
+                Check(waited < TimeSpan.FromSeconds(1.5),
+                    $"a writer waiting mid-batch got in after {waited.TotalMilliseconds:N0} ms "
+                    + $"(a batch is 500 files of at least {FileMs} ms each here: over {500 * FileMs / 1000.0:N0} s)");
+                var done = await holder.ExitAsync();
+                Check(done.ExitCode == 0, $"and the run went on to back up all {BackupFiles:N0} files");
+                Check((await repo.GetAllFilesForBackupSetAsync(set4.Id)).Count == BackupFiles,
+                    "every one of them recorded");
+            }
         }
         catch (Exception ex)
         {
@@ -223,6 +272,70 @@ internal static class Program
         return 0;
     }
 
+    const int BackupFiles = 1_500;
+
+    /// <summary>How long the backup in section 4 takes over each file, in ms.</summary>
+    const int FileMs = 10;
+
+    /// <summary>Whether another process holds <paramref name="lockFile"/>.</summary>
+    static bool IsHeld(string lockFile)
+    {
+        try
+        {
+            using var _ = new FileStream(lockFile, FileMode.Open, FileAccess.ReadWrite, FileShare.None);
+            return false;
+        }
+        catch (IOException)
+        {
+            return true;
+        }
+    }
+
+    // ------------------------------------------------------------------
+    // The Worker's backup: YieldWritesToWaitingProcesses, as the Worker sets it,
+    // and FileMs over each file, so a batch lasts long enough to wait for.
+    // ------------------------------------------------------------------
+
+    static async Task<int> BackupHolderAsync(string catalog, int setId, string source, string dest)
+    {
+        SqliteCatalogRepository.YieldWritesToWaitingProcesses = true;
+        var repo = new SqliteCatalogRepository(catalog);
+        var svc = new DirectoryBackupService(repo, new FileScanner(repo), new VersionRetentionService(repo),
+            destinationFlush: new NoFlush());
+        bool announced = false;
+        // The report each file starts with: the run holds the lock from before
+        // the first one.
+        var progress = new SyncProgress<BackupProgress>(p =>
+        {
+            if (p.CurrentDisc != 1 || p.CurrentFileBytesWritten != 0 || string.IsNullOrEmpty(p.CurrentFile))
+                return;
+            if (!announced)
+            {
+                Console.WriteLine("HOLDING");
+                Console.Out.Flush();
+                announced = true;
+            }
+            Thread.Sleep(FileMs);
+        });
+        var job = new BackupJob
+        {
+            BackupSetId = setId,
+            Sources = [new SourceSelection { Path = source, IsDirectory = true, IsSelected = true }],
+            TargetDirectory = dest,
+            ZipMode = ZipMode.None,
+        };
+        var result = await svc.ExecuteAsync(job, dest, null, progress, CancellationToken.None);
+        Console.WriteLine($"DONE batches=0 after=0 success={result.Success}");
+        return result.Success ? 0 : 1;
+    }
+
+    /// <summary>Durability is not what section 4 is about.</summary>
+    sealed class NoFlush : IDestinationFlush
+    {
+        public Task FlushAsync(string destination, IReadOnlyCollection<string> written, CancellationToken ct) =>
+            Task.CompletedTask;
+    }
+
     sealed class Holder(Process process) : IDisposable
     {
         readonly TaskCompletionSource _holding = new(TaskCreationOptions.RunContinuationsAsynchronously);
@@ -256,7 +369,10 @@ internal static class Program
         }
     }
 
-    static Holder StartHolder(string catalog, int setId, double seconds, bool yield)
+    static Holder StartHolder(string catalog, int setId, double seconds, bool yield) =>
+        StartProcess("holder", catalog, setId.ToString(), seconds.ToString(), yield ? "yield" : "noyield");
+
+    static Holder StartProcess(params string[] args)
     {
         var psi = new ProcessStartInfo(Environment.ProcessPath!)
         {
@@ -264,7 +380,7 @@ internal static class Program
             RedirectStandardOutput = true,
             CreateNoWindow = true,
         };
-        foreach (var a in new[] { "holder", catalog, setId.ToString(), seconds.ToString(), yield ? "yield" : "noyield" })
+        foreach (var a in args)
             psi.ArgumentList.Add(a);
         var holder = new Holder(Process.Start(psi)!);
         holder.Attach();
