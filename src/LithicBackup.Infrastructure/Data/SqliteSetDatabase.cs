@@ -1642,30 +1642,30 @@ internal sealed class SqliteSetDatabase : IDisposable
     }
 
     /// <summary>
-    /// Single-hash variant of <see cref="GetActivePlainContentPathsAsync"/>.
-    /// Returns the destination-relative path of an active PLAIN copy of the
-    /// given content hash, or null when no such copy exists.
+    /// Single-hash variant of <see cref="GetActivePlainContentPathsAsync"/>: the
+    /// destination-relative path of every active PLAIN copy of the given content
+    /// hash, in path order; empty when there is none.
     /// </summary>
     /// <remarks>
     /// The whole-set version GROUP BYs every active plain row in the set — a
     /// full scan of a multi-million-row table on every backup run. A directory
     /// backup only asks about the hashes of the files it is actually writing,
     /// so it looks them up one at a time through IX_DeduplicationBlocks-style
-    /// seeks on IX_Files_Active_Hash instead. MIN(DiscPath) matches the
-    /// whole-set query's choice of representative copy exactly.
+    /// seeks on IX_Files_Active_Hash instead. Ordered by DiscPath, so the first
+    /// is the whole-set query's MIN(DiscPath) choice of representative copy.
     /// </remarks>
-    public async Task<string?> GetActivePlainContentPathByHashAsync(
+    public async Task<IReadOnlyList<string>> GetActivePlainContentPathsByHashAsync(
         int backupSetId, string hash, CancellationToken ct = default)
     {
         ct.ThrowIfCancellationRequested();
         if (string.IsNullOrEmpty(hash))
-            return null;
+            return [];
 
         using var _ = await LockAsync(ct).ConfigureAwait(false);
 
         using var cmd = _connection.CreateCommand();
         cmd.CommandText = """
-            SELECT MIN(f.DiscPath) FROM Files f
+            SELECT f.DiscPath FROM Files f
             INNER JOIN Discs d ON f.DiscId = d.Id
             WHERE f.Hash = $hash
               AND d.BackupSetId = $setId
@@ -1674,12 +1674,73 @@ internal sealed class SqliteSetDatabase : IDisposable
               AND f.IsDeduped = 0
               AND f.IsSplit = 0
               AND f.IsZipped = 0
+            ORDER BY f.DiscPath
             """;
         cmd.Parameters.AddWithValue("$setId", backupSetId);
         cmd.Parameters.AddWithValue("$hash", hash);
 
-        var result = cmd.ExecuteScalar();
-        return result is string s ? s : null;
+        var paths = new List<string>();
+        foreach (var r in Rows(cmd, ct))
+            paths.Add(r.GetString(0));
+        return paths;
+    }
+
+    /// <summary>See <see cref="ICatalogRepository.GetReferencesWithoutContentAsync"/>.</summary>
+    public async Task<IReadOnlyList<long>> GetReferencesWithoutContentAsync(
+        int backupSetId, int discId, CancellationToken ct = default)
+    {
+        ct.ThrowIfCancellationRequested();
+        using var _ = await LockAsync(ct).ConfigureAwait(false);
+
+        // The disc's references through IX_Files_DiscId, each probing
+        // IX_Files_Active_Hash; "plain" as everywhere a reference resolves.
+        using var cmd = _connection.CreateCommand();
+        cmd.CommandText = """
+            SELECT r.Id FROM Files r
+            WHERE r.DiscId = $discId AND r.IsDeleted = 0 AND r.IsFileRef = 1
+              AND EXISTS (SELECT 1 FROM Discs d WHERE d.Id = r.DiscId AND d.BackupSetId = $setId)
+              AND (r.Hash = '' OR NOT EXISTS (
+                  SELECT 1 FROM Files p
+                  WHERE p.Hash = r.Hash AND p.IsDeleted = 0
+                    AND p.IsFileRef = 0 AND p.IsDeduped = 0 AND p.IsSplit = 0 AND p.IsZipped = 0))
+            """;
+        cmd.Parameters.AddWithValue("$discId", discId);
+        cmd.Parameters.AddWithValue("$setId", backupSetId);
+
+        var ids = new List<long>();
+        foreach (var r in Rows(cmd, ct))
+            ids.Add(r.GetInt64(0));
+        return ids;
+    }
+
+    /// <summary>See <see cref="ICatalogRepository.GetRetiredCopiesOfReferencedContentAsync"/>.</summary>
+    public async Task<IReadOnlyList<FileRecord>> GetRetiredCopiesOfReferencedContentAsync(
+        int backupSetId, CancellationToken ct = default)
+    {
+        ct.ThrowIfCancellationRequested();
+        using var _ = await LockAsync(ct).ConfigureAwait(false);
+
+        // Every retired plain row, each probing IX_Files_Active_Hash for a live
+        // reference to its content and a live plain copy of it.
+        using var cmd = _connection.CreateCommand();
+        cmd.CommandText = """
+            SELECT p.* FROM Files p
+            WHERE p.IsDeleted = 1 AND p.Hash <> ''
+              AND p.IsFileRef = 0 AND p.IsDeduped = 0 AND p.IsSplit = 0 AND p.IsZipped = 0
+              AND EXISTS (SELECT 1 FROM Discs d WHERE d.Id = p.DiscId AND d.BackupSetId = $setId)
+              AND EXISTS (SELECT 1 FROM Files r WHERE r.Hash = p.Hash AND r.IsDeleted = 0 AND r.IsFileRef = 1)
+              AND NOT EXISTS (
+                  SELECT 1 FROM Files q
+                  WHERE q.Hash = p.Hash AND q.IsDeleted = 0
+                    AND q.IsFileRef = 0 AND q.IsDeduped = 0 AND q.IsSplit = 0 AND q.IsZipped = 0)
+            ORDER BY p.Id DESC
+            """;
+        cmd.Parameters.AddWithValue("$setId", backupSetId);
+
+        var list = new List<FileRecord>();
+        foreach (var r in Rows(cmd, ct))
+            list.Add(ReadFile(r));
+        return list;
     }
 
     public async Task<HashSet<long>> GetActivePlainContentSizesAsync(int backupSetId, CancellationToken ct = default)

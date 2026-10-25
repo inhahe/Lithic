@@ -442,11 +442,9 @@ public class VerifyService : IVerifyService
     private async Task<string?> ResolvePlainContentPathAsync(
         int backupSetId, string hash, string targetDirectory, CancellationToken ct)
     {
-        if (string.IsNullOrEmpty(hash))
-            return null;
-        var candidates = await _catalog.GetActiveRecordsByHashAsync(backupSetId, hash, ct);
-        var plain = candidates.FirstOrDefault(r => !r.IsFileRef && !r.IsDeduped);
-        return plain is null ? null : Path.Combine(targetDirectory, plain.DiscPath);
+        return await PlainContent.FirstExistingAsync(_catalog, backupSetId, hash, targetDirectory, ct) is { } path
+            ? Path.Combine(targetDirectory, path)
+            : null;
     }
 
     private static string Shorten(string hash)

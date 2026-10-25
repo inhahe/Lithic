@@ -1804,6 +1804,65 @@ listed copy (a reverted file). Only excess versions can be held back. This
 applied to tiered excess versions all along; making the newest earlier version
 deletable made it likely, since that is the usual anchor.
 
+**A reference resolves to a copy whose file is there.** A content can have several
+plain copies recorded, and a record can outlive its file. Every resolver of a
+`.fileref` goes through `PlainContent.FirstExistingAsync`: the first of the
+content's recorded plain copies, in path order
+(`ICatalogRepository.GetActivePlainContentPathsByHashAsync`), whose file exists.
+That covers restore, Verify, Cleanup's reconcile, the engine's own checks and the
+backup's choice of anchor. Taking the first recorded copy, whatever became of its
+file, made Verify call intact references broken and restore fail on them. It also
+made the backup write each new duplicate as a reference to a file that was gone,
+broken from birth. Now a duplicate whose every recorded copy is gone is stored
+with its real bytes, and the references already pointing at that content resolve
+to it again. Pinned by `tools\excess_versions_test` §24.
+
+**A path that comes back continues its chain, and revives only what can be read
+back.** Retiring a path's records keeps their copies on the drive: the Worker does it
+when a file moves out of the set (`BackupWorker.MarkMovedOutAsync`), which a program
+that saves by renaming the old file away first can trigger if a poll lands between the
+rename and the write. When a later backup finds a file there again, the path's latest
+record is retired (`resurrecting` in `ExecuteCoreAsync`), and the backup:
+
+- makes live again the path's earlier versions under `_prev` whose copies are still
+  there (`ReviveHistoryAsync`), so retention judges them by the tiers rather than the
+  next Cleanup deleting them as leftovers;
+- revives the latest record in place, or un-deletes it as it moves into the history,
+  only if `CanReviveAsync` passes. A plain copy is re-read and hashed: Verify's repair
+  retires a copy whose bytes changed, and reviving it unread would undo the repair. A
+  `.dedup`'s blocks must all be in the store, and a `.fileref`'s content must have a
+  live plain copy whose file is there. Otherwise the file is stored afresh, plain when
+  nothing live holds its content.
+
+The guard on retiring only protects a copy against references outside the retired
+records. A reference retired with its copy and then revived alone was left resolving
+to nothing. Under 1.17.0, a program's saves did this to `big.ftsl` on the author's set:
+all ten earlier versions were retired, and the reference revived in place pointed at one
+of them. It also happened to review worktrees that were removed and made again. Pinned
+by `tools\excess_versions_test` §25.
+
+**A seed records no reference whose content is not on the drive.** A backup written
+by an older build can hold `.fileref` manifests whose plain copy is gone. Recorded as
+backed up, such a reference restores nothing, and no backup would ever copy its file
+again. After recording and hashing, a seed asks which references it recorded have no
+live plain copy of their content (`ICatalogRepository.GetReferencesWithoutContentAsync`)
+and retires them. Each such file is then left to the next backup, as a copy pruned for
+being missing is, and the seed's summary counts them
+(`SeedOutcome.ReferencesWithoutContent`). Pinned by `tools\excess_versions_test` §26.
+
+**A retired copy a reference needs comes back.** A set whose references broke before
+the guards existed has live references whose content's only copy is retired, often
+with its file still there. `ContentAnchors.ReviveRetiredCopiesAsync` finds those copies
+(`ICatalogRepository.GetRetiredCopiesOfReferencedContentAsync`, which reads every
+record because no index covers retired ones). For each content it makes live the newest
+copy whose file still hashes to it. Verify's repair runs it before flagging anything,
+and leaves alone the files whose references it mended: no copy is needed, and for a file
+whose source is gone it is the only way back. Cleanup's purge runs it when files listed
+as "deleted in the catalog" are ticked. That category is decided by stored path alone,
+and it used to delete such a copy, which was the last of its content. A copy made
+live is an ordinary live record: Cleanup lists one whose source is gone, and its guard
+keeps it while a reference needs it. Pinned by `tools\excess_versions_test` §27.
+
 **Overwriting in place retires the old record.** With no history the new copy
 replaces the old one at the same path, and the old live record must be marked
 deleted in the same batch (`replacedRecord` in `ExecuteCoreAsync`). It stayed

@@ -1,5 +1,53 @@
 # LithicBackup — Known Issues & Tech Debt
 
+## FIXED: Verify reported 72,000 broken references on the author's 6 TB set (2026-10-25)
+
+Read-only audits of the set's catalog (12.3 million records, 4.4 million live
+references) found 70,384 live references, to 44,286 contents, with no live plain
+copy recorded. All 70,384 are real. Three causes, all now closed:
+
+- **A seed adopted references whose content was not on the drive.** 66,945 were
+  recorded by the seed of 2026-10-18/19, from a backup written on another computer
+  whose copies of that content were gone. Their manifests' hints name paths that no
+  record has, some on drives the set no longer backs up. The seed now retires every
+  reference it recorded whose content has no plain copy, and says how many
+  (`SeedOutcome.ReferencesWithoutContent`; `tools\excess_versions_test` §26).
+- **Copies retired and deleted while references still needed them.** Removals before
+  d8684e9 (2026-10-20) retired records without the guard that keeps a live reference's
+  last copy. Most of the remaining references written on 2026-10-18/19 point at such a
+  copy, retired with its file gone.
+- **A reference revived without its copy.** 20 references written since then (15
+  contents) had their copy retired with them, and were then revived alone when their
+  file came back (design.md, "A path that comes back continues its chain";
+  `tools\excess_versions_test` §25). Every copy they need is still on the drive.
+
+Every one of the 70,364 older references has its source file still in place at the
+same size, so **Verify -> Re-backup missing files -> Back Up** recovers them all. That
+is about 44 GB to copy. A backup after this fix also brings back the earlier versions
+the repair retires, wherever their copies are intact.
+
+Also fixed on the way, in every resolver of a `.fileref`: each one took the first
+plain copy of its content the catalog recorded and looked no further. If that copy's
+file had gone, Verify called the reference broken even when another copy was intact,
+restore failed on it, and the backup wrote each new duplicate of that content as a
+reference to the missing file. All now take the first recorded copy whose file exists
+(`PlainContent.FirstExistingAsync`), and a duplicate whose every copy is gone gets real
+bytes again (design.md, "A reference resolves to a copy whose file is there").
+
+A broken reference whose copy was retired but is still on the drive now gets it back
+instead of losing it (`ContentAnchors.ReviveRetiredCopiesAsync`; design.md, "A retired
+copy a reference needs comes back"). Verify's repair does this before flagging
+anything, and the reference's file is then left alone; it is the only way back for a
+file whose source is gone. Cleanup's purge does it for files listed as deleted in the
+catalog, which it used to delete with the last bytes of such content. Pinned by
+`tools\excess_versions_test` §27.
+
+Also in Verify Integrity: the window no longer starts verifying on opening, so
+"Verify file contents" can be chosen first. **Re-backup missing files** did its
+work on the UI thread with no sign of progress, one catalog query per file (72,000
+on this set), so the button only turned grey. It now runs off the UI thread and
+the window says how far it has got.
+
 ## FIXED: with "Create subdirectory", the Worker and Cleanup used the folder above it (2026-10-25)
 
 A set with "Create subdirectory" keeps its backup in `Destination\Subfolder`, and

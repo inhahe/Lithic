@@ -296,16 +296,36 @@ public interface ICatalogRepository : IDisposable
     Task<Dictionary<string, string>> GetActivePlainContentPathsAsync(int backupSetId, CancellationToken ct = default);
 
     /// <summary>
-    /// Single-hash variant of <see cref="GetActivePlainContentPathsAsync"/>:
-    /// the destination-relative path of an active plain copy of
-    /// <paramref name="hash"/>, or null when the set has none.
+    /// Single-hash variant of <see cref="GetActivePlainContentPathsAsync"/>: the
+    /// destination-relative paths of every active plain copy of
+    /// <paramref name="hash"/>, in path order (the first is the one that method
+    /// names); empty when the set has none. A copy is listed whether or not its
+    /// file is still on the drive - Services' PlainContent.FirstExistingAsync
+    /// picks one that is.
     ///
     /// A backup only needs the entries for the content it is actually writing,
     /// so it resolves them one hash at a time (an indexed seek) instead of
     /// GROUP BY-ing every active plain row in a multi-million-row set on every
     /// run. See the "Worker pegged a CPU core" entry in known-issues.md.
     /// </summary>
-    Task<string?> GetActivePlainContentPathByHashAsync(int backupSetId, string hash, CancellationToken ct = default);
+    Task<IReadOnlyList<string>> GetActivePlainContentPathsByHashAsync(int backupSetId, string hash, CancellationToken ct = default);
+
+    /// <summary>
+    /// The live <c>.fileref</c> records of one disc whose content has no live plain
+    /// copy recorded at all: references with nothing to resolve to. A seed asks
+    /// this about the disc it has just recorded. Whether a recorded copy's file is
+    /// still there is not checked; a seed records only files it found.
+    /// </summary>
+    /// <param name="discId">The disc whose references are checked; the set's other discs supply the copies.</param>
+    Task<IReadOnlyList<long>> GetReferencesWithoutContentAsync(int backupSetId, int discId, CancellationToken ct = default);
+
+    /// <summary>
+    /// The retired plain copies of content that live <c>.fileref</c> records need
+    /// and no live plain copy holds, newest first: what a reference broken that way
+    /// could resolve to again, if the copy's file is still there (which is not
+    /// checked). Reads every record, since no index covers retired ones.
+    /// </summary>
+    Task<IReadOnlyList<FileRecord>> GetRetiredCopiesOfReferencedContentAsync(int backupSetId, CancellationToken ct = default);
 
     /// <summary>
     /// The distinct byte sizes of all content that currently has an active plain

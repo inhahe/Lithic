@@ -1312,7 +1312,8 @@ public class MainViewModel : ViewModelBase
                 + $"{outcome.PreviousVersions:N0} earlier version(s) (of which {outcome.MovedToHistory:N0} older "
                 + $"cop(ies) moved from beside a newer one into the history), {outcome.SkippedExisting:N0} already in "
                 + $"the catalog, {outcome.DuplicateCopies:N0} stored cop(ies) left untracked, "
-                + $"{outcome.Unrecognized:N0} unrecognised file(s) left alone.");
+                + $"{outcome.Unrecognized:N0} unrecognised file(s) left alone, "
+                + $"{outcome.ReferencesWithoutContent:N0} reference(s) to content not on the drive retired.");
 
             bool imported = outcome.Files + outcome.PreviousVersions > 0;
             string result;
@@ -1329,6 +1330,10 @@ public class MainViewModel : ViewModelBase
                 if (outcome.DuplicateCopies > 0)
                     parts.Add($"{outcome.DuplicateCopies:N0} stored copies could not be recorded and were left as "
                               + "they are; Cleanup's destination scan lists them as untracked");
+                if (outcome.ReferencesWithoutContent > 0)
+                    parts.Add($"{outcome.ReferencesWithoutContent:N0} duplicate-file references point at content "
+                              + "that is not on the drive, so they could restore nothing; they were left out, and "
+                              + "the backup copies those that are still in your folders again");
                 string detail = parts.Count > 0 ? $" ({string.Join("; ", parts)})" : "";
                 result = $"Imported {outcome.Files:N0} files{detail}. Run a backup next: it copies only "
                          + "what changed, and resumes automated backups.";

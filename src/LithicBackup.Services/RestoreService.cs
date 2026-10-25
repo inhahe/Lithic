@@ -778,18 +778,18 @@ public class RestoreService : IRestoreService
         string destPath,
         CancellationToken ct)
     {
-        var candidates = await _catalog.GetActiveRecordsByHashAsync(backupSetId, hash, ct);
-        var plain = candidates.FirstOrDefault(r => !r.IsFileRef && !r.IsDeduped);
-        if (plain is null)
-            throw new FileNotFoundException(
-                $"No plain copy found for referenced content {hash}.");
+        if (await PlainContent.FirstExistingAsync(_catalog, backupSetId, hash, discRoot, ct) is not { } source)
+        {
+            var recorded = await _catalog.GetActivePlainContentPathsByHashAsync(backupSetId, hash, ct);
+            throw recorded.Count == 0
+                ? new FileNotFoundException($"No plain copy found for referenced content {hash}.")
+                : new FileNotFoundException(
+                    $"Referenced content file missing: {recorded[0]}"
+                    + (recorded.Count > 1 ? $" (and the {recorded.Count - 1:N0} other cop{(recorded.Count == 2 ? "y" : "ies")} recorded)" : ""),
+                    Path.Combine(discRoot, recorded[0]));
+        }
 
-        string sourcePath = Path.Combine(discRoot, plain.DiscPath);
-        if (!File.Exists(sourcePath))
-            throw new FileNotFoundException(
-                $"Referenced content file missing: {plain.DiscPath}", sourcePath);
-
-        File.Copy(sourcePath, destPath, overwrite: true);
+        File.Copy(Path.Combine(discRoot, source), destPath, overwrite: true);
     }
 
     /// <summary>

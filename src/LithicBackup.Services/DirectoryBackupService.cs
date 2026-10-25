@@ -311,15 +311,19 @@ public class DirectoryBackupService
         // resolve, so ReacquireLockAsync empties the memo.
         var contentPathCache = new Dictionary<string, string?>(StringComparer.OrdinalIgnoreCase);
 
-        // Destination-relative path of an active plain copy of this content, or
-        // null when the set has none (so the content still needs real bytes).
+        // Destination-relative path of an active plain copy of this content whose
+        // file is there, or null when the set has none (so the content still
+        // needs real bytes). A copy recorded but gone from the drive is passed
+        // over: a .fileref to it would be broken from the moment it was written,
+        // while real bytes stored now also give the references already pointing
+        // at this content something to resolve to again.
         async Task<string?> ContentPathForHashAsync(string? hash)
         {
             if (string.IsNullOrEmpty(hash))
                 return null;
             if (contentPathCache.TryGetValue(hash, out string? cached))
                 return cached;
-            string? found = await _catalog.GetActivePlainContentPathByHashAsync(backupSetId, hash, ct);
+            string? found = await PlainContent.FirstExistingAsync(_catalog, backupSetId, hash, targetDirectory, ct);
             contentPathCache[hash] = found;
             return found;
         }
@@ -794,6 +798,10 @@ public class DirectoryBackupService
                 pathsWithHistory?.Add(file.FullPath);
             }
 
+            // The chain continues whole: its earlier versions come back with it.
+            if (resurrecting)
+                await ReviveHistoryAsync(backupSetId, targetDirectory, file.FullPath, existingInfo.MaxVersion, ct);
+
             // Between chunks of this file. A pause lets the write lock go
             // (WaitOutPauseAsync), and the number this version took was read under
             // that lock: if another writer added a version of the file meanwhile,
@@ -985,8 +993,9 @@ public class DirectoryBackupService
                         // copy is still on disk, just revive the record in place
                         // (un-delete + refresh timestamp/size) rather than rewriting
                         // identical bytes and cutting a redundant version. If the
-                        // copy is gone (e.g. retention purged it) we fall through to
-                        // a normal write so a live copy is recreated.
+                        // copy is gone (e.g. retention purged it), or cannot be read
+                        // back (CanReviveAsync), we fall through to a normal write so
+                        // a live copy is recreated.
                         string revivePath = GetCurrentPath(
                             targetDirectory, file.FullPath,
                             existingInfo.IsDeduped, existingInfo.IsFileRef);
@@ -994,7 +1003,8 @@ public class DirectoryBackupService
                         {
                             var revived = await _catalog.GetFileRecordByPathAndVersionAsync(
                                 backupSetId, file.FullPath, existingInfo.MaxVersion, ct);
-                            if (revived is not null)
+                            if (revived is not null && await CanReviveAsync(
+                                    backupSetId, targetDirectory, revived, revived.DiscPath, ct))
                             {
                                 revived.IsDeleted = false;
                                 revived.SourceLastWriteUtc = file.LastWriteUtc;
@@ -1385,8 +1395,10 @@ public class DirectoryBackupService
                             // file was deleted-and-recreated). Now that it holds
                             // the real _prev bytes of a live chain again, un-delete
                             // it so it's a retained version rather than a ghost
-                            // hidden from restore/version listings.
-                            if (resurrecting)
+                            // hidden from restore/version listings - if what it
+                            // stores can still be read back (CanReviveAsync).
+                            if (resurrecting && await CanReviveAsync(
+                                    backupSetId, targetDirectory, oldRecord, oldRecordDiscPath, ct))
                                 oldRecord.IsDeleted = false;
                             await _catalog.UpdateFileRecordAsync(oldRecord, ct);
                         }
@@ -3633,6 +3645,91 @@ public class DirectoryBackupService
     }
 
     /// <summary>
+    /// Make live again the earlier versions of a path that comes back after all its
+    /// records were retired: moved out of the set and back, or saved by a program
+    /// that renames the old file away before writing the new one, which the Worker
+    /// can catch in between. Retiring a path keeps its copies on the drive (see
+    /// <c>BackupWorker.MarkMovedOutAsync</c>), and its latest record comes back with
+    /// the file, so the chain continues. Left retired, the earlier versions would
+    /// be kept by no tier and deleted by the next Cleanup, and a revived
+    /// <c>.fileref</c> whose content one of them holds would resolve to nothing.
+    /// Only copies under <c>_prev</c> (a retired record at the current path
+    /// describes bytes since overwritten) that can still be read back
+    /// (<see cref="CanReviveAsync"/>), and not the latest version, which the caller
+    /// deals with.
+    /// </summary>
+    /// <param name="sourcePath">The path being backed up, its latest record retired.</param>
+    /// <param name="latestVersion">That record's version.</param>
+    private async Task ReviveHistoryAsync(
+        int backupSetId, string targetDirectory, string sourcePath, int latestVersion, CancellationToken ct)
+    {
+        var records = await _catalog.GetFileRecordsByPathAsync(backupSetId, sourcePath, ct);
+        var liveDiscPaths = records.Where(r => !r.IsDeleted)
+            .Select(r => r.DiscPath.Replace('/', '\\'))
+            .ToHashSet(StringComparer.OrdinalIgnoreCase);
+        // One record per stored copy: a seed run twice can have recorded one twice.
+        var retired = records
+            .Where(r => r.IsDeleted && !r.IsSplit && !r.IsZipped && r.Version != latestVersion
+                        && HistoryPaths.IsPreviousVersion(r.DiscPath))
+            .GroupBy(r => r.DiscPath.Replace('/', '\\'), StringComparer.OrdinalIgnoreCase)
+            .Where(g => !liveDiscPaths.Contains(g.Key))
+            .Select(g => g.MaxBy(r => r.Id)!)
+            .ToList();
+        // References last: one may resolve to a plain copy revived just before it.
+        foreach (bool references in (bool[])[false, true])
+        {
+            var revive = new List<long>();
+            foreach (var r in retired.Where(r => r.IsFileRef == references))
+                if (await CanReviveAsync(backupSetId, targetDirectory, r, r.DiscPath, ct))
+                    revive.Add(r.Id);
+            await _catalog.MarkFileRecordsLiveByIdsAsync(backupSetId, revive, ct);
+        }
+    }
+
+    /// <summary>
+    /// Whether a retired record may be live again with its copy as it stands. The
+    /// copy must hold the record's content: a plain copy is read and hashed, since
+    /// Verify's repair retires a copy whose bytes changed for the next backup to
+    /// replace, and reviving it unread would undo that. Every block of a
+    /// <c>.dedup</c> manifest must be in the store. A <c>.fileref</c>'s content must
+    /// have a live plain copy whose file is there, since the copy it resolved to may
+    /// have been retired with it.
+    /// </summary>
+    /// <param name="discPath">Where the record's copy is now, relative to the backup folder.</param>
+    private async Task<bool> CanReviveAsync(
+        int backupSetId, string targetDirectory, FileRecord record, string discPath, CancellationToken ct)
+    {
+        string path = Path.Combine(targetDirectory, discPath);
+        var described = new FileVersionInfo(
+            record.Version, record.SizeBytes, record.SourceLastWriteUtc,
+            record.IsDeduped, record.IsFileRef, record.Hash ?? "");
+        if (!StoredCopyMatches(
+                await DescribeStoredCopyAsync(path, record.IsDeduped, record.IsFileRef,
+                    hashPlain: !string.IsNullOrEmpty(record.Hash), ct),
+                described))
+            return false;
+        if (record.IsFileRef)
+            return await PlainContent.FirstExistingAsync(
+                _catalog, backupSetId, record.Hash, targetDirectory, ct) is not null;
+        if (record.IsDeduped)
+        {
+            try
+            {
+                var manifest = JsonSerializer.Deserialize<DedupManifest>(
+                    await File.ReadAllTextAsync(path, ct), _jsonOptions);
+                string blockStoreDir = Path.Combine(targetDirectory, "_blocks");
+                return manifest is not null
+                    && manifest.BlockHashes.All(h => File.Exists(Path.Combine(blockStoreDir, h + ".blk")));
+            }
+            catch (Exception ex) when (ex is IOException or UnauthorizedAccessException or JsonException)
+            {
+                return false;
+            }
+        }
+        return true;
+    }
+
+    /// <summary>
     /// Size and content hash of a stored copy. A manifest's figures come from the
     /// manifest; a plain copy is read, and hashed when <paramref name="hashPlain"/>
     /// is set. Null when it cannot be read.
@@ -4222,11 +4319,9 @@ public class DirectoryBackupService
     private async Task<string?> ResolvePlainContentPathAsync(
         int backupSetId, string hash, string targetDirectory, CancellationToken ct)
     {
-        if (string.IsNullOrEmpty(hash))
-            return null;
-        var candidates = await _catalog.GetActiveRecordsByHashAsync(backupSetId, hash, ct);
-        var plain = candidates.FirstOrDefault(r => !r.IsFileRef && !r.IsDeduped);
-        return plain is null ? null : Path.Combine(targetDirectory, plain.DiscPath);
+        return await PlainContent.FirstExistingAsync(_catalog, backupSetId, hash, targetDirectory, ct) is { } path
+            ? Path.Combine(targetDirectory, path)
+            : null;
     }
 
     /// <summary>
@@ -4568,9 +4663,15 @@ public class DirectoryBackupService
     /// Files left alone: a manifest that could not be read, or a file in a
     /// <c>_prev</c> folder not named <c>name.vN</c>.
     /// </param>
+    /// <param name="ReferencesWithoutContent">
+    /// <c>.fileref</c> manifests found and recorded, then retired: no plain copy of
+    /// their content was on the drive, so they could restore nothing. The next
+    /// backup copies such a file again while its source is there. Counted among
+    /// <paramref name="Files"/> and <paramref name="PreviousVersions"/>.
+    /// </param>
     public sealed record SeedOutcome(
         int Files, int PreviousVersions, int SkippedExisting, int DuplicateCopies, int Unrecognized,
-        int MovedToHistory = 0);
+        int MovedToHistory = 0, int ReferencesWithoutContent = 0);
 
     /// <summary>The stored files of one source path found in one folder of the destination.</summary>
     private sealed class SeedGroup
@@ -4970,10 +5071,19 @@ public class DirectoryBackupService
         // size are read; a set seeded before this gets its hashes here too.
         await ContentAnchors.HashUnhashedAnchorsAsync(_catalog, backupSetId, targetDir, among: null, ct);
 
+        // A manifest whose content is nowhere on the drive - its copy deleted by
+        // whatever wrote the backup - restores nothing. Recorded, it would sit in
+        // the catalog as backed up, and no backup would copy its file again.
+        // Retired, it leaves the file to the next backup, as a copy pruned for
+        // being missing does.
+        var withoutContent = await _catalog.GetReferencesWithoutContentAsync(backupSetId, discRecord.Id, ct);
+        await _catalog.MarkFileRecordsDeletedByIdsAsync(backupSetId, withoutContent, ct);
+
         // Always report final state so the UI shows the true total.
         Report("", force: true);
 
-        return new SeedOutcome(files, versions, skippedExisting, duplicates, unrecognized, movedToHistory);
+        return new SeedOutcome(files, versions, skippedExisting, duplicates, unrecognized, movedToHistory,
+            withoutContent.Count);
     }
 
     /// <summary>plain = 0, .dedup = 1, .fileref = 2: the order a seed prefers them in.</summary>

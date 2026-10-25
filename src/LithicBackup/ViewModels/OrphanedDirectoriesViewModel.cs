@@ -2472,6 +2472,8 @@ public class OrphanedDirectoriesViewModel : ViewModelBase, IConfirmClose, IDispo
                 // Stored files a live record points at once the catalog update
                 // is done: never deleted (see FindDiscPathsInUseAsync).
                 var stillInUse = new HashSet<string>(StringComparer.OrdinalIgnoreCase);
+                // Retired copies made live again for references that needed them.
+                var revivedDiscPaths = new HashSet<string>(StringComparer.OrdinalIgnoreCase);
                 int inUseKept = 0;
                 int fDeleted = 0;
                 int fFailed = 0;
@@ -2714,6 +2716,19 @@ public class OrphanedDirectoriesViewModel : ViewModelBase, IConfirmClose, IDispo
                     if (keptIds.Count > 0)
                         catPurged -= await _catalog.MarkFileRecordsLiveByIdsAsync(backupSetId, keptIds, ct);
 
+                    // A file listed as deleted in the catalog can hold the only copy
+                    // of content a live reference needs, on a set whose references
+                    // lost their copies before the guards that keep them existed.
+                    // Made live again, it is a copy kept for a reference.
+                    if (targetDir is not null && workItems.Any(w => w.Reason == OrphanedReason.CatalogDeleted))
+                    {
+                        ((IProgress<Services.ProgressReport>)progress).Report(
+                            "Cleaning up: checking whether a broken duplicate-file reference needs a file listed...");
+                        foreach (var r in await Services.ContentAnchors.ReviveRetiredCopiesAsync(
+                                     _catalog, backupSetId, targetDir, ct))
+                            revivedDiscPaths.Add(r.DiscPath.Replace('/', '\\'));
+                    }
+
                     // Force a final true N/N before the disk-delete phase takes
                     // over, so the catalog phase never ends mid-throttle on a
                     // stale number.
@@ -2792,6 +2807,7 @@ public class OrphanedDirectoriesViewModel : ViewModelBase, IConfirmClose, IDispo
                         foreach (var f in _activeFiles)
                             if (keptIds.Contains(f.Id))
                                 allDiscPaths.Remove(f.DiscPath.Replace('/', '\\'));
+                    allDiscPaths.ExceptWith(revivedDiscPaths);
 
                     // Nor one a live record still points at.
                     foreach (var used in stillInUse)
@@ -2831,7 +2847,7 @@ public class OrphanedDirectoriesViewModel : ViewModelBase, IConfirmClose, IDispo
                         && (purgedPaths.Contains(f.SourcePath) || purgedRecordIds.Contains(f.Id)));
                 }
 
-                keptForReferences = keptIds.Count;
+                keptForReferences = keptIds.Count + revivedDiscPaths.Count;
                 leftAloneSinceScan = leftAlone;
                 keptInUse = inUseKept;
                 return (catPurged, fDeleted, fFailed, bytes, fAbsent);

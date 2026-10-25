@@ -615,8 +615,14 @@ public class SqliteCatalogRepository : ICatalogRepository
     public Task<Dictionary<string, string>> GetActivePlainContentPathsAsync(int backupSetId, CancellationToken ct = default)
         => GetSet(backupSetId).GetActivePlainContentPathsAsync(backupSetId, ct);
 
-    public Task<string?> GetActivePlainContentPathByHashAsync(int backupSetId, string hash, CancellationToken ct = default)
-        => GetSet(backupSetId).GetActivePlainContentPathByHashAsync(backupSetId, hash, ct);
+    public Task<IReadOnlyList<string>> GetActivePlainContentPathsByHashAsync(int backupSetId, string hash, CancellationToken ct = default)
+        => GetSet(backupSetId).GetActivePlainContentPathsByHashAsync(backupSetId, hash, ct);
+
+    public Task<IReadOnlyList<long>> GetReferencesWithoutContentAsync(int backupSetId, int discId, CancellationToken ct = default)
+        => GetSet(backupSetId).GetReferencesWithoutContentAsync(backupSetId, discId, ct);
+
+    public Task<IReadOnlyList<FileRecord>> GetRetiredCopiesOfReferencedContentAsync(int backupSetId, CancellationToken ct = default)
+        => GetSet(backupSetId).GetRetiredCopiesOfReferencedContentAsync(backupSetId, ct);
 
     public Task<HashSet<long>> GetActivePlainContentSizesAsync(int backupSetId, CancellationToken ct = default)
         => GetSet(backupSetId).GetActivePlainContentSizesAsync(backupSetId, ct);

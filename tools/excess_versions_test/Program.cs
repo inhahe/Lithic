@@ -23,6 +23,7 @@
 using System.IO;
 using System.Reflection;
 using System.Runtime.ExceptionServices;
+using System.Text.Json;
 using System.Windows.Threading;
 using LithicBackup.Core;
 using LithicBackup.Core.Interfaces;
@@ -254,7 +255,7 @@ internal static class Program
         Check(xh[xRef].IsFileRef && !xh[xPlain].IsFileRef, "one is plain, the other a .fileref to it");
         await File.WriteAllTextAsync(xPlain, "the plain one changed");
         await Backup();
-        string? xAnchor = await repo.GetActivePlainContentPathByHashAsync(set.Id, xHash);
+        string? xAnchor = (await repo.GetActivePlainContentPathsByHashAsync(set.Id, xHash)).FirstOrDefault();
         Check(xAnchor is not null && File.ReadAllText(Path.Combine(target, xAnchor)) == "shared content X",
             "the .fileref's content still resolves to a copy that holds it");
         var oldRows = (await repo.GetFileRecordsByPathAsync(set.Id, xPlain)).Where(r => !r.IsDeleted).ToList();
@@ -263,7 +264,7 @@ internal static class Program
         string x3 = Path.Combine(source, "x3.bin");
         await File.WriteAllTextAsync(x3, "shared content X");
         await Backup();
-        string? x3Anchor = await repo.GetActivePlainContentPathByHashAsync(set.Id, xHash);
+        string? x3Anchor = (await repo.GetActivePlainContentPathsByHashAsync(set.Id, xHash)).FirstOrDefault();
         Check(x3Anchor is not null && File.ReadAllText(Path.Combine(target, x3Anchor)) == "shared content X",
             "a new file with the old content is stored with bytes that exist");
 
@@ -296,6 +297,416 @@ internal static class Program
         await CleanupInSubfolderAsync(root);
         await RecordsElsewhereAsync(root);
         await SharedBackupFolderAsync(root);
+        await ReferencesResolveToAnIntactCopyAsync(root);
+        await ComingBackAfterRetirementAsync(root);
+        await SeedLeavesOutReferencesWithoutContentAsync(root);
+        await RetiredCopiesComeBackAsync(root);
+    }
+
+    /// <summary>
+    /// §27. A reference whose copy was retired while it still needed it (as
+    /// removals did before the guard) gets that copy back when the copy's file is
+    /// still there with the content. The copy comes back from ContentAnchors
+    /// directly, from Cleanup's purge instead of being deleted as deleted in the
+    /// catalog, and from Verify's repair instead of the reference's file being
+    /// flagged for re-backup. A copy whose bytes changed does not come back.
+    /// </summary>
+    static async Task RetiredCopiesComeBackAsync(string root)
+    {
+        Console.WriteLine();
+        Console.WriteLine("=== 27. A retired copy a reference still needs comes back ===");
+        string source = Path.Combine(root, "src27"), target = Path.Combine(root, "dst27");
+        Directory.CreateDirectory(source);
+        Directory.CreateDirectory(target);
+        string dir = Path.Combine(root, "cat27");
+        Directory.CreateDirectory(dir);
+        using var repo = new SqliteCatalogRepository(Path.Combine(dir, "catalog.db"));
+        List<SourceSelection> Sel() =>
+            [new SourceSelection { Path = source, IsDirectory = true, IsSelected = true, AutoIncludeNewSubdirectories = true }];
+        var set = await repo.CreateBackupSetAsync(new BackupSet
+        {
+            Name = "retired copies", SourceRoots = [source], SourceSelections = Sel(), CreatedUtc = DateTime.UtcNow,
+            DefaultMediaType = MediaType.Directory,
+            JobOptions = new JobOptions { TargetDirectory = target, EnableFileDeduplication = true },
+        });
+        BackupJob Job() => new()
+        {
+            BackupSetId = set.Id, Sources = Sel(), EnableFileDeduplication = true, TargetDirectory = target,
+            ZipMode = ZipMode.None,
+        };
+        var svc = new DirectoryBackupService(repo, new FileScanner(repo), new VersionRetentionService(repo));
+        async Task<FileRecord> Live(string path) =>
+            (await repo.GetFileRecordsByPathAsync(set.Id, path)).Where(r => !r.IsDeleted).MaxBy(r => r.Version)!;
+        async Task<bool> IsLive(FileRecord r) =>
+            (await repo.GetFileRecordsByPathAsync(set.Id, r.SourcePath)).Any(x => x.Id == r.Id && !x.IsDeleted);
+        async Task<List<string>> Broken() =>
+            [.. (await new VerifyService(repo, new FileScanner(repo)).VerifyAsync(Job(), target))
+                .Issues.Where(i => i.Kind == VerifyIssueKind.FileRefUnresolved).Select(i => i.Path)];
+
+        string a = Path.Combine(source, "a.txt"), b = Path.Combine(source, "b.txt");
+        string c = Path.Combine(source, "c.txt"), d = Path.Combine(source, "d.txt");
+        foreach (var (path, text) in new[] { (a, "kept for a reference, section twenty-seven"),
+                                             (b, "kept for a reference, section twenty-seven"),
+                                             (c, "changed under its record, section twenty-seven"),
+                                             (d, "changed under its record, section twenty-seven") })
+            await File.WriteAllTextAsync(path, text);
+        if (!(await svc.ExecuteAsync(Job(), target, VersionRetentionService.DefaultTiers, null, CancellationToken.None)).Success)
+            throw new Exception("backup failed");
+        var plainAB = (await Live(a)).IsFileRef ? await Live(b) : await Live(a);
+        string refAB = plainAB.SourcePath == a ? b : a;
+        var plainCD = (await Live(c)).IsFileRef ? await Live(d) : await Live(c);
+        string refCD = plainCD.SourcePath == c ? d : c;
+        // Retired without the guard, as removals were; one copy's bytes then changed.
+        await repo.MarkFileRecordsDeletedByIdsAsync(set.Id, [plainAB.Id, plainCD.Id]);
+        await File.WriteAllTextAsync(Path.Combine(target, plainCD.DiscPath), "other bytes now, section twenty-seven");
+        var broken = await Broken();
+        Check(broken.Count == 2, $"set-up: both references are broken ({broken.Count})");
+
+        var revived = await ContentAnchors.ReviveRetiredCopiesAsync(repo, set.Id, target, CancellationToken.None);
+        broken = await Broken();
+        Check(revived.Count == 1 && revived[0].Id == plainAB.Id && await IsLive(plainAB),
+            $"the copy still holding its content is live again ({revived.Count} revived)");
+        Check(broken.SequenceEqual([refCD], StringComparer.OrdinalIgnoreCase),
+            $"and only the reference whose copy changed is still broken ({string.Join("; ", broken)})");
+
+        // Cleanup lists the retired copy as deleted in the catalog; its purge keeps it.
+        await repo.MarkFileRecordsDeletedByIdsAsync(set.Id, [plainAB.Id]);
+        var vm = new OrphanedDirectoriesViewModel(repo, set);
+        vm.ScanCatalogCommand.Execute(null);
+        await WaitFor(() => !vm.IsLoading, 60000);
+        vm.ScanDestinationCommand.Execute(null);
+        await WaitFor(() => vm.IsScanningDestination, 3000);
+        await WaitFor(() => !vm.IsScanningDestination, 60000);
+        bool listed = vm.Items.Any(i => i.Reason == OrphanedReason.CatalogDeleted
+            && i.DiscFilePaths?.Any(p => p.Equals(plainAB.DiscPath, StringComparison.OrdinalIgnoreCase)) == true);
+        Check(listed, "Cleanup lists the retired copy as deleted in the catalog");
+        foreach (var cat in vm.Categories)
+            foreach (var n in cat.RootNodes)
+                n.IsChecked = cat.Reason == OrphanedReason.CatalogDeleted;
+        vm.PurgeSelectedCommand.Execute(null);
+        await WaitFor(() => vm.IsPurging, 3000);
+        await WaitFor(() => !vm.IsPurging, 60000);
+        Check(File.Exists(Path.Combine(target, plainAB.DiscPath)) && await IsLive(plainAB)
+              && vm.SummaryText.Contains("references still need", StringComparison.Ordinal),
+            $"the purge keeps it, live again, for the reference (\"{vm.SummaryText}\")");
+
+        // Verify's repair gives the reference its copy back instead of flagging it.
+        await repo.MarkFileRecordsDeletedByIdsAsync(set.Id, [plainAB.Id]);
+        var verify = new VerifyIntegrityViewModel(repo, new FileScanner(repo), set);
+        verify.VerifyCommand.Execute(null);
+        await WaitFor(() => verify.HasRun && !verify.IsLoading, 60000);
+        Check(verify.RepairableCount == 2, $"set-up: Verify offers both broken references for repair ({verify.RepairableCount})");
+        verify.RepairCommand.Execute(null);
+        await WaitFor(() => verify.Repaired && !verify.IsBusy, 60000);
+        Check(await IsLive(plainAB) && (await repo.GetFileRecordsByPathAsync(set.Id, refAB)).Any(r => !r.IsDeleted),
+            $"Verify's repair makes the copy live and leaves its reference alone (\"{verify.SummaryText}\")");
+        Check((await repo.GetFileRecordsByPathAsync(set.Id, refCD)).All(r => r.IsDeleted),
+            "and flags the file whose reference has no copy left, for the next backup");
+        verify.Dispose();
+        Microsoft.Data.Sqlite.SqliteConnection.ClearAllPools();
+    }
+
+    /// <summary>
+    /// §26. A seed from a backup whose reference points at content no longer on
+    /// the drive does not record that reference as backed up: it is retired and
+    /// counted, and the next backup copies the file again.
+    /// </summary>
+    static async Task SeedLeavesOutReferencesWithoutContentAsync(string root)
+    {
+        Console.WriteLine();
+        Console.WriteLine("=== 26. A seed leaves out references to content not on the drive ===");
+        string source = Path.Combine(root, "src26"), target = Path.Combine(root, "dst26");
+        Directory.CreateDirectory(source);
+        Directory.CreateDirectory(target);
+        List<SourceSelection> Sel() =>
+            [new SourceSelection { Path = source, IsDirectory = true, IsSelected = true, AutoIncludeNewSubdirectories = true }];
+        BackupJob Job(int setId) => new()
+        {
+            BackupSetId = setId, Sources = Sel(), EnableFileDeduplication = true, TargetDirectory = target,
+            ZipMode = ZipMode.None,
+        };
+        async Task<(SqliteCatalogRepository Repo, BackupSet Set)> NewSet(string name)
+        {
+            string dir = Path.Combine(root, name);
+            Directory.CreateDirectory(dir);
+            var repo = new SqliteCatalogRepository(Path.Combine(dir, "catalog.db"));
+            var set = await repo.CreateBackupSetAsync(new BackupSet
+            {
+                Name = name, SourceRoots = [source], SourceSelections = Sel(), CreatedUtc = DateTime.UtcNow,
+                DefaultMediaType = MediaType.Directory,
+                JobOptions = new JobOptions { TargetDirectory = target, EnableFileDeduplication = true },
+            });
+            return (repo, set);
+        }
+        static DirectoryBackupService Service(SqliteCatalogRepository repo) =>
+            new(repo, new FileScanner(repo), new VersionRetentionService(repo));
+        async Task Backup(SqliteCatalogRepository repo, int setId)
+        {
+            var r = await Service(repo).ExecuteAsync(Job(setId), target, VersionRetentionService.DefaultTiers, null, CancellationToken.None);
+            if (!r.Success) throw new Exception("backup failed");
+        }
+        async Task<FileRecord?> Live(SqliteCatalogRepository repo, int setId, string path) =>
+            (await repo.GetFileRecordsByPathAsync(setId, path)).Where(r => !r.IsDeleted).MaxBy(r => r.Version);
+
+        // The backup a seed will find: two pairs of duplicates, then one pair's
+        // plain copy deleted from the drive.
+        string a = Path.Combine(source, "a.txt"), b = Path.Combine(source, "b.txt");
+        string c = Path.Combine(source, "c.txt"), d = Path.Combine(source, "d.txt");
+        await File.WriteAllTextAsync(a, "kept content, section twenty-six");
+        await File.WriteAllTextAsync(b, "kept content, section twenty-six");
+        await File.WriteAllTextAsync(c, "lost content, section twenty-six");
+        await File.WriteAllTextAsync(d, "lost content, section twenty-six");
+        var (old, oldSet) = await NewSet("cat26-old");
+        string lostRef, keptRef;
+        using (old)
+        {
+            await Backup(old, oldSet.Id);
+            var lostPlain = (await Live(old, oldSet.Id, c))!.IsFileRef ? d : c;
+            lostRef = lostPlain == c ? d : c;
+            keptRef = (await Live(old, oldSet.Id, a))!.IsFileRef ? a : b;
+            File.Delete(Path.Combine(target, (await Live(old, oldSet.Id, lostPlain))!.DiscPath));
+            File.Delete(lostPlain);
+        }
+
+        var (repo, set) = await NewSet("cat26-new");
+        using (repo)
+        {
+            var outcome = await Service(repo).SeedFromExistingDirectoryAsync(set.Id, target);
+            Check(outcome.ReferencesWithoutContent == 1, $"the seed counts one reference without content ({outcome.ReferencesWithoutContent})");
+            Check(await Live(repo, set.Id, lostRef) is null, "and leaves it out of the catalog");
+            Check((await Live(repo, set.Id, keptRef))?.IsFileRef == true, "while a reference whose content is there is recorded");
+            int broken = (await new VerifyService(repo, new FileScanner(repo)).VerifyAsync(Job(set.Id), target))
+                .Issues.Count(i => i.Kind == VerifyIssueKind.FileRefUnresolved);
+            Check(broken == 0, $"Verify finds no broken reference after the seed ({broken})");
+
+            await Backup(repo, set.Id);
+            var again = await Live(repo, set.Id, lostRef);
+            Check(again is { IsFileRef: false } && File.ReadAllText(Path.Combine(target, again.DiscPath)) == "lost content, section twenty-six",
+                "the next backup copies that file again");
+        }
+        Microsoft.Data.Sqlite.SqliteConnection.ClearAllPools();
+    }
+
+    /// <summary>
+    /// §25. A path whose records were all retired (moved out of the set, or caught
+    /// between the rename and the write of a program's save) and that then comes
+    /// back continues its chain. Its earlier versions are live again. A
+    /// reference is revived only when its content still has a live copy, and
+    /// otherwise the file is stored afresh. A copy whose bytes no longer match its
+    /// record is not revived either.
+    /// </summary>
+    static async Task ComingBackAfterRetirementAsync(string root)
+    {
+        Console.WriteLine();
+        Console.WriteLine("=== 25. A file that comes back after its records were retired ===");
+        string source = Path.Combine(root, "src25"), target = Path.Combine(root, "dst25");
+        Directory.CreateDirectory(Path.Combine(source, "one"));
+        Directory.CreateDirectory(Path.Combine(source, "two"));
+        Directory.CreateDirectory(target);
+        string dir = Path.Combine(root, "cat25");
+        Directory.CreateDirectory(dir);
+        using var repo = new SqliteCatalogRepository(Path.Combine(dir, "catalog.db"));
+        List<SourceSelection> Sel() =>
+            [new SourceSelection { Path = source, IsDirectory = true, IsSelected = true, AutoIncludeNewSubdirectories = true }];
+        var set = await repo.CreateBackupSetAsync(new BackupSet
+        {
+            Name = "coming back", SourceRoots = [source], SourceSelections = Sel(), CreatedUtc = DateTime.UtcNow,
+            DefaultMediaType = MediaType.Directory,
+            JobOptions = new JobOptions { TargetDirectory = target, EnableFileDeduplication = true },
+        });
+        BackupJob Job() => new()
+        {
+            BackupSetId = set.Id, Sources = Sel(), EnableFileDeduplication = true, TargetDirectory = target,
+            ZipMode = ZipMode.None,
+        };
+        async Task Backup()
+        {
+            var svc = new DirectoryBackupService(repo, new FileScanner(repo), new VersionRetentionService(repo));
+            var r = await svc.ExecuteAsync(Job(), target, VersionRetentionService.DefaultTiers, null, CancellationToken.None);
+            if (!r.Success) throw new Exception("backup failed");
+        }
+        async Task<List<FileRecord>> All(string path) => [.. await repo.GetFileRecordsByPathAsync(set.Id, path)];
+        async Task<FileRecord?> Live(string path) => (await All(path)).Where(r => !r.IsDeleted).MaxBy(r => r.Version);
+        // What the Worker does with a path that left the set.
+        async Task Retire(string path) => await repo.RetireRecordsKeepingNeededCopiesAsync(
+            set.Id, (await All(path)).Where(r => !r.IsDeleted).Select(r => r.Id).ToList());
+        var touch = DateTime.UtcNow.AddMinutes(1);
+        void Touch(string path) => File.SetLastWriteTimeUtc(path, touch = touch.AddMinutes(1));
+        async Task<List<string>> Broken() =>
+            [.. (await new VerifyService(repo, new FileScanner(repo)).VerifyAsync(Job(), target))
+                .Issues.Where(i => i.Kind == VerifyIssueKind.FileRefUnresolved).Select(i => i.Path)];
+
+        // The chain: A, then B, then A again - stored as a reference to the A that
+        // is now an earlier version.
+        string x = Path.Combine(source, "one", "x.txt");
+        await File.WriteAllTextAsync(x, "content A, section twenty-five");
+        await Backup();
+        await File.WriteAllTextAsync(x, "content B, section twenty-five, longer");
+        await Backup();
+        await File.WriteAllTextAsync(x, "content A, section twenty-five");
+        await Backup();
+        var chain = await All(x);
+        Check(chain.Count == 3 && chain.Single(r => r.Version == 3).IsFileRef,
+            $"set-up: x.txt has three versions, the newest a reference to the first ({chain.Count})");
+        await Retire(x);
+        Check((await All(x)).All(r => r.IsDeleted), "set-up: moving x.txt out retires all three");
+        Touch(x);
+        await Backup();
+        var back = await All(x);
+        Check(back.Count == 3 && back.All(r => !r.IsDeleted),
+            $"back unchanged, x.txt has all three versions live again ({back.Count(r => !r.IsDeleted)} of {back.Count})");
+
+        // Across paths: the reference comes back, the copy it resolved to does not.
+        string p = Path.Combine(source, "one", "p.txt"), q = Path.Combine(source, "two", "q.txt");
+        await File.WriteAllTextAsync(p, "shared content, section twenty-five");
+        await File.WriteAllTextAsync(q, "shared content, section twenty-five");
+        await Backup();
+        var (refPath, plainPath) = (await Live(p))!.IsFileRef ? (p, q) : (q, p);
+        Check((await Live(refPath))!.IsFileRef && !(await Live(plainPath))!.IsFileRef,
+            "set-up: of two files of one content, one is a reference to the other");
+        await Retire(refPath);
+        await Retire(plainPath);
+        File.Delete(plainPath);
+        Touch(refPath);
+        await Backup();
+        var comeBack = await Live(refPath);
+        Check(comeBack is { IsFileRef: false } && File.Exists(Path.Combine(target, comeBack.DiscPath)),
+            "the reference whose copy stayed retired comes back with its own bytes");
+
+        // The same, coming back changed: the old reference goes into the history,
+        // still retired, as nothing holds its content.
+        string m = Path.Combine(source, "one", "m.txt"), n = Path.Combine(source, "two", "n.txt");
+        await File.WriteAllTextAsync(m, "more shared content, section twenty-five");
+        await File.WriteAllTextAsync(n, "more shared content, section twenty-five");
+        await Backup();
+        var (mRef, mPlain) = (await Live(m))!.IsFileRef ? (m, n) : (n, m);
+        await Retire(mRef);
+        await Retire(mPlain);
+        File.Delete(mPlain);
+        await File.WriteAllTextAsync(mRef, "changed since, section twenty-five");
+        await Backup();
+        var mRows = await All(mRef);
+        Check(mRows.Where(r => !r.IsDeleted).All(r => !r.IsFileRef) && mRows.Any(r => r.IsFileRef && r.IsDeleted),
+            "coming back changed, its old reference stays retired");
+
+        // A copy Verify found changed, retired for the next backup to replace.
+        string z = Path.Combine(source, "two", "z.txt");
+        await File.WriteAllTextAsync(z, "zed content, section twenty-five");
+        await Backup();
+        string zStored = Path.Combine(target, (await Live(z))!.DiscPath);
+        await File.WriteAllTextAsync(zStored, "ZED CONTENT, SECTION TWENTY-FIVE");
+        await Retire(z);
+        Touch(z);
+        await Backup();
+        var zLive = await Live(z);
+        Check(zLive is not null && File.ReadAllText(Path.Combine(target, zLive.DiscPath)) == "zed content, section twenty-five",
+            "a copy whose bytes changed is replaced, not revived");
+
+        var broken = await Broken();
+        Check(broken.Count == 0, $"no reference is left without its content ({string.Join("; ", broken)})");
+        Microsoft.Data.Sqlite.SqliteConnection.ClearAllPools();
+    }
+
+    /// <summary>
+    /// §24. A .fileref resolves to any recorded plain copy of its content whose
+    /// file is still there, not just the first recorded: Verify does not call it
+    /// broken, restore restores it, and the backup points a new duplicate at an
+    /// intact copy. With every copy gone, a new duplicate gets real bytes, which
+    /// the old references then resolve to.
+    /// </summary>
+    static async Task ReferencesResolveToAnIntactCopyAsync(string root)
+    {
+        Console.WriteLine();
+        Console.WriteLine("=== 24. A reference resolves to any copy of its content that is still there ===");
+        string source = Path.Combine(root, "src24"), target = Path.Combine(root, "dst24");
+        Directory.CreateDirectory(source);
+        Directory.CreateDirectory(target);
+        string dir = Path.Combine(root, "cat24");
+        Directory.CreateDirectory(dir);
+        using var repo = new SqliteCatalogRepository(Path.Combine(dir, "catalog.db"));
+        List<SourceSelection> Sel() =>
+            [new SourceSelection { Path = source, IsDirectory = true, IsSelected = true, AutoIncludeNewSubdirectories = true }];
+        var set = await repo.CreateBackupSetAsync(new BackupSet
+        {
+            Name = "intact copies", SourceRoots = [source], SourceSelections = Sel(), CreatedUtc = DateTime.UtcNow,
+            DefaultMediaType = MediaType.Directory,
+            JobOptions = new JobOptions { TargetDirectory = target, EnableFileDeduplication = true },
+        });
+        BackupJob Job() => new()
+        {
+            BackupSetId = set.Id, Sources = Sel(), EnableFileDeduplication = true, TargetDirectory = target,
+            ZipMode = ZipMode.None,
+        };
+        async Task Backup()
+        {
+            var svc = new DirectoryBackupService(repo, new FileScanner(repo), new VersionRetentionService(repo));
+            var r = await svc.ExecuteAsync(Job(), target, VersionRetentionService.DefaultTiers, null, CancellationToken.None);
+            if (!r.Success) throw new Exception("backup failed");
+        }
+        async Task<FileRecord> Live(string path) =>
+            (await repo.GetFileRecordsByPathAsync(set.Id, path)).Where(r => !r.IsDeleted).MaxBy(r => r.Version)!;
+        async Task<int> BrokenReferences() =>
+            (await new VerifyService(repo, new FileScanner(repo)).VerifyAsync(Job(), target))
+                .Issues.Count(i => i.Kind == VerifyIssueKind.FileRefUnresolved);
+
+        const string content = "the same bytes, for section twenty-four";
+        string a = Path.Combine(source, "a.txt"), b = Path.Combine(source, "b.txt");
+        string c = Path.Combine(source, "c.txt"), d = Path.Combine(source, "d.txt");
+        await File.WriteAllTextAsync(a, content);
+        await File.WriteAllTextAsync(b, content);
+        await Backup();
+        var recA = await Live(a);
+        var recB = await Live(b);
+        var plain = recA.IsFileRef ? recB : recA;
+        Check(recA.IsFileRef != recB.IsFileRef, "two files of one content: one stored plain, the other a reference to it");
+
+        // Another plain copy of the content recorded, whose file has gone - first
+        // in path order, where the catalog's single-copy answer used to look.
+        var disc = await repo.CreateDiscAsync(new DiscRecord
+        {
+            BackupSetId = set.Id, Label = target, SequenceNumber = 9, MediaType = MediaType.Directory,
+            Status = BurnSessionStatus.Completed, CreatedUtc = DateTime.UtcNow,
+        });
+        await repo.CreateFileRecordAsync(new FileRecord
+        {
+            DiscId = disc.Id, SourcePath = Path.Combine(root, "elsewhere", "gone.txt"), DiscPath = @"!gone\gone.txt",
+            SizeBytes = content.Length, Hash = plain.Hash, SourceLastWriteUtc = DateTime.UtcNow, BackedUpUtc = DateTime.UtcNow,
+        });
+        Check((await repo.GetActivePlainContentPathsByHashAsync(set.Id, plain.Hash)).FirstOrDefault() == @"!gone\gone.txt"
+              && await PlainContent.FirstExistingAsync(repo, set.Id, plain.Hash, target) == plain.DiscPath,
+            "the intact copy is found, though a copy whose file has gone is recorded first");
+        Check(await BrokenReferences() == 0, "Verify does not call the reference broken");
+
+        var restorer = new RestoreService(repo);
+        string restoreTo = Path.Combine(root, "restored24");
+        var restored = await restorer.RestoreAsync(
+            await restorer.MaterializeSelectionAsync(set.Id, [source], []),
+            new Dictionary<string, string> { [source[..1].ToUpperInvariant()] = restoreTo });
+        var restoredFiles = Directory.Exists(restoreTo)
+            ? Directory.GetFiles(restoreTo, "*.txt", SearchOption.AllDirectories) : [];
+        Check(restored.Errors.Count == 0 && restoredFiles.Length == 2
+              && restoredFiles.All(f => File.ReadAllText(f) == content),
+            $"restore restores the reference from the intact copy ({restoredFiles.Length} restored; {string.Join("; ", restored.Errors)})");
+
+        await File.WriteAllTextAsync(c, content);
+        await Backup();
+        var recC = await Live(c);
+        var manifest = JsonSerializer.Deserialize<FileRefManifest>(await File.ReadAllTextAsync(Path.Combine(target, recC.DiscPath)),
+            new JsonSerializerOptions { PropertyNameCaseInsensitive = true });
+        Check(recC.IsFileRef && manifest?.ContentPath == plain.DiscPath,
+            $"a new duplicate is stored as a reference to the intact copy ({manifest?.ContentPath})");
+
+        // Every recorded copy gone: a reference written now would be broken from
+        // birth, so the new duplicate gets real bytes, and the references already
+        // there resolve to them.
+        File.Delete(Path.Combine(target, plain.DiscPath));
+        await File.WriteAllTextAsync(d, content);
+        await Backup();
+        var recD = await Live(d);
+        Check(!recD.IsFileRef && File.Exists(Path.Combine(target, recD.DiscPath)),
+            "with every copy gone, a new duplicate is stored with its real bytes");
+        Check(await BrokenReferences() == 0, "and the references already there resolve to them");
+        Microsoft.Data.Sqlite.SqliteConnection.ClearAllPools();
     }
 
     /// <summary>
@@ -962,7 +1373,7 @@ internal static class Program
         vm.PurgeSelectedCommand.Execute(null);
         await WaitFor(() => vm.IsPurging, 3000);
         await WaitFor(() => !vm.IsPurging, 60000);
-        string? anchor = await repo.GetActivePlainContentPathByHashAsync(set.Id, hHash);
+        string? anchor = (await repo.GetActivePlainContentPathsByHashAsync(set.Id, hHash)).FirstOrDefault();
         Check(vm.SummaryText.Contains("kept 1", StringComparison.Ordinal), $"the purge keeps one copy for m.bin (\"{vm.SummaryText}\")");
         Check(anchor is not null && File.Exists(Path.Combine(target, anchor))
               && File.ReadAllText(Path.Combine(target, anchor)) == "content H",
@@ -1056,7 +1467,7 @@ internal static class Program
         var plainRows = await repo.GetFileRecordsByPathAsync(set.Id, plainOne);
         Check(plainRows.Where(x => x.Id == original.Id || x.Id == twin.Id).All(x => x.IsDeleted),
             "both records of the replaced copy are retired, the duplicate too");
-        string? home = await repo.GetActivePlainContentPathByHashAsync(set.Id, shared);
+        string? home = (await repo.GetActivePlainContentPathsByHashAsync(set.Id, shared)).FirstOrDefault();
         Check(home is not null && File.Exists(Path.Combine(target, home))
               && File.ReadAllText(Path.Combine(target, home)) == "q and r share this",
             $"and the .fileref that needed its content was given it, the duplicate not counting as a copy ({home ?? "none"})");
@@ -1225,7 +1636,7 @@ internal static class Program
         await Backup(repo, set.Id);
         var anchorNow = (await repo.GetAllFilesForBackupSetAsync(set.Id)).Single(f => f.Id == anchor.Id);
         Check(anchorNow.IsDeleted, "retention does delete the hash-less copy, now an excess version");
-        string? home = await repo.GetActivePlainContentPathByHashAsync(set.Id, sharedHash);
+        string? home = (await repo.GetActivePlainContentPathsByHashAsync(set.Id, sharedHash)).FirstOrDefault();
         Check(home is not null && File.Exists(Path.Combine(target, home)) && File.ReadAllText(Path.Combine(target, home)) == shared,
             $"and, having made the .fileref a plain copy first, leaves its content a home ({home ?? "none"})");
         Microsoft.Data.Sqlite.SqliteConnection.ClearAllPools();
@@ -1810,7 +2221,7 @@ internal static class Program
         Check(!vm.IsPurging, $"the purge finished (\"{vm.SummaryText}\")");
         Check(vm.SummaryText.Contains("kept 1", StringComparison.Ordinal), "and says it kept one copy for a reference");
 
-        string? anchor = await repo.GetActivePlainContentPathByHashAsync(set.Id, hHash);
+        string? anchor = (await repo.GetActivePlainContentPathsByHashAsync(set.Id, hHash)).FirstOrDefault();
         Check(anchor is not null && File.Exists(Path.Combine(target, anchor))
               && File.ReadAllText(Path.Combine(target, anchor)) == "content H",
             "m.bin's content still resolves to a copy on disk");
