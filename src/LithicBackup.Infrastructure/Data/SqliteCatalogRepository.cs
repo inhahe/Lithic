@@ -583,6 +583,9 @@ public class SqliteCatalogRepository : ICatalogRepository
         int backupSetId, IReadOnlyCollection<long> ids, CancellationToken ct = default)
         => GetSet(backupSetId).GetLiveDiscPathsAsync(ids, ct);
 
+    public Task<string?> FindLiveRecordsOutsideAsync(int backupSetId, string backupRoot, CancellationToken ct = default)
+        => GetSet(backupSetId).FindLiveRecordsOutsideAsync(backupSetId, backupRoot, ct);
+
     public Task<Dictionary<string, FileVersionInfo>> GetLatestVersionInfoAsync(int backupSetId, CancellationToken ct = default)
         => GetSet(backupSetId).GetLatestVersionInfoAsync(backupSetId, ct);
 

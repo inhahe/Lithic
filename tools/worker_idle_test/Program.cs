@@ -26,6 +26,8 @@
 //      C8 while the app works on a set, the Worker starts no run on it, stops
 //         one that is going, and carries on after.
 //      C11 with "create subdirectory", the Worker backs up into the subfolder.
+//      C12-C14 a set with live records outside its backup folder is refused and
+//         held by the full backup, a continuous one and a rename.
 //
 // Build with -p:OldCode=true to compile only what also builds against the code
 // before the change (A2 and C), and watch it fail there.
@@ -867,6 +869,104 @@ async Task PartC()
         bool continuous = await WaitUntil(() => File.Exists(Path.Combine(inSub, "two.txt")), TimeSpan.FromSeconds(60));
         Check(continuous, "C11 and so does its continuous backup");
         Check(!Directory.Exists(inDst), "C11 nothing is written beside the subfolder");
+        await rig.DisposeAsync();
+    }
+
+    // C12-C14 ---------------------------------------------------------------
+    // A set whose catalog has live records in a folder other than its backup
+    // folder - here beside its subfolder, where the Worker wrote before it
+    // honoured "create subdirectory" - is refused and held by each of the
+    // Worker's three paths: a backup in the backup folder would not find those
+    // copies, and each changed file's earlier versions would lose their files.
+    // Each path gets its own rig, because the first refusal holds the set and
+    // stops the others.
+    async Task<(Rig Rig, string Src, string InSub)> SubfolderRigAsync(string name)
+    {
+        string dir = Path.Combine(root, name);
+        string src = Path.Combine(dir, "src");
+        string dst = Path.Combine(dir, "dst");
+        Directory.CreateDirectory(src);
+        Directory.CreateDirectory(dst);
+        File.WriteAllText(Path.Combine(src, "one.txt"), "one");
+        string drive = char.ToUpperInvariant(src[0]).ToString();
+        var rig = await Rig.CreateAsync(Path.Combine(dir, "catalog.db"), stampedSetIds, set =>
+        {
+            set.SourceSelections = [ new SourceSelection { Path = src, IsDirectory = true, IsSelected = true, AutoIncludeNewSubdirectories = true } ];
+            set.SourceRoots = [src];
+            set.JobOptions!.TargetDirectory = dst;
+            set.JobOptions.CreateSubdirectory = true;
+            set.JobOptions.SubdirectoryName = "Sub";
+        });
+        rig.Destination.Connected = true;
+        return (rig, src, Path.Combine(dst, "Sub", drive, src.Substring(3)));
+    }
+    // A live record of a file the old Worker copied beside the subfolder.
+    async Task RecordBesideSubfolderAsync(Rig rig, string src)
+    {
+        var set = (await rig.Repo.GetBackupSetAsync(rig.SetId))!;
+        var disc = await rig.Repo.CreateDiscAsync(new DiscRecord
+        {
+            BackupSetId = rig.SetId, Label = set.JobOptions!.TargetDirectory!, SequenceNumber = 1,
+            MediaType = MediaType.Directory, Status = BurnSessionStatus.Completed, CreatedUtc = DateTime.UtcNow,
+        });
+        string drive = char.ToUpperInvariant(src[0]).ToString();
+        await rig.Repo.CreateFileRecordAsync(new FileRecord
+        {
+            DiscId = disc.Id, SourcePath = Path.Combine(src, "old.txt"),
+            DiscPath = Path.Combine(drive, src.Substring(3), "old.txt"), SizeBytes = 3, Hash = "",
+            SourceLastWriteUtc = DateTime.UtcNow, BackedUpUtc = DateTime.UtcNow,
+        });
+    }
+    bool Held(Rig rig) => rig.Repo.GetBackupSetAsync(rig.SetId).GetAwaiter().GetResult()!.JobOptions!.HoldAutomatedBackups;
+    const string ElsewhereLine = "are recorded in";
+
+    {
+        // C12: at the full backup.
+        var (rig, src, inSub) = await SubfolderRigAsync("c12");
+        await RecordBesideSubfolderAsync(rig, src);
+        await rig.Worker.StartAsync(CancellationToken.None);
+        bool refused = await WaitUntil(() => rig.Log.Count(ElsewhereLine) > 0, TimeSpan.FromSeconds(60));
+        bool held = await WaitUntil(() => Held(rig), TimeSpan.FromSeconds(10));
+        Check(refused && rig.Log.Count("Starting backup for") == 0,
+            "C12 a set with records beside its subfolder is refused at its full backup");
+        Check(held, "C12 and held, so the app shows its automated backups as paused");
+        Check(!Directory.Exists(inSub), "C12 nothing is written into the subfolder");
+        await rig.DisposeAsync();
+    }
+    {
+        // C13: at a continuous backup of a changed file, once records turn up elsewhere.
+        var (rig, src, inSub) = await SubfolderRigAsync("c13");
+        await rig.Worker.StartAsync(CancellationToken.None);
+        bool first = await WaitUntil(() => File.Exists(Path.Combine(inSub, "one.txt")), TimeSpan.FromSeconds(60));
+        await RecordBesideSubfolderAsync(rig, src);
+        File.WriteAllText(Path.Combine(src, "two.txt"), "two");
+        bool refused = await WaitUntil(() => rig.Log.Count(ElsewhereLine) > 0, TimeSpan.FromSeconds(60));
+        bool held = await WaitUntil(() => Held(rig), TimeSpan.FromSeconds(10));
+        await Task.Delay(TimeSpan.FromSeconds(3));   // in case a copy were on its way
+        Check(first && refused && held, "C13 a continuous backup is refused and the set held");
+        Check(!File.Exists(Path.Combine(inSub, "two.txt")), "C13 and the changed file is not copied");
+        await rig.DisposeAsync();
+    }
+    {
+        // C14: at a rename. The moves come from the USN journal, which an
+        // unelevated harness cannot read, so the move is queued on the stopped
+        // Worker's state and the apply step called directly.
+        var (rig, src, inSub) = await SubfolderRigAsync("c14");
+        await rig.Worker.StartAsync(CancellationToken.None);
+        bool first = await WaitUntil(() => File.Exists(Path.Combine(inSub, "one.txt")), TimeSpan.FromSeconds(60));
+        await rig.Worker.StopAsync(CancellationToken.None);
+        await RecordBesideSubfolderAsync(rig, src);
+        File.Move(Path.Combine(src, "one.txt"), Path.Combine(src, "renamed.txt"));
+        const BindingFlags Private = BindingFlags.NonPublic | BindingFlags.Instance;
+        var states = (System.Collections.IDictionary)typeof(BackupWorker).GetField("_sets", Private)!.GetValue(rig.Worker)!;
+        object state = states[rig.SetId]!;
+        var moves = (List<UsnMove>)state.GetType().GetProperty("PendingMoves")!.GetValue(state)!;
+        moves.Add(new UsnMove(Path.Combine(src, "one.txt"), Path.Combine(src, "renamed.txt"), false));
+        await (Task)typeof(BackupWorker).GetMethod("RunMovesAsync", Private)!.Invoke(rig.Worker, [state, CancellationToken.None])!;
+        Check(first && rig.Log.Count(ElsewhereLine) > 0 && Held(rig), "C14 a rename is refused and the set held");
+        Check(File.Exists(Path.Combine(inSub, "one.txt")) && !File.Exists(Path.Combine(inSub, "renamed.txt")),
+            "C14 and the copy in the subfolder is not moved");
+        Check(moves.Count == 1, "C14 the move stays queued for when the set is sorted out");
         await rig.DisposeAsync();
     }
 #endif

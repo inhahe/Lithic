@@ -98,6 +98,30 @@ public class JobOptions
     }
 
     /// <summary>
+    /// Whether two paths name the same backup folder in the sense the catalog's
+    /// disc labels are matched to a set's backup folder: whatever the drive
+    /// letter (a drive can come back under another one, which the destination
+    /// resolver follows without relabelling anything), the case, and the kind and
+    /// number of trailing separators. Everything that decides whether a label is
+    /// the set's folder compares this way, so that they cannot disagree;
+    /// <see cref="Interfaces.ICatalogRepository.FindLiveRecordsOutsideAsync"/>
+    /// does it in SQL, on <see cref="FolderWithoutDrive"/>.
+    /// </summary>
+    public static bool SameFolderOnAnyDrive(string? a, string? b)
+        => a is not null && b is not null
+           && string.Equals(FolderWithoutDrive(a), FolderWithoutDrive(b), StringComparison.OrdinalIgnoreCase);
+
+    /// <summary>
+    /// A folder path without its first two characters - the drive ("X:"), or a
+    /// UNC path's leading "\\" - with '/' read as '\' and no trailing separator.
+    /// </summary>
+    public static string FolderWithoutDrive(string path)
+    {
+        string p = path.Replace('/', '\\');
+        return (p.Length > 2 ? p[2..] : "").TrimEnd('\\');
+    }
+
+    /// <summary>
     /// Automated backup schedule. Null or <c>Enabled = false</c> means
     /// manual-only. Stored as JSON — backward-compatible with older sets
     /// that lack this field.

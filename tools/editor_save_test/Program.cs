@@ -276,6 +276,7 @@ internal static class Program
         await ReconcileAfterEditAsync();
         await VerifyStartsAsync();
         await RetentionChangeOffersRemovalAsync();
+        await RecordsElsewhereRefusedAsync();
 #endif
         Check(_dialogs.Unexpected.Count == 0,
             "no unexpected message box appeared"
@@ -513,8 +514,6 @@ internal static class Program
             return;
         }
         var row = _vm.BackupSets.First(r => r.Id == _setId);
-        static TierSetViewModel? DefaultOf(Editor e) => e.Vm.TierSets.FirstOrDefault(t => t.Name == "Default");
-        static ReviewTreeDialog? OpenReview() => Application.Current.Windows.OfType<ReviewTreeDialog>().FirstOrDefault();
         static string Header(ReviewTreeDialog d) => ((ReviewTreeViewModel)d.DataContext).HeaderText.Split('\n')[0];
         async Task<HashSet<string>> LiveDiscPaths() => (await _observer.GetActivePreviousVersionsAsync(_setId))
             .Select(r => Path.Combine(dst, r.DiscPath)).ToHashSet(StringComparer.OrdinalIgnoreCase);
@@ -670,7 +669,141 @@ internal static class Program
         Check(File.Exists(Prev(_smallFile, 2)) && File.Exists(Prev(_bigFile, 1)) && (await LiveDiscPaths()).Count == 2,
             "both earlier versions are still there, and recorded");
     }
+
+    /// <summary>
+    /// 26: while some of a set's live records belong to another folder than its
+    /// backup folder (a subfolder setting changed, a destination retyped, an
+    /// older Worker's runs), the app does nothing in the backup folder: the
+    /// retention offer is not made, a backup is refused, and dropping a source
+    /// removes nothing - each saying why. Working there would lose track of those
+    /// records' files, or retire records whose files it never deletes. Runs on
+    /// the set and backup that section 25 left.
+    /// </summary>
+    static async Task RecordsElsewhereRefusedAsync()
+    {
+        Console.WriteLine();
+        Console.WriteLine("=== 26. with files recorded in another folder, the app does not work in the backup folder ===");
+        string dst = Path.Combine(_root, "dst-retention");
+
+        // A main window that really backs up, and removes a dropped source's
+        // copies without asking first, so that each refusal is all that stops it.
+        _vm = new MainViewModel(
+            _catalog,
+            burner: null!,
+            scanner: new LithicBackup.Infrastructure.FileSystem.FileScanner(_catalog),
+            orchestrator: null!,
+            restoreService: null!,
+            catalogFreeRestoreService: null!,
+            directoryBackupService: new DirectoryBackupService(
+                _catalog,
+                new LithicBackup.Infrastructure.FileSystem.FileScanner(_catalog),
+                new VersionRetentionService(_catalog)),
+            settings: new UserSettings { ReconcileMode = ReconcileAfterEditMode.Always });
+        if (!await WaitFor(() => _vm.BackupSets.Any(r => r.Id == _setId), 10000))
+        {
+            Check(false, "the main window loaded the test set");
+            return;
+        }
+        var disc = await _observer.CreateDiscAsync(new DiscRecord
+        {
+            BackupSetId = _setId, Label = Path.Combine(_root, "elsewhere"), SequenceNumber = 99,
+            MediaType = MediaType.Directory, Status = BurnSessionStatus.Completed, CreatedUtc = DateTime.UtcNow,
+        });
+        await _observer.CreateFileRecordAsync(new FileRecord
+        {
+            DiscId = disc.Id, SourcePath = Path.Combine(_a, "elsewhere.txt"), DiscPath = Path.Combine("X", "elsewhere.txt"),
+            SizeBytes = 1, Hash = "", SourceLastWriteUtc = DateTime.UtcNow, BackedUpUtc = DateTime.UtcNow,
+        });
+        int discsBefore = (await _observer.GetDiscsForBackupSetAsync(_setId)).Count;
+        var filesBefore = Directory.GetFiles(dst, "*", SearchOption.AllDirectories)
+            .Select(f => (f, File.GetLastWriteTimeUtc(f))).ToHashSet();
+        bool BackupUntouched() => Directory.GetFiles(dst, "*", SearchOption.AllDirectories)
+            .Select(f => (f, File.GetLastWriteTimeUtc(f))).ToHashSet().SetEquals(filesBefore);
+
+        // --- a retention change offers nothing ---
+        var ed = await OpenEditorAsync("elsewhere: retention");
+        if (ed is null) return;
+        var def = DefaultOf(ed)!;
+        ed.Vm.SelectedTierSet = def;
+        await Task.Delay(300);
+        ed.Vm.MarkClean();
+        def.Tiers[0].MaxVersions = "1";
+        ed.Vm.SaveCommand.Execute(null);
+        Check(await WaitClosedAsync(ed.Window), "Save closes the editor");
+        await EnsureClosedAsync(ed.Window);
+        Check(await WaitFor(() => _vm.StatusText.Contains("recorded in another folder", StringComparison.Ordinal), 20000),
+            $"a retention change offers no removal, and the status bar says why (\"{_vm.StatusText}\")");
+        Check(!await WaitFor(() => OpenReview() is not null, 2000) && BackupUntouched(), "and nothing is offered or removed");
+
+        // --- a backup is refused ---
+        var row = _vm.BackupSets.First(r => r.Id == _setId);
+        File.WriteAllText(_smallFile, "changed, so a backup would copy it");
+        _dialogs.Expect("Backup Folder Changed", DialogWatcher.IDOK);
+        _vm.SetBackupCommand.Execute(row);
+        Check(await WaitFor(() => _dialogs.WasAnswered("Backup Folder Changed"), 20000),
+            "backing the set up explains that its files are recorded in another folder");
+        Check(await WaitFor(() => _vm.StatusText.Contains("was not backed up", StringComparison.Ordinal), 5000),
+            $"and the status bar says it was not backed up (\"{_vm.StatusText}\")");
+        await Task.Delay(1000);
+        Check(BackupUntouched() && (await _observer.GetDiscsForBackupSetAsync(_setId)).Count == discsBefore,
+            "nothing was written");
+        _dialogs.ClearExpectations();
+
+        // --- dropping a source removes nothing, and asks nothing first ---
+        ed = await OpenEditorAsync("elsewhere: drop b");
+        if (ed is null) return;
+        _dialogs.Expect("Backup Folder Changed", DialogWatcher.IDOK);
+        Check(await ToggleAsync(ed, _b, false), "unticking folder b registers as a user edit");
+        ed.Vm.SaveCommand.Execute(null);
+        Check(await WaitClosedAsync(ed.Window), "Save closes the editor");
+        await EnsureClosedAsync(ed.Window);
+        Check(await WaitFor(() => _dialogs.WasAnswered("Backup Folder Changed"), 20000) && OpenReview() is null,
+            "dropping a source explains, without first reviewing what it would remove");
+        Check(await WaitFor(() => _vm.StatusText.Contains("Left the removed-source files in place", StringComparison.Ordinal), 5000),
+            $"and the status bar says the files were left (\"{_vm.StatusText}\")");
+        Check(BackupUntouched(), "folder b's backed-up files are still there");
+        _dialogs.ClearExpectations();
+
+        // --- moving the backup folder in the editor asks first ---
+        // (Every save above left the folder alone and asked nothing: the check for
+        // unexpected message boxes at the end covers that.)
+        ed = await OpenEditorAsync("elsewhere: move folder");
+        if (ed is null) return;
+        await Task.Delay(300);
+        ed.Vm.MarkClean();
+        ed.Vm.SubdirectoryName = "Moved";
+        ed.Vm.CreateSubdirectory = true;
+        async Task<bool> Unmoved() => (await DbSetAsync()).JobOptions is { CreateSubdirectory: false };
+
+        _dialogs.Expect("Change Backup Folder", DialogWatcher.IDNO);
+        ed.Vm.SaveCommand.Execute(null);
+        Check(await WaitFor(() => _dialogs.WasAnswered("Change Backup Folder"), 10000),
+            "saving a new backup folder for a set with history asks first");
+        await Task.Delay(500);
+        Check(IsOpen(ed.Window) && await Unmoved(), "No keeps the editor open, and saves nothing");
+        _dialogs.ClearExpectations();
+
+        _dialogs.Expect("Unsaved Changes", DialogWatcher.IDYES);
+        _dialogs.Expect("Change Backup Folder", DialogWatcher.IDNO);
+        ed.Window.Close();
+        await Task.Delay(500);
+        Check(_dialogs.WasAnswered("Unsaved Changes") && _dialogs.WasAnswered("Change Backup Folder"),
+            "so does Yes at the close prompt");
+        Check(IsOpen(ed.Window) && await Unmoved(), "and No there keeps the editor open too, and saves nothing");
+        _dialogs.ClearExpectations();
+
+        _dialogs.Expect("Change Backup Folder", DialogWatcher.IDYES);
+        ed.Vm.SaveCommand.Execute(null);
+        Check(await WaitClosedAsync(ed.Window), "Yes saves and closes the editor");
+        await EnsureClosedAsync(ed.Window);
+        var moved = (await DbSetAsync()).JobOptions!;
+        Check(moved is { CreateSubdirectory: true, SubdirectoryName: "Moved" }, "and the new backup folder is saved");
+        _dialogs.ClearExpectations();
+    }
 #endif
+
+    static ReviewTreeDialog? OpenReview() => Application.Current.Windows.OfType<ReviewTreeDialog>().FirstOrDefault();
+    static TierSetViewModel? DefaultOf(Editor e) => e.Vm.TierSets.FirstOrDefault(t => t.Name == "Default");
 
     // ------------------------------------------------------------------ helpers
 
@@ -909,7 +1042,6 @@ internal static class Program
         Console.WriteLine();
         Console.WriteLine("=== 16. tier edits enable Save, are saved, and are asked about on X ===");
 
-        static TierSetViewModel? DefaultOf(Editor e) => e.Vm.TierSets.FirstOrDefault(t => t.Name == "Default");
         static VersionTierSet? DbDefault(BackupSet s) => s.JobOptions?.TierSets.FirstOrDefault(t => t.Name == "Default");
 
         // --- remove every tier from Default, then Save ---

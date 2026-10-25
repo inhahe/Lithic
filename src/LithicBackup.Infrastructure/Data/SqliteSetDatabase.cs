@@ -995,6 +995,33 @@ internal sealed class SqliteSetDatabase : IDisposable
         return list;
     }
 
+    /// <summary>See <see cref="ICatalogRepository.FindLiveRecordsOutsideAsync"/>.</summary>
+    public async Task<string?> FindLiveRecordsOutsideAsync(
+        int backupSetId, string backupRoot, CancellationToken ct = default)
+    {
+        ct.ThrowIfCancellationRequested();
+        using var _ = await LockAsync(ct).ConfigureAwait(false);
+
+        // A disc record is labelled with the folder its run wrote to. Compared as
+        // JobOptions.SameFolderOnAnyDrive compares: "X:" (or a UNC path's leading
+        // "\\") dropped from both sides, separators and trailing ones evened out,
+        // case ignored.
+        using var cmd = _connection.CreateCommand();
+        cmd.CommandText = """
+            SELECT d.Label FROM Discs d
+            WHERE d.BackupSetId = $setId AND d.MediaType = $directory
+              AND rtrim(substr(replace(d.Label, '/', char(92)), 3), char(92)) <> $folder COLLATE NOCASE
+              AND EXISTS (SELECT 1 FROM Files f WHERE f.DiscId = d.Id AND f.IsDeleted = 0)
+            LIMIT 1
+            """;
+        cmd.Parameters.AddWithValue("$setId", backupSetId);
+        cmd.Parameters.AddWithValue("$directory", (int)MediaType.Directory);
+        cmd.Parameters.AddWithValue("$folder", JobOptions.FolderWithoutDrive(backupRoot));
+        foreach (var r in Rows(cmd, ct))
+            return r.GetString(0);
+        return null;
+    }
+
     /// <summary>See <see cref="ICatalogRepository.GetLiveDiscPathsAsync"/>.</summary>
     public async Task<Dictionary<long, string>> GetLiveDiscPathsAsync(
         IReadOnlyCollection<long> ids, CancellationToken ct = default)

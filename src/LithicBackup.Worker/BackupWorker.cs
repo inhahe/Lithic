@@ -1995,7 +1995,8 @@ public sealed class BackupWorker : BackgroundService
 
             // Dropped rather than requeued: nothing can run until the user acts,
             // and the full backup that follows picks these files up anyway.
-            if (await RefuseUntrackedDestinationAsync(state, targetDir, ct))
+            if (await RefuseBackupElsewhereAsync(state, targetDir, ct)
+                || await RefuseUntrackedDestinationAsync(state, targetDir, ct))
                 return;
 
             var job = BuildJob(set, opts, targetDir);
@@ -2096,6 +2097,11 @@ public sealed class BackupWorker : BackgroundService
                     set.Name, state.PendingMoves.Count);
                 return; // destination not connected — moves stay queued
             }
+
+            // Relocating copies the catalog records in another folder would lose
+            // them; the moves stay queued until the user has sorted the set out.
+            if (await RefuseBackupElsewhereAsync(state, targetDir, ct))
+                return;
 
             var job = BuildJob(set, opts, targetDir);
 
@@ -2510,8 +2516,9 @@ public sealed class BackupWorker : BackgroundService
             if (!await ResolveSourcesAsync(state, runCt))
                 return ReconcileOutcome.DidNotRun; // No source available; retry later.
 
-            if (await RefuseUntrackedDestinationAsync(state, targetDir, runCt))
-                return ReconcileOutcome.DidNotRun; // Until the user seeds or backs up in the app.
+            if (await RefuseBackupElsewhereAsync(state, targetDir, runCt)
+                || await RefuseUntrackedDestinationAsync(state, targetDir, runCt))
+                return ReconcileOutcome.DidNotRun; // Until the user sorts the set out in the app.
 
             _logger.LogInformation("Starting backup for \"{Name}\" → {Target}", set.Name, targetDir);
 
@@ -2618,6 +2625,56 @@ public sealed class BackupWorker : BackgroundService
             run?.Dispose();
             _backupLock.Release();
         }
+    }
+
+    /// <summary>
+    /// True when the set must not be backed up because live records of its
+    /// catalog belong to a folder other than its backup folder
+    /// (<see cref="ICatalogRepository.FindLiveRecordsOutsideAsync"/>): written
+    /// before its subfolder setting changed, before its destination was retyped
+    /// in the editor, or by a Worker that ignored "Create subdirectory". A backup
+    /// in the backup folder cannot find those copies, so each changed file's
+    /// earlier versions lose their files. Held, and logged once, like the refusal
+    /// below; the app explains when the user next backs the set up there.
+    /// </summary>
+    private async Task<bool> RefuseBackupElsewhereAsync(SetState state, string targetDir, CancellationToken ct)
+    {
+        var set = state.BackupSet;
+        string? elsewhere;
+        try
+        {
+            elsewhere = await _catalog.FindLiveRecordsOutsideAsync(set.Id, targetDir, ct);
+        }
+        catch (OperationCanceledException) { throw; }
+        catch (Exception ex)
+        {
+            _logger.LogWarning(ex,
+                "Could not check where the backed-up files of \"{Name}\" are recorded; skipping this run.", set.Name);
+            BlockRuns(state);
+            return true;
+        }
+
+        if (elsewhere is null)
+        {
+            state.RefusedElsewhereAt = null;
+            return false;
+        }
+
+        BlockRuns(state);
+        if (!string.Equals(state.RefusedElsewhereAt, targetDir, StringComparison.OrdinalIgnoreCase))
+        {
+            state.RefusedElsewhereAt = targetDir;
+            _logger.LogWarning(
+                "Not backing up \"{Name}\": some of its backed-up files are recorded in {Elsewhere}, but it now "
+                + "backs up to {Target}. A backup there would lose track of their earlier versions. If the backup "
+                + "was moved, use Change Destination in Lithic Backup; if the set's \"Create subdirectory\" setting "
+                + "or its subfolder's name was changed, change it back; to start afresh there, clear its backup "
+                + "history in the set's editor. Its automated backups are paused until then, which its row in "
+                + "Lithic Backup shows.",
+                set.Name, elsewhere, targetDir);
+        }
+        await HoldAutomatedBackupsAsync(set, ct);
+        return true;
     }
 
     /// <summary>
@@ -2779,6 +2836,13 @@ public sealed class BackupWorker : BackgroundService
         /// rather than at every poll. Null while not refusing.
         /// </summary>
         public string? RefusedUntrackedAt { get; set; }
+
+        /// <summary>
+        /// The backup folder this set was last refused at because its catalog
+        /// records files in another folder (<c>RefuseBackupElsewhereAsync</c>), so
+        /// the refusal is logged once. Null while not refusing.
+        /// </summary>
+        public string? RefusedElsewhereAt { get; set; }
 
         /// <summary>
         /// Directories actually selected for this set (not the drive roots).

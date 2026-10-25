@@ -74,14 +74,24 @@ public static class DestinationWalker
         public int DirectoriesSkipped;
     }
 
+    /// <param name="skipFolders">
+    /// Folders, relative to <paramref name="targetDir"/>, not to walk: other sets'
+    /// backup folders inside this one (a set backing up to <c>E:\B</c> beside one
+    /// using <c>E:\B\Sub</c>). Their files are in no catalog this walk reads, and
+    /// would all be listed as untracked - for deletion.
+    /// </param>
     public static DestinationWalkResult Walk(
         string targetDir,
         Dictionary<UInt128, DestPathState> discPathLookup,
         Func<string, string?> reconstructSourcePath,
         IProgress<string>? progress = null,
         int maxParallelism = DefaultParallelism,
-        CancellationToken ct = default)
+        CancellationToken ct = default,
+        IReadOnlyCollection<string>? skipFolders = null)
     {
+        var skip = new HashSet<string>(
+            (skipFolders ?? []).Select(f => f.Replace('/', '\\').Trim('\\')).Where(f => f.Length > 0),
+            StringComparer.OrdinalIgnoreCase);
         var targetInfo = new DirectoryInfo(targetDir);
         if (!targetInfo.Exists)
             throw new DirectoryNotFoundException($"Destination directory not found: {targetDir}");
@@ -115,6 +125,8 @@ public static class DestinationWalker
                 () => new Bucket(),
                 (item, _, bucket) =>
                 {
+                    if (skip.Contains(item.RelativeDir))
+                        return bucket;
                     ProcessDirectory(
                         item.Dir, item.RelativeDir, discPathLookup, reconstructSourcePath,
                         bucket, next);

@@ -802,6 +802,46 @@ public class MainViewModel : ViewModelBase
             AfterSave();
         }
 
+        // Before a save that moves the set's backup folder (its destination,
+        // "Create subdirectory" or the subfolder's name) while some of its files
+        // are recorded outside the new one: nothing moves them, so from then on
+        // the set would be refused - its backups held, nothing deleted from it -
+        // until they are in one folder again. Asked here, where the user can still
+        // back out, rather than learnt at the next backup. Not for the save at
+        // File > Exit, which cannot ask; the refusal covers it.
+        //
+        // The question, or null when there is none to ask. The editor's fields are
+        // read on the UI thread, the catalog off it, and the result is not handed
+        // back to the UI thread: the close prompt waits for this synchronously.
+        async Task<string?> BackupFolderMoveQuestionAsync()
+        {
+            string? newRoot = EditorJobOptions(backupSet, sourceSelection).BackupRoot();
+            if (newRoot is null)
+                return null;
+            string? elsewhere = await Task.Run(async () =>
+            {
+                string? oldRoot = (await _catalog.GetBackupSetAsync(backupSet.Id))?.JobOptions?.BackupRoot();
+                if (oldRoot is null || JobOptions.SameFolderOnAnyDrive(oldRoot, newRoot))
+                    return null;
+                return await _catalog.FindLiveRecordsOutsideAsync(backupSet.Id, newRoot);
+            }).ConfigureAwait(false);
+            return elsewhere is null ? null
+                : $"Some of this set's backed-up files are recorded in\n    {elsewhere}\n"
+                  + $"and this change makes its backup folder\n    {newRoot}\n\n"
+                  + "LithicBackup does not move backed-up files. Until they are all in one folder again, the set "
+                  + "will not be backed up and nothing will be deleted from it.\n\n"
+                  + "If you moved the backup to another drive or folder, use Change Destination on the set's "
+                  + "right-click menu instead, which records where its files now are. To start a fresh backup "
+                  + "in the new folder, clear the set's backup history after saving.\n\n"
+                  + "Save this change anyway?";
+        }
+
+        // Ask it, on the UI thread. True to go ahead with the save.
+        static bool ConfirmBackupFolderMove(string? question)
+            => question is null
+               || MessageBox.Show(question, "Change Backup Folder", MessageBoxButton.YesNo,
+                      MessageBoxImage.Warning) == MessageBoxResult.Yes;
+
         void AfterSave()
         {
             savedThisSession = true;
@@ -908,6 +948,14 @@ public class MainViewModel : ViewModelBase
             }
             else if (result == MessageBoxResult.Yes)
             {
+                // Declined: stay open, as for Cancel. Waited for here because
+                // Closing must decide before it returns; the catalog part runs off
+                // the UI thread and does not come back to it.
+                if (!ConfirmBackupFolderMove(BackupFolderMoveQuestionAsync().GetAwaiter().GetResult()))
+                {
+                    e.Cancel = true;
+                    return;
+                }
                 // Save in the Closed handler. For a new set, clear the "unsaved new"
                 // marker so it is kept rather than deleted.
                 saveOnClose = true;
@@ -1011,6 +1059,11 @@ public class MainViewModel : ViewModelBase
         {
             try
             {
+                if (!ConfirmBackupFolderMove(await BackupFolderMoveQuestionAsync()))
+                {
+                    sourceSelection.SaveStatusText = "Not saved";
+                    return;
+                }
                 await SaveAllAsync();
                 _unsavedNewSetId = null; // committed — don't delete on close
                 StatusText = $"Backup set \"{sourceSelection.SetName}\" saved. {DateTime.Now:HH:mm:ss}";
@@ -1085,6 +1138,11 @@ public class MainViewModel : ViewModelBase
 
                 try
                 {
+                    if (!ConfirmBackupFolderMove(await BackupFolderMoveQuestionAsync()))
+                    {
+                        sourceSelection.SeedResult = "Not saved, so nothing was imported.";
+                        return;
+                    }
                     await SaveAllAsync();
                     _unsavedNewSetId = null; // committed - Cancel must not delete it now
                 }
@@ -1924,6 +1982,19 @@ public class MainViewModel : ViewModelBase
     private async Task PromptAndPurgeRemovedAsync(
         BackupSet backupSet, List<FileRecord> removed)
     {
+        // Asked before the review, which would otherwise end in a refusal: with
+        // records in another folder, the deletion below - in the backup folder -
+        // would retire their records and leave their files behind. It reads only
+        // the catalog, so the answer holds through the review; whether the drive
+        // is there is asked after it, since it can be plugged in meanwhile.
+        string? targetDir = backupSet.JobOptions?.BackupRoot();
+        if (targetDir is not null && await RecordsElsewhereRefusalAsync(backupSet, targetDir) is { } elsewhereMessage)
+        {
+            MessageBox.Show(elsewhereMessage, "Backup Folder Changed", MessageBoxButton.OK, MessageBoxImage.Warning);
+            StatusText = "Left the removed-source files in place: some of the set's files are recorded in another folder.";
+            return;
+        }
+
         // One review row per source path; size is the sum across its versions.
         var byPath = removed
             .GroupBy(f => f.SourcePath, StringComparer.OrdinalIgnoreCase)
@@ -1943,8 +2014,6 @@ public class MainViewModel : ViewModelBase
                 + "(remove later via Cleanup).";
             return;
         }
-
-        string? targetDir = backupSet.JobOptions?.BackupRoot();
 
         // Refuse if the set HAS a destination but it isn't reachable. Marking the
         // catalog without deleting the files would free nothing and would drop the
@@ -2170,6 +2239,12 @@ public class MainViewModel : ViewModelBase
             {
                 StatusText = $"Saved \"{set.Name}\". Its destination ({opts.BackupRoot()}) is not connected, so the "
                              + "earlier versions its new retention settings no longer keep are left for Cleanup.";
+                return;
+            }
+            if (await RecordsElsewhereRefusalAsync(set, root) is not null)
+            {
+                StatusText = $"Saved \"{set.Name}\". Some of its backed-up files are recorded in another folder than "
+                             + $"{root}, so no earlier versions were offered for removal; backing it up explains.";
                 return;
             }
 
@@ -2604,6 +2679,40 @@ public class MainViewModel : ViewModelBase
     // Change destination path for a directory-mode backup set
     // -------------------------------------------------------------------
 
+    /// <summary>
+    /// Relabel a set's discs for Change Destination, so they name the folders
+    /// their files are now in.
+    /// </summary>
+    /// <param name="oldRoot">The set's backup folder before the move.</param>
+    /// <param name="oldDestination">Its destination before the move: with "Create
+    /// subdirectory", the folder above the backup folder, where an older Worker
+    /// wrote its runs.</param>
+    /// <param name="newRoot">The backup folder after it.</param>
+    /// <param name="newDestination">The destination after it.</param>
+    /// <remarks>
+    /// A label is matched to the old folders on any drive letter, as the guard
+    /// that refuses a set with records elsewhere matches it
+    /// (<see cref="JobOptions.SameFolderOnAnyDrive"/>): labels written before
+    /// the drive changed letter would otherwise stay behind, and that guard
+    /// would then refuse the set for them.
+    /// </remarks>
+    public static async Task RelabelDiscsAfterMoveAsync(ICatalogRepository catalog, int setId,
+        string? oldRoot, string oldDestination, string? newRoot, string newDestination)
+    {
+        foreach (var disc in await catalog.GetDiscsForBackupSetAsync(setId))
+        {
+            string? relabel =
+                JobOptions.SameFolderOnAnyDrive(disc.Label, oldRoot) ? newRoot
+                : JobOptions.SameFolderOnAnyDrive(disc.Label, oldDestination) ? newDestination
+                : null;
+            if (relabel is not null && relabel != disc.Label)
+            {
+                disc.Label = relabel;
+                await catalog.UpdateDiscAsync(disc);
+            }
+        }
+    }
+
     private async Task ChangeDestinationAsync()
     {
         if (SelectedBackupSet?.JobOptions is null) return;
@@ -2668,21 +2777,8 @@ public class MainViewModel : ViewModelBase
             // Destination only - never the selection.
             await _catalog.UpdateBackupSetMetadataAsync(backupSet);
 
-            // Update disc record labels so they reflect the new path.
-            string? newRoot = backupSet.JobOptions.BackupRoot();
-            var discs = await _catalog.GetDiscsForBackupSetAsync(backupSet.Id);
-            foreach (var disc in discs)
-            {
-                string? relabel =
-                    string.Equals(disc.Label, oldRoot, StringComparison.OrdinalIgnoreCase) ? newRoot
-                    : string.Equals(disc.Label, oldPath, StringComparison.OrdinalIgnoreCase) ? newPath
-                    : null;
-                if (relabel is not null)
-                {
-                    disc.Label = relabel;
-                    await _catalog.UpdateDiscAsync(disc);
-                }
-            }
+            await RelabelDiscsAfterMoveAsync(_catalog, backupSet.Id,
+                oldRoot, oldPath, backupSet.JobOptions.BackupRoot(), newPath);
 
             StatusText = $"Destination relocated: {oldPath} → {newPath}";
         }
@@ -3853,6 +3949,15 @@ public class MainViewModel : ViewModelBase
         var job = BuildJob(backupSet, opts, sources);
 
         bool isDir = job.TargetDirectory is not null;
+
+        // Records written to a folder other than the backup folder: a backup here
+        // would lose track of their earlier versions. Refused, and said why.
+        if (isDir && await RecordsElsewhereRefusalAsync(backupSet, job.TargetDirectory!) is { } elsewhereMessage)
+        {
+            MessageBox.Show(elsewhereMessage, "Backup Folder Changed", MessageBoxButton.OK, MessageBoxImage.Warning);
+            StatusText = $"\"{backupSet.Name}\" was not backed up: its backed-up files are recorded in another folder.";
+            return;
+        }
 
         // No history, but the destination already holds a backup at this set's
         // paths (an imported or re-created set, a cleared history): ask before
@@ -5636,6 +5741,36 @@ public class MainViewModel : ViewModelBase
     /// the set. Seeding records what is there instead; "back up anyway" remains
     /// for when copying it all again is really what the user wants.
     /// </remarks>
+    /// <summary>
+    /// Why the set must not be written to or deleted from in
+    /// <paramref name="backupRoot"/>, or null when it may: live records of its
+    /// catalog belong to another folder
+    /// (<see cref="ICatalogRepository.FindLiveRecordsOutsideAsync"/>). A backup
+    /// there cannot find those copies, so each changed file's earlier versions
+    /// lose their files, and a purge there retires records without deleting them.
+    /// A check that fails refuses too.
+    /// </summary>
+    private async Task<string?> RecordsElsewhereRefusalAsync(BackupSet set, string backupRoot)
+    {
+        string? elsewhere;
+        try
+        {
+            elsewhere = await _catalog.FindLiveRecordsOutsideAsync(set.Id, backupRoot);
+        }
+        catch (Exception ex)
+        {
+            CrashLogger.Log(ex, $"GUI: checking where the files of \"{set.Name}\" are recorded");
+            return $"Could not check where the backed-up files of \"{set.Name}\" are recorded: {ex.Message}";
+        }
+        return elsewhere is null ? null
+            : $"Some of \"{set.Name}\"'s backed-up files are recorded in\n    {elsewhere}\n"
+              + $"but its backup folder is now\n    {backupRoot}\n\n"
+              + "Working there would lose track of them and their earlier versions, so nothing was done.\n\n"
+              + "If you moved the backup, use Change Destination on the set's right-click menu. If you changed "
+              + "its \"Create subdirectory\" setting or the subfolder's name, change it back. To start a fresh "
+              + "backup in the new folder instead, use Clear Backup History in the set's editor first.";
+    }
+
     private async Task<bool> ConfirmBackupOverUntrackedDestinationAsync(
         BackupSet backupSet, IReadOnlyList<SourceSelection> sources, string targetDirectory)
     {

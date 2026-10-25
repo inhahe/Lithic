@@ -380,10 +380,42 @@ public class OrphanedDirectoriesViewModel : ViewModelBase, IConfirmClose, IDispo
     /// </summary>
     public bool IsDestinationUnavailable => _targetDir is not null && !_destinationAvailable;
 
-    /// <summary>Banner text naming the destination that could not be reached.</summary>
-    public string DestinationUnavailableText =>
-        $"Destination not connected: {_targetDir}  —  nothing can be deleted from the " +
-        "backup and the destination cannot be scanned until it is available.";
+    /// <summary>Banner text naming the destination that could not be reached, or why it cannot be used.</summary>
+    public string DestinationUnavailableText => _recordsElsewhere is { } elsewhere
+        ? $"Some of this set's backed-up files are recorded in {elsewhere}, not in its backup folder " +
+          $"{_targetDir}  —  nothing can be deleted from the backup or scanned there until that is sorted " +
+          "out. If the backup was moved, use Change Destination; if the set's subfolder setting was " +
+          "changed, change it back."
+        : $"Destination not connected: {_targetDir}  —  nothing can be deleted from the " +
+          "backup and the destination cannot be scanned until it is available.";
+
+    /// <summary>
+    /// A folder other than the backup folder that live records of the set were
+    /// written to (<see cref="ICatalogRepository.FindLiveRecordsOutsideAsync"/>),
+    /// or null. While there is one, the backup folder is treated as unusable: a
+    /// purge working there would retire those records without deleting their
+    /// files, and its destination scan would not see them.
+    /// </summary>
+    private string? _recordsElsewhere;
+
+    /// <summary>Re-ask where the set's live records are; see <see cref="_recordsElsewhere"/>.</summary>
+    private async Task RefreshRecordsElsewhereAsync()
+    {
+        if (_targetDir is null)
+            return;
+        try
+        {
+            _recordsElsewhere = await _catalog.FindLiveRecordsOutsideAsync(_backupSet.Id, _targetDir);
+        }
+        catch (Exception ex)
+        {
+            // Unknown is not "all here": keep purges off.
+            _recordsElsewhere = $"a folder that could not be checked ({ex.Message})";
+        }
+        RefreshDestinationAvailability();
+        // The banner's text depends on it even when availability stays the same.
+        OnPropertyChanged(nameof(DestinationUnavailableText));
+    }
 
     /// <summary>
     /// Re-test whether the destination is reachable and republish the properties
@@ -407,7 +439,7 @@ public class OrphanedDirectoriesViewModel : ViewModelBase, IConfirmClose, IDispo
     /// </summary>
     private void RefreshDestinationAvailability()
     {
-        bool available = Services.DestinationFilePurger.IsAvailable(_targetDir);
+        bool available = Services.DestinationFilePurger.IsAvailable(_targetDir) && _recordsElsewhere is null;
 
         if (available == _destinationAvailable)
             return;
@@ -550,6 +582,8 @@ public class OrphanedDirectoriesViewModel : ViewModelBase, IConfirmClose, IDispo
     private async Task LoadAsync()
     {
         IsLoading = true;
+        // So the banner says, before anything else, when the backup folder cannot be used.
+        await RefreshRecordsElsewhereAsync();
         // Taken before the catalog is read - a purge leaves alone anything written
         // since - and kept, with the files read, only once this scan's results
         // replace the listed ones: the purge acts on what is listed.
@@ -1659,42 +1693,55 @@ public class OrphanedDirectoriesViewModel : ViewModelBase, IConfirmClose, IDispo
     /// </summary>
     private async Task ScanDestinationAsync()
     {
-        // The destination walk loads its own catalog snapshot (below), so it no
-        // longer depends on the on-demand catalog classification having run —
-        // only on the set having a destination directory that is actually there.
-        // Checking here as well as in CanExecute matters because the drive can be
-        // unplugged while the dialog sits open; without it the walk would get as
-        // far as throwing DirectoryNotFoundException and report the failure as if
-        // it were an unexpected error rather than a disconnected drive.
-        RefreshDestinationAvailability();
         if (_targetDir is null)
             return;
-        if (!_destinationAvailable)
-        {
-            DestinationScanStatusText =
-                $"Destination not connected: {_targetDir} — connect it and scan again.";
-            return;
-        }
 
-        // Give immediate feedback the moment the button is pressed: flip the
-        // busy flag (greys the Scan button via CanExecute) and show a wait
-        // cursor.  The initialization below — clearing a potentially large
-        // Items collection and loading every catalog record — runs on the UI
-        // thread and can take a few seconds before the background walk starts,
-        // so without this the button stayed enabled and the cursor normal
-        // during that gap.
+        // The busy flag goes up before anything is awaited, so that no other
+        // action can start in between (every command tests IsBusy). It also gives
+        // immediate feedback: it greys the Scan button and shows a wait cursor
+        // through the initialization below - clearing a potentially large Items
+        // collection and loading every catalog record - which runs on the UI
+        // thread and can take a few seconds before the background walk starts.
         IsScanningDestination = true;
         DestinationScanStatusText = "Scanning destination directory...";
-        // Before the catalog snapshot is taken: a purge leaves alone anything written since.
-        _destinationScanStartedUtc = DateTime.UtcNow;
-
-        // Yield at Background priority so WPF actually renders the disabled
-        // button before the work below starts.
-        await Dispatcher.Yield(DispatcherPriority.Background);
-
         bool removedAny = false;
         try
         {
+            // The destination walk loads its own catalog snapshot (below), so it
+            // does not depend on the on-demand catalog classification having run -
+            // only on the set's backup folder being there and holding its records.
+            // Checking here as well as in CanExecute matters because the drive can
+            // be unplugged while the dialog sits open; without it the walk would get
+            // as far as throwing DirectoryNotFoundException and report the failure
+            // as if it were an unexpected error rather than a disconnected drive.
+            await RefreshRecordsElsewhereAsync();
+            if (!_destinationAvailable)
+            {
+                DestinationScanStatusText = _recordsElsewhere is null
+                    ? $"Destination not connected: {_targetDir} — connect it and scan again."
+                    : DestinationUnavailableText;
+                return;
+            }
+
+            // Other sets' backup folders inside this one: their files are in no
+            // catalog this scan reads, and would all be listed as untracked.
+            var otherSetsInside = new List<string>();
+            string root = _targetDir.TrimEnd('\\');
+            foreach (var other in await _catalog.GetAllBackupSetsAsync())
+            {
+                if (other.Id != _backupSet.Id
+                    && other.JobOptions?.BackupRoot() is { } otherRoot
+                    && otherRoot.TrimEnd('\\').StartsWith(root + "\\", StringComparison.OrdinalIgnoreCase))
+                    otherSetsInside.Add(otherRoot.TrimEnd('\\')[(root.Length + 1)..]);
+            }
+
+            // Before the catalog snapshot is taken: a purge leaves alone anything written since.
+            _destinationScanStartedUtc = DateTime.UtcNow;
+
+            // Yield at Background priority so WPF actually renders the disabled
+            // button before the work below starts.
+            await Dispatcher.Yield(DispatcherPriority.Background);
+
             // Remove any prior destination-only items so re-scanning replaces
             // (not duplicates) previous findings.
             for (int i = Items.Count - 1; i >= 0; i--)
@@ -1781,7 +1828,8 @@ public class OrphanedDirectoriesViewModel : ViewModelBase, IConfirmClose, IDispo
                 // which pins its verdicts against the original sequential walk,
                 // because this is what Cleanup offers to delete.
                 return Services.DestinationWalker.Walk(
-                    targetDir, discPathLookup, TryReconstructSourcePath, progress, ct: _closed.Token);
+                    targetDir, discPathLookup, TryReconstructSourcePath, progress, ct: _closed.Token,
+                    skipFolders: otherSetsInside);
             });
 
             // ---- UI thread from here on ----
@@ -2244,14 +2292,22 @@ public class OrphanedDirectoriesViewModel : ViewModelBase, IConfirmClose, IDispo
         // path, so with the drive unplugged the purge marked the rows, found
         // File.Exists false for every path, counted zero deletions AND zero
         // failures, and reported plain success.
-        RefreshDestinationAvailability();
+        //
+        // Busy before the check is awaited: a second click on Purge meanwhile
+        // would otherwise pass the IsBusy test above and purge the same items twice.
+        IsPurging = true;
+        await RefreshRecordsElsewhereAsync();
         if (IsDestinationUnavailable)
         {
-            string msg =
-                $"Destination not connected ({_targetDir}) — nothing was cleaned. " +
-                "Connect the drive and run the cleanup again; marking the catalog " +
-                "without deleting the backed-up files would free no space and would " +
-                "hide those files from the catalog scan.";
+            IsPurging = false;
+            string msg = _recordsElsewhere is { } elsewhere
+                ? $"Some of this set's backed-up files are recorded in {elsewhere}, not in its backup " +
+                  $"folder ({_targetDir}), so nothing was cleaned: the cleanup would retire their records " +
+                  "without deleting their files."
+                : $"Destination not connected ({_targetDir}) — nothing was cleaned. " +
+                  "Connect the drive and run the cleanup again; marking the catalog " +
+                  "without deleting the backed-up files would free no space and would " +
+                  "hide those files from the catalog scan.";
             SummaryText = msg;
             LastCleanupResultText = $"Last cleanup at {DateTime.Now:HH:mm:ss}: {msg}";
             return;
@@ -2282,7 +2338,6 @@ public class OrphanedDirectoriesViewModel : ViewModelBase, IConfirmClose, IDispo
         _purgeCts = new CancellationTokenSource();
         var ct = _purgeCts.Token;
 
-        IsPurging = true;
         LastCleanupResultText = "";
 
         // Every stage shows in BOTH lines - the header and the line beside Close -
@@ -2830,6 +2885,11 @@ public class OrphanedDirectoriesViewModel : ViewModelBase, IConfirmClose, IDispo
     // Catalog reconcile (dry-run analyze, then explicit apply)
     // ------------------------------------------------------------------
 
+    /// <summary>Why a reconcile was not started: the backup folder is missing, or the set's records are elsewhere.</summary>
+    private string ReconcileRefusalText => _recordsElsewhere is null
+        ? $"Destination not connected: {_targetDir} - connect it and analyze again."
+        : DestinationUnavailableText;
+
     /// <summary>
     /// Dry run: walk the catalog against the destination and report how many
     /// stale <c>.fileref</c> rows would be flipped to plain and how many
@@ -2842,16 +2902,18 @@ public class OrphanedDirectoriesViewModel : ViewModelBase, IConfirmClose, IDispo
             return;
 
         // Reconcile compares the catalog against the destination, so an absent
-        // destination would make every active row look like missing content.
-        RefreshDestinationAvailability();
+        // destination - or records kept in another folder - would make those rows
+        // look like missing content. Busy before the check is awaited, so that
+        // nothing else starts meanwhile.
+        IsReconciling = true;
+        await RefreshRecordsElsewhereAsync();
         if (!_destinationAvailable)
         {
-            ReconcileStatusText =
-                $"Destination not connected: {_targetDir} - connect it and analyze again.";
+            IsReconciling = false;
+            ReconcileStatusText = ReconcileRefusalText;
             return;
         }
 
-        IsReconciling = true;
         SetReconcileReport(null);
         ReconcileStatusText = "Analyzing catalog against destination...";
 
@@ -2922,15 +2984,15 @@ public class OrphanedDirectoriesViewModel : ViewModelBase, IConfirmClose, IDispo
         // The report was computed against a destination that may since have been
         // unplugged; applying it then would prune rows whose content is merely
         // unreachable.
-        RefreshDestinationAvailability();
+        IsReconciling = true;
+        await RefreshRecordsElsewhereAsync();
         if (!_destinationAvailable)
         {
-            ReconcileStatusText =
-                $"Destination not connected: {_targetDir} - connect it and analyze again.";
+            IsReconciling = false;
+            ReconcileStatusText = ReconcileRefusalText;
             return;
         }
 
-        IsReconciling = true;
         ReconcileStatusText = "Applying reconcile...";
 
         try

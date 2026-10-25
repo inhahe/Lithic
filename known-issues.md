@@ -13,13 +13,27 @@ retention offer; none of the author's sets uses the option. All of them now go
 through `JobOptions.BackupRoot`. Pinned by `tools\excess_versions_test` §21 and
 `tools\worker_idle_test` C11, each failing with its half of the fix reverted.
 
-**Open:** a set that used the option and was backed up by the Worker before the
-fix keeps those copies in the destination itself: their records still restore
-(each disc record names the folder it was written to), but they are outside the
-backup folder, so Cleanup's destination scan does not see them, and a file the
-Worker wrote there gets its next version in the subfolder without its copy being
-moved to the history. Clearing the set's history and seeding from the subfolder,
-then deleting the stray tree by hand, is the clean way out.
+**Open, but guarded:** a set that used the option and was backed up by the Worker
+before the fix keeps those copies in the destination itself. Their records still
+restore, since each disc record names the folder it was written to. Such a set is
+now refused by the Worker (and held), by backing up and removing dropped sources
+in the app, by the retention offer and by Cleanup, each saying why (design.md,
+"Nothing works in the backup folder while live records belong to another"). No build
+since the fix writes such copies; to sort out a set that already has them, clear
+its history and seed from the subfolder, then delete the
+stray tree by hand. Nothing does it for the user; no set of the author's needs it.
+The guard came out of the Opus review of the fix, which found that the fix alone
+left these sets to lose their earlier versions quietly.
+
+**Open: two sets with the same backup folder.** Two sets with one destination and
+no subfolder (or the same subfolder) share a backup folder, and nothing stops
+it. Each set's Cleanup destination scan then lists the other set's files as
+untracked, offering them for deletion. A set *nested* inside another's folder is
+handled: the outer set's scan skips it. The proper fix needs a decision: refuse
+(or warn about) a backup folder that equals or overlaps another set's when the
+editor saves, or have the destination scan treat every set's live records in that
+folder as tracked (reading each such set's catalog). Neither of the author's sets
+shares a folder.
 
 **Also noticed:** `BackupJobViewModel` (the old new-set wizard) is never
 constructed; only its two static exclusion-pattern helpers are used. Its view

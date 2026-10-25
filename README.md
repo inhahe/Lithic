@@ -9,7 +9,7 @@ Lithic Backup is designed to make optical media backups practical and painless �
 ### Backup Targets
 
 - **Optical media** — CD, DVD, Blu-Ray, and M-Disc with full IMAPI2 burning support
-- **Directory** — any local, external, or network-attached folder. Tick **Create subdirectory** in the set's editor to keep its backup in a folder of its own inside it; every part of the app — backups started in the app or by the background service, Cleanup, Verify, Restore — then works in that folder.
+- **Directory** — any local, external, or network-attached folder. Tick **Create subdirectory** in the set's editor to keep its backup in a folder of its own inside it; every part of the app — backups started in the app or by the background service, Cleanup, Verify, Restore — then works in that folder. If some of a set's backed-up files are recorded in another folder than its backup folder (its subfolder setting was changed, or its destination was retyped rather than moved with **Change Destination**), LithicBackup neither backs it up nor deletes anything from it until that is put right, and says how. The set's editor asks before saving a change that would cause this.
 
 ### Disc Storage
 

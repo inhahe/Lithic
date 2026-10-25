@@ -200,6 +200,19 @@ public interface ICatalogRepository : IDisposable
         int backupSetId, IReadOnlyCollection<long> ids, CancellationToken ct = default);
 
     /// <summary>
+    /// A folder other than <paramref name="backupRoot"/> that live records of the
+    /// set were written to (a directory disc record's label), or null when every
+    /// live record belongs to the backup folder. Drive letters are not compared:
+    /// a drive that moved to another letter holds the same folder. Anything about
+    /// to write to, or delete from, the backup folder must ask: records written
+    /// elsewhere are invisible there, and a backup or purge working there loses
+    /// track of them (a subfolder changed in the editor, a destination retyped
+    /// rather than changed with Change Destination, a Worker before 1.18 that
+    /// ignored "Create subdirectory").
+    /// </summary>
+    Task<string?> FindLiveRecordsOutsideAsync(int backupSetId, string backupRoot, CancellationToken ct = default);
+
+    /// <summary>
     /// Get lightweight version info for the latest version of each file in a
     /// backup set. Returns one entry per unique SourcePath with the max version
     /// and its metadata. Much cheaper than <see cref="GetAllFilesForBackupSetAsync"/>.

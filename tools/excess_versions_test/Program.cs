@@ -291,6 +291,129 @@ internal static class Program
         await PreviousVersionsIndexAsync(root);
         TierWalk();
         await CleanupInSubfolderAsync(root);
+        await RecordsElsewhereAsync(root);
+    }
+
+    /// <summary>
+    /// §22. Records written to a folder other than the backup folder (a subfolder
+    /// changed, a destination retyped, the old Worker beside the subfolder) are
+    /// found - ignoring drive letters and retired records - and Cleanup will not
+    /// purge such a set. And Cleanup's destination scan leaves another set's
+    /// backup folder inside this one alone, instead of listing it all as untracked.
+    /// </summary>
+    static async Task RecordsElsewhereAsync(string root)
+    {
+        Console.WriteLine();
+        Console.WriteLine("=== 22. Records written elsewhere stop a purge; another set's folder inside is not scanned ===");
+        string dir = Path.Combine(root, "cat22");
+        Directory.CreateDirectory(dir);
+        using var repo = new SqliteCatalogRepository(Path.Combine(dir, "catalog.db"));
+
+        // --- the catalog check ---
+        var probe = await repo.CreateBackupSetAsync(new BackupSet
+        {
+            Name = "probe", SourceRoots = [@"D:\src"], CreatedUtc = DateTime.UtcNow, DefaultMediaType = MediaType.Directory,
+        });
+        async Task<DiscRecord> Disc(int setId, string label) => await repo.CreateDiscAsync(new DiscRecord
+        {
+            BackupSetId = setId, Label = label, SequenceNumber = 1, MediaType = MediaType.Directory,
+            Status = BurnSessionStatus.Completed, CreatedUtc = DateTime.UtcNow,
+        });
+        async Task Record(DiscRecord d, string discPath, bool deleted = false) => await repo.CreateFileRecordAsync(new FileRecord
+        {
+            DiscId = d.Id, SourcePath = @"D:\src\" + Path.GetFileName(discPath), DiscPath = discPath, SizeBytes = 1,
+            Hash = "", IsDeleted = deleted, SourceLastWriteUtc = DateTime.UtcNow, BackedUpUtc = DateTime.UtcNow,
+        });
+        await Record(await Disc(probe.Id, @"H:\lithicbackup"), @"D\src\a.txt");
+        await Record(await Disc(probe.Id, @"F:\lithicbackup\"), @"D\src\b.txt");       // same folder, old letter
+        await Record(await Disc(probe.Id, "i:/lithicbackup"), @"D\src\c.txt");         // and other separators
+        await Record(await Disc(probe.Id, @"H:\lithicbackup\Sub"), @"D\src\d.txt", deleted: true); // only retired
+        Check(await repo.FindLiveRecordsOutsideAsync(probe.Id, @"H:\lithicbackup") is null,
+            "a drive moved to another letter, other separators and retired records are not 'elsewhere'");
+        Check(await repo.FindLiveRecordsOutsideAsync(probe.Id, @"H:\lithicbackup\Sub") is { } other
+              && other.StartsWith(@"H:\lithicbackup", StringComparison.OrdinalIgnoreCase),
+            "with the subfolder as the backup folder, the records beside it are found");
+        await Record(await Disc(probe.Id, @"H:\lithicbackup\Sub"), @"D\src\e.txt");
+        Check(await repo.FindLiveRecordsOutsideAsync(probe.Id, @"G:\lithicbackup") is not null
+              && await repo.FindLiveRecordsOutsideAsync(probe.Id, @"G:\elsewhere") is not null,
+            "a live record in the subfolder is elsewhere from the folder above, and anything is from another folder");
+
+        // --- Change Destination relabels what the check counts as the old folders ---
+        // The backup folder H:\lithicbackup\Sub moves to J:\moved\Sub; the folder
+        // above it (an older Worker's runs) goes along to J:\moved.
+        var relabelled = await repo.CreateBackupSetAsync(new BackupSet
+        {
+            Name = "relabelled", SourceRoots = [@"D:\src"], CreatedUtc = DateTime.UtcNow, DefaultMediaType = MediaType.Directory,
+        });
+        await Record(await Disc(relabelled.Id, @"H:\lithicbackup\Sub"), @"D\src\g.txt");
+        await Record(await Disc(relabelled.Id, @"F:\lithicbackup\Sub\"), @"D\src\h.txt");   // before a letter change
+        await Record(await Disc(relabelled.Id, @"F:\lithicbackup"), @"D\src\i.txt");        // an older Worker's run
+        await Record(await Disc(relabelled.Id, @"Z:\unrelated"), @"D\src\j.txt");
+        await LithicBackup.ViewModels.MainViewModel.RelabelDiscsAfterMoveAsync(repo, relabelled.Id,
+            @"H:\lithicbackup\Sub", @"H:\lithicbackup", @"J:\moved\Sub", @"J:\moved");
+        var labels = (await repo.GetDiscsForBackupSetAsync(relabelled.Id)).Select(d => d.Label).ToList();
+        Check(labels.SequenceEqual([@"J:\moved\Sub", @"J:\moved\Sub", @"J:\moved", @"Z:\unrelated"]),
+            $"Change Destination relabels the old folders on any drive letter, and nothing else ({string.Join(", ", labels)})");
+        // A set like the author's: one folder, recorded under two drive letters.
+        var twoLetters = await repo.CreateBackupSetAsync(new BackupSet
+        {
+            Name = "two letters", SourceRoots = [@"D:\src"], CreatedUtc = DateTime.UtcNow, DefaultMediaType = MediaType.Directory,
+        });
+        await Record(await Disc(twoLetters.Id, @"H:\lithicbackup"), @"D\src\k.txt");
+        await Record(await Disc(twoLetters.Id, @"F:\lithicbackup"), @"D\src\l.txt");
+        await LithicBackup.ViewModels.MainViewModel.RelabelDiscsAfterMoveAsync(repo, twoLetters.Id,
+            @"H:\lithicbackup", @"H:\lithicbackup", @"J:\moved", @"J:\moved");
+        Check(await repo.FindLiveRecordsOutsideAsync(twoLetters.Id, @"J:\moved") is null,
+            "after it, a set recorded under two drive letters of one folder has nothing elsewhere");
+
+        // --- Cleanup refuses to purge such a set ---
+        string dest = Path.Combine(dir, "dst");
+        Directory.CreateDirectory(dest);
+        var moved = await repo.CreateBackupSetAsync(new BackupSet
+        {
+            Name = "moved", SourceRoots = [@"D:\src"], CreatedUtc = DateTime.UtcNow, DefaultMediaType = MediaType.Directory,
+            JobOptions = new JobOptions { TargetDirectory = dest, CreateSubdirectory = true, SubdirectoryName = "Sub" },
+        });
+        Directory.CreateDirectory(Path.Combine(dest, "Sub"));
+        await Record(await Disc(moved.Id, dest), @"D\src\f.txt");   // written beside the subfolder
+        var vm = new OrphanedDirectoriesViewModel(repo, moved);
+        vm.ScanCatalogCommand.Execute(null);
+        await WaitFor(() => !vm.IsLoading, 60000);
+        Check(vm.IsDestinationUnavailable && vm.DestinationUnavailableText.Contains("recorded in", StringComparison.Ordinal),
+            $"Cleanup treats the backup folder as unusable, and says why (\"{vm.DestinationUnavailableText}\")");
+        Check(!vm.ScanDestinationCommand.CanExecute(null), "and offers no destination scan");
+
+        // --- another set's backup folder inside this one is not scanned ---
+        string shared = Path.Combine(dir, "shared");
+        var outer = await repo.CreateBackupSetAsync(new BackupSet
+        {
+            Name = "outer", SourceRoots = [@"D:\src"], CreatedUtc = DateTime.UtcNow, DefaultMediaType = MediaType.Directory,
+            JobOptions = new JobOptions { TargetDirectory = shared },
+        });
+        await repo.CreateBackupSetAsync(new BackupSet
+        {
+            Name = "inner", SourceRoots = [@"D:\src"], CreatedUtc = DateTime.UtcNow, DefaultMediaType = MediaType.Directory,
+            JobOptions = new JobOptions { TargetDirectory = shared, CreateSubdirectory = true, SubdirectoryName = "Inner" },
+        });
+        string innerFile = Path.Combine(shared, "Inner", "D", "src", "inner.txt");
+        string strayFile = Path.Combine(shared, "D", "src", "stray.txt");
+        Directory.CreateDirectory(Path.GetDirectoryName(innerFile)!);
+        Directory.CreateDirectory(Path.GetDirectoryName(strayFile)!);
+        await File.WriteAllTextAsync(innerFile, "the inner set's copy");
+        await File.WriteAllTextAsync(strayFile, "untracked in outer");
+        var outerVm = new OrphanedDirectoriesViewModel(repo, outer);
+        outerVm.ScanCatalogCommand.Execute(null);
+        await WaitFor(() => !outerVm.IsLoading, 60000);
+        outerVm.ScanDestinationCommand.Execute(null);
+        await WaitFor(() => outerVm.IsScanningDestination, 3000);
+        await WaitFor(() => !outerVm.IsScanningDestination, 60000);
+        var untracked = outerVm.Items.Where(i => i.Reason == OrphanedReason.UntrackedFile)
+            .SelectMany(i => i.DiscFilePaths ?? []).ToList();
+        Check(untracked.Any(p => p.EndsWith("stray.txt", StringComparison.OrdinalIgnoreCase)),
+            $"the outer set's own untracked file is found ({string.Join(", ", untracked)})");
+        Check(!untracked.Any(p => p.Contains(@"Inner\", StringComparison.OrdinalIgnoreCase)),
+            "the inner set's backup folder is not scanned, so none of its files is offered for deletion");
+        Microsoft.Data.Sqlite.SqliteConnection.ClearAllPools();
     }
 
     /// <summary>
@@ -1224,10 +1347,16 @@ internal static class Program
         Row(OrphanedReason.DeletedFromDisk, "keep-me.txt").IsChecked = false;
         Row(OrphanedReason.UntrackedFile, "stray-keep.txt").IsChecked = false;
 
+        // A double click: the second must find the window busy, though the first
+        // is still awaiting its check of where the set's records are.
+        vm.PurgeSelectedCommand.Execute(null);
+        bool busyAtOnce = vm.IsPurging;
         vm.PurgeSelectedCommand.Execute(null);
         await WaitFor(() => vm.IsPurging, 3000);
         await WaitFor(() => !vm.IsPurging, 60000);
         Check(!vm.IsPurging, $"the purge finished (\"{vm.SummaryText}\")");
+        Check(busyAtOnce && calls.Count(c => c == "begin") == 1,
+            $"a second click while the first starts does not purge again (busy at once: {busyAtOnce}, purges: {calls.Count(c => c == "begin")})");
         Check(vm.SummaryText.Contains("left 2 files alone", StringComparison.Ordinal),
             "and says it left two files alone: one backed up again since the scan, one back on disk");
         Check(vm.SummaryText.Contains("kept 1 stored file", StringComparison.Ordinal),

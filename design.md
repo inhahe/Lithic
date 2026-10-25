@@ -1443,6 +1443,49 @@ old destination itself. Pinned by `tools\excess_versions_test` §21 (Cleanup
 deletes in the subfolder and never the same path beside it) and
 `tools\worker_idle_test` C11.
 
+**Nothing works in the backup folder while live records belong to another.**
+`ICatalogRepository.FindLiveRecordsOutsideAsync` returns the label of a disc
+holding live records whose folder is not the set's backup folder. That happens
+when the subfolder setting or name changed, when the destination was retyped in
+the editor rather than moved with Change Destination, or when an older Worker
+wrote beside the subfolder (above). A backup into the backup folder would not find
+those copies, so each changed file's earlier versions would lose their files.
+Cleanup, removing dropped sources and the retention offer delete in the backup
+folder, so they would retire those records and leave their files behind. Reconcile
+would see them as missing and prune them. So:
+
+* **the Worker** refuses the set at all three of its paths (full, targeted,
+  moves), holds its automated backups and logs once (`RefuseBackupElsewhereAsync`);
+  moves stay queued;
+* **backing up in the app** explains in a "Backup Folder Changed" box, and so does
+  **removing dropped sources**, which asks before its review rather than after;
+* **the retention offer** is not made, and the status bar says why;
+* **the editor** asks ("Change Backup Folder") before a save that moves the
+  backup folder (destination, "Create subdirectory", subfolder name) while files
+  are recorded outside the new one: on the Save button, at Yes on the close
+  prompt (No keeps the editor open) and before seeding. The save at File > Exit
+  cannot ask and is left to the refusals;
+* **Cleanup** treats the backup folder as unusable, with a banner saying why: no
+  purge, destination scan or reconcile.
+
+Each asks again at the moment it acts, and Cleanup raises its busy flag before
+asking, so that a second click cannot start a second purge. A failed check counts
+as a refusal. "Another folder" ignores the drive letter, since a drive followed to
+a new letter is relabelled by nothing. `JobOptions.SameFolderOnAnyDrive` and
+`FolderWithoutDrive` are the definition, which the SQL mirrors. Change Destination
+relabels by the same rule (`MainViewModel.RelabelDiscsAfterMoveAsync`), so a set
+recorded under two letters of one folder comes out of a move whole. The way out is
+the message's: move with Change Destination, put the subfolder setting back, or
+clear the set's history and start afresh. A set with records both in and beside
+its subfolder has only the last.
+
+**Another set's backup folder inside this one is not Cleanup's.** The destination
+scan skips every other set's backup folder that lies strictly inside this set's,
+since their files are in no catalog it reads and would all be offered as
+untracked. Two sets sharing exactly one folder are not handled. Pinned by
+`tools\excess_versions_test` §22, `tools\worker_idle_test` C12-C14 and
+`tools\editor_save_test` §26.
+
 ## An empty catalog is not an empty destination
 
 The engine numbers a file's versions from the catalog (`GetLastVersionAsync`,
