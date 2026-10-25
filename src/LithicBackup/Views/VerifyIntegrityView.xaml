@@ -19,9 +19,9 @@
             </TextBlock>
         </StackPanel>
 
-        <!-- Loading / progress indicator -->
+        <!-- Progress, while verifying or flagging files for re-backup -->
         <StackPanel DockPanel.Dock="Top" Margin="0,0,0,12"
-                    Visibility="{Binding IsLoading, Converter={StaticResource BoolToVis}}">
+                    Visibility="{Binding IsBusy, Converter={StaticResource BoolToVis}}">
             <ProgressBar IsIndeterminate="{Binding IsProgressIndeterminate}"
                          Minimum="0" Maximum="100"
                          Value="{Binding ProgressPercent, Mode=OneWay}"
@@ -77,8 +77,9 @@
             </ScrollViewer.Style>
 
             <StackPanel>
-                <!-- Stats grid -->
-                <Border Style="{StaticResource Card}" Padding="16,12" Margin="0,0,0,12">
+                <!-- Stats grid, once a verification has run -->
+                <Border Style="{StaticResource Card}" Padding="16,12" Margin="0,0,0,12"
+                        Visibility="{Binding HasRun, Converter={StaticResource BoolToVis}}">
                     <Grid>
                         <Grid.ColumnDefinitions>
                             <ColumnDefinition Width="*" />

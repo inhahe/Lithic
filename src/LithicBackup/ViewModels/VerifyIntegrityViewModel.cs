@@ -1,6 +1,7 @@
 using System.Collections.ObjectModel;
 using System.IO;
 using System.Windows.Input;
+using LithicBackup.Core;
 using LithicBackup.Core.Interfaces;
 using LithicBackup.Core.Models;
 using LithicBackup.Services;
@@ -21,13 +22,18 @@ public class VerifyIntegrityViewModel : ViewModelBase, IDisposable
     private readonly IFileScanner _scanner;
     private readonly BackupSet _backupSet;
 
-    // False until a run starts: the constructor's start is refused while a run
-    // is loading, and so is the Verify button.
+    // False until a run starts: the Verify button is refused while a run is loading.
     private bool _isLoading;
+    private bool _hasRun;
     private bool _isProgressIndeterminate = true;
     private double _progressPercent;
     private string _progressText = "Preparing verification...";
-    private string _summaryText = "";
+    // Nothing runs until the user has chosen how thoroughly to verify.
+    private string _summaryText =
+        "Choose how to verify, then press Verify. It checks that every source file is in the backup "
+        + "and every backed-up file is still there. With \"Verify file contents\" ticked it also reads "
+        + "every backed-up file back and re-hashes it, catching silent corruption - as long as reading "
+        + "the whole backup takes.";
     private bool _succeeded;
 
     private int _sourceFilesChecked;
@@ -73,8 +79,6 @@ public class VerifyIntegrityViewModel : ViewModelBase, IDisposable
 
         RepairCommand = new RelayCommand(async _ => await RepairAsync(), _ => CanRepair);
         VerifyCommand = new RelayCommand(async _ => await RunVerificationAsync(), _ => CanVerify);
-
-        _ = RunVerificationAsync();
     }
 
     // --- Properties ---
@@ -87,8 +91,21 @@ public class VerifyIntegrityViewModel : ViewModelBase, IDisposable
         private set
         {
             if (SetProperty(ref _isLoading, value))
+            {
                 OnPropertyChanged(nameof(CanVerify));
+                OnPropertyChanged(nameof(IsBusy));
+            }
         }
+    }
+
+    /// <summary>Whether a verification or a repair is under way: the progress line shows.</summary>
+    public bool IsBusy => _isLoading || _isRepairing;
+
+    /// <summary>Whether a verification has finished, so there are results to show.</summary>
+    public bool HasRun
+    {
+        get => _hasRun;
+        private set => SetProperty(ref _hasRun, value);
     }
 
     public bool IsProgressIndeterminate
@@ -206,6 +223,7 @@ public class VerifyIntegrityViewModel : ViewModelBase, IDisposable
             {
                 OnPropertyChanged(nameof(CanRepair));
                 OnPropertyChanged(nameof(CanVerify));
+                OnPropertyChanged(nameof(IsBusy));
             }
         }
     }
@@ -338,6 +356,7 @@ public class VerifyIntegrityViewModel : ViewModelBase, IDisposable
                 return;
             }
 
+            HasRun = true;
             SourceFilesChecked = result.SourceFilesChecked;
             RecordsChecked = result.RecordsChecked;
             FileRefsChecked = result.FileRefsChecked;
@@ -424,35 +443,62 @@ public class VerifyIntegrityViewModel : ViewModelBase, IDisposable
         if (!CanRepair)
             return;
 
+        var paths = _repairablePaths.ToList();
+        string? targetDir = _verifiedTargetDir;
+        int setId = _backupSet.Id;
         IsRepairing = true;
+        IsProgressIndeterminate = false;
+        ProgressPercent = 0;
+        ProgressText = $"Finding the backed-up copies of {paths.Count:N0} file(s)...";
         CommandManager.InvalidateRequerySuggested();
+        var progress = new Progress<(double Percent, string Text, bool Indeterminate)>(p =>
+        {
+            ProgressPercent = p.Percent;
+            ProgressText = p.Text;
+            IsProgressIndeterminate = p.Indeterminate;
+        });
         try
         {
-            // Every live record of the paths, and which of them may be kept for
-            // another file's .fileref: an intact earlier version may - its file is
-            // there - but not the current copy, which must go for the next backup
-            // to copy the file again (and that copy is a copy of the content too).
-            var candidates = new List<long>();
-            var keepable = new List<long>();
-            foreach (var path in _repairablePaths)
+            // Off the UI thread: one catalog query per file and a file check per
+            // copy, tens of thousands of each on a large set.
+            var (marked, kept) = await Task.Run(async () =>
             {
-                var live = (await _catalog.GetFileRecordsByPathAsync(_backupSet.Id, path))
-                    .Where(r => !r.IsDeleted).ToList();
-                long newest = live.Count == 0 ? -1 : live.MaxBy(r => r.Version)!.Id;
-                foreach (var r in live)
+                IProgress<(double, string, bool)> report = progress;
+                var cadence = new ProgressCadence();
+
+                // Every live record of the paths, and which of them may be kept for
+                // another file's .fileref: an intact earlier version may - its file
+                // is there - but not the current copy, which must go for the next
+                // backup to copy the file again (and that copy is a copy of the
+                // content too).
+                var candidates = new List<long>();
+                var keepable = new List<long>();
+                for (int i = 0; i < paths.Count; i++)
                 {
-                    candidates.Add(r.Id);
-                    if (r.Id != newest && _verifiedTargetDir is not null
-                        && File.Exists(Path.Combine(_verifiedTargetDir, r.DiscPath)))
-                        keepable.Add(r.Id);
+                    var live = (await _catalog.GetFileRecordsByPathAsync(setId, paths[i]))
+                        .Where(r => !r.IsDeleted).ToList();
+                    long newest = live.Count == 0 ? -1 : live.MaxBy(r => r.Version)!.Id;
+                    foreach (var r in live)
+                    {
+                        candidates.Add(r.Id);
+                        if (r.Id != newest && targetDir is not null
+                            && File.Exists(Path.Combine(targetDir, r.DiscPath)))
+                            keepable.Add(r.Id);
+                    }
+                    if (cadence.IsDue())
+                        report.Report((100.0 * (i + 1) / paths.Count,
+                            $"Finding the backed-up copies of the files ({i + 1:N0} of {paths.Count:N0})\n{paths[i]}",
+                            false));
                 }
-            }
-            var kept = await _catalog.RetireRecordsKeepingNeededCopiesAsync(_backupSet.Id, candidates, keepable);
-            int marked = candidates.Count - kept.Count;
+
+                report.Report((100, $"Updating the catalog: flagging {candidates.Count:N0} record(s)...", true));
+                var stillNeeded = await _catalog.RetireRecordsKeepingNeededCopiesAsync(setId, candidates, keepable);
+                return (candidates.Count - stillNeeded.Count, stillNeeded.Count);
+            });
             Repaired = true;
             SummaryText = $"Flagged {marked:N0} file(s) for re-backup"
-                + (kept.Count > 0
-                    ? $", keeping {kept.Count:N0} earlier cop{(kept.Count == 1 ? "y" : "ies")} that duplicate-file references still need. "
+                + (kept > 0
+                    ? $", keeping {kept:N0} earlier cop{(kept == 1 ? "y" : "ies")} that duplicate-file references still need. "
                     : ". ")
                 + "Close this window and run Backup to copy them to the destination again.";
         }

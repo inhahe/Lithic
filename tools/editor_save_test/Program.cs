@@ -306,14 +306,16 @@ internal static class Program
     }
 
     /// <summary>
-    /// 24: Verify Integrity verifies when its window opens, and says so as it
-    /// goes: the run it starts on opening finishes, and Verify is available
-    /// again after it.
+    /// 24: Verify Integrity opens waiting for the user to choose how thoroughly to
+    /// verify, with "verify file contents" available, and says what to do; the
+    /// Verify button runs it with the choice made, and it finishes, with Verify
+    /// available again after it. (It used to start on opening, so the choice
+    /// could only be made for a second run.)
     /// </summary>
     static async Task VerifyStartsAsync()
     {
         Console.WriteLine();
-        Console.WriteLine("=== 24. Verify Integrity verifies when its window opens ===");
+        Console.WriteLine("=== 24. Verify Integrity lets the user choose, then verifies ===");
         var row = _vm.BackupSets.First(r => r.Id == _setId);
         _vm.SetVerifyIntegrityCommand.Execute(row);
         TaskWindow? win = null;
@@ -322,12 +324,48 @@ internal static class Program
             "the Verify Integrity window opened");
         if (win is null) return;
         MoveOffscreen(win);
+        var verify = (VerifyIntegrityViewModel)win.Flow!;
+        await Task.Delay(1000);
+        Check(!verify.IsLoading && !verify.HasRun && verify.CanVerify
+              && verify.SummaryText.StartsWith("Choose how to verify", StringComparison.Ordinal),
+            $"it waits for a choice, and says so (\"{verify.SummaryText}\")");
+        verify.VerifyContents = true;
+        verify.VerifyCommand.Execute(null);
         // Its steps' reports are verify_progress_test's to check; this small set
         // can finish before anything here could watch them.
-        var verify = (VerifyIntegrityViewModel)win.Flow!;
-        bool finished = await WaitFor(() => !verify.IsLoading && verify.SummaryText.Length > 0, 30000);
-        Check(finished, $"it verified, and finished (\"{verify.SummaryText}\"; showing \"{verify.ProgressText}\")");
+        bool finished = await WaitFor(() => verify.HasRun && !verify.IsLoading, 30000);
+        Check(finished && verify.ContentsWereVerified,
+            $"Verify ran with the choice made - contents read and re-hashed (\"{verify.SummaryText}\"; showing \"{verify.ProgressText}\")");
         Check(verify.CanVerify, "and Verify is available again");
+
+        // A backed-up file gone from the destination: found, and flagged for the
+        // next backup to copy again, with the window saying how far it has got
+        // and what it did.
+        var set = await DbSetAsync();
+        string root = set.JobOptions!.BackupRoot()!;
+        var victim = (await _observer.GetAllFilesForBackupSetAsync(_setId))
+            .FirstOrDefault(r => !r.IsDeleted && !r.IsFileRef && File.Exists(Path.Combine(root, r.DiscPath)));
+        Check(victim is not null, "the set has a backed-up file to lose");
+        if (victim is not null)
+        {
+            File.Delete(Path.Combine(root, victim.DiscPath));
+            verify.VerifyContents = false;
+            verify.VerifyCommand.Execute(null);
+            Check(await WaitFor(() => verify.HasRun && !verify.IsLoading && verify.RepairableCount > 0, 30000),
+                $"Verify finds the missing file and offers to back it up again ({verify.RepairableCount} offered)");
+            bool sawProgress = false;
+            verify.PropertyChanged += (_, e) =>
+            {
+                if (e.PropertyName == nameof(VerifyIntegrityViewModel.IsBusy) && verify.IsBusy)
+                    sawProgress = true;
+            };
+            verify.RepairCommand.Execute(null);
+            Check(await WaitFor(() => verify.Repaired && !verify.IsBusy, 30000) && sawProgress
+                  && verify.SummaryText.StartsWith("Flagged", StringComparison.Ordinal),
+                $"flagging shows progress while it runs, and says what it did (\"{verify.SummaryText}\")");
+            Check((await _observer.GetFileRecordsByPathAsync(_setId, victim.SourcePath)).All(r => r.IsDeleted),
+                "and the lost file's records are retired, so the next backup copies it again");
+        }
         win.Close();
         await WaitFor(() => !IsOpen(win), 5000);
     }
