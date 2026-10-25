@@ -995,6 +995,27 @@ internal sealed class SqliteSetDatabase : IDisposable
         return list;
     }
 
+    /// <summary>See <see cref="ICatalogRepository.GetLiveDiscPathsAsync"/>.</summary>
+    public async Task<Dictionary<long, string>> GetLiveDiscPathsAsync(
+        IReadOnlyCollection<long> ids, CancellationToken ct = default)
+    {
+        ct.ThrowIfCancellationRequested();
+        var result = new Dictionary<long, string>();
+        if (ids.Count == 0)
+            return result;
+        using var _ = await LockAsync(ct).ConfigureAwait(false);
+
+        using var cmd = _connection.CreateCommand();
+        cmd.CommandText = """
+            SELECT f.Id, f.DiscPath FROM Files f
+            WHERE f.IsDeleted = 0 AND f.Id IN (SELECT value FROM json_each($ids))
+            """;
+        cmd.Parameters.AddWithValue("$ids", System.Text.Json.JsonSerializer.Serialize(ids));
+        foreach (var r in Rows(cmd, ct))
+            result[r.GetInt64(0)] = r.GetString(1);
+        return result;
+    }
+
     public async Task ForEachDiscPathEntryAsync(
         int backupSetId,
         Action<string, bool, string> onEntry,

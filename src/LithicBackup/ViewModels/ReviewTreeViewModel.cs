@@ -26,6 +26,9 @@ public sealed class ReviewTreeNode
     public bool IsDirectory { get; set; }
     public long SizeBytes { get; set; }
 
+    /// <summary>Said after a file's name ("3 earlier versions"); null for none.</summary>
+    public string? Detail { get; set; }
+
     /// <summary>Count of file leaves at or below this node (directories only).</summary>
     public int FileCount { get; set; }
 
@@ -85,9 +88,10 @@ public sealed class ReviewTreeNode
 }
 
 /// <summary>
-/// View-model backing the read-only reconcile-review dialog used after a set's
-/// sources are edited: either the purge preview (files whose sources were
-/// removed) or the additions preview (files newly covered).  Builds a directory
+/// View-model backing the read-only reconcile-review dialog used after a set is
+/// edited: the purge preview (files whose sources were removed), the additions
+/// preview (files newly covered), or the earlier versions a retention change no
+/// longer keeps.  Builds a directory
 /// tree from a flat <c>(path, size)</c> list, collapsing single-child directory
 /// chains so a deeply-nested folder shows as one root row, and supports
 /// click-to-sort by Name, Files, or Size.
@@ -172,7 +176,7 @@ public sealed class ReviewTreeViewModel : ViewModelBase
     public static ReviewTreeViewModel ForRemoval(
         IReadOnlyList<(string SourcePath, long SizeBytes)> removedFiles)
     {
-        var (roots, fileCount, totalBytes) = BuildTree(removedFiles);
+        var (roots, fileCount, totalBytes) = BuildTree(removedFiles.Select(f => (f.SourcePath, f.SizeBytes, (string?)null)).ToList());
         string loc = roots.Count == 1 ? "location" : "locations";
         string files = fileCount == 1 ? "file" : "files";
         // Same promise on the removal side: only the listed copies are deleted,
@@ -193,7 +197,7 @@ public sealed class ReviewTreeViewModel : ViewModelBase
     public static ReviewTreeViewModel ForAdditions(
         IReadOnlyList<(string SourcePath, long SizeBytes)> addedFiles)
     {
-        var (roots, fileCount, totalBytes) = BuildTree(addedFiles);
+        var (roots, fileCount, totalBytes) = BuildTree(addedFiles.Select(f => (f.SourcePath, f.SizeBytes, (string?)null)).ToList());
         string loc = roots.Count == 1 ? "location" : "locations";
         string files = fileCount == 1 ? "file" : "files";
         // Say exactly what will happen: ONLY these files are copied. The backup
@@ -210,12 +214,37 @@ public sealed class ReviewTreeViewModel : ViewModelBase
             roots, header, "Back Up Added Sources", "Back up");
     }
 
+    /// <summary>
+    /// Build the preview of the earlier versions a set's retention settings no
+    /// longer keep, after an edit that changed them: one row per file, sized by
+    /// the versions of it that would go.
+    /// </summary>
+    /// <param name="files">Per source file: the bytes of its earlier versions that would go, and how many there are.</param>
+    public static ReviewTreeViewModel ForVersionsNotKept(
+        IReadOnlyList<(string SourcePath, long SizeBytes, int Versions)> files)
+    {
+        var (roots, fileCount, totalBytes) = BuildTree(files
+            .Select(f => (f.SourcePath, f.SizeBytes,
+                (string?)(f.Versions == 1 ? "1 earlier version" : $"{f.Versions:N0} earlier versions")))
+            .ToList());
+        int versions = files.Sum(f => f.Versions);
+        string fileWord = fileCount == 1 ? "file" : "files";
+        string header =
+            $"{versions:N0} earlier version{(versions == 1 ? "" : "s")} of {fileCount:N0} {fileWord} "
+            + $"({totalBytes:N0} bytes) {(versions == 1 ? "is" : "are")} no longer kept by this set's retention settings.\n\n"
+            + "Delete ONLY these earlier versions from the destination? Each file's current "
+            + "backed-up copy stays, and so does every earlier version the settings still keep. "
+            + "Your source files are not touched.";
+        return new ReviewTreeViewModel(
+            roots, header, "Remove Versions No Longer Kept", "Remove");
+    }
+
     // ------------------------------------------------------------------
     // Tree building
     // ------------------------------------------------------------------
 
     private static (List<ReviewTreeNode> Roots, int FileCount, long TotalBytes) BuildTree(
-        IReadOnlyList<(string SourcePath, long SizeBytes)> filesIn)
+        IReadOnlyList<(string SourcePath, long SizeBytes, string? Detail)> filesIn)
     {
         var dirs = new Dictionary<string, ReviewTreeNode>(StringComparer.OrdinalIgnoreCase);
         var roots = new List<ReviewTreeNode>();
@@ -238,7 +267,7 @@ public sealed class ReviewTreeViewModel : ViewModelBase
 
         int fileCount = 0;
         long totalBytes = 0;
-        foreach (var (path, size) in filesIn)
+        foreach (var (path, size, detail) in filesIn)
         {
             var dir = Path.GetDirectoryName(path);
             if (string.IsNullOrEmpty(dir))
@@ -251,6 +280,7 @@ public sealed class ReviewTreeViewModel : ViewModelBase
                 FullPath = path,
                 Name = Path.GetFileName(path),
                 SizeBytes = size,
+                Detail = detail,
             });
             fileCount++;
             totalBytes += size;
@@ -301,6 +331,8 @@ public sealed class ReviewTreeViewModel : ViewModelBase
         node.Name = isRoot ? node.FullPath : Path.GetFileName(node.FullPath.TrimEnd('\\'));
         if (string.IsNullOrEmpty(node.Name))
             node.Name = node.FullPath;
+        if (node.Detail is not null)
+            node.Name += $"  ({node.Detail})";
         foreach (var c in node.Children)
             FixNames(c, isRoot: false);
     }

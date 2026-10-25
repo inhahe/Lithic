@@ -62,9 +62,35 @@ public class JobOptions
     /// </summary>
     public List<SourceVolumeMapping> SourceVolumeMappings { get; set; } = [];
 
+    /// <summary>
+    /// Whether the backup lives in a folder of its own inside the destination,
+    /// named <see cref="SubdirectoryName"/>. See <see cref="BackupRoot"/>.
+    /// </summary>
     public bool CreateSubdirectory { get; set; }
     public string? SubdirectoryName { get; set; }
     public List<string> ExcludedExtensions { get; set; } = [];
+
+    /// <summary>
+    /// The folder the set's backup lives in: its stored files' destination-relative
+    /// paths start here. The destination, plus <see cref="SubdirectoryName"/> when
+    /// <see cref="CreateSubdirectory"/> is on and it names one. Every reader and
+    /// writer of the backup goes through this, so none can look in, or delete
+    /// from, the folder above.
+    /// </summary>
+    /// <param name="destination">
+    /// The destination as found just now (a drive followed to a new letter); null
+    /// for <see cref="TargetDirectory"/> as stored.
+    /// </param>
+    /// <returns>Null when the set has no destination (a disc set).</returns>
+    public string? BackupRoot(string? destination = null)
+    {
+        string? root = destination ?? TargetDirectory;
+        if (string.IsNullOrWhiteSpace(root))
+            return null;
+        return CreateSubdirectory && !string.IsNullOrWhiteSpace(SubdirectoryName)
+            ? System.IO.Path.Combine(root, SubdirectoryName.Trim())
+            : root;
+    }
 
     /// <summary>
     /// Automated backup schedule. Null or <c>Enabled = false</c> means

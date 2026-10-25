@@ -1572,14 +1572,16 @@ earlier version of a `KeepsNoHistory` file as not kept, newest included (the
 tiered rule "never delete the newest earlier version" exists to keep a rollback,
 which a set that keeps none has declined). Automatic retention deliberately still
 skips them: an edit to one setting should not have the next backup delete tens of
-gigabytes unreviewed. Cleanup's Excess Versions offers them for review. Excluded
-files' versions stay the exclusion category's.
+gigabytes unreviewed. Two places offer them for review: Cleanup's Excess Versions,
+and the editor straight after a retention change (below). Excluded files'
+versions stay the exclusion category's.
 
 **One tier walk.** `VersionRetentionService.SelectExpired` is the tier rule
 (youngest tier first; per tier keep its newest `MaxVersions`; never the file's
 newest earlier version), and `FindVersionsNotKept` is the policy around it for
 review (an empty Default's versions too; an excluded file's never). The backup's
-retention pass and Cleanup's Excess Versions both go through them. There were two hand copies of the walk; Cleanup's said it "replicates"
+retention pass, Cleanup's Excess Versions and the editor's offer all go through
+them. There were two hand copies of the walk; Cleanup's said it "replicates"
 the engine's, which is how copies drift.
 
 **Earlier versions have an index of their own.** `IX_Files_ActivePrevious` is a
@@ -1596,6 +1598,26 @@ while building this index is a full scan under it. The first reader builds it
 the other process's writers wait on the lock file, with no timeout, rather than
 failing on the busy timeout. Built once per set database; a caller can say why
 it waits (`onIndexing`).
+
+**After a retention change, the editor offers the versions it no longer keeps.**
+Without it they stayed until the user happened to open Cleanup (an emptied
+Default's for good). On a save whose retention settings differ from the editor's
+as it opened, `OfferToRemoveVersionsNoLongerKeptAsync` reads the set's earlier
+versions through the index, applies `FindVersionsNotKept`, drops the copies a
+`.fileref` needs, and shows the rest in the review tree. "Differ" compares
+`RetentionSignature`s of options built **through the editor** at both ends
+(`EditorJobOptions`, the same path `SyncSettingsToJobOptions` writes by): from the
+stored options, a load-and-save round trip that normalised anything would have
+offered removals after every save. It runs after the source reconcile, whose
+removals can take some of the same versions, is independent of
+`ReconcileAfterEditMode` (that setting gates a source scan that can take hours;
+this one reads an index, and the review tree is itself the question), and is
+skipped while the set is busy. The purge holds the set's row like the removal of
+dropped sources, then, in one transaction: re-reads the records by id
+(`GetLiveDiscPathsAsync`: one retired since is left alone, one a rename moved is
+deleted where it now is), retires them through `RetireRecordsKeepingNeededCopiesAsync`,
+and keeps any file a live record still points at; files are deleted after the
+commit. Pinned by `tools\editor_save_test` §25.
 
 **Cleanup must not delete a copy a `.fileref` needs.** A `.fileref` stores no
 bytes; it resolves by hash to an active plain copy. The engine's retention pass

@@ -191,6 +191,15 @@ public interface ICatalogRepository : IDisposable
         int backupSetId, Action? onIndexing = null, CancellationToken ct = default);
 
     /// <summary>
+    /// The current stored path of each of <paramref name="ids"/> that is still
+    /// live, by id; ids retired meanwhile are absent. For work that found records
+    /// earlier and is about to act on them: a rename can have moved a record's
+    /// stored file since.
+    /// </summary>
+    Task<Dictionary<long, string>> GetLiveDiscPathsAsync(
+        int backupSetId, IReadOnlyCollection<long> ids, CancellationToken ct = default);
+
+    /// <summary>
     /// Get lightweight version info for the latest version of each file in a
     /// backup set. Returns one entry per unique SourcePath with the max version
     /// and its metadata. Much cheaper than <see cref="GetAllFilesForBackupSetAsync"/>.

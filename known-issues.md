@@ -536,7 +536,9 @@ excess versions, catalog duplicates or manual-exclusion matches for the rest.
 
 **Open:**
 - Automatic retention still leaves the earlier versions of an emptied Default's
-  files; only Cleanup removes them, after review. By choice.
+  files; they are removed only after review. By choice. Since 1.18.0 the editor
+  offers that review itself, straight after the retention change is saved;
+  Cleanup's Excess Versions remains the way to remove them later.
 - Cleanup can hold back only excess versions. If the last plain copies of content
   a `.fileref` needs are all in other ticked categories (deleted from disk,
   removed from sources, excluded), the purge deletes them and that reference

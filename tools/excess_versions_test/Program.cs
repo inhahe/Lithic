@@ -296,7 +296,8 @@ internal static class Program
     /// §19. GetActivePreviousVersionsAsync: exactly the live earlier versions -
     /// the first path segment ending in _prev, either separator - read through an
     /// index of their own that the first call builds, so a whole-set retention
-    /// pass no longer reads every record to find them.
+    /// pass no longer reads every record to find them. GetLiveDiscPathsAsync:
+    /// only live ids, with their stored paths.
     /// </summary>
     static async Task PreviousVersionsIndexAsync(string root)
     {
@@ -369,6 +370,10 @@ internal static class Program
             Check(plan.Any(p => p.Contains("IX_Files_ActivePrevious", StringComparison.Ordinal)),
                 $"the read is planned through the index ({string.Join(" | ", plan)})");
         }
+
+        var livePaths = await repo.GetLiveDiscPathsAsync(set.Id, [prev.Id, current.Id, retired.Id, 999_999]);
+        Check(livePaths.Count == 2 && livePaths[prev.Id] == prev.DiscPath && livePaths[current.Id] == current.DiscPath,
+            "GetLiveDiscPathsAsync: live ids with their stored paths; retired and unknown ids left out");
         _ = deep; _ = preview;
     }
 

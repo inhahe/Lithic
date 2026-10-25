@@ -702,6 +702,13 @@ public class MainViewModel : ViewModelBase
         sourceSelection.SetName = backupSet.Name;
         RestoreSourceSettings(sourceSelection, backupSet.JobOptions);
 
+        // The retention settings as the editor will write them, before any edit:
+        // after a save, a different signature offers to remove the versions the
+        // new settings no longer keep. Taken through the editor, not from the
+        // stored options, because a save writes the tier sets from the editor: a
+        // round trip that changed nothing must compare equal.
+        string retentionBefore = RetentionSignature(EditorJobOptions(backupSet, sourceSelection));
+
         // Capture the clean baseline for the close prompt RIGHT NOW — synchronously,
         // before the dialog is ever shown — so a fast open/close can't beat it.  The
         // old capture point (the Phase 3 ContextIdle pass, after the multi-second
@@ -979,15 +986,22 @@ public class MainViewModel : ViewModelBase
             // of added folders cannot run until they finish. Folders added are
             // then picked up by the next backup, and copies of removed ones are
             // left for Cleanup.
+            // Then, if the retention settings changed, offer to remove the
+            // earlier versions they no longer keep - after the sources, whose
+            // removal can take some of those versions with it.
             if (savedThisSession && savedState is not null)
             {
                 if (RowFor(backupSet.Id)?.BusyActivity is { } busy)
                     StatusText = $"Saved \"{savedState.Name}\". It is still {busy}, so folders you added "
                                  + "will be backed up by its next backup, and backed-up copies of folders you "
-                                 + "removed are left for Cleanup.";
+                                 + "removed, and any earlier versions its retention settings no longer keep, "
+                                 + "are left for Cleanup.";
                 else
+                {
                     await ReconcileDestinationAfterEditAsync(
                         savedState, originalSelections, sourceSelection.ChangedSelectionPaths);
+                    await OfferToRemoveVersionsNoLongerKeptAsync(savedState, retentionBefore);
+                }
             }
         };
 
@@ -2106,6 +2120,226 @@ public class MainViewModel : ViewModelBase
         StatusText = parts.Count > 0
             ? "Removed sources: " + string.Join(", ", parts) + "."
             : "No destination files needed removal.";
+    }
+
+    // -------------------------------------------------------------------
+    // After a retention change: offer to remove the versions no longer kept
+    // -------------------------------------------------------------------
+
+    private const string RemovingVersionsNotKept = "removing earlier versions";
+
+    /// <summary>
+    /// After a saved edit that changed the set's retention settings: find the
+    /// earlier versions the new settings no longer keep
+    /// (<see cref="VersionRetentionService.FindVersionsNotKept"/>, as Cleanup's
+    /// Excess Versions) and offer, in the review tree, to delete them now. Without
+    /// it they stayed until the user happened to run Cleanup - and those of a
+    /// file that falls to an emptied Default, for good: the backup's own
+    /// retention pass never removes those unasked.
+    /// </summary>
+    /// <param name="set">The set as saved.</param>
+    /// <param name="retentionBefore"><see cref="RetentionSignature"/> of the editor as it opened.</param>
+    private async Task OfferToRemoveVersionsNoLongerKeptAsync(BackupSet set, string retentionBefore)
+    {
+        var opts = set.JobOptions;
+        if (opts is null || RetentionSignature(opts) == retentionBefore)
+            return;
+        string? root = opts.BackupRoot();
+        if (root is null)
+            return; // A disc set keeps no history folder.
+
+        // Before the scan, not just before the delete: offering what cannot be
+        // removed now helps nobody, and the purge refuses an absent destination.
+        if (!Services.DestinationFilePurger.IsAvailable(root))
+        {
+            StatusText = $"Saved \"{set.Name}\". Its destination ({root}) is not connected, so the earlier "
+                         + "versions its new retention settings no longer keep are left for Cleanup.";
+            return;
+        }
+
+        var (completed, notKept) = await Views.ProgressDialog.RunAsync(
+            Application.Current.MainWindow,
+            "Retention settings changed",
+            $"Looking for earlier versions \"{set.Name}\" no longer keeps…",
+            cancellable: true,
+            async (progress, ct) =>
+            {
+                var previous = await _catalog.GetActivePreviousVersionsAsync(set.Id,
+                    onIndexing: () => progress.Report(
+                        "Indexing this set's earlier versions. This happens once; on a large set it takes a minute or two…"),
+                    ct);
+                progress.Report($"Checking {previous.Count:N0} earlier versions against the new settings…");
+                var found = VersionRetentionService.FindVersionsNotKept(previous, opts, DateTime.UtcNow);
+                // As in Cleanup: the last copy of content a duplicate-file
+                // reference still needs is kept, and not listed.
+                if (found.Count > 0)
+                {
+                    var needed = await _catalog.GetNeededContentCopiesAsync(
+                        set.Id, found.Select(r => r.Id).ToList(), ct: ct);
+                    found.RemoveAll(r => needed.Contains(r.Id));
+                }
+                return found;
+            },
+            // Read-only, apart from building the index once.
+            modal: false);
+
+        if (!completed)
+        {
+            StatusText = "Cancelled. The earlier versions the new retention settings no longer keep were left in place.";
+            return;
+        }
+        if (notKept.Count == 0)
+        {
+            StatusText = $"Saved \"{set.Name}\". No earlier versions need removing under its new retention settings.";
+            return;
+        }
+
+        var dialog = new ReviewTreeDialog
+        {
+            Owner = Application.Current.MainWindow,
+            DataContext = ReviewTreeViewModel.ForVersionsNotKept(notKept
+                .GroupBy(r => r.SourcePath, StringComparer.OrdinalIgnoreCase)
+                .Select(g => (g.Key, g.Sum(r => r.SizeBytes), g.Count()))
+                .ToList()),
+        };
+        if (dialog.ShowDialog() != true)
+        {
+            StatusText = $"Left the earlier versions \"{set.Name}\" no longer keeps; Cleanup's Excess Versions "
+                         + "can remove them later.";
+            return;
+        }
+
+        // The review can take a while; the drive may have gone, or something
+        // started on the set.
+        if (!Services.DestinationFilePurger.IsAvailable(root))
+        {
+            StatusText = $"Destination not connected ({root}), so the earlier versions were left in place. "
+                         + "Connect it and remove them via Cleanup's Excess Versions.";
+            return;
+        }
+        var row = RowFor(set.Id);
+        if (row is { IsWorking: true })
+        {
+            StatusText = $"\"{set.Name}\" is {row.BusyActivity ?? "backing up"} right now, so the earlier versions "
+                         + "were left in place. Remove them via Cleanup's Excess Versions when that has finished.";
+            return;
+        }
+
+        // Hold the set's row, as the removal of dropped sources does: the Worker
+        // starts nothing on the set and stops what it is running, and this waits
+        // for that run to go.
+        string outcome = "";
+        bool failed = false;
+        BeginRowWork(row, RemovingVersionsNotKept,
+            "Removing the earlier versions its retention settings no longer keep…", cancel: null);
+        try
+        {
+            await WaitForBackgroundRunAsync(row, set.Id, "Removing earlier versions");
+            (outcome, failed) = await PurgeVersionsNoLongerKeptAsync(set.Id, notKept, root);
+        }
+        finally
+        {
+            EndRowWork(row, outcome, failed);
+        }
+        StatusText = outcome;
+        await LoadBackupSetsAsync();
+    }
+
+    /// <summary>
+    /// The removal itself, for <see cref="OfferToRemoveVersionsNoLongerKeptAsync"/>,
+    /// with the set held: <paramref name="versions"/> retired and their stored
+    /// files deleted, except a copy a duplicate-file reference still needs and a
+    /// file a live record still points at.
+    /// </summary>
+    /// <param name="versions">The earlier versions found and confirmed, as read then.</param>
+    /// <param name="root">The folder the set's backup lives in.</param>
+    /// <returns>What was done, for the status bar and the set's row; whether it failed.</returns>
+    private async Task<(string Outcome, bool Failed)> PurgeVersionsNoLongerKeptAsync(
+        int setId, IReadOnlyList<FileRecord> versions, string root)
+    {
+        (int Retired, int Deleted, int Failures, long Bytes, int Absent, int Kept) result;
+        try
+        {
+            // Not cancellable: the user confirmed the deletion, and a half-done
+            // purge leaves the catalog and the destination out of step.
+            (_, result) = await Views.ProgressDialog.RunAsync<(int, int, int, long, int, int)>(
+                Application.Current.MainWindow,
+                "Removing earlier versions",
+                "Deleting the earlier versions the retention settings no longer keep…",
+                cancellable: false,
+                async (progress, ct) =>
+                {
+                    // The guard below finds a reference's content by hash: give one to
+                    // any plain copy about to go that has none (a seed with Skip
+                    // hashing records them so), as the backup's retention pass does.
+                    var unhashed = versions
+                        .Where(v => string.IsNullOrEmpty(v.Hash) && !v.IsFileRef && !v.IsDeduped)
+                        .Select(v => v.Id).ToList();
+                    if (unhashed.Count > 0)
+                    {
+                        progress.Report("Checking copies that duplicate-file references may need…");
+                        await ContentAnchors.HashUnhashedAnchorsAsync(_catalog, setId, root, unhashed, ct);
+                    }
+
+                    progress.Report("Updating the catalog…");
+                    var discPaths = new HashSet<string>(StringComparer.OrdinalIgnoreCase);
+                    int retired, kept;
+                    var tx = await _catalog.BeginTransactionAsync(setId, ct,
+                        onWaitingForOtherProcess: () => progress.Report(
+                            "Waiting for the background backup of this set to pause…"));
+                    try
+                    {
+                        // The records as they are now, under the write lock: one retired
+                        // since is left alone, and one a rename has moved since is
+                        // deleted where it now is, not where the scan found it.
+                        var live = await _catalog.GetLiveDiscPathsAsync(setId, versions.Select(v => v.Id).ToList(), ct);
+                        // A copy a reference still needs stays live, with its file.
+                        var keptIds = await _catalog.RetireRecordsKeepingNeededCopiesAsync(setId, live.Keys.ToList(), ct: ct);
+                        foreach (var (id, discPath) in live)
+                            if (!keptIds.Contains(id))
+                                discPaths.Add(discPath.Replace('/', '\\'));
+                        // Nor a file another live record still points at.
+                        if (discPaths.Count > 0)
+                            discPaths.ExceptWith(await _catalog.FindDiscPathsInUseAsync(setId, discPaths.ToList(), ct));
+                        retired = live.Count - keptIds.Count;
+                        kept = keptIds.Count;
+                        tx.Complete();
+                    }
+                    finally
+                    {
+                        tx.Dispose();
+                    }
+
+                    // Outside the transaction, so a file that cannot be deleted
+                    // cannot roll the catalog back; it shows up later as a
+                    // catalog-deleted file in Cleanup's destination scan.
+                    var (deleted, failures, bytes, absent) =
+                        Services.DestinationFilePurger.DeleteFilesAndSweep(root, discPaths, progress);
+                    return (retired, deleted, failures, bytes, absent, kept);
+                });
+        }
+        catch (Exception ex)
+        {
+            CrashLogger.Log(ex, $"GUI: removing earlier versions of set {setId}");
+            return ($"Removing the earlier versions failed: {ex.Message}", true);
+        }
+
+        var (retiredCount, deletedCount, failureCount, bytesFreed, absentCount, keptCount) = result;
+        var parts = new List<string>
+        {
+            $"removed {retiredCount:N0} earlier version{(retiredCount == 1 ? "" : "s")}",
+        };
+        if (deletedCount > 0)
+            parts.Add($"deleted {deletedCount:N0} file{(deletedCount == 1 ? "" : "s")} ({FormatBytes(bytesFreed)} bytes freed)");
+        if (failureCount > 0)
+            parts.Add($"{failureCount:N0} could not be deleted (Cleanup's destination scan lists them)");
+        if (absentCount > 0)
+            parts.Add($"{absentCount:N0} already gone");
+        if (keptCount > 0)
+            parts.Add($"kept {keptCount:N0} that duplicate-file references now need");
+        return (char.ToUpperInvariant(parts[0][0]) + parts[0][1..]
+                + (parts.Count > 1 ? ": " + string.Join(", ", parts.Skip(1)) : "") + ".",
+            failureCount > 0);
     }
 
     /// <summary>
@@ -3934,18 +4168,37 @@ public class MainViewModel : ViewModelBase
     /// </remarks>
     private string SnapshotEditorSettings(BackupSet backupSet, SourceSelectionViewModel vm)
     {
-        var opts = backupSet.JobOptions is null
-            ? new JobOptions()
-            : JsonSerializer.Deserialize<JobOptions>(
-                JsonSerializer.Serialize(backupSet.JobOptions, _jsonOptions),
-                _jsonOptions) ?? new JobOptions();
-        ApplyVmSettingsToJobOptions(opts, vm);
+        var opts = EditorJobOptions(backupSet, vm);
         // Not an editor setting: seeding and Clear Backup History write it to the
         // catalog themselves, and Save keeps whatever is stored. Left in, a set
         // opened while held would differ from its edits by it.
         opts.HoldAutomatedBackups = false;
         return JsonSerializer.Serialize(new { Name = vm.SetName, JobOptions = opts }, _jsonOptions);
     }
+
+    /// <summary>
+    /// The options a save would write from the editor as it stands, on a copy of
+    /// the set's: everything the editor shows comes from it, exactly as
+    /// <see cref="SyncSettingsToJobOptions"/> writes it.
+    /// </summary>
+    private JobOptions EditorJobOptions(BackupSet backupSet, SourceSelectionViewModel vm)
+    {
+        var opts = backupSet.JobOptions is null
+            ? new JobOptions()
+            : JsonSerializer.Deserialize<JobOptions>(
+                JsonSerializer.Serialize(backupSet.JobOptions, _jsonOptions),
+                _jsonOptions) ?? new JobOptions();
+        ApplyVmSettingsToJobOptions(opts, vm);
+        return opts;
+    }
+
+    /// <summary>
+    /// A set's retention settings as one comparable string: its tier sets (tiers,
+    /// patterns, exemptions) and an old set's flat tiers. Two equal strings keep
+    /// exactly the same versions.
+    /// </summary>
+    private static string RetentionSignature(JobOptions? options) =>
+        JsonSerializer.Serialize(new { options?.TierSets, options?.RetentionTiers });
 
     private static void SyncSettingsToJobOptions(BackupSet backupSet, SourceSelectionViewModel vm)
     {

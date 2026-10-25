@@ -275,6 +275,7 @@ internal static class Program
         NoTierWarning();
         await ReconcileAfterEditAsync();
         await VerifyStartsAsync();
+        await RetentionChangeOffersRemovalAsync();
 #endif
         Check(_dialogs.Unexpected.Count == 0,
             "no unexpected message box appeared"
@@ -433,6 +434,169 @@ internal static class Program
             $"and retired its record, leaving a's ({string.Join(", ", live)})");
         Check(row.LastResultText.StartsWith("Removed sources: purged 1 catalog record, deleted 1 file", StringComparison.Ordinal),
             $"the row says what was removed (\"{row.LastResultText}\")");
+    }
+
+    /// <summary>
+    /// 25: after a saved edit that tightens the retention settings, the earlier
+    /// versions they no longer keep are offered for removal, and Remove deletes
+    /// exactly those. Declining removes nothing, and a save that leaves the
+    /// retention settings alone offers nothing - even with versions still there
+    /// that the settings do not keep.
+    /// </summary>
+    static async Task RetentionChangeOffersRemovalAsync()
+    {
+        Console.WriteLine();
+        Console.WriteLine("=== 25. after a retention change, the versions no longer kept are offered for removal ===");
+
+        // Real version history: small.txt backed up three times (two earlier
+        // versions), big.bin twice (one), with a Default that keeps every version.
+        string dst = Path.Combine(_root, "dst-retention");
+        Directory.CreateDirectory(dst);
+        var keepAll = new VersionTierSet { Name = "Default", Tiers = [new() { MaxAge = null, MaxVersions = null }] };
+        var set = await DbSetAsync();
+        set.SourceSelections =
+        [
+            Dir(_src, null, auto: false, expanded: true,
+                Dir(_a, true, auto: false),
+                Dir(_b, true, auto: false)),
+        ];
+        set.JobOptions!.TargetDirectory = dst;
+        set.JobOptions.TierSets = [keepAll];
+        set.JobOptions.RetentionTiers = keepAll.Tiers;
+        await _observer.UpdateBackupSetAsync(set);
+        await _observer.ClearBackupSetCatalogAsync(_setId);
+        var backup = new DirectoryBackupService(
+            _observer, new LithicBackup.Infrastructure.FileSystem.FileScanner(_observer),
+            new VersionRetentionService(_observer));
+        async Task<bool> BackUp()
+        {
+            var r = await backup.ExecuteAsync(new BackupJob
+            {
+                BackupSetId = _setId, Sources = set.SourceSelections, TargetDirectory = dst,
+                ZipMode = ZipMode.None, TierSets = [keepAll], RetentionTiers = keepAll.Tiers,
+            }, dst, keepAll.Tiers, null, CancellationToken.None);
+            return r.Success;
+        }
+        File.WriteAllText(_smallFile, "small, version one");
+        File.WriteAllText(_bigFile, "big, version one");
+        bool built = await BackUp();
+        File.WriteAllText(_smallFile, "small, version two, longer");
+        built &= await BackUp();
+        File.WriteAllText(_smallFile, "small, version three, longer still");
+        File.WriteAllText(_bigFile, "big, version two, longer");
+        built &= await BackUp();
+
+        string Rel(string source) => source[Path.GetPathRoot(source)!.Length..];
+        string Current(string source) => Path.Combine(dst, source[..1], Rel(source));
+        string Prev(string source, int v) => Path.Combine(dst, source[..1] + "_prev", Rel(source) + $".v{v}");
+        if (!(built && File.Exists(Prev(_smallFile, 1)) && File.Exists(Prev(_smallFile, 2)) && File.Exists(Prev(_bigFile, 1))))
+        {
+            Check(false, "set-up: small.txt has two earlier versions on disk and big.bin one");
+            return;
+        }
+        long smallV1Bytes = new FileInfo(Prev(_smallFile, 1)).Length;
+
+        // A main window that reconciles no source edit, so only the retention
+        // offer can ask anything.
+        _vm = new MainViewModel(
+            _catalog,
+            burner: null!,
+            scanner: new LithicBackup.Infrastructure.FileSystem.FileScanner(_catalog),
+            orchestrator: null!,
+            restoreService: null!,
+            catalogFreeRestoreService: null!,
+            directoryBackupService: null!,
+            settings: new UserSettings { ReconcileMode = ReconcileAfterEditMode.Never });
+        if (!await WaitFor(() => _vm.BackupSets.Any(r => r.Id == _setId), 10000))
+        {
+            Check(false, "the main window loaded the test set");
+            return;
+        }
+        var row = _vm.BackupSets.First(r => r.Id == _setId);
+        static TierSetViewModel? DefaultOf(Editor e) => e.Vm.TierSets.FirstOrDefault(t => t.Name == "Default");
+        static ReviewTreeDialog? OpenReview() => Application.Current.Windows.OfType<ReviewTreeDialog>().FirstOrDefault();
+        static string Header(ReviewTreeDialog d) => ((ReviewTreeViewModel)d.DataContext).HeaderText.Split('\n')[0];
+        async Task<HashSet<string>> LiveDiscPaths() => (await _observer.GetActivePreviousVersionsAsync(_setId))
+            .Select(r => Path.Combine(dst, r.DiscPath)).ToHashSet(StringComparer.OrdinalIgnoreCase);
+
+        // --- keep every version -> keep 1: small.txt's older earlier version goes ---
+        var ed = await OpenEditorAsync("retention: keep 1");
+        if (ed is null) return;
+        var def = DefaultOf(ed);
+        ed.Vm.SelectedTierSet = def;
+        await Task.Delay(300);
+        ed.Vm.MarkClean();
+        def!.Tiers[0].MaxVersions = "1";
+        ed.Vm.SaveCommand.Execute(null);
+        Check(await WaitClosedAsync(ed.Window), "Save closes the editor");
+
+        ReviewTreeDialog? review = null;
+        Check(await WaitFor(() => (review = OpenReview()) is not null, 20000),
+            "the versions keep-1 no longer keeps are offered for removal");
+        if (review is null) return;
+        // N0, as the header writes it: the separator is the locale's.
+        Check(Header(review).StartsWith($"1 earlier version of 1 file ({smallV1Bytes:N0} bytes) is no longer kept",
+                StringComparison.Ordinal),
+            $"just small.txt's older earlier version (\"{Header(review)}\")");
+        review.DialogResult = true;
+        Check(await WaitFor(() => !row.IsRunning && row.LastResultText.Length > 0, 20000), "the removal finishes");
+        Check(!File.Exists(Prev(_smallFile, 1)), "Remove deleted small.txt.v1");
+        Check(File.Exists(Prev(_smallFile, 2)) && File.Exists(Current(_smallFile))
+              && File.Exists(Prev(_bigFile, 1)) && File.Exists(Current(_bigFile)),
+            "and nothing else: small.txt's newer earlier version, both current copies and big.bin's earlier version stay");
+        var live = await LiveDiscPaths();
+        Check(!live.Contains(Prev(_smallFile, 1)) && live.Contains(Prev(_smallFile, 2)) && live.Contains(Prev(_bigFile, 1)),
+            "its record is retired, and only its");
+        Check(row.LastResultText.StartsWith("Removed 1 earlier version: deleted 1 file", StringComparison.Ordinal),
+            $"the row says what was removed (\"{row.LastResultText}\")");
+        await EnsureClosedAsync(ed.Window);
+
+        // --- empty Default, then decline: nothing is removed ---
+        ed = await OpenEditorAsync("retention: empty, decline");
+        if (ed is null) return;
+        def = DefaultOf(ed);
+        ed.Vm.SelectedTierSet = def;
+        await Task.Delay(300);
+        ed.Vm.MarkClean();
+        foreach (var tier in def!.Tiers.ToList())
+            tier.RemoveCommand.Execute(null);
+        ed.Vm.SaveCommand.Execute(null);
+        Check(await WaitClosedAsync(ed.Window), "Save closes the editor");
+        review = null;
+        Check(await WaitFor(() => (review = OpenReview()) is not null, 20000),
+            "emptying Default offers every earlier version left");
+        if (review is null) return;
+        Check(Header(review).StartsWith("2 earlier versions of 2 files", StringComparison.Ordinal),
+            $"small.txt's and big.bin's (\"{Header(review)}\")");
+        review.DialogResult = false;
+        await Task.Delay(1000);
+        Check(File.Exists(Prev(_smallFile, 2)) && File.Exists(Prev(_bigFile, 1)), "declining deletes nothing");
+        Check((await LiveDiscPaths()).Count == 2, "and retires nothing");
+        Check(_vm.StatusText.Contains("Cleanup", StringComparison.Ordinal),
+            $"and says where they can go later (\"{_vm.StatusText}\")");
+        await EnsureClosedAsync(ed.Window);
+
+        // --- a save that leaves retention alone offers nothing, though versions
+        // the settings do not keep are still there. Stored without the built-in
+        // "None" set, which the editor adds on loading: the save writes the tier
+        // sets back in a different form with the same meaning, which must not
+        // count as a change. ---
+        set = await DbSetAsync();
+        set.JobOptions!.TierSets = [new VersionTierSet { Name = "Default", Tiers = [] }];
+        set.JobOptions.RetentionTiers = [];
+        await _observer.UpdateBackupSetAsync(set);
+        ed = await OpenEditorAsync("retention: untouched");
+        if (ed is null) return;
+        await Task.Delay(300);
+        ed.Vm.MarkClean();
+        ed.Vm.SetName = "editor-save-test (renamed)";
+        ed.Vm.SaveCommand.Execute(null);
+        Check(await WaitClosedAsync(ed.Window), "Save closes the editor");
+        Check(!await WaitFor(() => OpenReview() is not null, 3000),
+            "a save that changed no retention setting offers no removal");
+        if (OpenReview() is { } stray)
+            stray.DialogResult = false;
+        await EnsureClosedAsync(ed.Window);
     }
 #endif
 
