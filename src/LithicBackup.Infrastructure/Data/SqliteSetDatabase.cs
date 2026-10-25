@@ -955,12 +955,12 @@ internal sealed class SqliteSetDatabase : IDisposable
                 if (OwnsTransaction)
                 {
                     cmd.ExecuteNonQuery();
+                    // Not remembered: the caller's transaction can still roll it
+                    // back, and the check above is a cheap read next time.
+                    return;
                 }
-                else
-                {
-                    using (SqliteCancellation.Watch(_connection, ct))
-                        SqliteCancellation.Interruptible(cmd.ExecuteNonQuery, ct);
-                }
+                using (SqliteCancellation.Watch(_connection, ct))
+                    SqliteCancellation.Interruptible(cmd.ExecuteNonQuery, ct);
             }
             _previousVersionIndexExists = true;
         }
@@ -2240,14 +2240,27 @@ internal sealed class SqliteSetDatabase : IDisposable
             wanted.TryAdd(p.Replace('/', '\\'), p);
 
         using var _ = await LockAsync(ct).ConfigureAwait(false);
-        using var cmd = _connection.CreateCommand();
-        cmd.CommandText = "SELECT DiscPath FROM Files WHERE IsDeleted = 0";
         var found = new List<string>();
-        foreach (var r in Rows(cmd, ct))
+        void Read(string where)
         {
-            if (wanted.Remove(r.GetString(0).Replace('/', '\\'), out var given))
-                found.Add(given);
+            using var cmd = _connection.CreateCommand();
+            cmd.CommandText = "SELECT DiscPath FROM Files WHERE " + where;
+            foreach (var r in Rows(cmd, ct))
+            {
+                if (wanted.Remove(r.GetString(0).Replace('/', '\\'), out var given))
+                    found.Add(given);
+            }
         }
+
+        // A live record stored at an earlier version's path is itself one of the
+        // rows the earlier-versions index covers, so those paths are looked for
+        // there: a few thousand rows, not every live row in the set. This often
+        // runs inside a purge's transaction, under the set's write lock.
+        if (wanted.Keys.Any(Core.HistoryPaths.IsPreviousVersion))
+            Read(PreviousVersionCandidateSql);
+        // Anything else can be any live row.
+        if (wanted.Count > 0 && wanted.Keys.Any(p => !Core.HistoryPaths.IsPreviousVersion(p)))
+            Read("IsDeleted = 0");
         return found;
     }
 

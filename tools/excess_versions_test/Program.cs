@@ -449,6 +449,34 @@ internal static class Program
                 $"the read is planned through the index ({string.Join(" | ", plan)})");
         }
 
+        // Stored paths still in use, earlier versions found through the index: a
+        // retired record's path is free, a live one's is not, whichever form.
+        var inUse = await repo.FindDiscPathsInUseAsync(set.Id,
+            [prev.DiscPath, retired.DiscPath, current.DiscPath, @"D\src\nothing.txt"]);
+        Check(inUse.Count == 2 && inUse.Contains(prev.DiscPath) && inUse.Contains(current.DiscPath),
+            $"FindDiscPathsInUseAsync: earlier versions and current copies in use, a retired one free ({string.Join(", ", inUse)})");
+
+        // An index built inside a transaction that is then rolled back is gone;
+        // the next read must build it again, not believe it is there.
+        // A catalog of its own: set databases are named by set id, so a second
+        // catalog beside the first would share its set-1.db, index and all.
+        string rollbackDir = Path.Combine(root, "prev-index-rollback");
+        Directory.CreateDirectory(rollbackDir);
+        using (var repo2 = new SqliteCatalogRepository(Path.Combine(rollbackDir, "catalog.db")))
+        {
+            var set2 = await repo2.CreateBackupSetAsync(new BackupSet
+            {
+                Name = "rollback", SourceRoots = [@"D:\src"], CreatedUtc = DateTime.UtcNow,
+                DefaultMediaType = MediaType.Directory,
+            });
+            int built = 0;
+            var tx = await repo2.BeginTransactionAsync(set2.Id);
+            await repo2.GetActivePreviousVersionsAsync(set2.Id, onIndexing: () => built++);
+            tx.Dispose(); // no Complete: rolled back, index with it
+            await repo2.GetActivePreviousVersionsAsync(set2.Id, onIndexing: () => built++);
+            Check(built == 2, $"an index built inside a rolled-back transaction is built again by the next read ({built} builds)");
+        }
+
         var livePaths = await repo.GetLiveDiscPathsAsync(set.Id, [prev.Id, current.Id, retired.Id, 999_999]);
         Check(livePaths.Count == 2 && livePaths[prev.Id] == prev.DiscPath && livePaths[current.Id] == current.DiscPath,
             "GetLiveDiscPathsAsync: live ids with their stored paths; retired and unknown ids left out");
@@ -482,6 +510,16 @@ internal static class Program
         Check(VersionRetentionService.SelectExpired(lone, [new() { MaxAge = null, MaxVersions = 0 }], now).Count == 0,
             "a file's newest earlier version is always kept, even by a tier that keeps none");
         Check(VersionRetentionService.SelectExpired(a, [], now).Count == 0, "no tiers expire nothing");
+
+        // Two versions backed up at the same moment: the lower version expires,
+        // whatever order they come in.
+        var t1 = new FileRecord { Id = 50, SourcePath = @"D:\t", DiscPath = @"D_prev\t.v3", Version = 3, BackedUpUtc = now.AddDays(-1) };
+        var t2 = new FileRecord { Id = 40, SourcePath = @"D:\t", DiscPath = @"D_prev\t.v2", Version = 2, BackedUpUtc = now.AddDays(-1) };
+        var keepOne = new List<VersionRetentionTier> { new() { MaxVersions = 1 } };
+        var e1 = VersionRetentionService.SelectExpired([t1, t2], keepOne, now);
+        var e2 = VersionRetentionService.SelectExpired([t2, t1], keepOne, now);
+        Check(e1.Count == 1 && e1[0].Version == 2 && e2.Count == 1 && e2[0].Version == 2,
+            "a tie in backup time keeps the higher version, in any input order");
 
         var opts = new JobOptions
         {

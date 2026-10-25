@@ -61,9 +61,9 @@ public class VersionRetentionService
     /// </para>
     /// <para>
     /// The whole-set form reads only the set's earlier versions, through their
-    /// index (<see cref="ICatalogRepository.GetActivePreviousVersionsAsync"/>). It
-    /// used to read every record in the set to find them: all 12.3 million rows
-    /// of one real set, for 21,919 earlier versions, on every full backup.
+    /// index (<see cref="ICatalogRepository.GetActivePreviousVersionsAsync"/>):
+    /// they are a small fraction of a large set's rows (21,919 of 12.3 million on
+    /// one real set), and this runs after every full backup.
     /// </para>
     /// </remarks>
     public async Task<IReadOnlyList<FileRecord>> ComputeRetentionAsync(
@@ -174,7 +174,14 @@ public class VersionRetentionService
         if (versions.Count == 0 || tiers.Count == 0)
             return expired;
 
-        var newestFirst = versions.OrderByDescending(v => v.BackedUpUtc).ToList();
+        // Ties in time (a seed dates versions by their files' write times, which
+        // a tool can preserve) go to the higher version, then the later record:
+        // callers pass versions in different orders, and must all keep the same.
+        var newestFirst = versions
+            .OrderByDescending(v => v.BackedUpUtc)
+            .ThenByDescending(v => v.Version)
+            .ThenByDescending(v => v.Id)
+            .ToList();
         long newestId = newestFirst[0].Id;
 
         TimeSpan previousBoundary = TimeSpan.Zero;
