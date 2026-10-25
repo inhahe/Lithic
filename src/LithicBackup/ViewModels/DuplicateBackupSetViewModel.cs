@@ -7,27 +7,35 @@ namespace LithicBackup.ViewModels;
 /// for the new set, choose which grouped parts of the source set to carry over
 /// (sources, settings, schedule), and set the destination directory directly.
 ///
-/// The destination is pre-filled with a folder of the copy's own beside the
-/// original's (MainViewModel.SuggestedCopyFolder), so the dialog works as it
-/// opens. The copy needs a backup folder of its own: one that is already a set's
-/// is refused (see JobOptions.SharesBackupFolderWith), and the dialog says so as
-/// soon as the destination names one. The copy starts with no backup history; it
-/// can be seeded from its own folder.
+/// The destination is pre-filled with a folder of the copy's own, named for it,
+/// beside the original's (MainViewModel.SuggestedCopyFolder), so the dialog works
+/// as it opens; it follows the name until the destination is edited. The copy
+/// needs a backup folder of its own: one that is already a set's is refused (see
+/// JobOptions.SharesBackupFolderWith), and the dialog says so as soon as the
+/// destination names one. The copy starts with no backup history; it can be
+/// seeded from its own folder.
 /// </summary>
 public class DuplicateBackupSetViewModel : ViewModelBase
 {
     private readonly Func<string, string?>? _backupFolderOwner;
+    private readonly Func<string, string>? _suggestDestination;
+
+    /// <summary>Whether the user has set the destination, which then no longer follows the name.</summary>
+    private bool _destinationEdited;
 
     /// <param name="sourceName">The name of the set being copied.</param>
-    /// <param name="suggestedDestination">The copy's destination to start from.</param>
+    /// <param name="suggestDestination">
+    /// The destination to suggest for a copy of a given name; null suggests none.
+    /// </param>
     /// <param name="backupFolderOwner">
     /// The name of the set whose backup folder a destination would be, or null.
     /// </param>
     public DuplicateBackupSetViewModel(
-        string sourceName, string? suggestedDestination, Func<string, string?>? backupFolderOwner = null)
+        string sourceName, Func<string, string>? suggestDestination, Func<string, string?>? backupFolderOwner = null)
     {
         _name = $"Copy of {sourceName}";
-        _targetDirectory = suggestedDestination ?? string.Empty;
+        _suggestDestination = suggestDestination;
+        _targetDirectory = suggestDestination?.Invoke(_name) ?? string.Empty;
         _backupFolderOwner = backupFolderOwner;
 
         BrowseTargetCommand = new RelayCommand(_ => BrowseTarget());
@@ -37,7 +45,11 @@ public class DuplicateBackupSetViewModel : ViewModelBase
     public string Name
     {
         get => _name;
-        set => SetProperty(ref _name, value);
+        set
+        {
+            if (SetProperty(ref _name, value) && !_destinationEdited && _suggestDestination is not null)
+                SetDestination(_suggestDestination(value.Trim()));
+        }
     }
 
     private bool _copySourceSelections = true;
@@ -90,11 +102,17 @@ public class DuplicateBackupSetViewModel : ViewModelBase
         get => _targetDirectory;
         set
         {
-            if (SetProperty(ref _targetDirectory, value))
-            {
-                OnPropertyChanged(nameof(IsDestinationInUse));
-                OnPropertyChanged(nameof(DestinationInUseText));
-            }
+            _destinationEdited = true;
+            SetDestination(value);
+        }
+    }
+
+    private void SetDestination(string value)
+    {
+        if (SetProperty(ref _targetDirectory, value, nameof(TargetDirectory)))
+        {
+            OnPropertyChanged(nameof(IsDestinationInUse));
+            OnPropertyChanged(nameof(DestinationInUseText));
         }
     }
 

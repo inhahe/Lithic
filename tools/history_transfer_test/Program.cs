@@ -208,8 +208,13 @@ Check(imported.IncludedHistory, "the import found the history");
 Check(imported.FileRecords == allA.Count, $"every file record came across ({imported.FileRecords} of {allA.Count})");
 Check(setB.JobOptions?.HoldAutomatedBackups == true, "automated backups arrive held");
 string? localVolume = thisComputer.GetVolumeId(target);
-Check(localVolume is not null && setB.JobOptions?.DestinationVolumeId == localVolume,
-    $"the old computer's volume identity, which does not resolve here, is replaced by this one's ({setB.JobOptions?.DestinationVolumeId})");
+Check(localVolume is not null && setB.JobOptions is { DestinationVolumeId: null, DestinationSubpath: null },
+    $"the old computer's volume identity, which does not resolve here, is dropped ({setB.JobOptions?.DestinationVolumeId})");
+// Not looked up from the path at the import: that letter may be another disk's here.
+// The set's next save or backup captures it, once the user has checked the path.
+var nextResolve = JsonSerializer.Deserialize<JobOptions>(JsonSerializer.Serialize(setB.JobOptions))!;
+new DestinationResolver(thisComputer).Resolve(nextResolve);
+Check(nextResolve.DestinationVolumeId == localVolume, "and the next resolve captures this computer's from the path");
 var resolvable = new JobOptions { TargetDirectory = target, DestinationVolumeId = localVolume, DestinationSubpath = "kept" };
 BackupSetTransfer.LocalizeDestination(resolvable, new DestinationResolver(thisComputer));
 Check(resolvable.DestinationVolumeId == localVolume && resolvable.DestinationSubpath == "kept",

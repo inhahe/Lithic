@@ -570,18 +570,50 @@ public partial class App : Application
         // unsaved changes asks as it always does, and its Yes saves - or keeps the
         // editor open, when the save is refused or fails - as at any other time.
         // Once Shutdown has begun nothing can stay open, and an edit that could not
-        // be saved would be lost. An editor still open after this - Cancel, or a
-        // save that goes on after the prompt - keeps the app running; it closes
-        // once saved, and Exit can be chosen again.
+        // be saved would be lost. An editor still open after this keeps the app
+        // running: Cancel, or Yes, whose save goes on after the prompt and calls
+        // this again once it has closed the editor (ClosingEditorsForExit tells it
+        // that an exit asked). One already closing - its own prompt open - throws
+        // when closed again, and is waited for the same way.
         foreach (var editor in Windows.OfType<Views.BackupSetEditorWindow>().ToList())
         {
-            editor.Close();
+            ClosingEditorsForExit = true;
+            try
+            {
+                editor.Close();
+            }
+            catch (InvalidOperationException)
+            {
+                return;
+            }
+            finally
+            {
+                ClosingEditorsForExit = false;
+            }
             if (Windows.OfType<Views.BackupSetEditorWindow>().Contains(editor))
                 return;
+        }
+        if (EndApplicationOverride is { } end)
+        {
+            end();
+            return;
         }
         IsExiting = true;
         Shutdown();
     }
+
+    /// <summary>
+    /// What <see cref="ExitApplication"/> does instead of shutting down, once no
+    /// editor stands in its way; null in the app. A test harness sets it, so that
+    /// testing an exit does not end the harness.
+    /// </summary>
+    internal Action? EndApplicationOverride { get; set; }
+
+    /// <summary>
+    /// True while <see cref="ExitApplication"/> is closing an editor, so that a Yes
+    /// at its "save before closing?" prompt carries the exit on after the save.
+    /// </summary>
+    internal bool ClosingEditorsForExit { get; private set; }
 
     /// <summary>
     /// A session-end request — Windows logging off/shutting down, OR an installer's

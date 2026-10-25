@@ -324,6 +324,13 @@ internal static class Program
         Check(At(@"E:\B ").SharesBackupFolderWith(At(@"E:\B")) && At(@"E:\B.").SharesBackupFolderWith(At(@"E:\B"))
               && At(@"E:\X\..\B").SharesBackupFolderWith(At(@"E:\B")) && At(@"E:\\B").SharesBackupFolderWith(At(@"E:\B")),
             "paths Windows resolves to one folder are one folder: trailing space or dot, '..', doubled separators");
+        JobOptions OnVolume(string dest, string subpath) => new()
+        {
+            TargetDirectory = dest, DestinationVolumeId = "V9", DestinationSubpath = subpath,
+        };
+        Check(OnVolume(@"F:\B", "B").SharesBackupFolderWith(OnVolume(@"C:\Mounts\Disk\B", "B"))
+              && !OnVolume(@"F:\B", "B").SharesBackupFolderWith(OnVolume(@"C:\Mounts\Disk\C", "C")),
+            "one volume through a drive letter and through a mount folder is one volume's folder");
 
         string dir = Path.Combine(root, "cat23");
         Directory.CreateDirectory(dir);
@@ -359,8 +366,27 @@ internal static class Program
               && LithicBackup.ViewModels.MainViewModel.SuggestedCopyFolder(new BackupSet(), "x") == "",
             "Copy suggests a folder named for the copy beside the original's backup folder");
 
+        // A check that fails says so, rather than blaming anything else.
+        var failing = new OrphanedDirectoriesViewModel(
+            FailsOn.Wrap(repo, nameof(ICatalogRepository.GetAllBackupSetOptionsAsync)), first);
+        failing.ScanCatalogCommand.Execute(null);
+        await WaitFor(() => !failing.IsLoading, 60000);
+        Check(failing.IsDestinationUnavailable
+              && failing.DestinationUnavailableText.StartsWith("Could not check the backup folder", StringComparison.Ordinal),
+            $"a folder check that fails leaves the folder unusable, and says so (\"{failing.DestinationUnavailableText}\")");
+
+        // Copy's suggestion follows the copy's name until the destination is edited.
+        var follow = new DuplicateBackupSetViewModel("X", name => Path.Combine(@"E:\B", name));
+        string firstSuggestion = follow.TargetDirectory;
+        follow.Name = "Renamed";
+        string renamed = follow.TargetDirectory;
+        follow.TargetDirectory = @"E:\Mine";
+        follow.Name = "Again";
+        Check(firstSuggestion == @"E:\B\Copy of X" && renamed == @"E:\B\Renamed" && follow.TargetDirectory == @"E:\Mine",
+            "Copy's suggested folder follows the name, and stops once the destination is edited");
+
         // Copy: the dialog says so the moment the destination is another set's folder.
-        var copy = new DuplicateBackupSetViewModel("first", shared,
+        var copy = new DuplicateBackupSetViewModel("first", _ => shared,
             dest => new JobOptions { TargetDirectory = dest }.SharesBackupFolderWith(first.JobOptions!) ? "first" : null);
         Check(copy.IsDestinationInUse && copy.DestinationInUseText.Contains("\"first\"", StringComparison.Ordinal),
             "the Copy dialog refuses the original's folder, which it starts from");
@@ -1828,6 +1854,36 @@ public class SecondDiscUpdateFails : DispatchProxy
     {
         if (targetMethod!.Name == nameof(ICatalogRepository.UpdateDiscAsync) && ++_updates == 2)
             return Task.FromException(new IOException("simulated failure on the second disc"));
+        try
+        {
+            return targetMethod.Invoke(_inner, args);
+        }
+        catch (TargetInvocationException ex) when (ex.InnerException is not null)
+        {
+            ExceptionDispatchInfo.Capture(ex.InnerException).Throw();
+            throw;
+        }
+    }
+}
+
+/// <summary>A catalog whose one named method throws; everything else passes through.</summary>
+public class FailsOn : DispatchProxy
+{
+    private ICatalogRepository _inner = null!;
+    private string _method = "";
+
+    public static ICatalogRepository Wrap(ICatalogRepository inner, string method)
+    {
+        var proxy = Create<ICatalogRepository, FailsOn>();
+        ((FailsOn)(object)proxy)._inner = inner;
+        ((FailsOn)(object)proxy)._method = method;
+        return proxy;
+    }
+
+    protected override object? Invoke(MethodInfo? targetMethod, object?[]? args)
+    {
+        if (targetMethod!.Name == _method)
+            throw new IOException($"simulated failure in {_method}");
         try
         {
             return targetMethod.Invoke(_inner, args);

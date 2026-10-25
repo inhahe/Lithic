@@ -387,7 +387,10 @@ public class OrphanedDirectoriesViewModel : ViewModelBase, IConfirmClose, IDispo
     private bool _backupFolderMissing;
 
     /// <summary>Banner text: why the backup folder cannot be used.</summary>
-    public string DestinationUnavailableText => _sharedWith is { } partner
+    public string DestinationUnavailableText => _folderCheckError is { } error
+        ? $"Could not check the backup folder {_targetDir} ({error})  —  nothing can be deleted from the "
+          + "backup or scanned there until it can be."
+        : _sharedWith is { } partner
         ? $"\"{partner}\" backs up to the same folder, {_targetDir}  —  either set could delete the "
           + "other's backed-up files, so nothing can be deleted from the backup or scanned there. "
           + BackupFolderOwners.SharedAdvice(partner)
@@ -423,7 +426,14 @@ public class OrphanedDirectoriesViewModel : ViewModelBase, IConfirmClose, IDispo
     /// Whether the backup folder cannot be used for a reason of its own rather
     /// than an unconnected drive: records elsewhere, a partner, or no folder yet.
     /// </summary>
-    private bool HasFolderProblem => _recordsElsewhere is not null || _sharedWith is not null || _backupFolderMissing;
+    private bool HasFolderProblem => _folderCheckError is not null || _recordsElsewhere is not null
+                                     || _sharedWith is not null || _backupFolderMissing;
+
+    /// <summary>
+    /// Why the last <see cref="RefreshFolderChecksAsync"/> could not check the
+    /// folder, or null. Unknown is not "all clear": the folder is unusable meanwhile.
+    /// </summary>
+    private string? _folderCheckError;
 
     /// <summary>
     /// Re-ask where the set's live records are and whether another set shares its
@@ -439,11 +449,15 @@ public class OrphanedDirectoriesViewModel : ViewModelBase, IConfirmClose, IDispo
                 ? await BackupFolderOwners.FindOtherAsync(_catalog, _backupSet.Id, options)
                 : null;
             _recordsElsewhere = await _catalog.FindLiveRecordsOutsideAsync(_backupSet.Id, _targetDir);
+            _folderCheckError = null;
         }
         catch (Exception ex)
         {
-            // Unknown is not "all here": keep purges off.
-            _recordsElsewhere = $"a folder that could not be checked ({ex.Message})";
+            // Nothing from before stands, and the folder stays unusable until a
+            // check succeeds.
+            _sharedWith = null;
+            _recordsElsewhere = null;
+            _folderCheckError = ex.Message;
         }
         RefreshDestinationAvailability();
         // The banner's text depends on it even when availability stays the same.
@@ -473,7 +487,7 @@ public class OrphanedDirectoriesViewModel : ViewModelBase, IConfirmClose, IDispo
     private void RefreshDestinationAvailability()
     {
         bool reachable = Services.DestinationFilePurger.IsAvailable(_targetDir);
-        bool available = reachable && _recordsElsewhere is null && _sharedWith is null;
+        bool available = reachable && _folderCheckError is null && _recordsElsewhere is null && _sharedWith is null;
         // The drive is there, but not the backup folder: with "Create subdirectory"
         // before the first backup has made it, or a folder moved or deleted.
         bool folderMissing = !reachable && _targetDir is not null
@@ -2343,7 +2357,7 @@ public class OrphanedDirectoriesViewModel : ViewModelBase, IConfirmClose, IDispo
         if (IsDestinationUnavailable)
         {
             IsPurging = false;
-            string msg = _sharedWith is null && _recordsElsewhere is { } elsewhere
+            string msg = _folderCheckError is null && _sharedWith is null && _recordsElsewhere is { } elsewhere
                 ? $"Some of this set's backed-up files are recorded in {elsewhere}, not in its backup " +
                   $"folder ({_targetDir}), so nothing was cleaned: the cleanup would retire their records " +
                   "without deleting their files."

@@ -1508,53 +1508,72 @@ would number their versions apart in one tree.
 `JobOptions.SharesBackupFolderWith` says what "the same folder" is: the same
 volume, by identity when both sets know it and otherwise by drive letter, since
 rotating backup drives can hold one folder name at one letter, and the same folder
-on it. Paths compare as Windows resolves them (`JobOptions.SamePath`:
+on it. On one volume the folders compare relative to its root (from
+`DestinationSubpath`), so a volume reached through a mount folder and through a
+letter is one volume. Paths compare as Windows resolves them (`JobOptions.SamePath`:
 `GetFullPath`, so "..", doubled separators and trailing dots or spaces are
 disregarded). One folder inside another is not the same folder.
 `BackupFolderOwners.FindOther` finds the owner from every set's options, read
-without their selection trees. Every check compares a candidate whose identity
-has been looked up on this computer (`MainViewModel.ResolvedCopy`), so a folder is
-matched by volume whatever drive letters the sets last saw. An identity this
-computer cannot resolve is not kept on import (`BackupSetTransfer.LocalizeDestination`).
-A disk can carry its GUID to another computer (the author's 6 TB drive did, and its
-imported set followed it from `I:` to `F:`), and such an identity is kept. One that
-does not resolve is dropped and captured again from the path: it would never
+without their selection trees.
+
+Every check compares a candidate whose identity has been looked up on this
+computer (`MainViewModel.ResolvedCopy`), and the identity it was judged by is
+saved with it. The editor's save captures a missing one, and Copy saves the
+options it checked. Left for the next backup, the identity would come from
+whichever drive had the letter by then. An identity this computer cannot resolve
+is not kept on import (`BackupSetTransfer.LocalizeDestination`). A disk can carry
+its GUID to another computer (the author's 6 TB drive did, and its imported set
+followed it from `I:` to `F:`, which the import's closing message now says), and
+such an identity is kept. One that does not resolve is dropped: it would never
 resolve here, leaving the destination "not connected" for good, and it would
-compare as another volume. A drive unplugged during the import cannot be told
-from a foreign GUID, and loses its identity too. Source identities are left as
-exported: one that does not resolve is skipped, and the paths are used.
+compare as another volume. It is not looked up from the path at the import, since
+that letter may be another disk's here, but at the set's next save or backup,
+once the user has checked the destination. A drive unplugged during the import
+cannot be told from a foreign GUID, and loses its identity too. Source identities
+are left as exported: one that does not resolve is skipped, and the paths are used.
 
 Nothing gives a set a folder another set has:
 
 * **the editor** refuses on every save path, for a new set or a changed folder,
   but not for an unchanged one, since editing is how two sets saved before the
   rule are separated. File > Exit closes open editors first, while they can still
-  refuse (`App.ExitApplication`); one that stays open keeps the app running. A
-  save at a Restart Manager exit, which cannot ask, drops the edit and says so;
+  refuse (`App.ExitApplication`). A Yes at an editor's prompt saves as the Save
+  button does and then carries the exit on (`ClosingEditorsForExit`); an editor
+  that stays open, after Cancel or a refused save, keeps the app running;
 * **Change Destination** refuses before its confirmation;
-* **Import** refuses a set whose folder is already here, before importing, off the
-  UI thread;
+* **Import** refuses a set whose folder is already here, before importing;
 * **Copy** refuses in its dialog as soon as the destination names a set's folder,
-  by path, and against the catalog by volume before creating. It suggests a folder
-  named for the copy beside the original's (`MainViewModel.SuggestedCopyFolder`),
-  so the dialog works as it opens. The copy never carries the original's
-  subfolder, and its old "Backup history" option is gone: it only worked with the
-  original's own folder.
+  by path, and against the catalog by volume when the dialog closes. A refusal
+  there brings the dialog back with its choices. It suggests a folder named for
+  the copy beside the original's, taken by no set
+  (`MainViewModel.SuggestedCopyFolder`); the suggestion follows the copy's name
+  until the destination is edited. A new folder is made when the set is created,
+  since a share has no volume identity and counts as connected only while its
+  folder exists. The copy never carries the original's subfolder, and its old
+  "Backup history" option is gone: it only worked with the original's own folder;
+* **Seed from Existing Backup** refuses a folder another set shares: the seed
+  would record that set's files as this one's and file some of them away.
+
+Every check that reads a volume or the catalog runs off the UI thread, since the
+path can be a slow share.
 
 **Two sets that already share a folder** are held as for records elsewhere (the
-same three places). The Worker refuses and holds both. The app refuses to back
-either up, to remove dropped sources, and the retention offer
+same three places). The Worker refuses and holds both, and lifts a hold it put on
+for sharing once the set shares no folder: separating them usually means changing
+the other set, which leaves this one untouched. A hold from before a restart is
+not known to be the service's, and the row's Resume link ends it. The app refuses
+to back either up, to remove dropped sources, and the retention offer
 (`MainViewModel.BackupFolderRefusalAsync`, "Backup Folder Shared"). Cleanup treats
-the folder as unusable. All say the way out (`BackupFolderOwners.SharedAdvice`):
-delete a set that is a copy of the other, or clear one set's history and give it
-a folder of its own.
+the folder as unusable, and so does a check that fails, which says so. All say the
+way out (`BackupFolderOwners.SharedAdvice`): delete a set that is a copy of the
+other, or clear one set's history and give it a folder of its own.
 
 The editor also stops putting a changed destination back. It used to save the new
 path with the old volume identity, from which the resolver rebuilt the old path at
 the next backup. A destination that differs from the editor's own copy of the
-options is a change, and loses the identity, which is captured again from the new
-path. One that a drive's letter change moved while the editor was open is not a
-change, and keeps it. Pinned by `tools\excess_versions_test` §23,
+options is a change, and loses the identity, which the save captures again from
+the new path. One that a drive's letter change moved while the editor was open is
+not a change, and keeps it. Pinned by `tools\excess_versions_test` §23,
 `tools\editor_save_test` §21 and §27, `tools\worker_idle_test` C15 and
 `tools\history_transfer_test` 1.
 

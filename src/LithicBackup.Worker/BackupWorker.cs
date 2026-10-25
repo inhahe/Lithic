@@ -515,6 +515,7 @@ public sealed class BackupWorker : BackgroundService
             return;
 
         var allSets = await _catalog.GetAllBackupSetsAsync(ct);
+        var allOptions = allSets.Select(s => new BackupSetOptions(s.Id, s.Name, s.JobOptions)).ToList();
         var seen = new HashSet<int>();
 
         foreach (var set in allSets)
@@ -558,6 +559,25 @@ public sealed class BackupWorker : BackgroundService
                         set.Name);
                 }
                 state.BackupSet = set;
+            }
+
+            // Held by this service for sharing its backup folder, and sharing none
+            // now: the user gave one of the two a folder of its own - often the
+            // other, which leaves this set untouched. The hold was this service's
+            // and ends with its reason. (Not one from before a restart: whose that
+            // was is no longer known, and the row's Resume link ends it.)
+            if (held && state.RefusedSharedWith is { } partner && set.JobOptions is { } options
+                && BackupFolderOwners.FindOther(allOptions, set.Id, options) is null)
+            {
+                state.RefusedSharedWith = null;
+                if (await ReleaseAutomatedBackupsAsync(set, ct))
+                {
+                    _logger.LogInformation(
+                        "\"{Name}\" no longer shares its backup folder with \"{Partner}\".", set.Name, partner);
+                    options.HoldAutomatedBackups = false;
+                    held = false;
+                    active = set.RunsAutomatically();
+                }
             }
 
             if (scheduled && held != state.WasHeld)
@@ -2783,6 +2803,30 @@ public sealed class BackupWorker : BackgroundService
         catch (Exception ex)
         {
             _logger.LogWarning(ex, "Could not pause the automated backups of \"{Name}\".", set.Name);
+        }
+    }
+
+    /// <summary>
+    /// End a hold this service put on the set's automated backups, written on a
+    /// fresh copy of the set. True when the set is no longer held.
+    /// </summary>
+    private async Task<bool> ReleaseAutomatedBackupsAsync(BackupSet set, CancellationToken ct)
+    {
+        try
+        {
+            var fresh = await _catalog.GetBackupSetAsync(set.Id, ct);
+            if (fresh?.JobOptions is { HoldAutomatedBackups: true } opts)
+            {
+                opts.HoldAutomatedBackups = false;
+                await _catalog.UpdateBackupSetMetadataAsync(fresh, ct);
+            }
+            return true;
+        }
+        catch (OperationCanceledException) { throw; }
+        catch (Exception ex)
+        {
+            _logger.LogWarning(ex, "Could not resume the automated backups of \"{Name}\".", set.Name);
+            return false;
         }
     }
 

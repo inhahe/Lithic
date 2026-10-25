@@ -105,11 +105,7 @@ public sealed class DestinationResolver : IDestinationResolver
         }
     }
 
+    /// <summary>The same path, as <see cref="JobOptions.SamePath"/> decides; two nulls are too.</summary>
     private static bool PathsEqual(string? a, string? b)
-    {
-        if (a is null || b is null)
-            return a is null && b is null;
-        return string.Equals(
-            a.TrimEnd('\\'), b.TrimEnd('\\'), StringComparison.OrdinalIgnoreCase);
-    }
+        => a is null || b is null ? a is null && b is null : JobOptions.SamePath(a, b);
 }

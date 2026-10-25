@@ -991,7 +991,7 @@ async Task PartC()
             set.SourceRoots = [src];
             set.JobOptions!.TargetDirectory = dst;
         });
-        await rig.Repo.CreateBackupSetAsync(new BackupSet
+        var partner = await rig.Repo.CreateBackupSetAsync(new BackupSet
         {
             Name = "its partner", SourceRoots = [], CreatedUtc = DateTime.UtcNow, DefaultMediaType = MediaType.Directory,
             JobOptions = new JobOptions { TargetDirectory = dst },
@@ -999,12 +999,19 @@ async Task PartC()
         rig.Destination.Connected = true;
         await rig.Worker.StartAsync(CancellationToken.None);
         bool refused = await WaitUntil(() => rig.Log.Count("backs up to the same folder") > 0, TimeSpan.FromSeconds(60));
-        bool held = await WaitUntil(
-            () => rig.Repo.GetBackupSetAsync(rig.SetId).GetAwaiter().GetResult()!.JobOptions!.HoldAutomatedBackups,
-            TimeSpan.FromSeconds(10));
+        bool StillHeld() => rig.Repo.GetBackupSetAsync(rig.SetId).GetAwaiter().GetResult()!.JobOptions!.HoldAutomatedBackups;
+        bool held = await WaitUntil(StillHeld, TimeSpan.FromSeconds(10));
         Check(refused && held && rig.Log.Count("Starting backup for") == 0,
             "C15 a set whose folder another set shares is refused and held");
         Check(Directory.GetFileSystemEntries(dst).Length == 0, "C15 and nothing is written there");
+
+        // The partner is given a folder of its own, and this set is never touched:
+        // its hold, which was this service's, ends with its reason.
+        partner.JobOptions!.TargetDirectory = Path.Combine(dir, "partner-dst");
+        await rig.Repo.UpdateBackupSetAsync(partner);
+        bool released = await WaitUntil(() => !StillHeld(), TimeSpan.FromSeconds(60));
+        Check(released && rig.Log.Count("no longer shares its backup folder") > 0,
+            "C15 once the other set has a folder of its own, this one's automated backups resume");
         await rig.DisposeAsync();
     }
 #endif

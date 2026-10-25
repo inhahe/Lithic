@@ -861,9 +861,10 @@ another letter. Restore now falls back to the set's current destination.
   on the computer above (the log shows `i:` followed to `F:`), but where Windows
   gives the drive a different volume GUID, the destination read "not connected"
   until **Change Destination** re-captured it. Import now keeps an identity only if
-  it resolves here, and otherwise captures it again from the path
-  (`BackupSetTransfer.LocalizeDestination`). Source identities are left as they
-  were: one that does not resolve is skipped, and the paths are used.
+  it resolves here, and otherwise drops it, to be captured from the path at the
+  set's next save or backup (`BackupSetTransfer.LocalizeDestination`). Source
+  identities are left as they were: one that does not resolve is skipped, and the
+  paths are used.
 - **Duplicate** with "Backup history" did not copy `DeduplicationBlocks`. The
   option is gone (two sets may not share a folder), and with it the copier.
 

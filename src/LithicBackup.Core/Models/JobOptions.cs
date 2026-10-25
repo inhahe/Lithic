@@ -127,8 +127,24 @@ public class JobOptions
             return false;
         if (!string.IsNullOrEmpty(DestinationVolumeId) && !string.IsNullOrEmpty(other.DestinationVolumeId))
             return string.Equals(DestinationVolumeId, other.DestinationVolumeId, StringComparison.OrdinalIgnoreCase)
-                   && SameFolderOnAnyDrive(mine, theirs);
+                   && string.Equals(FolderOnVolume(), other.FolderOnVolume(), StringComparison.OrdinalIgnoreCase);
         return SamePath(mine, theirs);
+    }
+
+    /// <summary>
+    /// The backup folder relative to its volume's root, without separators at
+    /// either end: from <see cref="DestinationSubpath"/> where the identity gave
+    /// one - so a volume reached through a mount folder and through a drive letter
+    /// is one volume's folder - otherwise the path without its drive.
+    /// </summary>
+    private string FolderOnVolume()
+    {
+        string relative = DestinationSubpath is { } subpath
+            ? CreateSubdirectory && !string.IsNullOrWhiteSpace(SubdirectoryName)
+                ? System.IO.Path.Combine(subpath, SubdirectoryName.Trim())
+                : subpath
+            : FolderWithoutDrive(BackupRoot() ?? "");
+        return relative.Replace('/', '\\').Trim('\\');
     }
 
     /// <summary>

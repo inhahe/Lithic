@@ -148,12 +148,13 @@ public static class BackupSetTransfer
     /// Make an imported set's destination volume identity this computer's. One
     /// that resolves here is kept: the same disk can carry its GUID to another
     /// computer, and the set then follows it to whatever letter it has here. One
-    /// that does not is dropped and captured again from the path when its drive
-    /// is next seen: another computer may know the drive by another GUID, which
-    /// would never resolve here (the destination "not connected" for good), and a
-    /// set's folder would compare as another volume's than a local set's in it.
-    /// A drive that is not plugged in cannot be told from a foreign GUID, and
-    /// loses its identity too.
+    /// that does not is dropped: another computer may know the drive by another
+    /// GUID, which would never resolve here (the destination "not connected" for
+    /// good), and a set's folder would compare as another volume's than a local
+    /// set's in it. A drive that is not plugged in cannot be told from a foreign
+    /// GUID, and loses its identity too. None is looked up from the path now -
+    /// that letter may be another disk's here - but at the set's next save or
+    /// backup, once the user has checked its destination, as the import asks.
     /// </summary>
     public static void LocalizeDestination(JobOptions options, IDestinationResolver resolver)
     {
@@ -161,7 +162,6 @@ public static class BackupSetTransfer
             return;
         options.DestinationVolumeId = null;
         options.DestinationSubpath = null;
-        resolver.Resolve(options);   // captured from the path, if its drive is here
     }
 
     /// <summary>

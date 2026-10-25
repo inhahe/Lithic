@@ -688,6 +688,8 @@ internal static class Program
 
         // A main window that really backs up, and removes a dropped source's
         // copies without asking first, so that each refusal is all that stops it.
+        // With the app's destination resolver, which the folder checks of this
+        // section and the next judge and save volume identities by.
         _vm = new MainViewModel(
             _catalog,
             burner: null!,
@@ -699,6 +701,8 @@ internal static class Program
                 _catalog,
                 new LithicBackup.Infrastructure.FileSystem.FileScanner(_catalog),
                 new VersionRetentionService(_catalog)),
+            destinationResolver: new LithicBackup.Infrastructure.FileSystem.DestinationResolver(
+                new LithicBackup.Infrastructure.FileSystem.Win32VolumeResolver()),
             settings: new UserSettings { ReconcileMode = ReconcileAfterEditMode.Always });
         if (!await WaitFor(() => _vm.BackupSets.Any(r => r.Id == _setId), 10000))
         {
@@ -889,6 +893,22 @@ internal static class Program
                 $"backing up a set whose folder another set shares is refused, and says why (\"{_vm.StatusText}\")");
             Check((await _observer.GetDiscsForBackupSetAsync(_setId)).Count == discsBefore, "and nothing is written");
             _dialogs.ClearExpectations();
+
+            // --- nor seeded from it: the seed would take the other set's files ---
+            Directory.CreateDirectory((await DbSetAsync()).JobOptions!.BackupRoot()!);
+            ed = await OpenEditorAsync("shared: seed");
+            if (ed is null) return;
+            await Task.Delay(300);
+            ed.Vm.MarkClean();
+            int filesBefore = (await _observer.GetAllFilesForBackupSetAsync(_setId)).Count;
+            _dialogs.Expect("Backup Folder Shared", DialogWatcher.IDOK);
+            ed.Vm.SeedFromExistingCommand.Execute(null);
+            Check(await WaitFor(() => _dialogs.WasAnswered("Backup Folder Shared"), 20000)
+                  && await WaitFor(() => ed.Vm.SeedResult.StartsWith("Not seeded", StringComparison.Ordinal), 5000)
+                  && (await _observer.GetAllFilesForBackupSetAsync(_setId)).Count == filesBefore,
+                $"seeding from a folder another set shares is refused, and imports nothing (\"{ed.Vm.SeedResult}\")");
+            _dialogs.ClearExpectations();
+            await EnsureClosedAsync(ed.Window);
         }
         finally
         {
@@ -915,6 +935,9 @@ internal static class Program
         _dialogs.Expect("Change Backup Folder", DialogWatcher.IDYES);   // its files are recorded in the old one
         ed.Vm.SaveCommand.Execute(null);
         Check(await WaitClosedAsync(ed.Window, 15000), "the retyped destination is saved");
+        Check((await DbSetAsync()).JobOptions!.DestinationVolumeId is { } savedVolume
+              && savedVolume == volumes.GetVolumeId(retyped),
+            "with the new volume identity, captured at the save from the drive it was judged by");
         await EnsureClosedAsync(ed.Window);
         _dialogs.ClearExpectations();
         var saved = (await DbSetAsync()).JobOptions!;
@@ -1945,34 +1968,51 @@ internal static class Program
         await EnsureClosedAsync(ed.Window);
     }
 
+    /// <summary>
+    /// 8: File > Exit closes an open editor first, while it can still refuse. Yes
+    /// saves as the Save button does and the exit carries on once the editor has
+    /// closed; Cancel keeps the app running. (An exit used to save synchronously
+    /// inside the editor's Closed handler, and to drop an edit it could not save.)
+    /// </summary>
     static async Task ExitAnswerYesSavesBeforeReturningAsync()
     {
         Console.WriteLine();
-        Console.WriteLine("=== 8. File > Exit, Yes: the save is on disk before the window is gone ===");
-        var ed = await OpenEditorAsync("exit");
-        if (ed is null) return;
-        int w0 = _counter.Writes;
-        await ToggleAsync(ed, _a, false);
-
-        SetAppFlag("IsExiting", true);
+        Console.WriteLine("=== 8. File > Exit: the editor asks first; Yes saves and the exit carries on ===");
+        int ended = 0;
+        _app.EndApplicationOverride = () => ended++;
         try
         {
+            var ed = await OpenEditorAsync("exit");
+            if (ed is null) return;
+            int w0 = _counter.Writes;
+            await ToggleAsync(ed, _a, false);
+
             _dialogs.Expect("Unsaved Changes", DialogWatcher.IDYES);
-            ed.Window.Close();
-            // No awaiting here: an exiting process does not wait either.
-            var db = await Task.Run(() => _observer.GetBackupSetAsync(_setId));
+            _app.ExitApplication();
             Check(_dialogs.WasAnswered("Unsaved Changes"), "the exit asked whether to save");
-            Check(!IsCovered(db!.SourceSelections, _a),
-                "and by the time Close() returned, the unticked folder was already saved");
-            await WaitClosedAsync(ed.Window);
+            Check(await WaitFor(() => !IsOpen(ed.Window), 15000) && await WaitFor(() => ended == 1, 5000),
+                $"Yes saved, closed the editor, and the exit carried on (exits: {ended})");
+            var db = await DbSetAsync();
+            Check(!IsCovered(db.SourceSelections, _a) && _counter.Writes - w0 == 1,
+                $"with the unticked folder saved, in exactly one write (writes: {_counter.Writes - w0})");
             _dialogs.ClearExpectations();
+            await EnsureClosedAsync(ed.Window);
+
+            ed = await OpenEditorAsync("exit, cancelled");
+            if (ed is null) return;
+            await ToggleAsync(ed, _a, true);
+            _dialogs.Expect("Unsaved Changes", DialogWatcher.IDCANCEL);
+            _app.ExitApplication();
+            await Task.Delay(500);
+            Check(_dialogs.WasAnswered("Unsaved Changes") && IsOpen(ed.Window) && ended == 1,
+                "Cancel at the prompt keeps the editor open, and the app running");
+            _dialogs.ClearExpectations();
+            await EnsureClosedAsync(ed.Window);
         }
         finally
         {
-            SetAppFlag("IsExiting", false);
+            _app.EndApplicationOverride = null;
         }
-        Check(_counter.Writes - w0 == 1, $"with exactly one write (writes: {_counter.Writes - w0})");
-        await EnsureClosedAsync(ed.Window);
     }
 
     static async Task StandaloneLargestFilesAsync()
@@ -2194,7 +2234,9 @@ internal static class Program
             SourceRoots = [_src],
             CreatedUtc = DateTime.UtcNow,
             DefaultMediaType = MediaType.Directory,
-            JobOptions = new JobOptions { TargetDirectory = _dst },
+            // A folder of its own: in the test set's, the two would share one,
+            // which the app refuses to back up, seed or clean.
+            JobOptions = new JobOptions { TargetDirectory = Path.Combine(_root, "dst-lf-unit") },
             SourceSelections = [Dir(_src, true, false)],
         });
         var scanner = new StubScanner(
