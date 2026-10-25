@@ -9,9 +9,9 @@ copy recorded. All 70,384 are real. Three causes, all now closed:
 - **A seed adopted references whose content was not on the drive.** 66,945 were
   recorded by the seed of 2026-10-18/19, from a backup written on another computer
   whose copies of that content were gone. Their manifests' hints name paths that no
-  record has, some on drives the set no longer backs up. The seed now retires every
-  reference it recorded whose content has no plain copy, and says how many
-  (`SeedOutcome.ReferencesWithoutContent`; `tools\excess_versions_test` §26).
+  record has, some on drives the set no longer backs up. The seed now leaves out every
+  reference it recorded whose content has no plain copy, even when stopped, and says how
+  many (`SeedOutcome.ReferencesWithoutContent`; `tools\excess_versions_test` §26).
 - **Copies retired and deleted while references still needed them.** Removals before
   d8684e9 (2026-10-20) retired records without the guard that keeps a live reference's
   last copy. Most of the remaining references written on 2026-10-18/19 point at such a
@@ -35,12 +35,20 @@ reference to the missing file. All now take the first recorded copy whose file e
 bytes again (design.md, "A reference resolves to a copy whose file is there").
 
 A broken reference whose copy was retired but is still on the drive now gets it back
-instead of losing it (`ContentAnchors.ReviveRetiredCopiesAsync`; design.md, "A retired
-copy a reference needs comes back"). Verify's repair does this before flagging
-anything, and the reference's file is then left alone; it is the only way back for a
-file whose source is gone. Cleanup's purge does it for files listed as deleted in the
-catalog, which it used to delete with the last bytes of such content. Pinned by
+instead of losing it (`ContentAnchors.ReviveCopiesAsync`; design.md, "A retired copy a
+reference needs comes back"). Verify's repair does this before flagging anything, and
+the reference's file is then left alone; it is the only way back for a file whose
+source is gone. Cleanup's purge does it for the files ticked under "deleted in the
+catalog", which it used to delete with the last bytes of such content. Pinned by
 `tools\excess_versions_test` §27.
+
+Two more found on the way. An empty file was stored as a `.fileref` (8,001 of them on
+the set, all resolving to one empty file), and losing that one file would have broken
+them all. Empty content needs no copy now (design.md, "Empty content needs no copy").
+And Verify, with contents checked, reported a corrupt anchor only for the first
+reference it met, so the repair retired that reference alone and the next backup revived
+it against the same bad copy. It now reports the anchor and every reference to it
+(design.md, "Verify reports a wrong anchor").
 
 Also in Verify Integrity: the window no longer starts verifying on opening, so
 "Verify file contents" can be chosen first. **Re-backup missing files** did its

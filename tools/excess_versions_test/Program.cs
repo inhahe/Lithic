@@ -301,6 +301,129 @@ internal static class Program
         await ComingBackAfterRetirementAsync(root);
         await SeedLeavesOutReferencesWithoutContentAsync(root);
         await RetiredCopiesComeBackAsync(root);
+        await EmptyContentNeedsNoCopyAsync(root);
+        await WrongAnchorIsReportedAsync(root);
+    }
+
+    /// <summary>A set backing <paramref name="source"/> up to <paramref name="target"/> with file-level dedup, in a catalog of its own.</summary>
+    static async Task<(SqliteCatalogRepository Repo, BackupSet Set, Func<BackupJob> Job)> DedupSetAsync(
+        string root, string name, string source, string target)
+    {
+        string dir = Path.Combine(root, name);
+        Directory.CreateDirectory(dir);
+        var repo = new SqliteCatalogRepository(Path.Combine(dir, "catalog.db"));
+        List<SourceSelection> Sel() =>
+            [new SourceSelection { Path = source, IsDirectory = true, IsSelected = true, AutoIncludeNewSubdirectories = true }];
+        var set = await repo.CreateBackupSetAsync(new BackupSet
+        {
+            Name = name, SourceRoots = [source], SourceSelections = Sel(), CreatedUtc = DateTime.UtcNow,
+            DefaultMediaType = MediaType.Directory,
+            JobOptions = new JobOptions { TargetDirectory = target, EnableFileDeduplication = true },
+        });
+        BackupJob Job() => new()
+        {
+            BackupSetId = set.Id, Sources = Sel(), EnableFileDeduplication = true, TargetDirectory = target,
+            ZipMode = ZipMode.None,
+        };
+        return (repo, set, Job);
+    }
+
+    /// <summary>
+    /// §28. Empty content needs no copy. A backup stores empty files plain, never
+    /// as references. A reference to empty content that an older build wrote,
+    /// with no plain copy of it anywhere, is kept by a seed, passed by Verify and
+    /// restored as an empty file.
+    /// </summary>
+    static async Task EmptyContentNeedsNoCopyAsync(string root)
+    {
+        Console.WriteLine();
+        Console.WriteLine("=== 28. Empty content needs no copy ===");
+        string source = Path.Combine(root, "src28"), target = Path.Combine(root, "dst28");
+        Directory.CreateDirectory(source);
+        Directory.CreateDirectory(target);
+        string e1 = Path.Combine(source, "e1.txt"), e2 = Path.Combine(source, "e2.txt");
+        await File.WriteAllBytesAsync(e1, []);
+        await File.WriteAllBytesAsync(e2, []);
+        var (repo, set, job) = await DedupSetAsync(root, "cat28", source, target);
+        using (repo)
+        {
+            var svc = new DirectoryBackupService(repo, new FileScanner(repo), new VersionRetentionService(repo));
+            if (!(await svc.ExecuteAsync(job(), target, VersionRetentionService.DefaultTiers, null, CancellationToken.None)).Success)
+                throw new Exception("backup failed");
+            var rows = (await repo.GetFileRecordsByPathAsync(set.Id, e1)).Concat(await repo.GetFileRecordsByPathAsync(set.Id, e2)).ToList();
+            Check(rows.Count == 2 && rows.All(r => !r.IsFileRef && r.Hash == EmptyContent.Hash),
+                "two empty files are both stored plain, not one as a reference to the other");
+        }
+
+        // A destination written by an older build: an empty file's reference, and no
+        // plain copy of empty content anywhere.
+        string oldTarget = Path.Combine(root, "dst28-old");
+        string e3 = Path.Combine(source, "e3.txt");
+        await File.WriteAllBytesAsync(e3, []);
+        string manifestPath = Path.Combine(oldTarget, e3[..1], e3[3..]) + ".fileref";
+        Directory.CreateDirectory(Path.GetDirectoryName(manifestPath)!);
+        await File.WriteAllTextAsync(manifestPath, JsonSerializer.Serialize(new FileRefManifest
+        {
+            OriginalName = "e3.txt", OriginalSize = 0, Hash = EmptyContent.Hash, SourcePath = e3, ContentPath = "",
+        }));
+        var (oldRepo, oldSet, oldJob) = await DedupSetAsync(root, "cat28-old", source, oldTarget);
+        using (oldRepo)
+        {
+            var svc = new DirectoryBackupService(oldRepo, new FileScanner(oldRepo), new VersionRetentionService(oldRepo));
+            var seeded = await svc.SeedFromExistingDirectoryAsync(oldSet.Id, oldTarget);
+            var e3Rows = await oldRepo.GetFileRecordsByPathAsync(oldSet.Id, e3);
+            Check(seeded.ReferencesWithoutContent == 0 && e3Rows.Count == 1 && e3Rows[0].IsFileRef && !e3Rows[0].IsDeleted,
+                $"a seed keeps the reference to empty content ({seeded.ReferencesWithoutContent} left out)");
+            int broken = (await new VerifyService(oldRepo, new FileScanner(oldRepo)).VerifyAsync(oldJob(), oldTarget))
+                .Issues.Count(i => i.Kind == VerifyIssueKind.FileRefUnresolved);
+            Check(broken == 0, $"Verify does not call it broken ({broken})");
+            var restorer = new RestoreService(oldRepo);
+            string restoreTo = Path.Combine(root, "restored28");
+            var restored = await restorer.RestoreAsync(
+                await restorer.MaterializeSelectionAsync(oldSet.Id, [], [e3]),
+                new Dictionary<string, string> { [source[..1].ToUpperInvariant()] = restoreTo });
+            var files = Directory.Exists(restoreTo) ? Directory.GetFiles(restoreTo, "e3.txt", SearchOption.AllDirectories) : [];
+            Check(restored.Errors.Count == 0 && files.Length == 1 && new FileInfo(files[0]).Length == 0,
+                $"and restore writes the empty file ({string.Join("; ", restored.Errors)})");
+        }
+        Microsoft.Data.Sqlite.SqliteConnection.ClearAllPools();
+    }
+
+    /// <summary>
+    /// §29. With "Verify file contents", a plain copy whose bytes are wrong is
+    /// reported as its own file, and so is every reference that resolves to it,
+    /// whichever the catalog reaches first. Verify's repair then retires the copy
+    /// too, rather than only the first reference, after which the next backup
+    /// would have revived the others against the bad copy.
+    /// </summary>
+    static async Task WrongAnchorIsReportedAsync(string root)
+    {
+        Console.WriteLine();
+        Console.WriteLine("=== 29. A wrong copy is reported for itself and for every reference to it ===");
+        string source = Path.Combine(root, "src29"), target = Path.Combine(root, "dst29");
+        Directory.CreateDirectory(source);
+        Directory.CreateDirectory(target);
+        var paths = new[] { "a.txt", "b.txt", "c.txt" }.Select(n => Path.Combine(source, n)).ToList();
+        foreach (var p in paths)
+            await File.WriteAllTextAsync(p, "the same bytes, section twenty-nine");
+        var (repo, set, job) = await DedupSetAsync(root, "cat29", source, target);
+        using (repo)
+        {
+            var svc = new DirectoryBackupService(repo, new FileScanner(repo), new VersionRetentionService(repo));
+            if (!(await svc.ExecuteAsync(job(), target, VersionRetentionService.DefaultTiers, null, CancellationToken.None)).Success)
+                throw new Exception("backup failed");
+            var live = new List<FileRecord>();
+            foreach (var p in paths)
+                live.AddRange((await repo.GetFileRecordsByPathAsync(set.Id, p)).Where(r => !r.IsDeleted));
+            var plain = live.Single(r => !r.IsFileRef);
+            await File.WriteAllTextAsync(Path.Combine(target, plain.DiscPath), "THE SAME BYTES, SECTION TWENTY-NINE");
+            var mismatched = (await new VerifyService(repo, new FileScanner(repo)).VerifyAsync(job(), target, verifyContents: true))
+                .Issues.Where(i => i.Kind == VerifyIssueKind.ContentMismatch)
+                .Select(i => i.Path).ToHashSet(StringComparer.OrdinalIgnoreCase);
+            Check(mismatched.SetEquals(paths),
+                $"the copy and both references to it are reported ({mismatched.Count} of {paths.Count})");
+        }
+        Microsoft.Data.Sqlite.SqliteConnection.ClearAllPools();
     }
 
     /// <summary>
@@ -362,12 +485,49 @@ internal static class Program
         var broken = await Broken();
         Check(broken.Count == 2, $"set-up: both references are broken ({broken.Count})");
 
-        var revived = await ContentAnchors.ReviveRetiredCopiesAsync(repo, set.Id, target, CancellationToken.None);
+        async Task<IReadOnlyList<FileRecord>> Revive(params string[] hashes)
+        {
+            var candidates = await repo.GetRetiredPlainCopiesAsync(set.Id, hashes);
+            using var tx = await repo.BeginTransactionAsync(set.Id);
+            var made = await ContentAnchors.ReviveCopiesAsync(repo, set.Id, target, candidates, CancellationToken.None);
+            tx.Complete();
+            return made;
+        }
+        FileRecord Fake(string name, string discPath, string hash, bool isRef, int version = 1) => new()
+        {
+            DiscId = plainAB.DiscId, SourcePath = Path.Combine(root, "elsewhere27", name), DiscPath = discPath,
+            SizeBytes = 1, Hash = hash, IsFileRef = isRef, Version = version,
+            SourceLastWriteUtc = DateTime.UtcNow, BackedUpUtc = DateTime.UtcNow,
+        };
+
+        // A live record of the content whose file has gone is no copy of it.
+        var goneCopy = await repo.CreateFileRecordAsync(Fake("gone.txt", @"!gone27\gone.txt", plainAB.Hash, isRef: false));
+        var revived = await Revive(plainAB.Hash, plainCD.Hash);
+        await repo.MarkFileRecordsDeletedByIdsAsync(set.Id, [goneCopy.Id]);
         broken = await Broken();
         Check(revived.Count == 1 && revived[0].Id == plainAB.Id && await IsLive(plainAB),
-            $"the copy still holding its content is live again ({revived.Count} revived)");
+            $"the copy still holding its content is live again, past a live record whose file is gone ({revived.Count} revived)");
         Check(broken.SequenceEqual([refCD], StringComparer.OrdinalIgnoreCase),
             $"and only the reference whose copy changed is still broken ({string.Join("; ", broken)})");
+
+        // A retired copy at a file's current location, though intact, is not
+        // revived when a newer record of that file stores it under another name:
+        // the next backup of that file could write over it unawares.
+        byte[] eBytes = System.Text.Encoding.UTF8.GetBytes("a stale head's content, section twenty-seven");
+        string eHash = Convert.ToHexString(System.Security.Cryptography.SHA256.HashData(eBytes)).ToLowerInvariant();
+        string eStored = Path.Combine(target, "stale", "e.txt");
+        Directory.CreateDirectory(Path.GetDirectoryName(eStored)!);
+        await File.WriteAllBytesAsync(eStored, eBytes);
+        var oldHead = await repo.CreateFileRecordAsync(Fake("e.txt", @"stale\e.txt", eHash, isRef: false));
+        var newHead = await repo.CreateFileRecordAsync(
+            Fake("e.txt", @"stale\e.txt.fileref", plainAB.Hash, isRef: true, version: 2));
+        var needsE = await repo.CreateFileRecordAsync(Fake("needs-e.txt", @"!needs\e.fileref", eHash, isRef: true));
+        await repo.MarkFileRecordsDeletedByIdsAsync(set.Id, [oldHead.Id]);
+        var stale = await Revive(eHash);
+        Check(stale.Count == 0 && !await IsLive(oldHead),
+            $"a retired copy at the current location under a newer head is left retired ({stale.Count} revived)");
+        await repo.MarkFileRecordsDeletedByIdsAsync(set.Id, [newHead.Id, needsE.Id]);
+        File.Delete(eStored);
 
         // Cleanup lists the retired copy as deleted in the catalog; its purge keeps it.
         await repo.MarkFileRecordsDeletedByIdsAsync(set.Id, [plainAB.Id]);
@@ -395,7 +555,8 @@ internal static class Program
         var verify = new VerifyIntegrityViewModel(repo, new FileScanner(repo), set);
         verify.VerifyCommand.Execute(null);
         await WaitFor(() => verify.HasRun && !verify.IsLoading, 60000);
-        Check(verify.RepairableCount == 2, $"set-up: Verify offers both broken references for repair ({verify.RepairableCount})");
+        Check(verify.RepairableCount == 2,
+            $"set-up: Verify offers both broken references for repair ({string.Join("; ", verify.Issues.Select(i => $"{i.Kind} {Path.GetFileName(i.Path)}"))})");
         verify.RepairCommand.Execute(null);
         await WaitFor(() => verify.Repaired && !verify.IsBusy, 60000);
         Check(await IsLive(plainAB) && (await repo.GetFileRecordsByPathAsync(set.Id, refAB)).Any(r => !r.IsDeleted),
@@ -473,15 +634,20 @@ internal static class Program
         {
             var outcome = await Service(repo).SeedFromExistingDirectoryAsync(set.Id, target);
             Check(outcome.ReferencesWithoutContent == 1, $"the seed counts one reference without content ({outcome.ReferencesWithoutContent})");
-            Check(await Live(repo, set.Id, lostRef) is null, "and leaves it out of the catalog");
+            Check((await repo.GetFileRecordsByPathAsync(set.Id, lostRef)).Count == 0 && outcome.Files == 2,
+                $"and leaves it out of the catalog, and out of the files it imported ({outcome.Files})");
             Check((await Live(repo, set.Id, keptRef))?.IsFileRef == true, "while a reference whose content is there is recorded");
+            var again = await Service(repo).SeedFromExistingDirectoryAsync(set.Id, target);
+            Check(again.ReferencesWithoutContent == 1 && again.Files == 0
+                  && (await repo.GetFileRecordsByPathAsync(set.Id, lostRef)).Count == 0,
+                $"seeding again records nothing more, not even a retired row ({again.Files} file(s))");
             int broken = (await new VerifyService(repo, new FileScanner(repo)).VerifyAsync(Job(set.Id), target))
                 .Issues.Count(i => i.Kind == VerifyIssueKind.FileRefUnresolved);
             Check(broken == 0, $"Verify finds no broken reference after the seed ({broken})");
 
             await Backup(repo, set.Id);
-            var again = await Live(repo, set.Id, lostRef);
-            Check(again is { IsFileRef: false } && File.ReadAllText(Path.Combine(target, again.DiscPath)) == "lost content, section twenty-six",
+            var copied = await Live(repo, set.Id, lostRef);
+            Check(copied is { IsFileRef: false } && File.ReadAllText(Path.Combine(target, copied.DiscPath)) == "lost content, section twenty-six",
                 "the next backup copies that file again");
         }
         Microsoft.Data.Sqlite.SqliteConnection.ClearAllPools();
@@ -555,6 +721,56 @@ internal static class Program
         var back = await All(x);
         Check(back.Count == 3 && back.All(r => !r.IsDeleted),
             $"back unchanged, x.txt has all three versions live again ({back.Count(r => !r.IsDeleted)} of {back.Count})");
+
+        // The guard keeps live an earlier version another file's reference needs,
+        // so the path comes back with one version live and the rest retired: it
+        // still continues its whole chain.
+        string w = Path.Combine(source, "one", "w.txt"), wDup = Path.Combine(source, "two", "w-dup.txt");
+        await File.WriteAllTextAsync(w, "w content A, section twenty-five");
+        await Backup();
+        await File.WriteAllTextAsync(w, "w content B, section twenty-five, longer");
+        await Backup();
+        await File.WriteAllTextAsync(w, "w content C, section twenty-five, longer still");
+        await File.WriteAllTextAsync(wDup, "w content A, section twenty-five");
+        await Backup();
+        Check((await Live(wDup))!.IsFileRef, "set-up: w-dup.txt is a reference to w.txt's first version");
+        await Retire(w);
+        Check((await All(w)).Count(r => !r.IsDeleted) == 1,
+            "set-up: moving w.txt out keeps live only the version w-dup.txt needs");
+        Touch(w);
+        await Backup();
+        var wBack = await All(w);
+        Check(wBack.Count == 3 && wBack.All(r => !r.IsDeleted),
+            $"back unchanged, w.txt has all three versions live again ({wBack.Count(r => !r.IsDeleted)} of {wBack.Count})");
+
+        // An earlier version that is a reference whose only copy is the newest
+        // version comes back with it.
+        // (Folder "one" is backed up before "two", so the anchor is the plain copy.)
+        string anchor = Path.Combine(source, "one", "aa-anchor.txt"), z2 = Path.Combine(source, "two", "z2.txt");
+        await File.WriteAllTextAsync(anchor, "z2 content A, section twenty-five");
+        await File.WriteAllTextAsync(z2, "z2 content A, section twenty-five");
+        await Backup();
+        Check((await Live(z2))!.IsFileRef && !(await Live(anchor))!.IsFileRef,
+            "set-up: z2.txt is a reference to aa-anchor.txt");
+        await File.WriteAllTextAsync(z2, "z2 content B, section twenty-five, longer");
+        await Backup();
+        // The anchor goes (retired and deleted, as removals did before the guard),
+        // so z2's content A comes back as plain bytes.
+        var anchorLive = await Live(anchor);
+        await repo.MarkFileRecordsDeletedByIdsAsync(set.Id, [anchorLive!.Id]);
+        File.Delete(Path.Combine(target, anchorLive.DiscPath));
+        File.Delete(anchor);
+        await File.WriteAllTextAsync(z2, "z2 content A, section twenty-five");
+        await Backup();
+        var z2Rows = await All(z2);
+        Check(z2Rows.Count == 3 && z2Rows.Single(r => r.Version == 1).IsFileRef && !z2Rows.Single(r => r.Version == 3).IsFileRef,
+            "set-up: z2.txt's first version is a reference, its newest the content in plain bytes");
+        await Retire(z2);
+        Touch(z2);
+        await Backup();
+        z2Rows = await All(z2);
+        Check(z2Rows.Count == 3 && z2Rows.All(r => !r.IsDeleted),
+            $"back unchanged, z2.txt's reference version comes back with the newest copy it needs ({z2Rows.Count(r => !r.IsDeleted)} of {z2Rows.Count})");
 
         // Across paths: the reference comes back, the copy it resolved to does not.
         string p = Path.Combine(source, "one", "p.txt"), q = Path.Combine(source, "two", "q.txt");
@@ -660,8 +876,8 @@ internal static class Program
         var plain = recA.IsFileRef ? recB : recA;
         Check(recA.IsFileRef != recB.IsFileRef, "two files of one content: one stored plain, the other a reference to it");
 
-        // Another plain copy of the content recorded, whose file has gone - first
-        // in path order, where the catalog's single-copy answer used to look.
+        // Another plain copy of the content recorded, whose file has gone, and
+        // first in path order: a resolver must look past it.
         var disc = await repo.CreateDiscAsync(new DiscRecord
         {
             BackupSetId = set.Id, Label = target, SequenceNumber = 9, MediaType = MediaType.Directory,
@@ -2047,10 +2263,12 @@ internal static class Program
     static bool ConfirmCloseWhenIdle(IConfirmClose flow) => flow.ConfirmClose(canCancel: true);
 
     /// <summary>
-    /// §11. git's atomic save: index.lock is created empty, caught by a backup
-    /// while empty (so stored as a .fileref to empty content), then renamed over
+    /// §11. A file stored as a .fileref renamed over one already backed up, as
+    /// git's atomic save can do: index.lock is caught by a backup while it holds a
+    /// copy of another file's content (so stored as a .fileref), then renamed over
     /// index. Relocating it would put index.fileref beside the plain index: a
-    /// stale pointer at the current location.
+    /// stale pointer at the current location. (An empty index.lock cannot show
+    /// this: empty files are stored plain.)
     /// </summary>
     static async Task RenameOverExistingAsync(string root)
     {
@@ -2082,16 +2300,16 @@ internal static class Program
             if (!r.Success) throw new Exception("backup failed");
         }
 
-        string empty = Path.Combine(source, "empty.txt");
+        string lockTwin = Path.Combine(source, "other.txt");
         string index = Path.Combine(source, "index");
         string lockFile = Path.Combine(source, "index.lock");
-        await File.WriteAllTextAsync(empty, "");
+        await File.WriteAllTextAsync(lockTwin, "content index.lock is caught with");
         await File.WriteAllTextAsync(index, "index version one");
         await Backup();
-        await File.WriteAllTextAsync(lockFile, "");          // git creates index.lock
-        await Backup();                                       // ...and a backup catches it empty
+        await File.WriteAllTextAsync(lockFile, "content index.lock is caught with");
+        await Backup();                                       // a backup catches index.lock part-written
         var lockHead = (await repo.GetLatestVersionInfoAsync(set.Id))[lockFile];
-        Check(lockHead.IsFileRef, "index.lock, caught empty, is stored as a .fileref");
+        Check(lockHead.IsFileRef, "index.lock, caught holding other.txt's content, is stored as a .fileref");
 
         await File.WriteAllTextAsync(lockFile, "index version two");
         File.Move(lockFile, index, overwrite: true);          // git renames it over index

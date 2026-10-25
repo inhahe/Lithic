@@ -29,4 +29,15 @@ public static class PlainContent
         }
         return null;
     }
+
+    /// <summary>
+    /// <see cref="FirstExistingAsync"/>, as a full path. Empty content needs no
+    /// copy, so callers that may meet a reference to it ask
+    /// <see cref="Core.EmptyContent.Is"/> first.
+    /// </summary>
+    public static async Task<string?> FirstExistingFullPathAsync(
+        ICatalogRepository catalog, int backupSetId, string? hash, string backupRoot, CancellationToken ct = default)
+        => await FirstExistingAsync(catalog, backupSetId, hash, backupRoot, ct) is { } path
+            ? Path.Combine(backupRoot, path)
+            : null;
 }

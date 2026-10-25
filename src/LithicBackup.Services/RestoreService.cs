@@ -1,6 +1,7 @@
 using System.IO.Compression;
 using System.Security.Cryptography;
 using System.Text.Json;
+using LithicBackup.Core;
 using LithicBackup.Core.Interfaces;
 using LithicBackup.Core.Models;
 
@@ -438,20 +439,20 @@ public class RestoreService : IRestoreService
             // --- File-level dedup reference (.fileref) ------------------------
             if (record.IsFileRef)
             {
+                // Empty content: nothing to read back, from this disc or another.
+                if (EmptyContent.Is(record.Hash))
+                    return null;
                 bool ptrExists = File.Exists(Path.Combine(discRoot, record.DiscPath));
 
-                var candidates = await _catalog.GetActiveRecordsByHashAsync(backupSetId, record.Hash, ct);
-                var plain = candidates.FirstOrDefault(r =>
-                    !r.IsFileRef && !r.IsDeduped
-                    && File.Exists(Path.Combine(discRoot, r.DiscPath)));
-
-                if (plain is null)
+                // Resolved as every reference is (PlainContent), on this disc.
+                if (await PlainContent.FirstExistingAsync(_catalog, backupSetId, record.Hash, discRoot, ct)
+                        is not { } plainRel)
                     return Issue(DiscFileIssueKind.UnresolvedReference,
                         ptrExists
                             ? "Backing copy is on another disc; not verified from this disc."
                             : "Reference pointer missing and backing copy is on another disc.");
 
-                string plainPath = Path.Combine(discRoot, plain.DiscPath);
+                string plainPath = Path.Combine(discRoot, plainRel);
                 long len = new FileInfo(plainPath).Length;
                 if (len != record.SizeBytes)
                     return Issue(DiscFileIssueKind.SizeMismatch,
@@ -778,6 +779,12 @@ public class RestoreService : IRestoreService
         string destPath,
         CancellationToken ct)
     {
+        // Empty content needs no copy.
+        if (EmptyContent.Is(hash))
+        {
+            await File.WriteAllBytesAsync(destPath, [], ct);
+            return;
+        }
         if (await PlainContent.FirstExistingAsync(_catalog, backupSetId, hash, discRoot, ct) is not { } source)
         {
             var recorded = await _catalog.GetActivePlainContentPathsByHashAsync(backupSetId, hash, ct);

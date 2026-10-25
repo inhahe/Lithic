@@ -450,8 +450,9 @@ public class VerifyIntegrityViewModel : ViewModelBase, IDisposable
     /// incremental diff ignores deleted records, the next backup sees those
     /// source files as no longer backed up and re-copies them to the destination.
     /// A broken reference is first given back a retired copy of its content that
-    /// is still on the drive, if there is one (ContentAnchors.ReviveRetiredCopiesAsync),
-    /// and its file is then left alone.
+    /// is still on the drive, if there is one (ContentAnchors.ReviveCopiesAsync),
+    /// and its file is then left alone. Closing the window stops the work before the
+    /// catalog is changed; the changes themselves are not interrupted.
     /// </summary>
     private async Task RepairAsync()
     {
@@ -462,6 +463,12 @@ public class VerifyIntegrityViewModel : ViewModelBase, IDisposable
         var referenceOnly = new HashSet<string>(_brokenReferenceOnlyPaths, StringComparer.OrdinalIgnoreCase);
         string? targetDir = _verifiedTargetDir;
         int setId = _backupSet.Id;
+        // The window's closing cancels this, as it does a verification.
+        var cts = new CancellationTokenSource();
+        var previous = _cts;
+        _cts = cts;
+        previous?.Dispose();
+        var ct = cts.Token;
         IsRepairing = true;
         IsProgressIndeterminate = false;
         ProgressPercent = 0;
@@ -483,13 +490,34 @@ public class VerifyIntegrityViewModel : ViewModelBase, IDisposable
                 var cadence = new ProgressCadence();
 
                 // A broken reference's content may still be on the drive, under a
-                // record retired while the reference needed it.
-                IReadOnlyList<FileRecord> revived = [];
+                // record retired while the reference needed it: the contents its
+                // live references cannot find, then their retired copies.
+                int revived = 0;
                 if (targetDir is not null && referenceOnly.Count > 0)
                 {
-                    report.Report((0, "Looking for copies still on the drive that broken references need "
-                        + "(this reads the whole catalog)...", true));
-                    revived = await ContentAnchors.ReviveRetiredCopiesAsync(_catalog, setId, targetDir, CancellationToken.None);
+                    var lost = new HashSet<string>(StringComparer.OrdinalIgnoreCase);
+                    int n = 0;
+                    foreach (string path in referenceOnly)
+                    {
+                        foreach (var r in await _catalog.GetFileRecordsByPathAsync(setId, path, ct))
+                            if (!r.IsDeleted && r.IsFileRef && !await ResolvesAsync(r, setId, targetDir, ct))
+                                lost.Add(r.Hash);
+                        n++;
+                        if (cadence.IsDue())
+                            report.Report((100.0 * n / referenceOnly.Count,
+                                $"Finding what the broken references need ({n:N0} of {referenceOnly.Count:N0})\n{path}", false));
+                    }
+                    if (lost.Count > 0)
+                    {
+                        report.Report((0, $"Looking on the drive for copies of {lost.Count:N0} content(s) the broken "
+                            + "references need (this reads the whole catalog)...", true));
+                        var copies = await _catalog.GetRetiredPlainCopiesAsync(setId, lost, ct);
+                        // Under the set's write lock: no backup may change a copy
+                        // between its check and its revival.
+                        using var tx = await _catalog.BeginTransactionAsync(setId, ct);
+                        revived = (await ContentAnchors.ReviveCopiesAsync(_catalog, setId, targetDir, copies, ct)).Count;
+                        tx.Complete();
+                    }
                 }
 
                 // Every live record of the paths, and which of them may be kept for
@@ -502,10 +530,10 @@ public class VerifyIntegrityViewModel : ViewModelBase, IDisposable
                 int mended = 0;
                 for (int i = 0; i < paths.Count; i++)
                 {
-                    var live = (await _catalog.GetFileRecordsByPathAsync(setId, paths[i]))
+                    var live = (await _catalog.GetFileRecordsByPathAsync(setId, paths[i], ct))
                         .Where(r => !r.IsDeleted).ToList();
-                    if (revived.Count > 0 && referenceOnly.Contains(paths[i])
-                        && await AllReferencesResolveAsync(live, setId, targetDir!))
+                    if (revived > 0 && referenceOnly.Contains(paths[i])
+                        && await AllReferencesResolveAsync(live, setId, targetDir!, ct))
                     {
                         mended++;
                         continue;
@@ -524,10 +552,12 @@ public class VerifyIntegrityViewModel : ViewModelBase, IDisposable
                             false));
                 }
 
+                // The last point at which closing the window stops it.
+                ct.ThrowIfCancellationRequested();
                 report.Report((100, $"Updating the catalog: flagging {candidates.Count:N0} record(s)...", true));
                 var stillNeeded = await _catalog.RetireRecordsKeepingNeededCopiesAsync(setId, candidates, keepable);
                 return (candidates.Count - stillNeeded.Count, stillNeeded.Count, mended);
-            });
+            }, ct);
             Repaired = true;
             string mendedText = relinked > 0
                 ? $"{relinked:N0} file(s) with a broken duplicate-file reference got their content back from "
@@ -542,6 +572,10 @@ public class VerifyIntegrityViewModel : ViewModelBase, IDisposable
                   + "Close this window and run Backup to copy them to the destination again."
                   + (relinked > 0 ? " " + mendedText : "");
         }
+        catch (OperationCanceledException)
+        {
+            SummaryText = "Repair stopped before the catalog was changed.";
+        }
         catch (Exception ex)
         {
             SummaryText = $"Could not update the catalog: {ex.Message}";
@@ -553,11 +587,23 @@ public class VerifyIntegrityViewModel : ViewModelBase, IDisposable
         }
     }
 
-    /// <summary>Whether every <c>.fileref</c> among a path's live records resolves to a copy whose file is there.</summary>
-    private async Task<bool> AllReferencesResolveAsync(IEnumerable<FileRecord> live, int setId, string targetDir)
+    /// <summary>Whether a live <c>.fileref</c> record's content can be restored: it is empty, or a live plain copy of it is there.</summary>
+    private async Task<bool> ResolvesAsync(FileRecord reference, int setId, string targetDir, CancellationToken ct) =>
+        EmptyContent.Is(reference.Hash)
+        || await PlainContent.FirstExistingAsync(_catalog, setId, reference.Hash, targetDir, ct) is not null;
+
+    /// <summary>
+    /// Whether a path's live records include a <c>.fileref</c>, and every one of
+    /// them resolves (<see cref="ResolvesAsync"/>). A path with none left - retired
+    /// since Verify ran - was not mended.
+    /// </summary>
+    private async Task<bool> AllReferencesResolveAsync(
+        IReadOnlyCollection<FileRecord> live, int setId, string targetDir, CancellationToken ct)
     {
+        if (!live.Any(r => r.IsFileRef))
+            return false;
         foreach (var r in live.Where(r => r.IsFileRef))
-            if (await PlainContent.FirstExistingAsync(_catalog, setId, r.Hash, targetDir) is null)
+            if (!await ResolvesAsync(r, setId, targetDir, ct))
                 return false;
         return true;
     }

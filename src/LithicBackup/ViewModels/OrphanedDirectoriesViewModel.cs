@@ -2432,6 +2432,13 @@ public class OrphanedDirectoriesViewModel : ViewModelBase, IConfirmClose, IDispo
                 item.MatchingSourcePaths,
                 item.ExcessVersionRecords,
                 item.DiscFilePaths,
+                // A catalog-deleted row's stored path, and the source path of a
+                // retired record there (the row shows its stored path again when
+                // none was known).
+                CatalogDeletedFiles = item.Reason == OrphanedReason.CatalogDeleted && item.Files is not null
+                    ? item.Files.Where(f => f.DiscRel is not null && !string.Equals(f.Path, f.DiscRel, StringComparison.Ordinal))
+                        .Select(f => (DiscRel: f.DiscRel!, SourcePath: f.Path)).ToList()
+                    : null,
             }).ToList();
 
             int backupSetId = _backupSet.Id;
@@ -2719,13 +2726,29 @@ public class OrphanedDirectoriesViewModel : ViewModelBase, IConfirmClose, IDispo
                     // A file listed as deleted in the catalog can hold the only copy
                     // of content a live reference needs, on a set whose references
                     // lost their copies before the guards that keep them existed.
-                    // Made live again, it is a copy kept for a reference.
-                    if (targetDir is not null && workItems.Any(w => w.Reason == OrphanedReason.CatalogDeleted))
+                    // Made live again, it is a copy kept for a reference. Only the
+                    // ticked files are looked at: they are what this purge deletes.
+                    var deletedInCatalog = workItems
+                        .Where(w => w.CatalogDeletedFiles is not null)
+                        .SelectMany(w => w.CatalogDeletedFiles!)
+                        .GroupBy(f => f.SourcePath, StringComparer.OrdinalIgnoreCase)
+                        .ToList();
+                    if (targetDir is not null && deletedInCatalog.Count > 0)
                     {
-                        ((IProgress<Services.ProgressReport>)progress).Report(
-                            "Cleaning up: checking whether a broken duplicate-file reference needs a file listed...");
-                        foreach (var r in await Services.ContentAnchors.ReviveRetiredCopiesAsync(
-                                     _catalog, backupSetId, targetDir, ct))
+                        var copies = new List<FileRecord>();
+                        for (int i = 0; i < deletedInCatalog.Count; i++)
+                        {
+                            var group = deletedInCatalog[i];
+                            if (cadence.IsDue())
+                                ((IProgress<Services.ProgressReport>)progress).Report(
+                                    "Cleaning up: checking whether a broken duplicate-file reference needs a "
+                                    + $"listed file ({i + 1:N0} of {deletedInCatalog.Count:N0})");
+                            var at = group.Select(f => f.DiscRel).ToHashSet(StringComparer.OrdinalIgnoreCase);
+                            copies.AddRange((await _catalog.GetFileRecordsByPathAsync(backupSetId, group.Key, ct))
+                                .Where(r => r.IsDeleted && at.Contains(r.DiscPath.Replace('/', '\\'))));
+                        }
+                        foreach (var r in await Services.ContentAnchors.ReviveCopiesAsync(
+                                     _catalog, backupSetId, targetDir, copies, ct))
                             revivedDiscPaths.Add(r.DiscPath.Replace('/', '\\'));
                     }
 

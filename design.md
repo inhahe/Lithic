@@ -1821,18 +1821,25 @@ to it again. Pinned by `tools\excess_versions_test` §24.
 back.** Retiring a path's records keeps their copies on the drive: the Worker does it
 when a file moves out of the set (`BackupWorker.MarkMovedOutAsync`), which a program
 that saves by renaming the old file away first can trigger if a poll lands between the
-rename and the write. When a later backup finds a file there again, the path's latest
-record is retired (`resurrecting` in `ExecuteCoreAsync`), and the backup:
+rename and the write. When a later backup finds a file at a path whose newest record is
+retired, `ReviveChainAsync` (from `ExecuteCoreAsync`, before the file is read) makes live
+again what of the chain can be read back. The test is the newest record, not the newest
+live one: the guard that retired the path may have kept an earlier version live for
+another file's reference. The candidates are the retired records under `_prev` and the
+newest record wherever it is stored; an older retired record at the current location
+describes bytes since overwritten. Each must pass `CanReviveAsync`:
 
-- makes live again the path's earlier versions under `_prev` whose copies are still
-  there (`ReviveHistoryAsync`), so retention judges them by the tiers rather than the
-  next Cleanup deleting them as leftovers;
-- revives the latest record in place, or un-deletes it as it moves into the history,
-  only if `CanReviveAsync` passes. A plain copy is re-read and hashed: Verify's repair
-  retires a copy whose bytes changed, and reviving it unread would undo the repair. A
-  `.dedup`'s blocks must all be in the store, and a `.fileref`'s content must have a
-  live plain copy whose file is there. Otherwise the file is stored afresh, plain when
-  nothing live holds its content.
+- a plain copy is re-read and hashed, since Verify's repair retires a copy whose bytes
+  changed and reviving it unread would undo the repair;
+- a `.dedup`'s manifest must match the record and all its blocks be in the store;
+- a `.fileref`'s content must be empty or have a live plain copy whose file is there.
+
+Plain copies go first, then references, which may resolve to a copy just revived, the
+newest included. If the newest record is revived the file is then an ordinary changed
+or unchanged one. If not, the path is `resurrecting`: its numbering continues, the old
+copy is filed under `_prev` (un-deleted there only if it passes `CanReviveAsync` after
+all, as a copy found at its own `.vN` can), and the file is copied afresh, plain when
+nothing live holds its content.
 
 The guard on retiring only protects a copy against references outside the retired
 records. A reference retired with its copy and then revived alone was left resolving
@@ -1844,24 +1851,54 @@ by `tools\excess_versions_test` §25.
 **A seed records no reference whose content is not on the drive.** A backup written
 by an older build can hold `.fileref` manifests whose plain copy is gone. Recorded as
 backed up, such a reference restores nothing, and no backup would ever copy its file
-again. After recording and hashing, a seed asks which references it recorded have no
-live plain copy of their content (`ICatalogRepository.GetReferencesWithoutContentAsync`)
-and retires them. Each such file is then left to the next backup, as a copy pruned for
-being missing is, and the seed's summary counts them
-(`SeedOutcome.ReferencesWithoutContent`). Pinned by `tools\excess_versions_test` §26.
+again. After recording and hashing, a seed deletes outright the references it recorded
+whose content has no live plain copy recorded
+(`ICatalogRepository.DeleteSeededReferencesWithoutContentAsync`). They are left out
+rather than retired, because a re-run skips only paths with live records and would
+otherwise add them again as retired rows each time. Each such file is the next backup's
+to copy, as one the catalog has never seen, and the seed's summary counts them
+(`SeedOutcome.ReferencesWithoutContent`), outside the files and versions it imported. A
+stopped seed does the same for what it recorded, unless plain copies went unhashed
+(Skip hashing) and cannot yet be told from missing ones. The check is of recorded copies,
+not their files, which a seed has just found; Verify judges files. Pinned by
+`tools\excess_versions_test` §26.
 
 **A retired copy a reference needs comes back.** A set whose references broke before
 the guards existed has live references whose content's only copy is retired, often
-with its file still there. `ContentAnchors.ReviveRetiredCopiesAsync` finds those copies
-(`ICatalogRepository.GetRetiredCopiesOfReferencedContentAsync`, which reads every
-record because no index covers retired ones). For each content it makes live the newest
-copy whose file still hashes to it. Verify's repair runs it before flagging anything,
-and leaves alone the files whose references it mended: no copy is needed, and for a file
-whose source is gone it is the only way back. Cleanup's purge runs it when files listed
-as "deleted in the catalog" are ticked. That category is decided by stored path alone,
-and it used to delete such a copy, which was the last of its content. A copy made
-live is an ordinary live record: Cleanup lists one whose source is gone, and its guard
-keeps it while a reference needs it. Pinned by `tools\excess_versions_test` §27.
+with its file still there. `ContentAnchors.ReviveCopiesAsync` takes candidate retired
+plain copies and, for each content, makes live the newest one that is needed and still
+holds it. It is needed when a live reference resolves to its content and no live plain
+copy whose file is there does. It still holds the content when its file hashes to the
+record's hash. A candidate at a file's current location counts only if it is that file's
+newest record, since an older one there describes bytes the next backup of the file may
+write over unawares. The caller holds the set's write lock, so no backup changes a copy
+between its check and its revival. Two callers, each passing only what is at risk:
+
+- Verify's repair passes the retired copies (`ICatalogRepository.GetRetiredPlainCopiesAsync`,
+  which reads every record because no index covers retired ones) of the contents its
+  broken references cannot find. It leaves alone the files whose references it mended:
+  no copy is needed, and for a file whose source is gone it is the only way back.
+- Cleanup's purge passes the retired records at the "deleted in the catalog" files
+  ticked. That category is decided by stored path alone, and it would otherwise delete
+  the last copy of such content.
+
+A copy made live is an ordinary live record: Cleanup lists one whose source is gone,
+and its guard keeps it while a reference needs it. Pinned by
+`tools\excess_versions_test` §27.
+
+**Empty content needs no copy** (`Core.EmptyContent`). A backup stores an empty file
+plain, never as a `.fileref`: there are no bytes to share, and a manifest is larger than
+the file. Older builds did write such references, thousands on the author's set, all
+resolving to one empty file. One whose anchor goes is still not broken: restore writes
+the empty file, and Verify, reconcile, the seed's check, the revival of copies and the
+backup's post-copy check pass it by. Pinned by `tools\excess_versions_test` §28.
+
+**Verify reports a wrong anchor for itself and for every reference to it.** With
+"Verify file contents", each plain copy is hashed once however many records share it,
+and its actual hash is kept, so every record that resolves to it is compared with its
+own expected hash. A corrupt anchor reached first through a reference was once reported
+only for that reference: Verify's repair then retired the reference alone, and the next
+backup revived it against the same bad copy. Pinned by `tools\excess_versions_test` §29.
 
 **Overwriting in place retires the old record.** With no history the new copy
 replaces the old one at the same path, and the old live record must be marked

@@ -5298,7 +5298,7 @@ public class MainViewModel : ViewModelBase
             Services.TaskKinds.Verify, set.Id, set.Name,
             () => new VerifyIntegrityViewModel(_catalog, _scanner, set),
             (vm, close) => ((VerifyIntegrityViewModel)vm).DoneRequested += close);
-        StatusText = $"Verifying backup integrity for \"{set.Name}\".";
+        StatusText = $"Opened Verify Integrity for \"{set.Name}\".";
     }
 
     // -------------------------------------------------------------------

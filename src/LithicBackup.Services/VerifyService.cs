@@ -123,12 +123,26 @@ public class VerifyService : IVerifyService
         // content don't re-query the catalog or re-stat the disk.
         var resolvedPlain = new Dictionary<string, string?>(StringComparer.OrdinalIgnoreCase);
         // When verifying contents, remember which absolute plain paths and which
-        // blocks we've already hashed so shared anchors / blocks are read once.
-        var hashedPaths = new HashSet<string>(StringComparer.OrdinalIgnoreCase);
+        // blocks we've already hashed so shared anchors / blocks are read once -
+        // with each plain path's actual hash (null when unreadable), so that a
+        // wrong anchor is reported for its own file and for every reference to it,
+        // whichever the catalog reaches first.
+        var hashedPaths = new Dictionary<string, string?>(StringComparer.OrdinalIgnoreCase);
+
         var hashedBlocks = new HashSet<string>(StringComparer.OrdinalIgnoreCase);
         int recordsChecked = 0;
         int fileRefsChecked = 0;
         int itemsHashed = 0;
+        // The actual hash of a plain copy, read once however many records share it.
+        async Task<string?> ActualHashAsync(string path)
+        {
+            if (!hashedPaths.TryGetValue(path, out string? actual))
+            {
+                itemsHashed++;
+                hashedPaths[path] = actual = await ComputeFileHashAsync(path, ct);
+            }
+            return actual;
+        }
         int total = activeRecords.Count;
         int processed = 0;
         string checking = verifyContents
@@ -164,15 +178,19 @@ public class VerifyService : IVerifyService
                         continue;
                     }
 
+                    // Empty content needs no copy (EmptyContent).
+                    if (EmptyContent.Is(record.Hash))
+                        continue;
+
                     // The referenced content must resolve to an existing plain copy.
                     if (!resolvedPlain.TryGetValue(record.Hash, out string? plainPath))
                     {
-                        plainPath = await ResolvePlainContentPathAsync(
-                            backupSetId, record.Hash, targetDirectory, ct);
+                        plainPath = await PlainContent.FirstExistingFullPathAsync(
+                            _catalog, backupSetId, record.Hash, targetDirectory, ct);
                         resolvedPlain[record.Hash] = plainPath;
                     }
 
-                    if (plainPath is null || !File.Exists(plainPath))
+                    if (plainPath is null)
                     {
                         issues.Add(new VerifyIssue
                         {
@@ -182,22 +200,18 @@ public class VerifyService : IVerifyService
                             Kind = VerifyIssueKind.FileRefUnresolved,
                         });
                     }
-                    else if (verifyContents && hashedPaths.Add(plainPath))
+                    else if (verifyContents
+                        && await ActualHashAsync(plainPath) is { } actual && !HashEquals(actual, record.Hash))
                     {
-                        // Re-hash the shared plain copy once and compare to the catalog.
-                        itemsHashed++;
-                        string? actual = await ComputeFileHashAsync(plainPath, ct);
-                        if (actual is not null && !HashEquals(actual, record.Hash))
+                        // The shared plain copy, re-hashed once, does not hold the content.
+                        issues.Add(new VerifyIssue
                         {
-                            issues.Add(new VerifyIssue
-                            {
-                                Path = record.SourcePath,
-                                Detail = "Resolved content hash does not match the catalog "
-                                    + $"(expected {Shorten(record.Hash)}, got {Shorten(actual)}): "
-                                    + plainPath,
-                                Kind = VerifyIssueKind.ContentMismatch,
-                            });
-                        }
+                            Path = record.SourcePath,
+                            Detail = "Resolved content hash does not match the catalog "
+                                + $"(expected {Shorten(record.Hash)}, got {Shorten(actual)}): "
+                                + plainPath,
+                            Kind = VerifyIssueKind.ContentMismatch,
+                        });
                     }
                 }
                 else if (record.IsDeduped)
@@ -288,14 +302,12 @@ public class VerifyService : IVerifyService
                     }
                     else if (verifyContents
                         && !record.IsZipped && !record.IsSplit
-                        && !string.IsNullOrEmpty(record.Hash)
-                        && hashedPaths.Add(filePath))
+                        && !string.IsNullOrEmpty(record.Hash))
                     {
                         // Re-hash the stored plain copy and compare against the catalog.
                         // Zipped/split stores don't hold the raw content directly,
                         // so a name-vs-hash comparison wouldn't be meaningful for them.
-                        itemsHashed++;
-                        string? actual = await ComputeFileHashAsync(filePath, ct);
+                        string? actual = await ActualHashAsync(filePath);
                         if (actual is not null && !HashEquals(actual, record.Hash))
                         {
                             issues.Add(new VerifyIssue
@@ -439,14 +451,6 @@ public class VerifyService : IVerifyService
     /// Resolve a content hash to the absolute path of an active plain copy of
     /// that content somewhere in the backup tree, or <c>null</c> if none exists.
     /// </summary>
-    private async Task<string?> ResolvePlainContentPathAsync(
-        int backupSetId, string hash, string targetDirectory, CancellationToken ct)
-    {
-        return await PlainContent.FirstExistingAsync(_catalog, backupSetId, hash, targetDirectory, ct) is { } path
-            ? Path.Combine(targetDirectory, path)
-            : null;
-    }
-
     private static string Shorten(string hash)
         => hash.Length <= 12 ? hash : hash[..12];
 }

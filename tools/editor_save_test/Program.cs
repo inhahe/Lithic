@@ -309,8 +309,7 @@ internal static class Program
     /// 24: Verify Integrity opens waiting for the user to choose how thoroughly to
     /// verify, with "verify file contents" available, and says what to do; the
     /// Verify button runs it with the choice made, and it finishes, with Verify
-    /// available again after it. (It used to start on opening, so the choice
-    /// could only be made for a second run.)
+    /// available again after it. The choice has to come before the first run.
     /// </summary>
     static async Task VerifyStartsAsync()
     {

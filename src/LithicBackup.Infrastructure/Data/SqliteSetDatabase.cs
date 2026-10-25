@@ -1,5 +1,6 @@
 using System.Globalization;
 using Microsoft.Data.Sqlite;
+using LithicBackup.Core;
 using LithicBackup.Core.Interfaces;
 using LithicBackup.Core.Models;
 
@@ -1685,62 +1686,88 @@ internal sealed class SqliteSetDatabase : IDisposable
         return paths;
     }
 
-    /// <summary>See <see cref="ICatalogRepository.GetReferencesWithoutContentAsync"/>.</summary>
-    public async Task<IReadOnlyList<long>> GetReferencesWithoutContentAsync(
+    /// <summary>See <see cref="ICatalogRepository.DeleteSeededReferencesWithoutContentAsync"/>.</summary>
+    public async Task<IReadOnlyList<string>> DeleteSeededReferencesWithoutContentAsync(
         int backupSetId, int discId, CancellationToken ct = default)
     {
         ct.ThrowIfCancellationRequested();
-        using var _ = await LockAsync(ct).ConfigureAwait(false);
+        using var _ = await WriteLockAsync(ct).ConfigureAwait(false);
 
         // The disc's references through IX_Files_DiscId, each probing
         // IX_Files_Active_Hash; "plain" as everywhere a reference resolves.
         using var cmd = _connection.CreateCommand();
         cmd.CommandText = """
-            SELECT r.Id FROM Files r
-            WHERE r.DiscId = $discId AND r.IsDeleted = 0 AND r.IsFileRef = 1
-              AND EXISTS (SELECT 1 FROM Discs d WHERE d.Id = r.DiscId AND d.BackupSetId = $setId)
-              AND (r.Hash = '' OR NOT EXISTS (
-                  SELECT 1 FROM Files p
-                  WHERE p.Hash = r.Hash AND p.IsDeleted = 0
-                    AND p.IsFileRef = 0 AND p.IsDeduped = 0 AND p.IsSplit = 0 AND p.IsZipped = 0))
+            DELETE FROM Files
+            WHERE Id IN (
+                SELECT r.Id FROM Files r
+                WHERE r.DiscId = $discId AND r.IsDeleted = 0 AND r.IsFileRef = 1 AND r.Hash <> $empty
+                  AND EXISTS (SELECT 1 FROM Discs d WHERE d.Id = r.DiscId AND d.BackupSetId = $setId)
+                  AND (r.Hash = '' OR NOT EXISTS (
+                      SELECT 1 FROM Files p
+                      WHERE p.Hash = r.Hash AND p.IsDeleted = 0
+                        AND p.IsFileRef = 0 AND p.IsDeduped = 0 AND p.IsSplit = 0 AND p.IsZipped = 0)))
+            RETURNING DiscPath
             """;
         cmd.Parameters.AddWithValue("$discId", discId);
         cmd.Parameters.AddWithValue("$setId", backupSetId);
+        cmd.Parameters.AddWithValue("$empty", EmptyContent.Hash);
 
-        var ids = new List<long>();
-        foreach (var r in Rows(cmd, ct))
-            ids.Add(r.GetInt64(0));
-        return ids;
+        // A write, so not through Rows, and not cancellable: the caller counts
+        // every row the statement deleted.
+        var paths = new List<string>();
+        using (var r = cmd.ExecuteReader())
+            while (r.Read())
+                paths.Add(r.GetString(0));
+        return paths;
     }
 
-    /// <summary>See <see cref="ICatalogRepository.GetRetiredCopiesOfReferencedContentAsync"/>.</summary>
-    public async Task<IReadOnlyList<FileRecord>> GetRetiredCopiesOfReferencedContentAsync(
-        int backupSetId, CancellationToken ct = default)
+    /// <summary>See <see cref="ICatalogRepository.GetRetiredPlainCopiesAsync"/>.</summary>
+    public async Task<IReadOnlyList<FileRecord>> GetRetiredPlainCopiesAsync(
+        int backupSetId, IReadOnlyCollection<string> hashes, CancellationToken ct = default)
     {
         ct.ThrowIfCancellationRequested();
+        if (hashes.Count == 0)
+            return [];
         using var _ = await LockAsync(ct).ConfigureAwait(false);
 
-        // Every retired plain row, each probing IX_Files_Active_Hash for a live
-        // reference to its content and a live plain copy of it.
+        // Every record, checked against the hashes as a set (json_each builds an
+        // ephemeral index for the IN): no index covers retired rows.
         using var cmd = _connection.CreateCommand();
         cmd.CommandText = """
             SELECT p.* FROM Files p
-            WHERE p.IsDeleted = 1 AND p.Hash <> ''
+            WHERE p.IsDeleted = 1
               AND p.IsFileRef = 0 AND p.IsDeduped = 0 AND p.IsSplit = 0 AND p.IsZipped = 0
+              AND p.Hash IN (SELECT value FROM json_each($hashes))
               AND EXISTS (SELECT 1 FROM Discs d WHERE d.Id = p.DiscId AND d.BackupSetId = $setId)
-              AND EXISTS (SELECT 1 FROM Files r WHERE r.Hash = p.Hash AND r.IsDeleted = 0 AND r.IsFileRef = 1)
-              AND NOT EXISTS (
-                  SELECT 1 FROM Files q
-                  WHERE q.Hash = p.Hash AND q.IsDeleted = 0
-                    AND q.IsFileRef = 0 AND q.IsDeduped = 0 AND q.IsSplit = 0 AND q.IsZipped = 0)
             ORDER BY p.Id DESC
             """;
         cmd.Parameters.AddWithValue("$setId", backupSetId);
+        cmd.Parameters.AddWithValue("$hashes", System.Text.Json.JsonSerializer.Serialize(hashes));
 
         var list = new List<FileRecord>();
         foreach (var r in Rows(cmd, ct))
             list.Add(ReadFile(r));
         return list;
+    }
+
+    /// <summary>See <see cref="ICatalogRepository.HasLiveReferenceAsync"/>.</summary>
+    public async Task<bool> HasLiveReferenceAsync(int backupSetId, string hash, CancellationToken ct = default)
+    {
+        ct.ThrowIfCancellationRequested();
+        if (string.IsNullOrEmpty(hash))
+            return false;
+        using var _ = await LockAsync(ct).ConfigureAwait(false);
+
+        using var cmd = _connection.CreateCommand();
+        cmd.CommandText = """
+            SELECT 1 FROM Files r
+            INNER JOIN Discs d ON r.DiscId = d.Id
+            WHERE r.Hash = $hash AND r.IsDeleted = 0 AND r.IsFileRef = 1 AND d.BackupSetId = $setId
+            LIMIT 1
+            """;
+        cmd.Parameters.AddWithValue("$setId", backupSetId);
+        cmd.Parameters.AddWithValue("$hash", hash);
+        return cmd.ExecuteScalar() is not null;
     }
 
     public async Task<HashSet<long>> GetActivePlainContentSizesAsync(int backupSetId, CancellationToken ct = default)

@@ -124,12 +124,14 @@ public sealed class CatalogReconcileService
                 {
                     if (File.Exists(Path.Combine(targetDirectory, r.DiscPath)))
                         continue; // manifest present
+                    if (EmptyContent.Is(r.Hash))
+                        continue; // restorable with no copy at all
                     if (!resolvedPlain.TryGetValue(r.Hash, out string? plain))
                     {
-                        plain = await ResolvePlainContentPathAsync(backupSetId, r.Hash, targetDirectory, ct);
+                        plain = await PlainContent.FirstExistingFullPathAsync(_catalog, backupSetId, r.Hash, targetDirectory, ct);
                         resolvedPlain[r.Hash] = plain;
                     }
-                    if (plain is not null && File.Exists(plain))
+                    if (plain is not null)
                         continue; // content still resolvable via another plain copy
                     reason = "file reference: manifest missing and no plain copy of its content remains";
                 }
@@ -222,10 +224,12 @@ public sealed class CatalogReconcileService
                 // Re-verify the content is STILL missing before marking deleted.
                 var r = p.Record;
                 if (File.Exists(Path.Combine(targetDirectory, r.DiscPath))) { skipped++; continue; }
-                if (r.IsFileRef)
+                if (r.IsFileRef
+                    && (EmptyContent.Is(r.Hash)
+                        || await PlainContent.FirstExistingAsync(_catalog, backupSetId, r.Hash, targetDirectory, ct) is not null))
                 {
-                    var plain = await ResolvePlainContentPathAsync(backupSetId, r.Hash, targetDirectory, ct);
-                    if (plain is not null && File.Exists(plain)) { skipped++; continue; }
+                    skipped++;
+                    continue;
                 }
 
                 // Only if the row is still what Analyze read (see the flips).
@@ -244,14 +248,6 @@ public sealed class CatalogReconcileService
     }
 
     // ------------------------------------------------------------------
-
-    private async Task<string?> ResolvePlainContentPathAsync(
-        int backupSetId, string hash, string targetDirectory, CancellationToken ct)
-    {
-        return await PlainContent.FirstExistingAsync(_catalog, backupSetId, hash, targetDirectory, ct) is { } path
-            ? Path.Combine(targetDirectory, path)
-            : null;
-    }
 
     private static async Task<string?> ComputeFileHashAsync(string path, CancellationToken ct)
     {
