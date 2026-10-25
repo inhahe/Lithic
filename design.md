@@ -1564,15 +1564,38 @@ extensions would have stopped being backed up, and Cleanup would have listed
 their backups under "matches configured exclusion" for deletion. Pinned by
 `tools\excess_versions_test` §7, which fails against the old check.
 
-**Earlier versions of no-history files are excess, and only Cleanup removes
-them.** Removing Default's tiers stops new versions, but the retention pass skips
+**Earlier versions of no-history files are excess, but are removed only after
+review.** Removing Default's tiers stops new versions, but the retention pass skips
 a path whose tiers are empty, so the versions it already had would stay for good
-(88 GB on one real set). Cleanup's Excess Versions now lists every earlier
-version of a `KeepsNoHistory` file, newest included (the tiered rule "never
-delete the newest earlier version" exists to keep a rollback, which a set that
-keeps none has declined). Automatic retention deliberately still skips them: an
-edit to one setting should not have the next backup delete tens of gigabytes
-unreviewed. Excluded files' versions stay the exclusion category's.
+(88 GB on one real set). `VersionRetentionService.FindVersionsNotKept` counts every
+earlier version of a `KeepsNoHistory` file as not kept, newest included (the
+tiered rule "never delete the newest earlier version" exists to keep a rollback,
+which a set that keeps none has declined). Automatic retention deliberately still
+skips them: an edit to one setting should not have the next backup delete tens of
+gigabytes unreviewed. Cleanup's Excess Versions offers them for review. Excluded
+files' versions stay the exclusion category's.
+
+**One tier walk.** `VersionRetentionService.SelectExpired` is the tier rule
+(youngest tier first; per tier keep its newest `MaxVersions`; never the file's
+newest earlier version), and `FindVersionsNotKept` is the policy around it for
+review (an empty Default's versions too; an excluded file's never). The backup's
+retention pass and Cleanup's Excess Versions both go through them. There were two hand copies of the walk; Cleanup's said it "replicates"
+the engine's, which is how copies drift.
+
+**Earlier versions have an index of their own.** `IX_Files_ActivePrevious` is a
+partial index on live rows whose `DiscPath` contains `_prev` (a superset of
+`HistoryPaths.IsPreviousVersion`, the first-segment test, applied to what it
+returns). They are a small minority: 21,919 of 12,255,940 rows on one real set,
+where a full scan for them took 112 s - and every full backup's retention pass
+read the whole set to find them. The query must use the index's predicate word
+for word, or SQLite cannot prove the index covers it (`tools\excess_versions_test`
+§19 checks the plan). **It is not in `SetSchema.sql`**: that script runs on
+every open and must never need SQLite's write lock on an existing database,
+while building this index is a full scan under it. The first reader builds it
+(`EnsurePreviousVersionIndexAsync`) under the set's cross-process write lock, so
+the other process's writers wait on the lock file, with no timeout, rather than
+failing on the busy timeout. Built once per set database; a caller can say why
+it waits (`onIndexing`).
 
 **Cleanup must not delete a copy a `.fileref` needs.** A `.fileref` stores no
 bytes; it resolves by hash to an active plain copy. The engine's retention pass

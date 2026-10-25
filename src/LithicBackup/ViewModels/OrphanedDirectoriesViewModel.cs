@@ -1232,9 +1232,9 @@ public class OrphanedDirectoriesViewModel : ViewModelBase, IConfirmClose, IDispo
     // ------------------------------------------------------------------
 
     /// <summary>
-    /// Detect file versions that exceed the configured retention tier limits.
-    /// Replicates the core logic of VersionRetentionService.ComputeRetentionAsync
-    /// using the already-loaded in-memory file list.
+    /// Earlier versions the set's retention settings no longer keep
+    /// (<see cref="VersionRetentionService.FindVersionsNotKept"/>), among the
+    /// active files no earlier category has offered, grouped by folder.
     /// </summary>
     private async Task<List<OrphanedDirectoryItem>> DetectExcessVersionsAsync(
         List<OrphanedDirectoryItem> orphanedDirs,
@@ -1247,43 +1247,7 @@ public class OrphanedDirectoriesViewModel : ViewModelBase, IConfirmClose, IDispo
         var jobOptions = _backupSet.JobOptions;
         if (jobOptions is null) return [];
 
-        // Build per-file tier selector: file path → retention tiers, and whether
-        // the file is backed up with NO history at all.
-        Func<string, IReadOnlyList<VersionRetentionTier>> tierSelector;
-        Func<string, bool> keepsNoHistory = _ => false;
-
-        if (jobOptions.TierSets.Count > 0)
-        {
-            var resolver = VersionTierSet.BuildTierResolver(jobOptions.TierSets);
-            tierSelector = path => resolver(path).Tiers;
-
-            // An empty Default: every file no other tier set matches is backed
-            // up and overwritten in place (the engine's keepVersions is false
-            // for it). Any earlier version such a file still has - kept from
-            // before the tiers were removed - is excess by definition, newest
-            // included: nothing else removes them, since the retention pass
-            // applies no rules to a set with no tiers. (A NON-Default set with
-            // no tiers and patterns excludes its files from backup instead;
-            // those are the configured-exclusion category's, and skipped below.)
-            // Only for a Default that is really there and empty. The resolver
-            // makes up an empty one when the list has none (old or hand-edited
-            // data), and the editor shows that set with the stock tiers - its
-            // files' versions must not all be offered for deletion.
-            if (jobOptions.TierSets.Any(t => t.KeepsNoHistory))
-                keepsNoHistory = path => resolver(path).KeepsNoHistory;
-        }
-        else if (jobOptions.RetentionTiers.Count > 0)
-        {
-            var flatTiers = jobOptions.RetentionTiers;
-            tierSelector = _ => flatTiers;
-        }
-        else
-        {
-            return []; // No retention rules configured.
-        }
-
-        // Build skip-sets: files in orphaned dirs or matched by exclusion filter.
-        // IsPathUnderRoot handles path-separator boundaries correctly.
+        // Files in orphaned dirs or matched by an exclusion are offered there.
         var alreadyOffered = AlreadyOfferedFilter(orphanedDirs);
         var excludedPaths = new HashSet<string>(
             excludedItems
@@ -1291,131 +1255,17 @@ public class OrphanedDirectoriesViewModel : ViewModelBase, IConfirmClose, IDispo
                 .SelectMany(i => i.MatchingSourcePaths!),
             StringComparer.OrdinalIgnoreCase);
 
-        // Filter active files to only those not already flagged.
-        var eligibleFiles = _activeFiles
-            .Where(f =>
-            {
-                progress?.Bump();
-                if (alreadyOffered(f.SourcePath))
-                    return false;
-                if (excludedPaths.Contains(f.SourcePath))
-                    return false;
-                return true;
-            })
-            .ToList();
-
-        var now = DateTime.UtcNow;
-        var excessRecords = new List<FileRecord>();
-
-        // Group by source path — same approach as VersionRetentionService.
-        //
-        // Filtered to PREV-version records BEFORE the grouping, which is not a
-        // micro-optimisation: only a "_prev" record can ever be excess, and on a
-        // real set they are a small minority of rows. Grouping first built a
-        // group for every distinct source path — roughly a million — and each one
-        // then allocated a list, sorted it, and bailed immediately on
-        // versions.Count == 0. The result is identical because nothing below
-        // reads a non-prev member of the group; only group.Key is used.
-        var groupedByPath = eligibleFiles
-            .Where(f => IsPreviousVersionPath(f.DiscPath))
-            .GroupBy(f => f.SourcePath, StringComparer.OrdinalIgnoreCase);
-
-        // A tier list is shared by every path its tier set matches, so sorting it
-        // inside the loop repeated the same sort once per group. Keyed by the
-        // list instance itself: tierSelector hands back the same object each
-        // time, and the default comparer on a type that does not override Equals
-        // is reference equality — which is exactly the identity we want here.
-        var sortedTierCache = new Dictionary<object, List<VersionRetentionTier>>();
-
-        foreach (var group in groupedByPath)
+        // Only an earlier version can be excess, and they are a small minority of
+        // rows: filter to them before anything else looks at a path.
+        var eligible = _activeFiles.Where(f =>
         {
-            // A "real" previous version is a FileRecord whose DiscPath lives
-            // under "{drive}_prev/..." — that's where every actual backup
-            // run writes superseded copies (see
-            // DirectoryBackupService.GetPrevDiscPath).  Records pointing at
-            // the current location are NOT versions, even if there are
-            // several of them sharing a SourcePath — that situation is a
-            // catalog anomaly (e.g. a non-idempotent re-seed) and is
-            // surfaced in the separate Catalog-Duplicate phase below, not
-            // here.  Restricting the tier walk to "_prev" records keeps the
-            // Excess-Versions category meaningful for users who haven't
-            // backed up yet.
-            // Every member is already a prev-version record (filtered above), and
-            // GroupBy never yields an empty group, so this is non-empty by
-            // construction. The guard stays as a cheap invariant check.
-            var versions = group
-                .OrderByDescending(f => f.BackedUpUtc)
-                .ToList();
+            progress?.Bump();
+            return HistoryPaths.IsPreviousVersion(f.DiscPath)
+                && !alreadyOffered(f.SourcePath)
+                && !excludedPaths.Contains(f.SourcePath);
+        });
 
-            if (versions.Count == 0)
-                continue;
-
-            var tiers = tierSelector(group.Key);
-            if (tiers.Count == 0)
-            {
-                // Backed up with no history: every earlier version goes.
-                if (keepsNoHistory(group.Key))
-                    excessRecords.AddRange(versions);
-                // Otherwise excluded from backup: the exclusion category's.
-                continue;
-            }
-
-            // Never delete the most recent prev version: we'd lose the
-            // ability to roll back at all.  (Note: the "current" record is
-            // automatically safe — it isn't in `versions` because its
-            // DiscPath isn't a `_prev` path.)
-            long newestId = versions[0].Id;
-
-            // Walk tiers from youngest to oldest.
-            if (!sortedTierCache.TryGetValue(tiers, out var sortedTiers))
-            {
-                sortedTiers = tiers
-                    .OrderBy(t => t.MaxAge ?? TimeSpan.MaxValue)
-                    .ToList();
-                sortedTierCache[tiers] = sortedTiers;
-            }
-
-            var processed = new HashSet<long>();
-            TimeSpan previousBoundary = TimeSpan.Zero;
-
-            foreach (var tier in sortedTiers)
-            {
-                TimeSpan upperBoundary = tier.MaxAge ?? TimeSpan.MaxValue;
-
-                // Find versions in this tier's age range.
-                var tierVersions = versions
-                    .Where(v => !processed.Contains(v.Id))
-                    .Where(v =>
-                    {
-                        var age = now - v.BackedUpUtc;
-                        return age >= previousBoundary && age < upperBoundary;
-                    })
-                    .OrderByDescending(v => v.BackedUpUtc) // Keep newest first.
-                    .ToList();
-
-                if (tier.MaxVersions.HasValue && tierVersions.Count > tier.MaxVersions.Value)
-                {
-                    // Keep MaxVersions newest, mark rest for deletion.
-                    int toKeep = tier.MaxVersions.Value;
-                    for (int i = 0; i < tierVersions.Count; i++)
-                    {
-                        processed.Add(tierVersions[i].Id);
-                        if (i >= toKeep && tierVersions[i].Id != newestId)
-                        {
-                            excessRecords.Add(tierVersions[i]);
-                        }
-                    }
-                }
-                else
-                {
-                    // Unlimited or within limit — keep all.
-                    foreach (var v in tierVersions)
-                        processed.Add(v.Id);
-                }
-
-                previousBoundary = upperBoundary;
-            }
-        }
+        var excessRecords = VersionRetentionService.FindVersionsNotKept(eligible, jobOptions, DateTime.UtcNow);
 
         // Never delete the last plain copy of content a surviving .fileref still
         // resolves to by hash: that reference would become unrestorable. The
@@ -1470,25 +1320,6 @@ public class OrphanedDirectoriesViewModel : ViewModelBase, IConfirmClose, IDispo
         }
 
         return results;
-    }
-
-    /// <summary>
-    /// Returns true when <paramref name="discPath"/> points at a previous
-    /// version of a file — i.e. lives under a "{drive}_prev/" subtree.
-    /// LithicBackup writes every superseded copy under that prefix (see
-    /// <c>DirectoryBackupService.GetPrevDiscPath</c>), so this is the
-    /// authoritative test for "is this record a real older version" versus
-    /// just a stray catalog row pointing at the current file.
-    /// Tolerates both path separators because catalog DiscPaths normalize
-    /// inconsistently in different code paths.
-    /// </summary>
-    private static bool IsPreviousVersionPath(string discPath)
-    {
-        if (string.IsNullOrEmpty(discPath)) return false;
-        int sep = discPath.IndexOfAny(['\\', '/']);
-        if (sep < 0) return false;
-        var firstSegment = discPath.AsSpan(0, sep);
-        return firstSegment.EndsWith("_prev", StringComparison.OrdinalIgnoreCase);
     }
 
     /// <summary>
@@ -1617,7 +1448,7 @@ public class OrphanedDirectoriesViewModel : ViewModelBase, IConfirmClose, IDispo
             .Where(f =>
             {
                 progress?.Bump();
-                if (IsPreviousVersionPath(f.DiscPath)) return false;
+                if (HistoryPaths.IsPreviousVersion(f.DiscPath)) return false;
                 if (alreadyOffered(f.SourcePath))
                     return false;
                 if (excludedPaths.Contains(f.SourcePath)) return false;

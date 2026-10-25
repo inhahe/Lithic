@@ -1,14 +1,16 @@
+using LithicBackup.Core;
 using LithicBackup.Core.Interfaces;
 using LithicBackup.Core.Models;
 
 namespace LithicBackup.Services;
 
 /// <summary>
-/// Applies tiered version retention policies to backup sets.
-/// Identifies file versions that should be marked as deleted based on
-/// age-based retention tiers.
+/// Tiered version retention: which earlier versions of a file its tiers no
+/// longer keep. The rule lives here once (<see cref="SelectExpired"/>) and serves
+/// the backup engine's retention pass, Cleanup's Excess Versions, and the
+/// editor's offer after a retention change.
 /// </summary>
-public class VersionRetentionService : IVersionRetentionService
+public class VersionRetentionService
 {
     private readonly ICatalogRepository _catalog;
 
@@ -27,34 +29,14 @@ public class VersionRetentionService : IVersionRetentionService
     ];
 
     /// <summary>
-    /// Apply retention tiers to all files in a backup set.
-    /// Returns the list of FileRecords that should be deleted.
+    /// The earlier versions the backup engine's retention pass retires, under
+    /// per-file tiers. A file whose tiers are empty is left alone here: this pass
+    /// runs unattended after every backup, and a set's empty Default would
+    /// otherwise discard history the moment it was saved. Removing those is
+    /// <see cref="FindVersionsNotKept"/>'s, for Cleanup and the editor, after the
+    /// user has seen the list.
     /// </summary>
-    public async Task<IReadOnlyList<FileRecord>> ComputeRetentionAsync(
-        int backupSetId,
-        IReadOnlyList<VersionRetentionTier> tiers,
-        CancellationToken ct = default)
-    {
-        return await ComputeRetentionAsync(
-            backupSetId,
-            _ => tiers,
-            ct);
-    }
-
-    /// <summary>
-    /// Apply retention tiers to all files in a backup set, using per-file
-    /// tier resolution.  The <paramref name="tierSelector"/> receives a source
-    /// path and returns the retention tiers to apply to that file's versions.
-    /// </summary>
-    public async Task<IReadOnlyList<FileRecord>> ComputeRetentionAsync(
-        int backupSetId,
-        Func<string, IReadOnlyList<VersionRetentionTier>> tierSelector,
-        CancellationToken ct = default)
-        => await ComputeRetentionAsync(backupSetId, tierSelector, pathScope: null, ct);
-
-    /// <summary>
-    /// As above, but optionally restricted to <paramref name="pathScope"/>.
-    /// </summary>
+    /// <param name="tierSelector">A source path's retention tiers.</param>
     /// <param name="pathScope">
     /// When null, every path in the set is evaluated. When non-null, only these
     /// source paths are — used by continuous/targeted backups, which write a new
@@ -78,13 +60,10 @@ public class VersionRetentionService : IVersionRetentionService
     /// version leaves no previous one, so it can have nothing to prune.)
     /// </para>
     /// <para>
-    /// The whole-set form loads and materialises every record in the set:
-    /// 2.35M rows / ~10.4 s of SQL alone on a real set database, plus the objects
-    /// and the GC pressure of building them. Running that after every
-    /// continuous-backup pass — typically to retire versions of the single file
-    /// that changed — was the largest remaining term in the Worker service
-    /// pegging a CPU core. See the "Worker pegged a CPU core" entry in
-    /// known-issues.md.
+    /// The whole-set form reads only the set's earlier versions, through their
+    /// index (<see cref="ICatalogRepository.GetActivePreviousVersionsAsync"/>). It
+    /// used to read every record in the set to find them: all 12.3 million rows
+    /// of one real set, for 21,919 earlier versions, on every full backup.
     /// </para>
     /// </remarks>
     public async Task<IReadOnlyList<FileRecord>> ComputeRetentionAsync(
@@ -93,10 +72,10 @@ public class VersionRetentionService : IVersionRetentionService
         IReadOnlyCollection<string>? pathScope,
         CancellationToken ct = default)
     {
-        IReadOnlyList<FileRecord> allFiles;
+        IEnumerable<FileRecord> previous;
         if (pathScope is null)
         {
-            allFiles = await _catalog.GetAllFilesForBackupSetAsync(backupSetId, ct);
+            previous = await _catalog.GetActivePreviousVersionsAsync(backupSetId, ct: ct);
         }
         else
         {
@@ -106,145 +85,117 @@ public class VersionRetentionService : IVersionRetentionService
                 ct.ThrowIfCancellationRequested();
                 scoped.AddRange(await _catalog.GetFileRecordsByPathAsync(backupSetId, path, ct));
             }
-            allFiles = scoped;
+            previous = scoped.Where(f => !f.IsDeleted && HistoryPaths.IsPreviousVersion(f.DiscPath));
         }
 
         var now = DateTime.UtcNow;
-
-        // Group by source path.
-        var groupedByPath = allFiles
-            .Where(f => !f.IsDeleted)
-            .GroupBy(f => f.SourcePath, StringComparer.OrdinalIgnoreCase);
-
         var toDelete = new List<FileRecord>();
-
-        foreach (var group in groupedByPath)
+        foreach (var group in previous.GroupBy(f => f.SourcePath, StringComparer.OrdinalIgnoreCase))
         {
             ct.ThrowIfCancellationRequested();
-
-            // Tier-based retention only applies to actual previous-version
-            // records, which always live under "{drive}_prev/..." (see
-            // DirectoryBackupService.GetPrevDiscPath).  A SourcePath with
-            // only current-location rows isn't carrying historical
-            // versions, so there's nothing for retention to trim — even if
-            // there's more than one such row (which is a catalog anomaly
-            // surfaced separately by the Cleanup view's CatalogDuplicate
-            // detection, not a retention concern).
-            var versions = group
-                .Where(f => IsPreviousVersionPath(f.DiscPath))
-                .OrderByDescending(f => f.BackedUpUtc)
-                .ToList();
-
-            if (versions.Count == 0)
-                continue; // No real prev-version records to consider.
-
-            // Resolve this file's retention tiers.
             var tiers = tierSelector(group.Key);
-            if (tiers.Count == 0)
-                continue; // "None" tier set — no retention rules to apply.
-
-            // Never delete the most recent prev version (we'd lose the
-            // ability to roll back at all).  The current-location record
-            // is automatically safe — it's not in `versions`.
-            long newestId = versions[0].Id;
-
-            // Walk tiers from youngest to oldest.
-            // Each tier defines an age range and max versions for that range.
-            var sortedTiers = tiers
-                .OrderBy(t => t.MaxAge ?? TimeSpan.MaxValue)
-                .ToList();
-
-            // Track which versions have been processed (kept or deleted).
-            var processed = new HashSet<long>();
-
-            TimeSpan previousBoundary = TimeSpan.Zero;
-
-            foreach (var tier in sortedTiers)
-            {
-                TimeSpan upperBoundary = tier.MaxAge ?? TimeSpan.MaxValue;
-
-                // Find versions in this tier's age range.
-                var tierVersions = versions
-                    .Where(v => !processed.Contains(v.Id))
-                    .Where(v =>
-                    {
-                        var age = now - v.BackedUpUtc;
-                        return age >= previousBoundary && age < upperBoundary;
-                    })
-                    .OrderByDescending(v => v.BackedUpUtc) // Keep newest first.
-                    .ToList();
-
-                if (tier.MaxVersions.HasValue && tierVersions.Count > tier.MaxVersions.Value)
-                {
-                    // Keep MaxVersions newest, mark rest for deletion.
-                    int toKeep = tier.MaxVersions.Value;
-                    for (int i = 0; i < tierVersions.Count; i++)
-                    {
-                        processed.Add(tierVersions[i].Id);
-                        if (i >= toKeep && tierVersions[i].Id != newestId)
-                        {
-                            toDelete.Add(tierVersions[i]);
-                        }
-                    }
-                }
-                else
-                {
-                    // Unlimited or within limit — keep all.
-                    foreach (var v in tierVersions)
-                        processed.Add(v.Id);
-                }
-
-                previousBoundary = upperBoundary;
-            }
+            if (tiers.Count > 0)
+                toDelete.AddRange(SelectExpired(group.ToList(), tiers, now));
         }
-
         return toDelete;
     }
 
     /// <summary>
-    /// Apply retention and mark the identified files as deleted in the catalog.
+    /// Every earlier version among <paramref name="previousVersions"/> that the
+    /// set's retention settings no longer keep: those its tiers have expired,
+    /// and every one of a file that falls to an empty Default tier set (backed up
+    /// with no history). A file a tier set excludes from backup is left alone:
+    /// its copies are the business of Cleanup's exclusion category.
     /// </summary>
-    /// <remarks>
-    /// WARNING: this only flips the catalog <c>IsDeleted</c> bit — it does NOT
-    /// physically remove the version file from the destination.  Wiring this into
-    /// the backup path as-is would recreate the "catalog-deleted (still on disk)"
-    /// inconsistency (records marked deleted while their bytes linger).  It has no
-    /// callers today; the live backup path uses
-    /// <see cref="ComputeRetentionAsync(int, Func{string, IReadOnlyList{VersionRetentionTier}}, CancellationToken)"/>
-    /// and performs the physical delete itself (see
-    /// <c>DirectoryBackupService.ExecuteAsync</c>, retention section), flipping
-    /// <c>IsDeleted</c> only after the file is confirmed gone.  If this method is
-    /// ever revived, it must delete the physical file first and mark the record
-    /// deleted only on confirmed removal.
-    /// </remarks>
-    public async Task ApplyRetentionAsync(
-        int backupSetId,
-        IReadOnlyList<VersionRetentionTier> tiers,
-        CancellationToken ct = default)
+    /// <param name="previousVersions">
+    /// Live earlier-version records (anything else is ignored), all of a file's
+    /// together or not at all: the newest earlier version of a file with tiers is
+    /// always kept, and which one that is depends on seeing them all.
+    /// </param>
+    /// <param name="options">The set's options: its tier sets, or for an old set its flat tiers.</param>
+    /// <param name="now">The time ages are measured from.</param>
+    public static List<FileRecord> FindVersionsNotKept(
+        IEnumerable<FileRecord> previousVersions, JobOptions options, DateTime now)
     {
-        var filesToDelete = await ComputeRetentionAsync(backupSetId, tiers, ct);
+        Func<string, IReadOnlyList<VersionRetentionTier>> tierSelector;
+        Func<string, bool> keepsNoHistory = _ => false;
 
-        foreach (var file in filesToDelete)
+        if (options.TierSets.Count > 0)
         {
-            ct.ThrowIfCancellationRequested();
-            file.IsDeleted = true;
-            await _catalog.UpdateFileRecordAsync(file, ct);
+            var resolver = VersionTierSet.BuildTierResolver(options.TierSets);
+            tierSelector = path => resolver(path).Tiers;
+            // Only for a Default that is really there and empty. The resolver
+            // makes up an empty one when the list has none (old or hand-edited
+            // data), and the editor shows that set with the stock tiers - its
+            // files' versions must not all be offered for deletion.
+            if (options.TierSets.Any(t => t.KeepsNoHistory))
+                keepsNoHistory = path => resolver(path).KeepsNoHistory;
         }
+        else if (options.RetentionTiers.Count > 0)
+        {
+            var flat = options.RetentionTiers;
+            tierSelector = _ => flat;
+        }
+        else
+        {
+            return []; // No retention rules configured.
+        }
+
+        var notKept = new List<FileRecord>();
+        foreach (var group in previousVersions
+                     .Where(f => !f.IsDeleted && HistoryPaths.IsPreviousVersion(f.DiscPath))
+                     .GroupBy(f => f.SourcePath, StringComparer.OrdinalIgnoreCase))
+        {
+            var tiers = tierSelector(group.Key);
+            if (tiers.Count > 0)
+                notKept.AddRange(SelectExpired(group.ToList(), tiers, now));
+            else if (keepsNoHistory(group.Key))
+                notKept.AddRange(group); // Backed up with no history: every earlier version goes.
+            // Otherwise excluded from backup: not a retention matter.
+        }
+        return notKept;
     }
 
     /// <summary>
-    /// True when <paramref name="discPath"/> points at a previous version of
-    /// a file (i.e. lives under a "{drive}_prev/" subtree).  See
-    /// <c>DirectoryBackupService.GetPrevDiscPath</c> for the writer side.
-    /// Tolerates both path separators because catalog DiscPaths normalize
-    /// inconsistently in different code paths.
+    /// The earlier versions of one file that <paramref name="tiers"/> no longer
+    /// keep. Tiers are walked youngest first, each covering the ages from the
+    /// previous tier's limit up to its own; within one, its newest
+    /// <see cref="VersionRetentionTier.MaxVersions"/> are kept and older ones
+    /// expire. The file's newest earlier version is always kept, so the last
+    /// change can always be rolled back.
     /// </summary>
-    private static bool IsPreviousVersionPath(string discPath)
+    /// <param name="versions">All of one file's live earlier versions, in any order.</param>
+    /// <param name="tiers">The file's tiers, in any order; empty keeps everything.</param>
+    /// <param name="now">The time ages are measured from.</param>
+    public static List<FileRecord> SelectExpired(
+        IReadOnlyCollection<FileRecord> versions, IReadOnlyList<VersionRetentionTier> tiers, DateTime now)
     {
-        if (string.IsNullOrEmpty(discPath)) return false;
-        int sep = discPath.IndexOfAny(['\\', '/']);
-        if (sep < 0) return false;
-        var firstSegment = discPath.AsSpan(0, sep);
-        return firstSegment.EndsWith("_prev", StringComparison.OrdinalIgnoreCase);
+        var expired = new List<FileRecord>();
+        if (versions.Count == 0 || tiers.Count == 0)
+            return expired;
+
+        var newestFirst = versions.OrderByDescending(v => v.BackedUpUtc).ToList();
+        long newestId = newestFirst[0].Id;
+
+        TimeSpan previousBoundary = TimeSpan.Zero;
+        foreach (var tier in tiers.OrderBy(t => t.MaxAge ?? TimeSpan.MaxValue))
+        {
+            TimeSpan upperBoundary = tier.MaxAge ?? TimeSpan.MaxValue;
+            if (tier.MaxVersions is int keep)
+            {
+                // Versions in this tier's age range, newest first.
+                int index = 0;
+                foreach (var v in newestFirst)
+                {
+                    var age = now - v.BackedUpUtc;
+                    if (age < previousBoundary || age >= upperBoundary)
+                        continue;
+                    if (index++ >= keep && v.Id != newestId)
+                        expired.Add(v);
+                }
+            }
+            previousBoundary = upperBoundary;
+        }
+        return expired;
     }
 }

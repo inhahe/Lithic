@@ -2875,20 +2875,9 @@ public class DirectoryBackupService
     /// </summary>
     private static string RemapDiscPath(FileRecord rec, string newSourcePath)
     {
-        return IsPrevDiscPath(rec.DiscPath)
+        return HistoryPaths.IsPreviousVersion(rec.DiscPath)
             ? GetPrevDiscPath(newSourcePath, rec.Version, rec.IsDeduped, rec.IsFileRef)
             : GetCurrentDiscPath(newSourcePath, rec.IsDeduped, rec.IsFileRef);
-    }
-
-    /// <summary>
-    /// True when a disc-relative path sits under a history tree — its first path
-    /// segment (the drive folder) ends with <c>_prev</c>.
-    /// </summary>
-    private static bool IsPrevDiscPath(string discPath)
-    {
-        int sep = discPath.IndexOf('\\');
-        return sep > 0
-            && discPath.AsSpan(0, sep).EndsWith("_prev", StringComparison.OrdinalIgnoreCase);
     }
 
     private static void EnsureParentDirectory(string path)
@@ -3599,7 +3588,7 @@ public class DirectoryBackupService
     {
         var record = await _catalog.GetFileRecordByPathAndVersionAsync(
             backupSetId, sourcePath, existingInfo.MaxVersion, ct);
-        if (record is null || IsPrevDiscPath(record.DiscPath))
+        if (record is null || HistoryPaths.IsPreviousVersion(record.DiscPath))
             return;
         string prevDiscPath = GetPrevDiscPath(sourcePath, record.Version, record.IsDeduped, record.IsFileRef);
         string prevAbs = Path.Combine(targetDirectory, prevDiscPath);

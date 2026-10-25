@@ -876,6 +876,125 @@ internal sealed class SqliteSetDatabase : IDisposable
         return list;
     }
 
+    // ---------------------------------------------------------------
+    // Earlier versions (history)
+    // ---------------------------------------------------------------
+
+    /// <summary>
+    /// The live rows that may be earlier versions: a superset of
+    /// <see cref="Core.HistoryPaths.IsPreviousVersion"/>, written so SQLite can
+    /// prove a query using it is covered by <see cref="PreviousVersionIndexSql"/>.
+    /// A row is an earlier version when its first path segment ends with
+    /// <c>_prev</c>; this matches <c>_prev</c> anywhere in the path, and callers
+    /// apply the exact test to what it returns. Matching "prev" without the
+    /// underscore would also take every path through a "preview" folder.
+    /// </summary>
+    private const string PreviousVersionCandidateSql =
+        "IsDeleted = 0 AND instr(lower(DiscPath), '_prev') > 0";
+
+    private const string PreviousVersionIndexName = "IX_Files_ActivePrevious";
+
+    /// <summary>
+    /// A partial index of the live rows that may be earlier versions, by source
+    /// path. They are a small minority (21,919 of 12,255,940 rows on one real
+    /// set, whose full scan for them took 112 s), and without it every reader of
+    /// earlier versions - each full backup's retention pass among them - read
+    /// the whole set to find them.
+    ///
+    /// <para>Not in SetSchema.sql: that script runs on every open, and must never
+    /// need SQLite's write lock on an existing database, while building this index
+    /// is a full scan under it. <see cref="EnsurePreviousVersionIndexAsync"/>
+    /// builds it once, under the set's cross-process write lock, for the first
+    /// reader that needs it.</para>
+    /// </summary>
+    private const string PreviousVersionIndexSql =
+        $"CREATE INDEX IF NOT EXISTS {PreviousVersionIndexName} ON Files(SourcePath) WHERE {PreviousVersionCandidateSql}";
+
+    /// <summary>Set once the index is known to exist, so the check is not repeated.</summary>
+    private volatile bool _previousVersionIndexExists;
+
+    /// <summary>
+    /// Build <see cref="PreviousVersionIndexSql"/> if this database does not have
+    /// it yet. The build holds the set's write lock, so the other process's
+    /// writers wait for it (on the lock file, with no timeout) instead of failing
+    /// on SQLite's busy timeout, and this process's other calls wait on the gate.
+    /// </summary>
+    /// <param name="onBuilding">Called once if the index has to be built, so a caller can say so.</param>
+    private async Task EnsurePreviousVersionIndexAsync(Action? onBuilding, CancellationToken ct)
+    {
+        if (_previousVersionIndexExists)
+            return;
+
+        bool PresentNow()
+        {
+            using var check = _connection.CreateCommand();
+            check.CommandText = "SELECT EXISTS (SELECT 1 FROM sqlite_master WHERE type = 'index' AND name = $name)";
+            check.Parameters.AddWithValue("$name", PreviousVersionIndexName);
+            return Convert.ToInt64(check.ExecuteScalar()) != 0;
+        }
+
+        using (await LockAsync(ct).ConfigureAwait(false))
+        {
+            if (PresentNow())
+            {
+                _previousVersionIndexExists = true;
+                return;
+            }
+        }
+
+        onBuilding?.Invoke();
+        using (await WriteLockAsync(ct).ConfigureAwait(false))
+        {
+            // Another process may have built it while this one waited for the lock.
+            if (!PresentNow())
+            {
+                using var cmd = _connection.CreateCommand();
+                cmd.CommandText = PreviousVersionIndexSql;
+                // Stoppable only on its own: inside the caller's transaction an
+                // aborted statement would roll the whole transaction back.
+                if (OwnsTransaction)
+                {
+                    cmd.ExecuteNonQuery();
+                }
+                else
+                {
+                    using (SqliteCancellation.Watch(_connection, ct))
+                        SqliteCancellation.Interruptible(cmd.ExecuteNonQuery, ct);
+                }
+            }
+            _previousVersionIndexExists = true;
+        }
+    }
+
+    /// <summary>See <see cref="ICatalogRepository.GetActivePreviousVersionsAsync"/>.</summary>
+    public async Task<IReadOnlyList<FileRecord>> GetActivePreviousVersionsAsync(
+        int backupSetId, Action? onIndexing = null, CancellationToken ct = default)
+    {
+        ct.ThrowIfCancellationRequested();
+        await EnsurePreviousVersionIndexAsync(onIndexing, ct).ConfigureAwait(false);
+        using var _ = await LockAsync(ct).ConfigureAwait(false);
+
+        using var cmd = _connection.CreateCommand();
+        // The candidate predicate word for word (hence no alias on Files), so the
+        // partial index serves it; ordered by the index's own key.
+        cmd.CommandText = $"""
+            SELECT * FROM Files
+            WHERE {PreviousVersionCandidateSql}
+              AND EXISTS (SELECT 1 FROM Discs d WHERE d.Id = Files.DiscId AND d.BackupSetId = $setId)
+            ORDER BY SourcePath
+            """;
+        cmd.Parameters.AddWithValue("$setId", backupSetId);
+
+        var list = new List<FileRecord>();
+        foreach (var r in Rows(cmd, ct))
+        {
+            var f = ReadFile(r);
+            if (Core.HistoryPaths.IsPreviousVersion(f.DiscPath))
+                list.Add(f);
+        }
+        return list;
+    }
+
     public async Task ForEachDiscPathEntryAsync(
         int backupSetId,
         Action<string, bool, string> onEntry,

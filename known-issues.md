@@ -1,5 +1,17 @@
 # LithicBackup — Known Issues & Tech Debt
 
+## FIXED: every full backup read the whole set to find its earlier versions (2026-10-25)
+
+The retention pass at the end of each full backup loaded every record of the
+set (`GetAllFilesForBackupSetAsync`, tombstones included) and kept the earlier
+versions among them. On the author's 6 TB set that is 12,255,940 rows (an
+11.5 GB database) for 21,919 earlier versions; a plain scan for them took
+112 s, before materialising millions of records the pass then discarded.
+Earlier versions now have a partial index of their own (`IX_Files_ActivePrevious`),
+built once per set by the first reader, and the pass reads only them. Found while
+building the editor's offer to remove versions after a retention change, which
+needed the same read to be quick.
+
 ## FIXED: Verify Integrity never verified; it sat on "Preparing verification..." (2026-10-24)
 
 **Cause.** `VerifyIntegrityViewModel` started its run from its constructor,

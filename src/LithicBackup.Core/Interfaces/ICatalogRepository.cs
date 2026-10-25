@@ -179,6 +179,18 @@ public interface ICatalogRepository : IDisposable
         IProgress<int>? rowProgress = null);
 
     /// <summary>
+    /// Every live earlier version in the set (a record whose stored file is under a
+    /// <c>{drive}_prev</c> folder), whole rows, ordered by source path. Read through an index of earlier
+    /// versions, so it costs what there is to return rather than a read of the
+    /// whole set. The first call on a set database without that index builds it,
+    /// once: a full scan under the set's write lock.
+    /// See <see cref="LithicBackup.Core.HistoryPaths.IsPreviousVersion"/> for the definition.
+    /// </summary>
+    /// <param name="onIndexing">Called once if the index has to be built first, so a caller can say why it waits.</param>
+    Task<IReadOnlyList<FileRecord>> GetActivePreviousVersionsAsync(
+        int backupSetId, Action? onIndexing = null, CancellationToken ct = default);
+
+    /// <summary>
     /// Get lightweight version info for the latest version of each file in a
     /// backup set. Returns one entry per unique SourcePath with the max version
     /// and its metadata. Much cheaper than <see cref="GetAllFilesForBackupSetAsync"/>.

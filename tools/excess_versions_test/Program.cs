@@ -288,6 +288,134 @@ internal static class Program
         await InPlaceOverwriteAsync(root);
         await KeptCopyAcrossCategoriesAsync(root);
         await GuardedRetireAsync(root);
+        await PreviousVersionsIndexAsync(root);
+        TierWalk();
+    }
+
+    /// <summary>
+    /// §19. GetActivePreviousVersionsAsync: exactly the live earlier versions -
+    /// the first path segment ending in _prev, either separator - read through an
+    /// index of their own that the first call builds, so a whole-set retention
+    /// pass no longer reads every record to find them.
+    /// </summary>
+    static async Task PreviousVersionsIndexAsync(string root)
+    {
+        Console.WriteLine();
+        Console.WriteLine("=== 19. Earlier versions are read through an index of their own ===");
+        string dbPath = Path.Combine(root, "prev-index", "catalog.db");
+        Directory.CreateDirectory(Path.GetDirectoryName(dbPath)!);
+        using var repo = new SqliteCatalogRepository(dbPath);
+        var set = await repo.CreateBackupSetAsync(new BackupSet
+        {
+            Name = "prev-index", SourceRoots = [@"D:\src"], CreatedUtc = DateTime.UtcNow,
+            DefaultMediaType = MediaType.Directory,
+        });
+        var disc = await repo.CreateDiscAsync(new DiscRecord
+        {
+            BackupSetId = set.Id, Label = @"X:\dst", SequenceNumber = 1, MediaType = MediaType.Directory,
+            Status = BurnSessionStatus.Completed, CreatedUtc = DateTime.UtcNow,
+        });
+        async Task<FileRecord> Add(string source, string discPath, bool deleted = false) =>
+            await repo.CreateFileRecordAsync(new FileRecord
+            {
+                DiscId = disc.Id, SourcePath = source, DiscPath = discPath, SizeBytes = 1, Hash = "",
+                IsDeleted = deleted, SourceLastWriteUtc = DateTime.UtcNow, BackedUpUtc = DateTime.UtcNow,
+            });
+        var prev = await Add(@"D:\src\a.txt", @"D_prev\src\a.txt.v1");
+        var prevSlash = await Add(@"D:\src\b.txt", "D_prev/src/b.txt.v1");
+        var current = await Add(@"D:\src\a.txt", @"D\src\a.txt");
+        var deep = await Add(@"D:\src\old_prev\c.txt", @"D\src\old_prev\c.txt");
+        var preview = await Add(@"D:\preview\d.txt", @"D\preview\d.txt");
+        var retired = await Add(@"D:\src\e.txt", @"D_prev\src\e.txt.v1", deleted: true);
+
+        string setDb = Path.Combine(Path.GetDirectoryName(dbPath)!, "sets", $"set-{set.Id}.db");
+        bool IndexExists()
+        {
+            using var c = new Microsoft.Data.Sqlite.SqliteConnection($"Data Source={setDb};Mode=ReadOnly;Pooling=False");
+            c.Open();
+            using var cmd = c.CreateCommand();
+            cmd.CommandText = "SELECT EXISTS (SELECT 1 FROM sqlite_master WHERE type = 'index' AND name = 'IX_Files_ActivePrevious')";
+            return Convert.ToInt64(cmd.ExecuteScalar()) != 0;
+        }
+        Check(!IndexExists(), "a set database does not build the index when it opens");
+
+        int indexing = 0;
+        var found = await repo.GetActivePreviousVersionsAsync(set.Id, onIndexing: () => indexing++);
+        var ids = found.Select(f => f.Id).ToHashSet();
+        Check(ids.SetEquals([prev.Id, prevSlash.Id]),
+            $"exactly the live earlier versions, either separator (got {string.Join(", ", found.Select(f => f.DiscPath))})");
+        Check(found.All(f => f.SizeBytes == 1 && f.SourcePath.Length > 0), "as whole records");
+        Check(indexing == 1 && IndexExists(), "the first read builds the index, and says so once");
+        await repo.GetActivePreviousVersionsAsync(set.Id, onIndexing: () => indexing++);
+        Check(indexing == 1, "later reads use it");
+
+        // The planner must be able to serve the read from the index: the
+        // predicate has to be the index's own, word for word.
+        using (var c = new Microsoft.Data.Sqlite.SqliteConnection($"Data Source={setDb};Mode=ReadOnly;Pooling=False"))
+        {
+            c.Open();
+            using var cmd = c.CreateCommand();
+            cmd.CommandText = """
+                EXPLAIN QUERY PLAN
+                SELECT * FROM Files
+                WHERE IsDeleted = 0 AND instr(lower(DiscPath), '_prev') > 0
+                  AND EXISTS (SELECT 1 FROM Discs d WHERE d.Id = Files.DiscId AND d.BackupSetId = 1)
+                ORDER BY SourcePath
+                """;
+            var plan = new List<string>();
+            using (var r = cmd.ExecuteReader())
+                while (r.Read())
+                    plan.Add(r.GetString(3));
+            Check(plan.Any(p => p.Contains("IX_Files_ActivePrevious", StringComparison.Ordinal)),
+                $"the read is planned through the index ({string.Join(" | ", plan)})");
+        }
+        _ = deep; _ = preview;
+    }
+
+    /// <summary>
+    /// §20. The one tier walk (VersionRetentionService.SelectExpired) the backup's
+    /// retention pass, Cleanup and the editor's offer share; and FindVersionsNotKept,
+    /// which adds an empty Default's versions and leaves an excluded file's.
+    /// </summary>
+    static void TierWalk()
+    {
+        Console.WriteLine();
+        Console.WriteLine("=== 20. One tier walk for every caller ===");
+        var now = new DateTime(2026, 10, 25, 12, 0, 0, DateTimeKind.Utc);
+        long id = 0;
+        FileRecord V(string path, double daysOld) => new()
+        {
+            Id = ++id, SourcePath = path, DiscPath = @"D_prev\" + path[3..] + ".v" + id,
+            BackedUpUtc = now.AddDays(-daysOld),
+        };
+        // The stock tiers: all under 10 days, 3 under a year, 1 older.
+        var tiers = VersionRetentionService.DefaultTiers;
+        var a = new[] { V(@"D:\a", 1), V(@"D:\a", 2), V(@"D:\a", 20), V(@"D:\a", 30), V(@"D:\a", 40), V(@"D:\a", 50),
+                        V(@"D:\a", 400), V(@"D:\a", 500) };
+        var expired = VersionRetentionService.SelectExpired(a, tiers, now).Select(v => v.BackedUpUtc).ToHashSet();
+        Check(expired.SetEquals([now.AddDays(-50), now.AddDays(-500)]),
+            "under 10 days all kept; of 20-50 days the newest 3 kept; over a year the newest 1 kept");
+        var lone = new[] { V(@"D:\b", 900) };
+        Check(VersionRetentionService.SelectExpired(lone, [new() { MaxAge = null, MaxVersions = 0 }], now).Count == 0,
+            "a file's newest earlier version is always kept, even by a tier that keeps none");
+        Check(VersionRetentionService.SelectExpired(a, [], now).Count == 0, "no tiers expire nothing");
+
+        var opts = new JobOptions
+        {
+            TierSets =
+            [
+                new VersionTierSet { Name = "Default", Tiers = [] },
+                new VersionTierSet { Name = "Logs", Tiers = [new() { MaxVersions = 1 }], FilePatterns = ["*.log"] },
+                new VersionTierSet { Name = "None", Tiers = [], FilePatterns = ["*.tmp"] },
+            ],
+        };
+        var all = new[] { V(@"D:\x.bin", 1), V(@"D:\x.bin", 2), V(@"D:\y.log", 1), V(@"D:\y.log", 2), V(@"D:\z.tmp", 1) };
+        var notKept = VersionRetentionService.FindVersionsNotKept(all, opts, now).Select(v => v.SourcePath + "@" + v.BackedUpUtc.Day).ToList();
+        Check(notKept.Count == 3 && notKept.Count(p => p.StartsWith(@"D:\x.bin")) == 2 && notKept.Count(p => p.StartsWith(@"D:\y.log")) == 1,
+            $"FindVersionsNotKept: every version of an empty Default's file, the tiers' excess of the rest, none of an excluded file's ({string.Join(", ", notKept)})");
+        opts.TierSets.RemoveAt(0);
+        Check(VersionRetentionService.FindVersionsNotKept(all, opts, now).All(v => !v.SourcePath.EndsWith(".bin")),
+            "with no Default in the list, unmatched files' versions are not offered");
     }
 
     /// <summary>
