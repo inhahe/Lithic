@@ -811,6 +811,16 @@ public class MainViewModel : ViewModelBase
             // cannot be waited for here, and is the one thing this may miss.
             _ = sourceSelection.FlushPendingEditsAsync();
 
+            // Not saved into another set's backup folder, even now: the user has
+            // nothing left to change it with, so the edit is dropped and told so.
+            // The catalog is read off the UI thread, which this does not need back.
+            if (BackupFolderInUseAsync().GetAwaiter().GetResult() is { } inUse)
+            {
+                MessageBox.Show(inUse + "\n\nYour changes to this set were not saved.", "Backup Folder In Use",
+                    MessageBoxButton.OK, MessageBoxImage.Warning);
+                return;
+            }
+
             SyncSettingsToJobOptions(backupSet, sourceSelection);
             backupSet.SourceSelections = sourceSelection.GetSelections();
             Task.Run(async () =>
@@ -818,6 +828,7 @@ public class MainViewModel : ViewModelBase
                 await CarryStoredHoldAsync(backupSet);
                 await _catalog.UpdateBackupSetAsync(backupSet);
             }).GetAwaiter().GetResult();
+            _unsavedNewSetId = null; // committed: the Closed handler must not delete it
             AfterSave();
         }
 
@@ -852,6 +863,30 @@ public class MainViewModel : ViewModelBase
                   + "right-click menu instead, which records where its files now are. To start a fresh backup "
                   + "in the new folder, clear the set's backup history after saving.\n\n"
                   + "Save this change anyway?";
+        }
+
+        // Before a save that would give the set a backup folder another set
+        // already has: the refusal's text, or null. Always for a new set; for
+        // others only when the save changes the folder, so that two sets which
+        // already share one can still be edited (Cleanup refuses them). The
+        // editor's fields are read here, the catalog off the UI thread without
+        // coming back to it, since File > Exit waits for this synchronously.
+        Task<string?> BackupFolderInUseAsync()
+        {
+            var opts = EditorJobOptions(backupSet, sourceSelection);
+            bool isNew = _unsavedNewSetId is not null;
+            if (opts.BackupRoot() is not { } newRoot)
+                return Task.FromResult<string?>(null);
+            return Task.Run(async () =>
+            {
+                if (!isNew
+                    && (await _catalog.GetBackupSetAsync(backupSet.Id))?.JobOptions?.BackupRoot() is { } oldRoot
+                    && string.Equals(oldRoot.TrimEnd('\\', '/'), newRoot.TrimEnd('\\', '/'), StringComparison.OrdinalIgnoreCase))
+                    return null;
+                return await SetSharingBackupFolderAsync(_catalog, backupSet.Id, opts) is { } owner
+                    ? BackupFolderInUseMessage(newRoot, owner)
+                    : null;
+            });
         }
 
         // Ask it, on the UI thread. True to go ahead with the save.
@@ -910,7 +945,8 @@ public class MainViewModel : ViewModelBase
         // Set by the Cancel button: close and throw the edits away, no prompt.
         bool discardRequested = false;
 
-        // Set by Yes at the close prompt: the Closed handler saves.
+        // Set by Yes at the close prompt during File > Exit: the Closed handler
+        // saves. (Yes otherwise saves and closes as the Save button does.)
         bool saveOnClose = false;
 
         // Whether anything genuinely changed since the last save. The event-based
@@ -969,10 +1005,9 @@ public class MainViewModel : ViewModelBase
                 if (Application.Current is App { IsExiting: true })
                 {
                     // File > Exit: the Closed handler saves at once (SaveBeforeExit),
-                    // which leaves no time to ask anything more. For a new set,
-                    // clear the "unsaved new" marker so it is kept, not deleted.
+                    // which leaves no time to ask anything more. A new set keeps its
+                    // "unsaved new" marker until that save succeeds.
                     saveOnClose = true;
-                    _unsavedNewSetId = null;
                 }
                 else
                 {
@@ -996,32 +1031,31 @@ public class MainViewModel : ViewModelBase
             // Stop any background PlanAsync scan.
             autoCheckCts?.Cancel();
 
-            if (_unsavedNewSetId is int unsavedId)
+            if (saveOnClose)
             {
-                // A new set that was never saved - Cancel, No at the prompt, or a
-                // forced shutdown. Delete the temporary record so no orphan
-                // appears in the catalog.
-                _unsavedNewSetId = null;
-                try { await _catalog.DeleteBackupSetAsync(unsavedId); }
-                catch { /* best effort */ }
-            }
-            else if (saveOnClose)
-            {
-                // Yes at the close prompt. Guard the save: this is an async-void
-                // event handler, so an unhandled exception here would tear down
-                // the app. On failure savedThisSession stays false, so the
-                // reconcile below is correctly skipped.
+                // Yes at the close prompt during File > Exit. Guard the save: this
+                // is an async-void event handler, so an unhandled exception here
+                // would tear down the app. On failure savedThisSession stays false,
+                // so the reconcile below is correctly skipped.
                 try
                 {
-                    if (Application.Current is App { IsExiting: true })
-                        SaveBeforeExit();
-                    else
-                        await SaveAllAsync();
+                    SaveBeforeExit();
                 }
                 catch (Exception ex)
                 {
                     StatusText = $"Failed to save on close: {ex.Message}";
                 }
+            }
+
+            if (_unsavedNewSetId is int unsavedId)
+            {
+                // A new set that was never saved - Cancel, No at the prompt, a
+                // forced shutdown, or a save at File > Exit that was refused or
+                // failed. Delete the temporary record so no orphan appears in the
+                // catalog.
+                _unsavedNewSetId = null;
+                try { await _catalog.DeleteBackupSetAsync(unsavedId); }
+                catch { /* best effort */ }
             }
 
             // Stop this editor's directory-size scheduler - after the save above,
@@ -1085,6 +1119,12 @@ public class MainViewModel : ViewModelBase
         {
             try
             {
+                if (await BackupFolderInUseAsync() is { } inUse)
+                {
+                    MessageBox.Show(inUse, "Backup Folder In Use", MessageBoxButton.OK, MessageBoxImage.Warning);
+                    sourceSelection.SaveStatusText = "Not saved";
+                    return;
+                }
                 if (!ConfirmBackupFolderMove(await BackupFolderMoveQuestionAsync()))
                 {
                     sourceSelection.SaveStatusText = "Not saved";
@@ -1164,6 +1204,12 @@ public class MainViewModel : ViewModelBase
 
                 try
                 {
+                    if (await BackupFolderInUseAsync() is { } inUse)
+                    {
+                        MessageBox.Show(inUse, "Backup Folder In Use", MessageBoxButton.OK, MessageBoxImage.Warning);
+                        sourceSelection.SeedResult = "Not saved, so nothing was imported.";
+                        return;
+                    }
                     if (!ConfirmBackupFolderMove(await BackupFolderMoveQuestionAsync()))
                     {
                         sourceSelection.SeedResult = "Not saved, so nothing was imported.";
@@ -2706,6 +2752,31 @@ public class MainViewModel : ViewModelBase
     // -------------------------------------------------------------------
 
     /// <summary>
+    /// The name of a set other than <paramref name="setId"/> whose backup folder
+    /// <paramref name="options"/> would share (see
+    /// <see cref="JobOptions.SharesBackupFolderWith"/>), or null when none.
+    /// </summary>
+    /// <param name="setId">The set the options are for; 0 for one not created yet.</param>
+    /// <param name="options">Its options as they would be saved.</param>
+    public static async Task<string?> SetSharingBackupFolderAsync(
+        ICatalogRepository catalog, int setId, JobOptions options)
+    {
+        foreach (var other in await catalog.GetAllBackupSetsAsync())
+        {
+            if (other.Id != setId && other.JobOptions is { } theirs && options.SharesBackupFolderWith(theirs))
+                return other.Name;
+        }
+        return null;
+    }
+
+    /// <summary>Why a set may not have the backup folder <paramref name="root"/>, which <paramref name="owner"/> has.</summary>
+    internal static string BackupFolderInUseMessage(string root, string owner) =>
+        $"The backup folder\n    {root}\nis already the backup folder of \"{owner}\".\n\n"
+        + "Two sets cannot share one: each set's Cleanup would offer the other's backed-up files for "
+        + "deletion, and backups of the same files would get in each other's way. Choose another "
+        + "destination, or give this set a folder of its own there (\"Create subdirectory\" in its editor).";
+
+    /// <summary>
     /// Relabel a set's discs for Change Destination, so they name the folders
     /// their files are now in.
     /// </summary>
@@ -2787,6 +2858,31 @@ public class MainViewModel : ViewModelBase
         string newPath = dialog.SelectedPath;
         if (string.Equals(newPath, oldPath, StringComparison.OrdinalIgnoreCase))
             return;
+
+        // Not into another set's backup folder; asked before the confirmation,
+        // which would otherwise end in a refusal. The new path's volume is looked
+        // up on a copy of the options, as the move below does for real.
+        try
+        {
+            var moved = JsonSerializer.Deserialize<JobOptions>(
+                JsonSerializer.Serialize(backupSet.JobOptions, _jsonOptions), _jsonOptions)!;
+            moved.TargetDirectory = newPath;
+            moved.DestinationVolumeId = null;
+            moved.DestinationSubpath = null;
+            _destinationResolver?.Resolve(moved);
+            if (await SetSharingBackupFolderAsync(_catalog, backupSet.Id, moved) is { } owner)
+            {
+                MessageBox.Show(BackupFolderInUseMessage(moved.BackupRoot()!, owner), "Backup Folder In Use",
+                    MessageBoxButton.OK, MessageBoxImage.Warning);
+                StatusText = $"Destination not changed: {moved.BackupRoot()} is \"{owner}\"'s backup folder.";
+                return;
+            }
+        }
+        catch (Exception ex)
+        {
+            StatusText = $"Failed to change destination: {ex.Message}";
+            return;
+        }
 
         // Confirm and explain what this does.
         var confirm = MessageBox.Show(
@@ -3004,7 +3100,12 @@ public class MainViewModel : ViewModelBase
         var src = SelectedBackupSet;
 
         // Ask the user which parts of the set to carry over.
-        var vm = new DuplicateBackupSetViewModel(src.Name, src.JobOptions?.TargetDirectory);
+        // The dialog refuses a destination that is already a set's backup folder,
+        // from the sets in the list; the catalog is asked again before creating.
+        var sets = BackupSets.Select(r => r.Model).ToList();
+        var vm = new DuplicateBackupSetViewModel(src.Name, src.JobOptions?.TargetDirectory,
+            destination => sets.FirstOrDefault(s => s.JobOptions is { } theirs
+                && new JobOptions { TargetDirectory = destination }.SharesBackupFolderWith(theirs))?.Name);
         var dialog = new DuplicateBackupSetDialog
         {
             Owner = Application.Current.MainWindow,
@@ -3064,17 +3165,12 @@ public class MainViewModel : ViewModelBase
                     copiedOptions.ExcludedExtensions = [.. src.JobOptions.ExcludedExtensions];
 
                 // Destination is set directly in the dialog (pre-filled from the
-                // source). Carry the source's subdirectory shaping only when the
-                // destination is unchanged from the original target. Store null
-                // (not empty) for a blank destination so the Worker treats the
-                // set as inactive until a real destination is chosen.
+                // source), with no subfolder: the source's would make it the
+                // source's backup folder. Store null (not empty) for a blank
+                // destination so the Worker treats the set as inactive until a
+                // real destination is chosen.
                 copiedOptions.TargetDirectory =
                     string.IsNullOrWhiteSpace(vm.TargetDirectory) ? null : vm.TargetDirectory.Trim();
-                if (vm.KeepsOriginalTarget)
-                {
-                    copiedOptions.CreateSubdirectory = src.JobOptions.CreateSubdirectory;
-                    copiedOptions.SubdirectoryName = src.JobOptions.SubdirectoryName;
-                }
 
                 // Schedule is its own opt-in.
                 if (vm.CopySchedule && src.JobOptions.Schedule is not null)
@@ -3093,6 +3189,17 @@ public class MainViewModel : ViewModelBase
                 }
             }
 
+            // Not into another set's backup folder (the dialog judged from the
+            // list, which a set added meanwhile, by import say, is not yet in).
+            if (copiedOptions is not null
+                && await SetSharingBackupFolderAsync(_catalog, 0, copiedOptions) is { } owner)
+            {
+                MessageBox.Show(BackupFolderInUseMessage(copiedOptions.BackupRoot()!, owner),
+                    "Duplicate Backup Set", MessageBoxButton.OK, MessageBoxImage.Warning);
+                StatusText = $"Did not copy \"{src.Name}\": the destination is \"{owner}\"'s backup folder.";
+                return;
+            }
+
             var newSet = await _catalog.CreateBackupSetAsync(new BackupSet
             {
                 Name = vm.Name.Trim(),
@@ -3105,13 +3212,6 @@ public class MainViewModel : ViewModelBase
                 CapacityOverrideBytes = vm.CopySettings ? src.CapacityOverrideBytes : null,
                 CreatedUtc = DateTime.UtcNow,
             });
-
-            // Optionally carry over the record of what's already backed up.
-            // Only valid (and only offered) when the destination is unchanged.
-            if (vm.CopyBackupHistory && vm.KeepsOriginalTarget)
-            {
-                await _catalog.CopyBackupSetCatalogAsync(src.Id, newSet.Id);
-            }
 
             await LoadBackupSetsAsync();
 
@@ -4447,9 +4547,23 @@ public class MainViewModel : ViewModelBase
     /// </summary>
     private static void ApplyVmSettingsToJobOptions(JobOptions opts, SourceSelectionViewModel vm)
     {
-        // Target mode + directory.
+        // Target mode + directory. A destination changed in the editor is a new
+        // place, so the volume identity stored for the old one goes with it: the
+        // resolver rebuilds the path from that identity, and would put the old
+        // path back at the next backup. It is captured again from the new path
+        // when its drive is next seen. Equal to the copy's own value means not
+        // edited, and the identity stays: a drive that moved to another letter
+        // while the editor was open is followed by it, not by the editor's field.
         if (vm.IsDirectoryMode)
+        {
+            if (!string.Equals(opts.TargetDirectory?.TrimEnd('\\', '/'), vm.TargetDirectory?.TrimEnd('\\', '/'),
+                    StringComparison.OrdinalIgnoreCase))
+            {
+                opts.DestinationVolumeId = null;
+                opts.DestinationSubpath = null;
+            }
             opts.TargetDirectory = vm.TargetDirectory;
+        }
         opts.CreateSubdirectory = vm.CreateSubdirectory;
         opts.SubdirectoryName = vm.SubdirectoryName;
 
@@ -5437,6 +5551,28 @@ public class MainViewModel : ViewModelBase
     {
         try
         {
+            // Not into another set's backup folder (importing a set already here
+            // does exactly that). The file's volume identity was taken on the
+            // computer it came from, so it is looked up again here from the path.
+            var (settings, _) = await BackupSetTransfer.ReadSummaryAsync(fileName);
+            if (settings.JobOptions is { } imported)
+            {
+                var here = JsonSerializer.Deserialize<JobOptions>(
+                    JsonSerializer.Serialize(imported, _jsonOptions), _jsonOptions)!;
+                here.DestinationVolumeId = null;
+                here.DestinationSubpath = null;
+                _destinationResolver?.Resolve(here);
+                if (await SetSharingBackupFolderAsync(_catalog, 0, here) is { } owner)
+                {
+                    StatusText = $"Did not import \"{settings.Name}\": its backup folder is \"{owner}\"'s.";
+                    MessageBox.Show(PromptOwner(),
+                        $"\"{settings.Name}\" was not imported.\n\n" + BackupFolderInUseMessage(here.BackupRoot()!, owner)
+                        + "\n\nTo import it anyway, give the existing set another folder first.",
+                        "Import Backup Set", MessageBoxButton.OK, MessageBoxImage.Warning);
+                    return;
+                }
+            }
+
             CrashLogger.Log(null, $"GUI: importing {fileName}.");
             var clock = System.Diagnostics.Stopwatch.StartNew();
             StatusText = $"Importing {Path.GetFileName(fileName)}…";

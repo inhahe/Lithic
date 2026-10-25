@@ -7,22 +7,27 @@ namespace LithicBackup.ViewModels;
 /// for the new set, choose which grouped parts of the source set to carry over
 /// (sources, settings, schedule), and set the destination directory directly.
 ///
-/// The destination is pre-filled with the source set's target directory so the
-/// usual edits are quick: clear or change it to back up the same sources to a
-/// different place, or keep it to back up to the same location. The "backup
-/// history" option is only meaningful when the destination still matches the
-/// original target, so it is automatically disabled (and cleared) whenever the
-/// destination is changed away from it.
+/// The destination is pre-filled with the source set's target directory, as a
+/// starting point to edit. The copy needs a backup folder of its own: one that is
+/// already a set's is refused (see JobOptions.SharesBackupFolderWith), and the
+/// dialog says so as soon as the destination names one. The copy starts with no
+/// backup history; it can be seeded from its own folder.
 /// </summary>
 public class DuplicateBackupSetViewModel : ViewModelBase
 {
-    private readonly string _originalTargetDirectory;
+    private readonly Func<string, string?>? _backupFolderOwner;
 
-    public DuplicateBackupSetViewModel(string sourceName, string? sourceTargetDirectory)
+    /// <param name="sourceName">The name of the set being copied.</param>
+    /// <param name="sourceTargetDirectory">Its destination, to start from.</param>
+    /// <param name="backupFolderOwner">
+    /// The name of the set whose backup folder a destination would be, or null.
+    /// </param>
+    public DuplicateBackupSetViewModel(
+        string sourceName, string? sourceTargetDirectory, Func<string, string?>? backupFolderOwner = null)
     {
         _name = $"Copy of {sourceName}";
-        _originalTargetDirectory = sourceTargetDirectory ?? string.Empty;
-        _targetDirectory = _originalTargetDirectory;
+        _targetDirectory = sourceTargetDirectory ?? string.Empty;
+        _backupFolderOwner = backupFolderOwner;
 
         BrowseTargetCommand = new RelayCommand(_ => BrowseTarget());
     }
@@ -77,9 +82,7 @@ public class DuplicateBackupSetViewModel : ViewModelBase
     private string _targetDirectory;
     /// <summary>
     /// Destination directory for the new set. Pre-filled with the source set's
-    /// target. Leave empty to choose a location later. Changing it away from the
-    /// original disables (and clears) the backup-history option, since the
-    /// catalog records describe files at the original destination.
+    /// target. Leave empty to choose a location later.
     /// </summary>
     public string TargetDirectory
     {
@@ -88,35 +91,25 @@ public class DuplicateBackupSetViewModel : ViewModelBase
         {
             if (SetProperty(ref _targetDirectory, value))
             {
-                if (!CanCopyBackupHistory)
-                    CopyBackupHistory = false;
-                OnPropertyChanged(nameof(CanCopyBackupHistory));
+                OnPropertyChanged(nameof(IsDestinationInUse));
+                OnPropertyChanged(nameof(DestinationInUseText));
             }
         }
     }
 
-    private bool _copyBackupHistory;
-    /// <summary>
-    /// The catalog records of which files are already backed up. Off by default;
-    /// only valid when the destination still matches the original target
-    /// (otherwise the records would describe files at the wrong destination).
-    /// </summary>
-    public bool CopyBackupHistory
-    {
-        get => _copyBackupHistory;
-        set => SetProperty(ref _copyBackupHistory, value);
-    }
+    /// <summary>The set whose backup folder the destination is, or null.</summary>
+    private string? DestinationOwner => string.IsNullOrWhiteSpace(_targetDirectory)
+        ? null
+        : _backupFolderOwner?.Invoke(_targetDirectory.Trim());
 
-    /// <summary>
-    /// Backup history can only be copied when the destination is unchanged from
-    /// the source set's original target directory.
-    /// </summary>
-    public bool CanCopyBackupHistory =>
-        !string.IsNullOrWhiteSpace(_targetDirectory)
-        && PathsEqual(_targetDirectory, _originalTargetDirectory);
+    /// <summary>Whether the destination is already a set's backup folder, which a copy may not have.</summary>
+    public bool IsDestinationInUse => DestinationOwner is not null;
 
-    /// <summary>True when the destination still points at the original target.</summary>
-    public bool KeepsOriginalTarget => CanCopyBackupHistory;
+    /// <summary>What the dialog says while <see cref="IsDestinationInUse"/>; empty otherwise.</summary>
+    public string DestinationInUseText => DestinationOwner is { } owner
+        ? $"This is the backup folder of \"{owner}\". The copy needs a folder of its own: change it, "
+          + "or leave it empty to choose one later."
+        : "";
 
     public ICommand BrowseTargetCommand { get; }
 
@@ -135,10 +128,4 @@ public class DuplicateBackupSetViewModel : ViewModelBase
         if (dialog.ShowDialog() == System.Windows.Forms.DialogResult.OK)
             TargetDirectory = dialog.SelectedPath;
     }
-
-    private static bool PathsEqual(string a, string b)
-        => string.Equals(
-            a.Trim().TrimEnd('\\', '/'),
-            b.Trim().TrimEnd('\\', '/'),
-            StringComparison.OrdinalIgnoreCase);
 }

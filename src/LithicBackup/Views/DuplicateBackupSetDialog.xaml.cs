@@ -26,6 +26,12 @@ public partial class DuplicateBackupSetDialog : Window
                 MessageBoxButton.OK, MessageBoxImage.Warning);
             return;
         }
+        if (DataContext is DuplicateBackupSetViewModel { IsDestinationInUse: true } inUse)
+        {
+            MessageBox.Show(inUse.DestinationInUseText, "Duplicate Backup Set",
+                MessageBoxButton.OK, MessageBoxImage.Warning);
+            return;
+        }
         DialogResult = true;
     }
 

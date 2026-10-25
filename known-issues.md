@@ -26,19 +26,31 @@ of the author's needs it.
 The guard came out of the Opus review of the fix, which found that the fix alone
 left these sets to lose their earlier versions quietly.
 
-**Open: two sets with the same backup folder.** Two sets with one destination and
-no subfolder (or the same subfolder) share a backup folder, and nothing stops
-it. Each set's Cleanup destination scan then lists the other set's files as
-untracked, offering them for deletion. A set *nested* inside another's folder is
-handled: the outer set's scan skips it. The proper fix needs a decision: refuse
-(or warn about) a backup folder that equals or overlaps another set's when the
-editor saves, or have the destination scan treat every set's live records in that
-folder as tracked (reading each such set's catalog). Neither of the author's sets
-shares a folder.
+**Two sets with the same backup folder: refused since 1.18.0.** Two sets with one
+destination and no subfolder (or the same subfolder) shared a backup folder, and
+nothing stopped it: each set's Cleanup destination scan listed the other's files
+as untracked, for deletion. Saving, Change Destination, Import and Copy now
+refuse a folder another set has, and Cleanup will not scan one two existing sets
+share (design.md, "A backup folder belongs to one set"). Copy's "Backup history"
+option went with it: it only worked by keeping the original's folder.
 
-**Also noticed:** `BackupJobViewModel` (the old new-set wizard) is never
-constructed; only its two static exclusion-pattern helpers are used. Its view
-(`BackupJobView.xaml`) and template can go, with the helpers moved.
+**Removed:** `BackupJobViewModel`, the old new-set wizard, which nothing
+constructed, with its view, its template and `StartBurnForSavedSet`; its two
+exclusion-pattern helpers moved into `MainViewModel`.
+
+**FIXED: a destination changed in the editor was put back at the next backup.**
+The editor saved the new path with the old volume identity, and the resolver,
+which rebuilds the path from the identity, wrote the old path back. Found while
+building the shared-folder check, which needs each set's real folder.
+
+**Open: the Sqlite package floats.** `LithicBackup.Infrastructure` references
+`Microsoft.Data.Sqlite` as `8.*`, so each restore can pick a different patch. On
+2026-10-25 a restore picked 8.0.33 while NuGet's cached listing of
+`Microsoft.Data.Sqlite.Core` stopped at 8.0.32, and silently resolved Core 9.0.0
+under it (warning NU1603 only), in the product and in the harnesses. Clearing the
+HTTP cache (`dotnet nuget locals http-cache --clear`) and restoring again fixed
+it. The proper fix is to pin exact versions, or to commit lock files
+(`RestorePackagesWithLockFile`), so that a release build cannot drift.
 
 ## FIXED: every full backup read the whole set to find its earlier versions (2026-10-25)
 
@@ -5398,7 +5410,7 @@ scenario runs under both `MemoryBudget = Fixed 0 GiB` (forces the streaming/pref
 path) and the default Auto budget (buffered path) — 24/24 checks pass. The disc harness
 still passes 25/25.
 
-## TECH DEBT: `StartBurnForSavedSet` / `PlanCompleted` now have zero callers (2026-07-15)
+## RESOLVED 2026-10-25 (removed with `BackupJobViewModel`): `StartBurnForSavedSet` / `PlanCompleted` had zero callers (2026-07-15)
 
 Discovered while wiring roadmap item 4. `MainViewModel.StartBurnForSavedSet` and
 `BackupJobViewModel.PlanCompleted` (raised at ~line 559) have **no remaining callers**

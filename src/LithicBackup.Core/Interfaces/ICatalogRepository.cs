@@ -76,16 +76,6 @@ public interface ICatalogRepository : IDisposable
     /// </summary>
     Task ClearBackupSetCatalogAsync(int backupSetId, CancellationToken ct = default);
 
-    /// <summary>
-    /// Copy the backup history (discs, file records, and file chunks) from one
-    /// backup set to another, remapping the disc/file primary keys.  Used when
-    /// duplicating a set and opting to carry over its record of what is already
-    /// backed up.  The destination set must already exist; its existing history
-    /// is left untouched (callers should clear it first if a clean copy is
-    /// desired).  Shared deduplication blocks are not duplicated.
-    /// </summary>
-    Task CopyBackupSetCatalogAsync(int sourceSetId, int destSetId, CancellationToken ct = default);
-
     // --- Discs ---
     Task<DiscRecord> CreateDiscAsync(DiscRecord disc, CancellationToken ct = default);
     Task<DiscRecord?> GetDiscAsync(int id, CancellationToken ct = default);

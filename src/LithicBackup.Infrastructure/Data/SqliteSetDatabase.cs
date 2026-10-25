@@ -2530,43 +2530,6 @@ internal sealed class SqliteSetDatabase : IDisposable
         }
     }
 
-    /// <summary>
-    /// Copy all disc/file/chunk records out of this set's database.  Used by the
-    /// master repository when duplicating a set's backup history into another
-    /// set.  Runs under the gate to give a consistent snapshot.
-    /// </summary>
-    public async Task<SetCatalogSnapshot> ReadSnapshotAsync(CancellationToken ct = default)
-    {
-        ct.ThrowIfCancellationRequested();
-        using var _ = await LockAsync(ct).ConfigureAwait(false);
-
-        var discs = new List<DiscRecord>();
-        using (var cmd = _connection.CreateCommand())
-        {
-            cmd.CommandText = "SELECT * FROM Discs ORDER BY Id";
-            foreach (var r in Rows(cmd, ct))
-                discs.Add(ReadDisc(r));
-        }
-
-        var files = new List<FileRecord>();
-        using (var cmd = _connection.CreateCommand())
-        {
-            cmd.CommandText = "SELECT * FROM Files ORDER BY Id";
-            foreach (var r in Rows(cmd, ct))
-                files.Add(ReadFile(r));
-        }
-
-        var chunks = new List<FileChunk>();
-        using (var cmd = _connection.CreateCommand())
-        {
-            cmd.CommandText = "SELECT * FROM FileChunks ORDER BY Id";
-            foreach (var r in Rows(cmd, ct))
-                chunks.Add(ReadChunk(r));
-        }
-
-        return new SetCatalogSnapshot(discs, files, chunks);
-    }
-
     // ---------------------------------------------------------------
     // One-time legacy migration
     // ---------------------------------------------------------------
@@ -2697,9 +2660,3 @@ internal sealed class SqliteSetDatabase : IDisposable
         _gate.Dispose();
     }
 }
-
-/// <summary>Immutable snapshot of one set's catalog records, used when copying history.</summary>
-internal sealed record SetCatalogSnapshot(
-    IReadOnlyList<DiscRecord> Discs,
-    IReadOnlyList<FileRecord> Files,
-    IReadOnlyList<FileChunk> Chunks);

@@ -295,6 +295,71 @@ internal static class Program
         TierWalk();
         await CleanupInSubfolderAsync(root);
         await RecordsElsewhereAsync(root);
+        await SharedBackupFolderAsync(root);
+    }
+
+    /// <summary>
+    /// §23. Two sets may not share a backup folder: what counts as the same folder,
+    /// finding the set that has one, Cleanup refusing to scan a folder two sets
+    /// already share, and the Copy dialog refusing another set's folder.
+    /// </summary>
+    static async Task SharedBackupFolderAsync(string root)
+    {
+        Console.WriteLine();
+        Console.WriteLine("=== 23. A backup folder belongs to one set ===");
+        JobOptions At(string dest, string? sub = null, string? volume = null) => new()
+        {
+            TargetDirectory = dest, CreateSubdirectory = sub is not null, SubdirectoryName = sub,
+            DestinationVolumeId = volume,
+        };
+        Check(At(@"E:\B").SharesBackupFolderWith(At(@"e:\b\")), "the same folder, whatever the case and trailing separator");
+        Check(!At(@"E:\B").SharesBackupFolderWith(At(@"F:\B")), "two drives' folders of one name, identities unknown, are two folders");
+        Check(At(@"E:\B", volume: "V1").SharesBackupFolderWith(At(@"F:\B", volume: "V1")),
+            "one volume under two letters is one folder");
+        Check(!At(@"E:\B", volume: "V1").SharesBackupFolderWith(At(@"E:\B", volume: "V2")),
+            "two volumes are two folders, whatever the stored letters say");
+        Check(!At(@"E:\B").SharesBackupFolderWith(At(@"E:\B", "Sub")), "a folder inside another's is not the same folder");
+        Check(At(@"E:\B\Sub").SharesBackupFolderWith(At(@"E:\B", "Sub")), "a subfolder that makes them the same is");
+        Check(!At(@"E:\B").SharesBackupFolderWith(new JobOptions()), "a set with no destination shares nothing");
+
+        string dir = Path.Combine(root, "cat23");
+        Directory.CreateDirectory(dir);
+        using var repo = new SqliteCatalogRepository(Path.Combine(dir, "catalog.db"));
+        string shared = Path.Combine(dir, "shared");
+        Directory.CreateDirectory(Path.Combine(shared, "D", "src"));
+        await File.WriteAllTextAsync(Path.Combine(shared, "D", "src", "theirs.txt"), "the other set's file");
+        BackupSet NewSet(string name, string dest) => new()
+        {
+            Name = name, SourceRoots = [@"D:\src"], CreatedUtc = DateTime.UtcNow, DefaultMediaType = MediaType.Directory,
+            JobOptions = new JobOptions { TargetDirectory = dest },
+        };
+        var first = await repo.CreateBackupSetAsync(NewSet("first", shared));
+        var second = await repo.CreateBackupSetAsync(NewSet("second", shared));
+        Check(await LithicBackup.ViewModels.MainViewModel.SetSharingBackupFolderAsync(repo, first.Id, first.JobOptions!) == "second"
+              && await LithicBackup.ViewModels.MainViewModel.SetSharingBackupFolderAsync(repo, 0, At(Path.Combine(dir, "free"))) is null,
+            "the set that has a folder is found, and none for a free one");
+
+        // Saved before such sets were refused: Cleanup will not scan their folder.
+        var vm = new OrphanedDirectoriesViewModel(repo, first);
+        vm.ScanCatalogCommand.Execute(null);
+        await WaitFor(() => !vm.IsLoading, 60000);
+        vm.ScanDestinationCommand.Execute(null);
+        await WaitFor(() => vm.IsScanningDestination, 3000);
+        await WaitFor(() => !vm.IsScanningDestination, 60000);
+        Check(vm.DestinationScanStatusText.StartsWith("Not scanned", StringComparison.Ordinal)
+              && !vm.Items.Any(i => i.Reason == OrphanedReason.UntrackedFile),
+            $"Cleanup does not scan a folder another set shares, so offers none of its files (\"{vm.DestinationScanStatusText}\")");
+
+        // Copy: the dialog says so the moment the destination is another set's folder.
+        var copy = new DuplicateBackupSetViewModel("first", shared,
+            dest => new JobOptions { TargetDirectory = dest }.SharesBackupFolderWith(first.JobOptions!) ? "first" : null);
+        Check(copy.IsDestinationInUse && copy.DestinationInUseText.Contains("\"first\"", StringComparison.Ordinal),
+            "the Copy dialog refuses the original's folder, which it starts from");
+        copy.TargetDirectory = Path.Combine(dir, "copy");
+        Check(!copy.IsDestinationInUse && copy.DestinationInUseText.Length == 0, "and accepts a folder of its own");
+        copy.TargetDirectory = "";
+        Check(!copy.IsDestinationInUse, "or none, to choose later");
+        Microsoft.Data.Sqlite.SqliteConnection.ClearAllPools();
     }
 
     /// <summary>

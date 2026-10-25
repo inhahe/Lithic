@@ -1496,9 +1496,39 @@ its subfolder has only the last.
 **Another set's backup folder inside this one is not Cleanup's.** The destination
 scan skips every other set's backup folder that lies strictly inside this set's,
 since their files are in no catalog it reads and would all be offered as
-untracked. Two sets sharing exactly one folder are not handled. Pinned by
-`tools\excess_versions_test` §22, `tools\worker_idle_test` C12-C14 and
-`tools\editor_save_test` §26.
+untracked. Pinned by `tools\excess_versions_test` §22, `tools\worker_idle_test`
+C12-C14 and `tools\editor_save_test` §26.
+
+**A backup folder belongs to one set.** Two sets in one folder would each list the
+other's files as untracked in Cleanup, offered for deletion, and backups of the
+same files would number their versions apart in one tree. So nothing gives a set a
+folder another set already has (`JobOptions.SharesBackupFolderWith`: the same
+volume, by identity when both sets know it and otherwise by drive letter, since
+two drives can hold folders of one name, and the same folder on it; one folder
+inside another is not the same). `MainViewModel.SetSharingBackupFolderAsync` finds
+the owner, and these refuse:
+
+* **the editor**, on every save path, for a new set or a changed folder, but not
+  for an unchanged one, so that two sets saved before the rule can still be
+  edited. At File > Exit, which cannot ask, the edit is dropped and the user told;
+* **Change Destination**, before its confirmation;
+* **Import**, for a set whose folder is already here. The file's volume identity
+  was taken on its old computer, so it is looked up again from the path;
+* **Copy**, in its dialog as soon as the destination names a set's folder, and
+  against the catalog before creating. The copy never carries the original's
+  subfolder, and its old "Backup history" option is gone: it only worked with the
+  original's own folder.
+
+Two sets that already share a folder are not refused anything but Cleanup's
+destination scan, which would offer one set's files as the other's strays.
+
+The editor also stops putting a changed destination back. It used to save the new
+path with the old volume identity, from which the resolver rebuilt the old path at
+the next backup. A destination that differs from the editor's own copy of the
+options is a change, and loses the identity, which is captured again from the new
+path. One that a drive's letter change moved while the editor was open is not a
+change, and keeps it. Pinned by `tools\excess_versions_test` §23 and
+`tools\editor_save_test` §21 and §27.
 
 ## An empty catalog is not an empty destination
 

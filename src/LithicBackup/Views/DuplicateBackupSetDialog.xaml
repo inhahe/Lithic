@@ -61,22 +61,17 @@
                     Cursor="Hand"
                     Command="{Binding BrowseTargetCommand}" />
         </Grid>
-        <TextBlock Text="Leave empty to choose a location later, or change it to back up the same sources elsewhere."
+        <TextBlock Text="{Binding DestinationInUseText}"
+                   Visibility="{Binding IsDestinationInUse, Converter={StaticResource BoolToVis}}"
+                   Foreground="{StaticResource WarningBrush}"
+                   FontSize="11"
+                   TextWrapping="Wrap"
+                   Margin="0,0,0,4" />
+        <TextBlock Text="The copy needs a backup folder of its own, and starts with no backup history. Leave the destination empty to choose one later."
                    Foreground="{StaticResource TextDimBrush}"
                    FontSize="11" FontStyle="Italic"
                    TextWrapping="Wrap"
-                   Margin="0,0,0,16" />
-
-        <CheckBox Content="Backup history (records of files already backed up)"
-                  IsChecked="{Binding CopyBackupHistory}"
-                  IsEnabled="{Binding CanCopyBackupHistory}"
-                  ToolTip="Only available when the destination is unchanged from the source set. Otherwise the new set starts fresh and treats every source file as new on its first run."
-                  Margin="0,0,0,4" />
-        <TextBlock Text="Available only when the destination matches the source set. Without it, the new set re-copies everything on its first run."
-                   Foreground="{StaticResource TextDimBrush}"
-                   FontSize="11" FontStyle="Italic"
-                   TextWrapping="Wrap"
-                   Margin="20,0,0,0" />
+                   Margin="0,0,0,0" />
 
         <!-- Buttons -->
         <StackPanel Orientation="Horizontal" HorizontalAlignment="Right"

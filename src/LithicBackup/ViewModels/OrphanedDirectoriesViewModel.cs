@@ -1746,6 +1746,17 @@ public class OrphanedDirectoriesViewModel : ViewModelBase, IConfirmClose, IDispo
             string root = JobOptions.FolderWithoutDrive(_targetDir);
             foreach (var other in await _catalog.GetAllBackupSetsAsync())
             {
+                // Another set in this very folder - saved before such sets were
+                // refused - would have every one of its files listed as untracked.
+                if (other.Id != _backupSet.Id && other.JobOptions is { } theirs
+                    && _backupSet.JobOptions?.SharesBackupFolderWith(theirs) == true)
+                {
+                    DestinationScanStatusText =
+                        $"Not scanned: {_targetDir} is also the backup folder of \"{other.Name}\", whose files "
+                        + "would all be listed here as untracked. Give one of the two sets a folder of its own "
+                        + "(a new destination, or \"Create subdirectory\") first.";
+                    return;
+                }
                 if (other.Id != _backupSet.Id
                     && other.JobOptions?.BackupRoot() is { } otherRoot
                     && JobOptions.FolderWithoutDrive(otherRoot) is var inner

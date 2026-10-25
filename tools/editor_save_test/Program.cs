@@ -277,6 +277,7 @@ internal static class Program
         await VerifyStartsAsync();
         await RetentionChangeOffersRemovalAsync();
         await RecordsElsewhereRefusedAsync();
+        await SharedBackupFolderAsync();
 #endif
         Check(_dialogs.Unexpected.Count == 0,
             "no unexpected message box appeared"
@@ -819,6 +820,88 @@ internal static class Program
         var moved = (await DbSetAsync()).JobOptions!;
         Check(moved is { CreateSubdirectory: true, SubdirectoryName: "Moved" }, "and the new backup folder is saved");
         _dialogs.ClearExpectations();
+    }
+
+    /// <summary>
+    /// 27: a save may not give a set another set's backup folder, though a set that
+    /// already shares one can still be edited; and a destination changed in the
+    /// editor gets a new volume identity, rather than being put back at the next
+    /// backup by the old one. Runs on the set section 26 left.
+    /// </summary>
+    static async Task SharedBackupFolderAsync()
+    {
+        Console.WriteLine();
+        Console.WriteLine("=== 27. a set's backup folder may not be another set's ===");
+        string theirs = Path.Combine(_root, "other-set-folder");
+        Directory.CreateDirectory(theirs);
+        var other = await _observer.CreateBackupSetAsync(new BackupSet
+        {
+            Name = "the other set", SourceRoots = [], CreatedUtc = DateTime.UtcNow,
+            DefaultMediaType = MediaType.Directory, JobOptions = new JobOptions { TargetDirectory = theirs },
+        });
+
+        // --- the other set's folder is refused ---
+        var ed = await OpenEditorAsync("shared: onto the other set's folder");
+        if (ed is null) return;
+        await Task.Delay(300);
+        ed.Vm.MarkClean();
+        ed.Vm.CreateSubdirectory = false;
+        ed.Vm.TargetDirectory = theirs + @"\";
+        _dialogs.Expect("Backup Folder In Use", DialogWatcher.IDOK);
+        ed.Vm.SaveCommand.Execute(null);
+        Check(await WaitFor(() => _dialogs.WasAnswered("Backup Folder In Use"), 10000),
+            "saving another set's backup folder is refused, and says why");
+        await Task.Delay(500);
+        Check(IsOpen(ed.Window) && (await DbSetAsync()).JobOptions is { CreateSubdirectory: true } stored
+              && !string.Equals(stored.TargetDirectory, theirs, StringComparison.OrdinalIgnoreCase),
+            "the editor stays open, and nothing is saved");
+        _dialogs.ClearExpectations();
+        await EnsureClosedAsync(ed.Window);
+
+        // --- two sets that already share a folder can still be edited ---
+        var mine = (await DbSetAsync()).JobOptions!;
+        other.JobOptions = new JobOptions
+        {
+            TargetDirectory = mine.TargetDirectory, CreateSubdirectory = mine.CreateSubdirectory,
+            SubdirectoryName = mine.SubdirectoryName,
+        };
+        await _observer.UpdateBackupSetAsync(other);
+        ed = await OpenEditorAsync("shared: already shared, renamed");
+        if (ed is null) return;
+        await Task.Delay(300);
+        ed.Vm.MarkClean();
+        ed.Vm.SetName = "editor-save-test (shared)";
+        ed.Vm.SaveCommand.Execute(null);
+        Check(await WaitClosedAsync(ed.Window) && (await DbSetAsync()).Name == "editor-save-test (shared)",
+            "a save that leaves an already shared folder alone goes through (Cleanup refuses such sets)");
+        await EnsureClosedAsync(ed.Window);
+        await _observer.DeleteBackupSetAsync(other.Id);
+
+        // --- a changed destination gets a new volume identity ---
+        var set = await DbSetAsync();
+        var volumes = new LithicBackup.Infrastructure.FileSystem.Win32VolumeResolver();
+        string oldDest = set.JobOptions!.TargetDirectory!;
+        string? volumeId = volumes.GetVolumeId(oldDest);
+        set.JobOptions.DestinationVolumeId = volumeId;
+        set.JobOptions.DestinationSubpath = oldDest[Path.GetPathRoot(oldDest)!.Length..];
+        await _observer.UpdateBackupSetAsync(set);
+        string retyped = Path.Combine(_root, "retyped-destination");
+        Directory.CreateDirectory(retyped);
+        ed = await OpenEditorAsync("shared: retyped destination");
+        if (ed is null) return;
+        await Task.Delay(300);
+        ed.Vm.MarkClean();
+        ed.Vm.CreateSubdirectory = false;
+        ed.Vm.TargetDirectory = retyped;
+        _dialogs.Expect("Change Backup Folder", DialogWatcher.IDYES);   // its files are recorded in the old one
+        ed.Vm.SaveCommand.Execute(null);
+        Check(await WaitClosedAsync(ed.Window, 15000), "the retyped destination is saved");
+        await EnsureClosedAsync(ed.Window);
+        _dialogs.ClearExpectations();
+        var saved = (await DbSetAsync()).JobOptions!;
+        new LithicBackup.Infrastructure.FileSystem.DestinationResolver(volumes).Resolve(saved);
+        Check(volumeId is not null && string.Equals(saved.TargetDirectory, retyped, StringComparison.OrdinalIgnoreCase),
+            $"and the next backup's resolve keeps it, rather than the old volume's path ({saved.TargetDirectory})");
     }
 #endif
 
@@ -1608,8 +1691,19 @@ internal static class Program
         LithicBackup.Services.OpenRequestQueue.DirectoryOverride = q;
         try
         {
+            // Exported with a destination of its own: imported beside the set it
+            // came from, into that set's folder, it is refused (checked below).
             string export = Path.Combine(_root, "shared.lithic");
-            await BackupSetTransfer.ExportAsync(_catalog, set, export, includeHistory: false);
+            var ownFolder = new BackupSet
+            {
+                Name = set.Name, SourceRoots = set.SourceRoots, SourceSelections = set.SourceSelections,
+                DefaultMediaType = set.DefaultMediaType, CreatedUtc = set.CreatedUtc,
+                JobOptions = JsonSerializer.Deserialize<JobOptions>(JsonSerializer.Serialize(set.JobOptions))!,
+            };
+            ownFolder.JobOptions.TargetDirectory = Path.Combine(_root, "imported-elsewhere");
+            ownFolder.JobOptions.DestinationVolumeId = null;
+            ownFolder.JobOptions.DestinationSubpath = null;
+            await BackupSetTransfer.ExportAsync(_catalog, ownFolder, export, includeHistory: false);
             var fromArgs = LithicBackup.Services.OpenRequestQueue.FilesFromArguments(
                 ["--test-mode", export, Path.Combine(_root, "missing.lithic"), Path.Combine(_root, "notes.txt")]);
             Check(fromArgs.Count == 1 && fromArgs[0] == export, "the command line yields just the existing export");
@@ -1651,6 +1745,17 @@ internal static class Program
             _dialogs.ClearExpectations();
             if (added is not null)
                 await _observer.DeleteBackupSetAsync(added.Id);
+
+            // The set exported as it is: imported, it would share its backup folder.
+            string sameFolder = Path.Combine(_root, "same-folder.lithic");
+            await BackupSetTransfer.ExportAsync(_catalog, set, sameFolder, includeHistory: false);
+            _dialogs.Expect("Open Backup Set", DialogWatcher.IDYES);
+            _dialogs.Expect("Import Backup Set", DialogWatcher.IDOK);
+            await _vm.OfferOpenedFilesAsync([sameFolder]);
+            Check(set.JobOptions?.BackupRoot() is not null && await SetCountAsync() == before
+                  && _vm.StatusText.StartsWith("Did not import", StringComparison.Ordinal),
+                $"a set whose backup folder another set already has is not imported (\"{_vm.StatusText}\")");
+            _dialogs.ClearExpectations();
 
             string junk = Path.Combine(_root, "junk.lithic");
             File.WriteAllText(junk, "not an export");

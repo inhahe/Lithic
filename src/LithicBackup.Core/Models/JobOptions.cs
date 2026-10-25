@@ -113,6 +113,26 @@ public class JobOptions
            && string.Equals(FolderWithoutDrive(a), FolderWithoutDrive(b), StringComparison.OrdinalIgnoreCase);
 
     /// <summary>
+    /// Whether this set's backup folder is <paramref name="other"/>'s. Two sets
+    /// may not share one: each set's Cleanup would list the other's files as
+    /// untracked, for deletion, and backups of the same files would number their
+    /// versions apart in one tree. The same volume - by its identity when both
+    /// sets know it, otherwise by drive letter, since two drives can hold folders
+    /// of the same name - and the same folder on it. A folder inside another's is
+    /// not the same folder (Cleanup leaves it alone).
+    /// </summary>
+    public bool SharesBackupFolderWith(JobOptions other)
+    {
+        if (BackupRoot() is not { } mine || other.BackupRoot() is not { } theirs)
+            return false;
+        if (!string.IsNullOrEmpty(DestinationVolumeId) && !string.IsNullOrEmpty(other.DestinationVolumeId))
+            return string.Equals(DestinationVolumeId, other.DestinationVolumeId, StringComparison.OrdinalIgnoreCase)
+                   && SameFolderOnAnyDrive(mine, theirs);
+        static string Full(string p) => p.Replace('/', '\\').TrimEnd('\\');
+        return string.Equals(Full(mine), Full(theirs), StringComparison.OrdinalIgnoreCase);
+    }
+
+    /// <summary>
     /// A folder path without its first two characters - the drive ("X:"), or a
     /// UNC path's leading "\\" - with '/' read as '\' and no trailing separator.
     /// </summary>
