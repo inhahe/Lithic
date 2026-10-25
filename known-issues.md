@@ -103,14 +103,17 @@ The editor saved the new path with the old volume identity, and the resolver,
 which rebuilds the path from the identity, wrote the old path back. Found while
 building the shared-folder check, which needs each set's real folder.
 
-**Open: the Sqlite package floats.** `LithicBackup.Infrastructure` references
-`Microsoft.Data.Sqlite` as `8.*`, so each restore can pick a different patch. On
-2026-10-25 a restore picked 8.0.33 while NuGet's cached listing of
-`Microsoft.Data.Sqlite.Core` stopped at 8.0.32, and silently resolved Core 9.0.0
-under it (warning NU1603 only), in the product and in the harnesses. Clearing the
-HTTP cache (`dotnet nuget locals http-cache --clear`) and restoring again fixed
-it. The proper fix is to pin exact versions, or to commit lock files
-(`RestorePackagesWithLockFile`), so that a release build cannot drift.
+**FIXED (in 1.19.0, with the move to .NET 10): the Sqlite package could change
+major version under a build.** `LithicBackup.Infrastructure` referenced
+`Microsoft.Data.Sqlite` as `8.*`. On 2026-10-25 a restore picked 8.0.33 while
+NuGet's cached listing of `Microsoft.Data.Sqlite.Core` stopped at 8.0.32, and
+silently resolved Core 9.0.0 under it (warning NU1603 only), in the product and in
+the harnesses. Every package now floats within its .NET 10 servicing line only
+(`10.0.*`), so it still takes bug fixes. `Microsoft.Data.Sqlite.Core` is
+referenced directly, so that range governs it, not the outer package's open-ended
+">=". NU1603 is an error in every project (the root `Directory.Build.props`).
+If a stale listing trips it, clear the cache (`dotnet nuget locals http-cache
+--clear`) and restore again.
 
 ## FIXED: every full backup read the whole set to find its earlier versions (2026-10-25)
 

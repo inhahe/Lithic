@@ -31,21 +31,20 @@ internal static class WorkerServiceHelper
         if (File.Exists(sameDir))
             return sameDir;
 
-        // Development: sibling project output.
-        var devPath = Path.GetFullPath(
-            Path.Combine(appDir, "..", "..", "..", "..",
-                "LithicBackup.Worker", "bin", "Debug", "net8.0-windows",
-                "LithicBackup.Worker.exe"));
-        if (File.Exists(devPath))
-            return devPath;
-
-        // Release build.
-        var relPath = Path.GetFullPath(
-            Path.Combine(appDir, "..", "..", "..", "..",
-                "LithicBackup.Worker", "bin", "Release", "net8.0-windows",
-                "LithicBackup.Worker.exe"));
-        if (File.Exists(relPath))
-            return relPath;
+        // Development: the Worker project's output beside this one's
+        // (bin\<configuration>\<target framework>\), Debug before Release. The
+        // target framework folder is the one this app runs from, so it follows
+        // the projects when they move to another .NET.
+        string targetFramework = new DirectoryInfo(Path.TrimEndingDirectorySeparator(appDir)).Name;
+        foreach (string configuration in (string[])["Debug", "Release"])
+        {
+            var devPath = Path.GetFullPath(
+                Path.Combine(appDir, "..", "..", "..", "..",
+                    "LithicBackup.Worker", "bin", configuration, targetFramework,
+                    "LithicBackup.Worker.exe"));
+            if (File.Exists(devPath))
+                return devPath;
+        }
 
         return null;
     }

@@ -34,4 +34,8 @@
     <SatelliteResourceLanguages>en</SatelliteResourceLanguages>
   </PropertyGroup>
 
+  <!-- The repository's settings for every project (MSBuild stops at the nearest
+       Directory.Build.props, so this one has to bring the next one up in). -->
+  <Import Project="$([MSBuild]::GetPathOfFileAbove('Directory.Build.props', '$(MSBuildThisFileDirectory)../'))" />
+
 </Project>

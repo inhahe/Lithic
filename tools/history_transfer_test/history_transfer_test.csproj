@@ -4,7 +4,7 @@
     <OutputType>Exe</OutputType>
     <!-- Never stamp the shipping version onto a harness (see design.md). -->
     <ImportDirectoryBuildProps>false</ImportDirectoryBuildProps>
-    <TargetFramework>net8.0-windows</TargetFramework>
+    <TargetFramework>net10.0-windows</TargetFramework>
     <ImplicitUsings>enable</ImplicitUsings>
     <Nullable>enable</Nullable>
     <AssemblyName>history_transfer_test</AssemblyName>

@@ -23,6 +23,16 @@ LithicBackup.sln
 `src\` inherits; `installer\build-installer.ps1` reads the same value, so the MSI
 `ProductVersion` cannot drift from the assembly version. See `CLAUDE.md`.
 
+Every project targets .NET 10 (`net10.0-windows`), as do the harnesses under
+`tools\`. The installer's custom action alone targets .NET Framework 4.7.2, which
+Windows Installer hosts (`installer\CustomActions`). The MSI publishes the app
+self-contained, so users need no .NET runtime. Packages float within their .NET 10
+servicing line (`10.0.*`), with `Microsoft.Data.Sqlite.Core` referenced directly so
+that range governs it. The root `Directory.Build.props`, which `src\`'s imports,
+makes NU1603 an error everywhere: a restore that cannot get the versions asked for
+fails rather than taking another major version (known-issues.md, "the Sqlite package
+could change major version").
+
 `tools\` holds stand-alone console harnesses (this project has no unit-test
 project — measurement and verification live there). Each sets
 `ImportDirectoryBuildProps=false` so it never stamps the shipping version onto

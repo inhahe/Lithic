@@ -3,7 +3,7 @@
   <PropertyGroup>
     <!-- Console subsystem on purpose: the harness reports numbers on stdout. -->
     <OutputType>Exe</OutputType>
-    <TargetFramework>net8.0-windows</TargetFramework>
+    <TargetFramework>net10.0-windows</TargetFramework>
     <UseWPF>true</UseWPF>
     <Nullable>disable</Nullable>
     <LangVersion>latest</LangVersion>

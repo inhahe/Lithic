@@ -289,7 +289,7 @@ upgrades in place — your backup sets, catalog, and settings (in
 - Optical drive (for disc backups only)
 
 The MSI is self-contained, so end users do **not** need the .NET runtime
-installed. Building from source requires the .NET 8.0 SDK.
+installed. Building from source requires the .NET 10 SDK.
 
 ## Building
 
