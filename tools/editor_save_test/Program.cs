@@ -1741,7 +1741,7 @@ internal static class Program
         Untick(lf.Value.Vm, _bigFile);
         await Task.Delay(300);
         Check(_counter.Writes == w0, $"unticking a file wrote nothing (writes: {_counter.Writes - w0})");
-        Check(BackupJobViewModel.ParseExclusionPatterns(ed.Vm.ExcludedExtensions)
+        Check(MainViewModel.ParseExclusionPatterns(ed.Vm.ExcludedExtensions)
                   .Contains(_bigFile, StringComparer.OrdinalIgnoreCase),
             "the file appears in the editor's own exclusion list");
 
@@ -2057,7 +2057,7 @@ internal static class Program
             "re-including removes it, case-insensitively, leaving the rest");
         Check(ReferenceEquals(MainViewModel.ApplyExclusionToggle("*.log", @"C:\zzz", false), "*.log"),
             "re-including something not listed changes nothing");
-        Check(BackupJobViewModel.ParseExclusionPatterns(
+        Check(MainViewModel.ParseExclusionPatterns(
                   MainViewModel.ApplyExclusionToggle("*.log\r\n*.tmp", @"C:\d\*", true))
               .SequenceEqual(["*.log", "*.tmp", @"C:\d\*"]),
             "appends to a CRLF list without losing entries");

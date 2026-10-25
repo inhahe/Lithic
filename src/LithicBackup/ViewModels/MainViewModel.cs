@@ -570,7 +570,7 @@ public class MainViewModel : ViewModelBase
     /// </summary>
     internal static string ApplyExclusionToggle(string patternsText, string pattern, bool excluded)
     {
-        var list = BackupJobViewModel.ParseExclusionPatterns(patternsText);
+        var list = ParseExclusionPatterns(patternsText);
         bool present = list.Contains(pattern, StringComparer.OrdinalIgnoreCase);
 
         if (excluded == present)
@@ -581,8 +581,27 @@ public class MainViewModel : ViewModelBase
         else
             list.RemoveAll(p => string.Equals(p, pattern, StringComparison.OrdinalIgnoreCase));
 
-        return BackupJobViewModel.FormatExclusionPatterns(list);
+        return FormatExclusionPatterns(list);
     }
+
+    /// <summary>
+    /// The editor's exclusion text (one pattern per line) as the list the set
+    /// stores: split on line breaks only - commas and semicolons are valid in
+    /// Windows file names, so in patterns - trimmed, blanks and repeats dropped.
+    /// </summary>
+    internal static List<string> ParseExclusionPatterns(string input)
+    {
+        if (string.IsNullOrWhiteSpace(input))
+            return [];
+
+        return input
+            .Split(['\r', '\n'], StringSplitOptions.RemoveEmptyEntries | StringSplitOptions.TrimEntries)
+            .Distinct(StringComparer.OrdinalIgnoreCase)
+            .ToList();
+    }
+
+    /// <summary>A set's exclusion list as the editor's text, one pattern per line.</summary>
+    internal static string FormatExclusionPatterns(List<string> patterns) => string.Join("\n", patterns);
 
     private async void StartEditFlow()
     {
@@ -4307,7 +4326,7 @@ public class MainViewModel : ViewModelBase
             vm.BlockSizeKb = (opts.DeduplicationBlockSize / 1024).ToString();
 
         // Excluded-from-backup glob patterns (set level).
-        vm.ExcludedExtensions = BackupJobViewModel.FormatExclusionPatterns(opts.ExcludedExtensions);
+        vm.ExcludedExtensions = FormatExclusionPatterns(opts.ExcludedExtensions);
 
         // Retention tier sets.
         if (opts.TierSets.Count > 0)
@@ -4455,7 +4474,7 @@ public class MainViewModel : ViewModelBase
             opts.DeduplicationBlockSize = blockKb * 1024;
 
         // Excluded-from-backup glob patterns (set level).
-        opts.ExcludedExtensions = BackupJobViewModel.ParseExclusionPatterns(vm.ExcludedExtensions);
+        opts.ExcludedExtensions = ParseExclusionPatterns(vm.ExcludedExtensions);
 
         // Tier sets.
         opts.TierSets = vm.TierSets.Select(ts => ts.ToModel()).ToList();
@@ -4646,28 +4665,6 @@ public class MainViewModel : ViewModelBase
         }
         catch { /* can't check — let it proceed */ }
         return true;
-    }
-
-    /// <summary>
-    /// Entry point for the new-set / edit-dialog flow, where planning is done by
-    /// a <see cref="BackupJobViewModel"/> rather than the inline scan phase. The
-    /// set has already been saved (so its row exists in <see cref="BackupSets"/>);
-    /// we resolve that row, mark it running, and hand off to <see cref="StartBurn"/>.
-    /// </summary>
-    private void StartBurnForSavedSet(BackupPlan plan, int? backupSetId)
-    {
-        var row = backupSetId.HasValue ? RowFor(backupSetId.Value) : null;
-        if (row is null)
-        {
-            StatusText = "Unable to locate the saved backup set to run.";
-            return;
-        }
-        if (row.IsRunning)
-            return;
-
-        row.Progress = null;
-        row.IsRunning = true;
-        StartBurn(row, plan);
     }
 
     private void StartBurn(BackupSetRowViewModel row, BackupPlan plan)
