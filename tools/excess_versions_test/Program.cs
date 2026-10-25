@@ -290,6 +290,84 @@ internal static class Program
         await GuardedRetireAsync(root);
         await PreviousVersionsIndexAsync(root);
         TierWalk();
+        await CleanupInSubfolderAsync(root);
+    }
+
+    /// <summary>
+    /// §21. With "create subdirectory", Cleanup works in the subfolder, where the
+    /// set's backup lives. It used the destination itself: it looked for, and
+    /// deleted, the set's stored files there - another set's copies, when one
+    /// backs up to that folder - and missed the set's own.
+    /// </summary>
+    static async Task CleanupInSubfolderAsync(string root)
+    {
+        Console.WriteLine();
+        Console.WriteLine("=== 21. Cleanup works in the backup's subfolder, and never beside it ===");
+        string source = Path.Combine(root, "src21"), dest = Path.Combine(root, "dst21");
+        string sub = Path.Combine(dest, "SetA");
+        Directory.CreateDirectory(source);
+        Directory.CreateDirectory(Path.Combine(root, "cat21"));
+        using var repo = new SqliteCatalogRepository(Path.Combine(root, "cat21", "catalog.db"));
+        var svc = new DirectoryBackupService(repo, new FileScanner(repo), new VersionRetentionService(repo));
+        List<SourceSelection> Sel() =>
+            [new SourceSelection { Path = source, IsDirectory = true, IsSelected = true, AutoIncludeNewSubdirectories = true }];
+        var keepAll = new VersionTierSet { Name = "Default", Tiers = [new() { MaxAge = null, MaxVersions = null }] };
+        var set = await repo.CreateBackupSetAsync(new BackupSet
+        {
+            Name = "subfolder", SourceRoots = [source], SourceSelections = Sel(),
+            CreatedUtc = DateTime.UtcNow, DefaultMediaType = MediaType.Directory,
+            JobOptions = new JobOptions
+            {
+                TargetDirectory = dest, CreateSubdirectory = true, SubdirectoryName = "SetA",
+                TierSets = [keepAll], RetentionTiers = keepAll.Tiers,
+            },
+        });
+        string root21 = set.JobOptions!.BackupRoot()!;
+        Check(string.Equals(root21, sub, StringComparison.OrdinalIgnoreCase), $"BackupRoot is the subfolder ({root21})");
+
+        string file = Path.Combine(source, "x.txt");
+        string rel = file[Path.GetPathRoot(file)!.Length..];
+        string drive = file[..1];
+        for (int v = 1; v <= 3; v++)
+        {
+            await File.WriteAllTextAsync(file, $"x, version {v}" + new string('.', v));
+            var r = await svc.ExecuteAsync(new BackupJob
+            {
+                BackupSetId = set.Id, Sources = Sel(), TargetDirectory = sub, ZipMode = ZipMode.None,
+                TierSets = [keepAll], RetentionTiers = keepAll.Tiers,
+            }, sub, keepAll.Tiers, null, CancellationToken.None);
+            if (!r.Success) throw new Exception("backup failed");
+        }
+        string v1 = Path.Combine(sub, drive + "_prev", rel + ".v1");
+        // Another set's copy at the same relative path, directly in the destination.
+        string decoy = Path.Combine(dest, drive + "_prev", rel + ".v1");
+        Directory.CreateDirectory(Path.GetDirectoryName(decoy)!);
+        await File.WriteAllTextAsync(decoy, "another set's version");
+        Check(File.Exists(v1), "set-up: x.txt.v1 is in the subfolder");
+
+        var s = (await repo.GetBackupSetAsync(set.Id))!;
+        var keepOne = new VersionTierSet { Name = "Default", Tiers = [new() { MaxAge = null, MaxVersions = 1 }] };
+        s.JobOptions!.TierSets = [keepOne];
+        s.JobOptions.RetentionTiers = keepOne.Tiers;
+        await repo.UpdateBackupSetAsync(s);
+
+        var vm = new OrphanedDirectoriesViewModel(repo, s);
+        Check(!vm.IsDestinationUnavailable, "Cleanup finds the backup's folder");
+        vm.ScanCatalogCommand.Execute(null);
+        await WaitFor(() => !vm.IsLoading && vm.Categories.Count > 0, 60000);
+        bool listed = vm.Items.Any(i => i.Reason == OrphanedReason.ExcessVersion);
+        Check(listed, "x.txt's older earlier version is excess under keep-1");
+        if (!listed) return;
+        foreach (var c in vm.Categories)
+            foreach (var n in c.RootNodes)
+                n.IsChecked = c.Reason == OrphanedReason.ExcessVersion;
+        vm.PurgeSelectedCommand.Execute(null);
+        await WaitFor(() => vm.IsPurging, 3000);
+        await WaitFor(() => !vm.IsPurging, 60000);
+        Check(!File.Exists(v1), $"the purge deletes it in the subfolder (\"{vm.SummaryText}\")");
+        Check(File.Exists(decoy) && File.ReadAllText(decoy) == "another set's version",
+            "and never the file at the same path directly in the destination");
+        Microsoft.Data.Sqlite.SqliteConnection.ClearAllPools();
     }
 
     /// <summary>

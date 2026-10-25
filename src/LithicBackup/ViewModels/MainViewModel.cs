@@ -1095,10 +1095,8 @@ public class MainViewModel : ViewModelBase
                 }
             }
 
-            string? dir = sourceSelection.TargetDirectory;
-            if (sourceSelection.CreateSubdirectory
-                && !string.IsNullOrWhiteSpace(sourceSelection.SubdirectoryName))
-                dir = Path.Combine(dir!, sourceSelection.SubdirectoryName.Trim());
+            string? dir = JobOptions.BackupRootFor(sourceSelection.TargetDirectory,
+                sourceSelection.CreateSubdirectory, sourceSelection.SubdirectoryName);
 
             if (string.IsNullOrWhiteSpace(dir) || !Directory.Exists(dir))
             {
@@ -1946,7 +1944,7 @@ public class MainViewModel : ViewModelBase
             return;
         }
 
-        string? targetDir = backupSet.JobOptions?.TargetDirectory;
+        string? targetDir = backupSet.JobOptions?.BackupRoot();
 
         // Refuse if the set HAS a destination but it isn't reachable. Marking the
         // catalog without deleting the files would free nothing and would drop the
@@ -2590,6 +2588,11 @@ public class MainViewModel : ViewModelBase
 
         try
         {
+            // A disc is labelled with the folder its run wrote to: the backup's
+            // own folder (BackupRoot), or for a set with the "create subdirectory"
+            // option backed up by an older Worker, the destination itself.
+            string? oldRoot = backupSet.JobOptions.BackupRoot();
+
             // Update the saved job options. The new path may live on a
             // different volume, so discard the old volume identity and let the
             // resolver re-capture it for the new path (the resolver's backfill
@@ -2602,12 +2605,17 @@ public class MainViewModel : ViewModelBase
             await _catalog.UpdateBackupSetMetadataAsync(backupSet);
 
             // Update disc record labels so they reflect the new path.
+            string? newRoot = backupSet.JobOptions.BackupRoot();
             var discs = await _catalog.GetDiscsForBackupSetAsync(backupSet.Id);
             foreach (var disc in discs)
             {
-                if (string.Equals(disc.Label, oldPath, StringComparison.OrdinalIgnoreCase))
+                string? relabel =
+                    string.Equals(disc.Label, oldRoot, StringComparison.OrdinalIgnoreCase) ? newRoot
+                    : string.Equals(disc.Label, oldPath, StringComparison.OrdinalIgnoreCase) ? newPath
+                    : null;
+                if (relabel is not null)
                 {
-                    disc.Label = newPath;
+                    disc.Label = relabel;
                     await _catalog.UpdateDiscAsync(disc);
                 }
             }
@@ -3145,10 +3153,7 @@ public class MainViewModel : ViewModelBase
     /// </remarks>
     private BackupJob BuildJob(BackupSet backupSet, JobOptions opts, List<SourceSelection> sources)
     {
-        string? targetDir = opts.TargetDirectory;
-        if (targetDir is not null && opts.CreateSubdirectory
-            && !string.IsNullOrWhiteSpace(opts.SubdirectoryName))
-            targetDir = Path.Combine(targetDir, opts.SubdirectoryName.Trim());
+        string? targetDir = opts.BackupRoot();
 
         if (_machineSettings.Refresh())
             StatusText = $"The backup settings in {MachineSettings.DefaultPath} could not be read; "

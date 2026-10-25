@@ -25,6 +25,7 @@
 //      C5 a full backup that throws is not started again at once;
 //      C8 while the app works on a set, the Worker starts no run on it, stops
 //         one that is going, and carries on after.
+//      C11 with "create subdirectory", the Worker backs up into the subfolder.
 //
 // Build with -p:OldCode=true to compile only what also builds against the code
 // before the change (A2 and C), and watch it fail there.
@@ -831,6 +832,41 @@ async Task PartC()
         Check(refused && rig.Log.Count("Starting backup for") == 0, "C10 a set with no history over a destination holding its backup is refused");
         Check(held, "C10 and held, so the app shows its automated backups as paused");
         Check(File.ReadAllText(Path.Combine(copy, "a.txt")) == "an older backup of it", "C10 nothing was copied over the backup");
+        await rig.DisposeAsync();
+    }
+
+    // C11 -------------------------------------------------------------------
+    // With "create subdirectory", the Worker backs up into the subfolder, as the
+    // app always did. It used the destination itself, so one set's catalog held
+    // copies in two trees, and Cleanup, which also looked in the destination
+    // itself, could delete another set's files there.
+    {
+        string dir = Path.Combine(root, "c11");
+        string src = Path.Combine(dir, "src");
+        string dst = Path.Combine(dir, "dst");
+        Directory.CreateDirectory(src);
+        Directory.CreateDirectory(dst);
+        File.WriteAllText(Path.Combine(src, "one.txt"), "one");
+        string drive = char.ToUpperInvariant(src[0]).ToString();
+        string inSub = Path.Combine(dst, "Sub", drive, src.Substring(3));
+        string inDst = Path.Combine(dst, drive, src.Substring(3));
+
+        var rig = await Rig.CreateAsync(Path.Combine(dir, "catalog.db"), stampedSetIds, set =>
+        {
+            set.SourceSelections = [ new SourceSelection { Path = src, IsDirectory = true, IsSelected = true, AutoIncludeNewSubdirectories = true } ];
+            set.SourceRoots = [src];
+            set.JobOptions!.TargetDirectory = dst;
+            set.JobOptions.CreateSubdirectory = true;
+            set.JobOptions.SubdirectoryName = "Sub";
+        });
+        rig.Destination.Connected = true;
+        await rig.Worker.StartAsync(CancellationToken.None);
+        bool scanned = await WaitUntil(() => File.Exists(Path.Combine(inSub, "one.txt")), TimeSpan.FromSeconds(60));
+        Check(scanned, "C11 the Worker's full backup writes into the subfolder");
+        File.WriteAllText(Path.Combine(src, "two.txt"), "two");
+        bool continuous = await WaitUntil(() => File.Exists(Path.Combine(inSub, "two.txt")), TimeSpan.FromSeconds(60));
+        Check(continuous, "C11 and so does its continuous backup");
+        Check(!Directory.Exists(inDst), "C11 nothing is written beside the subfolder");
         await rig.DisposeAsync();
     }
 #endif

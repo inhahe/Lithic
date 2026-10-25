@@ -1416,6 +1416,33 @@ not, for months. **When adding an operation that pairs a catalog write with a
 destination write, the guard goes at the top of the operation, not inside the
 destination half.**
 
+## A set's backup lives in one folder, and only `BackupRoot` names it
+
+With "Create subdirectory" a set's backup lives in `Destination\Subfolder`; its
+records' `DiscPath`s are relative to that folder, and each disc record is
+labelled with it. `JobOptions.BackupRoot(livePath)` (and `BackupRootFor`, for an
+editor's unsaved fields) is the one place that combines the two. It used to be
+done by hand at each site, and three got it wrong by using the destination
+itself:
+
+* **the Worker** (`ResolveDestinationAsync`): its scheduled and continuous runs
+  wrote into the destination itself while the app's wrote into the subfolder, so
+  one set's catalog held copies in two trees;
+* **Cleanup**: it scanned the destination itself and deleted there - the set's own
+  stored files were missed, and another set backing up to that folder could lose
+  copies at matching paths;
+* **the removal of dropped sources** after an edit, likewise.
+
+A data-loss bug that needed only a non-default checkbox and two sets sharing a
+destination. Cleanup's availability check uses the backup folder too: until the
+first backup makes it, nothing can be there to clean, and refusing is the safe
+answer. Connection is still judged on the destination (the resolver's), since the
+subfolder does not exist before the first run. Change Destination relabels discs
+labelled with the old backup folder and, for Worker runs before the fix, with the
+old destination itself. Pinned by `tools\excess_versions_test` §21 (Cleanup
+deletes in the subfolder and never the same path beside it) and
+`tools\worker_idle_test` C11.
+
 ## An empty catalog is not an empty destination
 
 The engine numbers a file's versions from the catalog (`GetLastVersionAsync`,

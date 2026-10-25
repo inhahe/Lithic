@@ -120,7 +120,7 @@ public class OrphanedDirectoriesViewModel : ViewModelBase, IConfirmClose, IDispo
     {
         _catalog = catalog;
         _backupSet = backupSet;
-        _targetDir = backupSet.JobOptions?.TargetDirectory;
+        _targetDir = backupSet.JobOptions?.BackupRoot();
         _reconcile = new CatalogReconcileService(catalog);
         RefreshDestinationAvailability();
 

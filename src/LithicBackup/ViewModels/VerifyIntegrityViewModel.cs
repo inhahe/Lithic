@@ -276,8 +276,8 @@ public class VerifyIntegrityViewModel : ViewModelBase, IDisposable
         try
         {
             var opts = _backupSet.JobOptions;
-            string? targetDir = opts?.TargetDirectory;
-            if (string.IsNullOrWhiteSpace(targetDir))
+            string? effectiveTargetDir = opts?.BackupRoot();
+            if (opts is null || effectiveTargetDir is null)
             {
                 SummaryText = "Integrity verification is available for directory-mode "
                     + "backups only. To verify an optical backup, use Restore and insert "
@@ -286,10 +286,6 @@ public class VerifyIntegrityViewModel : ViewModelBase, IDisposable
                 return;
             }
 
-            // Mirror the effective target dir resolution used by backups.
-            string effectiveTargetDir = targetDir!;
-            if (opts!.CreateSubdirectory && !string.IsNullOrWhiteSpace(opts.SubdirectoryName))
-                effectiveTargetDir = Path.Combine(effectiveTargetDir, opts.SubdirectoryName.Trim());
             _verifiedTargetDir = effectiveTargetDir;
 
             // Build the source selection tree (fall back to legacy SourceRoots).

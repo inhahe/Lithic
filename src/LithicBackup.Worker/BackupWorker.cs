@@ -176,9 +176,11 @@ public sealed class BackupWorker : BackgroundService
     /// <summary>
     /// Resolve a set's destination to a live path, following any drive-letter
     /// reassignment, backfilling/persisting the volume identity when it
-    /// changes, and logging a letter move.  Returns the live target directory,
-    /// or <c>null</c> when the destination volume is not currently connected
-    /// (the caller should skip the run).
+    /// changes, and logging a letter move.  Returns the folder the set's backup
+    /// lives in there (<see cref="JobOptions.BackupRoot"/>: with the "create
+    /// subdirectory" option, the subfolder, where the app backs up too), or
+    /// <c>null</c> when the destination volume is not currently connected (the
+    /// caller should skip the run).
     /// </summary>
     /// <remarks>
     /// A missing destination blocks the set's runs until the next poll
@@ -224,7 +226,9 @@ public sealed class BackupWorker : BackgroundService
                 set.Name, resolution.PreviousPath, resolution.LivePath);
         }
 
-        return resolution.LivePath;
+        // Connected is judged on the destination itself: the subfolder does not
+        // exist until the first backup makes it.
+        return resolution.LivePath is { } live ? set.JobOptions!.BackupRoot(live) : null;
     }
 
     /// <summary>

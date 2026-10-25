@@ -865,15 +865,14 @@ public class RestoreService : IRestoreService
         {
             var set = await _catalog.GetBackupSetAsync(disc.BackupSetId, ct);
             var opts = set?.JobOptions;
-            current = opts?.TargetDirectory;
             // The stored path is where the destination was when a backup last
             // ran; a set imported where its drive has another letter keeps the old
             // computer's until one does. Follow the volume instead. Nothing is
             // saved: restore only reads, and the next backup records the move.
-            if (opts is not null && _destinationResolver?.Resolve(opts) is { IsConnected: true, LivePath: { } live })
-                current = live;
-            if (current is not null && opts!.CreateSubdirectory && !string.IsNullOrWhiteSpace(opts.SubdirectoryName))
-                current = Path.Combine(current, opts.SubdirectoryName.Trim());
+            string? live = opts is not null
+                && _destinationResolver?.Resolve(opts) is { IsConnected: true, LivePath: { } found }
+                ? found : null;
+            current = opts?.BackupRoot(live);
             currentDestinations[disc.BackupSetId] = current;
         }
 

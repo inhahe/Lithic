@@ -83,13 +83,18 @@ public class JobOptions
     /// </param>
     /// <returns>Null when the set has no destination (a disc set).</returns>
     public string? BackupRoot(string? destination = null)
+        => BackupRootFor(destination ?? TargetDirectory, CreateSubdirectory, SubdirectoryName);
+
+    /// <summary>
+    /// <see cref="BackupRoot"/> from values not yet saved (an editor's fields).
+    /// </summary>
+    public static string? BackupRootFor(string? destination, bool createSubdirectory, string? subdirectoryName)
     {
-        string? root = destination ?? TargetDirectory;
-        if (string.IsNullOrWhiteSpace(root))
+        if (string.IsNullOrWhiteSpace(destination))
             return null;
-        return CreateSubdirectory && !string.IsNullOrWhiteSpace(SubdirectoryName)
-            ? System.IO.Path.Combine(root, SubdirectoryName.Trim())
-            : root;
+        return createSubdirectory && !string.IsNullOrWhiteSpace(subdirectoryName)
+            ? System.IO.Path.Combine(destination, subdirectoryName.Trim())
+            : destination;
     }
 
     /// <summary>

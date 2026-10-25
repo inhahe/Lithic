@@ -410,11 +410,8 @@ public class BackupCoverageViewModel : ViewModelBase, IDisposable
         var opts = _backupSet.JobOptions;
         if (opts?.TargetDirectory is null) return;
 
-        // Effective target dir (mirrors the backup path's subdirectory handling)
-        // so block-level dedup resolves the correct _blocks store.
-        string targetDir = opts.TargetDirectory;
-        if (opts.CreateSubdirectory && !string.IsNullOrWhiteSpace(opts.SubdirectoryName))
-            targetDir = System.IO.Path.Combine(targetDir, opts.SubdirectoryName.Trim());
+        // The backup's own folder, so block-level dedup resolves the right _blocks store.
+        string targetDir = opts.BackupRoot()!;
 
         var job = new BackupJob
         {

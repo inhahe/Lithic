@@ -1,5 +1,30 @@
 # LithicBackup — Known Issues & Tech Debt
 
+## FIXED: with "Create subdirectory", the Worker and Cleanup used the folder above it (2026-10-25)
+
+A set with "Create subdirectory" keeps its backup in `Destination\Subfolder`, and
+backups started in the app, seeding, Verify, Coverage and Restore all used that
+folder. The Worker's scheduled and continuous runs, Cleanup, and the removal of
+dropped sources after an edit used the destination itself. So the Worker wrote a
+second tree beside the app's under one catalog, and Cleanup missed the set's own
+files while deleting whatever sat at the same relative paths in the destination
+- another set's copies, if one backed up there. Found while building the editor's
+retention offer; none of the author's sets uses the option. All of them now go
+through `JobOptions.BackupRoot`. Pinned by `tools\excess_versions_test` §21 and
+`tools\worker_idle_test` C11, each failing with its half of the fix reverted.
+
+**Open:** a set that used the option and was backed up by the Worker before the
+fix keeps those copies in the destination itself: their records still restore
+(each disc record names the folder it was written to), but they are outside the
+backup folder, so Cleanup's destination scan does not see them, and a file the
+Worker wrote there gets its next version in the subfolder without its copy being
+moved to the history. Clearing the set's history and seeding from the subfolder,
+then deleting the stray tree by hand, is the clean way out.
+
+**Also noticed:** `BackupJobViewModel` (the old new-set wizard) is never
+constructed; only its two static exclusion-pattern helpers are used. Its view
+(`BackupJobView.xaml`) and template can go, with the helpers moved.
+
 ## FIXED: every full backup read the whole set to find its earlier versions (2026-10-25)
 
 The retention pass at the end of each full backup loaded every record of the
