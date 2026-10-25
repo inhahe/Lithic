@@ -519,6 +519,11 @@ internal static class Program
         async Task<HashSet<string>> LiveDiscPaths() => (await _observer.GetActivePreviousVersionsAsync(_setId))
             .Select(r => Path.Combine(dst, r.DiscPath)).ToHashSet(StringComparer.OrdinalIgnoreCase);
 
+        // An empty folder elsewhere in the backup, which a removal of one file's
+        // version has no business sweeping away.
+        string unrelatedEmpty = Path.Combine(dst, "unrelated-empty-folder");
+        Directory.CreateDirectory(unrelatedEmpty);
+
         // --- keep every version -> keep 1: small.txt's older earlier version goes ---
         var ed = await OpenEditorAsync("retention: keep 1");
         if (ed is null) return;
@@ -549,6 +554,7 @@ internal static class Program
             "its record is retired, and only its");
         Check(row.LastResultText.StartsWith("Removed 1 earlier version: deleted 1 file", StringComparison.Ordinal),
             $"the row says what was removed (\"{row.LastResultText}\")");
+        Check(Directory.Exists(unrelatedEmpty), "and sweeps no empty folder but the deleted file's own");
         await EnsureClosedAsync(ed.Window);
 
         // --- empty Default, then decline: nothing is removed ---
@@ -597,6 +603,72 @@ internal static class Program
         if (OpenReview() is { } stray)
             stray.DialogResult = false;
         await EnsureClosedAsync(ed.Window);
+
+        // Change Default's tiers in a fresh editor, and save.
+        async Task<bool> SaveDefaultTiers(string label, string? maxVersions, Action? beforeSave = null)
+        {
+            var e = await OpenEditorAsync(label);
+            if (e is null) return false;
+            var d = DefaultOf(e)!;
+            e.Vm.SelectedTierSet = d;
+            await Task.Delay(300);
+            e.Vm.MarkClean();
+            foreach (var tier in d.Tiers.ToList())
+                tier.RemoveCommand.Execute(null);
+            if (maxVersions is not null)
+            {
+                e.Vm.AddRetentionTierCommand.Execute(null);
+                d.Tiers[0].MaxVersions = maxVersions;
+            }
+            beforeSave?.Invoke();
+            e.Vm.SaveCommand.Execute(null);
+            bool closed = await WaitClosedAsync(e.Window);
+            await EnsureClosedAsync(e.Window);
+            return closed;
+        }
+
+        // --- a scan that fails says so, and the app carries on ---
+        _counter.FailOn = nameof(ICatalogRepository.GetActivePreviousVersionsAsync);
+        try
+        {
+            Check(await SaveDefaultTiers("retention: scan fails", "1"), "Save closes the editor");
+            Check(await WaitFor(() => _vm.StatusText.StartsWith("Could not look for", StringComparison.Ordinal), 10000),
+                $"a scan that fails says so on the status bar (\"{_vm.StatusText}\")");
+            Check(OpenReview() is null, "and offers nothing");
+        }
+        finally
+        {
+            _counter.FailOn = null;
+        }
+
+        // --- nothing is offered while the set is busy ---
+        Check(await SaveDefaultTiers("retention: busy", "2", beforeSave: () => row.IsRunning = true),
+            "Save closes the editor");
+        try
+        {
+            Check(await WaitFor(() => _vm.StatusText.Contains("right now", StringComparison.Ordinal), 10000),
+                $"a set that is working is not scanned, and the status bar says why (\"{_vm.StatusText}\")");
+            Check(!await WaitFor(() => OpenReview() is not null, 2000), "and nothing is offered");
+        }
+        finally
+        {
+            row.IsRunning = false;
+        }
+
+        // --- settings saved again between the review and Remove: nothing goes ---
+        Check(await SaveDefaultTiers("retention: changed during review", null), "Save closes the editor");
+        review = null;
+        Check(await WaitFor(() => (review = OpenReview()) is not null, 20000), "emptying Default offers the versions");
+        if (review is null) return;
+        set = await DbSetAsync();
+        set.JobOptions!.TierSets = [keepAll];
+        set.JobOptions.RetentionTiers = keepAll.Tiers;
+        await _observer.UpdateBackupSetAsync(set);
+        review.DialogResult = true;
+        Check(await WaitFor(() => !row.IsRunning && row.LastResultText.Contains("changed again", StringComparison.Ordinal), 20000),
+            $"settings changed since the review remove nothing, and say why (\"{row.LastResultText}\")");
+        Check(File.Exists(Prev(_smallFile, 2)) && File.Exists(Prev(_bigFile, 1)) && (await LiveDiscPaths()).Count == 2,
+            "both earlier versions are still there, and recorded");
     }
 #endif
 
@@ -1932,6 +2004,9 @@ public class CountingCatalog : DispatchProxy
 
     public int Writes => Volatile.Read(ref _writes);
 
+    /// <summary>A method that throws, once named here, as a failing disk would.</summary>
+    public volatile string? FailOn;
+
     internal static ICatalogRepository Wrap(ICatalogRepository inner, out CountingCatalog counter)
     {
         var proxy = Create<ICatalogRepository, CountingCatalog>();
@@ -1947,6 +2022,8 @@ public class CountingCatalog : DispatchProxy
                                or nameof(ICatalogRepository.CreateBackupSetAsync)
                                or nameof(ICatalogRepository.DeleteBackupSetAsync))
             Interlocked.Increment(ref _writes);
+        if (FailOn == targetMethod.Name)
+            throw new IOException($"simulated failure in {FailOn}");
         try
         {
             return targetMethod.Invoke(_inner, args);

@@ -80,9 +80,15 @@ internal static class DestinationFilePurger
     /// (deleted) catalog rows and resurface as "catalog-deleted files" on the
     /// next destination scan, which is an already-supported state.
     /// </param>
+    /// <param name="sweepWholeTree">
+    /// Sweep every empty folder in the destination (true), or only the folders
+    /// the deleted files were in, and their parents while they are empty (false).
+    /// The whole-tree walk tidies after a large purge, but visits every folder of
+    /// the backup: minutes on a large one, after deleting a handful of files.
+    /// </param>
     public static (int FilesDeleted, int Failures, long BytesFreed, int AlreadyAbsent) DeleteFilesAndSweep(
         string targetDir, IReadOnlyCollection<string> discRelPaths,
-        IProgress<ProgressReport>? progress, CancellationToken ct = default)
+        IProgress<ProgressReport>? progress, CancellationToken ct = default, bool sweepWholeTree = true)
     {
         int filesDeleted = 0;
         int failures = 0;
@@ -148,7 +154,12 @@ internal static class DestinationFilePurger
         // Skipped entirely when cancelled: the sweep is a tidy-up, and walking
         // the whole destination tree is exactly the kind of long unresponsive
         // tail a user who just pressed Cancel is trying to get away from.
-        if (!ct.IsCancellationRequested)
+        if (!sweepWholeTree)
+        {
+            if (!ct.IsCancellationRequested)
+                SweepEmptyParents(targetDir, discRelPaths);
+        }
+        else if (!ct.IsCancellationRequested)
         {
             progress?.Report("Cleaning up empty directories...");
             try
@@ -167,6 +178,43 @@ internal static class DestinationFilePurger
         }
 
         return (filesDeleted, failures, bytesFreed, alreadyAbsent);
+    }
+
+    /// <summary>
+    /// Remove the folders <paramref name="discRelPaths"/> were in, and their
+    /// parents, while each is empty, never <paramref name="targetDir"/> itself or
+    /// a content store (<c>_blocks</c>, <c>_filestore</c>).
+    /// </summary>
+    private static void SweepEmptyParents(string targetDir, IReadOnlyCollection<string> discRelPaths)
+    {
+        string root = Path.GetFullPath(targetDir).TrimEnd('\\');
+        // Every folder between a deleted file and the root, deepest first, so a
+        // folder is looked at only after all its emptied subfolders have gone.
+        var folders = new HashSet<string>(StringComparer.OrdinalIgnoreCase);
+        foreach (var discRel in discRelPaths)
+        {
+            string? dir = Path.GetDirectoryName(Path.GetFullPath(Path.Combine(targetDir, discRel)));
+            while (dir is not null && dir.StartsWith(root + "\\", StringComparison.OrdinalIgnoreCase)
+                   && folders.Add(dir))
+                dir = Path.GetDirectoryName(dir);
+        }
+        foreach (var dir in folders.OrderByDescending(d => d.Count(c => c == '\\')))
+        {
+            // Nor anything inside a content store.
+            string rel = dir[(root.Length + 1)..];
+            if (rel.Split('\\').Any(s => s.Equals("_blocks", StringComparison.OrdinalIgnoreCase)
+                                         || s.Equals("_filestore", StringComparison.OrdinalIgnoreCase)))
+                continue;
+            try
+            {
+                if (Directory.Exists(dir) && !Directory.EnumerateFileSystemEntries(dir).Any())
+                    Directory.Delete(dir);
+            }
+            catch
+            {
+                // Best effort, as the whole-tree sweep.
+            }
+        }
     }
 
     /// <summary>
