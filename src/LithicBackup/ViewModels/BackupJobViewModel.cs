@@ -417,14 +417,10 @@ public class BackupJobViewModel : ViewModelBase
 
         try
         {
-            // Compute the effective target directory, appending subdirectory if specified.
-            string? effectiveTargetDir = null;
-            if (IsDirectoryMode)
-            {
-                effectiveTargetDir = TargetDirectoryPath;
-                if (CreateSubdirectory && !string.IsNullOrWhiteSpace(SubdirectoryName))
-                    effectiveTargetDir = System.IO.Path.Combine(effectiveTargetDir, SubdirectoryName.Trim());
-            }
+            // The backup folder: the destination, or the subfolder in it.
+            string? effectiveTargetDir = IsDirectoryMode
+                ? JobOptions.BackupRootFor(TargetDirectoryPath, CreateSubdirectory, SubdirectoryName)
+                : null;
 
             var job = new BackupJob
             {
@@ -437,8 +433,6 @@ public class BackupJobViewModel : ViewModelBase
                 IncludeCatalogOnDisc = IncludeCatalogOnDisc,
                 AllowFileSplitting = AllowFileSplitting,
                 TargetDirectory = effectiveTargetDir,
-                CreateSubdirectory = CreateSubdirectory,
-                SubdirectoryName = CreateSubdirectory ? SubdirectoryName?.Trim() : null,
                 EnableFileDeduplication = EnableFileDeduplication,
                 EnableDeduplication = EnableDeduplication,
                 ExcludedExtensions = ParseExclusionPatterns(ExcludedExtensions),

@@ -95,14 +95,12 @@ public class BackupJob
     /// </summary>
     public List<VersionTierSet> TierSets { get; set; } = [];
 
-    /// <summary>When non-null, back up to this directory instead of optical media.</summary>
+    /// <summary>
+    /// When non-null, back up to this directory instead of optical media: the
+    /// set's backup folder (<see cref="JobOptions.BackupRoot"/>), which with
+    /// "Create subdirectory" is already the subfolder.
+    /// </summary>
     public string? TargetDirectory { get; set; }
-
-    /// <summary>Whether to create a subdirectory under the target directory.</summary>
-    public bool CreateSubdirectory { get; set; }
-
-    /// <summary>Name of the subdirectory to create under the target directory.</summary>
-    public string? SubdirectoryName { get; set; }
 
     /// <summary>
     /// Glob patterns to exclude from the backup (e.g. "*.log", "temp_*", "debug*.txt").

@@ -2550,7 +2550,11 @@ public sealed class BackupWorker : BackgroundService
                 job, targetDir, retentionTiers, progress: null, runCt,
                 precomputedDiff: diff,
                 onCommitBoundary: (excluded, innerCt) =>
-                    DrainJournalDuringFullScanAsync(state, excluded, innerCt));
+                    DrainJournalDuringFullScanAsync(state, excluded, innerCt),
+                onIndexing: () => _logger.LogInformation(
+                    "\"{Name}\": indexing its earlier versions before applying retention. This happens once "
+                    + "per set and takes minutes on a large one; the set's catalog is locked meanwhile.",
+                    set.Name));
 
             state.LastRunUtc = DateTime.UtcNow;
 
@@ -2666,12 +2670,9 @@ public sealed class BackupWorker : BackgroundService
             state.RefusedElsewhereAt = targetDir;
             _logger.LogWarning(
                 "Not backing up \"{Name}\": some of its backed-up files are recorded in {Elsewhere}, but it now "
-                + "backs up to {Target}. A backup there would lose track of their earlier versions. If the backup "
-                + "was moved, use Change Destination in Lithic Backup; if the set's \"Create subdirectory\" setting "
-                + "or its subfolder's name was changed, change it back; to start afresh there, clear its backup "
-                + "history in the set's editor. Its automated backups are paused until then, which its row in "
-                + "Lithic Backup shows.",
-                set.Name, elsewhere, targetDir);
+                + "backs up to {Target}. A backup there would lose track of their earlier versions. {Advice} "
+                + "Its automated backups are paused until then, which its row in Lithic Backup shows.",
+                set.Name, elsewhere, targetDir, RecordsElsewhere.Advice(elsewhere, targetDir));
         }
         await HoldAutomatedBackupsAsync(set, ct);
         return true;

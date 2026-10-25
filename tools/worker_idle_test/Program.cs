@@ -865,6 +865,10 @@ async Task PartC()
         await rig.Worker.StartAsync(CancellationToken.None);
         bool scanned = await WaitUntil(() => File.Exists(Path.Combine(inSub, "one.txt")), TimeSpan.FromSeconds(60));
         Check(scanned, "C11 the Worker's full backup writes into the subfolder");
+        // A new set has no earlier-versions index yet: building it is a full scan
+        // under the write lock, minutes on a large set, and the log says so.
+        bool indexed = await WaitUntil(() => rig.Log.Count("indexing its earlier versions") > 0, TimeSpan.FromSeconds(30));
+        Check(indexed, "C11 its first full backup logs that it is indexing the set's earlier versions");
         File.WriteAllText(Path.Combine(src, "two.txt"), "two");
         bool continuous = await WaitUntil(() => File.Exists(Path.Combine(inSub, "two.txt")), TimeSpan.FromSeconds(60));
         Check(continuous, "C11 and so does its continuous backup");

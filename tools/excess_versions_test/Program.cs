@@ -21,7 +21,10 @@
 //      needs nothing kept.
 
 using System.IO;
+using System.Reflection;
+using System.Runtime.ExceptionServices;
 using System.Windows.Threading;
+using LithicBackup.Core;
 using LithicBackup.Core.Interfaces;
 using LithicBackup.Core.Models;
 using LithicBackup.Infrastructure.Data;
@@ -330,6 +333,15 @@ internal static class Program
         await Record(await Disc(probe.Id, @"H:\lithicbackup\Sub"), @"D\src\d.txt", deleted: true); // only retired
         Check(await repo.FindLiveRecordsOutsideAsync(probe.Id, @"H:\lithicbackup") is null,
             "a drive moved to another letter, other separators and retired records are not 'elsewhere'");
+        // Case beyond ASCII, as JobOptions.SameFolderOnAnyDrive compares it (and
+        // the editor's question with it): SQLite's NOCASE would not fold it.
+        var umlaut = await repo.CreateBackupSetAsync(new BackupSet
+        {
+            Name = "umlaut", SourceRoots = [@"D:\src"], CreatedUtc = DateTime.UtcNow, DefaultMediaType = MediaType.Directory,
+        });
+        await Record(await Disc(umlaut.Id, @"H:\Sicherung-Ärger"), @"D\src\u.txt");
+        Check(await repo.FindLiveRecordsOutsideAsync(umlaut.Id, @"H:\sicherung-ärger") is null,
+            "a folder whose name differs only in the case of a non-ASCII letter is the same folder");
         Check(await repo.FindLiveRecordsOutsideAsync(probe.Id, @"H:\lithicbackup\Sub") is { } other
               && other.StartsWith(@"H:\lithicbackup", StringComparison.OrdinalIgnoreCase),
             "with the subfolder as the backup folder, the records beside it are found");
@@ -366,6 +378,28 @@ internal static class Program
         Check(await repo.FindLiveRecordsOutsideAsync(twoLetters.Id, @"J:\moved") is null,
             "after it, a set recorded under two drive letters of one folder has nothing elsewhere");
 
+        // All or none: a relabel that fails part-way leaves every label as it was,
+        // rather than the set half moved and refused for records elsewhere.
+        var atomic = await repo.CreateBackupSetAsync(new BackupSet
+        {
+            Name = "atomic", SourceRoots = [@"D:\src"], CreatedUtc = DateTime.UtcNow, DefaultMediaType = MediaType.Directory,
+        });
+        for (int i = 0; i < 3; i++)
+            await Record(await Disc(atomic.Id, @"H:\a"), $@"D\src\atomic{i}.txt");
+        bool relabelThrew = false;
+        try
+        {
+            await LithicBackup.ViewModels.MainViewModel.RelabelDiscsAfterMoveAsync(SecondDiscUpdateFails.Wrap(repo),
+                atomic.Id, @"H:\a", @"H:\a", @"J:\b", @"J:\b");
+        }
+        catch (IOException)
+        {
+            relabelThrew = true;
+        }
+        var atomicLabels = (await repo.GetDiscsForBackupSetAsync(atomic.Id)).Select(d => d.Label).ToList();
+        Check(relabelThrew && atomicLabels.All(l => l == @"H:\a"),
+            $"a relabel that fails part-way changes no label ({string.Join(", ", atomicLabels)})");
+
         // --- Cleanup refuses to purge such a set ---
         string dest = Path.Combine(dir, "dst");
         Directory.CreateDirectory(dest);
@@ -382,6 +416,27 @@ internal static class Program
         Check(vm.IsDestinationUnavailable && vm.DestinationUnavailableText.Contains("recorded in", StringComparison.Ordinal),
             $"Cleanup treats the backup folder as unusable, and says why (\"{vm.DestinationUnavailableText}\")");
         Check(!vm.ScanDestinationCommand.CanExecute(null), "and offers no destination scan");
+        Check(vm.DestinationUnavailableText.Contains("turn it off again", StringComparison.Ordinal)
+              && vm.DestinationUnavailableText.Contains("seed it from its backup folder", StringComparison.Ordinal),
+            "records just above the subfolder get the way out that fits them: the setting, or a fresh start");
+        Check(RecordsElsewhere.Advice(@"H:\old", @"H:\new").Contains("Change Destination", StringComparison.Ordinal)
+              && !RecordsElsewhere.Advice(@"H:\old", @"H:\new").Contains("turn it off", StringComparison.Ordinal),
+            "records in an unrelated folder get the general one");
+
+        // A subfolder the first backup has not made yet: the drive is there, so
+        // the banner must not say it is not connected.
+        var unmade = await repo.CreateBackupSetAsync(new BackupSet
+        {
+            Name = "unmade", SourceRoots = [@"D:\src"], CreatedUtc = DateTime.UtcNow, DefaultMediaType = MediaType.Directory,
+            JobOptions = new JobOptions { TargetDirectory = dest, CreateSubdirectory = true, SubdirectoryName = "NotYet" },
+        });
+        var unmadeVm = new OrphanedDirectoriesViewModel(repo, unmade);
+        unmadeVm.ScanCatalogCommand.Execute(null);
+        await WaitFor(() => !unmadeVm.IsLoading, 60000);
+        Check(unmadeVm.IsDestinationUnavailable
+              && unmadeVm.DestinationUnavailableText.Contains("does not exist", StringComparison.Ordinal)
+              && !unmadeVm.DestinationUnavailableText.Contains("not connected", StringComparison.Ordinal),
+            $"a backup folder not made yet is said to be missing, not unconnected (\"{unmadeVm.DestinationUnavailableText}\")");
 
         // --- another set's backup folder inside this one is not scanned ---
         string shared = Path.Combine(dir, "shared");
@@ -393,7 +448,9 @@ internal static class Program
         await repo.CreateBackupSetAsync(new BackupSet
         {
             Name = "inner", SourceRoots = [@"D:\src"], CreatedUtc = DateTime.UtcNow, DefaultMediaType = MediaType.Directory,
-            JobOptions = new JobOptions { TargetDirectory = shared, CreateSubdirectory = true, SubdirectoryName = "Inner" },
+            // Stored under another drive letter: the drive changed letters, and the
+            // outer set has run since, the inner one not yet.
+            JobOptions = new JobOptions { TargetDirectory = "Q" + shared[1..], CreateSubdirectory = true, SubdirectoryName = "Inner" },
         });
         string innerFile = Path.Combine(shared, "Inner", "D", "src", "inner.txt");
         string strayFile = Path.Combine(shared, "D", "src", "stray.txt");
@@ -595,9 +652,28 @@ internal static class Program
             int built = 0;
             var tx = await repo2.BeginTransactionAsync(set2.Id);
             await repo2.GetActivePreviousVersionsAsync(set2.Id, onIndexing: () => built++);
+            // A second read in the same transaction sees the index it built, still
+            // uncommitted, and must not take it for one that stays.
+            await repo2.GetActivePreviousVersionsAsync(set2.Id, onIndexing: () => built++);
             tx.Dispose(); // no Complete: rolled back, index with it
             await repo2.GetActivePreviousVersionsAsync(set2.Id, onIndexing: () => built++);
-            Check(built == 2, $"an index built inside a rolled-back transaction is built again by the next read ({built} builds)");
+            Check(built == 2, $"an index built inside a rolled-back transaction is built again by the next read, "
+                              + $"however often it was read there ({built} builds)");
+
+            // The in-use check, asked only about earlier versions' paths, reads
+            // them through the index, building it first: a later read builds nothing.
+            var set3 = await repo2.CreateBackupSetAsync(new BackupSet
+            {
+                Name = "in-use", SourceRoots = [@"D:\src"], CreatedUtc = DateTime.UtcNow,
+                DefaultMediaType = MediaType.Directory,
+            });
+            var tx3 = await repo2.BeginTransactionAsync(set3.Id);
+            await repo2.FindDiscPathsInUseAsync(set3.Id, [@"D_prev\src\x.txt.v1"]);
+            tx3.Complete();
+            tx3.Dispose();
+            int built3 = 0;
+            await repo2.GetActivePreviousVersionsAsync(set3.Id, onIndexing: () => built3++);
+            Check(built3 == 0, $"the in-use check of earlier versions' paths builds their index ({built3} later builds)");
         }
 
         var livePaths = await repo.GetLiveDiscPathsAsync(set.Id, [prev.Id, current.Id, retired.Id, 999_999]);
@@ -1658,5 +1734,34 @@ internal static class Program
             .Where(i => i.Reason == OrphanedReason.ExcessVersion && i.ExcessVersionRecords is not null)
             .SelectMany(i => i.ExcessVersionRecords!)
             .ToList();
+    }
+}
+
+/// <summary>A catalog whose second <c>UpdateDiscAsync</c> fails; everything else passes through.</summary>
+public class SecondDiscUpdateFails : DispatchProxy
+{
+    private ICatalogRepository _inner = null!;
+    private int _updates;
+
+    public static ICatalogRepository Wrap(ICatalogRepository inner)
+    {
+        var proxy = Create<ICatalogRepository, SecondDiscUpdateFails>();
+        ((SecondDiscUpdateFails)(object)proxy)._inner = inner;
+        return proxy;
+    }
+
+    protected override object? Invoke(MethodInfo? targetMethod, object?[]? args)
+    {
+        if (targetMethod!.Name == nameof(ICatalogRepository.UpdateDiscAsync) && ++_updates == 2)
+            return Task.FromException(new IOException("simulated failure on the second disc"));
+        try
+        {
+            return targetMethod.Invoke(_inner, args);
+        }
+        catch (TargetInvocationException ex) when (ex.InnerException is not null)
+        {
+            ExceptionDispatchInfo.Capture(ex.InnerException).Throw();
+            throw;
+        }
     }
 }

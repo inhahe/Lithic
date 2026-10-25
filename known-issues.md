@@ -19,9 +19,10 @@ restore, since each disc record names the folder it was written to. Such a set i
 now refused by the Worker (and held), by backing up and removing dropped sources
 in the app, by the retention offer and by Cleanup, each saying why (design.md,
 "Nothing works in the backup folder while live records belong to another"). No build
-since the fix writes such copies; to sort out a set that already has them, clear
-its history and seed from the subfolder, then delete the
-stray tree by hand. Nothing does it for the user; no set of the author's needs it.
+since the fix writes such copies. To sort out a set that already has them, clear
+its history and seed from the subfolder, then delete the stray tree by hand; every
+refusal says so (`RecordsElsewhere.Advice`). Nothing does it for the user; no set
+of the author's needs it.
 The guard came out of the Opus review of the fix, which found that the fix alone
 left these sets to lose their earlier versions quietly.
 

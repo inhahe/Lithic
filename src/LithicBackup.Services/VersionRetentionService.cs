@@ -42,6 +42,11 @@ public class VersionRetentionService
     /// source paths are — used by continuous/targeted backups, which write a new
     /// version for a handful of paths and would otherwise pay for the whole set.
     /// </param>
+    /// <param name="onIndexing">
+    /// Called once, for the whole set, if its earlier-versions index has to be
+    /// built first: a full scan of the set under its write lock, which takes
+    /// minutes on a large set, once per set.
+    /// </param>
     /// <remarks>
     /// <para>
     /// Retention is computed per source path from that path's own version rows
@@ -70,12 +75,13 @@ public class VersionRetentionService
         int backupSetId,
         Func<string, IReadOnlyList<VersionRetentionTier>> tierSelector,
         IReadOnlyCollection<string>? pathScope,
+        Action? onIndexing = null,
         CancellationToken ct = default)
     {
         IEnumerable<FileRecord> previous;
         if (pathScope is null)
         {
-            previous = await _catalog.GetActivePreviousVersionsAsync(backupSetId, ct: ct);
+            previous = await _catalog.GetActivePreviousVersionsAsync(backupSetId, onIndexing, ct);
         }
         else
         {

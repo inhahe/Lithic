@@ -380,12 +380,20 @@ public class OrphanedDirectoriesViewModel : ViewModelBase, IConfirmClose, IDispo
     /// </summary>
     public bool IsDestinationUnavailable => _targetDir is not null && !_destinationAvailable;
 
-    /// <summary>Banner text naming the destination that could not be reached, or why it cannot be used.</summary>
+    /// <summary>
+    /// Whether the backup folder is missing while the folder above it is there;
+    /// see <see cref="RefreshDestinationAvailability"/>.
+    /// </summary>
+    private bool _backupFolderMissing;
+
+    /// <summary>Banner text: why the backup folder cannot be used.</summary>
     public string DestinationUnavailableText => _recordsElsewhere is { } elsewhere
         ? $"Some of this set's backed-up files are recorded in {elsewhere}, not in its backup folder " +
           $"{_targetDir}  —  nothing can be deleted from the backup or scanned there until that is sorted " +
-          "out. If the backup was moved, use Change Destination; if the set's subfolder setting was " +
-          "changed, change it back."
+          "out. " + RecordsElsewhere.Advice(elsewhere, _targetDir!)
+        : _backupFolderMissing
+        ? $"The backup folder {_targetDir} does not exist: nothing has been backed up there yet, or it " +
+          "was moved or deleted. Nothing can be deleted from the backup or scanned there until it exists."
         : $"Destination not connected: {_targetDir}  —  nothing can be deleted from the " +
           "backup and the destination cannot be scanned until it is available.";
 
@@ -439,12 +447,18 @@ public class OrphanedDirectoriesViewModel : ViewModelBase, IConfirmClose, IDispo
     /// </summary>
     private void RefreshDestinationAvailability()
     {
-        bool available = Services.DestinationFilePurger.IsAvailable(_targetDir) && _recordsElsewhere is null;
+        bool reachable = Services.DestinationFilePurger.IsAvailable(_targetDir);
+        bool available = reachable && _recordsElsewhere is null;
+        // The drive is there, but not the backup folder: with "Create subdirectory"
+        // before the first backup has made it, or a folder moved or deleted.
+        bool folderMissing = !reachable && _targetDir is not null
+            && Path.GetDirectoryName(_targetDir.TrimEnd('\\')) is { } above && Directory.Exists(above);
 
-        if (available == _destinationAvailable)
+        if (available == _destinationAvailable && folderMissing == _backupFolderMissing)
             return;
 
         _destinationAvailable = available;
+        _backupFolderMissing = folderMissing;
         OnPropertyChanged(nameof(CanScanDestination));
         OnPropertyChanged(nameof(IsDestinationUnavailable));
         OnPropertyChanged(nameof(DestinationUnavailableText));
@@ -1717,7 +1731,7 @@ public class OrphanedDirectoriesViewModel : ViewModelBase, IConfirmClose, IDispo
             await RefreshRecordsElsewhereAsync();
             if (!_destinationAvailable)
             {
-                DestinationScanStatusText = _recordsElsewhere is null
+                DestinationScanStatusText = _recordsElsewhere is null && !_backupFolderMissing
                     ? $"Destination not connected: {_targetDir} — connect it and scan again."
                     : DestinationUnavailableText;
                 return;
@@ -1725,14 +1739,18 @@ public class OrphanedDirectoriesViewModel : ViewModelBase, IConfirmClose, IDispo
 
             // Other sets' backup folders inside this one: their files are in no
             // catalog this scan reads, and would all be listed as untracked.
+            // Whatever the drive letter, as everywhere a folder is matched: a set
+            // stores the letter its drive had at its own last run. Wrongly
+            // matching a folder on another drive only skips it, offering nothing.
             var otherSetsInside = new List<string>();
-            string root = _targetDir.TrimEnd('\\');
+            string root = JobOptions.FolderWithoutDrive(_targetDir);
             foreach (var other in await _catalog.GetAllBackupSetsAsync())
             {
                 if (other.Id != _backupSet.Id
                     && other.JobOptions?.BackupRoot() is { } otherRoot
-                    && otherRoot.TrimEnd('\\').StartsWith(root + "\\", StringComparison.OrdinalIgnoreCase))
-                    otherSetsInside.Add(otherRoot.TrimEnd('\\')[(root.Length + 1)..]);
+                    && JobOptions.FolderWithoutDrive(otherRoot) is var inner
+                    && inner.StartsWith(root + "\\", StringComparison.OrdinalIgnoreCase))
+                    otherSetsInside.Add(inner[(root.Length + 1)..]);
             }
 
             // Before the catalog snapshot is taken: a purge leaves alone anything written since.
@@ -2304,6 +2322,8 @@ public class OrphanedDirectoriesViewModel : ViewModelBase, IConfirmClose, IDispo
                 ? $"Some of this set's backed-up files are recorded in {elsewhere}, not in its backup " +
                   $"folder ({_targetDir}), so nothing was cleaned: the cleanup would retire their records " +
                   "without deleting their files."
+                : _backupFolderMissing
+                ? DestinationUnavailableText
                 : $"Destination not connected ({_targetDir}) — nothing was cleaned. " +
                   "Connect the drive and run the cleanup again; marking the catalog " +
                   "without deleting the backed-up files would free no space and would " +
@@ -2885,8 +2905,8 @@ public class OrphanedDirectoriesViewModel : ViewModelBase, IConfirmClose, IDispo
     // Catalog reconcile (dry-run analyze, then explicit apply)
     // ------------------------------------------------------------------
 
-    /// <summary>Why a reconcile was not started: the backup folder is missing, or the set's records are elsewhere.</summary>
-    private string ReconcileRefusalText => _recordsElsewhere is null
+    /// <summary>Why a reconcile was not started: the drive is missing, the backup folder is, or the set's records are elsewhere.</summary>
+    private string ReconcileRefusalText => _recordsElsewhere is null && !_backupFolderMissing
         ? $"Destination not connected: {_targetDir} - connect it and analyze again."
         : DestinationUnavailableText;
 

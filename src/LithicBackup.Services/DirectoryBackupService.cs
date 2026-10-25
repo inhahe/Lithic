@@ -119,6 +119,10 @@ public class DirectoryBackupService
         _destinationFlush = destinationFlush ?? new DestinationFlush();
     }
 
+    /// <summary>What the progress line says while the set's earlier-versions index is built.</summary>
+    public const string IndexingEarlierVersionsMessage =
+        "Indexing this set's earlier versions (once per set; minutes on a large one)...";
+
     /// <summary>
     /// Execute a directory backup: copy files with versioned history,
     /// update catalog, and apply retention.
@@ -130,9 +134,15 @@ public class DirectoryBackupService
     /// version, instead of re-evaluating every path in the set. Set by
     /// targeted/continuous backups, where the whole-set pass costs orders of
     /// magnitude more than the backup it follows; see
-    /// <see cref="VersionRetentionService.ComputeRetentionAsync(int, Func{string, IReadOnlyList{VersionRetentionTier}}, IReadOnlyCollection{string}, CancellationToken)"/>
+    /// <see cref="VersionRetentionService.ComputeRetentionAsync(int, Func{string, IReadOnlyList{VersionRetentionTier}}, IReadOnlyCollection{string}, Action, CancellationToken)"/>
     /// for why that is safe and what it defers to the next full backup. A full
     /// backup must leave this false.
+    /// </param>
+    /// <param name="onIndexing">
+    /// Called once if the retention pass has to build the set's earlier-versions
+    /// index first (minutes on a large set, once per set, with the set's write lock
+    /// held), so that a caller with no progress display can say so.
+    /// <paramref name="progress"/> is told as well.
     /// </param>
     /// <exception cref="BackupCanceledException">
     /// Cancelled: with the files that had failed by then, and whether the copy
@@ -148,14 +158,15 @@ public class DirectoryBackupService
         FailureCallback? onFailure = null,
         BackupDiff? precomputedDiff = null,
         bool scopeRetentionToBackedUpFiles = false,
-        CommitBoundaryHandler? onCommitBoundary = null)
+        CommitBoundaryHandler? onCommitBoundary = null,
+        Action? onIndexing = null)
     {
         var run = new RunState();
         try
         {
             return await ExecuteCoreAsync(
                 job, targetDirectory, retentionTiers, progress, ct, pauseEvent, onFailure,
-                precomputedDiff, scopeRetentionToBackedUpFiles, onCommitBoundary, run);
+                precomputedDiff, scopeRetentionToBackedUpFiles, onCommitBoundary, onIndexing, run);
         }
         catch (OperationCanceledException ex) when (ex is not BackupCanceledException)
         {
@@ -189,6 +200,7 @@ public class DirectoryBackupService
         BackupDiff? precomputedDiff,
         bool scopeRetentionToBackedUpFiles,
         CommitBoundaryHandler? onCommitBoundary,
+        Action? onIndexing,
         RunState run)
     {
         BackupDiff diff;
@@ -2028,7 +2040,18 @@ public class DirectoryBackupService
                         BytesTotalAll = totalBytes,
                         OverallPercentage = 100,
                     });
-                    toDelete = await _retention.ComputeRetentionAsync(backupSetId, tierSelector, null, ct);
+                    toDelete = await _retention.ComputeRetentionAsync(backupSetId, tierSelector, null,
+                        onIndexing: () =>
+                        {
+                            progress?.Report(new BackupProgress
+                            {
+                                StatusMessage = IndexingEarlierVersionsMessage,
+                                BytesWrittenTotal = bytesProcessed,
+                                BytesTotalAll = totalBytes,
+                                OverallPercentage = 100,
+                            });
+                            onIndexing?.Invoke();
+                        }, ct);
                 }
                 else
                 {
@@ -2039,7 +2062,7 @@ public class DirectoryBackupService
                     var expired = new List<FileRecord>();
                     await InBatchesAsync(pathsWithHistory,
                         async batch => expired.AddRange(
-                            await _retention.ComputeRetentionAsync(backupSetId, tierSelector, batch, ct)),
+                            await _retention.ComputeRetentionAsync(backupSetId, tierSelector, batch, ct: ct)),
                         done => reading.Advance(done, ""), pauseEvent, ct);
                     toDelete = expired;
                 }

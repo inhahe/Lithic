@@ -933,11 +933,15 @@ internal sealed class SqliteSetDatabase : IDisposable
             return Convert.ToInt64(check.ExecuteScalar()) != 0;
         }
 
+        // Never remembered from inside the caller's transaction: what it sees there
+        // may be its own uncommitted build, which a rollback takes away. The check
+        // is a cheap read next time.
         using (await LockAsync(ct).ConfigureAwait(false))
         {
             if (PresentNow())
             {
-                _previousVersionIndexExists = true;
+                if (!OwnsTransaction)
+                    _previousVersionIndexExists = true;
                 return;
             }
         }
@@ -953,16 +957,15 @@ internal sealed class SqliteSetDatabase : IDisposable
                 // Stoppable only on its own: inside the caller's transaction an
                 // aborted statement would roll the whole transaction back.
                 if (OwnsTransaction)
-                {
                     cmd.ExecuteNonQuery();
-                    // Not remembered: the caller's transaction can still roll it
-                    // back, and the check above is a cheap read next time.
-                    return;
+                else
+                {
+                    using (SqliteCancellation.Watch(_connection, ct))
+                        SqliteCancellation.Interruptible(cmd.ExecuteNonQuery, ct);
                 }
-                using (SqliteCancellation.Watch(_connection, ct))
-                    SqliteCancellation.Interruptible(cmd.ExecuteNonQuery, ct);
             }
-            _previousVersionIndexExists = true;
+            if (!OwnsTransaction)
+                _previousVersionIndexExists = true;
         }
     }
 
@@ -1002,23 +1005,40 @@ internal sealed class SqliteSetDatabase : IDisposable
         ct.ThrowIfCancellationRequested();
         using var _ = await LockAsync(ct).ConfigureAwait(false);
 
-        // A disc record is labelled with the folder its run wrote to. Compared as
-        // JobOptions.SameFolderOnAnyDrive compares: "X:" (or a UNC path's leading
-        // "\\") dropped from both sides, separators and trailing ones evened out,
-        // case ignored.
-        using var cmd = _connection.CreateCommand();
-        cmd.CommandText = """
-            SELECT d.Label FROM Discs d
-            WHERE d.BackupSetId = $setId AND d.MediaType = $directory
-              AND rtrim(substr(replace(d.Label, '/', char(92)), 3), char(92)) <> $folder COLLATE NOCASE
-              AND EXISTS (SELECT 1 FROM Files f WHERE f.DiscId = d.Id AND f.IsDeleted = 0)
-            LIMIT 1
-            """;
-        cmd.Parameters.AddWithValue("$setId", backupSetId);
-        cmd.Parameters.AddWithValue("$directory", (int)MediaType.Directory);
-        cmd.Parameters.AddWithValue("$folder", JobOptions.FolderWithoutDrive(backupRoot));
-        foreach (var r in Rows(cmd, ct))
-            return r.GetString(0);
+        // A disc record is labelled with the folder its run wrote to. A set has a
+        // handful of distinct labels however many runs it has made, so they are
+        // compared here, by the one definition of "the same folder"
+        // (JobOptions.SameFolderOnAnyDrive), and only a label naming another
+        // folder is asked about its live records.
+        var others = new List<string>();
+        using (var labels = _connection.CreateCommand())
+        {
+            labels.CommandText = "SELECT DISTINCT Label FROM Discs WHERE BackupSetId = $setId AND MediaType = $directory";
+            labels.Parameters.AddWithValue("$setId", backupSetId);
+            labels.Parameters.AddWithValue("$directory", (int)MediaType.Directory);
+            foreach (var r in Rows(labels, ct))
+            {
+                string label = r.GetString(0);
+                if (!JobOptions.SameFolderOnAnyDrive(label, backupRoot))
+                    others.Add(label);
+            }
+        }
+
+        foreach (string label in others)
+        {
+            using var live = _connection.CreateCommand();
+            live.CommandText = """
+                SELECT EXISTS (
+                    SELECT 1 FROM Discs d JOIN Files f ON f.DiscId = d.Id
+                    WHERE d.BackupSetId = $setId AND d.MediaType = $directory AND d.Label = $label
+                      AND f.IsDeleted = 0)
+                """;
+            live.Parameters.AddWithValue("$setId", backupSetId);
+            live.Parameters.AddWithValue("$directory", (int)MediaType.Directory);
+            live.Parameters.AddWithValue("$label", label);
+            if (Convert.ToInt64(live.ExecuteScalar()) != 0)
+                return label;
+        }
         return null;
     }
 
@@ -2266,28 +2286,27 @@ internal sealed class SqliteSetDatabase : IDisposable
         foreach (var p in discPaths)
             wanted.TryAdd(p.Replace('/', '\\'), p);
 
-        using var _ = await LockAsync(ct).ConfigureAwait(false);
-        var found = new List<string>();
-        void Read(string where)
-        {
-            using var cmd = _connection.CreateCommand();
-            cmd.CommandText = "SELECT DiscPath FROM Files WHERE " + where;
-            foreach (var r in Rows(cmd, ct))
-            {
-                if (wanted.Remove(r.GetString(0).Replace('/', '\\'), out var given))
-                    found.Add(given);
-            }
-        }
+        // One read either way. This often runs inside a purge's transaction, under
+        // the set's write lock. A path other than an earlier version's can be any
+        // live row, so then every live row is read, which covers the rest too.
+        // Only earlier versions' paths wanted: a live record stored at one is
+        // itself one of the rows the earlier-versions index covers, so they are
+        // looked for there - a few thousand rows, not every live row in the set -
+        // building the index first if this set has none yet.
+        bool onlyPrevious = wanted.Keys.All(Core.HistoryPaths.IsPreviousVersion);
+        if (onlyPrevious)
+            await EnsurePreviousVersionIndexAsync(null, ct).ConfigureAwait(false);
 
-        // A live record stored at an earlier version's path is itself one of the
-        // rows the earlier-versions index covers, so those paths are looked for
-        // there: a few thousand rows, not every live row in the set. This often
-        // runs inside a purge's transaction, under the set's write lock.
-        if (wanted.Keys.Any(Core.HistoryPaths.IsPreviousVersion))
-            Read(PreviousVersionCandidateSql);
-        // Anything else can be any live row.
-        if (wanted.Count > 0 && wanted.Keys.Any(p => !Core.HistoryPaths.IsPreviousVersion(p)))
-            Read("IsDeleted = 0");
+        using var _ = await LockAsync(ct).ConfigureAwait(false);
+        using var cmd = _connection.CreateCommand();
+        cmd.CommandText = "SELECT DiscPath FROM Files WHERE "
+                          + (onlyPrevious ? PreviousVersionCandidateSql : "IsDeleted = 0");
+        var found = new List<string>();
+        foreach (var r in Rows(cmd, ct))
+        {
+            if (wanted.Remove(r.GetString(0).Replace('/', '\\'), out var given))
+                found.Add(given);
+        }
         return found;
     }
 

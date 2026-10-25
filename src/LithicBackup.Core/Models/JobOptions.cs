@@ -103,9 +103,10 @@ public class JobOptions
     /// letter (a drive can come back under another one, which the destination
     /// resolver follows without relabelling anything), the case, and the kind and
     /// number of trailing separators. Everything that decides whether a label is
-    /// the set's folder compares this way, so that they cannot disagree;
-    /// <see cref="Interfaces.ICatalogRepository.FindLiveRecordsOutsideAsync"/>
-    /// does it in SQL, on <see cref="FolderWithoutDrive"/>.
+    /// the set's folder calls this, so that they cannot disagree:
+    /// <see cref="Interfaces.ICatalogRepository.FindLiveRecordsOutsideAsync"/>,
+    /// the editor's question before moving the folder, and Change Destination's
+    /// relabelling.
     /// </summary>
     public static bool SameFolderOnAnyDrive(string? a, string? b)
         => a is not null && b is not null

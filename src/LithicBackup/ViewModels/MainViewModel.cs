@@ -811,8 +811,7 @@ public class MainViewModel : ViewModelBase
         // File > Exit, which cannot ask; the refusal covers it.
         //
         // The question, or null when there is none to ask. The editor's fields are
-        // read on the UI thread, the catalog off it, and the result is not handed
-        // back to the UI thread: the close prompt waits for this synchronously.
+        // read on the UI thread, the catalog off it.
         async Task<string?> BackupFolderMoveQuestionAsync()
         {
             string? newRoot = EditorJobOptions(backupSet, sourceSelection).BackupRoot();
@@ -824,7 +823,7 @@ public class MainViewModel : ViewModelBase
                 if (oldRoot is null || JobOptions.SameFolderOnAnyDrive(oldRoot, newRoot))
                     return null;
                 return await _catalog.FindLiveRecordsOutsideAsync(backupSet.Id, newRoot);
-            }).ConfigureAwait(false);
+            });
             return elsewhere is null ? null
                 : $"Some of this set's backed-up files are recorded in\n    {elsewhere}\n"
                   + $"and this change makes its backup folder\n    {newRoot}\n\n"
@@ -948,18 +947,24 @@ public class MainViewModel : ViewModelBase
             }
             else if (result == MessageBoxResult.Yes)
             {
-                // Declined: stay open, as for Cancel. Waited for here because
-                // Closing must decide before it returns; the catalog part runs off
-                // the UI thread and does not come back to it.
-                if (!ConfirmBackupFolderMove(BackupFolderMoveQuestionAsync().GetAwaiter().GetResult()))
+                if (Application.Current is App { IsExiting: true })
                 {
-                    e.Cancel = true;
-                    return;
+                    // File > Exit: the Closed handler saves at once (SaveBeforeExit),
+                    // which leaves no time to ask anything more. For a new set,
+                    // clear the "unsaved new" marker so it is kept, not deleted.
+                    saveOnClose = true;
+                    _unsavedNewSetId = null;
                 }
-                // Save in the Closed handler. For a new set, clear the "unsaved new"
-                // marker so it is kept rather than deleted.
-                saveOnClose = true;
-                _unsavedNewSetId = null;
+                else
+                {
+                    // Otherwise exactly what the Save button does - asking first
+                    // if the save would move the backup folder - and closed by it,
+                    // once Closing has returned: that asks the catalog, which is not
+                    // to be waited for here on the UI thread. A refusal or a failed
+                    // save leaves the editor open with the edits in it.
+                    e.Cancel = true;
+                    dialog.Dispatcher.BeginInvoke(new Func<Task>(SaveAndCloseAsync));
+                }
             }
             // No: close without saving. A new set keeps _unsavedNewSetId, so the
             // Closed handler deletes its temporary record.
@@ -1054,8 +1059,10 @@ public class MainViewModel : ViewModelBase
         };
 
         // Save button: persist everything, then close the editor — matching the
-        // Settings dialog, where Save commits and dismisses in one action.
-        sourceSelection.SaveRequested += async () =>
+        // Settings dialog, where Save commits and dismisses in one action. Yes at
+        // the close prompt does the same.
+        sourceSelection.SaveRequested += SaveAndCloseAsync;
+        async Task SaveAndCloseAsync()
         {
             try
             {
@@ -1079,7 +1086,7 @@ public class MainViewModel : ViewModelBase
                 StatusText = $"Failed to save: {ex.Message}";
                 sourceSelection.SaveStatusText = "Save failed";
             }
-        };
+        }
 
         // Cancel discards. It used to just call Close(), which asked "Save before
         // closing?" - an odd question for a button labelled Cancel, and moot for
@@ -2699,6 +2706,7 @@ public class MainViewModel : ViewModelBase
     public static async Task RelabelDiscsAfterMoveAsync(ICatalogRepository catalog, int setId,
         string? oldRoot, string oldDestination, string? newRoot, string newDestination)
     {
+        var changed = new List<DiscRecord>();
         foreach (var disc in await catalog.GetDiscsForBackupSetAsync(setId))
         {
             string? relabel =
@@ -2708,8 +2716,25 @@ public class MainViewModel : ViewModelBase
             if (relabel is not null && relabel != disc.Label)
             {
                 disc.Label = relabel;
-                await catalog.UpdateDiscAsync(disc);
+                changed.Add(disc);
             }
+        }
+        if (changed.Count == 0)
+            return;
+
+        // All or none: a set has a disc record per run (tens of thousands), and
+        // labels half moved would leave it refused for records "elsewhere". One
+        // transaction is also one write, not one per disc.
+        var tx = await catalog.BeginTransactionAsync(setId);
+        try
+        {
+            foreach (var disc in changed)
+                await catalog.UpdateDiscAsync(disc);
+            tx.Complete();
+        }
+        finally
+        {
+            tx.Dispose();
         }
     }
 
@@ -2766,6 +2791,14 @@ public class MainViewModel : ViewModelBase
             // option backed up by an older Worker, the destination itself.
             string? oldRoot = backupSet.JobOptions.BackupRoot();
 
+            // The labels first, all or none. If that fails, nothing has changed;
+            // if saving the options below then fails, doing it again finds the
+            // labels moved already and saves the options. The other order could
+            // leave the options moved and the labels not: the set refused, for
+            // records in another folder.
+            await RelabelDiscsAfterMoveAsync(_catalog, backupSet.Id,
+                oldRoot, oldPath, backupSet.JobOptions.BackupRoot(newPath), newPath);
+
             // Update the saved job options. The new path may live on a
             // different volume, so discard the old volume identity and let the
             // resolver re-capture it for the new path (the resolver's backfill
@@ -2776,9 +2809,6 @@ public class MainViewModel : ViewModelBase
             _destinationResolver?.Resolve(backupSet.JobOptions);
             // Destination only - never the selection.
             await _catalog.UpdateBackupSetMetadataAsync(backupSet);
-
-            await RelabelDiscsAfterMoveAsync(_catalog, backupSet.Id,
-                oldRoot, oldPath, backupSet.JobOptions.BackupRoot(), newPath);
 
             StatusText = $"Destination relocated: {oldPath} → {newPath}";
         }
@@ -3332,8 +3362,6 @@ public class MainViewModel : ViewModelBase
             IncludeCatalogOnDisc = opts.IncludeCatalogOnDisc,
             AllowFileSplitting = opts.AllowFileSplitting,
             TargetDirectory = targetDir,
-            CreateSubdirectory = opts.CreateSubdirectory,
-            SubdirectoryName = opts.CreateSubdirectory ? opts.SubdirectoryName?.Trim() : null,
             EnableFileDeduplication = opts.EnableFileDeduplication,
             EnableDeduplication = opts.EnableDeduplication,
             DeduplicationBlockSize = opts.DeduplicationBlockSize > 0
@@ -5766,9 +5794,7 @@ public class MainViewModel : ViewModelBase
             : $"Some of \"{set.Name}\"'s backed-up files are recorded in\n    {elsewhere}\n"
               + $"but its backup folder is now\n    {backupRoot}\n\n"
               + "Working there would lose track of them and their earlier versions, so nothing was done.\n\n"
-              + "If you moved the backup, use Change Destination on the set's right-click menu. If you changed "
-              + "its \"Create subdirectory\" setting or the subfolder's name, change it back. To start a fresh "
-              + "backup in the new folder instead, use Clear Backup History in the set's editor first.";
+              + RecordsElsewhere.Advice(elsewhere, backupRoot);
     }
 
     private async Task<bool> ConfirmBackupOverUntrackedDestinationAsync(

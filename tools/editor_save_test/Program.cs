@@ -786,11 +786,31 @@ internal static class Program
         _dialogs.Expect("Unsaved Changes", DialogWatcher.IDYES);
         _dialogs.Expect("Change Backup Folder", DialogWatcher.IDNO);
         ed.Window.Close();
+        await WaitFor(() => _dialogs.WasAnswered("Change Backup Folder"), 10000);
         await Task.Delay(500);
         Check(_dialogs.WasAnswered("Unsaved Changes") && _dialogs.WasAnswered("Change Backup Folder"),
             "so does Yes at the close prompt");
         Check(IsOpen(ed.Window) && await Unmoved(), "and No there keeps the editor open too, and saves nothing");
         _dialogs.ClearExpectations();
+
+        // A catalog that fails while the close prompt's Yes asks: the editor stays
+        // open with the edit in it, and says so (it used to be waited for inside
+        // the window's Closing handler, out of which the failure escaped).
+        _counter.FailOn = nameof(ICatalogRepository.FindLiveRecordsOutsideAsync);
+        try
+        {
+            _dialogs.Expect("Unsaved Changes", DialogWatcher.IDYES);
+            ed.Window.Close();
+            Check(await WaitFor(() => _vm.StatusText.StartsWith("Failed to save", StringComparison.Ordinal), 10000),
+                $"a failure while asking says so (\"{_vm.StatusText}\")");
+            Check(IsOpen(ed.Window) && ed.Vm.CreateSubdirectory && await Unmoved(),
+                "and leaves the editor open with the edit in it, and nothing saved");
+        }
+        finally
+        {
+            _counter.FailOn = null;
+            _dialogs.ClearExpectations();
+        }
 
         _dialogs.Expect("Change Backup Folder", DialogWatcher.IDYES);
         ed.Vm.SaveCommand.Execute(null);

@@ -1463,16 +1463,30 @@ would see them as missing and prune them. So:
 * **the editor** asks ("Change Backup Folder") before a save that moves the
   backup folder (destination, "Create subdirectory", subfolder name) while files
   are recorded outside the new one: on the Save button, at Yes on the close
-  prompt (No keeps the editor open) and before seeding. The save at File > Exit
-  cannot ask and is left to the refusals;
+  prompt (No keeps the editor open) and before seeding. Yes at the close prompt
+  cancels that close and runs what the Save button runs, once `Closing` has
+  returned, so the catalog is never waited for inside the handler, and a failure
+  leaves the editor open with the edits. The save at File > Exit cannot ask and
+  is left to the refusals;
 * **Cleanup** treats the backup folder as unusable, with a banner saying why: no
-  purge, destination scan or reconcile.
+  purge, destination scan or reconcile. The same banner tells a backup folder that
+  does not exist while the folder above it does (a subfolder before the first
+  backup) from a drive that is not connected.
+
+What each says about the way out is one text, `RecordsElsewhere.Advice`. Records
+just above a subfolder can mean that "Create subdirectory" was turned on after
+backing up (turn it off), or that the set has backups both there and in the
+subfolder, from a Worker before 1.18 (clear the history, seed from the
+subfolder). The advice names both rather than guessing.
 
 Each asks again at the moment it acts, and Cleanup raises its busy flag before
 asking, so that a second click cannot start a second purge. A failed check counts
 as a refusal. "Another folder" ignores the drive letter, since a drive followed to
-a new letter is relabelled by nothing. `JobOptions.SameFolderOnAnyDrive` and
-`FolderWithoutDrive` are the definition, which the SQL mirrors. Change Destination
+a new letter is relabelled by nothing. `JobOptions.SameFolderOnAnyDrive` is the one
+definition, called by everything that compares: the catalog check reads the set's
+few distinct labels and compares them in C#, then looks for live records only
+under labels that differ. SQLite's `NOCASE` folds ASCII letters only, so a SQL
+copy of the rule would disagree with it on a name like "Ärger". Change Destination
 relabels by the same rule (`MainViewModel.RelabelDiscsAfterMoveAsync`), so a set
 recorded under two letters of one folder comes out of a move whole. The way out is
 the message's: move with Change Destination, put the subfolder setting back, or
@@ -1667,7 +1681,15 @@ while building this index is a full scan under it. The first reader builds it
 (`EnsurePreviousVersionIndexAsync`) under the set's cross-process write lock, so
 the other process's writers wait on the lock file, with no timeout, rather than
 failing on the busy timeout. Built once per set database; a caller can say why
-it waits (`onIndexing`).
+it waits (`onIndexing`): the backup engine's retention pass shows
+`DirectoryBackupService.IndexingEarlierVersionsMessage` on its progress line, and
+the Worker logs it, since its first full backup after an upgrade otherwise sat
+silently on "Applying retention rules" for minutes with the set locked. Seen from
+inside a caller's transaction, the index is never remembered as built, since it may
+be that transaction's own uncommitted build, which a rollback removes; the check
+is a cheap read next time. The in-use check (`FindDiscPathsInUseAsync`) reads
+once. It reads through the index, building it if needed, when asked only about
+earlier versions' paths, and reads every live row when asked about any other path.
 
 **After a retention change, the editor offers the versions it no longer keeps.**
 Without it they stayed until the user happened to open Cleanup (an emptied
