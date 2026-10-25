@@ -839,43 +839,62 @@ internal static class Program
             Name = "the other set", SourceRoots = [], CreatedUtc = DateTime.UtcNow,
             DefaultMediaType = MediaType.Directory, JobOptions = new JobOptions { TargetDirectory = theirs },
         });
-
-        // --- the other set's folder is refused ---
-        var ed = await OpenEditorAsync("shared: onto the other set's folder");
-        if (ed is null) return;
-        await Task.Delay(300);
-        ed.Vm.MarkClean();
-        ed.Vm.CreateSubdirectory = false;
-        ed.Vm.TargetDirectory = theirs + @"\";
-        _dialogs.Expect("Backup Folder In Use", DialogWatcher.IDOK);
-        ed.Vm.SaveCommand.Execute(null);
-        Check(await WaitFor(() => _dialogs.WasAnswered("Backup Folder In Use"), 10000),
-            "saving another set's backup folder is refused, and says why");
-        await Task.Delay(500);
-        Check(IsOpen(ed.Window) && (await DbSetAsync()).JobOptions is { CreateSubdirectory: true } stored
-              && !string.Equals(stored.TargetDirectory, theirs, StringComparison.OrdinalIgnoreCase),
-            "the editor stays open, and nothing is saved");
-        _dialogs.ClearExpectations();
-        await EnsureClosedAsync(ed.Window);
-
-        // --- two sets that already share a folder can still be edited ---
-        var mine = (await DbSetAsync()).JobOptions!;
-        other.JobOptions = new JobOptions
+        Editor? ed;
+        try
         {
-            TargetDirectory = mine.TargetDirectory, CreateSubdirectory = mine.CreateSubdirectory,
-            SubdirectoryName = mine.SubdirectoryName,
-        };
-        await _observer.UpdateBackupSetAsync(other);
-        ed = await OpenEditorAsync("shared: already shared, renamed");
-        if (ed is null) return;
-        await Task.Delay(300);
-        ed.Vm.MarkClean();
-        ed.Vm.SetName = "editor-save-test (shared)";
-        ed.Vm.SaveCommand.Execute(null);
-        Check(await WaitClosedAsync(ed.Window) && (await DbSetAsync()).Name == "editor-save-test (shared)",
-            "a save that leaves an already shared folder alone goes through (Cleanup refuses such sets)");
-        await EnsureClosedAsync(ed.Window);
-        await _observer.DeleteBackupSetAsync(other.Id);
+            // --- the other set's folder is refused ---
+            ed = await OpenEditorAsync("shared: onto the other set's folder");
+            if (ed is null) return;
+            await Task.Delay(300);
+            ed.Vm.MarkClean();
+            ed.Vm.CreateSubdirectory = false;
+            ed.Vm.TargetDirectory = theirs + @"\";
+            _dialogs.Expect("Backup Folder In Use", DialogWatcher.IDOK);
+            ed.Vm.SaveCommand.Execute(null);
+            Check(await WaitFor(() => _dialogs.WasAnswered("Backup Folder In Use"), 10000),
+                "saving another set's backup folder is refused, and says why");
+            await Task.Delay(500);
+            Check(IsOpen(ed.Window) && (await DbSetAsync()).JobOptions is { CreateSubdirectory: true } stored
+                  && !string.Equals(stored.TargetDirectory, theirs, StringComparison.OrdinalIgnoreCase),
+                "the editor stays open, and nothing is saved");
+            _dialogs.ClearExpectations();
+            await EnsureClosedAsync(ed.Window);
+
+            // --- two sets that already share a folder can still be edited ---
+            var mine = (await DbSetAsync()).JobOptions!;
+            other.JobOptions = new JobOptions
+            {
+                TargetDirectory = mine.TargetDirectory, CreateSubdirectory = mine.CreateSubdirectory,
+                SubdirectoryName = mine.SubdirectoryName,
+            };
+            await _observer.UpdateBackupSetAsync(other);
+            ed = await OpenEditorAsync("shared: already shared, renamed");
+            if (ed is null) return;
+            await Task.Delay(300);
+            ed.Vm.MarkClean();
+            ed.Vm.SetName = "editor-save-test (shared)";
+            ed.Vm.SaveCommand.Execute(null);
+            Check(await WaitClosedAsync(ed.Window) && (await DbSetAsync()).Name == "editor-save-test (shared)",
+                "a save that leaves an already shared folder alone goes through - it is how they are separated");
+            await EnsureClosedAsync(ed.Window);
+
+            // --- and until they are separated, neither is backed up ---
+            var row = _vm.BackupSets.First(r => r.Id == _setId);
+            int discsBefore = (await _observer.GetDiscsForBackupSetAsync(_setId)).Count;
+            _dialogs.Expect("Backup Folder Shared", DialogWatcher.IDOK);
+            _vm.SetBackupCommand.Execute(row);
+            Check(await WaitFor(() => _dialogs.WasAnswered("Backup Folder Shared"), 20000)
+                  && await WaitFor(() => _vm.StatusText.Contains("\"the other set\" backs up to the same folder",
+                      StringComparison.Ordinal), 5000),
+                $"backing up a set whose folder another set shares is refused, and says why (\"{_vm.StatusText}\")");
+            Check((await _observer.GetDiscsForBackupSetAsync(_setId)).Count == discsBefore, "and nothing is written");
+            _dialogs.ClearExpectations();
+        }
+        finally
+        {
+            // Left behind, it would share the test set's folder for every later section.
+            await _observer.DeleteBackupSetAsync(other.Id);
+        }
 
         // --- a changed destination gets a new volume identity ---
         var set = await DbSetAsync();

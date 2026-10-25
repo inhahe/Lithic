@@ -7,26 +7,27 @@ namespace LithicBackup.ViewModels;
 /// for the new set, choose which grouped parts of the source set to carry over
 /// (sources, settings, schedule), and set the destination directory directly.
 ///
-/// The destination is pre-filled with the source set's target directory, as a
-/// starting point to edit. The copy needs a backup folder of its own: one that is
-/// already a set's is refused (see JobOptions.SharesBackupFolderWith), and the
-/// dialog says so as soon as the destination names one. The copy starts with no
-/// backup history; it can be seeded from its own folder.
+/// The destination is pre-filled with a folder of the copy's own beside the
+/// original's (MainViewModel.SuggestedCopyFolder), so the dialog works as it
+/// opens. The copy needs a backup folder of its own: one that is already a set's
+/// is refused (see JobOptions.SharesBackupFolderWith), and the dialog says so as
+/// soon as the destination names one. The copy starts with no backup history; it
+/// can be seeded from its own folder.
 /// </summary>
 public class DuplicateBackupSetViewModel : ViewModelBase
 {
     private readonly Func<string, string?>? _backupFolderOwner;
 
     /// <param name="sourceName">The name of the set being copied.</param>
-    /// <param name="sourceTargetDirectory">Its destination, to start from.</param>
+    /// <param name="suggestedDestination">The copy's destination to start from.</param>
     /// <param name="backupFolderOwner">
     /// The name of the set whose backup folder a destination would be, or null.
     /// </param>
     public DuplicateBackupSetViewModel(
-        string sourceName, string? sourceTargetDirectory, Func<string, string?>? backupFolderOwner = null)
+        string sourceName, string? suggestedDestination, Func<string, string?>? backupFolderOwner = null)
     {
         _name = $"Copy of {sourceName}";
-        _targetDirectory = sourceTargetDirectory ?? string.Empty;
+        _targetDirectory = suggestedDestination ?? string.Empty;
         _backupFolderOwner = backupFolderOwner;
 
         BrowseTargetCommand = new RelayCommand(_ => BrowseTarget());
@@ -81,8 +82,8 @@ public class DuplicateBackupSetViewModel : ViewModelBase
 
     private string _targetDirectory;
     /// <summary>
-    /// Destination directory for the new set. Pre-filled with the source set's
-    /// target. Leave empty to choose a location later.
+    /// Destination directory for the new set. Pre-filled with a suggestion; empty
+    /// to choose a location later.
     /// </summary>
     public string TargetDirectory
     {

@@ -321,6 +321,9 @@ internal static class Program
         Check(!At(@"E:\B").SharesBackupFolderWith(At(@"E:\B", "Sub")), "a folder inside another's is not the same folder");
         Check(At(@"E:\B\Sub").SharesBackupFolderWith(At(@"E:\B", "Sub")), "a subfolder that makes them the same is");
         Check(!At(@"E:\B").SharesBackupFolderWith(new JobOptions()), "a set with no destination shares nothing");
+        Check(At(@"E:\B ").SharesBackupFolderWith(At(@"E:\B")) && At(@"E:\B.").SharesBackupFolderWith(At(@"E:\B"))
+              && At(@"E:\X\..\B").SharesBackupFolderWith(At(@"E:\B")) && At(@"E:\\B").SharesBackupFolderWith(At(@"E:\B")),
+            "paths Windows resolves to one folder are one folder: trailing space or dot, '..', doubled separators");
 
         string dir = Path.Combine(root, "cat23");
         Directory.CreateDirectory(dir);
@@ -335,20 +338,26 @@ internal static class Program
         };
         var first = await repo.CreateBackupSetAsync(NewSet("first", shared));
         var second = await repo.CreateBackupSetAsync(NewSet("second", shared));
-        Check(await LithicBackup.ViewModels.MainViewModel.SetSharingBackupFolderAsync(repo, first.Id, first.JobOptions!) == "second"
-              && await LithicBackup.ViewModels.MainViewModel.SetSharingBackupFolderAsync(repo, 0, At(Path.Combine(dir, "free"))) is null,
+        Check(await BackupFolderOwners.FindOtherAsync(repo, first.Id, first.JobOptions!) == "second"
+              && await BackupFolderOwners.FindOtherAsync(repo, 0, At(Path.Combine(dir, "free"))) is null,
             "the set that has a folder is found, and none for a free one");
 
-        // Saved before such sets were refused: Cleanup will not scan their folder.
+        // Saved before such sets were refused: Cleanup bans the folder - no purge,
+        // scan or reconcile - as for records elsewhere, and says why.
         var vm = new OrphanedDirectoriesViewModel(repo, first);
         vm.ScanCatalogCommand.Execute(null);
         await WaitFor(() => !vm.IsLoading, 60000);
-        vm.ScanDestinationCommand.Execute(null);
-        await WaitFor(() => vm.IsScanningDestination, 3000);
-        await WaitFor(() => !vm.IsScanningDestination, 60000);
-        Check(vm.DestinationScanStatusText.StartsWith("Not scanned", StringComparison.Ordinal)
-              && !vm.Items.Any(i => i.Reason == OrphanedReason.UntrackedFile),
-            $"Cleanup does not scan a folder another set shares, so offers none of its files (\"{vm.DestinationScanStatusText}\")");
+        Check(vm.IsDestinationUnavailable && !vm.ScanDestinationCommand.CanExecute(null)
+              && vm.DestinationUnavailableText.Contains("\"second\" backs up to the same folder", StringComparison.Ordinal),
+            $"Cleanup does not work in a folder another set shares, and says why (\"{vm.DestinationUnavailableText}\")");
+
+        // Copy suggests a folder of the copy's own, beside the original's.
+        BackupSet Rooted(string dest, string? sub = null) => new() { Name = "Main", JobOptions = At(dest, sub) };
+        Check(LithicBackup.ViewModels.MainViewModel.SuggestedCopyFolder(Rooted(@"E:\Backups\Main"), "Copy of Main") == @"E:\Backups\Copy of Main"
+              && LithicBackup.ViewModels.MainViewModel.SuggestedCopyFolder(Rooted(@"E:\"), "Copy of Main") == @"E:\Copy of Main"
+              && LithicBackup.ViewModels.MainViewModel.SuggestedCopyFolder(Rooted(@"E:\B", "Sub"), "a/b:c") == @"E:\B\a_b_c"
+              && LithicBackup.ViewModels.MainViewModel.SuggestedCopyFolder(new BackupSet(), "x") == "",
+            "Copy suggests a folder named for the copy beside the original's backup folder");
 
         // Copy: the dialog says so the moment the destination is another set's folder.
         var copy = new DuplicateBackupSetViewModel("first", shared,

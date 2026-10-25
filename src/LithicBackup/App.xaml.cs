@@ -566,6 +566,19 @@ public partial class App : Application
     /// </summary>
     internal void ExitApplication()
     {
+        // Open editors first, while their close can still be refused: one with
+        // unsaved changes asks as it always does, and its Yes saves - or keeps the
+        // editor open, when the save is refused or fails - as at any other time.
+        // Once Shutdown has begun nothing can stay open, and an edit that could not
+        // be saved would be lost. An editor still open after this - Cancel, or a
+        // save that goes on after the prompt - keeps the app running; it closes
+        // once saved, and Exit can be chosen again.
+        foreach (var editor in Windows.OfType<Views.BackupSetEditorWindow>().ToList())
+        {
+            editor.Close();
+            if (Windows.OfType<Views.BackupSetEditorWindow>().Contains(editor))
+                return;
+        }
         IsExiting = true;
         Shutdown();
     }

@@ -42,7 +42,7 @@
                   IsChecked="{Binding CopySchedule}"
                   Margin="0,0,0,16" />
 
-        <!-- Destination directory (inline, editable, pre-filled from source) -->
+        <!-- Destination directory (inline, editable, pre-filled with a folder of its own) -->
         <TextBlock Text="Destination directory:"
                    Foreground="{StaticResource TextSecondaryBrush}"
                    FontSize="11" Margin="0,0,0,4" />

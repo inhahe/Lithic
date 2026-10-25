@@ -145,6 +145,26 @@ public static class BackupSetTransfer
     }
 
     /// <summary>
+    /// Make an imported set's destination volume identity this computer's. One
+    /// that resolves here is kept: the same disk can carry its GUID to another
+    /// computer, and the set then follows it to whatever letter it has here. One
+    /// that does not is dropped and captured again from the path when its drive
+    /// is next seen: another computer may know the drive by another GUID, which
+    /// would never resolve here (the destination "not connected" for good), and a
+    /// set's folder would compare as another volume's than a local set's in it.
+    /// A drive that is not plugged in cannot be told from a foreign GUID, and
+    /// loses its identity too.
+    /// </summary>
+    public static void LocalizeDestination(JobOptions options, IDestinationResolver resolver)
+    {
+        if (string.IsNullOrEmpty(options.DestinationVolumeId) || resolver.Resolve(options).IsConnected)
+            return;
+        options.DestinationVolumeId = null;
+        options.DestinationSubpath = null;
+        resolver.Resolve(options);   // captured from the path, if its drive is here
+    }
+
+    /// <summary>
     /// Create a backup set from an export file, with its backup history if the
     /// file has it. Automated backups arrive paused
     /// (<see cref="JobOptions.HoldAutomatedBackups"/>). All or nothing: if the
@@ -155,9 +175,15 @@ public static class BackupSetTransfer
     /// The step under way and how far through it, at the <see cref="ProgressCadence"/>:
     /// extracting the history (bytes), then importing it (records).
     /// </param>
+    /// <param name="destinations">
+    /// This computer's destination resolver, to make the set's destination
+    /// identity this computer's (<see cref="LocalizeDestination"/>); null leaves
+    /// it as exported.
+    /// </param>
     public static async Task<BackupSetImportResult> ImportAsync(
         ICatalogRepository catalog, string path,
-        IProgress<ProgressReport>? progress = null, CancellationToken ct = default)
+        IProgress<ProgressReport>? progress = null, CancellationToken ct = default,
+        IDestinationResolver? destinations = null)
     {
         string? historyDb = null;
         try
@@ -197,7 +223,10 @@ public static class BackupSetTransfer
             // there is nothing to count.
             if (withHistory)
                 progress?.Report(new ProgressReport("Step 2 of 2: importing the backup history (preparing)", null));
-            var newSet = await catalog.CreateBackupSetAsync(exported.ToBackupSet(withHistory), ct);
+            var toCreate = exported.ToBackupSet(withHistory);
+            if (destinations is not null && toCreate.JobOptions is { } options)
+                LocalizeDestination(options, destinations);
+            var newSet = await catalog.CreateBackupSetAsync(toCreate, ct);
 
             int records = 0;
             if (withHistory)

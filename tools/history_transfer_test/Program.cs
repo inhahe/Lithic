@@ -167,6 +167,9 @@ string exportFile = Path.Combine(root, "laptop docs.lithic");
 var stagedInTemp = new System.Collections.Concurrent.ConcurrentBag<string>();
 using var tempWatch = new FileSystemWatcher(Path.GetTempPath(), "lithic-*") { EnableRaisingEvents = true };
 tempWatch.Created += (_, e) => stagedInTemp.Add(e.Name ?? "");
+// The destination's volume as the old computer knew it: a GUID this one does not.
+setAStored.JobOptions!.DestinationVolumeId = @"\\?\Volume{00000000-0000-0000-0000-0ldc0mputer1}\";
+setAStored.JobOptions.DestinationSubpath = "backup";
 await BackupSetTransfer.ExportAsync(repoA, setAStored, exportFile, includeHistory: true);
 byte[] head = File.ReadAllBytes(exportFile)[..4];
 Check(head[0] == 0x50 && head[1] == 0x4B, "an export with history is a zip");
@@ -193,7 +196,8 @@ for (int i = 1; i <= discsA.Count + 2; i++)
 }
 var otherDiscIds = (await repoB.GetDiscsForBackupSetAsync(other.Id)).Select(d => d.Id).ToHashSet();
 
-var imported = await BackupSetTransfer.ImportAsync(repoB, exportFile);
+var thisComputer = new Win32VolumeResolver();
+var imported = await BackupSetTransfer.ImportAsync(repoB, exportFile, destinations: new DestinationResolver(thisComputer));
 Check(!Directory.EnumerateFiles(repoB.DataDirectory, "lithic-import-*").Any(),
     "the import's staged history, kept beside the catalog, is gone afterwards");
 await Task.Delay(500);   // let the watcher's last events arrive
@@ -203,6 +207,13 @@ var setB = (await repoB.GetBackupSetAsync(imported.Set.Id))!;
 Check(imported.IncludedHistory, "the import found the history");
 Check(imported.FileRecords == allA.Count, $"every file record came across ({imported.FileRecords} of {allA.Count})");
 Check(setB.JobOptions?.HoldAutomatedBackups == true, "automated backups arrive held");
+string? localVolume = thisComputer.GetVolumeId(target);
+Check(localVolume is not null && setB.JobOptions?.DestinationVolumeId == localVolume,
+    $"the old computer's volume identity, which does not resolve here, is replaced by this one's ({setB.JobOptions?.DestinationVolumeId})");
+var resolvable = new JobOptions { TargetDirectory = target, DestinationVolumeId = localVolume, DestinationSubpath = "kept" };
+BackupSetTransfer.LocalizeDestination(resolvable, new DestinationResolver(thisComputer));
+Check(resolvable.DestinationVolumeId == localVolume && resolvable.DestinationSubpath == "kept",
+    "one that resolves here is kept, to follow the drive to its letter here");
 Check(setB.JobOptions?.Schedule is { Enabled: true, Mode: ScheduleMode.Continuous }, "the schedule itself is kept");
 Check(setB.LastBackupUtc == setAStored.LastBackupUtc, "the last-backup time came across (not 'Never backed up')");
 

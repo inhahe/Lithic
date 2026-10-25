@@ -1455,7 +1455,7 @@ folder, so they would retire those records and leave their files behind. Reconci
 would see them as missing and prune them. So:
 
 * **the Worker** refuses the set at all three of its paths (full, targeted,
-  moves), holds its automated backups and logs once (`RefuseBackupElsewhereAsync`);
+  moves), holds its automated backups and logs once (`RefuseUnusableBackupFolderAsync`);
   moves stay queued;
 * **backing up in the app** explains in a "Backup Folder Changed" box, and so does
   **removing dropped sources**, which asks before its review rather than after;
@@ -1500,35 +1500,63 @@ untracked. Pinned by `tools\excess_versions_test` §22, `tools\worker_idle_test`
 C12-C14 and `tools\editor_save_test` §26.
 
 **A backup folder belongs to one set.** Two sets in one folder would each list the
-other's files as untracked in Cleanup, offered for deletion, and backups of the
-same files would number their versions apart in one tree. So nothing gives a set a
-folder another set already has (`JobOptions.SharesBackupFolderWith`: the same
-volume, by identity when both sets know it and otherwise by drive letter, since
-two drives can hold folders of one name, and the same folder on it; one folder
-inside another is not the same). `MainViewModel.SetSharingBackupFolderAsync` finds
-the owner, and these refuse:
+other's files as untracked in Cleanup, offered for deletion. With the same
+records, as the old Copy "Backup history" option made them, either set's purges
+and retention delete files the other still records. And backups of the same files
+would number their versions apart in one tree.
 
-* **the editor**, on every save path, for a new set or a changed folder, but not
-  for an unchanged one, so that two sets saved before the rule can still be
-  edited. At File > Exit, which cannot ask, the edit is dropped and the user told;
-* **Change Destination**, before its confirmation;
-* **Import**, for a set whose folder is already here. The file's volume identity
-  was taken on its old computer, so it is looked up again from the path;
-* **Copy**, in its dialog as soon as the destination names a set's folder, and
-  against the catalog before creating. The copy never carries the original's
+`JobOptions.SharesBackupFolderWith` says what "the same folder" is: the same
+volume, by identity when both sets know it and otherwise by drive letter, since
+rotating backup drives can hold one folder name at one letter, and the same folder
+on it. Paths compare as Windows resolves them (`JobOptions.SamePath`:
+`GetFullPath`, so "..", doubled separators and trailing dots or spaces are
+disregarded). One folder inside another is not the same folder.
+`BackupFolderOwners.FindOther` finds the owner from every set's options, read
+without their selection trees. Every check compares a candidate whose identity
+has been looked up on this computer (`MainViewModel.ResolvedCopy`), so a folder is
+matched by volume whatever drive letters the sets last saw. An identity this
+computer cannot resolve is not kept on import (`BackupSetTransfer.LocalizeDestination`).
+A disk can carry its GUID to another computer (the author's 6 TB drive did, and its
+imported set followed it from `I:` to `F:`), and such an identity is kept. One that
+does not resolve is dropped and captured again from the path: it would never
+resolve here, leaving the destination "not connected" for good, and it would
+compare as another volume. A drive unplugged during the import cannot be told
+from a foreign GUID, and loses its identity too. Source identities are left as
+exported: one that does not resolve is skipped, and the paths are used.
+
+Nothing gives a set a folder another set has:
+
+* **the editor** refuses on every save path, for a new set or a changed folder,
+  but not for an unchanged one, since editing is how two sets saved before the
+  rule are separated. File > Exit closes open editors first, while they can still
+  refuse (`App.ExitApplication`); one that stays open keeps the app running. A
+  save at a Restart Manager exit, which cannot ask, drops the edit and says so;
+* **Change Destination** refuses before its confirmation;
+* **Import** refuses a set whose folder is already here, before importing, off the
+  UI thread;
+* **Copy** refuses in its dialog as soon as the destination names a set's folder,
+  by path, and against the catalog by volume before creating. It suggests a folder
+  named for the copy beside the original's (`MainViewModel.SuggestedCopyFolder`),
+  so the dialog works as it opens. The copy never carries the original's
   subfolder, and its old "Backup history" option is gone: it only worked with the
   original's own folder.
 
-Two sets that already share a folder are not refused anything but Cleanup's
-destination scan, which would offer one set's files as the other's strays.
+**Two sets that already share a folder** are held as for records elsewhere (the
+same three places). The Worker refuses and holds both. The app refuses to back
+either up, to remove dropped sources, and the retention offer
+(`MainViewModel.BackupFolderRefusalAsync`, "Backup Folder Shared"). Cleanup treats
+the folder as unusable. All say the way out (`BackupFolderOwners.SharedAdvice`):
+delete a set that is a copy of the other, or clear one set's history and give it
+a folder of its own.
 
 The editor also stops putting a changed destination back. It used to save the new
 path with the old volume identity, from which the resolver rebuilt the old path at
 the next backup. A destination that differs from the editor's own copy of the
 options is a change, and loses the identity, which is captured again from the new
 path. One that a drive's letter change moved while the editor was open is not a
-change, and keeps it. Pinned by `tools\excess_versions_test` §23 and
-`tools\editor_save_test` §21 and §27.
+change, and keeps it. Pinned by `tools\excess_versions_test` §23,
+`tools\editor_save_test` §21 and §27, `tools\worker_idle_test` C15 and
+`tools\history_transfer_test` 1.
 
 ## An empty catalog is not an empty destination
 

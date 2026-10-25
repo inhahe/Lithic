@@ -128,18 +128,46 @@ public class JobOptions
         if (!string.IsNullOrEmpty(DestinationVolumeId) && !string.IsNullOrEmpty(other.DestinationVolumeId))
             return string.Equals(DestinationVolumeId, other.DestinationVolumeId, StringComparison.OrdinalIgnoreCase)
                    && SameFolderOnAnyDrive(mine, theirs);
-        static string Full(string p) => p.Replace('/', '\\').TrimEnd('\\');
-        return string.Equals(Full(mine), Full(theirs), StringComparison.OrdinalIgnoreCase);
+        return SamePath(mine, theirs);
     }
 
     /// <summary>
+    /// Whether two paths name the same folder as Windows resolves them: case,
+    /// either separator, doubled and trailing separators, "." and ".." segments,
+    /// and the trailing dots and spaces Win32 drops all disregarded. The drive
+    /// letter counts; see <see cref="SameFolderOnAnyDrive"/> for when it doesn't.
+    /// </summary>
+    public static bool SamePath(string? a, string? b)
+        => a is not null && b is not null
+           && string.Equals(Normalized(a), Normalized(b), StringComparison.OrdinalIgnoreCase);
+
+    /// <summary>
     /// A folder path without its first two characters - the drive ("X:"), or a
-    /// UNC path's leading "\\" - with '/' read as '\' and no trailing separator.
+    /// UNC path's leading "\\" - normalised as <see cref="SamePath"/> normalises.
     /// </summary>
     public static string FolderWithoutDrive(string path)
     {
+        string p = Normalized(path);
+        return p.Length > 2 ? p[2..] : "";
+    }
+
+    /// <summary>
+    /// The path as Windows resolves it (<see cref="System.IO.Path.GetFullPath(string)"/>),
+    /// with no trailing separator; as given, with '/' read as '\', when it is not
+    /// a valid absolute path.
+    /// </summary>
+    private static string Normalized(string path)
+    {
         string p = path.Replace('/', '\\');
-        return (p.Length > 2 ? p[2..] : "").TrimEnd('\\');
+        try
+        {
+            if (System.IO.Path.IsPathFullyQualified(p))
+                p = System.IO.Path.GetFullPath(p);
+        }
+        catch (ArgumentException) { }
+        catch (NotSupportedException) { }
+        catch (System.IO.PathTooLongException) { }
+        return p.TrimEnd('\\');
     }
 
     /// <summary>

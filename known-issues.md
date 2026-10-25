@@ -29,10 +29,14 @@ left these sets to lose their earlier versions quietly.
 **Two sets with the same backup folder: refused since 1.18.0.** Two sets with one
 destination and no subfolder (or the same subfolder) shared a backup folder, and
 nothing stopped it: each set's Cleanup destination scan listed the other's files
-as untracked, for deletion. Saving, Change Destination, Import and Copy now
-refuse a folder another set has, and Cleanup will not scan one two existing sets
-share (design.md, "A backup folder belongs to one set"). Copy's "Backup history"
-option went with it: it only worked by keeping the original's folder.
+as untracked, for deletion, and a pair made by Copy's "Backup history" option had
+the same records, so either set's purges and retention could delete files the
+other still recorded. Saving, Change Destination, Import and Copy now refuse a
+folder another set has. Two sets that already share one are held: neither is
+backed up and nothing is deleted from the folder until one of them has its own,
+and the app, the background service's log and Cleanup say how (design.md, "A
+backup folder belongs to one set"). Copy's "Backup history" option went with it:
+it only worked by keeping the original's folder.
 
 **Removed:** `BackupJobViewModel`, the old new-set wizard, which nothing
 constructed, with its view, its template and `StartBurnForSavedSet`; its two
@@ -852,15 +856,16 @@ destination path at the time - and the drive-letter following never updated thos
 That is the situation of every set moved to a computer where its drive has
 another letter. Restore now falls back to the set's current destination.
 
-**Open:**
-- An imported set keeps the old computer's volume identities
-  (`DestinationVolumeId`, `SourceVolumeMappings`). They resolved on the computer
-  above (the log shows `i:` followed to `F:`), but where Windows gives the drive
-  a different volume GUID, the destination reads "not connected" until **Change
-  Destination** re-captures it.
-- **Duplicate** with "Backup history" (`CopyBackupSetCatalogAsync`) still copies
-  discs, files and chunks but not `DeduplicationBlocks`, so block dedup in the copy
-  starts without its index. Import does copy them.
+**Fixed since (2026-10-25):**
+- An imported set kept the old computer's destination volume identity. It resolved
+  on the computer above (the log shows `i:` followed to `F:`), but where Windows
+  gives the drive a different volume GUID, the destination read "not connected"
+  until **Change Destination** re-captured it. Import now keeps an identity only if
+  it resolves here, and otherwise captures it again from the path
+  (`BackupSetTransfer.LocalizeDestination`). Source identities are left as they
+  were: one that does not resolve is skipped, and the paths are used.
+- **Duplicate** with "Backup history" did not copy `DeduplicationBlocks`. The
+  option is gone (two sets may not share a folder), and with it the copier.
 
 ## FIXED: a paused backup held the set's write lock, stalling the Worker; other run-boundary hazards (2026-10-11)
 

@@ -1995,7 +1995,7 @@ public sealed class BackupWorker : BackgroundService
 
             // Dropped rather than requeued: nothing can run until the user acts,
             // and the full backup that follows picks these files up anyway.
-            if (await RefuseBackupElsewhereAsync(state, targetDir, ct)
+            if (await RefuseUnusableBackupFolderAsync(state, targetDir, ct)
                 || await RefuseUntrackedDestinationAsync(state, targetDir, ct))
                 return;
 
@@ -2100,7 +2100,7 @@ public sealed class BackupWorker : BackgroundService
 
             // Relocating copies the catalog records in another folder would lose
             // them; the moves stay queued until the user has sorted the set out.
-            if (await RefuseBackupElsewhereAsync(state, targetDir, ct))
+            if (await RefuseUnusableBackupFolderAsync(state, targetDir, ct))
                 return;
 
             var job = BuildJob(set, opts, targetDir);
@@ -2516,7 +2516,7 @@ public sealed class BackupWorker : BackgroundService
             if (!await ResolveSourcesAsync(state, runCt))
                 return ReconcileOutcome.DidNotRun; // No source available; retry later.
 
-            if (await RefuseBackupElsewhereAsync(state, targetDir, runCt)
+            if (await RefuseUnusableBackupFolderAsync(state, targetDir, runCt)
                 || await RefuseUntrackedDestinationAsync(state, targetDir, runCt))
                 return ReconcileOutcome.DidNotRun; // Until the user sorts the set out in the app.
 
@@ -2632,8 +2632,10 @@ public sealed class BackupWorker : BackgroundService
     }
 
     /// <summary>
-    /// True when the set must not be backed up because live records of its
-    /// catalog belong to a folder other than its backup folder
+    /// True when the set must not be backed up into its backup folder now. Either
+    /// another set backs up to the same folder (saved before that was refused),
+    /// so either set's retention and purges can delete the other's files. Or live
+    /// records of its catalog belong to a folder other than its backup folder
     /// (<see cref="ICatalogRepository.FindLiveRecordsOutsideAsync"/>): written
     /// before its subfolder setting changed, before its destination was retyped
     /// in the editor, or by a Worker that ignored "Create subdirectory". A backup
@@ -2641,22 +2643,40 @@ public sealed class BackupWorker : BackgroundService
     /// earlier versions lose their files. Held, and logged once, like the refusal
     /// below; the app explains when the user next backs the set up there.
     /// </summary>
-    private async Task<bool> RefuseBackupElsewhereAsync(SetState state, string targetDir, CancellationToken ct)
+    private async Task<bool> RefuseUnusableBackupFolderAsync(SetState state, string targetDir, CancellationToken ct)
     {
         var set = state.BackupSet;
-        string? elsewhere;
+        string? partner, elsewhere;
         try
         {
+            partner = await BackupFolderOwners.FindOtherAsync(_catalog, set.Id, set.JobOptions!, ct);
             elsewhere = await _catalog.FindLiveRecordsOutsideAsync(set.Id, targetDir, ct);
         }
         catch (OperationCanceledException) { throw; }
         catch (Exception ex)
         {
             _logger.LogWarning(ex,
-                "Could not check where the backed-up files of \"{Name}\" are recorded; skipping this run.", set.Name);
+                "Could not check the backup folder of \"{Name}\"; skipping this run.", set.Name);
             BlockRuns(state);
             return true;
         }
+
+        if (partner is not null)
+        {
+            BlockRuns(state);
+            if (!string.Equals(state.RefusedSharedWith, partner, StringComparison.OrdinalIgnoreCase))
+            {
+                state.RefusedSharedWith = partner;
+                _logger.LogWarning(
+                    "Not backing up \"{Name}\": \"{Partner}\" backs up to the same folder, {Target}, and either set "
+                    + "could delete the other's backed-up files. {Advice} Its automated backups are paused until "
+                    + "then, which its row in Lithic Backup shows.",
+                    set.Name, partner, targetDir, BackupFolderOwners.SharedAdvice(partner));
+            }
+            await HoldAutomatedBackupsAsync(set, ct);
+            return true;
+        }
+        state.RefusedSharedWith = null;
 
         if (elsewhere is null)
         {
@@ -2840,10 +2860,17 @@ public sealed class BackupWorker : BackgroundService
 
         /// <summary>
         /// The backup folder this set was last refused at because its catalog
-        /// records files in another folder (<c>RefuseBackupElsewhereAsync</c>), so
-        /// the refusal is logged once. Null while not refusing.
+        /// records files in another folder (<c>RefuseUnusableBackupFolderAsync</c>),
+        /// so the refusal is logged once. Null while not refusing.
         /// </summary>
         public string? RefusedElsewhereAt { get; set; }
+
+        /// <summary>
+        /// The set this one was last refused for sharing a backup folder with
+        /// (<c>RefuseUnusableBackupFolderAsync</c>), so the refusal is logged once.
+        /// Null while not refusing.
+        /// </summary>
+        public string? RefusedSharedWith { get; set; }
 
         /// <summary>
         /// Directories actually selected for this set (not the drive roots).

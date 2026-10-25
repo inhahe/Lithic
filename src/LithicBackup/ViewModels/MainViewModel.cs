@@ -868,9 +868,10 @@ public class MainViewModel : ViewModelBase
         // Before a save that would give the set a backup folder another set
         // already has: the refusal's text, or null. Always for a new set; for
         // others only when the save changes the folder, so that two sets which
-        // already share one can still be edited (Cleanup refuses them). The
-        // editor's fields are read here, the catalog off the UI thread without
-        // coming back to it, since File > Exit waits for this synchronously.
+        // already share one can still be edited - it is how they are separated
+        // (until then both are held: BackupFolderRefusalAsync). The editor's
+        // fields are read here, the catalog and the volume off the UI thread
+        // without coming back to it, since File > Exit waits for this synchronously.
         Task<string?> BackupFolderInUseAsync()
         {
             var opts = EditorJobOptions(backupSet, sourceSelection);
@@ -879,12 +880,15 @@ public class MainViewModel : ViewModelBase
                 return Task.FromResult<string?>(null);
             return Task.Run(async () =>
             {
+                var sets = await _catalog.GetAllBackupSetOptionsAsync();
                 if (!isNew
-                    && (await _catalog.GetBackupSetAsync(backupSet.Id))?.JobOptions?.BackupRoot() is { } oldRoot
-                    && string.Equals(oldRoot.TrimEnd('\\', '/'), newRoot.TrimEnd('\\', '/'), StringComparison.OrdinalIgnoreCase))
+                    && sets.FirstOrDefault(s => s.Id == backupSet.Id)?.JobOptions?.BackupRoot() is { } oldRoot
+                    && JobOptions.SamePath(oldRoot, newRoot))
                     return null;
-                return await SetSharingBackupFolderAsync(_catalog, backupSet.Id, opts) is { } owner
-                    ? BackupFolderInUseMessage(newRoot, owner)
+                return BackupFolderOwners.FindOther(sets, backupSet.Id, ResolvedCopy(opts)) is { } owner
+                    ? BackupFolderInUseMessage(newRoot, owner,
+                        "Choose another destination, or give this set a folder of its own there "
+                        + "(\"Create subdirectory\").")
                     : null;
             });
         }
@@ -2060,10 +2064,10 @@ public class MainViewModel : ViewModelBase
         // the catalog, so the answer holds through the review; whether the drive
         // is there is asked after it, since it can be plugged in meanwhile.
         string? targetDir = backupSet.JobOptions?.BackupRoot();
-        if (targetDir is not null && await RecordsElsewhereRefusalAsync(backupSet, targetDir) is { } elsewhereMessage)
+        if (targetDir is not null && await BackupFolderRefusalAsync(backupSet, targetDir) is { } refusal)
         {
-            MessageBox.Show(elsewhereMessage, "Backup Folder Changed", MessageBoxButton.OK, MessageBoxImage.Warning);
-            StatusText = "Left the removed-source files in place: some of the set's files are recorded in another folder.";
+            MessageBox.Show(refusal.Message, refusal.Title, MessageBoxButton.OK, MessageBoxImage.Warning);
+            StatusText = $"Left the removed-source files in place: {refusal.Reason}.";
             return;
         }
 
@@ -2313,10 +2317,10 @@ public class MainViewModel : ViewModelBase
                              + "earlier versions its new retention settings no longer keep are left for Cleanup.";
                 return;
             }
-            if (await RecordsElsewhereRefusalAsync(set, root) is not null)
+            if (await BackupFolderRefusalAsync(set, root) is { } refusal)
             {
-                StatusText = $"Saved \"{set.Name}\". Some of its backed-up files are recorded in another folder than "
-                             + $"{root}, so no earlier versions were offered for removal; backing it up explains.";
+                StatusText = $"Saved \"{set.Name}\". No earlier versions were offered for removal: {refusal.Reason}; "
+                             + "backing it up explains.";
                 return;
             }
 
@@ -2752,29 +2756,51 @@ public class MainViewModel : ViewModelBase
     // -------------------------------------------------------------------
 
     /// <summary>
-    /// The name of a set other than <paramref name="setId"/> whose backup folder
-    /// <paramref name="options"/> would share (see
-    /// <see cref="JobOptions.SharesBackupFolderWith"/>), or null when none.
+    /// Why a set may not have the backup folder <paramref name="root"/>, which
+    /// <paramref name="owner"/> has, followed by <paramref name="wayOut"/>: what
+    /// the user can do instead where the refusal happens.
     /// </summary>
-    /// <param name="setId">The set the options are for; 0 for one not created yet.</param>
-    /// <param name="options">Its options as they would be saved.</param>
-    public static async Task<string?> SetSharingBackupFolderAsync(
-        ICatalogRepository catalog, int setId, JobOptions options)
-    {
-        foreach (var other in await catalog.GetAllBackupSetsAsync())
-        {
-            if (other.Id != setId && other.JobOptions is { } theirs && options.SharesBackupFolderWith(theirs))
-                return other.Name;
-        }
-        return null;
-    }
-
-    /// <summary>Why a set may not have the backup folder <paramref name="root"/>, which <paramref name="owner"/> has.</summary>
-    internal static string BackupFolderInUseMessage(string root, string owner) =>
+    internal static string BackupFolderInUseMessage(string root, string owner, string wayOut) =>
         $"The backup folder\n    {root}\nis already the backup folder of \"{owner}\".\n\n"
         + "Two sets cannot share one: each set's Cleanup would offer the other's backed-up files for "
-        + "deletion, and backups of the same files would get in each other's way. Choose another "
-        + "destination, or give this set a folder of its own there (\"Create subdirectory\" in its editor).";
+        + "deletion, and backups of the same files would get in each other's way. " + wayOut;
+
+    /// <summary>
+    /// A copy of <paramref name="source"/>, moved to <paramref name="destination"/>
+    /// when one is given, with its destination's volume identity looked up on this
+    /// computer if it has none - as the resolver will at the next backup. What a
+    /// folder about to be given to a set is compared with the other sets' folders
+    /// by: by volume, whatever drive letters any of them last saw.
+    /// </summary>
+    private JobOptions ResolvedCopy(JobOptions source, string? destination = null)
+    {
+        var copy = JsonSerializer.Deserialize<JobOptions>(JsonSerializer.Serialize(source, _jsonOptions), _jsonOptions)!;
+        if (destination is not null)
+        {
+            copy.TargetDirectory = destination;
+            copy.DestinationVolumeId = null;
+            copy.DestinationSubpath = null;
+        }
+        if (string.IsNullOrEmpty(copy.DestinationVolumeId))
+            _destinationResolver?.Resolve(copy);
+        return copy;
+    }
+
+    /// <summary>
+    /// Where Copy suggests the copy of <paramref name="source"/> back up to: a
+    /// folder named for <paramref name="copyName"/> beside the source's backup
+    /// folder, which no set has yet; empty when the source has no destination.
+    /// Its own folder, so that accepting the dialog as it opens works.
+    /// </summary>
+    public static string SuggestedCopyFolder(BackupSet source, string copyName)
+    {
+        if (source.JobOptions?.BackupRoot() is not { } root)
+            return "";
+        string trimmed = root.TrimEnd('\\', '/');
+        string beside = Path.GetDirectoryName(trimmed) ?? (trimmed.Length == 2 ? trimmed + "\\" : trimmed);
+        string name = string.Concat(copyName.Select(c => Path.GetInvalidFileNameChars().Contains(c) ? '_' : c)).Trim();
+        return Path.Combine(beside, name.Length > 0 ? name : "Copy");
+    }
 
     /// <summary>
     /// Relabel a set's discs for Change Destination, so they name the folders
@@ -2860,20 +2886,17 @@ public class MainViewModel : ViewModelBase
             return;
 
         // Not into another set's backup folder; asked before the confirmation,
-        // which would otherwise end in a refusal. The new path's volume is looked
-        // up on a copy of the options, as the move below does for real.
+        // which would otherwise end in a refusal. On a copy of the options, moved
+        // and resolved as the move below does for real.
         try
         {
-            var moved = JsonSerializer.Deserialize<JobOptions>(
-                JsonSerializer.Serialize(backupSet.JobOptions, _jsonOptions), _jsonOptions)!;
-            moved.TargetDirectory = newPath;
-            moved.DestinationVolumeId = null;
-            moved.DestinationSubpath = null;
-            _destinationResolver?.Resolve(moved);
-            if (await SetSharingBackupFolderAsync(_catalog, backupSet.Id, moved) is { } owner)
+            var moved = ResolvedCopy(backupSet.JobOptions, newPath);
+            if (await BackupFolderOwners.FindOtherAsync(_catalog, backupSet.Id, moved) is { } owner)
             {
-                MessageBox.Show(BackupFolderInUseMessage(moved.BackupRoot()!, owner), "Backup Folder In Use",
-                    MessageBoxButton.OK, MessageBoxImage.Warning);
+                MessageBox.Show(BackupFolderInUseMessage(moved.BackupRoot()!, owner,
+                        "Choose another destination, or first give this set a folder of its own in its editor "
+                        + "(\"Create subdirectory\")."),
+                    "Backup Folder In Use", MessageBoxButton.OK, MessageBoxImage.Warning);
                 StatusText = $"Destination not changed: {moved.BackupRoot()} is \"{owner}\"'s backup folder.";
                 return;
             }
@@ -3099,11 +3122,12 @@ public class MainViewModel : ViewModelBase
 
         var src = SelectedBackupSet;
 
-        // Ask the user which parts of the set to carry over.
-        // The dialog refuses a destination that is already a set's backup folder,
-        // from the sets in the list; the catalog is asked again before creating.
+        // Ask the user which parts of the set to carry over, and where the copy
+        // backs up: a folder of its own, suggested beside the original's. The
+        // dialog refuses a set's backup folder, judged by path from the sets in
+        // the list; the catalog is asked again, by volume, before creating.
         var sets = BackupSets.Select(r => r.Model).ToList();
-        var vm = new DuplicateBackupSetViewModel(src.Name, src.JobOptions?.TargetDirectory,
+        var vm = new DuplicateBackupSetViewModel(src.Name, SuggestedCopyFolder(src, $"Copy of {src.Name}"),
             destination => sets.FirstOrDefault(s => s.JobOptions is { } theirs
                 && new JobOptions { TargetDirectory = destination }.SharesBackupFolderWith(theirs))?.Name);
         var dialog = new DuplicateBackupSetDialog
@@ -3189,12 +3213,14 @@ public class MainViewModel : ViewModelBase
                 }
             }
 
-            // Not into another set's backup folder (the dialog judged from the
-            // list, which a set added meanwhile, by import say, is not yet in).
+            // Not into another set's backup folder. The dialog judged by path from
+            // the list; this judges by volume, from the catalog, which also has any
+            // set added meanwhile (by an import, say).
             if (copiedOptions is not null
-                && await SetSharingBackupFolderAsync(_catalog, 0, copiedOptions) is { } owner)
+                && await BackupFolderOwners.FindOtherAsync(_catalog, 0, ResolvedCopy(copiedOptions)) is { } owner)
             {
-                MessageBox.Show(BackupFolderInUseMessage(copiedOptions.BackupRoot()!, owner),
+                MessageBox.Show(BackupFolderInUseMessage(copiedOptions.BackupRoot()!, owner,
+                        "Choose another destination for the copy."),
                     "Duplicate Backup Set", MessageBoxButton.OK, MessageBoxImage.Warning);
                 StatusText = $"Did not copy \"{src.Name}\": the destination is \"{owner}\"'s backup folder.";
                 return;
@@ -4099,10 +4125,10 @@ public class MainViewModel : ViewModelBase
 
         // Records written to a folder other than the backup folder: a backup here
         // would lose track of their earlier versions. Refused, and said why.
-        if (isDir && await RecordsElsewhereRefusalAsync(backupSet, job.TargetDirectory!) is { } elsewhereMessage)
+        if (isDir && await BackupFolderRefusalAsync(backupSet, job.TargetDirectory!) is { } refusal)
         {
-            MessageBox.Show(elsewhereMessage, "Backup Folder Changed", MessageBoxButton.OK, MessageBoxImage.Warning);
-            StatusText = $"\"{backupSet.Name}\" was not backed up: its backed-up files are recorded in another folder.";
+            MessageBox.Show(refusal.Message, refusal.Title, MessageBoxButton.OK, MessageBoxImage.Warning);
+            StatusText = $"\"{backupSet.Name}\" was not backed up: {refusal.Reason}.";
             return;
         }
 
@@ -4556,8 +4582,7 @@ public class MainViewModel : ViewModelBase
         // while the editor was open is followed by it, not by the editor's field.
         if (vm.IsDirectoryMode)
         {
-            if (!string.Equals(opts.TargetDirectory?.TrimEnd('\\', '/'), vm.TargetDirectory?.TrimEnd('\\', '/'),
-                    StringComparison.OrdinalIgnoreCase))
+            if (!JobOptions.SamePath(opts.TargetDirectory, vm.TargetDirectory))
             {
                 opts.DestinationVolumeId = null;
                 opts.DestinationSubpath = null;
@@ -5553,24 +5578,29 @@ public class MainViewModel : ViewModelBase
         {
             // Not into another set's backup folder (importing a set already here
             // does exactly that). The file's volume identity was taken on the
-            // computer it came from, so it is looked up again here from the path.
-            var (settings, _) = await BackupSetTransfer.ReadSummaryAsync(fileName);
-            if (settings.JobOptions is { } imported)
+            // computer it came from: judged as the import will keep it - this
+            // computer's if it resolves here, otherwise looked up from the path.
+            // Off the UI thread: the path can be a slow or unreachable share.
+            var (name, inUse) = await Task.Run(async () =>
             {
-                var here = JsonSerializer.Deserialize<JobOptions>(
-                    JsonSerializer.Serialize(imported, _jsonOptions), _jsonOptions)!;
-                here.DestinationVolumeId = null;
-                here.DestinationSubpath = null;
-                _destinationResolver?.Resolve(here);
-                if (await SetSharingBackupFolderAsync(_catalog, 0, here) is { } owner)
-                {
-                    StatusText = $"Did not import \"{settings.Name}\": its backup folder is \"{owner}\"'s.";
-                    MessageBox.Show(PromptOwner(),
-                        $"\"{settings.Name}\" was not imported.\n\n" + BackupFolderInUseMessage(here.BackupRoot()!, owner)
-                        + "\n\nTo import it anyway, give the existing set another folder first.",
-                        "Import Backup Set", MessageBoxButton.OK, MessageBoxImage.Warning);
-                    return;
-                }
+                var (settings, _) = await BackupSetTransfer.ReadSummaryAsync(fileName);
+                if (settings.JobOptions is not { TargetDirectory: not null } imported)
+                    return (settings.Name, (string?)null);
+                var here = ResolvedCopy(imported);
+                if (_destinationResolver is not null)
+                    BackupSetTransfer.LocalizeDestination(here, _destinationResolver);
+                return (settings.Name, await BackupFolderOwners.FindOtherAsync(_catalog, 0, here) is { } owner
+                    ? BackupFolderInUseMessage(here.BackupRoot()!, owner,
+                        $"If it is \"{owner}\" itself, it is already here. Otherwise give \"{owner}\" another "
+                        + "backup folder first, then import this set again.")
+                    : null);
+            });
+            if (inUse is not null)
+            {
+                StatusText = $"Did not import \"{name}\": its backup folder is another set's.";
+                MessageBox.Show(PromptOwner(), $"\"{name}\" was not imported.\n\n" + inUse,
+                    "Import Backup Set", MessageBoxButton.OK, MessageBoxImage.Warning);
+                return;
             }
 
             CrashLogger.Log(null, $"GUI: importing {fileName}.");
@@ -5584,7 +5614,7 @@ public class MainViewModel : ViewModelBase
                 "Import Backup Set",
                 $"Importing {fileName}",
                 cancellable: true,
-                (progress, ct) => BackupSetTransfer.ImportAsync(_catalog, fileName, progress, ct));
+                (progress, ct) => BackupSetTransfer.ImportAsync(_catalog, fileName, progress, ct, _destinationResolver));
             if (!completed)
             {
                 // The import creates its set before the history goes in and
@@ -5891,6 +5921,52 @@ public class MainViewModel : ViewModelBase
     }
 
     /// <summary>
+    /// Why nothing may be written to or deleted from the set's backup folder
+    /// <paramref name="backupRoot"/> now, or null when it may. Another set backs
+    /// up to the same folder (saved before that was refused), so either set's
+    /// purges and retention can delete the other's files. Or live records of the
+    /// set belong to another folder
+    /// (<see cref="ICatalogRepository.FindLiveRecordsOutsideAsync"/>): a backup
+    /// there cannot find those copies, so each changed file's earlier versions
+    /// lose their files, and a purge there retires records without deleting them.
+    /// A check that fails refuses too.
+    /// </summary>
+    /// <returns>The title and text of the box that says so, and a short reason for a status line.</returns>
+    private async Task<(string Title, string Message, string Reason)?> BackupFolderRefusalAsync(
+        BackupSet set, string backupRoot)
+    {
+        string? partner, elsewhere;
+        try
+        {
+            partner = set.JobOptions is { } options
+                ? await BackupFolderOwners.FindOtherAsync(_catalog, set.Id, options)
+                : null;
+            elsewhere = await _catalog.FindLiveRecordsOutsideAsync(set.Id, backupRoot);
+        }
+        catch (Exception ex)
+        {
+            CrashLogger.Log(ex, $"GUI: checking the backup folder of \"{set.Name}\"");
+            return ("Backup Folder Not Checked",
+                $"Could not check the backup folder of \"{set.Name}\": {ex.Message}",
+                "its backup folder could not be checked");
+        }
+        if (partner is not null)
+            return ("Backup Folder Shared",
+                $"\"{set.Name}\" and \"{partner}\" back up to the same folder,\n    {backupRoot}\n\n"
+                + "Working there would let either set delete the other's backed-up files, so nothing was done.\n\n"
+                + BackupFolderOwners.SharedAdvice(partner),
+                $"\"{partner}\" backs up to the same folder");
+        if (elsewhere is not null)
+            return ("Backup Folder Changed",
+                $"Some of \"{set.Name}\"'s backed-up files are recorded in\n    {elsewhere}\n"
+                + $"but its backup folder is now\n    {backupRoot}\n\n"
+                + "Working there would lose track of them and their earlier versions, so nothing was done.\n\n"
+                + RecordsElsewhere.Advice(elsewhere, backupRoot),
+                "its backed-up files are recorded in another folder");
+        return null;
+    }
+
+    /// <summary>
     /// Before backing up a directory set: if its catalog is empty but its
     /// destination already holds backed-up files where it writes, say so and let
     /// the user choose. Returns whether to go ahead.
@@ -5902,34 +5978,6 @@ public class MainViewModel : ViewModelBase
     /// the set. Seeding records what is there instead; "back up anyway" remains
     /// for when copying it all again is really what the user wants.
     /// </remarks>
-    /// <summary>
-    /// Why the set must not be written to or deleted from in
-    /// <paramref name="backupRoot"/>, or null when it may: live records of its
-    /// catalog belong to another folder
-    /// (<see cref="ICatalogRepository.FindLiveRecordsOutsideAsync"/>). A backup
-    /// there cannot find those copies, so each changed file's earlier versions
-    /// lose their files, and a purge there retires records without deleting them.
-    /// A check that fails refuses too.
-    /// </summary>
-    private async Task<string?> RecordsElsewhereRefusalAsync(BackupSet set, string backupRoot)
-    {
-        string? elsewhere;
-        try
-        {
-            elsewhere = await _catalog.FindLiveRecordsOutsideAsync(set.Id, backupRoot);
-        }
-        catch (Exception ex)
-        {
-            CrashLogger.Log(ex, $"GUI: checking where the files of \"{set.Name}\" are recorded");
-            return $"Could not check where the backed-up files of \"{set.Name}\" are recorded: {ex.Message}";
-        }
-        return elsewhere is null ? null
-            : $"Some of \"{set.Name}\"'s backed-up files are recorded in\n    {elsewhere}\n"
-              + $"but its backup folder is now\n    {backupRoot}\n\n"
-              + "Working there would lose track of them and their earlier versions, so nothing was done.\n\n"
-              + RecordsElsewhere.Advice(elsewhere, backupRoot);
-    }
-
     private async Task<bool> ConfirmBackupOverUntrackedDestinationAsync(
         BackupSet backupSet, IReadOnlyList<SourceSelection> sources, string targetDirectory)
     {

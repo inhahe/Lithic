@@ -387,7 +387,11 @@ public class OrphanedDirectoriesViewModel : ViewModelBase, IConfirmClose, IDispo
     private bool _backupFolderMissing;
 
     /// <summary>Banner text: why the backup folder cannot be used.</summary>
-    public string DestinationUnavailableText => _recordsElsewhere is { } elsewhere
+    public string DestinationUnavailableText => _sharedWith is { } partner
+        ? $"\"{partner}\" backs up to the same folder, {_targetDir}  —  either set could delete the "
+          + "other's backed-up files, so nothing can be deleted from the backup or scanned there. "
+          + BackupFolderOwners.SharedAdvice(partner)
+        : _recordsElsewhere is { } elsewhere
         ? $"Some of this set's backed-up files are recorded in {elsewhere}, not in its backup folder " +
           $"{_targetDir}  —  nothing can be deleted from the backup or scanned there until that is sorted " +
           "out. " + RecordsElsewhere.Advice(elsewhere, _targetDir!)
@@ -406,13 +410,34 @@ public class OrphanedDirectoriesViewModel : ViewModelBase, IConfirmClose, IDispo
     /// </summary>
     private string? _recordsElsewhere;
 
-    /// <summary>Re-ask where the set's live records are; see <see cref="_recordsElsewhere"/>.</summary>
-    private async Task RefreshRecordsElsewhereAsync()
+    /// <summary>
+    /// Another set whose backup folder this set's is (saved before that was
+    /// refused; see <see cref="BackupFolderOwners"/>), or null. While there is
+    /// one, the backup folder is treated as unusable: either set's purges can
+    /// delete the other's files, and the destination scan lists them all as
+    /// untracked.
+    /// </summary>
+    private string? _sharedWith;
+
+    /// <summary>
+    /// Whether the backup folder cannot be used for a reason of its own rather
+    /// than an unconnected drive: records elsewhere, a partner, or no folder yet.
+    /// </summary>
+    private bool HasFolderProblem => _recordsElsewhere is not null || _sharedWith is not null || _backupFolderMissing;
+
+    /// <summary>
+    /// Re-ask where the set's live records are and whether another set shares its
+    /// folder; see <see cref="_recordsElsewhere"/> and <see cref="_sharedWith"/>.
+    /// </summary>
+    private async Task RefreshFolderChecksAsync()
     {
         if (_targetDir is null)
             return;
         try
         {
+            _sharedWith = _backupSet.JobOptions is { } options
+                ? await BackupFolderOwners.FindOtherAsync(_catalog, _backupSet.Id, options)
+                : null;
             _recordsElsewhere = await _catalog.FindLiveRecordsOutsideAsync(_backupSet.Id, _targetDir);
         }
         catch (Exception ex)
@@ -448,7 +473,7 @@ public class OrphanedDirectoriesViewModel : ViewModelBase, IConfirmClose, IDispo
     private void RefreshDestinationAvailability()
     {
         bool reachable = Services.DestinationFilePurger.IsAvailable(_targetDir);
-        bool available = reachable && _recordsElsewhere is null;
+        bool available = reachable && _recordsElsewhere is null && _sharedWith is null;
         // The drive is there, but not the backup folder: with "Create subdirectory"
         // before the first backup has made it, or a folder moved or deleted.
         bool folderMissing = !reachable && _targetDir is not null
@@ -597,7 +622,7 @@ public class OrphanedDirectoriesViewModel : ViewModelBase, IConfirmClose, IDispo
     {
         IsLoading = true;
         // So the banner says, before anything else, when the backup folder cannot be used.
-        await RefreshRecordsElsewhereAsync();
+        await RefreshFolderChecksAsync();
         // Taken before the catalog is read - a purge leaves alone anything written
         // since - and kept, with the files read, only once this scan's results
         // replace the listed ones: the purge acts on what is listed.
@@ -1728,10 +1753,10 @@ public class OrphanedDirectoriesViewModel : ViewModelBase, IConfirmClose, IDispo
             // be unplugged while the dialog sits open; without it the walk would get
             // as far as throwing DirectoryNotFoundException and report the failure
             // as if it were an unexpected error rather than a disconnected drive.
-            await RefreshRecordsElsewhereAsync();
+            await RefreshFolderChecksAsync();
             if (!_destinationAvailable)
             {
-                DestinationScanStatusText = _recordsElsewhere is null && !_backupFolderMissing
+                DestinationScanStatusText = !HasFolderProblem
                     ? $"Destination not connected: {_targetDir} — connect it and scan again."
                     : DestinationUnavailableText;
                 return;
@@ -1744,19 +1769,8 @@ public class OrphanedDirectoriesViewModel : ViewModelBase, IConfirmClose, IDispo
             // matching a folder on another drive only skips it, offering nothing.
             var otherSetsInside = new List<string>();
             string root = JobOptions.FolderWithoutDrive(_targetDir);
-            foreach (var other in await _catalog.GetAllBackupSetsAsync())
+            foreach (var other in await _catalog.GetAllBackupSetOptionsAsync())
             {
-                // Another set in this very folder - saved before such sets were
-                // refused - would have every one of its files listed as untracked.
-                if (other.Id != _backupSet.Id && other.JobOptions is { } theirs
-                    && _backupSet.JobOptions?.SharesBackupFolderWith(theirs) == true)
-                {
-                    DestinationScanStatusText =
-                        $"Not scanned: {_targetDir} is also the backup folder of \"{other.Name}\", whose files "
-                        + "would all be listed here as untracked. Give one of the two sets a folder of its own "
-                        + "(a new destination, or \"Create subdirectory\") first.";
-                    return;
-                }
                 if (other.Id != _backupSet.Id
                     && other.JobOptions?.BackupRoot() is { } otherRoot
                     && JobOptions.FolderWithoutDrive(otherRoot) is var inner
@@ -2325,15 +2339,15 @@ public class OrphanedDirectoriesViewModel : ViewModelBase, IConfirmClose, IDispo
         // Busy before the check is awaited: a second click on Purge meanwhile
         // would otherwise pass the IsBusy test above and purge the same items twice.
         IsPurging = true;
-        await RefreshRecordsElsewhereAsync();
+        await RefreshFolderChecksAsync();
         if (IsDestinationUnavailable)
         {
             IsPurging = false;
-            string msg = _recordsElsewhere is { } elsewhere
+            string msg = _sharedWith is null && _recordsElsewhere is { } elsewhere
                 ? $"Some of this set's backed-up files are recorded in {elsewhere}, not in its backup " +
                   $"folder ({_targetDir}), so nothing was cleaned: the cleanup would retire their records " +
                   "without deleting their files."
-                : _backupFolderMissing
+                : HasFolderProblem
                 ? DestinationUnavailableText
                 : $"Destination not connected ({_targetDir}) — nothing was cleaned. " +
                   "Connect the drive and run the cleanup again; marking the catalog " +
@@ -2916,8 +2930,8 @@ public class OrphanedDirectoriesViewModel : ViewModelBase, IConfirmClose, IDispo
     // Catalog reconcile (dry-run analyze, then explicit apply)
     // ------------------------------------------------------------------
 
-    /// <summary>Why a reconcile was not started: the drive is missing, the backup folder is, or the set's records are elsewhere.</summary>
-    private string ReconcileRefusalText => _recordsElsewhere is null && !_backupFolderMissing
+    /// <summary>Why a reconcile was not started: the drive is missing, or the backup folder cannot be used.</summary>
+    private string ReconcileRefusalText => !HasFolderProblem
         ? $"Destination not connected: {_targetDir} - connect it and analyze again."
         : DestinationUnavailableText;
 
@@ -2937,7 +2951,7 @@ public class OrphanedDirectoriesViewModel : ViewModelBase, IConfirmClose, IDispo
         // look like missing content. Busy before the check is awaited, so that
         // nothing else starts meanwhile.
         IsReconciling = true;
-        await RefreshRecordsElsewhereAsync();
+        await RefreshFolderChecksAsync();
         if (!_destinationAvailable)
         {
             IsReconciling = false;
@@ -3016,7 +3030,7 @@ public class OrphanedDirectoriesViewModel : ViewModelBase, IConfirmClose, IDispo
         // unplugged; applying it then would prune rows whose content is merely
         // unreachable.
         IsReconciling = true;
-        await RefreshRecordsElsewhereAsync();
+        await RefreshFolderChecksAsync();
         if (!_destinationAvailable)
         {
             IsReconciling = false;

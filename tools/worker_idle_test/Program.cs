@@ -28,6 +28,7 @@
 //      C11 with "create subdirectory", the Worker backs up into the subfolder.
 //      C12-C14 a set with live records outside its backup folder is refused and
 //         held by the full backup, a continuous one and a rename.
+//      C15 two sets that back up to one folder are refused and held.
 //
 // Build with -p:OldCode=true to compile only what also builds against the code
 // before the change (A2 and C), and watch it fail there.
@@ -971,6 +972,39 @@ async Task PartC()
         Check(File.Exists(Path.Combine(inSub, "one.txt")) && !File.Exists(Path.Combine(inSub, "renamed.txt")),
             "C14 and the copy in the subfolder is not moved");
         Check(moves.Count == 1, "C14 the move stays queued for when the set is sorted out");
+        await rig.DisposeAsync();
+    }
+
+    // C15 -------------------------------------------------------------------
+    // Two sets that back up to one folder - saved before that was refused - are
+    // not backed up: either's retention and purges could delete the other's files.
+    {
+        string dir = Path.Combine(root, "c15");
+        string src = Path.Combine(dir, "src");
+        string dst = Path.Combine(dir, "dst");
+        Directory.CreateDirectory(src);
+        Directory.CreateDirectory(dst);
+        File.WriteAllText(Path.Combine(src, "one.txt"), "one");
+        var rig = await Rig.CreateAsync(Path.Combine(dir, "catalog.db"), stampedSetIds, set =>
+        {
+            set.SourceSelections = [ new SourceSelection { Path = src, IsDirectory = true, IsSelected = true } ];
+            set.SourceRoots = [src];
+            set.JobOptions!.TargetDirectory = dst;
+        });
+        await rig.Repo.CreateBackupSetAsync(new BackupSet
+        {
+            Name = "its partner", SourceRoots = [], CreatedUtc = DateTime.UtcNow, DefaultMediaType = MediaType.Directory,
+            JobOptions = new JobOptions { TargetDirectory = dst },
+        });
+        rig.Destination.Connected = true;
+        await rig.Worker.StartAsync(CancellationToken.None);
+        bool refused = await WaitUntil(() => rig.Log.Count("backs up to the same folder") > 0, TimeSpan.FromSeconds(60));
+        bool held = await WaitUntil(
+            () => rig.Repo.GetBackupSetAsync(rig.SetId).GetAwaiter().GetResult()!.JobOptions!.HoldAutomatedBackups,
+            TimeSpan.FromSeconds(10));
+        Check(refused && held && rig.Log.Count("Starting backup for") == 0,
+            "C15 a set whose folder another set shares is refused and held");
+        Check(Directory.GetFileSystemEntries(dst).Length == 0, "C15 and nothing is written there");
         await rig.DisposeAsync();
     }
 #endif
