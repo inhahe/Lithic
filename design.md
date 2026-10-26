@@ -1881,16 +1881,19 @@ copies, not their files, which a seed has just found; Verify judges files. Pinne
 
 **A retired copy a reference needs comes back.** A set whose references broke before
 the guards existed has live references whose content's only copy is retired, often
-with its file still there. `ContentAnchors.ReviveCopiesAsync` takes candidate retired
-plain copies and, for each content, makes live the newest one that is needed and still
-holds it. It is needed when a live reference resolves to its content and no live plain
+with its file still there. `ContentAnchors` takes candidate retired plain copies and,
+for each content, makes live the newest one that is needed and still holds it, in two
+steps. It is needed when a live reference resolves to its content and no live plain
 copy whose file is there does. It still holds the content when its file hashes to the
 record's hash. A candidate at a file's current location counts only if it is that file's
 newest record, since an older one there describes bytes the next backup of the file may
-write over unawares. The caller holds the set's write transaction, so no backup changes
-a copy between its check and its revival; without one it throws
-(`ICatalogRepository.OwnsWriteTransaction`). Two callers, each passing only what is at
-risk:
+write over unawares. `CheckCopiesAsync` reads and hashes the candidates before the set's
+write lock is taken, recording each file's size and write time. `ReviveCheckedAsync`
+then runs inside the caller's write transaction (without one it throws:
+`ICatalogRepository.OwnsWriteTransaction`). It rechecks only cheap facts, so the lock is
+held briefly: the record is still retired as it was, still needed and allowed where it
+is, and its file has the same size and write time. No backup can change a copy between
+that recheck and the revival. Two callers, each passing only what is at risk:
 
 - Verify's repair passes the retired copies (`ICatalogRepository.GetRetiredPlainCopiesAsync`,
   which reads every record because no index covers retired ones) of the contents its
@@ -1911,7 +1914,9 @@ the file. Older builds did write such references, thousands on the author's set,
 resolving to one empty file. One whose anchor goes is still not broken: restore writes
 the empty file, as do the catalog-free restore and `tools\lithic_restore.py`, and
 Verify, reconcile, the seed's check, the revival of copies and the backup's post-copy
-check pass it by (`PlainContent.ResolvesAsync`). Pinned by `tools\excess_versions_test` §28.
+check pass it by. They all ask `PlainContent.LocateAsync`, which says where a reference's
+content is: nowhere needed, a copy's path, or nowhere (`ResolvesAsync` for a yes or no).
+A backup's test is the hash, not the size. Pinned by `tools\excess_versions_test` §28.
 
 **Verify reports a wrong anchor for itself and for every reference to it.** With
 "Verify file contents", each plain copy is hashed once however many records share it,

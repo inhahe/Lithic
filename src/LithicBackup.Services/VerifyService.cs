@@ -121,7 +121,7 @@ public class VerifyService : IVerifyService
         // --- Checks 2 & 3: backing storage + .fileref resolution per record. ---
         // Cache hash -> resolved plain path so repeated references to the same
         // content don't re-query the catalog or re-stat the disk.
-        var resolvedPlain = new Dictionary<string, string?>(StringComparer.OrdinalIgnoreCase);
+        var resolvedPlain = new Dictionary<string, PlainContent.Source>(StringComparer.OrdinalIgnoreCase);
         // When verifying contents, remember which absolute plain paths and which
         // blocks we've already hashed so shared anchors / blocks are read once -
         // with each plain path's actual hash (null when unreadable), so that a
@@ -178,19 +178,17 @@ public class VerifyService : IVerifyService
                         continue;
                     }
 
-                    // Empty content needs no copy (EmptyContent).
-                    if (EmptyContent.Is(record.Hash))
+                    // The referenced content must resolve to an existing plain copy
+                    // (empty content needs none).
+                    if (!resolvedPlain.TryGetValue(record.Hash, out var source))
+                    {
+                        source = await PlainContent.LocateAsync(_catalog, backupSetId, record.Hash, targetDirectory, ct);
+                        resolvedPlain[record.Hash] = source;
+                    }
+                    if (source.IsEmpty)
                         continue;
 
-                    // The referenced content must resolve to an existing plain copy.
-                    if (!resolvedPlain.TryGetValue(record.Hash, out string? plainPath))
-                    {
-                        plainPath = await PlainContent.FirstExistingFullPathAsync(
-                            _catalog, backupSetId, record.Hash, targetDirectory, ct);
-                        resolvedPlain[record.Hash] = plainPath;
-                    }
-
-                    if (plainPath is null)
+                    if (source.FullPath is not { } plainPath)
                     {
                         issues.Add(new VerifyIssue
                         {

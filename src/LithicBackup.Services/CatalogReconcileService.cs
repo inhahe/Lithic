@@ -58,8 +58,8 @@ public sealed class CatalogReconcileService
         var active = all.Where(r => !r.IsDeleted).ToList();
         int total = active.Count;
 
-        // hash -> resolved active plain path (mirrors VerifyService's cache).
-        var resolvedPlain = new Dictionary<string, string?>(StringComparer.OrdinalIgnoreCase);
+        // hash -> whether a reference to it can be restored, asked once per content.
+        var resolvedPlain = new Dictionary<string, bool>(StringComparer.OrdinalIgnoreCase);
 
         // Records chosen for flipping — the prune pass treats these as "will be
         // present" rather than missing.
@@ -124,15 +124,13 @@ public sealed class CatalogReconcileService
                 {
                     if (File.Exists(Path.Combine(targetDirectory, r.DiscPath)))
                         continue; // manifest present
-                    if (EmptyContent.Is(r.Hash))
-                        continue; // restorable with no copy at all
-                    if (!resolvedPlain.TryGetValue(r.Hash, out string? plain))
+                    if (!resolvedPlain.TryGetValue(r.Hash, out bool resolves))
                     {
-                        plain = await PlainContent.FirstExistingFullPathAsync(_catalog, backupSetId, r.Hash, targetDirectory, ct);
-                        resolvedPlain[r.Hash] = plain;
+                        resolves = await PlainContent.ResolvesAsync(_catalog, backupSetId, r.Hash, targetDirectory, ct);
+                        resolvedPlain[r.Hash] = resolves;
                     }
-                    if (plain is not null)
-                        continue; // content still resolvable via another plain copy
+                    if (resolves)
+                        continue; // content still resolvable, by another plain copy or with none (empty)
                     reason = "file reference: manifest missing and no plain copy of its content remains";
                 }
                 else if (r.IsDeduped)

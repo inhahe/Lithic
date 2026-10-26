@@ -31,23 +31,31 @@ public static class PlainContent
     }
 
     /// <summary>
-    /// Whether a reference to <paramref name="hash"/> can be restored: its content
-    /// is empty, which needs no copy (<see cref="Core.EmptyContent"/>), or
-    /// <see cref="FirstExistingAsync"/> finds a copy.
+    /// Where a reference's content is to be read from. Empty content needs no copy
+    /// (<see cref="Core.EmptyContent"/>); other content is read from the copy at
+    /// <see cref="FullPath"/>; with neither, the reference cannot be restored.
     /// </summary>
-    public static async Task<bool> ResolvesAsync(
-        ICatalogRepository catalog, int backupSetId, string? hash, string backupRoot, CancellationToken ct = default)
-        => Core.EmptyContent.Is(hash)
-            || await FirstExistingAsync(catalog, backupSetId, hash, backupRoot, ct) is not null;
+    public readonly record struct Source(bool IsEmpty, string? FullPath)
+    {
+        /// <summary>Whether the reference can be restored.</summary>
+        public bool Found => IsEmpty || FullPath is not null;
+    }
 
     /// <summary>
-    /// <see cref="FirstExistingAsync"/>, as a full path, for a caller that reads
-    /// the copy. Empty content needs no copy, so such a caller asks
-    /// <see cref="Core.EmptyContent.Is"/> first.
+    /// Where the content of a reference to <paramref name="hash"/> is: every
+    /// resolver of a <c>.fileref</c> asks this (or <see cref="ResolvesAsync"/>), so
+    /// all of them treat empty content, and copies whose files have gone, alike.
     /// </summary>
-    public static async Task<string?> FirstExistingFullPathAsync(
+    public static async Task<Source> LocateAsync(
         ICatalogRepository catalog, int backupSetId, string? hash, string backupRoot, CancellationToken ct = default)
-        => await FirstExistingAsync(catalog, backupSetId, hash, backupRoot, ct) is { } path
-            ? Path.Combine(backupRoot, path)
-            : null;
+        => Core.EmptyContent.Is(hash)
+            ? new Source(true, null)
+            : new Source(false, await FirstExistingAsync(catalog, backupSetId, hash, backupRoot, ct) is { } path
+                ? Path.Combine(backupRoot, path)
+                : null);
+
+    /// <summary>Whether a reference to <paramref name="hash"/> can be restored (<see cref="LocateAsync"/>).</summary>
+    public static async Task<bool> ResolvesAsync(
+        ICatalogRepository catalog, int backupSetId, string? hash, string backupRoot, CancellationToken ct = default)
+        => (await LocateAsync(catalog, backupSetId, hash, backupRoot, ct)).Found;
 }

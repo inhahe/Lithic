@@ -450,7 +450,7 @@ public class VerifyIntegrityViewModel : ViewModelBase, IDisposable
     /// incremental diff ignores deleted records, the next backup sees those
     /// source files as no longer backed up and re-copies them to the destination.
     /// A broken reference is first given back a retired copy of its content that
-    /// is still on the drive, if there is one (ContentAnchors.ReviveCopiesAsync),
+    /// is still on the drive, if there is one (ContentAnchors.CheckCopiesAsync, ReviveCheckedAsync),
     /// and its file is then left alone. Closing the window stops the work before the
     /// catalog is changed; the changes themselves are not interrupted.
     /// </summary>
@@ -513,11 +513,16 @@ public class VerifyIntegrityViewModel : ViewModelBase, IDisposable
                         report.Report((0, $"Looking on the drive for copies of {lost.Count:N0} content(s) the broken "
                             + "references need (this reads the whole catalog)...", true));
                         var copies = await _catalog.GetRetiredPlainCopiesAsync(setId, lost, ct);
-                        // Under the set's write lock: no backup may change a copy
-                        // between its check and its revival.
-                        using var tx = await _catalog.BeginTransactionAsync(setId, ct);
-                        revived = (await ContentAnchors.ReviveCopiesAsync(_catalog, setId, targetDir, copies, ct)).Count;
-                        tx.Complete();
+                        // Read and hashed before the set's write lock is taken; under
+                        // it, only rechecked, so that no backup changes a copy between
+                        // its check and its revival.
+                        var found = await ContentAnchors.CheckCopiesAsync(_catalog, setId, targetDir, copies, ct);
+                        if (found.Count > 0)
+                        {
+                            using var tx = await _catalog.BeginTransactionAsync(setId, ct);
+                            revived = (await ContentAnchors.ReviveCheckedAsync(_catalog, setId, targetDir, found, ct)).Count;
+                            tx.Complete();
+                        }
                     }
                 }
                 // Copies given back are committed: from here it runs to the end,

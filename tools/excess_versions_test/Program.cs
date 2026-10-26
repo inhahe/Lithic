@@ -493,8 +493,9 @@ internal static class Program
         async Task<IReadOnlyList<FileRecord>> Revive(params string[] hashes)
         {
             var candidates = await repo.GetRetiredPlainCopiesAsync(set.Id, hashes);
+            var found = await ContentAnchors.CheckCopiesAsync(repo, set.Id, target, candidates, CancellationToken.None);
             using var tx = await repo.BeginTransactionAsync(set.Id);
-            var made = await ContentAnchors.ReviveCopiesAsync(repo, set.Id, target, candidates, CancellationToken.None);
+            var made = await ContentAnchors.ReviveCheckedAsync(repo, set.Id, target, found, CancellationToken.None);
             tx.Complete();
             return made;
         }
@@ -508,11 +509,26 @@ internal static class Program
         bool refused;
         try
         {
-            await ContentAnchors.ReviveCopiesAsync(repo, set.Id, target, [], CancellationToken.None);
+            await ContentAnchors.ReviveCheckedAsync(repo, set.Id, target, [], CancellationToken.None);
             refused = false;
         }
         catch (InvalidOperationException) { refused = true; }
         Check(refused, "reviving copies outside the set's write transaction is refused");
+
+        // Checked (and read in full) before the lock, a copy whose file then
+        // changes is not revived under it.
+        var checkedAB = await ContentAnchors.CheckCopiesAsync(
+            repo, set.Id, target, await repo.GetRetiredPlainCopiesAsync(set.Id, [plainAB.Hash]), CancellationToken.None);
+        string abStored = Path.Combine(target, plainAB.DiscPath);
+        File.SetLastWriteTimeUtc(abStored, File.GetLastWriteTimeUtc(abStored).AddMinutes(1));
+        IReadOnlyList<FileRecord> lateRevived;
+        using (var tx = await repo.BeginTransactionAsync(set.Id))
+        {
+            lateRevived = await ContentAnchors.ReviveCheckedAsync(repo, set.Id, target, checkedAB, CancellationToken.None);
+            tx.Complete();
+        }
+        Check(checkedAB.Count == 1 && lateRevived.Count == 0 && !await IsLive(plainAB),
+            $"a copy changed between its check and its revival is left retired ({checkedAB.Count} checked, {lateRevived.Count} revived)");
 
         // A live record of the content whose file has gone is no copy of it.
         var goneCopy = await repo.CreateFileRecordAsync(Fake("gone.txt", @"!gone27\gone.txt", plainAB.Hash, isRef: false));

@@ -2558,6 +2558,37 @@ public class OrphanedDirectoriesViewModel : ViewModelBase, IConfirmClose, IDispo
                     await Services.ContentAnchors.HashUnhashedAnchorsAsync(_catalog, backupSetId, targetDir, among: null, ct);
                 }
 
+                // -- 0c. A file listed as deleted in the catalog can hold the only
+                //       copy of content a live reference needs, on a set whose
+                //       references lost their copies before the guards that keep
+                //       them existed. Of the ticked ones - what this purge deletes -
+                //       find those, reading each in full before the transaction
+                //       takes the set's write lock; inside it they are only
+                //       rechecked and revived. --
+                IReadOnlyList<Services.ContentAnchors.CheckedCopy> neededDeletedInCatalog = [];
+                var deletedInCatalog = workItems
+                    .Where(w => w.CatalogDeletedFiles is not null)
+                    .SelectMany(w => w.CatalogDeletedFiles!)
+                    .GroupBy(f => f.SourcePath, StringComparer.OrdinalIgnoreCase)
+                    .ToList();
+                if (targetDir is not null && deletedInCatalog.Count > 0)
+                {
+                    var copies = new List<FileRecord>();
+                    for (int i = 0; i < deletedInCatalog.Count; i++)
+                    {
+                        var group = deletedInCatalog[i];
+                        if (cadence.IsDue())
+                            ((IProgress<Services.ProgressReport>)progress).Report(
+                                "Cleaning up: checking whether a broken duplicate-file reference needs a "
+                                + $"listed file ({i + 1:N0} of {deletedInCatalog.Count:N0})");
+                        var at = group.Select(f => f.DiscRel).ToHashSet(StringComparer.OrdinalIgnoreCase);
+                        copies.AddRange((await _catalog.GetFileRecordsByPathAsync(backupSetId, group.Key, ct))
+                            .Where(r => r.IsDeleted && at.Contains(r.DiscPath.Replace('/', '\\'))));
+                    }
+                    neededDeletedInCatalog = await Services.ContentAnchors.CheckCopiesAsync(
+                        _catalog, backupSetId, targetDir, copies, ct);
+                }
+
                 // -- 1. Catalog updates inside a single transaction. --
                 ((IProgress<Services.ProgressReport>)progress).Report("Cleaning up: starting the catalog update...");
                 var tx = await _catalog.BeginTransactionAsync(backupSetId, ct,
@@ -2723,34 +2754,13 @@ public class OrphanedDirectoriesViewModel : ViewModelBase, IConfirmClose, IDispo
                     if (keptIds.Count > 0)
                         catPurged -= await _catalog.MarkFileRecordsLiveByIdsAsync(backupSetId, keptIds, ct);
 
-                    // A file listed as deleted in the catalog can hold the only copy
-                    // of content a live reference needs, on a set whose references
-                    // lost their copies before the guards that keep them existed.
-                    // Made live again, it is a copy kept for a reference. Only the
-                    // ticked files are looked at: they are what this purge deletes.
-                    var deletedInCatalog = workItems
-                        .Where(w => w.CatalogDeletedFiles is not null)
-                        .SelectMany(w => w.CatalogDeletedFiles!)
-                        .GroupBy(f => f.SourcePath, StringComparer.OrdinalIgnoreCase)
-                        .ToList();
-                    if (targetDir is not null && deletedInCatalog.Count > 0)
-                    {
-                        var copies = new List<FileRecord>();
-                        for (int i = 0; i < deletedInCatalog.Count; i++)
-                        {
-                            var group = deletedInCatalog[i];
-                            if (cadence.IsDue())
-                                ((IProgress<Services.ProgressReport>)progress).Report(
-                                    "Cleaning up: checking whether a broken duplicate-file reference needs a "
-                                    + $"listed file ({i + 1:N0} of {deletedInCatalog.Count:N0})");
-                            var at = group.Select(f => f.DiscRel).ToHashSet(StringComparer.OrdinalIgnoreCase);
-                            copies.AddRange((await _catalog.GetFileRecordsByPathAsync(backupSetId, group.Key, ct))
-                                .Where(r => r.IsDeleted && at.Contains(r.DiscPath.Replace('/', '\\'))));
-                        }
-                        foreach (var r in await Services.ContentAnchors.ReviveCopiesAsync(
-                                     _catalog, backupSetId, targetDir, copies, ct))
+                    // The ticked catalog-deleted files a broken reference needs
+                    // (found before the transaction, step 0c) are live again, if
+                    // nothing changed them since: copies kept for a reference.
+                    if (targetDir is not null && neededDeletedInCatalog.Count > 0)
+                        foreach (var r in await Services.ContentAnchors.ReviveCheckedAsync(
+                                     _catalog, backupSetId, targetDir, neededDeletedInCatalog, ct))
                             revivedDiscPaths.Add(r.DiscPath.Replace('/', '\\'));
-                    }
 
                     // Force a final true N/N before the disk-delete phase takes
                     // over, so the catalog phase never ends mid-throttle on a

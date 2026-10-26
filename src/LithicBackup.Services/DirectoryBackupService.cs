@@ -1089,7 +1089,7 @@ public class DirectoryBackupService
                 //      normal, directly-usable file just like a non-dedup backup.
                 // Never for an empty file: there are no bytes to share, and a
                 // manifest is larger than the file (see EmptyContent).
-                string? dupContentPath = job.EnableFileDeduplication && contentSize > 0
+                string? dupContentPath = job.EnableFileDeduplication && !EmptyContent.Is(hash)
                     ? await ContentPathForHashAsync(hash)
                     : null;
                 if (dupContentPath is not null)
@@ -1910,11 +1910,12 @@ public class DirectoryBackupService
                         // A .fileref stores no bytes — verify that the content it
                         // references resolves to an existing plain copy elsewhere
                         // in the tree with the correct hash.
-                        if (!verifiedBlocks.Contains(info.Hash) && !EmptyContent.Is(info.Hash))
+                        var source = verifiedBlocks.Contains(info.Hash)
+                            ? default
+                            : await PlainContent.LocateAsync(_catalog, backupSetId, info.Hash, targetDirectory, ct);
+                        if (!verifiedBlocks.Contains(info.Hash) && !source.IsEmpty)
                         {
-                            string? plainPath = await PlainContent.FirstExistingFullPathAsync(
-                                _catalog, backupSetId, info.Hash, targetDirectory, ct);
-                            if (plainPath is null)
+                            if (source.FullPath is not { } plainPath)
                             {
                                 failedFiles.Add(new FailedFile
                                 {
@@ -3718,9 +3719,9 @@ public class DirectoryBackupService
                         new StoredFileInfo(manifest.OriginalSize, manifest.OriginalHash ?? "", true, false), described)
                     && manifest.BlockHashes.All(h => File.Exists(Path.Combine(blockStoreDir, h + ".blk")));
             }
-            catch (Exception ex) when (ex is IOException or UnauthorizedAccessException or JsonException)
+            catch (Exception ex) when (ex is not OperationCanceledException)
             {
-                return false;
+                return false; // unreadable, as DescribeStoredCopyAsync treats it
             }
         }
         if (!StoredCopyMatches(

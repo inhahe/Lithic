@@ -439,20 +439,17 @@ public class RestoreService : IRestoreService
             // --- File-level dedup reference (.fileref) ------------------------
             if (record.IsFileRef)
             {
-                // Empty content: nothing to read back, from this disc or another.
-                if (EmptyContent.Is(record.Hash))
-                    return null;
-                bool ptrExists = File.Exists(Path.Combine(discRoot, record.DiscPath));
-
                 // Resolved as every reference is (PlainContent), on this disc.
-                if (await PlainContent.FirstExistingAsync(_catalog, backupSetId, record.Hash, discRoot, ct)
-                        is not { } plainRel)
+                var source = await PlainContent.LocateAsync(_catalog, backupSetId, record.Hash, discRoot, ct);
+                if (source.IsEmpty)
+                    return null; // nothing to read back, from this disc or another
+                bool ptrExists = File.Exists(Path.Combine(discRoot, record.DiscPath));
+                if (source.FullPath is not { } plainPath)
                     return Issue(DiscFileIssueKind.UnresolvedReference,
                         ptrExists
                             ? "Backing copy is on another disc; not verified from this disc."
                             : "Reference pointer missing and backing copy is on another disc.");
 
-                string plainPath = Path.Combine(discRoot, plainRel);
                 long len = new FileInfo(plainPath).Length;
                 if (len != record.SizeBytes)
                     return Issue(DiscFileIssueKind.SizeMismatch,
@@ -779,13 +776,13 @@ public class RestoreService : IRestoreService
         string destPath,
         CancellationToken ct)
     {
-        // Empty content needs no copy.
-        if (EmptyContent.Is(hash))
+        var source = await PlainContent.LocateAsync(_catalog, backupSetId, hash, discRoot, ct);
+        if (source.IsEmpty)
         {
-            await File.WriteAllBytesAsync(destPath, [], ct);
+            await File.WriteAllBytesAsync(destPath, [], ct); // empty content needs no copy
             return;
         }
-        if (await PlainContent.FirstExistingAsync(_catalog, backupSetId, hash, discRoot, ct) is not { } source)
+        if (source.FullPath is not { } sourcePath)
         {
             var recorded = await _catalog.GetActivePlainContentPathsByHashAsync(backupSetId, hash, ct);
             throw recorded.Count == 0
@@ -796,7 +793,7 @@ public class RestoreService : IRestoreService
                     Path.Combine(discRoot, recorded[0]));
         }
 
-        File.Copy(Path.Combine(discRoot, source), destPath, overwrite: true);
+        File.Copy(sourcePath, destPath, overwrite: true);
     }
 
     /// <summary>
