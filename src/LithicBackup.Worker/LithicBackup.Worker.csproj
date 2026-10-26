@@ -11,8 +11,8 @@
     <PackageReference Include="Microsoft.Extensions.Hosting.WindowsServices" Version="10.0.*" />
     <!--
       EventWaitHandleAcl / EventWaitHandleSecurity (ShutdownSignalListener) come
-      with the .NET 10 shared framework. Under .NET 8 they needed the
-      System.Threading.AccessControl package, which NuGet now prunes (NU1510).
+      with the shared framework: no System.Threading.AccessControl package, which
+      NuGet would prune anyway (NU1510).
     -->
   </ItemGroup>
 

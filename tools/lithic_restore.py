@@ -299,11 +299,17 @@ def reassemble_dedup(manifest_path, block_store_dir, dest_path, verify):
             raise ValueError(f"hash mismatch after reassembly (expected {want})")
 
 
+EMPTY_SHA256 = "e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855"
+
+
 def resolve_fileref(manifest_path, backup_dir, hash_index):
-    """Return the absolute path of the plain copy holding a fileref's content."""
+    """Return the absolute path of the plain copy holding a fileref's content,
+    or None when the content is empty: an empty file needs no copy."""
     m = load_json_ci(manifest_path)
     content_hash = (m.get("hash") or "").lower()
     hint = m.get("contentpath") or ""
+    if content_hash == EMPTY_SHA256:
+        return None
 
     # 1) Trust-but-verify the ContentPath hint.
     if hint:
@@ -427,7 +433,10 @@ def run_restore(backup_dir, drives, mapping, args):
                                          dest_path, args.verify)
                     else:  # fileref
                         content = resolve_fileref(rec["abs_path"], backup_dir, hash_index)
-                        copy_file(content, dest_path)
+                        if content is None:
+                            open(dest_path, "wb").close()
+                        else:
+                            copy_file(content, dest_path)
 
                     sz = os.path.getsize(dest_path)
                     total_files += 1

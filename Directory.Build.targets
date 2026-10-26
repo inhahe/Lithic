@@ -1,0 +1,21 @@
+<Project>
+
+  <!--
+    Settings for every project in the repository: the product (src\), the test
+    harnesses (tools\) and the installer's custom action. A .targets file, not a
+    .props: the harnesses opt out of Directory.Build.props, to keep the shipping
+    version off themselves, but not out of this. Properties set here are
+    evaluated before anything runs, restore included.
+
+    NU1603: a package's dependency was not found at the version asked for, and
+    NuGet took a higher one, which can be another major version. As an error, a
+    restore that cannot get the versions asked for stops instead of building
+    something else. A stale HTTP cache is the usual cause: clear it and restore
+    again (known-issues.md has the command; an XML comment cannot hold its
+    double hyphen).
+  -->
+  <PropertyGroup>
+    <WarningsAsErrors>$(WarningsAsErrors);NU1603</WarningsAsErrors>
+  </PropertyGroup>
+
+</Project>

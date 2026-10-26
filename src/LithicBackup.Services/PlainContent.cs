@@ -31,8 +31,18 @@ public static class PlainContent
     }
 
     /// <summary>
-    /// <see cref="FirstExistingAsync"/>, as a full path. Empty content needs no
-    /// copy, so callers that may meet a reference to it ask
+    /// Whether a reference to <paramref name="hash"/> can be restored: its content
+    /// is empty, which needs no copy (<see cref="Core.EmptyContent"/>), or
+    /// <see cref="FirstExistingAsync"/> finds a copy.
+    /// </summary>
+    public static async Task<bool> ResolvesAsync(
+        ICatalogRepository catalog, int backupSetId, string? hash, string backupRoot, CancellationToken ct = default)
+        => Core.EmptyContent.Is(hash)
+            || await FirstExistingAsync(catalog, backupSetId, hash, backupRoot, ct) is not null;
+
+    /// <summary>
+    /// <see cref="FirstExistingAsync"/>, as a full path, for a caller that reads
+    /// the copy. Empty content needs no copy, so such a caller asks
     /// <see cref="Core.EmptyContent.Is"/> first.
     /// </summary>
     public static async Task<string?> FirstExistingFullPathAsync(

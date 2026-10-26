@@ -49,8 +49,8 @@ public static class ContentAnchors
     /// <para>A candidate at a file's current location (not under <c>_prev</c>) is
     /// taken only if it is that file's newest record. An older record there describes
     /// bytes that the next backup of the file may write over without knowing of it.</para>
-    /// <para>The caller holds the set's write lock (a transaction), so no backup
-    /// changes a copy between its check and its revival.</para>
+    /// <para>The caller holds the set's write transaction, so no backup changes a
+    /// copy between its check and its revival; called without one, it throws.</para>
     /// </summary>
     /// <param name="targetDir">The set's backup folder, which stored paths are relative to.</param>
     /// <param name="candidates">Retired plain records that may hold such content.</param>
@@ -59,6 +59,10 @@ public static class ContentAnchors
         ICatalogRepository catalog, int backupSetId, string targetDir,
         IEnumerable<FileRecord> candidates, CancellationToken ct)
     {
+        if (!catalog.OwnsWriteTransaction(backupSetId))
+            throw new InvalidOperationException(
+                "Retired copies are revived inside the set's write transaction, so that no backup "
+                + "changes one between its check and its revival.");
         var revived = new List<FileRecord>();
         // Contents decided, either way: one copy each is enough.
         var settled = new HashSet<string>(StringComparer.OrdinalIgnoreCase);

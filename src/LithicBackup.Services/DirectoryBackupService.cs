@@ -785,18 +785,27 @@ public class DirectoryBackupService
             // (ReviveChainAsync). The guard that retired it may have kept an
             // earlier version live for another file's reference, so the newest
             // live record is not the test: the newest record is.
-            if (last is { } found && (found.IsDeleted || found.HighestVersion > found.Version.MaxVersion)
-                && await ReviveChainAsync(backupSetId, targetDirectory, file.FullPath, found.HighestVersion, ct))
+            FileRecord? unrevivedNewest = null;
+            if (last is { } found && (found.IsDeleted || found.HighestVersion > found.Version.MaxVersion))
+            {
+                unrevivedNewest = await ReviveChainAsync(backupSetId, targetDirectory, file.FullPath, ct);
                 last = await _catalog.GetLastVersionAsync(backupSetId, file.FullPath, ct);
+            }
             bool hasExistingInfo = last is not null;
-            var existingInfo = last?.Version ?? default;
 
-            // Resurrection: every record of the path is retired, the newest one's
-            // copy among them too unreadable to revive. The chain's numbering
-            // continues, and the old copy is filed under _prev (un-deleted there
-            // only if it can be read back after all; see CanReviveAsync), but the
-            // file is copied afresh.
-            bool resurrecting = last is { IsDeleted: true };
+            // Resurrection: the newest record stays retired, its copy gone or no
+            // longer holding its content. It is still the head the chain goes on
+            // from, whatever older version is live: its copy is filed under its
+            // own number in _prev (un-deleted there only if it can be read back
+            // after all; see CanReviveAsync), and the file is copied afresh. Taken
+            // as the live head, the earlier version would make that bad copy at
+            // the current path look like a newer one the catalog never recorded,
+            // and record it.
+            bool resurrecting = unrevivedNewest is not null;
+            var existingInfo = unrevivedNewest is { } head
+                ? new FileVersionInfo(head.Version, head.SizeBytes, head.SourceLastWriteUtc,
+                    head.IsDeduped, head.IsFileRef, head.Hash ?? "")
+                : last?.Version ?? default;
 
             if (hasExistingInfo)
             {
@@ -3639,24 +3648,34 @@ public class DirectoryBackupService
     /// which may resolve to a copy just revived, the newest one included.</para>
     /// </summary>
     /// <param name="sourcePath">The path being backed up.</param>
-    /// <param name="highestVersion">The highest version any record of the path has.</param>
-    /// <returns>Whether any record was made live.</returns>
-    private async Task<bool> ReviveChainAsync(
-        int backupSetId, string targetDirectory, string sourcePath, int highestVersion, CancellationToken ct)
+    /// <returns>
+    /// The path's newest record when it is retired and stays so, its copy gone or
+    /// no longer holding its content: the head the caller resurrects from. Null
+    /// when the newest record is live, or was made live.
+    /// </returns>
+    private async Task<FileRecord?> ReviveChainAsync(
+        int backupSetId, string targetDirectory, string sourcePath, CancellationToken ct)
     {
         var records = await _catalog.GetFileRecordsByPathAsync(backupSetId, sourcePath, ct);
+        var newest = records.OrderByDescending(r => r.Version).ThenByDescending(r => r.Id).FirstOrDefault();
+        if (newest is null || !newest.IsDeleted)
+            return null;
         var liveDiscPaths = records.Where(r => !r.IsDeleted)
             .Select(r => r.DiscPath.Replace('/', '\\'))
             .ToHashSet(StringComparer.OrdinalIgnoreCase);
-        // One record per stored copy: a seed run twice can have recorded one twice.
+        // A live record of the same stored copy (a seed run twice) already stands
+        // for it.
+        if (liveDiscPaths.Contains(newest.DiscPath.Replace('/', '\\')))
+            return null;
+        // One record per stored copy, for the same reason.
         var retired = records
             .Where(r => r.IsDeleted && !r.IsSplit && !r.IsZipped
-                        && (r.Version == highestVersion || HistoryPaths.IsPreviousVersion(r.DiscPath)))
+                        && (r.Id == newest.Id || HistoryPaths.IsPreviousVersion(r.DiscPath)))
             .GroupBy(r => r.DiscPath.Replace('/', '\\'), StringComparer.OrdinalIgnoreCase)
             .Where(g => !liveDiscPaths.Contains(g.Key))
             .Select(g => g.MaxBy(r => r.Id)!)
             .ToList();
-        bool any = false;
+        bool newestRevived = false;
         foreach (bool references in (bool[])[false, true])
         {
             var revive = new List<long>();
@@ -3664,9 +3683,9 @@ public class DirectoryBackupService
                 if (await CanReviveAsync(backupSetId, targetDirectory, r, r.DiscPath, ct))
                     revive.Add(r.Id);
             await _catalog.MarkFileRecordsLiveByIdsAsync(backupSetId, revive, ct);
-            any |= revive.Count > 0;
+            newestRevived |= revive.Contains(newest.Id);
         }
-        return any;
+        return newestRevived ? null : newest;
     }
 
     /// <summary>
@@ -3710,8 +3729,7 @@ public class DirectoryBackupService
                 described))
             return false;
         return !record.IsFileRef
-            || EmptyContent.Is(record.Hash)
-            || await PlainContent.FirstExistingAsync(_catalog, backupSetId, record.Hash, targetDirectory, ct) is not null;
+            || await PlainContent.ResolvesAsync(_catalog, backupSetId, record.Hash, targetDirectory, ct);
     }
 
     /// <summary>
@@ -5022,17 +5040,10 @@ public class DirectoryBackupService
         catch
         {
             // Keep the whole paths already processed: a re-run carries on after
-            // them instead of hashing them all again. A re-run skips them, so the
-            // references among them without content are left out now, unless
-            // plain copies went unhashed (Skip hashing) and cannot yet be told
-            // from missing ones.
-            try
-            {
-                await FlushAsync();
-                if (!skipHashing)
-                    await LeaveOutReferencesWithoutContentAsync();
-            }
-            catch { /* the original error matters more */ }
+            // them instead of hashing them all again. Their references are not
+            // checked for content here: the copy one resolves to may be in a
+            // folder the walk had not reached. Verify finds any left broken.
+            try { await FlushAsync(); } catch { /* the original error matters more */ }
             throw;
         }
         finally
@@ -5060,17 +5071,16 @@ public class DirectoryBackupService
             unrecognized, movedToHistory, leftOutCurrent + leftOutEarlier);
 
         // A manifest whose content is nowhere on the drive - its copy deleted by
-        // whatever wrote the backup - restores nothing. Recorded, it would sit in
-        // the catalog as backed up, and no backup would copy its file again.
-        // Left out, its file is the next backup's to copy, as one the catalog has
-        // never seen (or one whose current copy was pruned as missing, when its
-        // history was recorded). Not cancellable: it runs after a cancel too.
+        // whatever wrote the backup - restores nothing. Live, it would sit in the
+        // catalog as backed up, and no backup would copy its file again. Retired,
+        // its file is the next backup's to copy, as one whose copy was pruned for
+        // being missing is, and its version number stays taken.
         async Task<(int Current, int Earlier)> LeaveOutReferencesWithoutContentAsync()
         {
-            var gone = await _catalog.DeleteSeededReferencesWithoutContentAsync(
+            var leftOut = await _catalog.RetireSeededReferencesWithoutContentAsync(
                 backupSetId, discRecord.Id, CancellationToken.None);
-            int earlier = gone.Count(HistoryPaths.IsPreviousVersion);
-            return (gone.Count - earlier, earlier);
+            int earlier = leftOut.Count(HistoryPaths.IsPreviousVersion);
+            return (leftOut.Count - earlier, earlier);
         }
     }
 

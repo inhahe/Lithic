@@ -385,6 +385,11 @@ internal static class Program
             var files = Directory.Exists(restoreTo) ? Directory.GetFiles(restoreTo, "e3.txt", SearchOption.AllDirectories) : [];
             Check(restored.Errors.Count == 0 && files.Length == 1 && new FileInfo(files[0]).Length == 0,
                 $"and restore writes the empty file ({string.Join("; ", restored.Errors)})");
+            string freeTo = Path.Combine(root, "restored28-free");
+            var free = await new CatalogFreeRestoreService().RestoreAsync(oldTarget, freeTo);
+            var freeFiles = Directory.Exists(freeTo) ? Directory.GetFiles(freeTo, "e3.txt", SearchOption.AllDirectories) : [];
+            Check(free.Errors.Count == 0 && freeFiles.Length == 1 && new FileInfo(freeFiles[0]).Length == 0,
+                $"as does the restore that reads no catalog ({string.Join("; ", free.Errors)})");
         }
         Microsoft.Data.Sqlite.SqliteConnection.ClearAllPools();
     }
@@ -499,6 +504,15 @@ internal static class Program
             SizeBytes = 1, Hash = hash, IsFileRef = isRef, Version = version,
             SourceLastWriteUtc = DateTime.UtcNow, BackedUpUtc = DateTime.UtcNow,
         };
+
+        bool refused;
+        try
+        {
+            await ContentAnchors.ReviveCopiesAsync(repo, set.Id, target, [], CancellationToken.None);
+            refused = false;
+        }
+        catch (InvalidOperationException) { refused = true; }
+        Check(refused, "reviving copies outside the set's write transaction is refused");
 
         // A live record of the content whose file has gone is no copy of it.
         var goneCopy = await repo.CreateFileRecordAsync(Fake("gone.txt", @"!gone27\gone.txt", plainAB.Hash, isRef: false));
@@ -634,13 +648,14 @@ internal static class Program
         {
             var outcome = await Service(repo).SeedFromExistingDirectoryAsync(set.Id, target);
             Check(outcome.ReferencesWithoutContent == 1, $"the seed counts one reference without content ({outcome.ReferencesWithoutContent})");
-            Check((await repo.GetFileRecordsByPathAsync(set.Id, lostRef)).Count == 0 && outcome.Files == 2,
-                $"and leaves it out of the catalog, and out of the files it imported ({outcome.Files})");
+            var lostRows = await repo.GetFileRecordsByPathAsync(set.Id, lostRef);
+            Check(lostRows.Count == 1 && lostRows[0].IsDeleted && outcome.Files == 2,
+                $"and leaves it retired, out of the files it imported ({outcome.Files})");
             Check((await Live(repo, set.Id, keptRef))?.IsFileRef == true, "while a reference whose content is there is recorded");
             var again = await Service(repo).SeedFromExistingDirectoryAsync(set.Id, target);
             Check(again.ReferencesWithoutContent == 1 && again.Files == 0
-                  && (await repo.GetFileRecordsByPathAsync(set.Id, lostRef)).Count == 0,
-                $"seeding again records nothing more, not even a retired row ({again.Files} file(s))");
+                  && (await repo.GetFileRecordsByPathAsync(set.Id, lostRef)).Count == 1,
+                $"seeding again records nothing more, not even another retired row ({again.Files} file(s))");
             int broken = (await new VerifyService(repo, new FileScanner(repo)).VerifyAsync(Job(set.Id), target))
                 .Issues.Count(i => i.Kind == VerifyIssueKind.FileRefUnresolved);
             Check(broken == 0, $"Verify finds no broken reference after the seed ({broken})");
@@ -742,6 +757,27 @@ internal static class Program
         var wBack = await All(w);
         Check(wBack.Count == 3 && wBack.All(r => !r.IsDeleted),
             $"back unchanged, w.txt has all three versions live again ({wBack.Count(r => !r.IsDeleted)} of {wBack.Count})");
+
+        // The newest copy, corrupt, cannot come back, while the history can: the
+        // corrupt bytes are never taken for a newer copy and recorded live.
+        string y = Path.Combine(source, "one", "y.txt");
+        await File.WriteAllTextAsync(y, "y content A, section twenty-five");
+        await Backup();
+        await File.WriteAllTextAsync(y, "y content B, section twenty-five, longer");
+        await Backup();
+        await File.WriteAllTextAsync(y, "y content C, section twenty-five, longest");
+        await Backup();
+        var yHead = (await Live(y))!;
+        await File.WriteAllTextAsync(Path.Combine(target, yHead.DiscPath), "Y CONTENT C, SECTION TWENTY-FIVE, LONGEST");
+        await Retire(y);
+        Touch(y);
+        await Backup();
+        var yLive = (await All(y)).Where(r => !r.IsDeleted).ToList();
+        static string Sha(string path) =>
+            Convert.ToHexString(System.Security.Cryptography.SHA256.HashData(File.ReadAllBytes(path))).ToLowerInvariant();
+        Check(yLive.Count == 3 && yLive.All(r => !r.IsFileRef && Sha(Path.Combine(target, r.DiscPath)) == r.Hash)
+              && File.ReadAllText(Path.Combine(target, (await Live(y))!.DiscPath)) == "y content C, section twenty-five, longest",
+            $"its history comes back, the file is copied afresh, and no live record holds the corrupt bytes ({yLive.Count} live)");
 
         // An earlier version that is a reference whose only copy is the newest
         // version comes back with it.

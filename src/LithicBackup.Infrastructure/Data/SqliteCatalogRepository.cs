@@ -618,8 +618,10 @@ public class SqliteCatalogRepository : ICatalogRepository
     public Task<IReadOnlyList<string>> GetActivePlainContentPathsByHashAsync(int backupSetId, string hash, CancellationToken ct = default)
         => GetSet(backupSetId).GetActivePlainContentPathsByHashAsync(backupSetId, hash, ct);
 
-    public Task<IReadOnlyList<string>> DeleteSeededReferencesWithoutContentAsync(int backupSetId, int discId, CancellationToken ct = default)
-        => GetSet(backupSetId).DeleteSeededReferencesWithoutContentAsync(backupSetId, discId, ct);
+    public Task<IReadOnlyList<string>> RetireSeededReferencesWithoutContentAsync(int backupSetId, int discId, CancellationToken ct = default)
+        => GetSet(backupSetId).RetireSeededReferencesWithoutContentAsync(backupSetId, discId, ct);
+
+    public bool OwnsWriteTransaction(int backupSetId) => GetSet(backupSetId).OwnsWriteTransaction;
 
     public Task<IReadOnlyList<FileRecord>> GetRetiredPlainCopiesAsync(
         int backupSetId, IReadOnlyCollection<string> hashes, CancellationToken ct = default)

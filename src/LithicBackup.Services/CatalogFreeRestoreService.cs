@@ -1,5 +1,6 @@
 using System.Security.Cryptography;
 using System.Text.Json;
+using LithicBackup.Core;
 using LithicBackup.Core.Interfaces;
 using LithicBackup.Core.Models;
 
@@ -208,6 +209,13 @@ public class CatalogFreeRestoreService : ICatalogFreeRestoreService
         var manifest = JsonSerializer.Deserialize<FileRefManifest>(json)
             ?? throw new InvalidOperationException(
                 $"Failed to parse fileref manifest: {manifestPath}");
+
+        // Empty content needs no copy.
+        if (EmptyContent.Is(manifest.Hash))
+        {
+            await File.WriteAllBytesAsync(destPath, [], ct);
+            return;
+        }
 
         string? contentPath = null;
 

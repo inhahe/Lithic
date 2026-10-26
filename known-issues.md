@@ -9,9 +9,9 @@ copy recorded. All 70,384 are real. Three causes, all now closed:
 - **A seed adopted references whose content was not on the drive.** 66,945 were
   recorded by the seed of 2026-10-18/19, from a backup written on another computer
   whose copies of that content were gone. Their manifests' hints name paths that no
-  record has, some on drives the set no longer backs up. The seed now leaves out every
-  reference it recorded whose content has no plain copy, even when stopped, and says how
-  many (`SeedOutcome.ReferencesWithoutContent`; `tools\excess_versions_test` §26).
+  record has, some on drives the set no longer backs up. The seed now retires every
+  reference it recorded whose content has no plain copy, and says how many
+  (`SeedOutcome.ReferencesWithoutContent`; `tools\excess_versions_test` §26).
 - **Copies retired and deleted while references still needed them.** Removals before
   d8684e9 (2026-10-20) retired records without the guard that keeps a live reference's
   last copy. Most of the remaining references written on 2026-10-18/19 point at such a
@@ -111,7 +111,7 @@ silently resolved Core 9.0.0 under it (warning NU1603 only), in the product and 
 the harnesses. Every package now floats within its .NET 10 servicing line only
 (`10.0.*`), so it still takes bug fixes. `Microsoft.Data.Sqlite.Core` is
 referenced directly, so that range governs it, not the outer package's open-ended
-">=". NU1603 is an error in every project (the root `Directory.Build.props`).
+">=". NU1603 is an error in every project (the root `Directory.Build.targets`).
 If a stale listing trips it, clear the cache (`dotnet nuget locals http-cache
 --clear`) and restore again.
 

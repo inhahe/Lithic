@@ -1313,7 +1313,7 @@ public class MainViewModel : ViewModelBase
                 + $"cop(ies) moved from beside a newer one into the history), {outcome.SkippedExisting:N0} already in "
                 + $"the catalog, {outcome.DuplicateCopies:N0} stored cop(ies) left untracked, "
                 + $"{outcome.Unrecognized:N0} unrecognised file(s) left alone, "
-                + $"{outcome.ReferencesWithoutContent:N0} reference(s) to content not on the drive retired.");
+                + $"{outcome.ReferencesWithoutContent:N0} reference(s) to content not on the drive left out.");
 
             bool imported = outcome.Files + outcome.PreviousVersions > 0;
             string result;
@@ -1331,21 +1331,27 @@ public class MainViewModel : ViewModelBase
                     parts.Add($"{outcome.DuplicateCopies:N0} stored copies could not be recorded and were left as "
                               + "they are; Cleanup's destination scan lists them as untracked");
                 if (outcome.ReferencesWithoutContent > 0)
-                    parts.Add($"{outcome.ReferencesWithoutContent:N0} duplicate-file references point at content "
-                              + "that is not on the drive, so they could restore nothing; they were left out, and "
-                              + "the backup copies those that are still in your folders again");
+                    parts.Add(LeftOutText(outcome.ReferencesWithoutContent));
                 string detail = parts.Count > 0 ? $" ({string.Join("; ", parts)})" : "";
                 result = $"Imported {outcome.Files:N0} files{detail}. Run a backup next: it copies only "
                          + "what changed, and resumes automated backups.";
             }
             else if (outcome.SkippedExisting > 0)
             {
-                result = $"Nothing new to import — all {outcome.SkippedExisting:N0} files were already in the catalog.";
+                result = $"Nothing new to import — all {outcome.SkippedExisting:N0} files were already in the catalog."
+                         + (outcome.ReferencesWithoutContent > 0 ? $" ({LeftOutText(outcome.ReferencesWithoutContent)}.)" : "");
             }
             else
             {
-                result = "No files found to import.";
+                result = outcome.ReferencesWithoutContent > 0
+                    ? $"Nothing imported: {LeftOutText(outcome.ReferencesWithoutContent)}."
+                    : "No files found to import.";
             }
+
+            static string LeftOutText(int count) =>
+                $"{count:N0} duplicate-file references point at content that is not on the drive, so they could "
+                + "restore nothing; they were left out, and the backup copies those that are still in your "
+                + "folders again";
 
             // Release the row before anything else can fail.
             sourceSelection.SeedResult = result;

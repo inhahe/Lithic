@@ -311,18 +311,19 @@ public interface ICatalogRepository : IDisposable
     Task<IReadOnlyList<string>> GetActivePlainContentPathsByHashAsync(int backupSetId, string hash, CancellationToken ct = default);
 
     /// <summary>
-    /// Delete outright the live <c>.fileref</c> records of one disc whose content
-    /// has no live plain copy recorded at all: references with nothing to resolve
-    /// to. Only for a seed, about the disc it is recording, whose rows describe
-    /// nothing until it ends: they are left out rather than retired, so that a
-    /// re-run, which skips only paths with live records, does not add them again
-    /// as retired rows. Whether a recorded copy's file is still there is not
-    /// checked; a seed records only files it found. Empty content needs no copy
-    /// and is never counted (<see cref="EmptyContent"/>).
+    /// Retire the live <c>.fileref</c> records of one disc whose content has no
+    /// live plain copy recorded at all: references with nothing to resolve to. For
+    /// a seed, about the disc it has just recorded. A record that a seed of the
+    /// same files retired before (same path, stored path, version and content) is
+    /// deleted instead, so re-running a seed adds no rows; retiring the others keeps
+    /// their version numbers taken, which the stored files' names still use.
+    /// Whether a recorded copy's file is still there is not checked; a seed
+    /// records only files it found. Empty content needs no copy and is never
+    /// counted (<see cref="EmptyContent"/>).
     /// </summary>
     /// <param name="discId">The seed's disc; the set's other discs supply copies too.</param>
-    /// <returns>The stored paths of the rows deleted.</returns>
-    Task<IReadOnlyList<string>> DeleteSeededReferencesWithoutContentAsync(int backupSetId, int discId, CancellationToken ct = default);
+    /// <returns>The stored paths of the records left out, retired or deleted.</returns>
+    Task<IReadOnlyList<string>> RetireSeededReferencesWithoutContentAsync(int backupSetId, int discId, CancellationToken ct = default);
 
     /// <summary>
     /// The retired plain copies of the given contents, newest first, with their
@@ -719,4 +720,10 @@ public interface ICatalogRepository : IDisposable
     /// hold it to the end of its batch.
     /// </summary>
     bool ShouldGiveWayToWaitingWriter(int backupSetId) => false;
+
+    /// <summary>
+    /// Whether the calling flow holds the set's write transaction
+    /// (<see cref="BeginTransactionAsync"/>): for code that must not run outside one.
+    /// </summary>
+    bool OwnsWriteTransaction(int backupSetId) => false;
 }

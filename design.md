@@ -28,10 +28,11 @@ Every project targets .NET 10 (`net10.0-windows`), as do the harnesses under
 Windows Installer hosts (`installer\CustomActions`). The MSI publishes the app
 self-contained, so users need no .NET runtime. Packages float within their .NET 10
 servicing line (`10.0.*`), with `Microsoft.Data.Sqlite.Core` referenced directly so
-that range governs it. The root `Directory.Build.props`, which `src\`'s imports,
-makes NU1603 an error everywhere: a restore that cannot get the versions asked for
+that range governs it. The root `Directory.Build.targets` makes NU1603 an error in
+every project, harnesses included: a restore that cannot get the versions asked for
 fails rather than taking another major version (known-issues.md, "the Sqlite package
-could change major version").
+could change major version"). It is a `.targets` file because the harnesses opt out
+of `Directory.Build.props` (below) but not of that.
 
 `tools\` holds stand-alone console harnesses (this project has no unit-test
 project — measurement and verification live there). Each sets
@@ -1846,10 +1847,12 @@ describes bytes since overwritten. Each must pass `CanReviveAsync`:
 
 Plain copies go first, then references, which may resolve to a copy just revived, the
 newest included. If the newest record is revived the file is then an ordinary changed
-or unchanged one. If not, the path is `resurrecting`: its numbering continues, the old
-copy is filed under `_prev` (un-deleted there only if it passes `CanReviveAsync` after
-all, as a copy found at its own `.vN` can), and the file is copied afresh, plain when
-nothing live holds its content.
+or unchanged one. If not, the path is `resurrecting` from that record, whatever older
+version is live: its numbering continues, its copy is filed under `_prev` (un-deleted
+there only if it passes `CanReviveAsync` after all, as a copy found at its own `.vN`
+can), and the file is copied afresh, plain when nothing live holds its content. Taken
+as the head, a live earlier version would make the bad copy at the current path look
+like a newer one the catalog never recorded, and the backup would record it.
 
 The guard on retiring only protects a copy against references outside the retired
 records. A reference retired with its copy and then revived alone was left resolving
@@ -1861,16 +1864,19 @@ by `tools\excess_versions_test` §25.
 **A seed records no reference whose content is not on the drive.** A backup written
 by an older build can hold `.fileref` manifests whose plain copy is gone. Recorded as
 backed up, such a reference restores nothing, and no backup would ever copy its file
-again. After recording and hashing, a seed deletes outright the references it recorded
-whose content has no live plain copy recorded
-(`ICatalogRepository.DeleteSeededReferencesWithoutContentAsync`). They are left out
-rather than retired, because a re-run skips only paths with live records and would
-otherwise add them again as retired rows each time. Each such file is the next backup's
-to copy, as one the catalog has never seen, and the seed's summary counts them
-(`SeedOutcome.ReferencesWithoutContent`), outside the files and versions it imported. A
-stopped seed does the same for what it recorded, unless plain copies went unhashed
-(Skip hashing) and cannot yet be told from missing ones. The check is of recorded copies,
-not their files, which a seed has just found; Verify judges files. Pinned by
+again. After recording and hashing, a seed retires the references it recorded whose
+content has no live plain copy recorded
+(`ICatalogRepository.RetireSeededReferencesWithoutContentAsync`). Retired, they keep
+their version numbers, which the stored files' names still use; a row deleted outright
+would let a later backup adopt such a manifest again as a live reference. A re-run
+skips only paths with live records, so it records them again: a record that an earlier
+seed of the same files already retired is then deleted instead, and re-running adds no
+rows. Each such file is the next backup's to copy, as one whose copy was pruned for
+being missing is, and the seed's summary counts them
+(`SeedOutcome.ReferencesWithoutContent`), outside the files and versions it imported.
+A stopped seed checks nothing: the copy a reference resolves to may be in a folder the
+walk had not reached, and Verify finds whatever stays broken. The check is of recorded
+copies, not their files, which a seed has just found; Verify judges files. Pinned by
 `tools\excess_versions_test` §26.
 
 **A retired copy a reference needs comes back.** A set whose references broke before
@@ -1881,13 +1887,16 @@ holds it. It is needed when a live reference resolves to its content and no live
 copy whose file is there does. It still holds the content when its file hashes to the
 record's hash. A candidate at a file's current location counts only if it is that file's
 newest record, since an older one there describes bytes the next backup of the file may
-write over unawares. The caller holds the set's write lock, so no backup changes a copy
-between its check and its revival. Two callers, each passing only what is at risk:
+write over unawares. The caller holds the set's write transaction, so no backup changes
+a copy between its check and its revival; without one it throws
+(`ICatalogRepository.OwnsWriteTransaction`). Two callers, each passing only what is at
+risk:
 
 - Verify's repair passes the retired copies (`ICatalogRepository.GetRetiredPlainCopiesAsync`,
   which reads every record because no index covers retired ones) of the contents its
   broken references cannot find. It leaves alone the files whose references it mended:
-  no copy is needed, and for a file whose source is gone it is the only way back.
+  no copy is needed, and for a file whose source is gone it is the only way back. Once copies are given back the repair
+  runs to the end, window closed or not.
 - Cleanup's purge passes the retired records at the "deleted in the catalog" files
   ticked. That category is decided by stored path alone, and it would otherwise delete
   the last copy of such content.
@@ -1900,8 +1909,9 @@ and its guard keeps it while a reference needs it. Pinned by
 plain, never as a `.fileref`: there are no bytes to share, and a manifest is larger than
 the file. Older builds did write such references, thousands on the author's set, all
 resolving to one empty file. One whose anchor goes is still not broken: restore writes
-the empty file, and Verify, reconcile, the seed's check, the revival of copies and the
-backup's post-copy check pass it by. Pinned by `tools\excess_versions_test` §28.
+the empty file, as do the catalog-free restore and `tools\lithic_restore.py`, and
+Verify, reconcile, the seed's check, the revival of copies and the backup's post-copy
+check pass it by (`PlainContent.ResolvesAsync`). Pinned by `tools\excess_versions_test` §28.
 
 **Verify reports a wrong anchor for itself and for every reference to it.** With
 "Verify file contents", each plain copy is hashed once however many records share it,

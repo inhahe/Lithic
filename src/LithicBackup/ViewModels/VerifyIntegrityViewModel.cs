@@ -500,7 +500,8 @@ public class VerifyIntegrityViewModel : ViewModelBase, IDisposable
                     foreach (string path in referenceOnly)
                     {
                         foreach (var r in await _catalog.GetFileRecordsByPathAsync(setId, path, ct))
-                            if (!r.IsDeleted && r.IsFileRef && !await ResolvesAsync(r, setId, targetDir, ct))
+                            if (!r.IsDeleted && r.IsFileRef && !string.IsNullOrEmpty(r.Hash)
+                                && !await ResolvesAsync(r, setId, targetDir, ct))
                                 lost.Add(r.Hash);
                         n++;
                         if (cadence.IsDue())
@@ -519,6 +520,11 @@ public class VerifyIntegrityViewModel : ViewModelBase, IDisposable
                         tx.Complete();
                     }
                 }
+                // Copies given back are committed: from here it runs to the end,
+                // window closed or not, so that the files whose references they
+                // mended are left alone and the rest flagged.
+                if (revived > 0)
+                    ct = CancellationToken.None;
 
                 // Every live record of the paths, and which of them may be kept for
                 // another file's .fileref: an intact earlier version may - its file
@@ -587,10 +593,9 @@ public class VerifyIntegrityViewModel : ViewModelBase, IDisposable
         }
     }
 
-    /// <summary>Whether a live <c>.fileref</c> record's content can be restored: it is empty, or a live plain copy of it is there.</summary>
-    private async Task<bool> ResolvesAsync(FileRecord reference, int setId, string targetDir, CancellationToken ct) =>
-        EmptyContent.Is(reference.Hash)
-        || await PlainContent.FirstExistingAsync(_catalog, setId, reference.Hash, targetDir, ct) is not null;
+    /// <summary>Whether a live <c>.fileref</c> record's content can be restored (PlainContent.ResolvesAsync).</summary>
+    private Task<bool> ResolvesAsync(FileRecord reference, int setId, string targetDir, CancellationToken ct) =>
+        PlainContent.ResolvesAsync(_catalog, setId, reference.Hash, targetDir, ct);
 
     /// <summary>
     /// Whether a path's live records include a <c>.fileref</c>, and every one of

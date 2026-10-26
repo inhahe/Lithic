@@ -447,10 +447,7 @@ public class VerifyService : IVerifyService
         ? $"{(int)t.TotalHours}:{t.Minutes:D2}:{t.Seconds:D2}"
         : $"{t.Minutes}:{t.Seconds:D2}";
 
-    /// <summary>
-    /// Resolve a content hash to the absolute path of an active plain copy of
-    /// that content somewhere in the backup tree, or <c>null</c> if none exists.
-    /// </summary>
+    /// <summary>The first twelve characters of a hash, for a message.</summary>
     private static string Shorten(string hash)
         => hash.Length <= 12 ? hash : hash[..12];
 }

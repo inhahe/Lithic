@@ -225,8 +225,7 @@ public sealed class CatalogReconcileService
                 var r = p.Record;
                 if (File.Exists(Path.Combine(targetDirectory, r.DiscPath))) { skipped++; continue; }
                 if (r.IsFileRef
-                    && (EmptyContent.Is(r.Hash)
-                        || await PlainContent.FirstExistingAsync(_catalog, backupSetId, r.Hash, targetDirectory, ct) is not null))
+                    && await PlainContent.ResolvesAsync(_catalog, backupSetId, r.Hash, targetDirectory, ct))
                 {
                     skipped++;
                     continue;

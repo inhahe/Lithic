@@ -348,6 +348,9 @@ internal sealed class SqliteSetDatabase : IDisposable
     /// </summary>
     internal bool ShouldGiveWayToWaitingWriter => YieldToWaitingWriters && AnotherProcessIsWaiting();
 
+    /// <summary>See <see cref="ICatalogRepository.OwnsWriteTransaction"/>.</summary>
+    internal bool OwnsWriteTransaction => OwnsTransaction;
+
     /// <summary>
     /// For a background writer (<see cref="YieldToWaitingWriters"/>): wait while a
     /// writer in another process is waiting for this set's lock. Its marker goes
@@ -1686,39 +1689,56 @@ internal sealed class SqliteSetDatabase : IDisposable
         return paths;
     }
 
-    /// <summary>See <see cref="ICatalogRepository.DeleteSeededReferencesWithoutContentAsync"/>.</summary>
-    public async Task<IReadOnlyList<string>> DeleteSeededReferencesWithoutContentAsync(
+    /// <summary>See <see cref="ICatalogRepository.RetireSeededReferencesWithoutContentAsync"/>.</summary>
+    public async Task<IReadOnlyList<string>> RetireSeededReferencesWithoutContentAsync(
         int backupSetId, int discId, CancellationToken ct = default)
     {
         ct.ThrowIfCancellationRequested();
         using var _ = await WriteLockAsync(ct).ConfigureAwait(false);
 
         // The disc's references through IX_Files_DiscId, each probing
-        // IX_Files_Active_Hash; "plain" as everywhere a reference resolves.
-        using var cmd = _connection.CreateCommand();
-        cmd.CommandText = """
-            DELETE FROM Files
-            WHERE Id IN (
-                SELECT r.Id FROM Files r
+        // IX_Files_Active_Hash ("plain" as everywhere a reference resolves), and
+        // for a twin an earlier seed retired, IX_Files_SourcePath_NoCase.
+        var found = new List<(long Id, string DiscPath, bool Twin)>();
+        using (var cmd = _connection.CreateCommand())
+        {
+            cmd.CommandText = """
+                SELECT r.Id, r.DiscPath,
+                       EXISTS (SELECT 1 FROM Files t
+                               WHERE t.SourcePath = r.SourcePath COLLATE NOCASE AND t.IsDeleted = 1
+                                 AND t.IsFileRef = 1 AND t.DiscPath = r.DiscPath
+                                 AND t.Version = r.Version AND t.Hash = r.Hash)
+                FROM Files r
                 WHERE r.DiscId = $discId AND r.IsDeleted = 0 AND r.IsFileRef = 1 AND r.Hash <> $empty
                   AND EXISTS (SELECT 1 FROM Discs d WHERE d.Id = r.DiscId AND d.BackupSetId = $setId)
                   AND (r.Hash = '' OR NOT EXISTS (
                       SELECT 1 FROM Files p
                       WHERE p.Hash = r.Hash AND p.IsDeleted = 0
-                        AND p.IsFileRef = 0 AND p.IsDeduped = 0 AND p.IsSplit = 0 AND p.IsZipped = 0)))
-            RETURNING DiscPath
-            """;
-        cmd.Parameters.AddWithValue("$discId", discId);
-        cmd.Parameters.AddWithValue("$setId", backupSetId);
-        cmd.Parameters.AddWithValue("$empty", EmptyContent.Hash);
+                        AND p.IsFileRef = 0 AND p.IsDeduped = 0 AND p.IsSplit = 0 AND p.IsZipped = 0))
+                """;
+            cmd.Parameters.AddWithValue("$discId", discId);
+            cmd.Parameters.AddWithValue("$setId", backupSetId);
+            cmd.Parameters.AddWithValue("$empty", EmptyContent.Hash);
+            foreach (var r in Rows(cmd, ct))
+                found.Add((r.GetInt64(0), r.GetString(1), r.GetInt64(2) != 0));
+        }
 
-        // A write, so not through Rows, and not cancellable: the caller counts
-        // every row the statement deleted.
-        var paths = new List<string>();
-        using (var r = cmd.ExecuteReader())
-            while (r.Read())
-                paths.Add(r.GetString(0));
-        return paths;
+        // Not cancellable from here: the caller counts every record left out.
+        using (var cmd = _connection.CreateCommand())
+        {
+            cmd.CommandText = "DELETE FROM Files WHERE Id IN (SELECT value FROM json_each($ids))";
+            cmd.Parameters.AddWithValue("$ids",
+                System.Text.Json.JsonSerializer.Serialize(found.Where(f => f.Twin).Select(f => f.Id)));
+            cmd.ExecuteNonQuery();
+        }
+        using (var cmd = _connection.CreateCommand())
+        {
+            cmd.CommandText = "UPDATE Files SET IsDeleted = 1 WHERE Id IN (SELECT value FROM json_each($ids))";
+            cmd.Parameters.AddWithValue("$ids",
+                System.Text.Json.JsonSerializer.Serialize(found.Where(f => !f.Twin).Select(f => f.Id)));
+            cmd.ExecuteNonQuery();
+        }
+        return found.Select(f => f.DiscPath).ToList();
     }
 
     /// <summary>See <see cref="ICatalogRepository.GetRetiredPlainCopiesAsync"/>.</summary>
@@ -1735,7 +1755,7 @@ internal sealed class SqliteSetDatabase : IDisposable
         using var cmd = _connection.CreateCommand();
         cmd.CommandText = """
             SELECT p.* FROM Files p
-            WHERE p.IsDeleted = 1
+            WHERE p.IsDeleted = 1 AND p.Hash <> ''
               AND p.IsFileRef = 0 AND p.IsDeduped = 0 AND p.IsSplit = 0 AND p.IsZipped = 0
               AND p.Hash IN (SELECT value FROM json_each($hashes))
               AND EXISTS (SELECT 1 FROM Discs d WHERE d.Id = p.DiscId AND d.BackupSetId = $setId)
