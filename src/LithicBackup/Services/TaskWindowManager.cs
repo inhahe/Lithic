@@ -59,13 +59,10 @@ public static class TaskKinds
 /// Opens, tracks and focuses the non-modal task windows, and enforces the rules
 /// about what may be open at the same time on one backup set.
 ///
-/// <para><b>Why this exists.</b> Task flows used to be swapped into the main
-/// window's <c>CurrentView</c>, which meant anything that set <c>CurrentView</c>
-/// destroyed whatever the user was doing. A backup starting did exactly that
-/// (<c>StartBurn</c> reset the view so the row's progress panel was visible), so
-/// leaving a multi-hour Cleanup scan running and starting a backup silently
-/// threw the scan away. A task that owns its own window cannot be discarded by
-/// an unrelated part of the app.</para>
+/// <para><b>Why this exists.</b> A task that owns its own window cannot be
+/// discarded by an unrelated part of the app: a backup starting cannot throw away
+/// a multi-hour Cleanup scan, as it could when tasks shared the main window's
+/// content area.</para>
 /// </summary>
 public sealed class TaskWindowManager
 {

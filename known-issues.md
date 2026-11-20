@@ -2582,8 +2582,8 @@ work inside it. A Cleanup destination scan is the worst case: hours of walking
 **Fix: each task owns a non-modal top-level window** (`Views/TaskWindow`,
 managed by `Services/TaskWindowManager`). A window that belongs to a task cannot
 be discarded by an unrelated part of the app, so the whole class of bug goes
-away rather than this one instance of it. `CurrentView` still exists but nothing
-assigns a flow to it, and the two lines above are gone.
+away rather than this one instance of it. The two lines above are gone, and so,
+since, is `CurrentView`: the main window's content area holds only the set list.
 
 Several windows may now be open at once, so `TaskKind` records what each flow
 does (`WritesCatalog` / `WritesDestination` / `ReadsDestination`) and the manager

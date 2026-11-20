@@ -37,7 +37,6 @@ public class MainViewModel : ViewModelBase
     private string _statusText = "Ready";
     private string _backgroundStatusText = "";
     private int _recorderCount;
-    private ViewModelBase? _currentView;
     private BackupSet? _selectedBackupSet;
     private string _serviceStatusText = "";
     /// <summary>True while a background poll is watching a transient service
@@ -49,8 +48,7 @@ public class MainViewModel : ViewModelBase
     /// <summary>
     /// Opens and tracks the non-modal task windows (Cleanup, Restore, Verify,
     /// ...). Each task owns a window, so nothing in the main window can discard
-    /// work in progress - which is exactly what used to happen when a backup
-    /// starting reset CurrentView out from under a running Cleanup scan.
+    /// work in progress.
     /// </summary>
     private readonly Services.TaskWindowManager _taskWindows;
     private Window? _largestFilesWindow;
@@ -130,42 +128,10 @@ public class MainViewModel : ViewModelBase
             o => (o as BackupSetRowViewModel)?.ScanCts?.Cancel(),
             o => o is BackupSetRowViewModel row && row.ScanCts is { IsCancellationRequested: false });
 
-        // Selected-set commands (used by menus/other views; operate on the
-        // currently selected set's row).
-        RunIncrementalCommand = new RelayCommand(
-            _ => { if (SelectedRow is { } r) StartIncrementalFlow(r); },
-            _ => SelectedRow is { IsRunning: false });
-        RestoreCommand = new RelayCommand(
-            _ => StartRestoreFlow(),
-            _ => SelectedBackupSet is not null);
-        EditBackupSetCommand = new RelayCommand(
-            _ => StartEditFlow(),
-            _ => SelectedBackupSet is not null);
-        ChangeDestinationCommand = new RelayCommand(
-            _ => _ = ChangeDestinationAsync(),
-            _ => SelectedBackupSet?.JobOptions?.TargetDirectory is not null);
-        CopyBackupSetCommand = new RelayCommand(
-            _ => _ = CopyBackupSetAsync(),
-            _ => SelectedBackupSet is not null);
-        OrphanedDirsCommand = new RelayCommand(
-            _ => StartOrphanedDirsFlow(),
-            _ => SelectedBackupSet is not null);
         FindFileCommand = new RelayCommand(
             _ => StartFindFileFlow());
         CatalogFreeRestoreCommand = new RelayCommand(
             _ => StartCatalogFreeRestoreFlow());
-        HomeCommand = new RelayCommand(_ => GoHome());
-        BackupCoverageCommand = new RelayCommand(
-            _ => StartBackupCoverageFlow(),
-            _ => SelectedBackupSet is not null);
-        LargestFilesCommand = new RelayCommand(
-            _ => StartLargestFilesFlow(),
-            _ => SelectedBackupSet is not null);
-        // Not while the set is backing up in this window: the export reads the
-        // set's database, and a read here shares the backup's connection.
-        ExportBackupSetCommand = new RelayCommand(
-            _ => _ = ExportBackupSetAsync(),
-            _ => SelectedBackupSet is not null && SelectedRow is not { IsRunning: true } and not { IsExporting: true });
         ImportBackupSetCommand = new RelayCommand(
             _ => _ = ImportBackupSetAsync());
 
@@ -298,13 +264,6 @@ public class MainViewModel : ViewModelBase
         set => SetProperty(ref _recorderCount, value);
     }
 
-    /// <summary>The view currently displayed in the main content area. Null = home screen.</summary>
-    public ViewModelBase? CurrentView
-    {
-        get => _currentView;
-        set => SetProperty(ref _currentView, value);
-    }
-
     public ObservableCollection<BackupSetRowViewModel> BackupSets { get; }
 
     public BackupSet? SelectedBackupSet
@@ -319,18 +278,8 @@ public class MainViewModel : ViewModelBase
     // --- Commands ---
 
     public ICommand NewBackupSetCommand { get; }
-    public ICommand EditBackupSetCommand { get; }
-    public ICommand ChangeDestinationCommand { get; }
-    public ICommand CopyBackupSetCommand { get; }
-    public ICommand RunIncrementalCommand { get; }
-    public ICommand RestoreCommand { get; }
-    public ICommand OrphanedDirsCommand { get; }
     public ICommand FindFileCommand { get; }
     public ICommand CatalogFreeRestoreCommand { get; }
-    public ICommand HomeCommand { get; }
-    public ICommand BackupCoverageCommand { get; }
-    public ICommand LargestFilesCommand { get; }
-    public ICommand ExportBackupSetCommand { get; }
     public ICommand ImportBackupSetCommand { get; }
 
     /// <summary>Cancels the scan phase of a backup (before burn starts).</summary>
@@ -5352,9 +5301,8 @@ public class MainViewModel : ViewModelBase
     }
 
     /// <param name="setView">
-    /// Where to put the view. Required: both callers host it explicitly (a task
-    /// window from the main screen, inline from the set editor), and defaulting
-    /// to the main window's CurrentView is what this refactor removed.
+    /// Where to put the view: a task window from the main screen, inline in the
+    /// set editor.
     /// </param>
     private async Task<LargestFilesViewModel> ShowLargestFilesAsync(
         BackupSet backupSet, Action onDone,
@@ -6564,21 +6512,6 @@ public class MainViewModel : ViewModelBase
     }
 
     // -------------------------------------------------------------------
-    // Navigation
-    // -------------------------------------------------------------------
-
-    private void GoHome()
-    {
-        CurrentView = null;
-        StatusText = RecorderCount switch
-        {
-            0 => "No disc recorders detected",
-            1 => "1 disc recorder detected",
-            _ => $"{RecorderCount} disc recorders detected",
-        };
-    }
-
-    // -------------------------------------------------------------------
     // Initialization
     // -------------------------------------------------------------------
 
@@ -6675,7 +6608,6 @@ public class MainViewModel : ViewModelBase
         }
     }
 
-    /// <summary>Find the row VM wrapping the given backup set, if loaded.</summary>
     /// <summary>
     /// Close every open task window. Called when the main window closes: the app
     /// runs with ShutdownMode.OnExplicitShutdown, so a task window left open
@@ -6683,12 +6615,9 @@ public class MainViewModel : ViewModelBase
     /// </summary>
     public void CloseTaskWindows() => _taskWindows.CloseAll();
 
+    /// <summary>Find the row VM wrapping the given backup set, if loaded.</summary>
     private BackupSetRowViewModel? RowFor(int setId) =>
         BackupSets.FirstOrDefault(r => r.Id == setId);
-
-    /// <summary>Find the row VM wrapping the currently-selected set, if any.</summary>
-    private BackupSetRowViewModel? SelectedRow =>
-        SelectedBackupSet is null ? null : RowFor(SelectedBackupSet.Id);
 
     private static string FormatBytes(long bytes) => $"{bytes:N0}";
 }

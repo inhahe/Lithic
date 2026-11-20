@@ -280,6 +280,7 @@ internal static class Program
         await SharedBackupFolderAsync();
         await ImportHoldsItsRowAsync();
         await RemapHoldsTheRowAsync();
+        await MainWindowShowsTheSetsAsync();
 #endif
         Check(_dialogs.Unexpected.Count == 0,
             "no unexpected message box appeared"
@@ -1000,6 +1001,76 @@ internal static class Program
         _dialogs.ClearExpectations();
         if (imported is not null)
             await _observer.DeleteBackupSetAsync(imported.Id);
+    }
+
+    /// <summary>
+    /// 30: the real main window, given the main view model, shows a row for every
+    /// set, its name and its actions, with no binding error anywhere in it.
+    /// </summary>
+    static async Task MainWindowShowsTheSetsAsync()
+    {
+        Console.WriteLine();
+        Console.WriteLine("=== 30. the main window shows every set, with no binding errors ===");
+        var errors = new BindingErrors();
+        PresentationTraceSources.Refresh();
+        PresentationTraceSources.DataBindingSource.Listeners.Add(errors);
+        PresentationTraceSources.DataBindingSource.Switch.Level = SourceLevels.Error;
+        var win = new MainWindow
+        {
+            DataContext = _vm, WindowStartupLocation = WindowStartupLocation.Manual,
+            Left = -20000, Top = -20000, ShowActivated = false, ShowInTaskbar = false,
+        };
+        try
+        {
+            win.Show();
+            await win.Dispatcher.InvokeAsync(() => { }, DispatcherPriority.ContextIdle);
+            await Task.Delay(500);
+            static IEnumerable<DependencyObject> Descendants(DependencyObject d)
+            {
+                for (int i = 0; i < System.Windows.Media.VisualTreeHelper.GetChildrenCount(d); i++)
+                {
+                    var child = System.Windows.Media.VisualTreeHelper.GetChild(d, i);
+                    yield return child;
+                    foreach (var below in Descendants(child))
+                        yield return below;
+                }
+            }
+            var visuals = Descendants(win).ToList();
+            var texts = visuals.OfType<System.Windows.Controls.TextBlock>().Select(t => t.Text).ToHashSet();
+            var missing = _vm.BackupSets.Where(r => !texts.Contains(r.Name)).Select(r => r.Name).ToList();
+            Check(_vm.BackupSets.Count > 0 && missing.Count == 0,
+                $"every set's row shows its name ({_vm.BackupSets.Count} sets; missing: {string.Join(", ", missing)})");
+            var commands = visuals.OfType<System.Windows.Controls.Button>().Select(b => b.Command).ToHashSet();
+            Check(commands.Contains(_vm.NewBackupSetCommand) && commands.Contains(_vm.ImportBackupSetCommand)
+                  && commands.Contains(_vm.SetBackupCommand),
+                "with the toolbar's New and Import, and each row's Backup");
+            Check(errors.Messages.Count == 0,
+                $"and no binding error ({errors.Messages.Count}: {string.Join(" | ", errors.Messages.Take(3))})");
+        }
+        finally
+        {
+            PresentationTraceSources.DataBindingSource.Listeners.Remove(errors);
+            // Closed as on an exit: an ordinary close would minimize the app to
+            // the tray, hiding this harness's stand-in main window.
+            AppMethod("MarkRestartManagerExit").Invoke(_app, null);
+            win.Close();
+            AppMethod("AbortRestartManagerExit").Invoke(_app, null);
+        }
+    }
+
+    static MethodInfo AppMethod(string name)
+        => typeof(App).GetMethod(name, BindingFlags.Instance | BindingFlags.NonPublic)!;
+
+    /// <summary>Collects the data-binding errors WPF traces.</summary>
+    sealed class BindingErrors : TraceListener
+    {
+        public readonly List<string> Messages = [];
+        public override void Write(string? message) { }
+        public override void WriteLine(string? message)
+        {
+            if (message is not null)
+                Messages.Add(message);
+        }
     }
 
     /// <summary>

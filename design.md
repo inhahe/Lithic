@@ -1206,9 +1206,10 @@ hours of scanning.
 looking at.** More generally, no background event may navigate. If a piece of UI
 needs to be seen, it appears where it belongs and waits.
 
-`CurrentView` and `GoHome` still exist but nothing assigns a flow to them. If you
-add a task flow, give it a window — do not reintroduce an inline view, because
-the moment one exists the global-state hazard is back.
+The main window's content area holds the set list and nothing else; it has no
+slot a flow could be put in. If you add a task flow, give it a window — do not
+reintroduce an inline view, because the moment one exists the global-state hazard
+is back.
 
 **Concurrency between windows is policed, not assumed.** Several task windows may
 be open at once, which means two of them can act on one backup set.
