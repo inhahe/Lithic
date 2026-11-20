@@ -56,6 +56,14 @@ public class TestDiscViewModel : ViewModelBase
     /// <summary>Fired when the user clicks "Close".</summary>
     public event Action? DoneRequested;
 
+    /// <summary>
+    /// The work holding the set's row in the main window right now ("seeding",
+    /// "removing the files of dropped sources"), or null when none is. A re-burn
+    /// is refused while that work runs: it records copies of files the work may
+    /// be retiring. Null when nothing can say.
+    /// </summary>
+    public Func<string?>? DescribeBusy { get; init; }
+
     public TestDiscViewModel(
         ICatalogRepository catalog,
         IRestoreService restoreService,
@@ -489,6 +497,12 @@ public class TestDiscViewModel : ViewModelBase
             return;
         if (affectedOnly && _failedFileRecordIds.Count == 0)
             return;
+        if (DescribeBusy?.Invoke() is { } busy)
+        {
+            SummaryText = $"This set is {busy} right now, so no disc was burned: that work changes the "
+                          + "records a re-burn writes. Re-burn when it has finished.";
+            return;
+        }
 
         var recorderId = TryGetRecorderId();
         if (recorderId is null)

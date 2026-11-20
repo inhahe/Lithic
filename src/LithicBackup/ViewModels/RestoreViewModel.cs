@@ -42,10 +42,11 @@ public class RestoreViewModel : ViewModelBase
     public event Action? DoneRequested;
 
     /// <summary>
-    /// What the set's row in the main window is doing right now ("backing up",
-    /// "removing the files of dropped sources"), or null when it is idle. A restore
-    /// is refused while it works: the work moves and deletes the stored files a
-    /// restore reads. Null when nothing can say.
+    /// The work holding the set's row in the main window right now ("seeding",
+    /// "removing the files of dropped sources"), or null when none is. A backup
+    /// does not count: opening this window during one warns, and the user may go
+    /// on. A restore is refused while that work runs: it moves and deletes the
+    /// stored files a restore reads. Null when nothing can say.
     /// </summary>
     public Func<string?>? DescribeBusy { get; init; }
 

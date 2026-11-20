@@ -45,6 +45,9 @@ public class MainViewModel : ViewModelBase
     private bool _servicePollActive;
     private BackupSetEditorWindow? _editorWindow;
 
+    /// <summary>The ids of the sets an editor is open on, once per editor: each holds its own copy of its set, which it may save.</summary>
+    private readonly List<int> _setsInEditor = [];
+
     /// <summary>
     /// Opens and tracks the non-modal task windows (Cleanup, Restore, Verify,
     /// ...). Each task owns a window, so nothing in the main window can discard
@@ -855,6 +858,7 @@ public class MainViewModel : ViewModelBase
             Title = $"Modify \u2014 {backupSet.Name}",
         };
         _editorWindow = dialog;
+        _setsInEditor.Add(backupSet.Id);
 
         // Closing the editor never saves by itself. How it closes decides:
         //   Save button   → SaveRequested has saved everything; closes silently.
@@ -970,6 +974,7 @@ public class MainViewModel : ViewModelBase
             sourceSelection.Dispose();
 
             _editorWindow = null;
+            _setsInEditor.Remove(backupSet.Id);
 
             // Work this editor started outlives it, visibly. A seed or a history
             // clear already holds the set's row (BeginRowWork). A duplicate
@@ -2909,8 +2914,9 @@ public class MainViewModel : ViewModelBase
         if (SelectedBackupSet is null) return;
         var backupSet = SelectedBackupSet;
 
-        // It rewrites the whole set below, selection included, so start from the
-        // catalog's copy - see ChangeDestinationAsync.
+        // The drives it offers come from the set as stored, not as this window
+        // last read it - see ChangeDestinationAsync. (What it saves is read again
+        // once it holds the row, below.)
         await RefreshFromCatalogAsync(backupSet, "remapping its source drive");
 
         // Collect the distinct source drive letters currently in the set.
@@ -2997,29 +3003,43 @@ public class MainViewModel : ViewModelBase
                 + "drive was not remapped. Remap it when that has finished.";
             return;
         }
+        // An editor open on the set would save its own copy of the sources,
+        // on the old drive, over the remap.
+        if (_setsInEditor.Contains(backupSet.Id))
+        {
+            StatusText = $"\"{backupSet.Name}\" is open in its editor, so its source drive was not remapped: "
+                + "saving the editor would put the old drive back. Close the editor, then remap.";
+            return;
+        }
         BeginRowWork(row, RemappingSourceDrive, $"Remapping source drive {oldDrive}: to {newDrive}:…", cancel: null);
         try
         {
             await WaitForBackgroundRunAsync(row, backupSet.Id, $"Remapping source drive {oldDrive}: to {newDrive}:");
 
+            // The set as stored now, with the row held: whatever was saved while
+            // the dialogs were open (the Worker pinning a folder, a backup's time)
+            // is kept. A copy of its own, so that the set the rest of the app holds
+            // changes only once the remap is saved.
+            var remapped = await _catalog.GetBackupSetAsync(backupSet.Id)
+                ?? throw new InvalidOperationException("the set no longer exists");
             // Mirror the change in the set's own source configuration so scans,
-            // watchers and future selections use the new drive too. Made here, on
-            // the UI thread, which owns the set; the work below only saves it.
-            for (int i = 0; i < backupSet.SourceRoots.Count; i++)
-                backupSet.SourceRoots[i] = RemapDriveInPath(backupSet.SourceRoots[i], oldDrive, newDrive);
-            if (backupSet.SourceSelections is not null)
-                RemapDriveInSelections(backupSet.SourceSelections, oldDrive, newDrive);
+            // watchers and future selections use the new drive too.
+            for (int i = 0; i < remapped.SourceRoots.Count; i++)
+                remapped.SourceRoots[i] = RemapDriveInPath(remapped.SourceRoots[i], oldDrive, newDrive);
+            if (remapped.SourceSelections is not null)
+                RemapDriveInSelections(remapped.SourceSelections, oldDrive, newDrive);
 
             // The records and the set, saved together as one piece of work that
             // an exit waits for: the records alone would say one drive and the
             // set's selection the other.
             int updated = await RunOnRowAsync(row, $"Remapping source drive {oldDrive}: to {newDrive}:", async _ =>
             {
-                int remapped = await _catalog.RemapSourcePathPrefixAsync(
-                    backupSet.Id, $"{oldDrive}:\\", $"{newDrive}:\\");
-                await _catalog.UpdateBackupSetAsync(backupSet);
-                return remapped;
+                int records = await _catalog.RemapSourcePathPrefixAsync(
+                    remapped.Id, $"{oldDrive}:\\", $"{newDrive}:\\");
+                await _catalog.UpdateBackupSetAsync(remapped);
+                return records;
             });
+            CopyPersistedFields(remapped, backupSet);
             StatusText = $"Remapped source drive {oldDrive}: → {newDrive}: ({updated:N0} record(s) updated).";
             EndRowWork(row, StatusText, isError: false);
         }
@@ -5073,18 +5093,28 @@ public class MainViewModel : ViewModelBase
         var set = SelectedBackupSet;
         _taskWindows.Show(
             Services.TaskKinds.Restore, set.Id, set.Name,
-            () => new RestoreViewModel(_catalog, _restoreService, set) { DescribeBusy = DescribeBusyRow(set.Id) },
+            () => new RestoreViewModel(_catalog, _restoreService, set) { DescribeBusy = DescribeHeldRow(set.Id) },
             (vm, close) => ((RestoreViewModel)vm).DoneRequested += close);
         StatusText = $"Restore files from \"{set.Name}\".";
     }
 
     /// <summary>
     /// For a task window on the set: what the set's row is doing right now
-    /// ("backing up", "seeding"), or null when it is idle. A task that writes or
-    /// reads the set's catalog or stored files refuses to act while it works.
+    /// ("backing up", "seeding"), or null when it is idle. Cleanup's purge, which
+    /// deletes what a backup would be writing, refuses while it works.
     /// </summary>
     private Func<string?> DescribeBusyRow(int setId)
         => () => RowFor(setId) is { IsWorking: true } r ? r.BusyActivity ?? "backing up" : null;
+
+    /// <summary>
+    /// For a task window on the set: the work holding the set's row right now
+    /// ("seeding", "removing the files of dropped sources"), or null when none
+    /// is. A backup is not such work: a task opened during one has been warned,
+    /// and may run beside it. Verify, Restore and Test Disc refuse to act while
+    /// such work runs.
+    /// </summary>
+    private Func<string?> DescribeHeldRow(int setId)
+        => () => RowFor(setId) is { IsWorking: true, BusyActivity: { } held } ? held : null;
 
     // -------------------------------------------------------------------
     // Flow 4: Cleanup (orphaned catalog records + optional destination scan)
@@ -5213,7 +5243,7 @@ public class MainViewModel : ViewModelBase
 
             _taskWindows.Show(
                 Services.TaskKinds.Restore, backupSet.Id, backupSet.Name,
-                () => new RestoreViewModel(_catalog, _restoreService, backupSet) { DescribeBusy = DescribeBusyRow(backupSet.Id) },
+                () => new RestoreViewModel(_catalog, _restoreService, backupSet) { DescribeBusy = DescribeHeldRow(backupSet.Id) },
                 (vm, close) => ((RestoreViewModel)vm).DoneRequested += close);
             StatusText = $"Restore files from \"{backupSet.Name}\".";
         };
@@ -5270,7 +5300,7 @@ public class MainViewModel : ViewModelBase
         var set = SelectedBackupSet;
         _taskWindows.Show(
             Services.TaskKinds.Verify, set.Id, set.Name,
-            () => new VerifyIntegrityViewModel(_catalog, _scanner, set) { DescribeBusy = DescribeBusyRow(set.Id) },
+            () => new VerifyIntegrityViewModel(_catalog, _scanner, set) { DescribeBusy = DescribeHeldRow(set.Id) },
             (vm, close) => ((VerifyIntegrityViewModel)vm).DoneRequested += close);
         StatusText = $"Opened Verify Integrity for \"{set.Name}\".";
     }
@@ -5286,7 +5316,10 @@ public class MainViewModel : ViewModelBase
         var set = SelectedBackupSet;
         _taskWindows.Show(
             Services.TaskKinds.TestDisc, set.Id, set.Name,
-            () => new TestDiscViewModel(_catalog, _restoreService, _orchestrator, _burner, set),
+            () => new TestDiscViewModel(_catalog, _restoreService, _orchestrator, _burner, set)
+            {
+                DescribeBusy = DescribeHeldRow(set.Id),
+            },
             (vm, close) => ((TestDiscViewModel)vm).DoneRequested += close);
         StatusText = $"Test a backup disc from \"{set.Name}\".";
     }
@@ -5485,27 +5518,33 @@ public class MainViewModel : ViewModelBase
         await ImportFromFileAsync(dialog.FileName);
     }
 
-    /// <summary>One prompt at a time when several export files are opened at once.</summary>
+    /// <summary>One offer at a time when several export files are opened at once.</summary>
     private readonly SemaphoreSlim _openedFilesGate = new(1, 1);
 
     /// <summary>
     /// Export files opened with Lithic Backup (double-clicked in Explorer, or
     /// handed over by a second launch): for each, show what it holds and ask
-    /// whether to add it as a backup set. One at a time, in order.
+    /// whether to add it as a backup set. One at a time, in order: the files
+    /// opened together each wait for the import of the one before.
     /// </summary>
     public async Task OfferOpenedFilesAsync(IReadOnlyList<string> paths)
     {
         foreach (string path in paths)
         {
+            bool accepted;
             await _openedFilesGate.WaitAsync();
             try
             {
-                await OfferImportAsync(path);
+                accepted = await OfferImportAsync(path);
             }
             finally
             {
                 _openedFilesGate.Release();
             }
+            // Outside the gate: an import runs for minutes, and a file opened
+            // meanwhile is answered at once - refused, as an import is under way.
+            if (accepted)
+                await ImportFromFileAsync(path);
         }
     }
 
@@ -5528,13 +5567,14 @@ public class MainViewModel : ViewModelBase
     [System.Runtime.InteropServices.DllImport("user32.dll")]
     private static extern bool IsWindowEnabled(IntPtr hWnd);
 
-    private async Task OfferImportAsync(string path)
+    /// <summary>Offer to import <paramref name="path"/>. Returns whether the user said Yes.</summary>
+    private async Task<bool> OfferImportAsync(string path)
     {
         // Said before the offer, not after a Yes it would then refuse.
         if (_importToken is not null)
         {
             RefuseSecondImport(path);
-            return;
+            return false;
         }
         var owner = PromptOwner();
         ExportedBackupSet settings;
@@ -5549,7 +5589,7 @@ public class MainViewModel : ViewModelBase
             MessageBox.Show(owner,
                 $"{Path.GetFileName(path)} is not a Lithic Backup set export, or could not be read.\n\n{ex.Message}",
                 "Open Backup Set", MessageBoxButton.OK, MessageBoxImage.Error);
-            return;
+            return false;
         }
 
         string destination = string.IsNullOrWhiteSpace(settings.JobOptions?.TargetDirectory)
@@ -5574,10 +5614,9 @@ public class MainViewModel : ViewModelBase
         if (answer != MessageBoxResult.Yes)
         {
             StatusText = $"Did not add \"{settings.Name}\" from {Path.GetFileName(path)}.";
-            return;
+            return false;
         }
-
-        await ImportFromFileAsync(path);
+        return true;
     }
 
     /// <summary>What holds the row of a set an import is still filling (see <see cref="ImportFromFileAsync"/>).</summary>
@@ -5617,18 +5656,34 @@ public class MainViewModel : ViewModelBase
     }
 
     /// <summary>
-    /// The import has ended, however it ended: release its set's row, and let the
-    /// next import start. Nothing when <paramref name="token"/> is not the import
-    /// under way: that import ended already, and another may have begun since.
+    /// The import has ended, however it ended: release its set's row, or remove
+    /// it if the set is gone, and let the next import start. Nothing when
+    /// <paramref name="token"/> is not the import under way: that import ended
+    /// already, and another may have begun since.
     /// </summary>
     /// <param name="token">The ending import's identity (<see cref="_importToken"/>) when it began.</param>
-    private void EndImport(object token)
+    /// <param name="completed">
+    /// The set was imported. When not, the import has deleted any set it created
+    /// (it is all or nothing), and the set's row, if a reload added one, goes at
+    /// once: released and left for the next reload, it would offer the actions of
+    /// a set that no longer exists.
+    /// </param>
+    private void EndImport(object token, bool completed)
     {
         if (!ReferenceEquals(_importToken, token))
             return;
         _importToken = null;
         if (_importingSetId is int id && RowFor(id) is { BusyActivity: BeingImported } row)
-            EndRowWork(row, "", isError: false);
+        {
+            if (completed)
+                EndRowWork(row, "", isError: false);
+            else
+            {
+                BackupSets.Remove(row);
+                if (SelectedBackupSet?.Id == id)
+                    SelectedBackupSet = null;
+            }
+        }
         _importingSetId = null;
         CommandManager.InvalidateRequerySuggested();
     }
@@ -5708,7 +5763,7 @@ public class MainViewModel : ViewModelBase
             // of records. A cancel leaves no set behind (the import is all or
             // nothing). The new set's row is held from the moment it exists.
             var dispatcher = Application.Current.Dispatcher;
-            bool completed;
+            bool completed = false;
             BackupSetImportResult result;
             try
             {
@@ -5733,7 +5788,7 @@ public class MainViewModel : ViewModelBase
             {
                 // Before any reload, which keeps a held row even when its set is
                 // gone (a cancelled import deletes its set).
-                EndImport(token);
+                EndImport(token, completed);
             }
             if (!completed)
             {
@@ -5795,7 +5850,7 @@ public class MainViewModel : ViewModelBase
         }
         finally
         {
-            EndImport(token);
+            EndImport(token, completed: false);
         }
     }
 

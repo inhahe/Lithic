@@ -2464,7 +2464,7 @@ public class OrphanedDirectoriesViewModel : ViewModelBase, IConfirmClose, IDispo
             int keptForReferences = 0;
             int leftAloneSinceScan = 0;
             int keptInUse = 0;
-            var (catalogPurged, filesDeleted, deleteFailures, bytesFreed, alreadyAbsent) = await Task.Run(async () =>
+            var purge = Task.Run(async () =>
             {
                 int catPurged = 0;
                 // Excess-version records held back because a .fileref still needs
@@ -2885,6 +2885,12 @@ public class OrphanedDirectoriesViewModel : ViewModelBase, IConfirmClose, IDispo
                 keptInUse = inUseKept;
                 return (catPurged, fDeleted, fFailed, bytes, fAbsent);
             });
+            // An exit stops it as Cancel does, and waits for it to stop: in the
+            // catalog phase it rolls back, in the deletion phase it stops between
+            // files, and either way what it did not do shows in the next scan.
+            using (Services.RunningWork.Track(purge, _purgeCts))
+                await purge;
+            var (catalogPurged, filesDeleted, deleteFailures, bytesFreed, alreadyAbsent) = purge.Result;
 
             // Back on the UI thread — update the observable collection.
             foreach (var (old, remaining) in afterPurge)

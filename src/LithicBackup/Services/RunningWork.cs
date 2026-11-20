@@ -2,13 +2,15 @@ namespace LithicBackup.Services;
 
 /// <summary>
 /// Work the app must not simply drop when it exits: what a progress dialog runs,
-/// and what <c>MainViewModel.RunOnRowAsync</c> runs for a held row (the removals
-/// after an edit, a source-drive remap). On a real exit <c>MainWindow</c> calls
-/// <see cref="CancelAndWait"/>. A process that simply ends runs no clean-up: an
-/// export would leave gigabytes of temporary files beside the export, an import
-/// a set without the history it claims, a removal its catalog changed without
-/// its files deleted, and a remap its records on one drive and its selection on
-/// the other.
+/// what <c>MainViewModel.RunOnRowAsync</c> runs for a held row (the removals
+/// after an edit, a source-drive remap), and Cleanup's purge. On a real exit
+/// <c>MainWindow</c> calls <see cref="CancelAndWait"/>. A process that simply ends
+/// runs no clean-up: an export would leave gigabytes of temporary files beside
+/// the export, an import a set without the history it claims, a removal its
+/// catalog changed without its files deleted, and a remap its records on one
+/// drive and its selection on the other. A purge leaves nothing its next scan
+/// cannot finish, stopped or not; stopped, it lets go of the set at once rather
+/// than when its hold goes stale.
 /// </summary>
 public static class RunningWork
 {

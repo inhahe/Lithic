@@ -71,11 +71,12 @@ public class VerifyIntegrityViewModel : ViewModelBase, IDisposable
     public event Action? DoneRequested;
 
     /// <summary>
-    /// What the set's row in the main window is doing right now ("backing up",
-    /// "removing the files of dropped sources"), or null when it is idle.
-    /// Verifying is refused while it works, as its files and records are changing
-    /// under it, and so is the repair, which writes the same catalog. Null when
-    /// nothing can say.
+    /// The work holding the set's row in the main window right now ("seeding",
+    /// "removing the files of dropped sources"), or null when none is. A backup
+    /// does not count: opening this window during one warns, and the user may go
+    /// on. Verifying is refused while that work runs, as its files and records are
+    /// changing under it, and so is the repair, which writes the same catalog.
+    /// Null when nothing can say.
     /// </summary>
     public Func<string?>? DescribeBusy { get; init; }
 

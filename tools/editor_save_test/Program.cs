@@ -439,8 +439,8 @@ internal static class Program
         }
         var row = _vm.BackupSets.First(r => r.Id == _setId);
 
-        // Task windows open on the set before the removal starts: no longer
-        // disabled by it, they must refuse to act while it holds the row.
+        // Task windows open on the set before the removal starts must refuse to
+        // act while it holds the row.
         _vm.SetVerifyIntegrityCommand.Execute(row);
         _vm.SetRestoreCommand.Execute(row);
         TaskWindow? verifyWin = null, restoreWin = null;
@@ -459,6 +459,13 @@ internal static class Program
         restore.RestoreToOriginal = true;
         if (restore.Roots.Count > 0)
             restore.Roots[0].IsSelected = true;
+
+        // A backup of the set, as its row shows one: running, no other work named.
+        // A window opened during one has been warned of it, and may run beside it.
+        row.IsRunning = true;
+        Check(verify.DescribeBusy?.Invoke() is null && restore.DescribeBusy?.Invoke() is null,
+            "a backup of the set does not stop an open Verify or Restore");
+        row.IsRunning = false;
 
         var ed = await OpenEditorAsync("reconcile");
         if (ed is null) return;
@@ -949,9 +956,10 @@ internal static class Program
     /// unavailable; the Import button is unavailable, and an opened export is
     /// refused before it is offered. A second import started while the first's
     /// result box is still up keeps its hold when that box closes, and its window,
-    /// opened under a dialog, outlives the dialog. Each import is frozen by holding
-    /// the new set's write lock, which its history waits for: a set's id is the
-    /// catalog's next.
+    /// opened under a dialog, outlives the dialog; an export opened while it runs
+    /// is refused at once. A third import, cancelled, takes its row with its set.
+    /// Each import is frozen by holding the new set's write lock, which its history
+    /// waits for: a set's id is the catalog's next.
     /// </summary>
     static async Task ImportHoldsItsRowAsync()
     {
@@ -980,7 +988,8 @@ internal static class Program
             await BackupSetTransfer.ExportAsync(_catalog, copy, file, includeHistory: true);
             return file;
         }
-        string exportA = await Export("imported-a"), exportB = await Export("imported-b");
+        string exportA = await Export("imported-a"), exportB = await Export("imported-b"),
+            exportC = await Export("imported-c");
 
         long nextId;
         using (var conn = new Microsoft.Data.Sqlite.SqliteConnection(
@@ -1011,7 +1020,7 @@ internal static class Program
         // --- A, as from the Import button, frozen ---
         var heldA = Hold(idA);
         var heldB = Hold(idB);
-        Task? importingA = null, importingB = null;
+        Task? importingA = null, importingB = null, lateOffer = null;
         try
         {
             importingA = (Task)importFromFile.Invoke(_vm, [exportA])!;
@@ -1078,6 +1087,19 @@ internal static class Program
             var rowB = _vm.BackupSets.FirstOrDefault(r => r.Id == idB);
             Check(rowB is { IsRunning: true, BusyActivity: "being imported" } && !_vm.ImportBackupSetCommand.CanExecute(null),
                 $"when the first import's box closes, the second keeps its set held ({rowB?.BusyActivity ?? "no row"})");
+
+            // An export opened while one opened before it imports is answered at
+            // once, not when that import ends.
+            _dialogs.Expect("Import Backup Set", DialogWatcher.IDOK);
+            var opened = _vm.OfferOpenedFilesAsync([exportA]);
+            bool answered = await Task.WhenAny(opened, Task.Delay(10000)) == opened;
+            Check(answered && _vm.StatusText.Contains("another import", StringComparison.Ordinal),
+                $"an export opened while an opened one imports is refused at once (\"{_vm.StatusText}\")");
+            if (!answered)
+            {
+                _dialogs.Expect("Open Backup Set", DialogWatcher.IDNO);
+                lateOffer = opened;
+            }
         }
         finally
         {
@@ -1090,13 +1112,53 @@ internal static class Program
             await importingA;
         if (importingB is not null)
             await importingB;
+        if (lateOffer is not null)
+            await lateOffer;
         Check(await _observer.HasFileRecordsAsync(idA) && await _observer.HasFileRecordsAsync(idB),
             "both imports finish, history and all");
         var rowsDone = _vm.BackupSets.Where(r => r.Id == idA || r.Id == idB).ToList();
         Check(rowsDone.Count == 2 && rowsDone.All(r => !r.IsRunning) && _vm.ImportBackupSetCommand.CanExecute(null),
             "and release their rows, and the Import button");
+
+        // --- C, cancelled after a reload has listed its held row ---
+        int idC = idB + 1;
+        BackupSetRowViewModel? rowC = null;
+        bool releasedWhileListed = false;
+        Task? importingC = null;
+        var heldC = Hold(idC);
+        try
+        {
+            importingC = (Task)importFromFile.Invoke(_vm, [exportC])!;
+            ProgressDialog? windowC = null;
+            Check(await Created(idC) && await WaitFor(() => (windowC = Application.Current.Windows.OfType<ProgressDialog>()
+                                                                .FirstOrDefault()) is not null, 10000),
+                "set-up: a third import waits to write its history");
+            await Reload();
+            rowC = _vm.BackupSets.FirstOrDefault(r => r.Id == idC);
+            Check(rowC is { IsRunning: true, BusyActivity: "being imported" }, "set-up: its row is listed, held");
+            if (rowC is not null)
+                rowC.PropertyChanged += (_, e) =>
+                {
+                    if (e.PropertyName == nameof(BackupSetRowViewModel.IsRunning) && !rowC.IsRunning
+                        && _vm.BackupSets.Contains(rowC))
+                        releasedWhileListed = true;
+                };
+            windowC?.Close();   // the window's close is its Cancel
+            await Task.WhenAny(importingC, Task.Delay(10000));
+        }
+        finally
+        {
+            heldC.Dispose();
+        }
+        if (importingC is not null)
+            await importingC;
+        Check(rowC is not null && await _observer.GetBackupSetAsync(idC) is null,
+            "a cancelled import deletes its set");
+        Check(rowC is not null && !releasedWhileListed && !_vm.BackupSets.Contains(rowC),
+            "and its row goes with it, never released to offer the actions of a set that is gone");
+
         _dialogs.ClearExpectations();
-        foreach (int id in new[] { idA, idB })
+        foreach (int id in new[] { idA, idB, idC })
             if (await _observer.GetBackupSetAsync(id) is not null)
                 await _observer.DeleteBackupSetAsync(id);
     }
@@ -1200,7 +1262,9 @@ internal static class Program
     /// 29: remapping a set's source drive holds the set's row while its records
     /// change - no backup of it can start meanwhile - and nothing else: no wait
     /// cursor over the app, no window disabled. Frozen by holding the set's write
-    /// lock, which the remap's update waits for.
+    /// lock, which the remap's update waits for. What was stored while its dialog
+    /// was open is kept, and the set the app holds keeps its old sources until the
+    /// remap is saved. A set open in its editor is not remapped.
     /// </summary>
     static async Task RemapHoldsTheRowAsync()
     {
@@ -1227,6 +1291,7 @@ internal static class Program
             Check(row is not null, "set-up: the set to remap is in the list");
             if (row is null) return;
 
+            var stamped = new DateTime(2026, 1, 2, 3, 4, 5, DateTimeKind.Utc);
             var held = new FileStream(Path.Combine(_root, "sets", $"set-{remapSet.Id}.db.writelock"),
                 FileMode.OpenOrCreate, FileAccess.ReadWrite, FileShare.None);
             try
@@ -1238,11 +1303,17 @@ internal static class Program
                                               .FirstOrDefault()) is not null, 10000),
                     "the remap dialog opens");
                 if (dialog is null) return;
+                // Stored while the dialog is open, as the Worker stamps a backup.
+                var stored = (await _observer.GetBackupSetAsync(remapSet.Id))!;
+                stored.LastBackupUtc = stamped;
+                await _observer.UpdateBackupSetAsync(stored);
                 dialog.DialogResult = true;
                 Check(await WaitFor(() => row.IsRunning && row.BusyActivity == "remapping its source drive", 10000),
                     $"the remap holds the set's row (\"{row.RunningStatusText}\")");
                 Check(!_vm.SetBackupCommand.CanExecute(row) && !_vm.SetModifyCommand.CanExecute(row),
                     "so the set cannot be backed up or modified meanwhile");
+                Check(char.ToUpperInvariant(row.Model.SourceRoots[0][0]) == from,
+                    $"the set the app holds keeps its sources until the remap is saved ({row.Model.SourceRoots[0]})");
                 var disabled = Application.Current.Windows.OfType<Window>()
                     .Where(w => w.IsVisible && !IsWindowEnabled(new System.Windows.Interop.WindowInteropHelper(w).Handle))
                     .Select(w => w.GetType().Name).ToList();
@@ -1259,6 +1330,34 @@ internal static class Program
             var after = await _observer.GetBackupSetAsync(remapSet.Id);
             Check(after is not null && after.SourceRoots.Count == 1 && char.ToUpperInvariant(after.SourceRoots[0][0]) != from,
                 $"and the set's source is on the new drive ({after?.SourceRoots.FirstOrDefault()})");
+            Check(after?.LastBackupUtc is { } last && Math.Abs((last - stamped).TotalSeconds) < 1,
+                $"keeping what was stored while its dialog was open ({after?.LastBackupUtc:o})");
+            Check(char.ToUpperInvariant(row.Model.SourceRoots[0][0]) != from,
+                $"and the set the app holds has the new drive too ({row.Model.SourceRoots[0]})");
+
+            // An editor open on a set holds a copy of its sources, which its save
+            // would write back over a remap.
+            var ed = await OpenEditorAsync("remap");
+            if (ed is not null)
+            {
+                var edited = _vm.BackupSets.First(r => r.Id == _setId);
+                var rootsBefore = (await _observer.GetBackupSetAsync(_setId))!.SourceRoots.ToList();
+                _dialogs.Expect("Remap Source Drive", DialogWatcher.IDYES);
+                _vm.SetRemapSourceDriveCommand.Execute(edited);
+                RemapSourceDriveDialog? second = null;
+                Check(await WaitFor(() => (second = Application.Current.Windows.OfType<RemapSourceDriveDialog>()
+                                              .FirstOrDefault()) is not null, 10000),
+                    "set-up: the remap dialog opens on the set being edited");
+                if (second is not null)
+                    second.DialogResult = true;
+                Check(await WaitFor(() => _vm.StatusText.Contains("open in its editor", StringComparison.Ordinal), 10000)
+                      && !edited.IsRunning,
+                    $"a set open in its editor is not remapped (\"{_vm.StatusText}\")");
+                Check((await _observer.GetBackupSetAsync(_setId))!.SourceRoots.SequenceEqual(rootsBefore),
+                    "and its sources are left alone");
+                ed.Window.Close();
+                Check(await WaitClosedAsync(ed.Window), "set-up: the editor closes");
+            }
         }
         finally
         {

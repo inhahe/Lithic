@@ -871,11 +871,17 @@ without stopping anything else. Work that changes a set holds the set's row
 (`BeginRowWork`; see "Catalog-writing work holds the set's row"), which refuses
 exactly the operations that would conflict with it, on that set alone, and holds
 the set against the Worker. A task window already open on the set when such work
-starts is no longer disabled either, so each one that acts on the set asks the row
-first (`DescribeBusy`) and refuses while it is held: Cleanup's purge, Verify and its
-repair, and Restore. The removals after an edit (the files of dropped sources, the
+starts is not disabled either, so each one that acts on the set asks the row
+first (`DescribeBusy`) and refuses while it is held: Verify and its repair, Restore
+and Test Disc's re-burns (`DescribeHeldRow`, which a backup does not count for: a
+window opened during one has been warned, and may run beside it), and Cleanup's
+purge, which deletes what a backup writes and so refuses during one too
+(`DescribeBusyRow`). The removals after an edit (the files of dropped sources, the
 earlier versions new retention settings no longer keep) and Remap Source Drive's
-two writes run through `RunOnRowAsync`. It runs the work off the UI
+two writes run through `RunOnRowAsync`. The remap rewrites the set as stored once
+it holds the row, not as read before its dialogs, and changes the set the app holds
+only once it is saved; it refuses a set an editor is open on, since the editor's
+save would put the old drive back. `RunOnRowAsync` runs the work off the UI
 thread, puts its progress on the row's status line, prefixed with what it is, and
 drops a report still queued when the work ends, which could otherwise land over
 the row's next work. An import holds the row of the set it creates
@@ -2018,20 +2024,25 @@ and `.history.partial`), so two exports to one file cannot delete each other's.
 An import holds the row of the set it creates from the moment the set exists,
 before its history goes in: a reload of the list meanwhile (a backup of another
 set finishing) would otherwise show a half-made set that could be backed up,
-modified or deleted. A cancelled or failed import deletes its set, so the row is
-released before the list is reloaded, which never drops a held row. One import
+modified or deleted. A cancelled or failed import deletes its set, and its row,
+if a reload added one, is removed at once (`EndImport`): released, it would offer
+the set's actions until the next reload. One import
 runs at a time: two at once could each find the same backup folder free and both
 take it. The Import button is unavailable meanwhile, and an opened `.lithic` is
-refused before it is offered. The folder is checked before the import starts and
+refused before it is offered, at once: opened files wait for each other's offers
+(`_openedFilesGate`), not for each other's imports, though files opened together
+are imported one after another. The folder is checked before the import starts and
 again just before the set is created (`ImportAsync`'s `refuseFolder`): extracting
 a history takes minutes, and another set can be given the folder meanwhile.
 
 On a real exit, `MainWindow` calls `RunningWork.CancelAndWait`, which cancels
-the work of every progress dialog, waits for that and for the work of held rows
-(`RunOnRowAsync`), up to 10 seconds, to unwind. A process that simply ends runs
-no `finally`: an export would leave gigabytes of temporary files beside the
-export, an import a set that claims a history its rolled-back transaction never
-wrote, and a removal its catalog changed without its files deleted.
+the work of every progress dialog and Cleanup's purge, and waits for that and for
+the work of held rows (`RunOnRowAsync`), up to 10 seconds, to unwind. A process
+that simply ends runs no `finally`: an export would leave gigabytes of temporary
+files beside the export, an import a set that claims a history its rolled-back
+transaction never wrote, and a removal its catalog changed without its files
+deleted. A purge, stopped or killed, leaves nothing its next scan cannot finish;
+stopped, it lets go of the set at once rather than when its hold goes stale.
 
 ## Opening a `.lithic` file reaches the one running window
 

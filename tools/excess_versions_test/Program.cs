@@ -2288,6 +2288,24 @@ internal static class Program
             "and not its unticked parent: keep-me.txt is still backed up");
 
         Console.WriteLine();
+        Console.WriteLine("=== 12d. An exit stops a running purge, and waits for it ===");
+        Row(OrphanedReason.DeletedFromDisk, "keep-me.txt").IsChecked = true;
+        using (repo.HoldSetForBackgroundBackup(set.Id))
+        {
+            vm.PurgeSelectedCommand.Execute(null);
+            Check(await WaitFor(() => vm.SummaryText.Contains("waiting for the background service", StringComparison.Ordinal), 5000),
+                "set-up: a purge of keep-me.txt waits for a background run");
+            RunningWork.CancelAndWait(TimeSpan.FromSeconds(5));
+            Check(await WaitFor(() => !vm.IsPurging, 2000)
+                  && vm.SummaryText.StartsWith("Cleanup cancelled", StringComparison.Ordinal),
+                $"an exit stops the purge and waits for it (\"{vm.SummaryText}\")");
+        }
+        // A purge the exit failed to stop carries on now; what follows needs it ended.
+        await WaitFor(() => !vm.IsPurging, 60000);
+        Check(await repo.GetActiveLatestRecordByPathAsync(set.Id, keepMe) is not null && File.Exists(Stored(keepMe)),
+            "stopped before its catalog half, the purge changed nothing");
+
+        Console.WriteLine();
         Console.WriteLine("=== 12c. Markers and the in-use query ===");
         string? markerPath;
         using (repo.HoldSetForCleanup(set.Id))
