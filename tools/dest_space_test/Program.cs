@@ -26,6 +26,7 @@
 
 using LithicBackup.Core.Interfaces;
 using LithicBackup.Core.Models;
+using LithicBackup.Harness;
 using LithicBackup.Infrastructure.Data;
 using LithicBackup.Services;
 
@@ -39,7 +40,7 @@ void Check(bool cond, string msg)
 const long GB = 1024L * 1024 * 1024;
 const long Low = 200L * 1024 * 1024;   // 200 MB -- genuinely below the 1 GB floor
 
-string root = Path.Combine(Path.GetTempPath(), "lithic_destspace_" + Guid.NewGuid().ToString("N"));
+string root = ScratchFolder.Create("lithic_destspace_");
 string destDir = Path.Combine(root, "dest");
 Directory.CreateDirectory(destDir);
 string destRoot = Path.GetPathRoot(destDir)!;
@@ -190,7 +191,9 @@ await flaky.CheckAsync();                      // low (streak 3)
 Check(streakAlerts.Count == 1, "three uninterrupted low readings do alert");
 flaky.Dispose();
 
-try { Directory.Delete(root, recursive: true); } catch { /* temp dir */ }
+interactiveRepo.Dispose();
+repo.Dispose();
+Check(ScratchFolder.Delete(root), $"the harness leaves no scratch folder behind ({root})");
 
 Console.WriteLine();
 Console.WriteLine(failures == 0 ? "ALL PASS" : $"{failures} FAILURE(S)");

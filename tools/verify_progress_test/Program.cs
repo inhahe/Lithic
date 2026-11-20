@@ -10,6 +10,7 @@
 using System.Diagnostics;
 using System.Text.RegularExpressions;
 using LithicBackup.Core;
+using LithicBackup.Harness;
 using LithicBackup.Core.Interfaces;
 using LithicBackup.Core.Models;
 using LithicBackup.Infrastructure.Data;
@@ -24,7 +25,7 @@ void Check(bool cond, string msg)
     if (!cond) failures++;
 }
 
-string root = Path.Combine(Path.GetTempPath(), "lithic_verifyprogress_" + Guid.NewGuid().ToString("N"));
+string root = ScratchFolder.Create("lithic_verifyprogress_");
 string src = Path.Combine(root, "src");
 string dst = Path.Combine(root, "dst");
 Directory.CreateDirectory(src);
@@ -179,13 +180,6 @@ Check(goneIssues.Count == Missing
 
 Console.WriteLine();
 repo.Dispose();
-SqliteConnection.ClearAllPools();
-for (int attempt = 0; attempt < 20 && Directory.Exists(root); attempt++)
-{
-    try { Directory.Delete(root, recursive: true); } catch { }
-    if (Directory.Exists(root))
-        Thread.Sleep(100);
-}
-Check(!Directory.Exists(root), "the harness leaves no temp folder behind");
+Check(ScratchFolder.Delete(root), $"the harness leaves no scratch folder behind ({root})");
 Console.WriteLine(failures == 0 ? "ALL PASS" : $"{failures} CHECK(S) FAILED");
 return failures == 0 ? 0 : 1;

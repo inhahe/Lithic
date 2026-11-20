@@ -21,6 +21,7 @@
 
 using LithicBackup.Core.Interfaces;
 using LithicBackup.Core.Models;
+using LithicBackup.Harness;
 using LithicBackup.Infrastructure.Data;
 using LithicBackup.Infrastructure.FileSystem;
 using LithicBackup.Services;
@@ -32,7 +33,7 @@ void Check(bool cond, string msg)
     if (!cond) failures++;
 }
 
-string root = Path.Combine(Path.GetTempPath(), "lithic_purgeint_" + Guid.NewGuid().ToString("N"));
+string root = ScratchFolder.Create("lithic_purgeint_");
 string source = Path.Combine(root, "src");
 string target = Path.Combine(root, "dst");
 Directory.CreateDirectory(source);
@@ -164,7 +165,9 @@ Check(again == 0, $"re-marking an already-deleted row reports 0 changed (got {ag
 var head = await repo.GetFileRecordByPathAndVersionAsync(set.Id, filePath, 2, CancellationToken.None);
 Check(head is not null && !head.IsDeleted, "the current version is still live");
 
+repo.Dispose();
+Check(ScratchFolder.Delete(root), $"the harness leaves no scratch folder behind ({root})");
+
 Console.WriteLine();
-try { Directory.Delete(root, recursive: true); } catch { }
 Console.WriteLine(failures == 0 ? "ALL CHECKS PASSED" : $"{failures} CHECK(S) FAILED");
 return failures == 0 ? 0 : 1;

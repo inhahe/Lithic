@@ -15,6 +15,7 @@ using System.IO;
 using System.Text.Json;
 using System.Windows.Threading;
 using LithicBackup.Core.Models;
+using LithicBackup.Harness;
 using LithicBackup.Infrastructure.Data;
 using LithicBackup.Infrastructure.FileSystem;
 using LithicBackup.ViewModels;
@@ -35,8 +36,7 @@ internal static class Program
     [STAThread]
     static int Main()
     {
-        string root = Path.Combine(Path.GetTempPath(), "lithic_missing_" + Guid.NewGuid().ToString("N"));
-        Directory.CreateDirectory(root);
+        string root = ScratchFolder.Create("lithic_missing_");
         CacheMaintenance.DirectoryOverride = Path.Combine(root, "appdata");
         Directory.CreateDirectory(CacheMaintenance.DirectoryOverride);
         try
@@ -52,8 +52,7 @@ internal static class Program
         }
         finally
         {
-            try { Microsoft.Data.Sqlite.SqliteConnection.ClearAllPools(); } catch { }
-            try { Directory.Delete(root, recursive: true); } catch { }
+            Check(ScratchFolder.Delete(root), $"the harness leaves no scratch folder behind ({root})");
         }
         Console.WriteLine();
         Console.WriteLine(_failures == 0 ? $"ALL {_checks} CHECKS PASSED" : $"{_failures} OF {_checks} CHECK(S) FAILED");
@@ -162,7 +161,8 @@ internal static class Program
         {
             Dir(src, null, auto: false, expanded: true, Dir(a, true, false), Dir(x, true, false)),
         };
-        var scanner = new FileScanner(new SqliteCatalogRepository(Path.Combine(root, "catalog.db")));
+        using var catalog = new SqliteCatalogRepository(Path.Combine(root, "catalog.db"));
+        var scanner = new FileScanner(catalog);
         async Task<List<string>> Names() =>
             (await scanner.ScanAsync(scanSel)).Select(f => Path.GetFileName(f.FullPath)).OrderBy(n => n).ToList();
 

@@ -40,6 +40,7 @@ using System.Text.Json;
 using LithicBackup.Core;
 using LithicBackup.Core.Interfaces;
 using LithicBackup.Core.Models;
+using LithicBackup.Harness;
 using LithicBackup.Infrastructure.Data;
 using LithicBackup.Infrastructure.FileSystem;
 using LithicBackup.Services;
@@ -54,8 +55,7 @@ void Check(bool cond, string msg)
 bool elevated = new WindowsPrincipal(WindowsIdentity.GetCurrent()).IsInRole(WindowsBuiltInRole.Administrator);
 Console.WriteLine(elevated ? "(running elevated)" : "(not elevated)");
 
-string root = Path.Combine(Path.GetTempPath(), "lithic_durability_" + Guid.NewGuid().ToString("N"));
-Directory.CreateDirectory(root);
+string root = ScratchFolder.Create("lithic_durability_");
 // A folder on another volume than the temp folder, for the junction: beside
 // this harness's binaries, which in this repository are on another drive.
 string elsewhere = Path.Combine(AppContext.BaseDirectory, "scratch_" + Guid.NewGuid().ToString("N"));
@@ -1102,8 +1102,8 @@ finally
     Microsoft.Data.Sqlite.SqliteConnection.ClearAllPools();
     if (substLetter is not null)
         Run("subst", substLetter + ":", "/D");
-    TryDelete(root);
-    TryDelete(elsewhere);
+    Check(ScratchFolder.Delete(root), $"the harness leaves no scratch folder behind ({root})");
+    Check(ScratchFolder.Delete(elsewhere), $"nor its folder on the other volume ({elsewhere})");
 }
 
 Console.WriteLine();
@@ -1175,22 +1175,6 @@ static void CopyTree(string from, string to)
         Directory.CreateDirectory(Path.GetDirectoryName(dest)!);
         File.Copy(f, dest);
         File.SetLastWriteTimeUtc(dest, File.GetLastWriteTimeUtc(f));
-    }
-}
-
-static void TryDelete(string dir)
-{
-    try
-    {
-        if (!Directory.Exists(dir))
-            return;
-        foreach (var f in Directory.EnumerateFiles(dir, "*", SearchOption.AllDirectories))
-            File.SetAttributes(f, FileAttributes.Normal);
-        Directory.Delete(dir, recursive: true);
-    }
-    catch (Exception ex)
-    {
-        Console.WriteLine($"  (could not delete {dir}: {ex.Message})");
     }
 }
 

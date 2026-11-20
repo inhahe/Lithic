@@ -24,6 +24,7 @@ using System.Diagnostics;
 using LithicBackup.Core;
 using LithicBackup.Core.Interfaces;
 using LithicBackup.Core.Models;
+using LithicBackup.Harness;
 using LithicBackup.Infrastructure.FileSystem;
 
 int failures = 0;
@@ -33,7 +34,7 @@ void Check(bool ok, string what)
     if (!ok) failures++;
 }
 
-string t = Path.Combine(Path.GetTempPath(), "lithic_linkloop_" + Guid.NewGuid().ToString("N"));
+string t = ScratchFolder.Create("lithic_linkloop_");
 string a = Path.Combine(t, "a"), b = Path.Combine(a, "b"), outside = Path.Combine(t, "outside"), m = Path.Combine(t, "m");
 foreach (var d in new[] { b, outside, m })
     Directory.CreateDirectory(d);
@@ -121,7 +122,7 @@ finally
     foreach (var j in new[] { P("a", "b", "loop"), P("a", "up"), P("a", "drive"), P("a", "ext"), P("a", "fwd"), P("a", "mutual"),
                               P("m", "back"), P("w", "b", "loop"), P("w", "ext") })
         try { Directory.Delete(j); } catch { }
-    try { Directory.Delete(t, recursive: true); } catch { }
+    Check(ScratchFolder.Delete(t), $"the harness leaves no scratch folder behind ({t})");
 }
 
 Console.WriteLine();

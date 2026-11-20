@@ -22,6 +22,7 @@
 
 using LithicBackup.Core.Interfaces;
 using LithicBackup.Core.Models;
+using LithicBackup.Harness;
 using LithicBackup.Infrastructure.Data;
 using LithicBackup.Infrastructure.FileSystem;
 using LithicBackup.Services;
@@ -34,7 +35,7 @@ void Check(bool cond, string msg)
     if (!cond) failures++;
 }
 
-string root = Path.Combine(Path.GetTempPath(), "lithic_interleave_" + Guid.NewGuid().ToString("N"));
+string root = ScratchFolder.Create("lithic_interleave_");
 string source = Path.Combine(root, "src");
 string target = Path.Combine(root, "dst");
 string catalogPath = Path.Combine(root, "catalog.db");
@@ -295,9 +296,10 @@ foreach (char drive in new[] { 'C', 'D', 'E' })
 }
 
 // ===================================================================
-Console.WriteLine();
-try { Directory.Delete(root, recursive: true); } catch { }
+repo.Dispose();
+Check(ScratchFolder.Delete(root), $"the harness leaves no scratch folder behind ({root})");
 
+Console.WriteLine();
 Console.WriteLine(failures == 0
     ? "ALL CHECKS PASSED"
     : $"{failures} CHECK(S) FAILED");

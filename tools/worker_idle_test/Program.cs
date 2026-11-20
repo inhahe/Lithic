@@ -39,6 +39,7 @@ using System.Runtime.ExceptionServices;
 using System.Runtime.InteropServices;
 using System.Text.Json;
 using LithicBackup.Core.Interfaces;
+using LithicBackup.Harness;
 using LithicBackup.Core.Models;
 using LithicBackup.Infrastructure.Data;
 using LithicBackup.Infrastructure.FileSystem;
@@ -80,8 +81,7 @@ for (int i = 0; i < args.Length; i++)
 }
 bool Run(string part) => onlyPart is null || onlyPart == part;
 
-string root = Path.Combine(Path.GetTempPath(), "lithic_idle_" + Guid.NewGuid().ToString("N"));
-Directory.CreateDirectory(root);
+string root = ScratchFolder.Create("lithic_idle_");
 var stampedSetIds = new List<int>();
 string Bs = "\\";
 
@@ -110,7 +110,7 @@ finally
     {
         try { File.Delete(FullScanStamp.PathFor(id)); } catch { }
     }
-    try { Directory.Delete(root, recursive: true); } catch { }
+    Check(ScratchFolder.Delete(root), $"the harness leaves no scratch folder behind ({root})");
 }
 
 Console.WriteLine();

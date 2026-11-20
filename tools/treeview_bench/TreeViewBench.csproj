@@ -11,7 +11,6 @@
     <RootNamespace>TreeViewBench</RootNamespace>
     <!-- Stand-alone harness: don't inherit anything from the app's build. -->
     <ImportDirectoryBuildProps>false</ImportDirectoryBuildProps>
-    <ImportDirectoryBuildTargets>false</ImportDirectoryBuildTargets>
   </PropertyGroup>
 
 </Project>

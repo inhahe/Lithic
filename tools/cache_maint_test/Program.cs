@@ -30,6 +30,7 @@
 
 using System.Diagnostics;
 using System.IO;
+using LithicBackup.Harness;
 using LithicBackup.ViewModels;
 using Microsoft.Data.Sqlite;
 
@@ -51,10 +52,9 @@ public static class Program
             return 1;
         }
 
-        string work = Path.Combine(Path.GetTempPath(), "lithic_cache_maint_test");
-        if (Directory.Exists(work))
-            Directory.Delete(work, recursive: true);
-        Directory.CreateDirectory(work);
+        // A copy of the cache, which can be hundreds of megabytes: made for each
+        // run and removed at its end.
+        string work = ScratchFolder.Create("lithic_cache_maint_");
 
         // Same file name the maintenance code looks for, in a directory it has
         // been redirected to.
@@ -156,6 +156,12 @@ public static class Program
         if (after.SurvivorsMatchOriginal(target, table, original) is { } mismatch)
         {
             Console.WriteLine($"FAIL: {mismatch}");
+            failures++;
+        }
+
+        if (!ScratchFolder.Delete(work))
+        {
+            Console.WriteLine($"FAIL: the copy of the cache was left behind ({work})");
             failures++;
         }
 

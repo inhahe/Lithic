@@ -20,6 +20,7 @@
 
 using System.Diagnostics;
 using LithicBackup.Core;
+using LithicBackup.Harness;
 using LithicBackup.Core.Interfaces;
 using LithicBackup.Core.Models;
 using LithicBackup.Infrastructure.Data;
@@ -45,8 +46,7 @@ internal static class Program
         if (args.Length > 0 && args[0] == "backup")
             return await BackupHolderAsync(args[1], int.Parse(args[2]), args[3], args[4]);
 
-        string root = Path.Combine(Path.GetTempPath(), "lithic_lockfair_" + Guid.NewGuid().ToString("N"));
-        Directory.CreateDirectory(root);
+        string root = ScratchFolder.Create("lithic_lockfair_");
         SqliteCatalogRepository? repo = null;
         try
         {
@@ -220,8 +220,7 @@ internal static class Program
         {
             // Its catalog closed first: an open one keeps the folder from going.
             repo?.Dispose();
-            Microsoft.Data.Sqlite.SqliteConnection.ClearAllPools();
-            try { Directory.Delete(root, recursive: true); } catch { }
+            Check(ScratchFolder.Delete(root), $"the harness leaves no scratch folder behind ({root})");
         }
 
         Console.WriteLine();

@@ -24,6 +24,7 @@
 
 using System.Diagnostics;
 using LithicBackup.Core.Models;
+using LithicBackup.Harness;
 using LithicBackup.Infrastructure.Data;
 using Microsoft.Data.Sqlite;
 
@@ -34,8 +35,7 @@ void Check(bool cond, string msg)
     if (!cond) failures++;
 }
 
-string root = Path.Combine(Path.GetTempPath(), "lithic_pathrange_" + Guid.NewGuid().ToString("N"));
-Directory.CreateDirectory(root);
+string root = ScratchFolder.Create("lithic_pathrange_");
 var repo = new SqliteCatalogRepository(Path.Combine(root, "catalog.db"));
 
 var set = await repo.CreateBackupSetAsync(new BackupSet
@@ -183,13 +183,6 @@ Check(movedPhotos == 1 && photos.Count == 1 && photos[0].SourcePath == @"C:\pr\p
 
 Console.WriteLine();
 repo.Dispose();
-SqliteConnection.ClearAllPools();
-for (int attempt = 0; attempt < 20 && Directory.Exists(root); attempt++)
-{
-    try { Directory.Delete(root, recursive: true); } catch { }
-    if (Directory.Exists(root))
-        Thread.Sleep(100);
-}
-Check(!Directory.Exists(root), "the harness leaves no temp folder behind");
+Check(ScratchFolder.Delete(root), $"the harness leaves no scratch folder behind ({root})");
 Console.WriteLine(failures == 0 ? "ALL PASS" : $"{failures} CHECK(S) FAILED");
 return failures == 0 ? 0 : 1;

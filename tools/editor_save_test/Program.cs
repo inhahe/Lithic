@@ -28,6 +28,7 @@ using System.Windows.Threading;
 using LithicBackup;
 using LithicBackup.Core.Interfaces;
 using LithicBackup.Core.Models;
+using LithicBackup.Harness;
 using LithicBackup.Infrastructure.Data;
 using LithicBackup.Services;
 using LithicBackup.ViewModels;
@@ -65,8 +66,8 @@ internal static class Program
     [STAThread]
     static int Main()
     {
-        _root = Path.Combine(Path.GetTempPath(), "lithic_editsave_" + Guid.NewGuid().ToString("N"));
-        Directory.CreateDirectory(_root);
+        _root = ScratchFolder.Create("lithic_editsave_");
+        bool folderGone = false;
         try
         {
             // The app's resources (styles, converters, view templates) without
@@ -140,28 +141,15 @@ internal static class Program
             // Closed first: SQLite's open files keep the folder from going.
             try { _catalog?.Dispose(); } catch { }
             try { _observer?.Dispose(); } catch { }
-            SqliteClearPools();
-            // Retried briefly: a folder another process (a scanner) still has
-            // open is only marked for deletion, and stays visible until it lets go.
-            for (int attempt = 0; attempt < 20 && Directory.Exists(_root); attempt++)
-            {
-                try { Directory.Delete(_root, recursive: true); } catch { }
-                if (Directory.Exists(_root))
-                    Thread.Sleep(100);
-            }
+            folderGone = ScratchFolder.Delete(_root);
         }
-        Check(!Directory.Exists(_root), $"the harness leaves no temp folder behind ({_root})");
+        Check(folderGone, $"the harness leaves no scratch folder behind ({_root})");
 
         Console.WriteLine();
         Console.WriteLine(_failures == 0
             ? $"ALL {_checks} CHECKS PASSED"
             : $"{_failures} OF {_checks} CHECK(S) FAILED");
         return _failures == 0 ? 0 : 1;
-    }
-
-    static void SqliteClearPools()
-    {
-        try { Microsoft.Data.Sqlite.SqliteConnection.ClearAllPools(); } catch { }
     }
 
     static SourceSelection Dir(string path, bool? selected, bool auto, bool expanded = false,

@@ -37,7 +37,15 @@ of `Directory.Build.props` (below) but not of that.
 `tools\` holds stand-alone console harnesses (this project has no unit-test
 project — measurement and verification live there). Each sets
 `ImportDirectoryBuildProps=false` so it never stamps the shipping version onto
-itself.
+itself. `tools\Directory.Build.targets` imports the root one, which it would
+otherwise hide, and compiles the code the harnesses share (`tools\Shared`) into
+every one of them.
+
+**A harness removes its scratch folder, and checks that it did.** Each run makes
+its own (`ScratchFolder.Create`, under `%TEMP%`) and ends with
+`Check(ScratchFolder.Delete(root), ...)`, after disposing every catalog it opened
+there: an open SQLite file keeps the folder, and a delete whose failure is
+swallowed left hundreds of folders behind, one per run.
 
 **A harness that constructs `App` must set `App.SkipStartupForTests` first.**
 WPF's `Application` constructor queues `OnStartup` for the first dispatcher pump,

@@ -10,6 +10,7 @@
 
 using LithicBackup.Core.Interfaces;
 using LithicBackup.Core.Models;
+using LithicBackup.Harness;
 using LithicBackup.Infrastructure.Data;
 using LithicBackup.Infrastructure.Deduplication;
 using LithicBackup.Infrastructure.FileSystem;
@@ -43,20 +44,19 @@ static long ActualStoredBytes(string target)
     return total;
 }
 
-// Run a real directory backup + the estimator over the same inputs and return
-// both the estimate and the actual on-disk stored size.
+// Run a real directory backup + the estimator over the same inputs, in a folder
+// of its own under the run's scratch folder, and return both the estimate and
+// the actual on-disk stored size.
 static async Task<(DedupSizeEstimate Est, long Actual, long Raw)> RunAsync(
+    string scratch,
     (string Name, byte[] Bytes)[] files,
     bool fileDedup,
-    bool blockDedup,
-    int? reuseSetId = null,
-    string? reuseTarget = null,
-    string? reuseCatalog = null)
+    bool blockDedup)
 {
-    string root = Path.Combine(Path.GetTempPath(), "lithic_est_" + Guid.NewGuid().ToString("N"));
+    string root = Path.Combine(scratch, Guid.NewGuid().ToString("N"));
     string source = Path.Combine(root, "src");
-    string target = reuseTarget ?? Path.Combine(root, "dst");
-    string catalogPath = reuseCatalog ?? Path.Combine(root, "catalog.db");
+    string target = Path.Combine(root, "dst");
+    string catalogPath = Path.Combine(root, "catalog.db");
     Directory.CreateDirectory(source);
     Directory.CreateDirectory(target);
 
@@ -67,7 +67,7 @@ static async Task<(DedupSizeEstimate Est, long Actual, long Raw)> RunAsync(
         await File.WriteAllBytesAsync(p, bytes);
     }
 
-    var repo = new SqliteCatalogRepository(catalogPath);
+    using var repo = new SqliteCatalogRepository(catalogPath);
     var scanner = new FileScanner(repo);
     var retention = new VersionRetentionService(repo);
     IDeduplicationEngine? engine = blockDedup ? new BlockDeduplicationEngine() : null;
@@ -81,8 +81,8 @@ static async Task<(DedupSizeEstimate Est, long Actual, long Raw)> RunAsync(
     // A real backup always belongs to a set, and since the catalog split into
     // per-set databases the file-dedup index lives in that set's database: with
     // no set the backup cannot dedup at all, while the estimator still assumes
-    // it will. A run with no set to reuse therefore gets one of its own.
-    int setId = reuseSetId ?? (await repo.CreateBackupSetAsync(new BackupSet
+    // it will. So the run gets a set of its own.
+    int setId = (await repo.CreateBackupSetAsync(new BackupSet
     {
         Name = "estimate",
         SourceRoots = [source],
@@ -129,9 +129,11 @@ static byte[] Cat(params byte[][] parts)
     return ms.ToArray();
 }
 
+string scratch = ScratchFolder.Create("lithic_est_");
+
 Console.WriteLine("=== no dedup: stored == raw ===");
 {
-    var (est, actual, raw) = await RunAsync(
+    var (est, actual, raw) = await RunAsync(scratch,
         new[] { ("a.bin", Rand(1, 100_000)), ("b.bin", Rand(2, 100_000)) },
         fileDedup: false, blockDedup: false);
     Check(est.StoredBytes == raw, $"estimate stored ({est.StoredBytes}) == raw ({raw})");
@@ -145,7 +147,7 @@ Console.WriteLine("\n=== file-level dedup: dup + unique + same-size-different ==
     byte[] u = Rand(4, 150_000);
     byte[] a = Rand(5, 100_000);
     byte[] b = Rand(6, 100_000); // same size as a, different content
-    var (est, actual, raw) = await RunAsync(
+    var (est, actual, raw) = await RunAsync(scratch,
         new[] { ("x1.bin", x), ("x2.bin", x), ("u.bin", u), ("a.bin", a), ("b.bin", b) },
         fileDedup: true, blockDedup: false);
     long expected = 200_000 + 150_000 + 100_000 + 100_000; // x once, u, a, b
@@ -159,7 +161,7 @@ Console.WriteLine("\n=== block-level dedup: files share a block ===");
 {
     byte[] fileA = Cat(P, Q, tail); // P, Q, tail
     byte[] fileB = Cat(P, R);       // P (shared with A), R
-    var (est, actual, raw) = await RunAsync(
+    var (est, actual, raw) = await RunAsync(scratch,
         new[] { ("A.bin", fileA), ("B.bin", fileB) },
         fileDedup: false, blockDedup: true);
     Check(est.BlockLevel, "block-level path reported");
@@ -173,7 +175,7 @@ Console.WriteLine("\n=== incremental: re-estimating an all-redundant run stores 
     // First back up two files into a real set, then estimate a second run over
     // the identical sources against that set — everything already has a plain
     // copy, so the next run writes nothing.
-    string root = Path.Combine(Path.GetTempPath(), "lithic_est_inc_" + Guid.NewGuid().ToString("N"));
+    string root = Path.Combine(scratch, "incremental");
     string source = Path.Combine(root, "src");
     string target = Path.Combine(root, "dst");
     string catalogPath = Path.Combine(root, "catalog.db");
@@ -185,7 +187,7 @@ Console.WriteLine("\n=== incremental: re-estimating an all-redundant run stores 
     await File.WriteAllBytesAsync(Path.Combine(source, "f1.bin"), f1);
     await File.WriteAllBytesAsync(Path.Combine(source, "f2.bin"), f2);
 
-    var repo = new SqliteCatalogRepository(catalogPath);
+    using var repo = new SqliteCatalogRepository(catalogPath);
     var scanner = new FileScanner(repo);
     var retention = new VersionRetentionService(repo);
     var set = await repo.CreateBackupSetAsync(new BackupSet
@@ -219,6 +221,8 @@ Console.WriteLine("\n=== incremental: re-estimating an all-redundant run stores 
     Check(est.StoredBytes == 0, $"all-redundant re-run estimates 0 new bytes (got {est.StoredBytes})");
     Check(est.RawBytes == f1.Length + f2.Length, "raw still reflects full source");
 }
+
+Check(ScratchFolder.Delete(scratch), $"the harness leaves no scratch folder behind ({scratch})");
 
 Console.WriteLine();
 if (failures == 0) { Console.WriteLine("ALL PASS"); return 0; }

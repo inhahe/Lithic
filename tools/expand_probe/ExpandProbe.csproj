@@ -12,7 +12,6 @@
          release metadata onto everything under src\; this harness is not part
          of the product and must not inherit it. -->
     <ImportDirectoryBuildProps>false</ImportDirectoryBuildProps>
-    <ImportDirectoryBuildTargets>false</ImportDirectoryBuildTargets>
   </PropertyGroup>
 
   <ItemGroup>

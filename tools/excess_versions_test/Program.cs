@@ -26,6 +26,7 @@ using System.Runtime.ExceptionServices;
 using System.Text.Json;
 using System.Windows.Threading;
 using LithicBackup.Core;
+using LithicBackup.Harness;
 using LithicBackup.Core.Interfaces;
 using LithicBackup.Core.Models;
 using LithicBackup.Infrastructure.Data;
@@ -48,8 +49,7 @@ internal static class Program
     [STAThread]
     static int Main()
     {
-        string root = Path.Combine(Path.GetTempPath(), "lithic_excess_" + Guid.NewGuid().ToString("N"));
-        Directory.CreateDirectory(root);
+        string root = ScratchFolder.Create("lithic_excess_");
         var dispatcher = Dispatcher.CurrentDispatcher;
         dispatcher.InvokeAsync(async () =>
         {
@@ -59,9 +59,7 @@ internal static class Program
         });
         Dispatcher.Run();
 
-        try { Microsoft.Data.Sqlite.SqliteConnection.ClearAllPools(); } catch { }
-        try { Directory.Delete(root, recursive: true); } catch { }
-        Check(!Directory.Exists(root), "the harness leaves no temp folder behind");
+        Check(ScratchFolder.Delete(root), $"the harness leaves no scratch folder behind ({root})");
         Console.WriteLine();
         Console.WriteLine(_failures == 0 ? "ALL PASS" : $"{_failures} CHECK(S) FAILED");
         return _failures == 0 ? 0 : 1;

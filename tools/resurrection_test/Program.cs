@@ -22,6 +22,7 @@
 
 using LithicBackup.Core.Interfaces;
 using LithicBackup.Core.Models;
+using LithicBackup.Harness;
 using LithicBackup.Infrastructure.Data;
 using LithicBackup.Infrastructure.FileSystem;
 using LithicBackup.Services;
@@ -38,7 +39,7 @@ static List<string> PrevFiles(string target) => Directory
     .Where(p => p.Replace('/', '\\').Contains("_prev\\", StringComparison.OrdinalIgnoreCase))
     .ToList();
 
-string root = Path.Combine(Path.GetTempPath(), "lithic_resurrect_" + Guid.NewGuid().ToString("N"));
+string root = ScratchFolder.Create("lithic_resurrect_");
 string source = Path.Combine(root, "src");
 string target = Path.Combine(root, "dst");
 string catalog = Path.Combine(root, "catalog.db");
@@ -144,6 +145,9 @@ Check(PrevFiles(target).Count == prevCountBefore,
 var headB = await repo.GetFileRecordByPathAndVersionAsync(set.Id, notePath, 2, CancellationToken.None);
 Check(headB is not null && !headB.IsDeleted,
     "the head version is live again (revived from its tombstone)");
+
+repo.Dispose();
+Check(ScratchFolder.Delete(root), $"the harness leaves no scratch folder behind ({root})");
 
 Console.WriteLine();
 if (failures == 0)

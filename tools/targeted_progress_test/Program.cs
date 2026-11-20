@@ -43,6 +43,7 @@ using System.Reflection;
 using LithicBackup.Core;
 using LithicBackup.Core.Interfaces;
 using LithicBackup.Core.Models;
+using LithicBackup.Harness;
 using LithicBackup.Infrastructure.Data;
 using LithicBackup.Infrastructure.Deduplication;
 using LithicBackup.Infrastructure.FileSystem;
@@ -63,8 +64,7 @@ internal static class Program
 
     static async Task<int> Main()
     {
-        string root = Path.Combine(Path.GetTempPath(), "lithic_targeted_" + Guid.NewGuid().ToString("N"));
-        Directory.CreateDirectory(root);
+        string root = ScratchFolder.Create("lithic_targeted_");
         try
         {
             await RunAsync(root);
@@ -78,8 +78,7 @@ internal static class Program
         }
         finally
         {
-            try { Microsoft.Data.Sqlite.SqliteConnection.ClearAllPools(); } catch { }
-            try { Directory.Delete(root, recursive: true); } catch { }
+            Check(ScratchFolder.Delete(root), $"the harness leaves no scratch folder behind ({root})");
         }
         Console.WriteLine();
         Console.WriteLine(_failures == 0 ? $"ALL {_checks} CHECKS PASSED" : $"{_failures} OF {_checks} CHECK(S) FAILED");
@@ -312,7 +311,7 @@ internal static class Program
         Directory.CreateDirectory(src);
         Directory.CreateDirectory(dest);
 
-        var repo = new SqliteCatalogRepository(Path.Combine(root, "catalog.db"));
+        using var repo = new SqliteCatalogRepository(Path.Combine(root, "catalog.db"));
         var set = await repo.CreateBackupSetAsync(new BackupSet
         {
             Name = "targeted-progress-test",

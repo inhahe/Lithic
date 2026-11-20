@@ -15,27 +15,16 @@ using System.Security.Cryptography;
 using LithicBackup.Core.Exceptions;
 using LithicBackup.Core.Interfaces;
 using LithicBackup.Core.Models;
+using LithicBackup.Harness;
 using LithicBackup.Infrastructure.Burning;
 using LithicBackup.Infrastructure.Data;
 using LithicBackup.Infrastructure.FileSystem;
 using LithicBackup.Services;
 
-string root = Path.Combine(Path.GetTempPath(), "lithic-disc-harness");
-if (Directory.Exists(root))
-{
-    // Clear read-only attributes first: some tests intentionally create read-only
-    // source files (the item-1 reburn cleanup test), and File.Copy preserves that
-    // flag into staging/shelf/restore trees. A plain Directory.Delete would throw
-    // on any leftover read-only file and leak the whole tree into the next run.
-    try
-    {
-        foreach (var f in Directory.EnumerateFiles(root, "*", SearchOption.AllDirectories))
-            try { new FileInfo(f).IsReadOnly = false; } catch { }
-    }
-    catch { /* best effort */ }
-    try { Directory.Delete(root, true); } catch { /* best effort */ }
-}
-Directory.CreateDirectory(root);
+// Some cases make read-only source files on purpose (the item-1 reburn clean-up
+// test), and File.Copy keeps that flag in the staging, shelf and restore trees:
+// ScratchFolder.Delete clears it.
+string root = ScratchFolder.Create("lithic_disc_");
 
 var runner = new TestRunner(root);
 
@@ -824,7 +813,14 @@ await runner.Run("changed-file-reburn-gets-distinct-disc-path", async ws =>
     ws.Assert(r.Mismatches == 0, $"{r.Mismatches} restored file(s) had wrong content");
 });
 
-return runner.Report();
+bool cleaned = ScratchFolder.Delete(root);
+int exitCode = runner.Report();
+if (!cleaned)
+{
+    Console.WriteLine($"  FAIL: the harness left its scratch folder behind ({root})");
+    exitCode = 1;
+}
+return exitCode;
 
 // ======================================================================
 // Test framework

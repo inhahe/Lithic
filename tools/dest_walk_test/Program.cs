@@ -11,6 +11,7 @@
 using System.Diagnostics;
 using System.IO;
 using LithicBackup.Services;
+using LithicBackup.Harness;
 
 namespace DestWalkTest;
 
@@ -38,7 +39,7 @@ internal static class Program
 
         Console.WriteLine();
         Console.WriteLine("=== 2. differential walk over generated trees ===");
-        string root = Path.Combine(Path.GetTempPath(), "lithic_destwalk_" + Guid.NewGuid().ToString("N"));
+        string root = ScratchFolder.Create("lithic_destwalk_");
         try
         {
             var rng = new Random(20260922);
@@ -57,7 +58,7 @@ internal static class Program
         }
         finally
         {
-            try { Directory.Delete(root, recursive: true); } catch { }
+            Check(ScratchFolder.Delete(root), $"the harness leaves no scratch folder behind ({root})");
         }
 
         Console.WriteLine();

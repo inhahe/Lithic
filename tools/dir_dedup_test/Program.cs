@@ -18,6 +18,7 @@
 using System.Security.Cryptography;
 using System.Text.Json;
 using LithicBackup.Core.Models;
+using LithicBackup.Harness;
 using LithicBackup.Infrastructure.Data;
 using LithicBackup.Infrastructure.FileSystem;
 using LithicBackup.Services;
@@ -44,12 +45,13 @@ static byte[] Content(int seed, int size)
 static string Sha256Hex(byte[] b) =>
     Convert.ToHexString(SHA256.HashData(b)).ToLowerInvariant();
 
-// Run one directory backup of the given (relativeName -> bytes) files and return
-// the plain content files and .fileref manifests found in the target tree.
+// Run one directory backup of the given (relativeName -> bytes) files, in a
+// folder of its own under the run's scratch folder, and return the plain content
+// files and .fileref manifests found in the target tree.
 static async Task<(List<string> Plain, List<(string Path, FileRefManifest M)> Refs, string Target)>
-    RunBackup((string Name, byte[] Bytes)[] files, bool forceStreaming)
+    RunBackup(string scratch, (string Name, byte[] Bytes)[] files, bool forceStreaming)
 {
-    string root = Path.Combine(Path.GetTempPath(), "lithic_dirdedup_" + Guid.NewGuid().ToString("N"));
+    string root = Path.Combine(scratch, Guid.NewGuid().ToString("N"));
     string source = Path.Combine(root, "src");
     string target = Path.Combine(root, "dst");
     string catalog = Path.Combine(root, "catalog.db");
@@ -63,7 +65,7 @@ static async Task<(List<string> Plain, List<(string Path, FileRefManifest M)> Re
         await File.WriteAllBytesAsync(p, bytes);
     }
 
-    var repo = new SqliteCatalogRepository(catalog);
+    using var repo = new SqliteCatalogRepository(catalog);
     var scanner = new FileScanner(repo);
     var retention = new VersionRetentionService(repo);
     // No dedup engine => block-level dedup OFF => NEW format (plain + .fileref).
@@ -134,6 +136,7 @@ static async Task<bool> PlainHashesCoverAsync(List<string> plain, HashSet<string
     return true;
 }
 
+string scratch = ScratchFolder.Create("lithic_dirdedup_");
 foreach (bool forceStreaming in new[] { true, false })
 {
     string mode = forceStreaming ? "streaming/prefix path" : "buffered path";
@@ -142,7 +145,7 @@ foreach (bool forceStreaming in new[] { true, false })
     // --- identical-dup: 2 byte-identical files -> 1 plain + 1 .fileref ---
     {
         byte[] x = Content(1, 200_000);
-        var (plain, refs, _) = await RunBackup(
+        var (plain, refs, _) = await RunBackup(scratch,
             new[] { ("a/original.bin", x), ("a/copy.bin", x) }, forceStreaming);
         Check(plain.Count == 1, $"identical-dup: 1 plain copy (got {plain.Count})");
         Check(refs.Count == 1, $"identical-dup: 1 .fileref (got {refs.Count})");
@@ -158,7 +161,7 @@ foreach (bool forceStreaming in new[] { true, false })
         byte[] b = Content(3, 200_000);
         Check(a.Length == b.Length && Sha256Hex(a) != Sha256Hex(b),
             "different-same-size: fixture is same-size but different content");
-        var (plain, refs, _) = await RunBackup(
+        var (plain, refs, _) = await RunBackup(scratch,
             new[] { ("d/a.bin", a), ("d/b.bin", b) }, forceStreaming);
         Check(plain.Count == 2, $"different-same-size: 2 plain copies (got {plain.Count})");
         Check(refs.Count == 0, $"different-same-size: 0 .fileref (got {refs.Count})");
@@ -170,7 +173,7 @@ foreach (bool forceStreaming in new[] { true, false })
     {
         byte[] x = Content(4, 200_000);
         byte[] y = Content(5, 200_000); // different content, same size as x
-        var (plain, refs, _) = await RunBackup(
+        var (plain, refs, _) = await RunBackup(scratch,
             new[] { ("m/first.bin", x), ("m/other.bin", y), ("m/again.bin", x) }, forceStreaming);
         Check(plain.Count == 2, $"mixed: 2 plain copies (got {plain.Count})");
         Check(refs.Count == 1, $"mixed: 1 .fileref (got {refs.Count})");
@@ -180,6 +183,8 @@ foreach (bool forceStreaming in new[] { true, false })
             "mixed: both plain anchors hold correct bytes");
     }
 }
+
+Check(ScratchFolder.Delete(scratch), $"the harness leaves no scratch folder behind ({scratch})");
 
 Console.WriteLine();
 if (failures == 0)

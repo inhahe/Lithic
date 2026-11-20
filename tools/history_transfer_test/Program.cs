@@ -32,6 +32,7 @@
 using System.Security.Cryptography;
 using System.Text.Json;
 using LithicBackup.Core;
+using LithicBackup.Harness;
 using LithicBackup.Core.Interfaces;
 using LithicBackup.Core.Models;
 using LithicBackup.Infrastructure.Data;
@@ -45,7 +46,7 @@ void Check(bool cond, string msg)
     if (!cond) failures++;
 }
 
-string root = Path.Combine(Path.GetTempPath(), "lithic_history_transfer_" + Guid.NewGuid().ToString("N"));
+string root = ScratchFolder.Create("lithic_history_transfer_");
 string source = Path.Combine(root, "src");
 string target = Path.Combine(root, "dst");
 Directory.CreateDirectory(source);
@@ -927,9 +928,7 @@ Console.WriteLine();
 // Closed before the folder goes, or SQLite's open files keep it from going.
 foreach (var repo in new[] { repoA, repoB, repoA7, repoB7, repoA7b, repoB7b, repoP, repoQ })
     repo.Dispose();
-Microsoft.Data.Sqlite.SqliteConnection.ClearAllPools();
-try { Directory.Delete(root, recursive: true); } catch { /* temp; best effort */ }
-Check(!Directory.Exists(root), "the harness leaves no temp folder behind");
+Check(ScratchFolder.Delete(root), $"the harness leaves no scratch folder behind ({root})");
 if (failures == 0)
 {
     Console.WriteLine(notMeasured.Count == 0

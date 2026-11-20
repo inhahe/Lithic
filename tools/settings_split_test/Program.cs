@@ -30,6 +30,7 @@
 using System.Text;
 using System.Text.Json;
 using LithicBackup.Core.Models;
+using LithicBackup.Harness;
 using LithicBackup.Infrastructure.FileSystem;
 using LithicBackup.Services;
 
@@ -42,8 +43,7 @@ void Check(bool cond, string msg)
     if (!cond) failures++;
 }
 
-string root = Path.Combine(Path.GetTempPath(), "lithic_settings_" + Guid.NewGuid().ToString("N"));
-Directory.CreateDirectory(root);
+string root = ScratchFolder.Create("lithic_settings_");
 string Sub(string name) => Path.Combine(root, name, "settings.json");
 
 try
@@ -323,7 +323,7 @@ try
 }
 finally
 {
-    try { Directory.Delete(root, recursive: true); } catch { }
+    Check(ScratchFolder.Delete(root), $"the harness leaves no scratch folder behind ({root})");
 }
 
 Console.WriteLine();

@@ -37,6 +37,7 @@ using System.IO;
 using System.Reflection;
 using System.Windows.Threading;
 using LithicBackup.Core.Models;
+using LithicBackup.Harness;
 using LithicBackup.Infrastructure.Data;
 using LithicBackup.ViewModels;
 
@@ -55,8 +56,7 @@ internal static class Program
     [STAThread]
     static int Main()
     {
-        string root = Path.Combine(Path.GetTempPath(), "lithic_widen_" + Guid.NewGuid().ToString("N"));
-        Directory.CreateDirectory(root);
+        string root = ScratchFolder.Create("lithic_widen_");
         try
         {
             // The node view-model awaits Dispatcher.Yield while loading children,
@@ -86,7 +86,7 @@ internal static class Program
         }
         finally
         {
-            try { Directory.Delete(root, recursive: true); } catch { }
+            Check(ScratchFolder.Delete(root), $"the harness leaves no scratch folder behind ({root})");
         }
 
         Console.WriteLine();
@@ -524,7 +524,7 @@ internal static class Program
         Console.WriteLine();
         Console.WriteLine("=== C. a stale copy cannot write its selection back ===");
 
-        var repo = new SqliteCatalogRepository(Path.Combine(tmp, "catalog.db"));
+        using var repo = new SqliteCatalogRepository(Path.Combine(tmp, "catalog.db"));
 
         var wide = new List<SourceSelection> { Dir("C:\\", true, false) };
         var narrow = new List<SourceSelection>

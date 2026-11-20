@@ -245,25 +245,27 @@ suspect, so the next run copies them again.
 everything stored on H: against the catalog and finds whatever these drops
 lost.
 
-## TECH DEBT: ten harnesses leave their temp folders behind (2026-10-24)
+## FIXED: test harnesses left their temp folders behind (seen 2026-10-21, fixed 2026-11-20)
 
-On every run, ten harnesses leave their `%TEMP%\lithic_<name>_<guid>` folder
-behind:
-- `case_rename_test`, `dest_space_test`, `dir_dedup_test`;
-- `dedup_estimate_test`, which leaves two;
-- `continuous_interleave_test`, `missing_source_test`,
-  `purge_record_integrity_test`;
-- `targeted_progress_test`, `selection_widening_test`, `resurrection_test`.
+Ten harnesses left their `%TEMP%\lithic_<name>_<guid>` folder behind on every
+run (`case_rename_test`, `dest_space_test`, `dir_dedup_test`, `dedup_estimate_test`
+(two), `continuous_interleave_test`, `missing_source_test`,
+`purge_record_integrity_test`, `targeted_progress_test`, `selection_widening_test`,
+`resurrection_test`): 286 folders, 712 MB, by 2026-10-21, and 194 more by
+2026-11-20. Most deleted their folder while their catalog was still open, inside
+`try { ... } catch { }`, so the delete failed unseen; `resurrection_test` and
+`case_rename_test` never tried. `cache_maint_test` kept a 500 MB copy of the real
+size cache between runs, and `disc_test_harness` its fixed-name folder.
 
-Most delete it while their catalog is still open, which fails quietly.
-`resurrection_test` never tries. Three full suite runs left 53 of them, 62 MB.
-`cache_maint_test` keeps a fixed-name copy of the real size cache
-(`%TEMP%\lithic_cache_maint_test`, 350 MB here) between runs.
-
-**Fix:** what `write_lock_fairness_test` now does: dispose every catalog it
-opened, call `SqliteConnection.ClearAllPools()`, then delete the folder in a
-`finally`, and say so if it cannot. `cache_maint_test` should delete its copy
-when it ends.
+**Fixed:** `tools\Shared\ScratchFolder.cs`, compiled into every harness by
+`tools\Directory.Build.targets`. `Create` makes a run's folder; `Delete` clears
+SQLite's pools and read-only flags (never through a junction, which can lead
+out of the folder) and retries for two seconds. Every harness that makes a
+folder disposes its catalogs, then checks `ScratchFolder.Delete`, so a leak now
+fails the run. `cache_maint_test` and `disc_test_harness` take a fresh folder per
+run and remove it at the end. `cache_maint_test`, `expand_probe` and
+`treeview_bench` no longer opt out of `Directory.Build.targets`, which was never
+needed and also dropped the root NU1603 rule for them.
 
 ## FIXED: retention flushed the destination once for every reference it promoted (2026-10-24)
 
@@ -344,26 +346,6 @@ sentinel will do: NTFS allows even U+10FFFF in a name. The bound is now exact,
 the path itself, look-alike siblings (`a bar`, `a!`, `a]`), emoji names and a
 name starting with U+10FFFF. It lists the parent of such a folder against a
 deadline, and remaps an emoji prefix. It also checks the cost.
-
-## TECH DEBT: most test harnesses leave their temp folder behind on every run
-
-**Seen 2026-10-21:** 286 `%TEMP%\lithic_<harness>_<guid>` folders, 712 MB,
-going back to 10/18 (deleted). By prefix: `dirdedup` 78, `excess` 46,
-`editsave` 45, `targeted` 22, `resurrect` 20, `est` 18, `purgeint` 18,
-`caserename` 15, `interleave` 15, `missing` 15, `lockfair` 12, `widen` 12,
-`destspace` 9, `est_inc` 6.
-
-**Cause.** Most harnesses end with `try { Directory.Delete(root, true) } catch { }`
-while their `SqliteCatalogRepository` instances are still open. SQLite holds
-the database files, the delete fails, and the empty catch hides it. A few never
-delete at all.
-
-**Fix, per harness:** dispose every repository it created (and call
-`SqliteConnection.ClearAllPools()`) before deleting, then
-`Check(!Directory.Exists(root), "the harness leaves no temp folder behind")`
-so a leak fails the run instead of accumulating. `history_transfer_test` and
-`editor_save_test` already do this. The second was fixed on 2026-10-21; every
-run of it had leaked about 2 MB.
 
 ## OPEN: a directory backup can fail a file with "Permission denied: Access to the path is denied." once, then not again (seen 2026-10-21)
 

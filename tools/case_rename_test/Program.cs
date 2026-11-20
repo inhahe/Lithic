@@ -25,6 +25,7 @@
 //   * the physical "_prev" file exists (no orphan without a catalog owner).
 
 using LithicBackup.Core.Models;
+using LithicBackup.Harness;
 using LithicBackup.Infrastructure.Data;
 using LithicBackup.Infrastructure.FileSystem;
 using LithicBackup.Services;
@@ -48,7 +49,7 @@ static void RecaseDirectory(string path, string newLeafName)
     Directory.Move(tmp, dest);
 }
 
-string root = Path.Combine(Path.GetTempPath(), "lithic_caserename_" + Guid.NewGuid().ToString("N"));
+string root = ScratchFolder.Create("lithic_caserename_");
 string source = Path.Combine(root, "src");
 string target = Path.Combine(root, "dst");
 string catalog = Path.Combine(root, "catalog.db");
@@ -134,6 +135,9 @@ if (v1 is not null && prevFilesOnDisk.Count == 1)
     Check(string.Equals(ownedAbs, onDisk, StringComparison.OrdinalIgnoreCase),
         "the _prev file on disk is the one the catalog row points at (no orphan)");
 }
+
+repo.Dispose();
+Check(ScratchFolder.Delete(root), $"the harness leaves no scratch folder behind ({root})");
 
 Console.WriteLine();
 if (failures == 0)

@@ -1,0 +1,14 @@
+<Project>
+
+  <!--
+    For every harness under tools\: the repository's own settings, then the code
+    the harnesses share. A Directory.Build.targets file here hides the root one
+    from MSBuild's search, so it is imported by hand.
+  -->
+  <Import Project="$([MSBuild]::GetPathOfFileAbove('Directory.Build.targets', '$(MSBuildThisFileDirectory)..\'))" />
+
+  <ItemGroup>
+    <Compile Include="$(MSBuildThisFileDirectory)Shared\ScratchFolder.cs" Link="Shared\ScratchFolder.cs" />
+  </ItemGroup>
+
+</Project>
