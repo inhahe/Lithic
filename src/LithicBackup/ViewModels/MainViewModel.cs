@@ -132,8 +132,10 @@ public class MainViewModel : ViewModelBase
             _ => StartFindFileFlow());
         CatalogFreeRestoreCommand = new RelayCommand(
             _ => StartCatalogFreeRestoreFlow());
+        // One import at a time (see ImportFromFileAsync).
         ImportBackupSetCommand = new RelayCommand(
-            _ => _ = ImportBackupSetAsync());
+            _ => _ = ImportBackupSetAsync(),
+            _ => _importToken is null);
 
         // Per-set action commands (take the row VM via CommandParameter). Each
         // gate is now per-row, so one set running never disables another's
@@ -2047,14 +2049,15 @@ public class MainViewModel : ViewModelBase
             return;
         }
         BeginRowWork(row, RemovingDroppedSources, "Removing the backed-up files of the sources you dropped…", cancel: null);
+        bool failed = true;
         try
         {
             await WaitForBackgroundRunAsync(row, backupSet.Id, "Removing the files of dropped sources");
-            await PurgeRemovedSourcesAsync(row, backupSet, removed, byPath, targetDir);
+            failed = await PurgeRemovedSourcesAsync(row, backupSet, removed, byPath, targetDir);
         }
         finally
         {
-            EndRowWork(row, StatusText, isError: false);
+            EndRowWork(row, StatusText, isError: failed);
         }
         await LoadBackupSetsAsync();
     }
@@ -2068,7 +2071,8 @@ public class MainViewModel : ViewModelBase
     /// goes to <see cref="StatusText"/>.
     /// </summary>
     /// <param name="row">The set's row, held; its status line shows the progress.</param>
-    private async Task PurgeRemovedSourcesAsync(
+    /// <returns>Whether it failed, or some files could not be deleted.</returns>
+    private async Task<bool> PurgeRemovedSourcesAsync(
         BackupSetRowViewModel? row, BackupSet backupSet, List<FileRecord> removed,
         List<(string SourcePath, long SizeBytes)> byPath, string? targetDir)
     {
@@ -2174,7 +2178,7 @@ public class MainViewModel : ViewModelBase
         catch (Exception ex)
         {
             StatusText = $"Failed to remove destination files: {ex.Message}";
-            return;
+            return true;
         }
 
         var parts = new List<string>();
@@ -2192,6 +2196,7 @@ public class MainViewModel : ViewModelBase
         StatusText = parts.Count > 0
             ? "Removed sources: " + string.Join(", ", parts) + "."
             : "No destination files needed removal.";
+        return delFailures > 0;
     }
 
     // -------------------------------------------------------------------
@@ -2996,17 +3001,25 @@ public class MainViewModel : ViewModelBase
         try
         {
             await WaitForBackgroundRunAsync(row, backupSet.Id, $"Remapping source drive {oldDrive}: to {newDrive}:");
-            int updated = await _catalog.RemapSourcePathPrefixAsync(
-                backupSet.Id, $"{oldDrive}:\\", $"{newDrive}:\\");
 
             // Mirror the change in the set's own source configuration so scans,
-            // watchers and future selections use the new drive too.
+            // watchers and future selections use the new drive too. Made here, on
+            // the UI thread, which owns the set; the work below only saves it.
             for (int i = 0; i < backupSet.SourceRoots.Count; i++)
                 backupSet.SourceRoots[i] = RemapDriveInPath(backupSet.SourceRoots[i], oldDrive, newDrive);
             if (backupSet.SourceSelections is not null)
                 RemapDriveInSelections(backupSet.SourceSelections, oldDrive, newDrive);
 
-            await _catalog.UpdateBackupSetAsync(backupSet);
+            // The records and the set, saved together as one piece of work that
+            // an exit waits for: the records alone would say one drive and the
+            // set's selection the other.
+            int updated = await RunOnRowAsync(row, $"Remapping source drive {oldDrive}: to {newDrive}:", async _ =>
+            {
+                int remapped = await _catalog.RemapSourcePathPrefixAsync(
+                    backupSet.Id, $"{oldDrive}:\\", $"{newDrive}:\\");
+                await _catalog.UpdateBackupSetAsync(backupSet);
+                return remapped;
+            });
             StatusText = $"Remapped source drive {oldDrive}: → {newDrive}: ({updated:N0} record(s) updated).";
             EndRowWork(row, StatusText, isError: false);
         }
@@ -5060,10 +5073,18 @@ public class MainViewModel : ViewModelBase
         var set = SelectedBackupSet;
         _taskWindows.Show(
             Services.TaskKinds.Restore, set.Id, set.Name,
-            () => new RestoreViewModel(_catalog, _restoreService, set),
+            () => new RestoreViewModel(_catalog, _restoreService, set) { DescribeBusy = DescribeBusyRow(set.Id) },
             (vm, close) => ((RestoreViewModel)vm).DoneRequested += close);
         StatusText = $"Restore files from \"{set.Name}\".";
     }
+
+    /// <summary>
+    /// For a task window on the set: what the set's row is doing right now
+    /// ("backing up", "seeding"), or null when it is idle. A task that writes or
+    /// reads the set's catalog or stored files refuses to act while it works.
+    /// </summary>
+    private Func<string?> DescribeBusyRow(int setId)
+        => () => RowFor(setId) is { IsWorking: true } r ? r.BusyActivity ?? "backing up" : null;
 
     // -------------------------------------------------------------------
     // Flow 4: Cleanup (orphaned catalog records + optional destination scan)
@@ -5134,9 +5155,7 @@ public class MainViewModel : ViewModelBase
             {
                 RowWork = new RowWorkHooks
                 {
-                    DescribeBusy = () => RowFor(setId) is { IsWorking: true } r
-                        ? r.BusyActivity ?? "backing up"
-                        : null,
+                    DescribeBusy = DescribeBusyRow(setId),
                     Begin = cts =>
                     {
                         BeginRowWork(RowFor(setId), CleaningActivity, "Cleaning up…", cts);
@@ -5194,7 +5213,7 @@ public class MainViewModel : ViewModelBase
 
             _taskWindows.Show(
                 Services.TaskKinds.Restore, backupSet.Id, backupSet.Name,
-                () => new RestoreViewModel(_catalog, _restoreService, backupSet),
+                () => new RestoreViewModel(_catalog, _restoreService, backupSet) { DescribeBusy = DescribeBusyRow(backupSet.Id) },
                 (vm, close) => ((RestoreViewModel)vm).DoneRequested += close);
             StatusText = $"Restore files from \"{backupSet.Name}\".";
         };
@@ -5251,7 +5270,7 @@ public class MainViewModel : ViewModelBase
         var set = SelectedBackupSet;
         _taskWindows.Show(
             Services.TaskKinds.Verify, set.Id, set.Name,
-            () => new VerifyIntegrityViewModel(_catalog, _scanner, set),
+            () => new VerifyIntegrityViewModel(_catalog, _scanner, set) { DescribeBusy = DescribeBusyRow(set.Id) },
             (vm, close) => ((VerifyIntegrityViewModel)vm).DoneRequested += close);
         StatusText = $"Opened Verify Integrity for \"{set.Name}\".";
     }
@@ -5511,6 +5530,12 @@ public class MainViewModel : ViewModelBase
 
     private async Task OfferImportAsync(string path)
     {
+        // Said before the offer, not after a Yes it would then refuse.
+        if (_importToken is not null)
+        {
+            RefuseSecondImport(path);
+            return;
+        }
         var owner = PromptOwner();
         ExportedBackupSet settings;
         bool hasHistory;
@@ -5591,13 +5616,49 @@ public class MainViewModel : ViewModelBase
                 "Being imported. The import's window shows how far it has got.", cancel: null);
     }
 
-    /// <summary>The import has ended, however it ended: release its set's row.</summary>
-    private void EndImport()
+    /// <summary>
+    /// The import has ended, however it ended: release its set's row, and let the
+    /// next import start. Nothing when <paramref name="token"/> is not the import
+    /// under way: that import ended already, and another may have begun since.
+    /// </summary>
+    /// <param name="token">The ending import's identity (<see cref="_importToken"/>) when it began.</param>
+    private void EndImport(object token)
     {
+        if (!ReferenceEquals(_importToken, token))
+            return;
         _importToken = null;
         if (_importingSetId is int id && RowFor(id) is { BusyActivity: BeingImported } row)
             EndRowWork(row, "", isError: false);
         _importingSetId = null;
+        CommandManager.InvalidateRequerySuggested();
+    }
+
+    /// <summary>
+    /// Why <paramref name="options"/>' backup folder cannot be an imported set's:
+    /// another set's already. Null when it is free. Judged as the import keeps the
+    /// options: the volume identity this computer's, the path where that volume is.
+    /// </summary>
+    /// <param name="options">The imported set's options, localized (BackupSetTransfer.LocalizeDestination).</param>
+    private async Task<string?> ImportFolderRefusalAsync(JobOptions options)
+    {
+        if (options.TargetDirectory is null)
+            return null;
+        var here = ResolvedCopy(options);
+        return await BackupFolderOwners.FindOtherAsync(_catalog, 0, here) is { } owner
+            ? BackupFolderInUseMessage(here.BackupRoot()!, owner,
+                $"If it is \"{owner}\" itself, it is already here. Otherwise give \"{owner}\" another "
+                + "backup folder first, then import this set again.")
+            : null;
+    }
+
+    /// <summary>Say that <paramref name="fileName"/> was not imported because another import is under way.</summary>
+    private void RefuseSecondImport(string fileName)
+    {
+        StatusText = $"Did not import {Path.GetFileName(fileName)}: another import is under way.";
+        MessageBox.Show(PromptOwner(),
+            $"{Path.GetFileName(fileName)} was not imported: another backup set is being imported. "
+            + "Import it once that has finished.",
+            "Import Backup Set", MessageBoxButton.OK, MessageBoxImage.Information);
     }
 
     /// <summary>
@@ -5609,15 +5670,12 @@ public class MainViewModel : ViewModelBase
     {
         if (_importToken is not null)
         {
-            StatusText = $"Did not import {Path.GetFileName(fileName)}: another import is under way.";
-            MessageBox.Show(PromptOwner(),
-                $"{Path.GetFileName(fileName)} was not imported: another backup set is being imported. "
-                + "Import it once that has finished.",
-                "Import Backup Set", MessageBoxButton.OK, MessageBoxImage.Information);
+            RefuseSecondImport(fileName);
             return;
         }
         var token = new object();
         _importToken = token;
+        CommandManager.InvalidateRequerySuggested();
         try
         {
             // Not into another set's backup folder (importing a set already here
@@ -5633,11 +5691,7 @@ public class MainViewModel : ViewModelBase
                 var here = ResolvedCopy(imported);
                 if (_destinationResolver is not null)
                     BackupSetTransfer.LocalizeDestination(here, _destinationResolver);
-                return (settings.Name, exported, await BackupFolderOwners.FindOtherAsync(_catalog, 0, here) is { } owner
-                    ? BackupFolderInUseMessage(here.BackupRoot()!, owner,
-                        $"If it is \"{owner}\" itself, it is already here. Otherwise give \"{owner}\" another "
-                        + "backup folder first, then import this set again.")
-                    : null);
+                return (settings.Name, exported, await ImportFolderRefusalAsync(here));
             });
             if (inUse is not null)
             {
@@ -5658,12 +5712,17 @@ public class MainViewModel : ViewModelBase
             BackupSetImportResult result;
             try
             {
+                // Owned by the main window, never by a dialog open over it: a
+                // window is closed with its owner, and closing this one cancels.
                 (completed, result) = await Views.ProgressDialog.RunAsync(
-                    PromptOwner(),
+                    Application.Current.MainWindow,
                     "Import Backup Set",
                     $"Importing {fileName}",
                     cancellable: true,
                     (progress, ct) => BackupSetTransfer.ImportAsync(_catalog, fileName, progress, ct, _destinationResolver,
+                        // Asked again just before the set is created: another set
+                        // can be given the folder while the history is extracted.
+                        refuseFolder: ImportFolderRefusalAsync,
                         // Posted, not invoked: an exit blocks the UI thread until
                         // the import ends, and an import waiting on the UI thread
                         // would not end.
@@ -5674,7 +5733,7 @@ public class MainViewModel : ViewModelBase
             {
                 // Before any reload, which keeps a held row even when its set is
                 // gone (a cancelled import deletes its set).
-                EndImport();
+                EndImport(token);
             }
             if (!completed)
             {
@@ -5720,6 +5779,12 @@ public class MainViewModel : ViewModelBase
                   + "first backup copies everything again." + moved + held;
             MessageBox.Show(message, "Import Backup Set", MessageBoxButton.OK, MessageBoxImage.Information);
         }
+        catch (BackupFolderTakenException taken)
+        {
+            StatusText = $"Did not import {Path.GetFileName(fileName)}: its backup folder is another set's.";
+            MessageBox.Show(PromptOwner(), $"{Path.GetFileName(fileName)} was not imported.\n\n" + taken.Message,
+                "Import Backup Set", MessageBoxButton.OK, MessageBoxImage.Warning);
+        }
         catch (Exception ex)
         {
             await LoadBackupSetsAsync();   // as for a cancel: a set may have come and gone
@@ -5730,7 +5795,7 @@ public class MainViewModel : ViewModelBase
         }
         finally
         {
-            EndImport();
+            EndImport(token);
         }
     }
 
@@ -5809,18 +5874,31 @@ public class MainViewModel : ViewModelBase
     private async Task<T> RunOnRowAsync<T>(
         BackupSetRowViewModel? row, string label, Func<IProgress<ProgressReport>, Task<T>> work)
     {
-        // Made here, on the UI thread, so its reports post back to it - in order,
-        // and ahead of this method's continuation, so none lands after it ends.
+        // Made here, on the UI thread, so its reports post back to it. Posted, they
+        // can still be queued when this returns - always so when the work ended
+        // before the await below, which then does not yield - and would land on
+        // the row after its caller has released it, or over its next work's
+        // status. Those are dropped.
+        bool ended = false;
         var progress = new Progress<ProgressReport>(r =>
         {
+            if (ended)
+                return;
             if (row is not null)
                 row.RunningStatusText = $"{label}: {r.Text}";
             else
                 StatusText = $"{label}: {r.Text}";
         });
         var task = Task.Run(() => work(progress));
-        using (Services.RunningWork.Track(task, cancel: null))
-            return await task;
+        try
+        {
+            using (Services.RunningWork.Track(task, cancel: null))
+                return await task;
+        }
+        finally
+        {
+            ended = true;
+        }
     }
 
     /// <summary>

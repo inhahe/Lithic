@@ -70,6 +70,15 @@ public class VerifyIntegrityViewModel : ViewModelBase, IDisposable
     /// <summary>Fired when the user clicks "Close".</summary>
     public event Action? DoneRequested;
 
+    /// <summary>
+    /// What the set's row in the main window is doing right now ("backing up",
+    /// "removing the files of dropped sources"), or null when it is idle.
+    /// Verifying is refused while it works, as its files and records are changing
+    /// under it, and so is the repair, which writes the same catalog. Null when
+    /// nothing can say.
+    /// </summary>
+    public Func<string?>? DescribeBusy { get; init; }
+
     public VerifyIntegrityViewModel(
         ICatalogRepository catalog,
         IFileScanner scanner,
@@ -273,6 +282,12 @@ public class VerifyIntegrityViewModel : ViewModelBase, IDisposable
     {
         if (IsLoading)
             return;
+        if (DescribeBusy?.Invoke() is { } busy)
+        {
+            SummaryText = $"This set is {busy} right now, so it was not verified: its files and records are "
+                          + "changing, and what Verify found would be wrong. Verify it when that has finished.";
+            return;
+        }
 
         // Fresh cancellation scope for this run. The previous run (if any) has
         // already completed, so disposing its source is safe.
@@ -458,6 +473,12 @@ public class VerifyIntegrityViewModel : ViewModelBase, IDisposable
     {
         if (!CanRepair)
             return;
+        if (DescribeBusy?.Invoke() is { } busy)
+        {
+            SummaryText = $"This set is {busy} right now, so nothing was flagged: that work changes the records "
+                          + "this would. Verify again when it has finished; what this found may be out of date.";
+            return;
+        }
 
         var paths = _repairablePaths.ToList();
         var referenceOnly = new HashSet<string>(_brokenReferenceOnlyPaths, StringComparer.OrdinalIgnoreCase);

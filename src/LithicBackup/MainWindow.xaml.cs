@@ -72,7 +72,7 @@ public partial class MainWindow : Window
         ApplyScreenMaxHeight();
 
         // Re-clamp whenever the window grows (e.g. backup-set buttons
-        // appear, or user navigates to a taller view).
+        // appear).
         SizeChanged += OnSizeChanged;
     }
 

@@ -281,6 +281,7 @@ internal static class Program
         await ImportHoldsItsRowAsync();
         await RemapHoldsTheRowAsync();
         await MainWindowShowsTheSetsAsync();
+        ExitWaitsForWork();
 #endif
         Check(_dialogs.Unexpected.Count == 0,
             "no unexpected message box appeared"
@@ -438,6 +439,27 @@ internal static class Program
         }
         var row = _vm.BackupSets.First(r => r.Id == _setId);
 
+        // Task windows open on the set before the removal starts: no longer
+        // disabled by it, they must refuse to act while it holds the row.
+        _vm.SetVerifyIntegrityCommand.Execute(row);
+        _vm.SetRestoreCommand.Execute(row);
+        TaskWindow? verifyWin = null, restoreWin = null;
+        Check(await WaitFor(() => (verifyWin = Application.Current.Windows.OfType<TaskWindow>()
+                                      .FirstOrDefault(w => w.Flow is VerifyIntegrityViewModel)) is not null
+                                  && (restoreWin = Application.Current.Windows.OfType<TaskWindow>()
+                                      .FirstOrDefault(w => w.Flow is RestoreViewModel)) is not null, 10000),
+            "set-up: Verify Integrity and Restore are open on the set");
+        if (verifyWin is null || restoreWin is null) return;
+        MoveOffscreen(verifyWin);
+        MoveOffscreen(restoreWin);
+        var verify = (VerifyIntegrityViewModel)verifyWin.Flow!;
+        var restore = (RestoreViewModel)restoreWin.Flow!;
+        Check(await WaitFor(() => !restore.IsLoading && restore.Roots.Count > 0, 10000),
+            "set-up: Restore has loaded the set's files");
+        restore.RestoreToOriginal = true;
+        if (restore.Roots.Count > 0)
+            restore.Roots[0].IsSelected = true;
+
         var ed = await OpenEditorAsync("reconcile");
         if (ed is null) return;
         await ToggleAsync(ed, _b, false);
@@ -473,11 +495,23 @@ internal static class Program
                 .Select(w => w.GetType().Name).ToList();
             Check(disabled.Count == 0 && !Application.Current.Windows.OfType<ProgressDialog>().Any(),
                 $"but no window is disabled, so other sets can be worked on ({string.Join(", ", disabled)})");
+
+            verify.VerifyCommand.Execute(null);
+            Check(!verify.IsLoading && verify.SummaryText.StartsWith("This set is removing the files of dropped sources",
+                    StringComparison.Ordinal),
+                $"an open Verify refuses to verify meanwhile (\"{verify.SummaryText}\")");
+            Check(restore.RestoreCommand.CanExecute(null), "set-up: Restore has something to restore");
+            restore.RestoreCommand.Execute(null);
+            Check(!restore.IsRestoring && restore.StatusText.StartsWith("This set is removing the files of dropped sources",
+                    StringComparison.Ordinal),
+                $"and an open Restore refuses to restore (\"{restore.StatusText}\")");
         }
         finally
         {
             held.Dispose();
         }
+        verifyWin.Close();
+        restoreWin.Close();
 
         // Added: c's file is offered for backup. Not now.
         ReviewTreeDialog? addition = null;
@@ -912,9 +946,12 @@ internal static class Program
     /// 28: an import leaves the rest of the app usable - its progress window is not
     /// modal - and holds the new set's row while it is half made: a reload of the
     /// list meanwhile shows the set as being imported, with Backup and Delete
-    /// unavailable, and a second import is refused until it ends. The import is
-    /// frozen by holding the new set's write lock, which its history waits for:
-    /// the set's id is the catalog's next.
+    /// unavailable; the Import button is unavailable, and an opened export is
+    /// refused before it is offered. A second import started while the first's
+    /// result box is still up keeps its hold when that box closes, and its window,
+    /// opened under a dialog, outlives the dialog. Each import is frozen by holding
+    /// the new set's write lock, which its history waits for: a set's id is the
+    /// catalog's next.
     /// </summary>
     static async Task ImportHoldsItsRowAsync()
     {
@@ -926,19 +963,24 @@ internal static class Program
             Check(false, "set-up: the test set has a backup history to export");
             return;
         }
-        // Exported with a destination of its own, so the import is not refused
-        // for sharing the test set's folder.
-        string export = Path.Combine(_root, "with-history.lithic");
-        var ownFolder = new BackupSet
+        // Exported with destinations of their own, so neither import is refused
+        // for sharing a folder.
+        async Task<string> Export(string name)
         {
-            Id = set.Id, Name = "imported with history", SourceRoots = set.SourceRoots,
-            SourceSelections = set.SourceSelections, DefaultMediaType = set.DefaultMediaType, CreatedUtc = set.CreatedUtc,
-            JobOptions = JsonSerializer.Deserialize<JobOptions>(JsonSerializer.Serialize(set.JobOptions))!,
-        };
-        ownFolder.JobOptions.TargetDirectory = Path.Combine(_root, "imported-with-history");
-        ownFolder.JobOptions.DestinationVolumeId = null;
-        ownFolder.JobOptions.DestinationSubpath = null;
-        await BackupSetTransfer.ExportAsync(_catalog, ownFolder, export, includeHistory: true);
+            string file = Path.Combine(_root, name + ".lithic");
+            var copy = new BackupSet
+            {
+                Id = set.Id, Name = name, SourceRoots = set.SourceRoots, SourceSelections = set.SourceSelections,
+                DefaultMediaType = set.DefaultMediaType, CreatedUtc = set.CreatedUtc,
+                JobOptions = JsonSerializer.Deserialize<JobOptions>(JsonSerializer.Serialize(set.JobOptions))!,
+            };
+            copy.JobOptions.TargetDirectory = Path.Combine(_root, name + "-folder");
+            copy.JobOptions.DestinationVolumeId = null;
+            copy.JobOptions.DestinationSubpath = null;
+            await BackupSetTransfer.ExportAsync(_catalog, copy, file, includeHistory: true);
+            return file;
+        }
+        string exportA = await Export("imported-a"), exportB = await Export("imported-b");
 
         long nextId;
         using (var conn = new Microsoft.Data.Sqlite.SqliteConnection(
@@ -949,58 +991,114 @@ internal static class Program
             cmd.CommandText = "SELECT seq FROM sqlite_sequence WHERE name = 'BackupSets'";
             nextId = Convert.ToInt64(cmd.ExecuteScalar()) + 1;
         }
-        var held = new FileStream(Path.Combine(_root, "sets", $"set-{nextId}.db.writelock"),
+        int idA = (int)nextId, idB = (int)nextId + 1;
+        FileStream Hold(int id) => new(Path.Combine(_root, "sets", $"set-{id}.db.writelock"),
             FileMode.OpenOrCreate, FileAccess.ReadWrite, FileShare.None);
-        Task? importing = null;
-        BackupSetRowViewModel? row = null;
+        async Task<bool> Created(int id)
+        {
+            for (var clock = Stopwatch.StartNew(); clock.ElapsedMilliseconds < 10000;)
+            {
+                if (await _observer.GetBackupSetAsync(id) is not null)
+                    return true;
+                await Task.Delay(40);
+            }
+            return false;
+        }
+        Task Reload() => (Task)typeof(MainViewModel).GetMethod("LoadBackupSetsAsync", BindingFlags.Instance | BindingFlags.NonPublic)!
+            .Invoke(_vm, null)!;
+        var importFromFile = typeof(MainViewModel).GetMethod("ImportFromFileAsync", BindingFlags.Instance | BindingFlags.NonPublic)!;
+
+        // --- A, as from the Import button, frozen ---
+        var heldA = Hold(idA);
+        var heldB = Hold(idB);
+        Task? importingA = null, importingB = null;
         try
         {
-            _dialogs.Expect("Open Backup Set", DialogWatcher.IDYES);
-            importing = _vm.OfferOpenedFilesAsync([export]);
-            bool created = false;
-            for (var clock = Stopwatch.StartNew(); !created && clock.ElapsedMilliseconds < 10000;)
-            {
-                created = await _observer.GetBackupSetAsync((int)nextId) is not null;
-                if (!created)
-                    await Task.Delay(40);
-            }
-            Check(created && await WaitFor(() => Application.Current.Windows.OfType<ProgressDialog>().Any(), 10000),
+            importingA = (Task)importFromFile.Invoke(_vm, [exportA])!;
+            Check(await Created(idA) && await WaitFor(() => Application.Current.Windows.OfType<ProgressDialog>().Any(), 10000),
                 "the import creates its set, then waits to write its history");
             var disabled = Application.Current.Windows.OfType<Window>()
                 .Where(w => w.IsVisible && !IsWindowEnabled(new System.Windows.Interop.WindowInteropHelper(w).Handle))
                 .Select(w => w.GetType().Name).ToList();
             Check(disabled.Count == 0, $"no window is disabled while it imports ({string.Join(", ", disabled)})");
+            Check(Application.Current.Windows.OfType<ProgressDialog>().All(d => d.Owner == Application.Current.MainWindow),
+                "its window belongs to the main window");
 
             // A reload while it imports - a backup of another set finishing, say.
-            await (Task)typeof(MainViewModel).GetMethod("LoadBackupSetsAsync", BindingFlags.Instance | BindingFlags.NonPublic)!
-                .Invoke(_vm, null)!;
-            row = _vm.BackupSets.FirstOrDefault(r => r.Id == nextId);
-            Check(row is { IsRunning: true, BusyActivity: "being imported" },
-                $"its half-made set shows as being imported ({row?.BusyActivity ?? "no row"})");
-            Check(row is not null && !_vm.SetBackupCommand.CanExecute(row) && !_vm.SetDeleteCommand.CanExecute(row),
+            await Reload();
+            var rowA = _vm.BackupSets.FirstOrDefault(r => r.Id == idA);
+            Check(rowA is { IsRunning: true, BusyActivity: "being imported" },
+                $"its half-made set shows as being imported ({rowA?.BusyActivity ?? "no row"})");
+            Check(rowA is not null && !_vm.SetBackupCommand.CanExecute(rowA) && !_vm.SetDeleteCommand.CanExecute(rowA),
                 "and cannot be backed up or deleted meanwhile");
+            Check(!_vm.ImportBackupSetCommand.CanExecute(null), "the Import button is unavailable meanwhile");
 
             _dialogs.Expect("Import Backup Set", DialogWatcher.IDOK);
-            await (Task)typeof(MainViewModel).GetMethod("ImportFromFileAsync", BindingFlags.Instance | BindingFlags.NonPublic)!
-                .Invoke(_vm, [export])!;
-            Check(_dialogs.WasAnswered("Import Backup Set") && _vm.StatusText.Contains("another import", StringComparison.Ordinal),
-                $"a second import is refused meanwhile (\"{_vm.StatusText}\")");
+            await _vm.OfferOpenedFilesAsync([exportB]);
+            Check(_dialogs.WasAnswered("Import Backup Set") && !_dialogs.WasAnswered("Open Backup Set")
+                  && _vm.StatusText.Contains("another import", StringComparison.Ordinal),
+                $"and an opened export is refused before it is offered (\"{_vm.StatusText}\")");
+            _dialogs.ClearExpectations();
+
+            // --- A ends, its result box held open; B starts under a dialog ---
+            _dialogs.Expect("Import Backup Set", DialogWatcher.HOLD);
+            heldA.Dispose();
+            Check(await WaitFor(() => _dialogs.IsHeld("Import Backup Set"), 20000),
+                "once it can write, the import finishes and says what it brought");
+
+            var dlg = new Window
+            {
+                Width = 120, Height = 80, ShowInTaskbar = false, Content = new System.Windows.Controls.TextBlock(),
+                WindowStartupLocation = WindowStartupLocation.Manual, Left = -3000, Top = -3000,
+            };
+            Window? ownerB = null;
+            bool startedB = false;
+            dlg.Loaded += (_, _) => dlg.Dispatcher.BeginInvoke(DispatcherPriority.ContextIdle, async () =>
+            {
+                _dialogs.Expect("Open Backup Set", DialogWatcher.IDYES);
+                importingB = _vm.OfferOpenedFilesAsync([exportB]);
+                startedB = await Created(idB)
+                           && await WaitFor(() => Application.Current.Windows.OfType<ProgressDialog>().Any(), 10000);
+                ownerB = Application.Current.Windows.OfType<ProgressDialog>().FirstOrDefault()?.Owner;
+                dlg.Close();
+            });
+            dlg.ShowDialog();
+            Check(startedB && ownerB == Application.Current.MainWindow,
+                "a second import, once the first has ended, can start, even from under a dialog, and its window belongs to the main window");
+            await Task.Delay(500);
+            Check(Application.Current.Windows.OfType<ProgressDialog>().Any() && await _observer.GetBackupSetAsync(idB) is not null,
+                "so closing the dialog leaves it importing");
+            await Reload();
+            Check(_vm.BackupSets.FirstOrDefault(r => r.Id == idB) is { IsRunning: true, BusyActivity: "being imported" },
+                "with its set held");
+
+            // The first import's result box closes: the second's hold must stay.
+            _dialogs.Release("Import Backup Set", DialogWatcher.IDOK);
+            await importingA;
+            var rowB = _vm.BackupSets.FirstOrDefault(r => r.Id == idB);
+            Check(rowB is { IsRunning: true, BusyActivity: "being imported" } && !_vm.ImportBackupSetCommand.CanExecute(null),
+                $"when the first import's box closes, the second keeps its set held ({rowB?.BusyActivity ?? "no row"})");
         }
         finally
         {
+            _dialogs.Release("Import Backup Set", DialogWatcher.IDOK);
             _dialogs.Expect("Import Backup Set", DialogWatcher.IDOK);
-            held.Dispose();
+            heldA.Dispose();
+            heldB.Dispose();
         }
-        if (importing is not null)
-            await importing;
-        var imported = await _observer.GetBackupSetAsync((int)nextId);
-        Check(imported is not null && await _observer.HasFileRecordsAsync((int)nextId),
-            "once it can write, the import finishes, history and all");
-        row = _vm.BackupSets.FirstOrDefault(r => r.Id == nextId);
-        Check(row is { IsRunning: false } && _vm.SetDeleteCommand.CanExecute(row), "and releases the set's row");
+        if (importingA is not null)
+            await importingA;
+        if (importingB is not null)
+            await importingB;
+        Check(await _observer.HasFileRecordsAsync(idA) && await _observer.HasFileRecordsAsync(idB),
+            "both imports finish, history and all");
+        var rowsDone = _vm.BackupSets.Where(r => r.Id == idA || r.Id == idB).ToList();
+        Check(rowsDone.Count == 2 && rowsDone.All(r => !r.IsRunning) && _vm.ImportBackupSetCommand.CanExecute(null),
+            "and release their rows, and the Import button");
         _dialogs.ClearExpectations();
-        if (imported is not null)
-            await _observer.DeleteBackupSetAsync(imported.Id);
+        foreach (int id in new[] { idA, idB })
+            if (await _observer.GetBackupSetAsync(id) is not null)
+                await _observer.DeleteBackupSetAsync(id);
     }
 
     /// <summary>
@@ -1055,6 +1153,31 @@ internal static class Program
             AppMethod("MarkRestartManagerExit").Invoke(_app, null);
             win.Close();
             AppMethod("AbortRestartManagerExit").Invoke(_app, null);
+        }
+    }
+
+    /// <summary>
+    /// 31: an exit cancels the running work that can be cancelled and waits for
+    /// all of it, and work that failed does not stop the exit.
+    /// </summary>
+    static void ExitWaitsForWork()
+    {
+        Console.WriteLine();
+        Console.WriteLine("=== 31. an exit waits for running work, which a failure in it does not stop ===");
+        var failed = Task.FromException(new IOException("simulated failure of a removal"));
+        using (RunningWork.Track(failed, cancel: null))
+        {
+            Exception? thrown = null;
+            try { RunningWork.CancelAndWait(TimeSpan.FromSeconds(1)); }
+            catch (Exception ex) { thrown = ex; }
+            Check(thrown is null, $"work that failed does not stop the exit ({thrown?.GetType().Name})");
+        }
+        using var cts = new CancellationTokenSource();
+        var waiting = Task.Delay(Timeout.Infinite, cts.Token);
+        using (RunningWork.Track(waiting, cts))
+        {
+            RunningWork.CancelAndWait(TimeSpan.FromSeconds(5));
+            Check(waiting.IsCanceled, "and work that can be cancelled is cancelled");
         }
     }
 
@@ -2684,9 +2807,14 @@ internal sealed class DialogWatcher : IDisposable
 {
     public const int IDOK = 1, IDCANCEL = 2, IDYES = 6, IDNO = 7;
 
+    /// <summary>Expected with this, a box is left open until <see cref="Release"/> answers it.</summary>
+    public const int HOLD = -1;
+
     private readonly object _lock = new();
     private readonly List<(string Title, int Button)> _expected = [];
     private readonly HashSet<string> _answered = [];
+    // Boxes expected with HOLD, by title, until released.
+    private readonly Dictionary<string, IntPtr> _held = [];
     public readonly List<string> Unexpected = [];
     private readonly Thread _thread;
     private volatile bool _stop;
@@ -2705,6 +2833,19 @@ internal sealed class DialogWatcher : IDisposable
     public bool WasAnswered(string title) { lock (_lock) return _answered.Contains(title); }
 
     public void ClearExpectations() { lock (_lock) { _expected.Clear(); _answered.Clear(); } }
+
+    /// <summary>Whether a box expected with <see cref="HOLD"/> is up and being held.</summary>
+    public bool IsHeld(string title) { lock (_lock) return _held.ContainsKey(title); }
+
+    /// <summary>Answer a held box with <paramref name="button"/>.</summary>
+    public void Release(string title, int button)
+    {
+        lock (_lock)
+        {
+            if (_held.Remove(title, out var h))
+                PostMessage(h, 0x0111, button, IntPtr.Zero);
+        }
+    }
 
     private void Loop()
     {
@@ -2725,6 +2866,9 @@ internal sealed class DialogWatcher : IDisposable
 
                 if (seen.TryGetValue(h, out long at))
                 {
+                    lock (_lock)
+                        if (_held.ContainsValue(h))
+                            return true;
                     // Answered but still up after a second: force it shut.
                     if (sw.ElapsedMilliseconds - at > 1000)
                     {
@@ -2750,6 +2894,12 @@ internal sealed class DialogWatcher : IDisposable
                         button = _expected[i].Button;
                         _expected.RemoveAt(i);
                         _answered.Add(t);
+                        if (button == HOLD)
+                        {
+                            _held[t] = h;
+                            seen[h] = sw.ElapsedMilliseconds;
+                            return true;
+                        }
                     }
                     else
                     {

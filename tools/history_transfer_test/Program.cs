@@ -276,6 +276,23 @@ catch (InvalidDataException) { rejected = true; }
 Check(rejected && (await repoB.GetAllBackupSetsAsync()).Count == setsBefore,
     "a file that is not an export is rejected and creates no set");
 
+// Asked again just before the set is created, with the options it would be
+// saved with: a folder taken meanwhile refuses the import, and nothing is made.
+string? askedAbout = null;
+bool taken = false;
+try
+{
+    await BackupSetTransfer.ImportAsync(repoB, settingsFile, refuseFolder: options =>
+    {
+        askedAbout = options.TargetDirectory;
+        return Task.FromResult<string?>("another set backs up there now");
+    });
+}
+catch (BackupFolderTakenException ex) { taken = ex.Message == "another set backs up there now"; }
+Check(taken && askedAbout == setAStored.JobOptions!.TargetDirectory
+      && (await repoB.GetAllBackupSetsAsync()).Count == setsBefore,
+    $"a folder taken while the import ran refuses it, before any set is made (asked about {askedAbout})");
+
 // The first open of a catalog drops its legacy master tables; a set must still
 // be deletable in that same session (an import's clean-up after a cancel or
 // failure deletes the set it created).

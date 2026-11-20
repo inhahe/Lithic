@@ -41,6 +41,14 @@ public class RestoreViewModel : ViewModelBase
     /// <summary>Fired when the user clicks "Done" or "Close".</summary>
     public event Action? DoneRequested;
 
+    /// <summary>
+    /// What the set's row in the main window is doing right now ("backing up",
+    /// "removing the files of dropped sources"), or null when it is idle. A restore
+    /// is refused while it works: the work moves and deletes the stored files a
+    /// restore reads. Null when nothing can say.
+    /// </summary>
+    public Func<string?>? DescribeBusy { get; init; }
+
     public RestoreViewModel(
         ICatalogRepository catalog,
         IRestoreService restoreService,
@@ -354,6 +362,12 @@ public class RestoreViewModel : ViewModelBase
     {
         if (!CanRestore())
             return;
+        if (DescribeBusy?.Invoke() is { } busy)
+        {
+            StatusText = $"This set is {busy} right now, so nothing was restored: that work moves and deletes "
+                         + "the backed-up files a restore reads. Restore when it has finished.";
+            return;
+        }
 
         _cts = new CancellationTokenSource();
         IsRestoring = true;

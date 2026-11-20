@@ -21,13 +21,8 @@ namespace LithicBackup.Views;
 /// directly: it wires the work up to an <c>IProgress&lt;string&gt;</c> and a
 /// <see cref="CancellationToken"/>, shows the dialog, auto-closes it when the
 /// work finishes, and reports whether the operation completed or was cancelled.
-///
-/// This replaced the old <c>Mouse.OverrideCursor = Cursors.Wait</c> pattern for
-/// the post-edit destination-reconcile scan/purge: the busy cursor gave no
-/// feedback, couldn't be cancelled, and (being a global override cleared only in
-/// a <c>finally</c>) could visually "stick" if a long reconcile ran on with no
-/// status. A dialog whose lifetime is deterministically tied to the work — closed
-/// in the work's completion continuation — can't leak that way.
+/// Its lifetime is tied to the work: it closes in the work's completion
+/// continuation, so it cannot outlive it the way a global busy cursor can.
 /// </summary>
 public partial class ProgressDialog : Window
 {

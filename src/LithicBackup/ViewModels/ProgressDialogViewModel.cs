@@ -1,8 +1,8 @@
 namespace LithicBackup.ViewModels;
 
 /// <summary>
-/// View model backing <see cref="Views.ProgressDialog"/>: a lightweight modal
-/// that shows what a background operation is doing (a fixed <see cref="Message"/>)
+/// View model backing <see cref="Views.ProgressDialog"/>: a small window that
+/// shows what a background operation is doing (a fixed <see cref="Message"/>)
 /// plus a live <see cref="Detail"/> line (counts / percentage), and — when
 /// <see cref="IsCancellable"/> — offers a Cancel button that aborts the work.
 ///

@@ -2,11 +2,13 @@ namespace LithicBackup.Services;
 
 /// <summary>
 /// Work the app must not simply drop when it exits: what a progress dialog runs,
-/// and work that holds a set's row while it changes the set. On a real exit
-/// <c>MainWindow</c> calls <see cref="CancelAndWait"/>. A process that simply ends
-/// runs no clean-up: an export would leave gigabytes of temporary files beside
-/// the export, an import a set without the history it claims, and a removal its
-/// catalog half done without its files.
+/// and what <c>MainViewModel.RunOnRowAsync</c> runs for a held row (the removals
+/// after an edit, a source-drive remap). On a real exit <c>MainWindow</c> calls
+/// <see cref="CancelAndWait"/>. A process that simply ends runs no clean-up: an
+/// export would leave gigabytes of temporary files beside the export, an import
+/// a set without the history it claims, a removal its catalog changed without
+/// its files deleted, and a remap its records on one drive and its selection on
+/// the other.
 /// </summary>
 public static class RunningWork
 {
@@ -40,7 +42,15 @@ public static class RunningWork
         }
         // Blocking is safe: the work runs on the thread pool, and a progress
         // report only posts to this thread, never waits for it.
-        Task.WaitAll(work, timeout);
+        try
+        {
+            Task.WaitAll(work, timeout);
+        }
+        catch (AggregateException)
+        {
+            // Work that failed or was cancelled has ended, which is all an exit
+            // waits for; each caller reports its own failure.
+        }
     }
 
     private sealed class Untrack((CancellationTokenSource? Cancel, Task Work) entry) : IDisposable

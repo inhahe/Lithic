@@ -60,9 +60,8 @@ public static class TaskKinds
 /// about what may be open at the same time on one backup set.
 ///
 /// <para><b>Why this exists.</b> A task that owns its own window cannot be
-/// discarded by an unrelated part of the app: a backup starting cannot throw away
-/// a multi-hour Cleanup scan, as it could when tasks shared the main window's
-/// content area.</para>
+/// discarded by an unrelated part of the app: nothing a backup does to the main
+/// window can throw away a multi-hour Cleanup scan.</para>
 /// </summary>
 public sealed class TaskWindowManager
 {

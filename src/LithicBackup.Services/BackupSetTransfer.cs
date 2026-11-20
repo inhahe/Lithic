@@ -13,6 +13,13 @@ namespace LithicBackup.Services;
 public sealed record BackupSetImportResult(BackupSet Set, bool IncludedHistory, int FileRecords);
 
 /// <summary>
+/// An import was refused because its backup folder is another set's
+/// (<see cref="BackupSetTransfer.ImportAsync"/>'s <c>refuseFolder</c>). Nothing
+/// was created.
+/// </summary>
+public sealed class BackupFolderTakenException(string message) : Exception(message);
+
+/// <summary>
 /// Reads and writes backup set export files (<c>.lithic</c>).
 ///
 /// <para><b>Two formats, told apart by their first bytes.</b> Settings only:
@@ -180,6 +187,13 @@ public static class BackupSetTransfer
     /// identity this computer's (<see cref="LocalizeDestination"/>); null leaves
     /// it as exported.
     /// </param>
+    /// <param name="refuseFolder">
+    /// Asked just before the set is created, with its options as they will be
+    /// saved: why its backup folder cannot be this set's (another set's already),
+    /// or null. The caller asks before the import too, but extracting a history
+    /// takes minutes, and another set can be given the folder meanwhile. A refusal
+    /// throws <see cref="BackupFolderTakenException"/>.
+    /// </param>
     /// <param name="onCreated">
     /// Called, on the import's own thread, the moment the set exists in the
     /// catalog, before its history goes in: until the import ends, the set is half
@@ -188,7 +202,8 @@ public static class BackupSetTransfer
     public static async Task<BackupSetImportResult> ImportAsync(
         ICatalogRepository catalog, string path,
         IProgress<ProgressReport>? progress = null, CancellationToken ct = default,
-        IDestinationResolver? destinations = null, Action<BackupSet>? onCreated = null)
+        IDestinationResolver? destinations = null,
+        Func<JobOptions, Task<string?>>? refuseFolder = null, Action<BackupSet>? onCreated = null)
     {
         string? historyDb = null;
         try
@@ -231,6 +246,9 @@ public static class BackupSetTransfer
             var toCreate = exported.ToBackupSet(withHistory);
             if (destinations is not null && toCreate.JobOptions is { } options)
                 LocalizeDestination(options, destinations);
+            if (refuseFolder is not null && toCreate.JobOptions is { } saved
+                && await refuseFolder(saved) is { } refusal)
+                throw new BackupFolderTakenException(refusal);
             var newSet = await catalog.CreateBackupSetAsync(toCreate, ct);
 
             int records = 0;

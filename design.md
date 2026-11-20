@@ -870,15 +870,20 @@ What a modal dialog used to protect is one set, and the set's row protects it
 without stopping anything else. Work that changes a set holds the set's row
 (`BeginRowWork`; see "Catalog-writing work holds the set's row"), which refuses
 exactly the operations that would conflict with it, on that set alone, and holds
-the set against the Worker. The removals after an edit (the files of dropped
-sources, the earlier versions new retention settings no longer keep) and Remap
-Source Drive run that way, through `RunOnRowAsync`. It runs the work off the UI
+the set against the Worker. A task window already open on the set when such work
+starts is no longer disabled either, so each one that acts on the set asks the row
+first (`DescribeBusy`) and refuses while it is held: Cleanup's purge, Verify and its
+repair, and Restore. The removals after an edit (the files of dropped sources, the
+earlier versions new retention settings no longer keep) and Remap Source Drive's
+two writes run through `RunOnRowAsync`. It runs the work off the UI
 thread, puts its progress on the row's status line, prefixed with what it is, and
 drops a report still queued when the work ends, which could otherwise land over
 the row's next work. An import holds the row of the set it creates
 (`BackupSetTransfer.ImportAsync`'s `onCreated`), the moment the set exists. It
 shows its progress in its own modeless window, which it needs because its first
-step comes before there is a set.
+step comes before there is a set. That window is owned by the main window, never
+by a dialog open over it: a window closes with its owner, and closing the import's
+cancels it.
 
 The dialog closes after awaiting the work, marshalled through the dispatcher —
 the continuation resumes on whatever context captured the await, which is the UI
@@ -2016,7 +2021,10 @@ set finishing) would otherwise show a half-made set that could be backed up,
 modified or deleted. A cancelled or failed import deletes its set, so the row is
 released before the list is reloaded, which never drops a held row. One import
 runs at a time: two at once could each find the same backup folder free and both
-take it.
+take it. The Import button is unavailable meanwhile, and an opened `.lithic` is
+refused before it is offered. The folder is checked before the import starts and
+again just before the set is created (`ImportAsync`'s `refuseFolder`): extracting
+a history takes minutes, and another set can be given the folder meanwhile.
 
 On a real exit, `MainWindow` calls `RunningWork.CancelAndWait`, which cancels
 the work of every progress dialog, waits for that and for the work of held rows
