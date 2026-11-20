@@ -9,10 +9,13 @@ using LithicBackup.ViewModels;
 namespace LithicBackup.Views;
 
 /// <summary>
-/// A small modal progress window that runs a background operation while showing
-/// what it's doing (a fixed message) and a live detail line (counts / percentage),
+/// A small progress window that runs a background operation while showing what
+/// it's doing (a fixed message) and a live detail line (counts / percentage),
 /// and — when the operation is cancellable — lets the user abort it by clicking
-/// Cancel or closing the window.
+/// Cancel or closing the window. Never modal: <c>ShowDialog</c> would disable
+/// every other window in the app, task windows and other sets' rows included.
+/// Work that changes one set holds that set's row instead (design.md, "Modality
+/// is a concurrency decision").
 ///
 /// Use the static <see cref="RunAsync{T}"/> helper rather than constructing this
 /// directly: it wires the work up to an <c>IProgress&lt;string&gt;</c> and a
@@ -80,9 +83,9 @@ public partial class ProgressDialog : Window
 
     private void ForceClose()
     {
-        // Safe to call more than once: the modeless path closes defensively
-        // after awaiting the work, because the continuation that normally closes
-        // the dialog can run BEFORE Show() when the work finishes quickly.
+        // Safe to call more than once: RunAsync closes defensively after
+        // awaiting the work, because the continuation that normally closes the
+        // dialog can run BEFORE Show() when the work finishes quickly.
         if (_closed)
             return;
         _closed = true;
@@ -91,32 +94,6 @@ public partial class ProgressDialog : Window
     }
 
     private bool _closed;
-
-    /// <summary>
-    /// Work running under a dialog now, with its cancel (null when it cannot be
-    /// cancelled). See <see cref="CancelRunningWork"/>.
-    /// </summary>
-    private static readonly List<(CancellationTokenSource? Cancel, Task Work)> Running = [];
-
-    /// <summary>
-    /// The app is exiting: cancel the work every dialog is running and wait, up to
-    /// <paramref name="timeout"/>, for it to unwind. A process that simply ends
-    /// runs no clean-up, so an export would leave its gigabyte temporary files
-    /// beside the export, and an import a set without the history it claims.
-    /// </summary>
-    public static void CancelRunningWork(TimeSpan timeout)
-    {
-        Task[] work;
-        lock (Running)
-        {
-            foreach (var (cancel, _) in Running)
-                cancel?.Cancel();
-            work = Running.Select(r => r.Work).ToArray();
-        }
-        // Blocking is safe: the work runs on the thread pool, and a progress
-        // report only posts to this thread, never waits for it.
-        Task.WaitAll(work, timeout);
-    }
 
     /// <summary>
     /// Run <paramref name="work"/> on a background thread while showing this
@@ -140,24 +117,14 @@ public partial class ProgressDialog : Window
     /// <c>(Completed: true, Result)</c> when the work ran to completion, or
     /// <c>(Completed: false, default)</c> when it was cancelled.
     /// </returns>
-    /// <param name="modal">
-    /// When true (the default) the dialog is shown with <c>ShowDialog</c>, which
-    /// in WPF disables EVERY other window in the app — including the task windows
-    /// that exist precisely so work can run side by side. Pass false for
-    /// READ-ONLY phases, where there is no reason to freeze the rest of the app
-    /// while a directory walk runs. Leave it true for anything that mutates the
-    /// catalog or the destination, where letting the user start a second
-    /// operation on the same set mid-flight is the hazard the modality prevents.
-    /// </param>
     public static Task<(bool Completed, T Result)> RunAsync<T>(
         Window? owner,
         string title,
         string message,
         bool cancellable,
-        Func<IProgress<ProgressReport>, CancellationToken, T> work,
-        bool modal = true)
+        Func<IProgress<ProgressReport>, CancellationToken, T> work)
         => RunAsync(owner, title, message, cancellable,
-            (progress, token) => Task.FromResult(work(progress, token)), modal);
+            (progress, token) => Task.FromResult(work(progress, token)));
 
     /// <summary>As below, for asynchronous work with no result: returns whether it completed.</summary>
     public static async Task<bool> RunAsync(
@@ -165,11 +132,10 @@ public partial class ProgressDialog : Window
         string title,
         string message,
         bool cancellable,
-        Func<IProgress<ProgressReport>, CancellationToken, Task> work,
-        bool modal = true)
+        Func<IProgress<ProgressReport>, CancellationToken, Task> work)
     {
         var (completed, _) = await RunAsync(owner, title, message, cancellable,
-            async (progress, token) => { await work(progress, token); return true; }, modal);
+            async (progress, token) => { await work(progress, token); return true; });
         return completed;
     }
 
@@ -182,8 +148,7 @@ public partial class ProgressDialog : Window
         string title,
         string message,
         bool cancellable,
-        Func<IProgress<ProgressReport>, CancellationToken, Task<T>> work,
-        bool modal = true)
+        Func<IProgress<ProgressReport>, CancellationToken, Task<T>> work)
     {
         var cts = cancellable ? new CancellationTokenSource() : null;
         var vm = new ProgressDialogViewModel(title, message, cancellable);
@@ -235,10 +200,6 @@ public partial class ProgressDialog : Window
             }
         });
 
-        var entry = (cts, (Task)workTask);
-        lock (Running)
-            Running.Add(entry);
-
         // Close the dialog once the work is done — whether it completed, threw,
         // or was cancelled. BeginInvoke hops back to the UI thread that owns the
         // window. ForceClose flips the close gate so OnClosing lets it through.
@@ -246,32 +207,21 @@ public partial class ProgressDialog : Window
             _ => dlg.Dispatcher.BeginInvoke(new Action(dlg.ForceClose)),
             TaskScheduler.Default);
 
-        if (modal)
-        {
-            dlg.ShowDialog();
-        }
-        else
-        {
-            dlg.Show();
-        }
+        dlg.Show();
 
-        // Work is essentially already finished here (its continuation is what
-        // closed the dialog), but await to observe its outcome / rethrow.
-        await workTask;
-        lock (Running)
-            Running.Remove(entry);
+        // Counted as running until it ends, so an exit waits for it.
+        using (RunningWork.Track(workTask, cts))
+            await workTask;
 
-        // ShowDialog only returns once the dialog has closed, so the modal path
-        // needs nothing more. Show() returns immediately, so close it here: the
-        // continuation above may still be queued, or may have run before the
-        // window existed. ForceClose is idempotent.
+        // Show() returned at once, so close the dialog here too: the continuation
+        // above may still be queued, or may have run before the window existed.
+        // ForceClose is idempotent.
         //
         // Marshalled rather than called directly: this resumes on whatever
         // context captured the await, which is the UI thread in the app but is
         // NOT guaranteed to be (with no SynchronizationContext the continuation
         // runs on the thread pool, and touching the Window from there throws).
-        if (!modal)
-            dlg.Dispatcher.Invoke(dlg.ForceClose);
+        dlg.Dispatcher.Invoke(dlg.ForceClose);
 
         if (error is not null)
             throw error;

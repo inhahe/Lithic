@@ -180,10 +180,15 @@ public static class BackupSetTransfer
     /// identity this computer's (<see cref="LocalizeDestination"/>); null leaves
     /// it as exported.
     /// </param>
+    /// <param name="onCreated">
+    /// Called, on the import's own thread, the moment the set exists in the
+    /// catalog, before its history goes in: until the import ends, the set is half
+    /// made, and the caller keeps everything else off it.
+    /// </param>
     public static async Task<BackupSetImportResult> ImportAsync(
         ICatalogRepository catalog, string path,
         IProgress<ProgressReport>? progress = null, CancellationToken ct = default,
-        IDestinationResolver? destinations = null)
+        IDestinationResolver? destinations = null, Action<BackupSet>? onCreated = null)
     {
         string? historyDb = null;
         try
@@ -229,28 +234,29 @@ public static class BackupSetTransfer
             var newSet = await catalog.CreateBackupSetAsync(toCreate, ct);
 
             int records = 0;
-            if (withHistory)
+            try
             {
-                var cadence = new ProgressCadence();
-                var rows = new SyncProgress<(long Done, long Total)>(r =>
+                onCreated?.Invoke(newSet);
+                if (withHistory)
                 {
-                    if (progress is not null && (cadence.IsDue() || r.Done == r.Total))
-                        progress.Report(new ProgressReport(
-                            $"Step 2 of 2: importing the backup history ({r.Done:N0} of {r.Total:N0} records)",
-                            r.Total > 0 ? r.Done * 100.0 / r.Total : 100));
-                });
-                try
-                {
+                    var cadence = new ProgressCadence();
+                    var rows = new SyncProgress<(long Done, long Total)>(r =>
+                    {
+                        if (progress is not null && (cadence.IsDue() || r.Done == r.Total))
+                            progress.Report(new ProgressReport(
+                                $"Step 2 of 2: importing the backup history ({r.Done:N0} of {r.Total:N0} records)",
+                                r.Total > 0 ? r.Done * 100.0 / r.Total : 100));
+                    });
                     records = await catalog.ImportSetHistoryAsync(newSet.Id, historyDb!, rows, ct);
                 }
-                catch
-                {
-                    // A set that says it has history but has none is the very
-                    // thing this exists to prevent.
-                    try { await catalog.DeleteBackupSetAsync(newSet.Id, CancellationToken.None); }
-                    catch { /* best effort */ }
-                    throw;
-                }
+            }
+            catch
+            {
+                // All or nothing: a set that says it has history but has none is
+                // the very thing this exists to prevent.
+                try { await catalog.DeleteBackupSetAsync(newSet.Id, CancellationToken.None); }
+                catch { /* best effort */ }
+                throw;
             }
 
             return new BackupSetImportResult(newSet, withHistory, records);

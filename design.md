@@ -860,23 +860,33 @@ work. If deep trees still run out of room, that is the next thing to build.
 
 ## Modality is a concurrency decision, not a cosmetic one
 
-`ProgressDialog.RunAsync` takes `modal` (default true). In WPF `ShowDialog`
-disables **every other window in the application** — including the task windows
-that exist precisely so work can run side by side — so a modal progress dialog
-silently reverses that design for as long as it is up.
+In WPF `ShowDialog` disables **every other window in the application** — the
+main window with every other set's row, and the task windows that exist precisely
+so work can run side by side — so a modal progress dialog silently reverses that
+design for as long as it is up. A long phase is therefore never modal:
+`ProgressDialog` is always shown with `Show`.
 
-The rule: **read-only phases pass `modal: false`; anything that mutates the
-catalog or the destination stays modal.** The post-edit diff scan and the
-added-folders walk only read, so they no longer freeze the app. The purge that
-follows ("Removing files from destination") stays modal, because letting the user
-start a second operation on the same set while files are being deleted is exactly
-the hazard the modality is preventing.
+What a modal dialog used to protect is one set, and the set's row protects it
+without stopping anything else. Work that changes a set holds the set's row
+(`BeginRowWork`; see "Catalog-writing work holds the set's row"), which refuses
+exactly the operations that would conflict with it, on that set alone, and holds
+the set against the Worker. The removals after an edit (the files of dropped
+sources, the earlier versions new retention settings no longer keep) and Remap
+Source Drive run that way, through `RunOnRowAsync`. It runs the work off the UI
+thread, puts its progress on the row's status line, prefixed with what it is, and
+drops a report still queued when the work ends, which could otherwise land over
+the row's next work. An import holds the row of the set it creates
+(`BackupSetTransfer.ImportAsync`'s `onCreated`), the moment the set exists. It
+shows its progress in its own modeless window, which it needs because its first
+step comes before there is a set.
 
-The modeless path closes its dialog after awaiting the work, marshalled through
-the dispatcher — the continuation resumes on whatever context captured the await,
-which is the UI thread in the app but is not guaranteed to be. Verified both
-orderings, including the race where the work finishes before `Show()`: each
-returns the right result and leaves zero windows open.
+The dialog closes after awaiting the work, marshalled through the dispatcher —
+the continuation resumes on whatever context captured the await, which is the UI
+thread in the app but is not guaranteed to be. Verified both orderings, including
+the race where the work finishes before `Show()`: each returns the right result and
+leaves zero windows open. `tools\editor_save_test` 23, 25, 28 and 29 freeze each
+kind of work by holding the set's write lock, and check that it holds the row and
+that no window is disabled meanwhile.
 
 ## After a selection edit, back up what was named — do not go looking for it again
 
@@ -1689,8 +1699,9 @@ Two forms of one numbered HISTORY version (`x.v3` and
 `x.v3.fileref`) cannot both be version 3, so there one is still kept (plain, then
 `.dedup`, then `.fileref`) and the other left untracked.
 
-**Catalog-writing work holds the set's row, wherever it was started.** Seeding
-and Clear Backup History call `BeginRowWork`/`EndRowWork`: the row goes into
+**Catalog-writing work holds the set's row, wherever it was started.** Seeding,
+Clear Backup History, the removals after an edit, Remap Source Drive and an
+import (for the set it creates) call `BeginRowWork`/`EndRowWork`: the row goes into
 `IsRunning` with `BusyActivity` set ("seeding"), its scan-phase status line shows
 the progress, and `ScanCts` is a token linked to the editor's own, so the row's
 Abort stops it. Reusing `IsRunning` rather than adding a flag is the point: every
@@ -1961,8 +1972,7 @@ turn a set into an exclusion set. Pinned by `tools\editor_save_test` §16.
 
 ## Export and import show their progress, and stop when told
 
-Both run in a `ProgressDialog` (modeless for export, which only reads; modal for
-import, which adds a set) with the step, a bar and Cancel, and end in a message
+Both run in a modeless `ProgressDialog` with the step, a bar and Cancel, and end in a message
 saying where the file went (with an offer to show it in Explorer) or what was
 imported. An export with history once ran for minutes with only a status-bar
 line, and the file appears under its name only once complete, so a user could
@@ -1999,11 +2009,20 @@ since `VACUUM INTO` reads a snapshot; the set is not held against the Worker
 either. An export's temporary files are named per run (`<file>.<guid>.partial`
 and `.history.partial`), so two exports to one file cannot delete each other's.
 
-On a real exit, `MainWindow` calls `ProgressDialog.CancelRunningWork`, which
-cancels whatever every progress dialog is running and waits up to 10 seconds
-for it to unwind. A process that simply ends runs no `finally`: an export
-would leave gigabytes of temporary files beside the export, and an import a
-set that claims a history its rolled-back transaction never wrote.
+An import holds the row of the set it creates from the moment the set exists,
+before its history goes in: a reload of the list meanwhile (a backup of another
+set finishing) would otherwise show a half-made set that could be backed up,
+modified or deleted. A cancelled or failed import deletes its set, so the row is
+released before the list is reloaded, which never drops a held row. One import
+runs at a time: two at once could each find the same backup folder free and both
+take it.
+
+On a real exit, `MainWindow` calls `RunningWork.CancelAndWait`, which cancels
+the work of every progress dialog, waits for that and for the work of held rows
+(`RunOnRowAsync`), up to 10 seconds, to unwind. A process that simply ends runs
+no `finally`: an export would leave gigabytes of temporary files beside the
+export, an import a set that claims a history its rolled-back transaction never
+wrote, and a removal its catalog changed without its files deleted.
 
 ## Opening a `.lithic` file reaches the one running window
 

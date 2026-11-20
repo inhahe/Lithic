@@ -1824,11 +1824,7 @@ public class MainViewModel : ViewModelBase
                     .ToList();
 
                 return (Removed: rem, AddedRoots: added);
-            },
-            // Read-only: it inspects the catalog and the selection trees and
-            // changes nothing, so there is no reason to disable every other
-            // window while it runs.
-            modal: false);
+            });
 
         if (!completed)
         {
@@ -2105,7 +2101,7 @@ public class MainViewModel : ViewModelBase
         try
         {
             await WaitForBackgroundRunAsync(row, backupSet.Id, "Removing the files of dropped sources");
-            await PurgeRemovedSourcesAsync(backupSet, removed, byPath, targetDir);
+            await PurgeRemovedSourcesAsync(row, backupSet, removed, byPath, targetDir);
         }
         finally
         {
@@ -2122,8 +2118,9 @@ public class MainViewModel : ViewModelBase
     /// stored files deleted, except what another file still needs. Its outcome
     /// goes to <see cref="StatusText"/>.
     /// </summary>
+    /// <param name="row">The set's row, held; its status line shows the progress.</param>
     private async Task PurgeRemovedSourcesAsync(
-        BackupSet backupSet, List<FileRecord> removed,
+        BackupSetRowViewModel? row, BackupSet backupSet, List<FileRecord> removed,
         List<(string SourcePath, long SizeBytes)> byPath, string? targetDir)
     {
         var sourcePaths = byPath.Select(p => p.SourcePath).ToList();
@@ -2137,19 +2134,13 @@ public class MainViewModel : ViewModelBase
         long bytesFreed = 0;
         try
         {
-            // Progress dialog (not a busy cursor) so the deletion + catalog
-            // reconcile always shows live status and the window deterministically
-            // closes when the work finishes — the old global cursor override
-            // could visually "stick" if a long reconcile ran on with no feedback.
-            // Not cancellable: the user already confirmed the deletion, and
-            // aborting mid-purge would leave the catalog and destination out of
-            // step (Cleanup can always finish a partial purge later).
-            var (_, purge) = await Views.ProgressDialog.RunAsync<(int Cat, int Files, int Fail, long Bytes, int Absent, int Kept)>(
-                Application.Current.MainWindow,
-                "Removing files from destination",
-                "Deleting backed-up copies of the removed folders\u2026",
-                cancellable: false,
-                async (progress, ct) =>
+            // On the row, which is held: the rest of the app stays usable. Not
+            // cancellable: the user already confirmed the deletion, and aborting
+            // mid-purge would leave the catalog and destination out of step
+            // (Cleanup can always finish a partial purge later).
+            var purge = await RunOnRowAsync<(int Cat, int Files, int Fail, long Bytes, int Absent, int Kept)>(
+                row, "Removing the files of dropped sources",
+                async progress =>
                 {
                     // Catalog marks inside a single transaction (mirrors Cleanup).
                     // Loop per source path so the marking shows live "x of y"
@@ -2157,7 +2148,9 @@ public class MainViewModel : ViewModelBase
                     // single static "Updating catalog…" that looks frozen while
                     // thousands of rows are updated — the user observed exactly this.
                     var cadence = new ProgressCadence();
-                    var tx = await _catalog.BeginTransactionAsync(backupSet.Id);
+                    var tx = await _catalog.BeginTransactionAsync(backupSet.Id, CancellationToken.None,
+                        onWaitingForOtherProcess: () => progress.Report(
+                            "Waiting for the background backup of this set to pause…"));
                     int purged = 0, kept = 0;
                     // Every live record of the removed paths, by id, with its stored file.
                     var candidates = new Dictionary<long, string>();
@@ -2220,9 +2213,9 @@ public class MainViewModel : ViewModelBase
                         // exactly as manual Cleanup's reconcile step does.
                         progress.Report("Repairing catalog references\u2026");
                         var reconcile = new CatalogReconcileService(_catalog);
-                        var report = await reconcile.AnalyzeAsync(backupSet.Id, targetDir, progress, ct);
+                        var report = await reconcile.AnalyzeAsync(backupSet.Id, targetDir, progress);
                         if (report.HasChanges)
-                            await reconcile.ApplyAsync(backupSet.Id, report, targetDir, progress, ct);
+                            await reconcile.ApplyAsync(backupSet.Id, report, targetDir, progress);
                     }
                     return (purged, fd, ff, bytes, absent, kept);
                 });
@@ -2365,9 +2358,7 @@ public class MainViewModel : ViewModelBase
                     found.RemoveAll(r => needed.Contains(r.Id));
                 }
                 return found;
-            },
-            // Read-only, apart from building the index once.
-            modal: false);
+            });
 
         if (!completed)
         {
@@ -2421,7 +2412,7 @@ public class MainViewModel : ViewModelBase
         try
         {
             await WaitForBackgroundRunAsync(row, set.Id, "Removing earlier versions");
-            (outcome, failed) = await PurgeVersionsNoLongerKeptAsync(set.Id, notKept, root, RetentionSignature(opts));
+            (outcome, failed) = await PurgeVersionsNoLongerKeptAsync(row, set.Id, notKept, root, RetentionSignature(opts));
         }
         finally
         {
@@ -2437,6 +2428,7 @@ public class MainViewModel : ViewModelBase
     /// files deleted, except a copy a duplicate-file reference still needs and a
     /// file a live record still points at.
     /// </summary>
+    /// <param name="row">The set's row, held; its status line shows the progress.</param>
     /// <param name="versions">The earlier versions found and confirmed, as read then.</param>
     /// <param name="root">The folder the set's backup lives in.</param>
     /// <param name="judgedBy">
@@ -2447,20 +2439,19 @@ public class MainViewModel : ViewModelBase
     /// </param>
     /// <returns>What was done, for the status bar and the set's row; whether it failed.</returns>
     private async Task<(string Outcome, bool Failed)> PurgeVersionsNoLongerKeptAsync(
-        int setId, IReadOnlyList<FileRecord> versions, string root, string judgedBy)
+        BackupSetRowViewModel? row, int setId, IReadOnlyList<FileRecord> versions, string root, string judgedBy)
     {
         (int Retired, int Deleted, int Failures, long Bytes, int Absent, int Kept) result;
         try
         {
-            // Not cancellable: the user confirmed the deletion, and a half-done
-            // purge leaves the catalog and the destination out of step.
-            (_, result) = await Views.ProgressDialog.RunAsync<(int, int, int, long, int, int)>(
-                Application.Current.MainWindow,
-                "Removing earlier versions",
-                "Deleting the earlier versions the retention settings no longer keep…",
-                cancellable: false,
-                async (progress, ct) =>
+            // On the row, which is held. Not cancellable: the user confirmed the
+            // deletion, and a half-done purge leaves the catalog and the
+            // destination out of step.
+            result = await RunOnRowAsync<(int, int, int, long, int, int)>(
+                row, "Removing earlier versions",
+                async progress =>
                 {
+                    var ct = CancellationToken.None;
                     // The guard below finds a reference's content by hash: give one to
                     // any plain copy about to go that has none (a seed with Skip
                     // hashing records them so), as the backup's retention pass does.
@@ -2596,10 +2587,7 @@ public class MainViewModel : ViewModelBase
                 }
                 return (Added: result, Scanned: scanned,
                         AlreadyCovered: alreadyCovered, CoveredBytes: coveredBytes);
-            },
-            // Read-only walk of the added folders — nothing to protect by
-            // disabling the rest of the app.
-            modal: false);
+            });
 
         // Cancelled the scan — leave the added folders for the next backup.
         if (!completed)
@@ -3045,9 +3033,20 @@ public class MainViewModel : ViewModelBase
             "Remap Source Drive", MessageBoxButton.YesNo, MessageBoxImage.Question);
         if (confirm != MessageBoxResult.Yes) return;
 
+        // Hold the set's row while its records change, as a seed does: a backup
+        // started meanwhile would scan the sources under one drive letter and
+        // look them up under the other. Every other set stays usable.
+        var row = RowFor(backupSet.Id);
+        if (row is { IsWorking: true })
+        {
+            StatusText = $"\"{backupSet.Name}\" is {row.BusyActivity ?? "backing up"} right now, so its source "
+                + "drive was not remapped. Remap it when that has finished.";
+            return;
+        }
+        BeginRowWork(row, RemappingSourceDrive, $"Remapping source drive {oldDrive}: to {newDrive}:…", cancel: null);
         try
         {
-            Mouse.OverrideCursor = Cursors.Wait;
+            await WaitForBackgroundRunAsync(row, backupSet.Id, $"Remapping source drive {oldDrive}: to {newDrive}:");
             int updated = await _catalog.RemapSourcePathPrefixAsync(
                 backupSet.Id, $"{oldDrive}:\\", $"{newDrive}:\\");
 
@@ -3060,16 +3059,17 @@ public class MainViewModel : ViewModelBase
 
             await _catalog.UpdateBackupSetAsync(backupSet);
             StatusText = $"Remapped source drive {oldDrive}: → {newDrive}: ({updated:N0} record(s) updated).";
+            EndRowWork(row, StatusText, isError: false);
         }
         catch (Exception ex)
         {
             StatusText = $"Failed to remap source drive: {ex.Message}";
+            EndRowWork(row, StatusText, isError: true);
         }
-        finally
-        {
-            Mouse.OverrideCursor = null;
-        }
+        await LoadBackupSetsAsync();
     }
+
+    private const string RemappingSourceDrive = "remapping its source drive";
 
     /// <summary>Uppercase drive letter of a path like <c>E:\foo</c>, or null.</summary>
     private static char? DriveLetterOf(string path) =>
@@ -5454,8 +5454,8 @@ public class MainViewModel : ViewModelBase
         {
             // A window of its own, with the step, a bar and Cancel: a history is
             // gigabytes and takes minutes, and the file appears only once complete.
-            // Modeless: it only reads the catalog, so the rest of the app stays
-            // usable, except deleting or exporting this set (IsExporting).
+            // It only reads the catalog, so the rest of the app stays usable,
+            // except deleting or exporting this set (IsExporting).
             bool completed;
             if (row is not null)
                 row.IsExporting = true;
@@ -5466,8 +5466,7 @@ public class MainViewModel : ViewModelBase
                     $"Export \"{set.Name}\"",
                     $"Exporting \"{set.Name}\" to {file}",
                     cancellable: true,
-                    (progress, ct) => BackupSetTransfer.ExportAsync(_catalog, set, file, withHistory, progress, ct),
-                    modal: false);
+                    (progress, ct) => BackupSetTransfer.ExportAsync(_catalog, set, file, withHistory, progress, ct));
             }
             finally
             {
@@ -5608,9 +5607,69 @@ public class MainViewModel : ViewModelBase
         await ImportFromFileAsync(path);
     }
 
-    /// <summary>Import an export file as a new backup set, and say what it brought.</summary>
+    /// <summary>What holds the row of a set an import is still filling (see <see cref="ImportFromFileAsync"/>).</summary>
+    private const string BeingImported = "being imported";
+
+    /// <summary>
+    /// The import under way, if any: an identity, so that word from an import
+    /// that has already ended holds nothing (<see cref="HoldImportedSet"/>).
+    /// </summary>
+    private object? _importToken;
+
+    /// <summary>The set the import under way has created and is still filling; null before it exists.</summary>
+    private int? _importingSetId;
+
+    /// <summary>
+    /// The import has created its set: hold its row until the import ends, so the
+    /// half-made set is neither backed up, modified nor deleted meanwhile.
+    /// </summary>
+    /// <param name="token">The import's identity (<see cref="_importToken"/>) when it began.</param>
+    private void HoldImportedSet(object token, int setId)
+    {
+        if (!ReferenceEquals(_importToken, token))
+            return;
+        _importingSetId = setId;
+        HoldIfImported(RowFor(setId));
+    }
+
+    /// <summary>
+    /// Hold <paramref name="row"/> if it is the set an import is still filling: when
+    /// the import creates the set, and when a reload during the import adds its row.
+    /// </summary>
+    private void HoldIfImported(BackupSetRowViewModel? row)
+    {
+        if (row is not null && row.Id == _importingSetId && !row.IsRunning)
+            BeginRowWork(row, BeingImported,
+                "Being imported. The import's window shows how far it has got.", cancel: null);
+    }
+
+    /// <summary>The import has ended, however it ended: release its set's row.</summary>
+    private void EndImport()
+    {
+        _importToken = null;
+        if (_importingSetId is int id && RowFor(id) is { BusyActivity: BeingImported } row)
+            EndRowWork(row, "", isError: false);
+        _importingSetId = null;
+    }
+
+    /// <summary>
+    /// Import an export file as a new backup set, and say what it brought. One
+    /// import at a time: two at once could both find a backup folder free and
+    /// take it. The rest of the app stays usable meanwhile.
+    /// </summary>
     private async Task ImportFromFileAsync(string fileName)
     {
+        if (_importToken is not null)
+        {
+            StatusText = $"Did not import {Path.GetFileName(fileName)}: another import is under way.";
+            MessageBox.Show(PromptOwner(),
+                $"{Path.GetFileName(fileName)} was not imported: another backup set is being imported. "
+                + "Import it once that has finished.",
+                "Import Backup Set", MessageBoxButton.OK, MessageBoxImage.Information);
+            return;
+        }
+        var token = new object();
+        _importToken = token;
         try
         {
             // Not into another set's backup folder (importing a set already here
@@ -5644,14 +5703,31 @@ public class MainViewModel : ViewModelBase
             var clock = System.Diagnostics.Stopwatch.StartNew();
             StatusText = $"Importing {Path.GetFileName(fileName)}…";
             // A window with the step, a bar and Cancel: a history holds millions
-            // of records. Modal, as it adds a set to the catalog. A cancel leaves
-            // no set behind (the import is all or nothing).
-            var (completed, result) = await Views.ProgressDialog.RunAsync(
-                PromptOwner(),
-                "Import Backup Set",
-                $"Importing {fileName}",
-                cancellable: true,
-                (progress, ct) => BackupSetTransfer.ImportAsync(_catalog, fileName, progress, ct, _destinationResolver));
+            // of records. A cancel leaves no set behind (the import is all or
+            // nothing). The new set's row is held from the moment it exists.
+            var dispatcher = Application.Current.Dispatcher;
+            bool completed;
+            BackupSetImportResult result;
+            try
+            {
+                (completed, result) = await Views.ProgressDialog.RunAsync(
+                    PromptOwner(),
+                    "Import Backup Set",
+                    $"Importing {fileName}",
+                    cancellable: true,
+                    (progress, ct) => BackupSetTransfer.ImportAsync(_catalog, fileName, progress, ct, _destinationResolver,
+                        // Posted, not invoked: an exit blocks the UI thread until
+                        // the import ends, and an import waiting on the UI thread
+                        // would not end.
+                        onCreated: created => dispatcher.BeginInvoke(System.Windows.Threading.DispatcherPriority.Send,
+                            () => HoldImportedSet(token, created.Id))));
+            }
+            finally
+            {
+                // Before any reload, which keeps a held row even when its set is
+                // gone (a cancelled import deletes its set).
+                EndImport();
+            }
             if (!completed)
             {
                 // The import creates its set before the history goes in and
@@ -5703,6 +5779,10 @@ public class MainViewModel : ViewModelBase
             CrashLogger.Log(ex, $"Import of {fileName}");
             MessageBox.Show($"Could not import {Path.GetFileName(fileName)}.\n\n{ex.Message}",
                 "Import Backup Set", MessageBoxButton.OK, MessageBoxImage.Error);
+        }
+        finally
+        {
+            EndImport();
         }
     }
 
@@ -5766,6 +5846,33 @@ public class MainViewModel : ViewModelBase
         row.RunningStatusText = status;
         row.ScanCts = cancel;
         row.IsRunning = true;
+    }
+
+    /// <summary>
+    /// Run the work of a row held by <see cref="BeginRowWork"/>, off the UI thread,
+    /// its progress on the row's status line, not in a dialog over the whole app:
+    /// the hold is what keeps other work off the set, and every other set stays
+    /// usable meanwhile. It counts as running until it ends, so an exit waits for
+    /// it (<see cref="Services.RunningWork"/>).
+    /// </summary>
+    /// <param name="row">The held row; with none, the progress goes to the status bar.</param>
+    /// <param name="label">What the work is, shown before each of its reports ("Removing earlier versions").</param>
+    /// <param name="work">The work, given where to report its progress. It cannot be cancelled.</param>
+    private async Task<T> RunOnRowAsync<T>(
+        BackupSetRowViewModel? row, string label, Func<IProgress<ProgressReport>, Task<T>> work)
+    {
+        // Made here, on the UI thread, so its reports post back to it - in order,
+        // and ahead of this method's continuation, so none lands after it ends.
+        var progress = new Progress<ProgressReport>(r =>
+        {
+            if (row is not null)
+                row.RunningStatusText = $"{label}: {r.Text}";
+            else
+                StatusText = $"{label}: {r.Text}";
+        });
+        var task = Task.Run(() => work(progress));
+        using (Services.RunningWork.Track(task, cancel: null))
+            return await task;
     }
 
     /// <summary>
@@ -6533,6 +6640,7 @@ public class MainViewModel : ViewModelBase
                         BackupSets.Insert(i, newRow);
                     else
                         BackupSets.Add(newRow);
+                    HoldIfImported(newRow);
                 }
             }
         }

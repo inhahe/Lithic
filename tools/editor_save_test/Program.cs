@@ -278,6 +278,8 @@ internal static class Program
         await RetentionChangeOffersRemovalAsync();
         await RecordsElsewhereRefusedAsync();
         await SharedBackupFolderAsync();
+        await ImportHoldsItsRowAsync();
+        await RemapHoldsTheRowAsync();
 #endif
         Check(_dialogs.Unexpected.Count == 0,
             "no unexpected message box appeared"
@@ -373,8 +375,9 @@ internal static class Program
     /// 23: after an edit that drops one folder and adds another, the app looks for
     /// what changed. The dropped folder's backed-up copies are offered for removal,
     /// and Remove deletes them and retires their records, leaving the rest; the
-    /// added folder's files are offered for backup. The scans and the purge do
-    /// their catalog work inside progress windows, awaited there.
+    /// added folder's files are offered for backup. The scans run in progress
+    /// windows; the removal on the set's row, which it holds, and no window is
+    /// disabled while it runs, so other sets can be worked on.
     /// </summary>
     static async Task ReconcileAfterEditAsync()
     {
@@ -451,7 +454,29 @@ internal static class Program
         // N0, as the header writes it: the separator is the locale's.
         Check(removalHeader.StartsWith($"1 file ({5000:N0} bytes)", StringComparison.Ordinal),
             $"just b's file (\"{removalHeader}\")");
-        removal.DialogResult = true;
+
+        // The removal frozen by holding the set's write lock, which its catalog
+        // half waits for: meanwhile it holds the set's row, and nothing else.
+        string lockPath = Path.Combine(_root, "sets", $"set-{_setId}.db.writelock");
+        var held = new FileStream(lockPath, FileMode.OpenOrCreate, FileAccess.ReadWrite, FileShare.None);
+        try
+        {
+            removal.DialogResult = true;
+            Check(await WaitFor(() => row.IsRunning && row.BusyActivity == "removing the files of dropped sources"
+                                      && row.RunningStatusText.Contains("Waiting", StringComparison.Ordinal), 10000),
+                $"the removal holds the set's row, its progress on the row (\"{row.RunningStatusText}\")");
+            Check(!_vm.SetBackupCommand.CanExecute(row) && !_vm.SetModifyCommand.CanExecute(row),
+                "the set cannot be backed up or modified meanwhile");
+            var disabled = Application.Current.Windows.OfType<Window>()
+                .Where(w => w.IsVisible && !IsWindowEnabled(new System.Windows.Interop.WindowInteropHelper(w).Handle))
+                .Select(w => w.GetType().Name).ToList();
+            Check(disabled.Count == 0 && !Application.Current.Windows.OfType<ProgressDialog>().Any(),
+                $"but no window is disabled, so other sets can be worked on ({string.Join(", ", disabled)})");
+        }
+        finally
+        {
+            held.Dispose();
+        }
 
         // Added: c's file is offered for backup. Not now.
         ReviewTreeDialog? addition = null;
@@ -580,7 +605,26 @@ internal static class Program
         Check(Header(review).StartsWith($"1 earlier version of 1 file ({smallV1Bytes:N0} bytes) is no longer kept",
                 StringComparison.Ordinal),
             $"just small.txt's older earlier version (\"{Header(review)}\")");
-        review.DialogResult = true;
+        // Frozen by holding the set's write lock, as in 23: it holds the row and
+        // shows its progress there, and disables no window.
+        var held = new FileStream(Path.Combine(_root, "sets", $"set-{_setId}.db.writelock"),
+            FileMode.OpenOrCreate, FileAccess.ReadWrite, FileShare.None);
+        try
+        {
+            review.DialogResult = true;
+            Check(await WaitFor(() => row.IsRunning && row.BusyActivity == "removing earlier versions"
+                                      && row.RunningStatusText.Contains("Waiting", StringComparison.Ordinal), 10000),
+                $"the removal holds the set's row, its progress on the row (\"{row.RunningStatusText}\")");
+            var disabled = Application.Current.Windows.OfType<Window>()
+                .Where(w => w.IsVisible && !IsWindowEnabled(new System.Windows.Interop.WindowInteropHelper(w).Handle))
+                .Select(w => w.GetType().Name).ToList();
+            Check(disabled.Count == 0 && !Application.Current.Windows.OfType<ProgressDialog>().Any(),
+                $"and no window is disabled meanwhile ({string.Join(", ", disabled)})");
+        }
+        finally
+        {
+            held.Dispose();
+        }
         Check(await WaitFor(() => !row.IsRunning && row.LastResultText.Length > 0, 20000), "the removal finishes");
         Check(!File.Exists(Prev(_smallFile, 1)), "Remove deleted small.txt.v1");
         Check(File.Exists(Prev(_smallFile, 2)) && File.Exists(Current(_smallFile))
@@ -864,6 +908,172 @@ internal static class Program
     }
 
     /// <summary>
+    /// 28: an import leaves the rest of the app usable - its progress window is not
+    /// modal - and holds the new set's row while it is half made: a reload of the
+    /// list meanwhile shows the set as being imported, with Backup and Delete
+    /// unavailable, and a second import is refused until it ends. The import is
+    /// frozen by holding the new set's write lock, which its history waits for:
+    /// the set's id is the catalog's next.
+    /// </summary>
+    static async Task ImportHoldsItsRowAsync()
+    {
+        Console.WriteLine();
+        Console.WriteLine("=== 28. an import leaves the app usable and holds its new set's row ===");
+        var set = await DbSetAsync();
+        if (!await _observer.HasFileRecordsAsync(_setId))
+        {
+            Check(false, "set-up: the test set has a backup history to export");
+            return;
+        }
+        // Exported with a destination of its own, so the import is not refused
+        // for sharing the test set's folder.
+        string export = Path.Combine(_root, "with-history.lithic");
+        var ownFolder = new BackupSet
+        {
+            Id = set.Id, Name = "imported with history", SourceRoots = set.SourceRoots,
+            SourceSelections = set.SourceSelections, DefaultMediaType = set.DefaultMediaType, CreatedUtc = set.CreatedUtc,
+            JobOptions = JsonSerializer.Deserialize<JobOptions>(JsonSerializer.Serialize(set.JobOptions))!,
+        };
+        ownFolder.JobOptions.TargetDirectory = Path.Combine(_root, "imported-with-history");
+        ownFolder.JobOptions.DestinationVolumeId = null;
+        ownFolder.JobOptions.DestinationSubpath = null;
+        await BackupSetTransfer.ExportAsync(_catalog, ownFolder, export, includeHistory: true);
+
+        long nextId;
+        using (var conn = new Microsoft.Data.Sqlite.SqliteConnection(
+                   $"Data Source={Path.Combine(_root, "catalog.db")};Mode=ReadOnly;Pooling=False"))
+        {
+            conn.Open();
+            using var cmd = conn.CreateCommand();
+            cmd.CommandText = "SELECT seq FROM sqlite_sequence WHERE name = 'BackupSets'";
+            nextId = Convert.ToInt64(cmd.ExecuteScalar()) + 1;
+        }
+        var held = new FileStream(Path.Combine(_root, "sets", $"set-{nextId}.db.writelock"),
+            FileMode.OpenOrCreate, FileAccess.ReadWrite, FileShare.None);
+        Task? importing = null;
+        BackupSetRowViewModel? row = null;
+        try
+        {
+            _dialogs.Expect("Open Backup Set", DialogWatcher.IDYES);
+            importing = _vm.OfferOpenedFilesAsync([export]);
+            bool created = false;
+            for (var clock = Stopwatch.StartNew(); !created && clock.ElapsedMilliseconds < 10000;)
+            {
+                created = await _observer.GetBackupSetAsync((int)nextId) is not null;
+                if (!created)
+                    await Task.Delay(40);
+            }
+            Check(created && await WaitFor(() => Application.Current.Windows.OfType<ProgressDialog>().Any(), 10000),
+                "the import creates its set, then waits to write its history");
+            var disabled = Application.Current.Windows.OfType<Window>()
+                .Where(w => w.IsVisible && !IsWindowEnabled(new System.Windows.Interop.WindowInteropHelper(w).Handle))
+                .Select(w => w.GetType().Name).ToList();
+            Check(disabled.Count == 0, $"no window is disabled while it imports ({string.Join(", ", disabled)})");
+
+            // A reload while it imports - a backup of another set finishing, say.
+            await (Task)typeof(MainViewModel).GetMethod("LoadBackupSetsAsync", BindingFlags.Instance | BindingFlags.NonPublic)!
+                .Invoke(_vm, null)!;
+            row = _vm.BackupSets.FirstOrDefault(r => r.Id == nextId);
+            Check(row is { IsRunning: true, BusyActivity: "being imported" },
+                $"its half-made set shows as being imported ({row?.BusyActivity ?? "no row"})");
+            Check(row is not null && !_vm.SetBackupCommand.CanExecute(row) && !_vm.SetDeleteCommand.CanExecute(row),
+                "and cannot be backed up or deleted meanwhile");
+
+            _dialogs.Expect("Import Backup Set", DialogWatcher.IDOK);
+            await (Task)typeof(MainViewModel).GetMethod("ImportFromFileAsync", BindingFlags.Instance | BindingFlags.NonPublic)!
+                .Invoke(_vm, [export])!;
+            Check(_dialogs.WasAnswered("Import Backup Set") && _vm.StatusText.Contains("another import", StringComparison.Ordinal),
+                $"a second import is refused meanwhile (\"{_vm.StatusText}\")");
+        }
+        finally
+        {
+            _dialogs.Expect("Import Backup Set", DialogWatcher.IDOK);
+            held.Dispose();
+        }
+        if (importing is not null)
+            await importing;
+        var imported = await _observer.GetBackupSetAsync((int)nextId);
+        Check(imported is not null && await _observer.HasFileRecordsAsync((int)nextId),
+            "once it can write, the import finishes, history and all");
+        row = _vm.BackupSets.FirstOrDefault(r => r.Id == nextId);
+        Check(row is { IsRunning: false } && _vm.SetDeleteCommand.CanExecute(row), "and releases the set's row");
+        _dialogs.ClearExpectations();
+        if (imported is not null)
+            await _observer.DeleteBackupSetAsync(imported.Id);
+    }
+
+    /// <summary>
+    /// 29: remapping a set's source drive holds the set's row while its records
+    /// change - no backup of it can start meanwhile - and nothing else: no wait
+    /// cursor over the app, no window disabled. Frozen by holding the set's write
+    /// lock, which the remap's update waits for.
+    /// </summary>
+    static async Task RemapHoldsTheRowAsync()
+    {
+        Console.WriteLine();
+        Console.WriteLine("=== 29. remapping a source drive holds the set's row, and nothing else ===");
+        char from = char.ToUpperInvariant(_src[0]);
+        if (!DriveInfo.GetDrives().Any(d => d.IsReady && d.DriveType != DriveType.CDRom
+                                            && char.ToUpperInvariant(d.Name[0]) != from))
+        {
+            Console.WriteLine("  (skipped: no other ready drive to remap to)");
+            return;
+        }
+        var remapSet = await _observer.CreateBackupSetAsync(new BackupSet
+        {
+            Name = "remap test", SourceRoots = [_src], CreatedUtc = DateTime.UtcNow,
+            DefaultMediaType = MediaType.Directory,
+            JobOptions = new JobOptions { TargetDirectory = Path.Combine(_root, "remap-dst") },
+        });
+        try
+        {
+            await (Task)typeof(MainViewModel).GetMethod("LoadBackupSetsAsync", BindingFlags.Instance | BindingFlags.NonPublic)!
+                .Invoke(_vm, null)!;
+            var row = _vm.BackupSets.FirstOrDefault(r => r.Id == remapSet.Id);
+            Check(row is not null, "set-up: the set to remap is in the list");
+            if (row is null) return;
+
+            var held = new FileStream(Path.Combine(_root, "sets", $"set-{remapSet.Id}.db.writelock"),
+                FileMode.OpenOrCreate, FileAccess.ReadWrite, FileShare.None);
+            try
+            {
+                _dialogs.Expect("Remap Source Drive", DialogWatcher.IDYES);
+                _vm.SetRemapSourceDriveCommand.Execute(row);
+                RemapSourceDriveDialog? dialog = null;
+                Check(await WaitFor(() => (dialog = Application.Current.Windows.OfType<RemapSourceDriveDialog>()
+                                              .FirstOrDefault()) is not null, 10000),
+                    "the remap dialog opens");
+                if (dialog is null) return;
+                dialog.DialogResult = true;
+                Check(await WaitFor(() => row.IsRunning && row.BusyActivity == "remapping its source drive", 10000),
+                    $"the remap holds the set's row (\"{row.RunningStatusText}\")");
+                Check(!_vm.SetBackupCommand.CanExecute(row) && !_vm.SetModifyCommand.CanExecute(row),
+                    "so the set cannot be backed up or modified meanwhile");
+                var disabled = Application.Current.Windows.OfType<Window>()
+                    .Where(w => w.IsVisible && !IsWindowEnabled(new System.Windows.Interop.WindowInteropHelper(w).Handle))
+                    .Select(w => w.GetType().Name).ToList();
+                Check(disabled.Count == 0 && System.Windows.Input.Mouse.OverrideCursor is null,
+                    $"but no window is disabled and no wait cursor covers the app ({string.Join(", ", disabled)})");
+            }
+            finally
+            {
+                held.Dispose();
+            }
+            Check(await WaitFor(() => !row.IsRunning, 10000)
+                  && row.LastResultText.StartsWith("Remapped source drive", StringComparison.Ordinal),
+                $"once it can write, the remap finishes and releases the row (\"{row.LastResultText}\")");
+            var after = await _observer.GetBackupSetAsync(remapSet.Id);
+            Check(after is not null && after.SourceRoots.Count == 1 && char.ToUpperInvariant(after.SourceRoots[0][0]) != from,
+                $"and the set's source is on the new drive ({after?.SourceRoots.FirstOrDefault()})");
+        }
+        finally
+        {
+            _dialogs.ClearExpectations();
+            await _observer.DeleteBackupSetAsync(remapSet.Id);
+        }
+    }
+
+    /// <summary>
     /// 27: a save may not give a set another set's backup folder, though a set that
     /// already shares one can still be edited; and a destination changed in the
     /// editor gets a new volume identity, rather than being put back at the next
@@ -1001,6 +1211,9 @@ internal static class Program
     }
 
     static bool IsOpen(Window w) => Application.Current.Windows.OfType<Window>().Contains(w);
+
+    /// <summary>Whether Windows lets the user use a window: a modal dialog over it disables it.</summary>
+    [DllImport("user32.dll")] private static extern bool IsWindowEnabled(IntPtr hWnd);
 
     static IEnumerable<SourceSelectionNodeViewModel> Walk(IEnumerable<SourceSelectionNodeViewModel> nodes)
     {
