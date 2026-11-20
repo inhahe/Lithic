@@ -31,21 +31,25 @@ servicing line (`10.0.*`), with `Microsoft.Data.Sqlite.Core` referenced directly
 that range governs it. The root `Directory.Build.targets` makes NU1603 an error in
 every project, harnesses included: a restore that cannot get the versions asked for
 fails rather than taking another major version (known-issues.md, "the Sqlite package
-could change major version"). It is a `.targets` file because the harnesses opt out
-of `Directory.Build.props` (below) but not of that.
+could change major version"). It is a `.targets` file because a harness may opt
+out of `Directory.Build.props` (below) but must not opt out of this.
 
 `tools\` holds stand-alone console harnesses (this project has no unit-test
-project — measurement and verification live there). Each sets
-`ImportDirectoryBuildProps=false` so it never stamps the shipping version onto
-itself. `tools\Directory.Build.targets` imports the root one, which it would
+project — measurement and verification live there). `src\Directory.Build.props`,
+which stamps the shipping version, is not on their search path; some also set
+`ImportDirectoryBuildProps=false`, which would keep a props file added to the root
+off them too. `tools\Directory.Build.targets` imports the root one, which it would
 otherwise hide, and compiles the code the harnesses share (`tools\Shared`) into
 every one of them.
 
 **A harness removes its scratch folder, and checks that it did.** Each run makes
-its own (`ScratchFolder.Create`, under `%TEMP%`) and ends with
-`Check(ScratchFolder.Delete(root), ...)`, after disposing every catalog it opened
-there: an open SQLite file keeps the folder, and a delete whose failure is
-swallowed left hundreds of folders behind, one per run.
+its own (`ScratchFolder.Create`, under `%TEMP%`, named for the harness and its
+process) and ends with `Check(ScratchFolder.Delete(root), ...)`, after disposing
+every catalog it opened there: an open SQLite file keeps the folder, and a delete
+whose failure is swallowed left hundreds of folders behind, one per run. A run
+that throws or is killed leaves its folder; the next run of the same harness
+removes the folders whose process is gone. `Delete` refuses any folder `Create`
+did not make, and never follows a junction out of one.
 
 **A harness that constructs `App` must set `App.SkipStartupForTests` first.**
 WPF's `Application` constructor queues `OnStartup` for the first dispatcher pump,

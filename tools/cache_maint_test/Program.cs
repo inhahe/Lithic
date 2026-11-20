@@ -52,9 +52,32 @@ public static class Program
             return 1;
         }
 
-        // A copy of the cache, which can be hundreds of megabytes: made for each
-        // run and removed at its end.
+        // The copy is hundreds of megabytes: removed however the measurement ends.
         string work = ScratchFolder.Create("lithic_cache_maint_");
+        int failures = 0;
+        try
+        {
+            failures = Measure(source, work);
+        }
+        finally
+        {
+            if (!ScratchFolder.Delete(work))
+            {
+                Console.WriteLine($"FAIL: the copy of the cache was left behind ({work})");
+                failures++;
+            }
+        }
+
+        Console.WriteLine(failures == 0 ? "\nPASS" : $"\n{failures} FAILURE(S)");
+        return failures == 0 ? 0 : 1;
+    }
+
+    /// <summary>
+    /// Compact a copy of <paramref name="source"/> made in <paramref name="work"/>,
+    /// timing it and proving it lossless. Returns how many checks failed.
+    /// </summary>
+    private static int Measure(string source, string work)
+    {
 
         // Same file name the maintenance code looks for, in a directory it has
         // been redirected to.
@@ -159,14 +182,7 @@ public static class Program
             failures++;
         }
 
-        if (!ScratchFolder.Delete(work))
-        {
-            Console.WriteLine($"FAIL: the copy of the cache was left behind ({work})");
-            failures++;
-        }
-
-        Console.WriteLine(failures == 0 ? "\nPASS" : $"\n{failures} FAILURE(S)");
-        return failures == 0 ? 0 : 1;
+        return failures;
     }
 
     private static string Mb(long bytes) => $"{bytes / 1048576.0:N1} MB";

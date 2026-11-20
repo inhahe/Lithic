@@ -50,20 +50,21 @@ void Junction(string link, string target)
     if (p.ExitCode != 0 || !Directory.Exists(link))
         throw new Exception($"could not create the junction {link} -> {target}");
 }
-Junction(Path.Combine(b, "loop"), a);
-Junction(Path.Combine(a, "up"), t);
-Junction(Path.Combine(a, "drive"), Path.GetPathRoot(t)!);
-Junction(Path.Combine(a, "ext"), outside);
-Junction(Path.Combine(a, "fwd"), b);
-Junction(Path.Combine(a, "mutual"), m);
-Junction(Path.Combine(m, "back"), a);
-
 static HashSet<string> Set(IEnumerable<string> paths) => new(paths, StringComparer.OrdinalIgnoreCase);
 string P(params string[] parts) => Path.Combine([t, .. parts]);
 string Show(IEnumerable<string> paths) => string.Join(", ", paths.Take(6).Select(p => p[(t.Length + 1)..])) + (paths.Count() > 6 ? $", ... ({paths.Count()})" : "");
 
 try
 {
+    // Inside the try: the finally removes the ones made before one that fails.
+    Junction(Path.Combine(b, "loop"), a);
+    Junction(Path.Combine(a, "up"), t);
+    Junction(Path.Combine(a, "drive"), Path.GetPathRoot(t)!);
+    Junction(Path.Combine(a, "ext"), outside);
+    Junction(Path.Combine(a, "fwd"), b);
+    Junction(Path.Combine(a, "mutual"), m);
+    Junction(Path.Combine(m, "back"), a);
+
     var fromA = Set([P("a", "b", "f.txt"), P("a", "ext", "g.txt"), P("a", "fwd", "f.txt"), P("a", "mutual", "h.txt")]);
 
     Console.WriteLine("=== 1. The scan of a folder holding loops ===");

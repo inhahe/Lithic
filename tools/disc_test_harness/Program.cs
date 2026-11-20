@@ -21,9 +21,6 @@ using LithicBackup.Infrastructure.Data;
 using LithicBackup.Infrastructure.FileSystem;
 using LithicBackup.Services;
 
-// Some cases make read-only source files on purpose (the item-1 reburn clean-up
-// test), and File.Copy keeps that flag in the staging, shelf and restore trees:
-// ScratchFolder.Delete clears it.
 string root = ScratchFolder.Create("lithic_disc_");
 
 var runner = new TestRunner(root);
@@ -813,14 +810,8 @@ await runner.Run("changed-file-reburn-gets-distinct-disc-path", async ws =>
     ws.Assert(r.Mismatches == 0, $"{r.Mismatches} restored file(s) had wrong content");
 });
 
-bool cleaned = ScratchFolder.Delete(root);
-int exitCode = runner.Report();
-if (!cleaned)
-{
-    Console.WriteLine($"  FAIL: the harness left its scratch folder behind ({root})");
-    exitCode = 1;
-}
-return exitCode;
+runner.Record("the harness leaves no scratch folder behind", ScratchFolder.Delete(root), root);
+return runner.Report();
 
 // ======================================================================
 // Test framework
@@ -842,9 +833,10 @@ sealed class TestRunner
     public async Task Run(string name, Func<Workspace, Task> body)
     {
         Console.WriteLine($"\n=== {name} ===");
-        var ws = new Workspace(Path.Combine(_root, name));
+        Workspace? ws = null;
         try
         {
+            ws = new Workspace(Path.Combine(_root, name));
             await body(ws);
             _results.Add((name, true, ws.FirstFailure ?? ""));
             if (ws.FirstFailure is null)
@@ -862,8 +854,16 @@ sealed class TestRunner
         }
         finally
         {
-            ws.Dispose();
+            ws?.Dispose();
         }
+    }
+
+    /// <summary>Count a check made outside any case, so that the summary includes it.</summary>
+    /// <param name="detail">Shown beside a failure.</param>
+    public void Record(string name, bool passed, string detail)
+    {
+        _results.Add((name, passed, detail));
+        Console.WriteLine($"\n=== {name} ===\n  {(passed ? "PASS" : "FAIL: " + detail)}");
     }
 
     public int Report()

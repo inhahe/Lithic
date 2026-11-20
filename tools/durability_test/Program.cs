@@ -58,8 +58,7 @@ Console.WriteLine(elevated ? "(running elevated)" : "(not elevated)");
 string root = ScratchFolder.Create("lithic_durability_");
 // A folder on another volume than the temp folder, for the junction: beside
 // this harness's binaries, which in this repository are on another drive.
-string elsewhere = Path.Combine(AppContext.BaseDirectory, "scratch_" + Guid.NewGuid().ToString("N"));
-Directory.CreateDirectory(elsewhere);
+string elsewhere = ScratchFolder.Create("lithic_durability_elsewhere_", AppContext.BaseDirectory);
 string? substLetter = null;
 SqliteCatalogRepository? repo = null;
 
@@ -1099,7 +1098,6 @@ try
 finally
 {
     repo?.Dispose();
-    Microsoft.Data.Sqlite.SqliteConnection.ClearAllPools();
     if (substLetter is not null)
         Run("subst", substLetter + ":", "/D");
     Check(ScratchFolder.Delete(root), $"the harness leaves no scratch folder behind ({root})");

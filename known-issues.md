@@ -258,14 +258,21 @@ run (`case_rename_test`, `dest_space_test`, `dir_dedup_test`, `dedup_estimate_te
 size cache between runs, and `disc_test_harness` its fixed-name folder.
 
 **Fixed:** `tools\Shared\ScratchFolder.cs`, compiled into every harness by
-`tools\Directory.Build.targets`. `Create` makes a run's folder; `Delete` clears
-SQLite's pools and read-only flags (never through a junction, which can lead
-out of the folder) and retries for two seconds. Every harness that makes a
-folder disposes its catalogs, then checks `ScratchFolder.Delete`, so a leak now
-fails the run. `cache_maint_test` and `disc_test_harness` take a fresh folder per
-run and remove it at the end. `cache_maint_test`, `expand_probe` and
-`treeview_bench` no longer opt out of `Directory.Build.targets`, which was never
-needed and also dropped the root NU1603 rule for them.
+`tools\Directory.Build.targets`. `Create` makes a run's folder, named for the
+harness and its process, and first removes the folders of earlier runs of the
+same harness whose process is gone: a run that throws or is killed (Ctrl+C runs
+no `finally`) leaves its folder only until the next run. `Delete` clears SQLite's
+pools, retries for two seconds, makes read-only entries writable (never through a
+junction, which can lead out of the folder), says why when the folder stays, and
+refuses any folder `Create` did not make. Every harness that makes a folder
+disposes its catalogs, then checks `ScratchFolder.Delete`, so a leak fails the
+run. `cache_maint_test` and `disc_test_harness` take a fresh folder per run and
+remove it at the end, `cache_maint_test` in a `finally`. The fixed-name folders
+the old versions left (`%TEMP%\lithic_cache_maint_test`, `%TEMP%\lithic-disc-harness`)
+were deleted by hand on 2026-11-20; nothing refers to those names any more.
+`cache_maint_test`, `expand_probe` and `treeview_bench` no longer opt out of
+`Directory.Build.targets`, which was never needed and also dropped the root
+NU1603 rule for them.
 
 ## FIXED: retention flushed the destination once for every reference it promoted (2026-10-24)
 
