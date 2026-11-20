@@ -105,9 +105,10 @@ public static class Program
         string table = Path.GetFileName(source).StartsWith("filehash", StringComparison.OrdinalIgnoreCase)
             ? "FileHashCache" : "DirectorySizeCache";
 
-        // Fingerprint the contents so the rebuild can be proved lossless.
+        // The table's shape before; that the rows survive unchanged is checked
+        // against the original copy afterwards (SurvivorsMatchOriginal).
         var before = Fingerprint(target, table);
-        Console.WriteLine($"before: {before.Rows:N0} rows, checksum {before.Checksum}, " +
+        Console.WriteLine($"before: {before.Rows:N0} rows, " +
                           $"{before.Columns} columns, layout {(before.WithoutRowid ? "WITHOUT ROWID" : "rowid")}");
 
         foreach (var r in CacheMaintenance.Survey())
@@ -149,7 +150,7 @@ public static class Program
         }
 
         var after = Fingerprint(target, table);
-        Console.WriteLine($"\nafter:  {after.Rows:N0} rows, checksum {after.Checksum}, " +
+        Console.WriteLine($"\nafter:  {after.Rows:N0} rows, " +
                           $"{after.Columns} columns, layout {(after.WithoutRowid ? "WITHOUT ROWID" : "rowid")}");
 
         // ---- verdict ----
@@ -187,7 +188,7 @@ public static class Program
 
     private static string Mb(long bytes) => $"{bytes / 1048576.0:N1} MB";
 
-    private sealed record Snapshot(long Rows, long Checksum, int Columns, bool WithoutRowid)
+    private sealed record Snapshot(long Rows, int Columns, bool WithoutRowid)
     {
         /// <summary>
         /// Re-read every surviving key from the compacted database and compare
@@ -241,7 +242,7 @@ public static class Program
         using var conn = new SqliteConnection($"Data Source={dbPath}");
         conn.Open();
 
-        long rows = 0, checksum = 0;
+        long rows = 0;
         int columns = 0;
         bool withoutRowid = false;
 
@@ -267,6 +268,6 @@ public static class Program
                 .Contains("WITHOUT ROWID", StringComparison.OrdinalIgnoreCase);
         }
 
-        return new Snapshot(rows, checksum, columns, withoutRowid);
+        return new Snapshot(rows, columns, withoutRowid);
     }
 }
